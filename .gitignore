@@ -1,0 +1,4 @@
+/.env
+/generated/
+/tmp/
+__pycache__/

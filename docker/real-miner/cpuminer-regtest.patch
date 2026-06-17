@@ -1,0 +1,19 @@
+diff --git a/util.c b/util.c
+index a8e6a68..0d4d40b 100644
+--- a/util.c
++++ b/util.c
+@@ -2124,8 +2124,11 @@ out:
+ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
+ {
+ 	double diff;
++	const double regtest_floor = 1.0 / 256.0;
+ 
+ 	diff = json_number_value(json_array_get(params, 0));
+-	if (diff == 0)
++	if (diff < 0)
+ 		return false;
++	if (diff == 0)
++		diff = regtest_floor;
+ 
+ 	pthread_mutex_lock(&sctx->work_lock);
+ 	sctx->next_diff = diff;

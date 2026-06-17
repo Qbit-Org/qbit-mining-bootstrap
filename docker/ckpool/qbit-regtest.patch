@@ -1,0 +1,543 @@
+diff --git a/src/ckpool.c b/src/ckpool.c
+index 1db49c4..b2beb8f 100644
+--- a/src/ckpool.c
++++ b/src/ckpool.c
+@@ -1185,11 +1185,11 @@ bool json_get_double(double *store, const json_t *val, const char *res)
+ 		LOGDEBUG("Json did not find entry %s", res);
+ 		goto out;
+ 	}
+-	if (!json_is_real(entry)) {
+-		LOGWARNING("Json entry %s is not a double", res);
++	if (!json_is_number(entry)) {
++		LOGWARNING("Json entry %s is not numeric", res);
+ 		goto out;
+ 	}
+-	*store = json_real_value(entry);
++	*store = json_number_value(entry);
+ 	LOGDEBUG("Json found entry %s: %f", res, *store);
+ 	ret = true;
+ out:
+@@ -1473,10 +1473,10 @@ static void parse_config(ckpool_t *ckp)
+ 	arr_val = json_object_get(json_conf, "trusted");
+ 	parse_trusted(ckp, arr_val);
+ 	json_get_string(&ckp->upstream, json_conf, "upstream");
+-	json_get_int64(&ckp->mindiff, json_conf, "mindiff");
+-	json_get_int64(&ckp->startdiff, json_conf, "startdiff");
+-	json_get_int64(&ckp->highdiff, json_conf, "highdiff");
+-	json_get_int64(&ckp->maxdiff, json_conf, "maxdiff");
++	json_get_double(&ckp->mindiff, json_conf, "mindiff");
++	json_get_double(&ckp->startdiff, json_conf, "startdiff");
++	json_get_double(&ckp->highdiff, json_conf, "highdiff");
++	json_get_double(&ckp->maxdiff, json_conf, "maxdiff");
+ 	json_get_string(&ckp->logdir, json_conf, "logdir");
+ 	json_get_int(&ckp->maxclients, json_conf, "maxclients");
+ 	json_get_double(&ckp->donation, json_conf, "donation");
+@@ -1778,10 +1778,11 @@ int main(int argc, char **argv)
+ 		quit(0, "Invalid nonce2length %d specified, must be 2~8", ckp.nonce2length);
+ 	if (!ckp.update_interval)
+ 		ckp.update_interval = 30;
++	const double regtest_floor = 1.0 / 256.0;
+ 	if (!ckp.mindiff)
+-		ckp.mindiff = 1;
++		ckp.mindiff = regtest_floor;
+ 	if (!ckp.startdiff)
+-		ckp.startdiff = 42;
++		ckp.startdiff = regtest_floor;
+ 	if (!ckp.highdiff)
+ 		ckp.highdiff = 1000000;
+ 	if (!ckp.logdir)
+diff --git a/src/ckpool.h b/src/ckpool.h
+index 0921496..f869586 100644
+--- a/src/ckpool.h
++++ b/src/ckpool.h
+@@ -233,10 +233,10 @@ struct ckpool_instance {
+ 	int nonce2length; // Extranonce2 length
+ 
+ 	/* Difficulty settings */
+-	int64_t mindiff; // Default 1
+-	int64_t startdiff; // Default 42
+-	int64_t highdiff; // Default 1000000
+-	int64_t maxdiff; // No default
++	double mindiff; // Default 1
++	double startdiff; // Default 42
++	double highdiff; // Default 1000000
++	double maxdiff; // No default
+ 
+ 	/* Coinbase data */
+ 	char *btcaddress; // Address to mine to
+diff --git a/src/stratifier.c b/src/stratifier.c
+index 8281fa0..f49fede 100644
+--- a/src/stratifier.c
++++ b/src/stratifier.c
+@@ -67,10 +67,10 @@ struct pool_stats {
+ 	double sps60;
+ 
+ 	/* Diff shares stats */
+-	int64_t unaccounted_diff_shares;
+-	int64_t accounted_diff_shares;
+-	int64_t unaccounted_rejects;
+-	int64_t accounted_rejects;
++	double unaccounted_diff_shares;
++	double accounted_diff_shares;
++	double unaccounted_rejects;
++	double accounted_rejects;
+ 
+ 	/* Diff shares per second for 1/5/15... minute rolling averages */
+ 	double dsps1;
+@@ -147,9 +147,9 @@ struct user_instance {
+ 	double best_diff; /* Best share found by this user */
+ 	int64_t best_ever; /* Best share ever found by this user */
+ 
+-	int64_t shares;
++	double shares;
+ 
+-	int64_t uadiff; /* Shares not yet accounted for in hashmeter */
++	double uadiff; /* Shares not yet accounted for in hashmeter */
+ 
+ 	double dsps1; /* Diff shares per second, 1 minute rolling average */
+ 	double dsps5; /* ... 5 minute ... */
+@@ -177,9 +177,9 @@ struct worker_instance {
+ 	worker_instance_t *next;
+ 	worker_instance_t *prev;
+ 
+-	int64_t shares;
++	double shares;
+ 
+-	int64_t uadiff; /* Shares not yet accounted for in hashmeter */
++	double uadiff; /* Shares not yet accounted for in hashmeter */
+ 
+ 	double dsps1;
+ 	double dsps5;
+@@ -192,7 +192,7 @@ struct worker_instance {
+ 
+ 	double best_diff; /* Best share found by this worker */
+ 	int64_t best_ever; /* Best share ever found by this worker */
+-	int mindiff; /* User chosen mindiff */
++	double mindiff; /* User chosen mindiff */
+ 
+ 	bool idle;
+ 	bool notified_idle;
+@@ -234,12 +234,13 @@ struct stratum_instance {
+ 	char enonce1var[20]; /* Fit up to 8 byte binary enonce1var */
+ 	uint64_t enonce1_64;
+ 	int session_id;
++	uint32_t version_rolling_mask;
+ 
+-	int64_t diff; /* Current diff */
+-	int64_t old_diff; /* Previous diff */
++	double diff; /* Current diff */
++	double old_diff; /* Previous diff */
+ 	int64_t diff_change_job_id; /* Last job_id we changed diff */
+ 
+-	int64_t uadiff; /* Shares not yet accounted for in hashmeter */
++	double uadiff; /* Shares not yet accounted for in hashmeter */
+ 
+ 	double dsps1; /* Diff shares per second, 1 minute rolling average */
+ 	double dsps5; /* ... 5 minute ... */
+@@ -286,7 +287,7 @@ struct stratum_instance {
+ 	time_t last_txns; /* Last time this worker requested txn hashes */
+ 	time_t disconnected_time; /* Time this instance disconnected */
+ 
+-	int64_t suggest_diff; /* Stratum client suggested diff */
++	double suggest_diff; /* Stratum client suggested diff */
+ 	double best_diff; /* Best share found by this instance */
+ 
+ 	sdata_t *sdata; /* Which sdata this client is bound to */
+@@ -544,8 +545,14 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
+ 	ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
+ 
+ 	/* Put block height at start of template */
+-	len = ser_number(wb->coinb1bin + ofs, wb->height);
+-	ofs += len;
++	if (wb->height >= 1 && wb->height <= 16) {
++		/* Match CScript() << nHeight for early chain heights. */
++		wb->coinb1bin[ofs++] = 0x50 + wb->height;
++		len = 1;
++	} else {
++		len = ser_number(wb->coinb1bin + ofs, wb->height);
++		ofs += len;
++	}
+ 
+ 	/* Followed by flag */
+ 	len = strlen(wb->flags) / 2;
+@@ -1039,9 +1046,10 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
+ 	ts_realtime(&wb->gentime);
+ 	/* Stats network_diff is not protected by lock but is not a critical
+ 	 * value */
++	const double regtest_floor = 1.0 / 256.0;
+ 	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+-	if (wb->network_diff < 1)
+-		wb->network_diff = 1;
++	if (wb->network_diff < regtest_floor)
++		wb->network_diff = regtest_floor;
+ 	stats->network_diff = wb->network_diff;
+ 	if (stats->network_diff != old_diff)
+ 		LOGWARNING("Network diff set to %.1f", stats->network_diff);
+@@ -3120,10 +3128,8 @@ static void update_diff(ckpool_t *ckp, const char *cmd)
+ 		return;
+ 	}
+ 
+-	/* We only really care about integer diffs so clamp the lower limit to
+-	 * 1 or it will round down to zero. */
+-	if (unlikely(diff < 1))
+-		diff = 1;
++	if (unlikely(diff <= 0))
++		diff = ckp->mindiff > 0 ? ckp->mindiff : 1.0 / 256.0;
+ 
+ 	dsdata = proxy->sdata;
+ 
+@@ -3723,7 +3729,7 @@ static json_t *user_stats(const user_instance_t *user)
+ 	ghs = user->dsps10080 * nonces;
+ 	suffix_string(ghs, suffix10080, 16, 0);
+ 
+-	JSON_CPACK(val, "{ss,ss,ss,ss,ss,sI,sI}",
++	JSON_CPACK(val, "{ss,ss,ss,ss,ss,sf,sI}",
+ 			"hashrate1m", suffix1,
+ 			"hashrate5m", suffix5,
+ 			"hashrate1hr", suffix60,
+@@ -3763,7 +3769,7 @@ static void block_share_summary(sdata_t *sdata)
+ 
+ 	sdiff = sdata->stats.accounted_diff_shares;
+ 	bdiff = sdiff / sdata->current_workbase->network_diff * 100;
+-	LOGWARNING("Block solved after %.0lf shares at %.1f%% diff",
++	LOGWARNING("Block solved after %.6f shares at %.1f%% diff",
+ 		   sdiff, bdiff);
+ }
+ 
+@@ -4128,7 +4134,7 @@ static json_t *workerinfo(const user_instance_t *user, const worker_instance_t *
+ {
+ 	json_t *val;
+ 
+-	JSON_CPACK(val, "{ss,ss,si,sf,sf,sf,sf,si,sf,si,sb}",
++	JSON_CPACK(val, "{ss,ss,si,sf,sf,sf,sf,si,sf,sf,sb}",
+ 		   "user", user->username, "worker", worker->workername, "id", user->id,
+ 	    "dsps1", worker->dsps1, "dsps5", worker->dsps5, "dsps60", worker->dsps60,
+ 	    "dsps1440", worker->dsps1440, "lastshare", worker->last_share.tv_sec,
+@@ -4493,7 +4499,7 @@ static void get_poolstats(sdata_t *sdata, int *sockd)
+ 	json_t *val;
+ 
+ 	mutex_lock(&sdata->stats_lock);
+-	JSON_CPACK(val, "{si,si,si,si,si,sI,sf,sf,sf,sf,sI,sI,sf,sf,sf,sf,sf,sf,sf}",
++	JSON_CPACK(val, "{si,si,si,si,si,sI,sf,sf,sf,sf,sf,sf,sf,sf,sf,sf,sf,sf,sf}",
+ 		   "start", stats->start_time.tv_sec, "update", stats->last_update.tv_sec,
+ 	    "workers", stats->workers + stats->remote_workers, "users", stats->users + stats->remote_users,
+ 	    "disconnected", stats->disconnected,
+@@ -5205,7 +5211,7 @@ static void read_userstats(ckpool_t *ckp, sdata_t *sdata, int tvsec_diff)
+ 		user->dsps10080 = dsps_from_key(val, "hashrate7d");
+ 		json_get_int(&lastshare, val, "lastshare");
+ 		user->last_share.tv_sec = lastshare;
+-		json_get_int64(&user->shares, val, "shares");
++		json_get_double(&user->shares, val, "shares");
+ 		json_get_double(&user->best_diff, val, "bestshare");
+ 		json_get_int64(&user->best_ever, val, "bestever");
+ 		json_get_int64(&authorised, val, "authorised");
+@@ -5247,7 +5253,7 @@ static void read_userstats(ckpool_t *ckp, sdata_t *sdata, int tvsec_diff)
+ 			json_get_int64(&worker->best_ever, arr_val, "bestever");
+ 			if (worker->best_diff > worker->best_ever)
+ 				worker->best_ever = worker->best_diff;
+-			json_get_int64(&worker->shares, arr_val, "shares");
++			json_get_double(&worker->shares, arr_val, "shares");
+ 			LOGINFO("Successfully read worker %s stats %f %f %f %f %f %ld", worker->workername,
+ 				worker->dsps1, worker->dsps5, worker->dsps60, worker->dsps1440, worker->best_diff, worker->best_ever);
+ 			if (tvsec_diff > 60)
+@@ -5567,8 +5573,12 @@ static void stratum_send_diff(sdata_t *sdata, const stratum_instance_t *client)
+ {
+ 	json_t *json_msg;
+ 
+-	JSON_CPACK(json_msg, "{s[I]soss}", "params", client->diff, "id", json_null(),
+-			     "method", "mining.set_difficulty");
++	json_msg = json_object();
++	json_t *params = json_array();
++	json_array_append_new(params, json_real(client->diff));
++	json_object_set_new_nocheck(json_msg, "params", params);
++	json_object_set_new_nocheck(json_msg, "id", json_null());
++	json_object_set_new_nocheck(json_msg, "method", json_string("mining.set_difficulty"));
+ 	stratum_add_send(sdata, json_msg, client->id, SM_DIFF);
+ }
+ 
+@@ -5603,7 +5613,8 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
+ 	worker_instance_t *worker = client->worker_instance;
+ 	double tdiff, bdiff, dsps, drr, network_diff, bias;
+ 	user_instance_t *user = client->user_instance;
+-	int64_t next_blockid, optimal, mindiff;
++	int64_t next_blockid;
++	double optimal, mindiff;
+ 	tv_t now_t;
+ 
+ 	mutex_lock(&ckp_sdata->uastats_lock);
+@@ -5677,7 +5688,9 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
+ 		bias = time_bias(bdiff, 300);
+ 		dsps = client->dsps5 / bias;
+ 	}
+-	drr = dsps / (double)client->diff;
++	if (unlikely(client->diff <= 0))
++		client->diff = ckp->mindiff > 0 ? ckp->mindiff : 1.0 / 256.0;
++	drr = dsps / client->diff;
+ 
+ 	/* Optimal rate product is 0.3, allow some hysteresis. */
+ 	if (drr > 0.15 && drr < 0.4)
+@@ -5692,9 +5705,9 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
+ 	if (mindiff) {
+ 		if (drr < 0.5)
+ 			return;
+-		optimal = lround(dsps * 2.4);
++		optimal = dsps * 2.4;
+ 	} else
+-		optimal = lround(dsps * 3.33);
++		optimal = dsps * 3.33;
+ 
+ 	/* Clamp to mindiff ~ network_diff */
+ 
+@@ -5711,9 +5724,6 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
+ 	/* Set to lower of optimal and network_diff */
+ 	optimal = MIN(optimal, network_diff);
+ 
+-	if (unlikely(optimal < 1))
+-		return;
+-
+ 	if (client->diff == optimal)
+ 		return;
+ 
+@@ -5727,7 +5737,7 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
+ 
+ 	client->ssdc = 0;
+ 
+-	LOGINFO("Client %s biased dsps %.2f dsps %.2f drr %.2f adjust diff from %"PRId64" to: %"PRId64" ",
++	LOGINFO("Client %s biased dsps %.6f dsps %.6f drr %.6f adjust diff from %.6f to %.6f ",
+ 		client->identity, dsps, client->dsps5, drr, client->diff, optimal);
+ 
+ 	copy_tv(&client->ldc, &now_t);
+@@ -6079,8 +6089,8 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
+ 	if (version_mask && strlen(version_mask) && validhex(version_mask)) {
+ 		sscanf(version_mask, "%x", &version_mask32);
+ 		// check version mask
+-		if (version_mask32 && ((~ckp->version_mask) & version_mask32) != 0) {
+-			// means client changed some bits which server doesn't allow to change
++		if (version_mask32 && ((~client->version_rolling_mask) & version_mask32) != 0) {
++			// means client changed some bits which server didn't negotiate
+ 			err = SE_INVALID_VERSION_MASK;
+ 			*err_val = JSON_ERR(err);
+ 			goto out;
+@@ -6469,6 +6479,80 @@ static json_params_t
+ 	return jp;
+ }
+ 
++static void send_json_result(sdata_t *sdata, const int64_t client_id, json_t *id_val,
++			     json_t *result_val, const int msg_type)
++{
++	json_t *val = json_object();
++
++	json_object_set_new_nocheck(val, "result", result_val);
++	json_object_set_nocheck(val, "id", id_val);
++	json_object_set_new_nocheck(val, "error", json_null());
++	stratum_add_send(sdata, val, client_id, msg_type);
++}
++
++static bool parse_version_rolling_mask(uint32_t *mask, const char *mask_str)
++{
++	if (!mask_str || strlen(mask_str) != 8 || !validhex(mask_str))
++		return false;
++	sscanf(mask_str, "%x", mask);
++	return true;
++}
++
++static json_t *configure_result(ckpool_t *ckp, stratum_instance_t *client, const json_t *params_val)
++{
++	json_t *extensions_val, *extension_params, *result_val, *arr_val;
++	size_t index;
++
++	result_val = json_object();
++	if (!json_is_array(params_val))
++		return result_val;
++
++	extensions_val = json_array_get(params_val, 0);
++	if (!json_is_array(extensions_val))
++		return result_val;
++
++	extension_params = json_array_get(params_val, 1);
++	if (!json_is_object(extension_params))
++		extension_params = NULL;
++
++	json_array_foreach(extensions_val, index, arr_val) {
++		const char *extension = json_string_value(arr_val);
++
++		if (!extension || !strlen(extension))
++			continue;
++
++		if (!safecmp(extension, "version-rolling")) {
++			const char *miner_mask_str = NULL;
++			json_t *miner_mask_val = NULL;
++			uint32_t miner_mask = 0xffffffff;
++			uint32_t negotiated_mask = 0;
++			char version_str[12];
++
++			if (extension_params) {
++				miner_mask_val = json_object_get(extension_params, "version-rolling.mask");
++				miner_mask_str = json_string_value(miner_mask_val);
++				if (miner_mask_val && !parse_version_rolling_mask(&miner_mask, miner_mask_str)) {
++					json_set_bool(result_val, "version-rolling", false);
++					json_set_string(result_val, "version-rolling.mask", "00000000");
++					client->version_rolling_mask = 0;
++					continue;
++				}
++			}
++
++			negotiated_mask = miner_mask & ckp->version_mask;
++			client->version_rolling_mask = negotiated_mask;
++			sprintf(version_str, "%08x", negotiated_mask);
++			json_set_bool(result_val, "version-rolling", negotiated_mask != 0);
++			json_set_string(result_val, "version-rolling.mask", version_str);
++			continue;
++		}
++
++		json_set_bool(result_val, extension, false);
++	}
++
++	return result_val;
++}
++
+ /* Implement support for the diff in the params as well as the originally
+  * documented form of placing diff within the method. Needs to be entered with
+  * client holding a ref count. */
+@@ -6476,15 +6560,15 @@ static void suggest_diff(ckpool_t *ckp, stratum_instance_t *client, const char *
+ 			 const json_t *params_val)
+ {
+ 	json_t *arr_val = json_array_get(params_val, 0);
+-	int64_t sdiff;
++	double sdiff;
+ 
+ 	if (unlikely(!client_active(client))) {
+ 		LOGNOTICE("Attempted to suggest diff on unauthorised client %s", client->identity);
+ 		return;
+ 	}
+-	if (arr_val && json_is_integer(arr_val))
+-		sdiff = json_integer_value(arr_val);
+-	else if (sscanf(method, "mining.suggest_difficulty(%"PRId64, &sdiff) != 1) {
++	if (arr_val && (json_is_real(arr_val) || json_is_integer(arr_val)))
++		sdiff = json_number_value(arr_val);
++	else if (sscanf(method, "mining.suggest_difficulty(%lf", &sdiff) != 1) {
+ 		LOGINFO("Failed to parse suggest_difficulty for client %s", client->identity);
+ 		return;
+ 	}
+@@ -6710,20 +6794,20 @@ static void parse_method(ckpool_t *ckp, sdata_t *sdata, stratum_instance_t *clie
+ 		return;
+ 	}
+ 
+-        if (cmdmatch(method, "mining.configure")) {
+-		json_t *val, *result_val;
+-		char version_str[12];
++	if (cmdmatch(method, "mining.configure")) {
++		json_t *result_val;
+ 
+ 		LOGINFO("Mining configure requested from %s %s", client->identity,
+ 			client->address);
+-		sprintf(version_str, "%08x", ckp->version_mask);
+-		val = json_object();
+-		JSON_CPACK(result_val, "{sbss}", "version-rolling", json_true(),
+-			   "version-rolling.mask", version_str);
+-		json_object_set_new_nocheck(val, "result", result_val);
+-		json_object_set_nocheck(val, "id", id_val);
+-		json_object_set_new_nocheck(val, "error", json_null());
+-		stratum_add_send(sdata, val, client_id, SM_CONFIGURE);
++		result_val = configure_result(ckp, client, params_val);
++		send_json_result(sdata, client_id, id_val, result_val, SM_CONFIGURE);
++		return;
++	}
++
++	if (cmdmatch(method, "mining.extranonce.subscribe")) {
++		LOGINFO("Mining extranonce subscribe requested from %s %s", client->identity,
++			client->address);
++		send_json_result(sdata, client_id, id_val, json_boolean(false), SM_CONFIGURE);
+ 		return;
+ 	}
+ 
+@@ -6905,7 +6989,7 @@ static void parse_remote_share(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
+ 		LOGWARNING("Failed to get workername from remote message %s", buf);
+ 		return;
+ 	}
+-	if (unlikely(!json_get_double(&diff, val, "diff") || diff < 1)) {
++	if (unlikely(!json_get_double(&diff, val, "diff") || diff <= 0)) {
+ 		LOGWARNING("Unable to parse valid diff from remote message %s", buf);
+ 		return;
+ 	}
+@@ -6931,7 +7015,7 @@ static void parse_remote_share(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
+ 	decay_user(user, diff, &now_t);
+ 	copy_tv(&user->last_share, &now_t);
+ 
+-	LOGINFO("Added %.0lf remote shares to worker %s", diff, workername);
++	LOGINFO("Added %.6f remote shares to worker %s", diff, workername);
+ }
+ 
+ static void parse_remote_shareerr(ckpool_t *ckp, json_t *val, const char *buf)
+@@ -7689,7 +7773,8 @@ static void sauth_process(ckpool_t *ckp, json_params_t *jp)
+ 	json_t *result_val, *err_val = NULL;
+ 	sdata_t *sdata = ckp->sdata;
+ 	stratum_instance_t *client;
+-	int64_t mindiff, client_id;
++	double mindiff;
++	int64_t client_id;
+ 	bool ret;
+ 
+ 	client_id = jp->client_id;
+@@ -8042,7 +8127,7 @@ static void *statsupdate(void *arg)
+ 			ghs = user->dsps10080 * nonces;
+ 			suffix_string(ghs, suffix10080, 16, 0);
+ 
+-			JSON_CPACK(val, "{ss,ss,ss,ss,ss,si,si,sI,sf,sI, sI}",
++			JSON_CPACK(val, "{ss,ss,ss,ss,ss,si,si,sf,sf,sI,sI}",
+ 					"hashrate1m", suffix1,
+ 					"hashrate5m", suffix5,
+ 					"hashrate1hr", suffix60,
+@@ -8105,7 +8190,7 @@ static void *statsupdate(void *arg)
+ 
+ 				LOGDEBUG("Storing worker %s", worker->workername);
+ 
+-				JSON_CPACK(wval, "{ss,ss,ss,ss,ss,ss,si,sI,sf,sI}",
++				JSON_CPACK(wval, "{ss,ss,ss,ss,ss,ss,si,sf,sf,sI}",
+ 						"workername", worker->workername,
+ 						"hashrate1m", suffix1,
+ 						"hashrate5m", suffix5,
+@@ -8199,8 +8284,8 @@ static void *statsupdate(void *arg)
+ 
+ 		/* Round to 4 significant digits */
+ 		percent = round(stats->accounted_diff_shares * 10000 / stats->network_diff) / 100;
+-		JSON_CPACK(val, "{sf,sI,sI,sI,sf,sf,sf,sf}",
+-			        "diff", percent,
++		JSON_CPACK(val, "{sf,sf,sf,sI,sf,sf,sf,sf}",
++		        "diff", percent,
+ 				"accepted", stats->accounted_diff_shares,
+ 				"rejected", stats->accounted_rejects,
+ 				"bestshare", stats->best_diff,
+@@ -8400,8 +8485,8 @@ static void read_poolstats(ckpool_t *ckp, int *tvsec_diff)
+ 	json_get_double(&stats->sps5, val, "SPS5m");
+ 	json_get_double(&stats->sps15, val, "SPS15m");
+ 	json_get_double(&stats->sps60, val, "SPS1h");
+-	json_get_int64(&stats->accounted_diff_shares, val, "accepted");
+-	json_get_int64(&stats->accounted_rejects, val, "rejected");
++	json_get_double(&stats->accounted_diff_shares, val, "accepted");
++	json_get_double(&stats->accounted_rejects, val, "rejected");
+ 	json_get_int64(&stats->best_diff, val, "bestshare");
+ 	json_decref(val);
+ 
+@@ -8452,14 +8537,18 @@ void *throbber(void *arg)
+ 		suffix_string(stats->dsps1 * nonces, hashrate, 16, 3);
+ 		ch = status_chars[(counter++) & 0x3];
+ 		get_timestamp(stamp);
+-		if (likely(sdata->current_workbase)) {
++		if (likely(sdata->current_workbase && sdata->current_workbase->network_diff > 0)) {
+ 			double bdiff = sdiff / sdata->current_workbase->network_diff * 100;
+ 
+-			fprintf(stdout, "\33[2K\r%s %c %sH/s  %.1f SPS  %d users  %d workers  %.0f shares  %.1f%% diff",
++			fprintf(stdout, "\33[2K\r%s %c %sH/s  %.1f SPS  %d users  %d workers  %.6f shares  %.1f%% diff",
+ 				stamp, ch, hashrate, stats->sps1, stats->users + stats->remote_users,
+ 				stats->workers + stats->remote_workers, sdiff, bdiff);
++		} else if (likely(sdata->current_workbase)) {
++			fprintf(stdout, "\33[2K\r%s %c %sH/s  %.1f SPS  %d users  %d workers  %.6f shares  %.1f%% diff",
++				stamp, ch, hashrate, stats->sps1, stats->users + stats->remote_users,
++				stats->workers + stats->remote_workers, sdiff, 0.0);
+ 		} else {
+-			fprintf(stdout, "\33[2K\r%s %c %sH/s  %.1f SPS  %d users  %d workers  %.0f shares",
++			fprintf(stdout, "\33[2K\r%s %c %sH/s  %.1f SPS  %d users  %d workers  %.6f shares",
+ 				stamp, ch, hashrate, stats->sps1, stats->users + stats->remote_users,
+ 				stats->workers + stats->remote_workers, sdiff);
+ 		}

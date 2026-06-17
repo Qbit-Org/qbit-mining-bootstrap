@@ -1,0 +1,47 @@
+diff --git a/src/bitcoin.c b/src/bitcoin.c
+index fa2132e7..89bee6d8 100644
+--- a/src/bitcoin.c
++++ b/src/bitcoin.c
+@@ -9,6 +9,7 @@
+ 
+ #include "config.h"
+ 
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "ckpool.h"
+@@ -16,7 +17,7 @@
+ #include "bitcoin.h"
+ #include "stratifier.h"
+ 
+-static char* understood_rules[] = {"segwit"};
++static char* understood_rules[] = {"segwit", "signet"};
+ 
+ static bool check_required_rule(const char* rule)
+ {
+@@ -114,6 +115,16 @@ out:
+ }
+ 
+ static const char *gbt_req = "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"], \"rules\" : [\"segwit\"]}]}\n";
++static const char *signet_gbt_req = "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"], \"rules\" : [\"segwit\", \"signet\"]}]}\n";
++
++static const char *current_gbt_req(void)
++{
++	const char *chain = getenv("QBIT_CHAIN");
++
++	if (chain && safecmp(chain, "signet") == 0)
++		return signet_gbt_req;
++	return gbt_req;
++}
+ 
+ /* Request getblocktemplate from bitcoind already connected with a connsock_t
+  * and then summarise the information to the most efficient set of data
+@@ -134,7 +145,7 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
+ 	int i;
+ 	bool ret = false;
+ 
+-	val = json_rpc_call(cs, gbt_req);
++	val = json_rpc_call(cs, current_gbt_req());
+ 	if (!val) {
+ 		LOGWARNING("%s:%s Failed to get valid json response to getblocktemplate", cs->url, cs->port);
+ 		return ret;

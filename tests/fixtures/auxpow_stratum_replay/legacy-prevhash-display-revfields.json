@@ -1,0 +1,33 @@
+{
+  "name": "legacy-prevhash-display-revfields",
+  "configure": {
+    "requested_mask": "1fffe000",
+    "server_mask": "1fffe000",
+    "negotiated_mask": "1fffe000"
+  },
+  "subscribe": {
+    "extranonce1": "00000001",
+    "extranonce2_size": 4
+  },
+  "notify": {
+    "job_id": "0000000000000001",
+    "previousblockhash_display": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "prevhash": "03020100070605040b0a09080f0e0d0c13121110171615141b1a19181f1e1d1c",
+    "coinb1": "0100000001",
+    "coinb2": "ffffffff0100f2052a01000000015100000000",
+    "merkle_branch": [],
+    "version": "20000000",
+    "nbits": "1d00ffff",
+    "ntime": "5f5e1000"
+  },
+  "submit": {
+    "worker": "worker",
+    "extranonce2": "00000002",
+    "ntime": "5f5e1000",
+    "nonce": "0000002a",
+    "version_bits": "00000000"
+  },
+  "expected": {
+    "diagnostic_variant": "display-revfields"
+  }
+}
