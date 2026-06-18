@@ -56,8 +56,12 @@ def install_test_framework_stubs() -> None:
         return hashlib.sha256(hashlib.sha256(data).digest()).digest()
 
     auxpow.AuxPowPayload = AuxPowPayload
-    auxpow.MERGED_MINING_HEADER = b""
-    auxpow.check_merkle_branch = lambda *args, **kwargs: True
+    auxpow.MERGED_MINING_HEADER = bytes.fromhex("fabe6d6d")
+
+    def check_merkle_branch(leaf: int, branch: list[int], index: int) -> int:
+        return leaf
+
+    auxpow.check_merkle_branch = check_merkle_branch
     auxpow.get_expected_index = lambda *args, **kwargs: 0
     blocktools.add_witness_commitment = lambda *args, **kwargs: None
     blocktools.create_block = lambda *args, **kwargs: object()
@@ -82,6 +86,19 @@ from lab.auxpow import auxpow_coordinator as coordinator  # noqa: E402
 
 
 class AuxPowVardiffCoordinatorTests(unittest.TestCase):
+    def test_build_chain_commitment_uses_display_order_root_bytes(self) -> None:
+        root_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        aux_template = {"hash": root_hex, "chainid": 31430}
+
+        commitment, chain_index = coordinator.build_chain_commitment(aux_template, chain_nonce=0x11223344)
+
+        self.assertEqual(chain_index, 0)
+        self.assertEqual(commitment[:4], bytes.fromhex("fabe6d6d"))
+        self.assertEqual(commitment[4:36], bytes.fromhex(root_hex))
+        self.assertNotEqual(commitment[4:36], int(root_hex, 16).to_bytes(32, "little"))
+        self.assertEqual(commitment[36:40], (1).to_bytes(4, "little"))
+        self.assertEqual(commitment[40:44], (0x11223344).to_bytes(4, "little"))
+
     def test_package_import_uses_package_vardiff_module(self) -> None:
         import lab.auxpow as auxpow_package
 

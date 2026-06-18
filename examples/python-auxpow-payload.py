@@ -8,10 +8,12 @@ instead of maintaining a second serializer here.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
 import time
+import tokenize
 from pathlib import Path
 
 
@@ -47,6 +49,36 @@ def resolve_qbit_src(explicit: str | None) -> Path:
     raise SystemExit(f"--qbit-src / QBIT_SRC_DIR does not contain {helper.relative_to(qbit_src)}: {qbit_src}")
 
 
+def code_tokens_without_comments_or_strings(source: str) -> str:
+    tokens: list[str] = []
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type in {
+            tokenize.COMMENT,
+            tokenize.DEDENT,
+            tokenize.INDENT,
+            tokenize.NEWLINE,
+            tokenize.NL,
+            tokenize.STRING,
+        }:
+            continue
+        tokens.append(token.string)
+    return "".join(tokens)
+
+
+def require_standard_auxpow_helper(qbit_src: Path) -> None:
+    helper = qbit_src / "test/functional/test_framework/auxpow.py"
+    source = helper.read_text(encoding="utf-8")
+    code = code_tokens_without_comments_or_strings(source)
+    if "+ser_uint256(chain_merkle_root)+" not in code:
+        return
+
+    raise SystemExit(
+        f"{helper} appears to commit the AuxPoW chain merkle root with internal little-endian uint256 bytes. "
+        "Use a qbit checkout whose functional-test AuxPoW helper commits the standard display-order root bytes, "
+        "or use lab/auxpow/auxpow_coordinator.py from this repository."
+    )
+
+
 def load_template(args: argparse.Namespace) -> dict[str, object]:
     if args.template_file:
         return json.loads(Path(args.template_file).read_text())
@@ -59,6 +91,7 @@ def main() -> int:
     args = parse_args()
     template = load_template(args)
     qbit_src = resolve_qbit_src(args.qbit_src)
+    require_standard_auxpow_helper(qbit_src)
 
     sys.path.insert(0, str(qbit_src / "test/functional"))
     from test_framework.auxpow import make_valid_auxpow_from_template

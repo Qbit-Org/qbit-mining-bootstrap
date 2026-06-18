@@ -232,13 +232,15 @@ The AuxPoW payload itself is serialized as:
 Commitment rules qbit enforces:
 
 - The merged-mining magic is `0xfabe6d6d`
-- If the magic header is present, it must appear exactly once and be immediately followed by the chain merkle root
+- If the magic header is present, it must appear exactly once and be immediately followed by the chain merkle root in display/big-endian byte order
+- The committed root bytes match the RPC hash display order; code using an internal `uint256` must reverse `ser_uint256(chain_root)` before writing the root into the coinbase `scriptSig`
 - After the chain merkle root come two little-endian `uint32`s: `merkle_size` and `nonce`
 - The slot index is deterministic from the nonce and chain ID; it is not free-form
 - `coinbase_branch_index` must be `0`
 - Parent PoW must satisfy qbit's target bits
 
 The helper in `examples/python-auxpow-payload.py` reads the `createauxblock` JSON, reuses qbit's own functional-test helper, and prints a valid `auxpow_hex`. Point it at a separate qbit checkout with `--qbit-src` or `QBIT_SRC_DIR`.
+The wrapper refuses qbit helper checkouts with the known old behavior that commits the internal little-endian `uint256` chain root directly.
 
 ### Real merge-mining path
 

@@ -283,6 +283,11 @@ def resolve_bitcoin_miner_address(bitcoin_rpc: JsonRpc) -> ResolvedAddress:
     return resolve_validated_address(bitcoin_rpc, address, field_name="BITCOIN_MINER_ADDRESS")
 
 
+def uint256_display_bytes(value: int) -> bytes:
+    """Return the RPC/display-order bytes for an internal uint256 value."""
+    return ser_uint256(value)[::-1]
+
+
 def build_chain_commitment(aux_template: dict[str, object], *, chain_nonce: int = 0) -> tuple[bytes, int]:
     chain_merkle_branch: list[int] = []
     chain_index = get_expected_index(
@@ -293,7 +298,7 @@ def build_chain_commitment(aux_template: dict[str, object], *, chain_nonce: int 
     chain_root = check_merkle_branch(leaf=int(aux_template["hash"], 16), branch=chain_merkle_branch, index=chain_index)
     commitment = (
         MERGED_MINING_HEADER
-        + ser_uint256(chain_root)
+        + uint256_display_bytes(chain_root)
         + (1 << len(chain_merkle_branch)).to_bytes(4, "little")
         + chain_nonce.to_bytes(4, "little")
     )
