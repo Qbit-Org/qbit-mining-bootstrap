@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -17,47 +16,48 @@ SPEC.loader.exec_module(payload_module)
 
 
 class PythonAuxpowPayloadTests(unittest.TestCase):
-    def write_helper(self, qbit_src: Path, source: str) -> None:
-        helper_dir = qbit_src / "test" / "functional" / "test_framework"
-        helper_dir.mkdir(parents=True)
-        (helper_dir / "auxpow.py").write_text(source, encoding="utf-8")
+    def test_template_commitment_order_accepts_internal_and_display(self) -> None:
+        self.assertEqual(payload_module.template_commitment_order({"commitmentorder": "internal"}), "internal")
+        self.assertEqual(payload_module.template_commitment_order({"commitmentorder": "display"}), "display")
 
-    def test_rejects_known_old_qbit_helper_commitment_byte_order(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            qbit_src = Path(tmp)
-            self.write_helper(
-                qbit_src,
-                "commitment = MERGED_MINING_HEADER + ser_uint256(chain_merkle_root) + b'footer'\n",
+    def test_template_commitment_order_is_optional_for_legacy_templates(self) -> None:
+        self.assertIsNone(payload_module.template_commitment_order({}))
+
+    def test_template_commitment_order_rejects_unknown_values(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            payload_module.template_commitment_order({"commitmentorder": "sideways"})
+
+        self.assertIn("unsupported commitmentorder", str(raised.exception))
+
+    def test_requires_activation_aware_helper_when_template_exposes_commitment_order(self) -> None:
+        def helper_without_commitment_order(template: dict[str, object], *, parent_time: int = 0, nonce: int = 0) -> object:
+            return object()
+
+        with self.assertRaises(SystemExit) as raised:
+            payload_module.require_commitment_order_helper(
+                helper_without_commitment_order,
+                Path("/tmp/qbit-src"),
             )
 
-            with self.assertRaises(SystemExit) as raised:
-                payload_module.require_standard_auxpow_helper(qbit_src)
+        self.assertIn("does not support createauxblock.commitmentorder", str(raised.exception))
 
-        self.assertIn("internal little-endian uint256 bytes", str(raised.exception))
+    def test_allows_activation_aware_helper(self) -> None:
+        def helper_with_commitment_order(
+            template: dict[str, object],
+            *,
+            parent_time: int = 0,
+            nonce: int = 0,
+            commitment_order: str | None = None,
+        ) -> object:
+            return object()
 
-    def test_allows_fixed_qbit_helper_commitment_byte_order(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            qbit_src = Path(tmp)
-            self.write_helper(
-                qbit_src,
-                "commitment = MERGED_MINING_HEADER + ser_uint256(chain_merkle_root)[::-1] + b'footer'\n",
-            )
+        payload_module.require_commitment_order_helper(helper_with_commitment_order, Path("/tmp/qbit-src"))
 
-            payload_module.require_standard_auxpow_helper(qbit_src)
+    def test_allows_helper_with_keyword_arguments(self) -> None:
+        def helper_with_kwargs(template: dict[str, object], **kwargs: object) -> object:
+            return object()
 
-    def test_helper_guard_ignores_comments_and_strings(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            qbit_src = Path(tmp)
-            self.write_helper(
-                qbit_src,
-                '''
-"""MERGED_MINING_HEADER + ser_uint256(chain_merkle_root) +"""
-# MERGED_MINING_HEADER + ser_uint256(chain_merkle_root) +
-commitment = b""
-''',
-            )
-
-            payload_module.require_standard_auxpow_helper(qbit_src)
+        payload_module.require_commitment_order_helper(helper_with_kwargs, Path("/tmp/qbit-src"))
 
 
 if __name__ == "__main__":

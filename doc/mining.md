@@ -232,15 +232,16 @@ The AuxPoW payload itself is serialized as:
 Commitment rules qbit enforces:
 
 - The merged-mining magic is `0xfabe6d6d`
-- If the magic header is present, it must appear exactly once and be immediately followed by the chain merkle root in display/big-endian byte order
-- The committed root bytes match the RPC hash display order; code using an internal `uint256` must reverse `ser_uint256(chain_root)` before writing the root into the coinbase `scriptSig`
+- `createauxblock.commitmentorder` selects the root byte order for that candidate: `internal` uses `ser_uint256(chain_root)` for historical qbit compatibility, and `display` uses `ser_uint256(chain_root)[::-1]` for the standard display/big-endian order
+- New qbit nodes also return `commitmentactivationheight` so operators can see where the response switches; older qbit nodes that omit `commitmentorder` used the historical internal order
+- If the magic header is present, it must appear exactly once and be immediately followed by the chain merkle root in the selected byte order
 - After the chain merkle root come two little-endian `uint32`s: `merkle_size` and `nonce`
 - The slot index is deterministic from the nonce and chain ID; it is not free-form
 - `coinbase_branch_index` must be `0`
 - Parent PoW must satisfy qbit's target bits
 
 The helper in `examples/python-auxpow-payload.py` reads the `createauxblock` JSON, reuses qbit's own functional-test helper, and prints a valid `auxpow_hex`. Point it at a separate qbit checkout with `--qbit-src` or `QBIT_SRC_DIR`.
-The wrapper refuses qbit helper checkouts with the known old behavior that commits the internal little-endian `uint256` chain root directly.
+When the template includes `commitmentorder`, the wrapper passes that value to the helper and refuses qbit helper checkouts that do not support the activation-aware `commitment_order` argument.
 
 ### Real merge-mining path
 

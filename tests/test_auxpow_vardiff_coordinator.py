@@ -88,7 +88,7 @@ from lab.auxpow import auxpow_coordinator as coordinator  # noqa: E402
 class AuxPowVardiffCoordinatorTests(unittest.TestCase):
     def test_build_chain_commitment_uses_display_order_root_bytes(self) -> None:
         root_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-        aux_template = {"hash": root_hex, "chainid": 31430}
+        aux_template = {"hash": root_hex, "chainid": 31430, "commitmentorder": "display"}
 
         commitment, chain_index = coordinator.build_chain_commitment(aux_template, chain_nonce=0x11223344)
 
@@ -98,6 +98,30 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
         self.assertNotEqual(commitment[4:36], int(root_hex, 16).to_bytes(32, "little"))
         self.assertEqual(commitment[36:40], (1).to_bytes(4, "little"))
         self.assertEqual(commitment[40:44], (0x11223344).to_bytes(4, "little"))
+
+    def test_build_chain_commitment_uses_internal_order_when_requested(self) -> None:
+        root_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        aux_template = {"hash": root_hex, "chainid": 31430, "commitmentorder": "internal"}
+
+        commitment, _ = coordinator.build_chain_commitment(aux_template)
+
+        self.assertEqual(commitment[4:36], int(root_hex, 16).to_bytes(32, "little"))
+        self.assertNotEqual(commitment[4:36], bytes.fromhex(root_hex))
+
+    def test_build_chain_commitment_defaults_to_internal_for_legacy_templates(self) -> None:
+        root_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        aux_template = {"hash": root_hex, "chainid": 31430}
+
+        commitment, _ = coordinator.build_chain_commitment(aux_template)
+
+        self.assertEqual(commitment[4:36], int(root_hex, 16).to_bytes(32, "little"))
+
+    def test_build_chain_commitment_rejects_unknown_commitment_order(self) -> None:
+        root_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        aux_template = {"hash": root_hex, "chainid": 31430, "commitmentorder": "sideways"}
+
+        with self.assertRaisesRegex(RuntimeError, "unsupported commitmentorder"):
+            coordinator.build_chain_commitment(aux_template)
 
     def test_package_import_uses_package_vardiff_module(self) -> None:
         import lab.auxpow as auxpow_package

@@ -28,19 +28,24 @@ qbit also:
 
 ## 2. Build the chain commitment
 
-The parent coinbase `scriptSig` must commit to the aux block hash through a chain merkle root. qbit accepts the standard merged-mining header:
+The parent coinbase `scriptSig` must commit to the aux block hash through a chain merkle root. qbit accepts the merged-mining header:
 
 ```text
-fabe6d6d || chain_merkle_root_be || merkle_size_le32 || nonce_le32
+fabe6d6d || chain_merkle_root || merkle_size_le32 || nonce_le32
 ```
 
-`chain_merkle_root_be` is the 32-byte chain merkle root in display/big-endian order, the same byte order used by RPC hash hex strings. Do not commit Bitcoin Core's internal little-endian `uint256` serialization directly; code that has `ser_uint256(chain_merkle_root)` must reverse those 32 bytes before appending the root to the parent coinbase `scriptSig`. With an empty chain merkle branch, the committed root bytes are `bytes.fromhex(createauxblock.hash)`.
+Use the byte order returned by `createauxblock.commitmentorder` for each candidate:
+
+- `display`: the standard 32-byte chain merkle root in display/big-endian order, the same byte order used by RPC hash hex strings. Code that has `ser_uint256(chain_merkle_root)` must reverse those 32 bytes before appending the root to the parent coinbase `scriptSig`. With an empty chain merkle branch, the committed root bytes are `bytes.fromhex(createauxblock.hash)`.
+- `internal`: qbit's historical compatibility mode. Commit Bitcoin Core's internal little-endian `uint256` serialization directly, equivalent to `ser_uint256(chain_merkle_root)`.
+
+New qbit nodes also return `commitmentactivationheight` so operators can see where `commitmentorder` switches. Older qbit nodes that omit `commitmentorder` used the historical internal order.
 
 Rules enforced by qbit:
 
 - the merged-mining header may appear at most once
-- if present, it must be immediately followed by the display-order chain merkle root
-- if omitted, the display-order chain merkle root must appear within the first 20 bytes of the `scriptSig`
+- if present, it must be immediately followed by the chain merkle root in the candidate's selected byte order
+- if omitted, the chain merkle root in the candidate's selected byte order must appear within the first 20 bytes of the `scriptSig`
 - the footer must contain both `merkle_size` and `nonce`
 
 ## 3. Compute the deterministic slot index
@@ -115,4 +120,4 @@ The safest way to stay aligned with qbit consensus is:
 3. submit the returned `auxpow_hex`
 
 `examples/python-auxpow-payload.py` implements that pattern so the repo does not need to maintain an independent AuxPoW serializer. Pass `--qbit-src` or set `QBIT_SRC_DIR` so it can import qbit's functional-test helper from a separate checkout.
-The wrapper refuses qbit helper checkouts with the known old behavior that commits `ser_uint256(chain_merkle_root)` directly instead of the standard display-order bytes.
+When the template includes `commitmentorder`, the wrapper passes that value to the helper and refuses qbit helper checkouts that do not support the activation-aware `commitment_order` argument.
