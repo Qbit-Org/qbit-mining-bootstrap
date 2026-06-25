@@ -1,6 +1,6 @@
 # qbit-mining-bootstrap 0.1.1 Release Notes
 
-Release date: TBD
+Release date: 2026-06-25
 
 ## Highlights
 
@@ -14,4 +14,3 @@ Release date: TBD
 - AuxPoW and merged-mining operators should prefer this release over 0.1.0 before live bridge trials.
 - No configuration migration is expected from 0.1.0.
 - This branch is based on `origin/0.1.x` through commit `0bb8fdb`.
-
