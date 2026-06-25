@@ -283,6 +283,25 @@ def resolve_bitcoin_miner_address(bitcoin_rpc: JsonRpc) -> ResolvedAddress:
     return resolve_validated_address(bitcoin_rpc, address, field_name="BITCOIN_MINER_ADDRESS")
 
 
+def auxpow_commitment_order(aux_template: dict[str, object]) -> str:
+    raw_order = aux_template.get("commitmentorder")
+    if raw_order is None:
+        return "internal"
+    order = str(raw_order).lower()
+    if order not in {"display", "internal"}:
+        raise RuntimeError(f"createauxblock returned unsupported commitmentorder={raw_order!r}")
+    return order
+
+
+def uint256_commitment_bytes(value: int, *, commitment_order: str) -> bytes:
+    internal_bytes = ser_uint256(value)
+    if commitment_order == "internal":
+        return internal_bytes
+    if commitment_order == "display":
+        return internal_bytes[::-1]
+    raise RuntimeError(f"unsupported AuxPoW commitment order {commitment_order!r}")
+
+
 def build_chain_commitment(aux_template: dict[str, object], *, chain_nonce: int = 0) -> tuple[bytes, int]:
     chain_merkle_branch: list[int] = []
     chain_index = get_expected_index(
@@ -293,7 +312,7 @@ def build_chain_commitment(aux_template: dict[str, object], *, chain_nonce: int 
     chain_root = check_merkle_branch(leaf=int(aux_template["hash"], 16), branch=chain_merkle_branch, index=chain_index)
     commitment = (
         MERGED_MINING_HEADER
-        + ser_uint256(chain_root)
+        + uint256_commitment_bytes(chain_root, commitment_order=auxpow_commitment_order(aux_template))
         + (1 << len(chain_merkle_branch)).to_bytes(4, "little")
         + chain_nonce.to_bytes(4, "little")
     )
@@ -1008,6 +1027,7 @@ class AuxPowStratumServer:
         if not force and current_job is not None and snapshot == tip_snapshot and not job_age_expired:
             return False
         aux_template = self.qbit_rpc.call("createauxblock", [self.qbit_miner_address])
+        commitment_order = auxpow_commitment_order(aux_template)
         btc_template = self.bitcoin_rpc.call("getblocktemplate", [{"rules": ["segwit"]}])
         job = self.make_job(
             job_id=self.next_job_id(),
@@ -1026,6 +1046,7 @@ class AuxPowStratumServer:
             "auxpow stratum: new job "
             f"{job.job_id} qbit_height={aux_template['height']} bitcoin_height={btc_template['height']} "
             f"share_diff={job.share_difficulty.normalize()} "
+            f"commitment_order={commitment_order} "
             f"prevhash={job.prevhash} parent_prevhash={btc_template['previousblockhash']} "
             f"reason={self.refresh_reason(force, snapshot, tip_snapshot, job_age_expired)}",
             flush=True,
@@ -1036,6 +1057,8 @@ class AuxPowStratumServer:
             qbit_height=aux_template["height"],
             qbit_hash=aux_template["hash"],
             qbit_bits=aux_template["bits"],
+            qbit_commitment_order=commitment_order,
+            qbit_commitment_activation_height=aux_template.get("commitmentactivationheight"),
             bitcoin_height=btc_template["height"],
             bitcoin_prevhash=btc_template["previousblockhash"],
             advertised_prevhash=job.prevhash,
