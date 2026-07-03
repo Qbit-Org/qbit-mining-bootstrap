@@ -701,7 +701,12 @@ def direct_coinbase_settlement_payload(ledger: Any, *, block_hash: str) -> dict[
     getter = getattr(ledger, "audit_bundle", None)
     if not callable(getter):
         return None
-    row = getter(block_hash=block_hash)
+    try:
+        row = getter(block_hash=block_hash)
+    except RuntimeError as exc:
+        if audit_bundle_body_read_failed(exc):
+            return None
+        raise
     if not isinstance(row, dict):
         return None
     bundle = row.get("audit_bundle")
@@ -723,6 +728,15 @@ def direct_coinbase_settlement_payload(ledger: Any, *, block_hash: str) -> dict[
         "payout_manifest_sha256": nullable_str(row.get("payout_manifest_sha256")),
         "artifacts": [],
     }
+
+
+def audit_bundle_body_read_failed(exc: RuntimeError) -> bool:
+    message = str(exc)
+    return (
+        message.startswith("audit bundle body is not retrievable")
+        or message.startswith("audit bundle body hash mismatch")
+        or message.startswith("audit bundle body is not valid JSON")
+    )
 
 
 def audit_bundle_settlement_mode(bundle: dict[str, object]) -> str | None:

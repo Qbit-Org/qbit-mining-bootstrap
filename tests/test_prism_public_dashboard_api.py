@@ -1048,6 +1048,29 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             self.assertEqual(settlement["payout_manifest_sha256"], ledger.payout_manifest_sha256)
             self.assertEqual(settlement["fanouts"], [])
 
+    def test_settlement_artifacts_returns_404_when_externalized_audit_body_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = ExternalizedDirectCoinbasePublicLedger(tmp)
+            ledger.body_uri.unlink()
+            handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/public/v1/blocks/{ledger.block_hash}/settlement-artifacts",
+                        timeout=5,
+                    )
+                self.assertEqual(raised.exception.code, 404)
+                raised.exception.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(ledger.resolver.body_read_count, 1)
+
     def test_settlement_artifacts_omit_unavailable_audit_bundle_link(self) -> None:
         ledger = MissingAuditBundleBodyLedger()
 
