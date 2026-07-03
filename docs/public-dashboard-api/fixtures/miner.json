@@ -1,0 +1,59 @@
+{
+  "schema": "prism.dashboard.miner.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "recipient_id": "qbrt1prismminer000000000000000000000000000000000000001",
+  "display_name": null,
+  "owed_balance_bits": 1842000,
+  "lifetime_earnings_bits": 38654846757,
+  "unpaid_earnings_bits": 1842000,
+  "minimum_payout_bits": 10485760,
+  "hashrate_ths": {
+    "m1": "615000.0",
+    "m5": "618000.25",
+    "m10": "619000.75",
+    "h3": "620000.5",
+    "h24": "601000.0"
+  },
+  "shares": {
+    "accepted_3h": 480,
+    "accepted_difficulty_3h": "118100000000",
+    "last_share_at": "2026-06-26T20:44:53Z"
+  },
+  "estimated_next_block": {
+    "share_percent": "27.05",
+    "estimated_reward_bits": 67620000
+  },
+  "estimated_time_to_minimum_payout_seconds": null,
+  "reward_window_percent": "27.05",
+  "workers_currently_hashing": 2,
+  "workers": [
+    {
+      "worker_name": "rig-a",
+      "status": "active",
+      "last_share_at": "2026-06-26T20:44:53Z",
+      "hashrate_ths_60s": "315000.0",
+      "hashrate_ths_3h": "320000.5"
+    },
+    {
+      "worker_name": "rig-b",
+      "status": "active",
+      "last_share_at": "2026-06-26T20:44:10Z",
+      "hashrate_ths_60s": "300000.0",
+      "hashrate_ths_3h": "300000.0"
+    }
+  ],
+  "recent_payouts": [
+    {
+      "block_height": 123450,
+      "block_hash": "0000000000000000000abc1230000000000000000000000000000000000000aa",
+      "created_at": "2026-06-26T19:55:00Z",
+      "transaction_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "transaction_kind": "coinbase",
+      "onchain_amount_bits": 66943800,
+      "carry_forward_balance_bits": 1842000,
+      "action": "onchain",
+      "maturity_state": "immature",
+      "explorer_url": "https://explorer.example/tx/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ]
+}

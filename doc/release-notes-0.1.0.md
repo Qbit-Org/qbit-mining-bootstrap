@@ -16,4 +16,3 @@ Release date: 2026-06-17
 - Compose defaults to regtest for deterministic local validation.
 - qbit source builds can be provided from a local checkout or a configured git ref.
 - qbit core remains the canonical source for consensus, block validation, and mining RPC semantics; this repo validates operator workflows around those interfaces.
-

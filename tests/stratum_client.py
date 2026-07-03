@@ -603,7 +603,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     bip310 = subparsers.add_parser("probe-bip310", help="assert BIP-310 mining.configure behavior")
     add_common_arguments(bip310, timeout_default=1.0, timeout_help="per-response timeout in seconds")
-    bip310.set_defaults(func=run_probe_bip310, version_mask="1fffe000")
+    bip310.set_defaults(func=run_probe_bip310, version_mask=DEFAULT_VERSION_MASK)
     bip310.add_argument(
         "--configured-version-mask",
         default=env_default("CKPOOL_VERSION_MASK", default=DEFAULT_VERSION_MASK),

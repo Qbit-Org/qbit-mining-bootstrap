@@ -48,6 +48,14 @@ def resolve_qbit_src(explicit: str | None) -> Path:
     raise SystemExit(f"--qbit-src / QBIT_SRC_DIR does not contain {helper.relative_to(qbit_src)}: {qbit_src}")
 
 
+def load_template(args: argparse.Namespace) -> dict[str, object]:
+    if args.template_file:
+        return json.loads(Path(args.template_file).read_text())
+    if args.template_json:
+        return json.loads(args.template_json)
+    return json.load(sys.stdin)
+
+
 def template_commitment_order(template: dict[str, object]) -> str | None:
     raw_order = template.get("commitmentorder")
     if raw_order is None:
@@ -67,14 +75,6 @@ def require_commitment_order_helper(helper: object, qbit_src: Path) -> None:
         f"{helper_path} does not support createauxblock.commitmentorder. "
         "Use a qbit checkout with the activation-aware AuxPoW functional-test helper."
     )
-
-
-def load_template(args: argparse.Namespace) -> dict[str, object]:
-    if args.template_file:
-        return json.loads(Path(args.template_file).read_text())
-    if args.template_json:
-        return json.loads(args.template_json)
-    return json.load(sys.stdin)
 
 
 def main() -> int:

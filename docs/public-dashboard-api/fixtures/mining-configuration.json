@@ -1,0 +1,22 @@
+{
+  "schema": "prism.dashboard.mining-configuration.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "active_configuration_id": "default",
+  "configurations": [
+    {
+      "id": "default",
+      "label": "PRISM default",
+      "description": "Default PRISM Stratum endpoint using the pool's current block template and payout policy.",
+      "pool_fee_bps": 100,
+      "block_template_policy": "pool-selected qbit block template with PRISM payout settlement",
+      "stratum_endpoints": [
+        {
+          "label": "Primary",
+          "url": "stratum+tcp://mine.prism.example:3340",
+          "protocol": "stratum_v1",
+          "default_port": 3340
+        }
+      ]
+    }
+  ]
+}

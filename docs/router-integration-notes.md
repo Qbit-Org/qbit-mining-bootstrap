@@ -18,12 +18,14 @@ aggregator in front of the qbit permissionless ckpool path.
 The bootstrap ckpool image starts with `CKPOOL_VERSION_MASK_MODE=dynamic`. At
 startup it asks qbitd for `getblocktemplate` and uses
 `versionrollingmask` when the connected node exposes it. Older qbitd builds
-fall back to `CKPOOL_VERSION_MASK=1fffe000`.
+fall back to the configured `CKPOOL_VERSION_MASK`; the public sample env uses
+`1fffe000` to match current qbitd permissionless templates.
 
 Routers that negotiate BIP310 should only pass miner-controlled version bits
 inside the mask granted by ckpool. If a miner requests a mask, the effective
 mask is the intersection of the miner's requested mask and qbit's configured
-mask.
+mask. If qbitd returns `versionrollingmask=00000000`, routers should treat
+version rolling as disabled for that upstream.
 
 ## Vardiff
 

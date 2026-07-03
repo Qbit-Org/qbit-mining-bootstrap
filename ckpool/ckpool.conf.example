@@ -20,5 +20,5 @@ max_block_weight = 2000000
 witness_scale_factor = 1
 auxpow_chain_id = 31430
 # Prefer getblocktemplate.versionrollingmask from the connected qbitd.
-# Use qbit's GBT-compatible fallback when qbitd does not advertise it.
+# Use the current production fallback only when qbitd cannot advertise it.
 version_mask = 1fffe000

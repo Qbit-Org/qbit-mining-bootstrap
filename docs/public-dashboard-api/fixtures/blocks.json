@@ -1,0 +1,42 @@
+{
+  "schema": "prism.dashboard.blocks.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "pagination": {
+    "page": 1,
+    "limit": 15,
+    "total_count": 128,
+    "total_pages": 9
+  },
+  "rows": [
+    {
+      "height": 123450,
+      "hash": "0000000000000000000abc1230000000000000000000000000000000000000aa",
+      "found_at": "2026-06-26T19:55:00Z",
+      "network_difficulty": "124930000000000",
+      "bits": "1d00ffff",
+      "solver_recipient_id": "qbrt1prismminer000000000000000000000000000000000000001",
+      "solver_worker_name": "rig-a",
+      "solver_share_difficulty": "119660000000000",
+      "reward_window_weight": "999440000000000",
+      "coinbase_value_bits": 250000000,
+      "audit_bundle_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "payout_manifest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "explorer_url": "https://explorer.example/block/0000000000000000000abc1230000000000000000000000000000000000000aa"
+    },
+    {
+      "height": 123401,
+      "hash": "0000000000000000000abc1230000000000000000000000000000000000000bb",
+      "found_at": "2026-06-26T15:20:00Z",
+      "network_difficulty": "124930000000000",
+      "bits": "1d00ffff",
+      "solver_recipient_id": "qbrt1prismminer000000000000000000000000000000000000002",
+      "solver_worker_name": null,
+      "solver_share_difficulty": null,
+      "reward_window_weight": "999440000000000",
+      "coinbase_value_bits": 250000000,
+      "audit_bundle_sha256": null,
+      "payout_manifest_sha256": null,
+      "explorer_url": null
+    }
+  ]
+}

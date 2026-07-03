@@ -22,6 +22,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install lint tools
         run: |
           sudo apt-get update
@@ -33,14 +36,16 @@ jobs:
       - name: ShellCheck shell scripts
         run: |
           touch .env
-          cp config/upstream.env.example config/upstream.env
           git ls-files '*.sh' | xargs shellcheck -x
 
       - name: Compile Python sources
-        run: python -m compileall -q docker lab tests examples
+        run: python -m compileall -q docker lab tests examples scripts
 
       - name: Run Python unit tests
         run: python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Run Rust tests
+        run: cargo test --locked --workspace --all-targets
 
       - name: Validate Docker Compose files
         run: |
@@ -51,6 +56,15 @@ jobs:
             --profile permissionless \
             --profile permissionless-real \
             --profile auxpow \
+            config --quiet
+          QBIT_SRC_DIR="$PWD" \
+          PRISM_STRATUM_PORT_HOST=127.0.0.1:43340 \
+          PRISM_STRATUM_PORT=43340 \
+          docker compose \
+            --env-file config/upstream.env.example \
+            --env-file .env.example \
+            -f compose.yaml \
+            --profile prism \
             config --quiet
 
   docker-builds:
@@ -76,4 +90,12 @@ jobs:
             --build-context qbit-src=/tmp/qbit-functional-fixture \
             --load \
             -f lab/auxpow/Dockerfile \
+            .
+
+      - name: Build PRISM coordinator image
+        run: |
+          docker buildx build \
+            --build-context qbit-src=/tmp/qbit-functional-fixture \
+            --load \
+            -f lab/prism/Dockerfile \
             .

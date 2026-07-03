@@ -1,0 +1,41 @@
+{
+  "schema": "prism.dashboard.pool-summary.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "network": {
+    "name": "qbit-signet",
+    "height": 123456,
+    "tip_hash": "0000000000000000000abc123000000000000000000000000000000000000001",
+    "bits": "1d00ffff",
+    "network_difficulty": "124930000000000",
+    "initial_block_download": false,
+    "peers": 8
+  },
+  "pool": {
+    "name": "PRISM",
+    "hashrate_ths": {
+      "h1": "2440000.25",
+      "h3": "2315000.75",
+      "h24": "2201000.5"
+    },
+    "participants_3h": 42,
+    "blocks_found_total": 128,
+    "prism_blocks_total": 128,
+    "total_mined_bits": 32000000000,
+    "expected_time_to_block_seconds": 18000,
+    "latest_block": {
+      "height": 123450,
+      "hash": "0000000000000000000abc1230000000000000000000000000000000000000aa",
+      "found_at": "2026-06-26T19:55:00Z",
+      "age_seconds": 3000,
+      "solver_recipient_id": "qbrt1prismminer000000000000000000000000000000000000001",
+      "solver_worker_name": "rig-a"
+    },
+    "reward_window": {
+      "window_multiplier": 8,
+      "requested_window_weight": "999440000000000",
+      "oldest_share_accepted_at": "2026-06-26T11:20:00Z",
+      "newest_share_accepted_at": "2026-06-26T20:44:53Z",
+      "included_share_count": 1942
+    }
+  }
+}

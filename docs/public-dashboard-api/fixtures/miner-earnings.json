@@ -1,0 +1,25 @@
+{
+  "schema": "prism.dashboard.miner-earnings.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "recipient_id": "qbrt1prismminer000000000000000000000000000000000000001",
+  "pagination": {
+    "page": 1,
+    "limit": 15,
+    "total_count": 128,
+    "total_pages": 9
+  },
+  "rows": [
+    {
+      "block_height": 123450,
+      "block_hash": "0000000000000000000abc1230000000000000000000000000000000000000aa",
+      "found_at": "2026-06-26T19:55:00Z",
+      "reward_share_percent": "27.05",
+      "gross_earning_bits": 67620000,
+      "settlement_fee_bits": 676200,
+      "net_earning_bits": 66943800,
+      "maturity_state": "immature",
+      "settlement_artifacts_url": "/public/v1/blocks/0000000000000000000abc1230000000000000000000000000000000000000aa/settlement-artifacts",
+      "explorer_url": "https://explorer.example/block/0000000000000000000abc1230000000000000000000000000000000000000aa"
+    }
+  ]
+}

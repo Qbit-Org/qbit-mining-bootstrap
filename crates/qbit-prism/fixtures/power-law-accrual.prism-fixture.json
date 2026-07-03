@@ -1,0 +1,101 @@
+{
+  "found_block": {
+    "block_height": 200,
+    "coinbase_value_sats": 500000000,
+    "network_difficulty": 200000,
+    "anchor_job_issued_at_ms": 2005
+  },
+  "shares": [
+    {
+      "share_seq": 1,
+      "share_id": "share-whale",
+      "miner_id": "miner-whale",
+      "order_key": "01",
+      "p2mr_program_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "share_difficulty": 1000000,
+      "network_difficulty": 200000,
+      "template_height": 199,
+      "job_id": "job-2000",
+      "job_issued_at_ms": 2000,
+      "accepted_at_ms": 2000,
+      "ntime": 1800000000
+    },
+    {
+      "share_seq": 2,
+      "share_id": "share-mid-a",
+      "miner_id": "miner-mid-a",
+      "order_key": "02",
+      "p2mr_program_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "share_difficulty": 200000,
+      "network_difficulty": 200000,
+      "template_height": 199,
+      "job_id": "job-2001",
+      "job_issued_at_ms": 2001,
+      "accepted_at_ms": 2001,
+      "ntime": 1800000000
+    },
+    {
+      "share_seq": 3,
+      "share_id": "share-mid-b",
+      "miner_id": "miner-mid-b",
+      "order_key": "03",
+      "p2mr_program_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "share_difficulty": 50000,
+      "network_difficulty": 200000,
+      "template_height": 199,
+      "job_id": "job-2002",
+      "job_issued_at_ms": 2002,
+      "accepted_at_ms": 2002,
+      "ntime": 1800000000
+    },
+    {
+      "share_seq": 4,
+      "share_id": "share-small-a",
+      "miner_id": "miner-small-a",
+      "order_key": "04",
+      "p2mr_program_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "share_difficulty": 10,
+      "network_difficulty": 200000,
+      "template_height": 199,
+      "job_id": "job-2003",
+      "job_issued_at_ms": 2003,
+      "accepted_at_ms": 2003,
+      "ntime": 1800000000
+    },
+    {
+      "share_seq": 5,
+      "share_id": "share-small-b",
+      "miner_id": "miner-small-b",
+      "order_key": "05",
+      "p2mr_program_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+      "share_difficulty": 1,
+      "network_difficulty": 200000,
+      "template_height": 199,
+      "job_id": "job-2004",
+      "job_issued_at_ms": 2004,
+      "accepted_at_ms": 2004,
+      "ntime": 1800000000
+    },
+    {
+      "share_seq": 6,
+      "share_id": "share-small-c",
+      "miner_id": "miner-small-c",
+      "order_key": "06",
+      "p2mr_program_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+      "share_difficulty": 1,
+      "network_difficulty": 200000,
+      "template_height": 199,
+      "job_id": "job-2005",
+      "job_issued_at_ms": 2005,
+      "accepted_at_ms": 2005,
+      "ntime": 1800000000
+    }
+  ],
+  "expected_min_output_sats": 14720,
+  "expected_onchain_count": 3,
+  "expected_accrued_recipients": [
+    "miner-small-a",
+    "miner-small-b",
+    "miner-small-c"
+  ]
+}

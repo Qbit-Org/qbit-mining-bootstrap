@@ -1,0 +1,42 @@
+{
+  "schema": "prism.dashboard.leaderboard.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "window": {
+    "id": "3h",
+    "started_at": "2026-06-26T17:45:00Z",
+    "ended_at": "2026-06-26T20:45:00Z"
+  },
+  "totals": {
+    "pool_hashrate_ths": "2315000.75",
+    "pool_accepted_share_difficulty": "441000000000",
+    "participant_count": 42
+  },
+  "pagination": {
+    "page": 1,
+    "limit": 15,
+    "total_count": 42,
+    "total_pages": 3
+  },
+  "rows": [
+    {
+      "rank": 1,
+      "recipient_id": "qbrt1prismminer000000000000000000000000000000000000001",
+      "display_name": null,
+      "hashrate_ths_3h": "620000.5",
+      "share_percent": "27.05",
+      "hash_percent": "26.78",
+      "blocks_found": 12,
+      "last_share_at": "2026-06-26T20:44:53Z"
+    },
+    {
+      "rank": 2,
+      "recipient_id": "qbrt1prismminer000000000000000000000000000000000000002",
+      "display_name": "Denver Lab",
+      "hashrate_ths_3h": "410000.25",
+      "share_percent": "17.71",
+      "hash_percent": "17.71",
+      "blocks_found": 8,
+      "last_share_at": "2026-06-26T20:44:21Z"
+    }
+  ]
+}

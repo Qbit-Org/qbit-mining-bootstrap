@@ -35,9 +35,9 @@ Keep miner-controlled version rolling inside the mask advertised by qbitd. The
 container defaults `CKPOOL_VERSION_MASK_MODE=dynamic`, so ckpool probes
 `getblocktemplate` at startup and writes the selected `version_mask` into
 `/etc/ckpool/ckpool.conf`. Older qbitd builds that do not return
-`versionrollingmask` fall back to `CKPOOL_VERSION_MASK=1fffe000` for
-compatibility. Low-byte masks such as `000000ff` are only for legacy or
-genesis-only test setups, not the production qbit permissionless ckpool path.
+`versionrollingmask` fall back to `CKPOOL_VERSION_MASK=1fffe000`. If qbitd
+returns `versionrollingmask=00000000`, ckpool disables BIP310 version rolling.
+For normal production qbit, the node-advertised mask is the source of truth.
 
 ### Fee and size accounting
 
@@ -72,4 +72,11 @@ For a controlled non-regtest-style probe, run ckpool against [`tests/fake_qbit_r
 
 ## Recommendation
 
-Treat this patched ckpool overlay as the default permissionless-mining story for qbit. Keep the qbit-specific payout policy, maturity override, version mask, and public-network runbooks visible until additional pool stacks are validated.
+Treat this patched ckpool overlay as the default single-address
+permissionless-mining story for qbit. It remains useful as a Stratum/BIP310
+comparison target and as a smoke test for qbit P2MR-only block acceptance.
+
+For non-custodial PRISM mining, use the builder-owned transport decision in
+[`docs/pool-base-decision.md`](../docs/pool-base-decision.md). ckpool should not
+own the multi-output payout split unless a later spike proves that external
+coinbase injection is less invasive than the repo-owned Stratum path.

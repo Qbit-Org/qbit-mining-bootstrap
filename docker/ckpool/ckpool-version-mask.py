@@ -16,6 +16,8 @@ from urllib import error, request
 HEX_MASK_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]{1,8}$")
 DYNAMIC_MODES = {"1", "true", "yes", "on", "auto", "dynamic", "advertised"}
 STATIC_MODES = {"0", "false", "no", "off", "static", "configured", "manual"}
+QBIT_VERSION_ROLLING_MASK = 0x1FFFE000
+QBIT_VERSION_ROLLING_MASK_HEX = f"{QBIT_VERSION_ROLLING_MASK:08x}"
 
 
 @dataclass(frozen=True)
@@ -73,7 +75,10 @@ def select_version_mask(template: dict[str, Any], fallback_mask: str) -> Resolve
     try:
         selected = normalize_mask(advertised, field="versionrollingmask")
     except ValueError as exc:
-        return ResolveResult(fallback, "fallback", f"invalid_versionrollingmask:{exc}", str(advertised))
+        raise ValueError(f"invalid getblocktemplate.versionrollingmask: {exc}") from exc
+
+    if selected == "00000000":
+        return ResolveResult(selected, "qbit_getblocktemplate", "disabled_by_zero_mask", str(advertised))
 
     return ResolveResult(selected, "qbit_getblocktemplate", "advertised", str(advertised))
 
@@ -108,7 +113,7 @@ def rpc_getblocktemplate(*, host: str, port: str, user: str, password: str, chai
 
 
 def resolve_from_env() -> ResolveResult:
-    fallback = os.environ.get("CKPOOL_VERSION_MASK", "1fffe000")
+    fallback = os.environ.get("CKPOOL_VERSION_MASK", QBIT_VERSION_ROLLING_MASK_HEX)
     mode = os.environ.get("CKPOOL_VERSION_MASK_MODE", "dynamic")
     if not mode_is_dynamic(mode):
         selected = normalize_mask(fallback, field="CKPOOL_VERSION_MASK")

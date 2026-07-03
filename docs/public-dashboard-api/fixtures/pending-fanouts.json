@@ -1,0 +1,35 @@
+{
+  "schema": "prism.dashboard.pending-fanouts.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "pagination": {
+    "page": 1,
+    "limit": 15,
+    "total_count": 1,
+    "total_pages": 1
+  },
+  "rows": [
+    {
+      "fanout_txid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "block_hash": "0000000000000000000abc1230000000000000000000000000000000000000aa",
+      "block_height": 123450,
+      "status": "awaiting_maturity",
+      "broadcastable_at_height": 124450,
+      "manifest_set_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "manifest_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "manifest_url": "/public/v1/artifacts/4444444444444444444444444444444444444444444444444444444444444444",
+      "audit_bundle_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "parent_coinbase_txid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "parent_coinbase_vout": 2,
+      "anchor_vout": null,
+      "covenant_output_value_bits": 4200000,
+      "fanout_output_sum_bits": 4180000,
+      "fanout_fee_bits": 20000,
+      "fanout_tx_hex": "02000000000100",
+      "fanout_tx_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "cpfp_anchor_spendable": false,
+      "last_broadcast_attempt_at": null,
+      "last_broadcast_error": null,
+      "explorer_url": null
+    }
+  ]
+}
