@@ -89,6 +89,23 @@ def base_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def production_env(**overrides: str) -> dict[str, str]:
+    env = base_env(
+        QBIT_PRODUCTION="1",
+        QBIT_CHAIN="testnet4",
+        QBIT_RPC_PASSWORD="not-default",
+        QBIT_MINER_ADDRESS="tq1miner",
+        CKPOOL_MINDIFF="1024",
+        CKPOOL_STARTDIFF="65536",
+        CKPOOL_MINDIFF_EXPLICIT="1",
+        CKPOOL_STARTDIFF_EXPLICIT="1",
+        CKPOOL_REQUIRE_P2MR_PAYOUT="1",
+        CKPOOL_STRATUM_PORT="3333",
+    )
+    env.update(overrides)
+    return env
+
+
 class QbitCkpoolPreflightTests(unittest.TestCase):
     def test_regtest_allows_implicit_regtest_difficulty_floor(self) -> None:
         messages = preflight.run_preflight(base_env(), FakeRpc())
@@ -121,6 +138,25 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
 
         with self.assertRaisesRegex(preflight.PreflightError, "requires explicit CKPOOL_STARTDIFF"):
             preflight.run_preflight(env, FakeRpc())
+
+    def test_production_gate_rejects_unsafe_ckpool_overrides(self) -> None:
+        cases = {
+            "regtest": {"QBIT_CHAIN": "regtest"},
+            "permissive": {"CKPOOL_PUBLIC_DIFF_POLICY": "permissive"},
+            "readiness": {"CKPOOL_NON_TEST_READINESS_GATE": "0"},
+            "assumptions": {"CKPOOL_VALIDATE_QBIT_ASSUMPTIONS": "0"},
+            "p2mr": {"CKPOOL_REQUIRE_P2MR_PAYOUT": "0"},
+            "password": {"QBIT_RPC_PASSWORD": "change-this"},
+            "port": {"CKPOOL_STRATUM_PORT": ""},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name), self.assertRaises(preflight.PreflightError):
+                preflight.run_preflight(production_env(**overrides), FakeRpc(rpc_chain="testnet4"))
+
+    def test_production_gate_accepts_strict_public_ckpool_env(self) -> None:
+        messages = preflight.run_preflight(production_env(), FakeRpc(rpc_chain="testnet4"))
+
+        self.assertTrue(any("production gate" in message for message in messages))
 
     def test_public_readiness_rejects_initial_block_download(self) -> None:
         env = base_env(

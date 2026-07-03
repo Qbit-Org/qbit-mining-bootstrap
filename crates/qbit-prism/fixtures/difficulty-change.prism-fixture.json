@@ -1,0 +1,87 @@
+{
+  "found_block": {
+    "block_height": 101,
+    "coinbase_value_sats": 500000000,
+    "network_difficulty": 10,
+    "anchor_job_issued_at_ms": 1003
+  },
+  "shares": [
+    {
+      "share_seq": 1,
+      "share_id": "share-1",
+      "miner_id": "miner-a",
+      "order_key": "01",
+      "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "share_difficulty": 10,
+      "network_difficulty": 8,
+      "template_height": 100,
+      "job_id": "job-1000",
+      "job_issued_at_ms": 1000,
+      "accepted_at_ms": 1000,
+      "ntime": 1800000000
+    },
+    {
+      "share_seq": 2,
+      "share_id": "share-2",
+      "miner_id": "miner-b",
+      "order_key": "02",
+      "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+      "share_difficulty": 20,
+      "network_difficulty": 8,
+      "template_height": 100,
+      "job_id": "job-1001",
+      "job_issued_at_ms": 1001,
+      "accepted_at_ms": 1001,
+      "ntime": 1800000000
+    },
+    {
+      "share_seq": 3,
+      "share_id": "share-3",
+      "miner_id": "miner-a",
+      "order_key": "01",
+      "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "share_difficulty": 30,
+      "network_difficulty": 10,
+      "template_height": 100,
+      "job_id": "job-1002",
+      "job_issued_at_ms": 1002,
+      "accepted_at_ms": 1002,
+      "ntime": 1800000000
+    },
+    {
+      "share_seq": 4,
+      "share_id": "share-4",
+      "miner_id": "miner-c",
+      "order_key": "03",
+      "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+      "share_difficulty": 50,
+      "network_difficulty": 10,
+      "template_height": 100,
+      "job_id": "job-1003",
+      "job_issued_at_ms": 1003,
+      "accepted_at_ms": 1003,
+      "ntime": 1800000000
+    }
+  ],
+  "expected_counted_window_weight": 80,
+  "expected_shares": [
+    {
+      "share_seq": 4,
+      "counted_difficulty": 50
+    },
+    {
+      "share_seq": 3,
+      "counted_difficulty": 30
+    }
+  ],
+  "expected_entitlements": [
+    {
+      "recipient_id": "miner-a",
+      "weight": 30
+    },
+    {
+      "recipient_id": "miner-c",
+      "weight": 50
+    }
+  ]
+}

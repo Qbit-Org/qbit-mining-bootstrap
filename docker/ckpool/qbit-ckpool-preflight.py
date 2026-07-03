@@ -126,6 +126,10 @@ def is_public_chain(chain: str) -> bool:
     return chain in PUBLIC_CHAINS
 
 
+def production_mode(env: dict[str, str]) -> bool:
+    return bool_env(env, "QBIT_PRODUCTION", False) or bool_env(env, "QBIT_TOOLS_PRODUCTION", False)
+
+
 def gbt_rules(chain: str) -> list[str]:
     rules = ["segwit"]
     if chain == "signet":
@@ -196,6 +200,31 @@ def validate_difficulty_policy(env: dict[str, str]) -> list[str]:
         f"maxdiff={maxdiff_text or '-'} policy={policy}"
     )
     return messages
+
+
+def validate_production_gate(env: dict[str, str]) -> list[str]:
+    if not production_mode(env):
+        return []
+
+    chain = chain_name(env)
+    if chain == "regtest":
+        raise PreflightError("QBIT_PRODUCTION=1 rejects regtest QBIT_CHAIN")
+
+    policy = env.get("CKPOOL_PUBLIC_DIFF_POLICY", "explicit").strip().lower() or "explicit"
+    if policy in DIFF_POLICY_PERMISSIVE:
+        raise PreflightError("QBIT_PRODUCTION=1 rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive")
+    if not bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True):
+        raise PreflightError("QBIT_PRODUCTION=1 rejects CKPOOL_NON_TEST_READINESS_GATE=0")
+    if not bool_env(env, "CKPOOL_VALIDATE_QBIT_ASSUMPTIONS", True):
+        raise PreflightError("QBIT_PRODUCTION=1 rejects CKPOOL_VALIDATE_QBIT_ASSUMPTIONS=0")
+    if is_public_chain(chain) and not bool_env(env, "CKPOOL_REQUIRE_P2MR_PAYOUT", True):
+        raise PreflightError("QBIT_PRODUCTION=1 rejects public-chain CKPOOL_REQUIRE_P2MR_PAYOUT=0")
+    if env.get("QBIT_RPC_PASSWORD", "") in {"", "change-this"}:
+        raise PreflightError("QBIT_PRODUCTION=1 requires a non-default QBIT_RPC_PASSWORD")
+    if not env.get("CKPOOL_STRATUM_PORT", ""):
+        raise PreflightError("QBIT_PRODUCTION=1 requires explicit CKPOOL_STRATUM_PORT")
+
+    return [f"production gate: chain={chain} ckpool=strict"]
 
 
 def validate_ckpool_knobs(env: dict[str, str]) -> list[str]:
@@ -375,6 +404,7 @@ def build_rpc_client(env: dict[str, str]) -> HttpRpcClient:
 
 def run_preflight(env: dict[str, str], rpc: RpcClient) -> list[str]:
     messages: list[str] = []
+    messages.extend(validate_production_gate(env))
     messages.extend(validate_ckpool_knobs(env))
     messages.extend(validate_difficulty_policy(env))
     messages.extend(validate_readiness(env, rpc))

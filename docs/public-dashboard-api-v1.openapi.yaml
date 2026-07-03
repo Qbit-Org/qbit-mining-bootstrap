@@ -1,0 +1,1518 @@
+openapi: 3.1.0
+info:
+  title: PRISM Public Dashboard API
+  version: 1.0.0
+  description: >
+    Public, read-only API contract implemented by the PRISM pool software and
+    consumed by dashboard clients. These endpoints expose dashboard-ready pool,
+    network, block, leaderboard, and miner status data without exposing internal
+    audit or operator control surfaces.
+servers:
+  - url: /public/v1
+tags:
+  - name: dashboard
+    description: Public dashboard read models.
+paths:
+  /pool-summary:
+    get:
+      tags: [dashboard]
+      operationId: getPoolSummary
+      summary: Get current pool and network summary cards.
+      responses:
+        "200":
+          description: Current public pool summary.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PoolSummaryResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /hashrate-series:
+    get:
+      tags: [dashboard]
+      operationId: getHashrateSeries
+      summary: Get chart-ready pool or miner hashrate time series.
+      parameters:
+        - name: subject
+          in: query
+          description: Use `pool` or `miner:{recipient_id}`.
+          required: false
+          schema:
+            type: string
+            default: pool
+            examples: [pool, "miner:qbrt1example"]
+        - name: range
+          in: query
+          required: false
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/HashrateRange"
+            default: 1m
+        - name: bucket
+          in: query
+          required: false
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/HashrateBucket"
+            default: auto
+      responses:
+        "200":
+          description: Hashrate series.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HashrateSeriesResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /leaderboard:
+    get:
+      tags: [dashboard]
+      operationId: getLeaderboard
+      summary: Get ranked pool contributors for a reward/hashrate window.
+      parameters:
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [3h]
+            default: 3h
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        "200":
+          description: Contributor leaderboard.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LeaderboardResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /blocks:
+    get:
+      tags: [dashboard]
+      operationId: getBlocks
+      summary: Get recent pool blocks.
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Recent block rows.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlocksResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /blocks/{block_hash}/settlement-artifacts:
+    get:
+      tags: [dashboard]
+      operationId: getBlockSettlementArtifacts
+      summary: Get public settlement artifacts and CTV fanouts for a block.
+      description: >
+        Returns a public index of artifact hashes, canonical artifact URLs, and
+        broadcastable fanout transaction data. Exact canonical artifacts may use
+        their own `qbit.prism.*` schemas; this wrapper keeps dashboard-facing
+        fields stable.
+      parameters:
+        - name: block_hash
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/HexHash"
+      responses:
+        "200":
+          description: Public block settlement artifact index.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettlementArtifactsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /fanouts/pending:
+    get:
+      tags: [dashboard]
+      operationId: getPendingFanouts
+      summary: Get pending non-terminal CTV fanouts.
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Pending fanout rows.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingFanoutsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /fanouts/{fanout_txid}:
+    get:
+      tags: [dashboard]
+      operationId: getFanout
+      summary: Get public CTV fanout status and broadcast artifact data.
+      parameters:
+        - name: fanout_txid
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/HexHash"
+      responses:
+        "200":
+          description: Fanout status and broadcast data.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FanoutResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /artifacts/{sha256}:
+    get:
+      tags: [dashboard]
+      operationId: getArtifact
+      summary: Download a content-addressed public PRISM settlement artifact.
+      description: >
+        Serves exact canonical public artifacts such as audit bundles, CTV
+        manifest sets, per-fanout manifests, or raw fanout transaction data.
+        These artifacts are verified by their path SHA-256 and may use their own
+        `qbit.prism.*` schemas. Dashboard-facing wrapper responses link here
+        rather than inlining large canonical artifacts.
+      parameters:
+        - name: sha256
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/HexHash"
+      responses:
+        "200":
+          description: Canonical public settlement artifact.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CanonicalArtifact"
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /mining-configuration:
+    get:
+      tags: [dashboard]
+      operationId: getMiningConfiguration
+      summary: Get public pool mining configuration and Stratum endpoints.
+      description: >
+        Supports a dashboard "next block" or configuration tab without
+        hardcoding pool fee policy, block template policy, or public mining
+        endpoints into the frontend.
+      responses:
+        "200":
+          description: Public mining configuration.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MiningConfigurationResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /miners/{recipient_id}:
+    get:
+      tags: [dashboard]
+      operationId: getMiner
+      summary: Get public miner status by payout recipient id.
+      parameters:
+        - name: recipient_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+      responses:
+        "200":
+          description: Miner status.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MinerResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /miners/{recipient_id}/earnings:
+    get:
+      tags: [dashboard]
+      operationId: getMinerEarnings
+      summary: Get paginated miner earnings by found block.
+      parameters:
+        - name: recipient_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Miner earnings rows.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MinerEarningsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /miners/{recipient_id}/payouts:
+    get:
+      tags: [dashboard]
+      operationId: getMinerPayouts
+      summary: Get paginated miner payout history.
+      parameters:
+        - name: recipient_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Miner payout rows.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MinerPayoutsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /miners/{recipient_id}/workers:
+    get:
+      tags: [dashboard]
+      operationId: getMinerWorkers
+      summary: Get paginated miner worker rows.
+      parameters:
+        - name: recipient_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 128
+        - name: hide_inactive
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+      responses:
+        "200":
+          description: Miner worker rows.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MinerWorkersResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+components:
+  headers:
+    BrowserCacheControl:
+      description: Browser cache policy; public dashboard responses require revalidation in browsers.
+      schema:
+        type: string
+        example: public, max-age=0, must-revalidate
+    SharedCacheControl:
+      description: Shared CDN cache policy with short TTL and stale-while-revalidate.
+      schema:
+        type: string
+        example: public, max-age=5, stale-while-revalidate=30
+    Age:
+      description: Origin cache age in seconds for the returned response body.
+      schema:
+        type: string
+        pattern: "^[0-9]+$"
+  parameters:
+    Page:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 15
+  responses:
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UpstreamUnavailable:
+      description: Required pool or node data source is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    IsoTimestamp:
+      type: string
+      format: date-time
+      description: UTC ISO-8601 timestamp.
+    HexHash:
+      type: string
+      pattern: "^[0-9a-f]{64}$"
+    HexString:
+      type: string
+      pattern: "^(?:[0-9a-f]{2})+$"
+      description: Lowercase hex-encoded bytes; must be non-empty and even length.
+    CompactBits:
+      type: string
+      pattern: "^[0-9a-f]{8}$"
+    DecimalString:
+      type: string
+      pattern: "^-?[0-9]+(\\.[0-9]+)?$"
+      description: Exact decimal quantity serialized as a string.
+    Bits:
+      type: integer
+      minimum: 0
+      description: Whole bits.
+    NullableString:
+      type:
+        - string
+        - "null"
+    NullableTimestamp:
+      oneOf:
+        - $ref: "#/components/schemas/IsoTimestamp"
+        - type: "null"
+    HashrateRange:
+      type: string
+      enum: [1w, 1m, 6m, all]
+      description: "Rolling history range. Values mean: 1w = 7 days, 1m = 30 days, 6m = 180 days, all = all retained history."
+    HashrateBucket:
+      type: string
+      enum: [auto, 5m, 1h, 1d]
+      description: "Time bucket size. Values mean: auto = server-selected, 5m = 5 minutes, 1h = 1 hour, 1d = 1 day."
+    Pagination:
+      type: object
+      additionalProperties: false
+      required: [page, limit, total_count, total_pages]
+      properties:
+        page:
+          type: integer
+          minimum: 1
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        total_count:
+          type: integer
+          minimum: 0
+        total_pages:
+          type: integer
+          minimum: 0
+    NetworkSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - height
+        - tip_hash
+        - bits
+        - network_difficulty
+        - initial_block_download
+        - peers
+      properties:
+        name:
+          type: string
+        height:
+          type: integer
+          minimum: 0
+        tip_hash:
+          $ref: "#/components/schemas/HexHash"
+        bits:
+          $ref: "#/components/schemas/CompactBits"
+        network_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        initial_block_download:
+          type: boolean
+        peers:
+          type: integer
+          minimum: 0
+    HashrateRollups:
+      type: object
+      additionalProperties: false
+      required: [h1, h3, h24]
+      properties:
+        h1:
+          $ref: "#/components/schemas/DecimalString"
+        h3:
+          $ref: "#/components/schemas/DecimalString"
+        h24:
+          $ref: "#/components/schemas/DecimalString"
+    LatestBlock:
+      type: object
+      additionalProperties: false
+      required:
+        - height
+        - hash
+        - found_at
+        - age_seconds
+        - solver_recipient_id
+        - solver_worker_name
+      properties:
+        height:
+          type: integer
+          minimum: 0
+        hash:
+          $ref: "#/components/schemas/HexHash"
+        found_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        age_seconds:
+          type: integer
+          minimum: 0
+        solver_recipient_id:
+          type: string
+        solver_worker_name:
+          $ref: "#/components/schemas/NullableString"
+    RewardWindowSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - window_multiplier
+        - requested_window_weight
+        - oldest_share_accepted_at
+        - newest_share_accepted_at
+        - included_share_count
+      properties:
+        window_multiplier:
+          type: integer
+          minimum: 1
+        requested_window_weight:
+          $ref: "#/components/schemas/DecimalString"
+        oldest_share_accepted_at:
+          $ref: "#/components/schemas/NullableTimestamp"
+        newest_share_accepted_at:
+          $ref: "#/components/schemas/NullableTimestamp"
+        included_share_count:
+          type: integer
+          minimum: 0
+    PoolFields:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - hashrate_ths
+        - participants_3h
+        - blocks_found_total
+        - prism_blocks_total
+        - total_mined_bits
+        - expected_time_to_block_seconds
+        - latest_block
+        - reward_window
+      properties:
+        name:
+          type: string
+        hashrate_ths:
+          $ref: "#/components/schemas/HashrateRollups"
+        participants_3h:
+          type: integer
+          minimum: 0
+        blocks_found_total:
+          type: integer
+          minimum: 0
+        prism_blocks_total:
+          type: integer
+          minimum: 0
+        total_mined_bits:
+          $ref: "#/components/schemas/Bits"
+        expected_time_to_block_seconds:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        latest_block:
+          oneOf:
+            - $ref: "#/components/schemas/LatestBlock"
+            - type: "null"
+        reward_window:
+          $ref: "#/components/schemas/RewardWindowSummary"
+    PoolSummaryResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, network, pool]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.pool-summary.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        network:
+          $ref: "#/components/schemas/NetworkSummary"
+        pool:
+          $ref: "#/components/schemas/PoolFields"
+    HashrateSubject:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, id]
+          properties:
+            type:
+              type: string
+              const: pool
+            id:
+              type: "null"
+        - type: object
+          additionalProperties: false
+          required: [type, id]
+          properties:
+            type:
+              type: string
+              const: miner
+            id:
+              type: string
+              minLength: 1
+    HashratePoint:
+      type: object
+      additionalProperties: false
+      required:
+        - timestamp
+        - hashrate_ths
+        - accepted_share_count
+        - accepted_share_difficulty
+      properties:
+        timestamp:
+          $ref: "#/components/schemas/IsoTimestamp"
+        hashrate_ths:
+          $ref: "#/components/schemas/DecimalString"
+        accepted_share_count:
+          type: integer
+          minimum: 0
+        accepted_share_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+    HashrateSeriesResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, subject, range, bucket, unit, points]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.hashrate-series.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        subject:
+          $ref: "#/components/schemas/HashrateSubject"
+        range:
+          $ref: "#/components/schemas/HashrateRange"
+        bucket:
+          $ref: "#/components/schemas/HashrateBucket"
+        unit:
+          type: string
+          const: ths
+        points:
+          type: array
+          items:
+            $ref: "#/components/schemas/HashratePoint"
+    WindowInfo:
+      type: object
+      additionalProperties: false
+      required: [id, started_at, ended_at]
+      properties:
+        id:
+          type: string
+          enum: [3h]
+        started_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        ended_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+    LeaderboardTotals:
+      type: object
+      additionalProperties: false
+      required:
+        - pool_hashrate_ths
+        - pool_accepted_share_difficulty
+        - participant_count
+      properties:
+        pool_hashrate_ths:
+          $ref: "#/components/schemas/DecimalString"
+        pool_accepted_share_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        participant_count:
+          type: integer
+          minimum: 0
+    LeaderboardRow:
+      type: object
+      additionalProperties: false
+      required:
+        - rank
+        - recipient_id
+        - display_name
+        - hashrate_ths_3h
+        - share_percent
+        - hash_percent
+        - blocks_found
+        - last_share_at
+      properties:
+        rank:
+          type: integer
+          minimum: 1
+        recipient_id:
+          type: string
+        display_name:
+          $ref: "#/components/schemas/NullableString"
+        hashrate_ths_3h:
+          $ref: "#/components/schemas/DecimalString"
+        share_percent:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        hash_percent:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        blocks_found:
+          type: integer
+          minimum: 0
+        last_share_at:
+          $ref: "#/components/schemas/NullableTimestamp"
+    LeaderboardResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, window, totals, pagination, rows]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.leaderboard.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        window:
+          $ref: "#/components/schemas/WindowInfo"
+        totals:
+          $ref: "#/components/schemas/LeaderboardTotals"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/LeaderboardRow"
+    BlockRow:
+      type: object
+      additionalProperties: false
+      required:
+        - height
+        - hash
+        - found_at
+        - network_difficulty
+        - bits
+        - solver_recipient_id
+        - solver_worker_name
+        - solver_share_difficulty
+        - reward_window_weight
+        - coinbase_value_bits
+        - audit_bundle_sha256
+        - payout_manifest_sha256
+        - explorer_url
+      properties:
+        height:
+          type: integer
+          minimum: 0
+        hash:
+          $ref: "#/components/schemas/HexHash"
+        found_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        network_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        bits:
+          $ref: "#/components/schemas/CompactBits"
+        solver_recipient_id:
+          type: string
+        solver_worker_name:
+          $ref: "#/components/schemas/NullableString"
+        solver_share_difficulty:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        reward_window_weight:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        coinbase_value_bits:
+          $ref: "#/components/schemas/Bits"
+        audit_bundle_sha256:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        payout_manifest_sha256:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        explorer_url:
+          oneOf:
+            - type: string
+              format: uri
+            - type: "null"
+    BlocksResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, pagination, rows]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.blocks.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlockRow"
+    SettlementStatus:
+      type: string
+      enum:
+        - awaiting_maturity
+        - broadcastable
+        - broadcast_submitted
+        - confirmed
+        - reorged
+        - failed
+    PendingSettlementStatus:
+      type: string
+      enum:
+        - awaiting_maturity
+        - broadcastable
+        - broadcast_submitted
+        - failed
+    ArtifactLink:
+      type: object
+      additionalProperties: false
+      required: [kind, sha256, url, content_type, byte_length]
+      properties:
+        kind:
+          type: string
+          enum:
+            - audit_bundle
+            - ctv_manifest_set
+            - ctv_manifest
+            - fanout_transaction
+        sha256:
+          $ref: "#/components/schemas/HexHash"
+        url:
+          oneOf:
+            - type: string
+              format: uri-reference
+            - type: "null"
+        content_type:
+          type: string
+        byte_length:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+    CanonicalArtifact:
+      type: object
+      description: >
+        Exact public PRISM artifact body. The concrete artifact schema is owned
+        by the artifact producer and verified by the content-addressed URL.
+      additionalProperties: true
+    FanoutArtifact:
+      type: object
+      additionalProperties: false
+      required:
+        - fanout_txid
+        - block_hash
+        - block_height
+        - status
+        - broadcastable_at_height
+        - manifest_set_sha256
+        - manifest_sha256
+        - manifest_url
+        - audit_bundle_sha256
+        - parent_coinbase_txid
+        - parent_coinbase_vout
+        - anchor_vout
+        - covenant_output_value_bits
+        - fanout_output_sum_bits
+        - fanout_fee_bits
+        - fanout_tx_hex
+        - fanout_tx_sha256
+        - cpfp_anchor_spendable
+        - last_broadcast_attempt_at
+        - last_broadcast_error
+        - explorer_url
+      properties:
+        fanout_txid:
+          $ref: "#/components/schemas/HexHash"
+        block_hash:
+          $ref: "#/components/schemas/HexHash"
+        block_height:
+          type: integer
+          minimum: 0
+        status:
+          $ref: "#/components/schemas/SettlementStatus"
+        broadcastable_at_height:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        manifest_set_sha256:
+          $ref: "#/components/schemas/HexHash"
+        manifest_sha256:
+          $ref: "#/components/schemas/HexHash"
+        manifest_url:
+          oneOf:
+            - type: string
+              format: uri-reference
+            - type: "null"
+        audit_bundle_sha256:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        parent_coinbase_txid:
+          $ref: "#/components/schemas/HexHash"
+        parent_coinbase_vout:
+          type: integer
+          minimum: 0
+        anchor_vout:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        covenant_output_value_bits:
+          $ref: "#/components/schemas/Bits"
+        fanout_output_sum_bits:
+          $ref: "#/components/schemas/Bits"
+        fanout_fee_bits:
+          $ref: "#/components/schemas/Bits"
+        fanout_tx_hex:
+          $ref: "#/components/schemas/HexString"
+        fanout_tx_sha256:
+          $ref: "#/components/schemas/HexHash"
+        cpfp_anchor_spendable:
+          type: boolean
+        last_broadcast_attempt_at:
+          $ref: "#/components/schemas/NullableTimestamp"
+        last_broadcast_error:
+          $ref: "#/components/schemas/NullableString"
+        explorer_url:
+          oneOf:
+            - type: string
+              format: uri
+            - type: "null"
+    SettlementArtifactsResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - generated_at
+        - block_hash
+        - block_height
+        - settlement_mode
+        - audit_bundle_sha256
+        - payout_manifest_sha256
+        - artifact_links
+        - fanouts
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.settlement-artifacts.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        block_hash:
+          $ref: "#/components/schemas/HexHash"
+        block_height:
+          type: integer
+          minimum: 0
+        settlement_mode:
+          type: string
+          enum:
+            - direct_coinbase
+            - hybrid_coinbase_ctv_fanout
+            - ctv_fanout
+        audit_bundle_sha256:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        payout_manifest_sha256:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        artifact_links:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactLink"
+        fanouts:
+          type: array
+          items:
+            $ref: "#/components/schemas/FanoutArtifact"
+    PendingFanoutsResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, pagination, rows]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.pending-fanouts.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingFanoutArtifact"
+    PendingFanoutArtifact:
+      allOf:
+        - $ref: "#/components/schemas/FanoutArtifact"
+        - type: object
+          required: [status]
+          properties:
+            status:
+              $ref: "#/components/schemas/PendingSettlementStatus"
+    FanoutResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, fanout]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.fanout.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        fanout:
+          $ref: "#/components/schemas/FanoutArtifact"
+    MiningEndpoint:
+      type: object
+      additionalProperties: false
+      required: [label, url, protocol, default_port]
+      properties:
+        label:
+          type: string
+        url:
+          type: string
+        protocol:
+          type: string
+          enum: [stratum_v1]
+        default_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+    MiningConfiguration:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - label
+        - description
+        - pool_fee_bps
+        - block_template_policy
+        - stratum_endpoints
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        description:
+          type: string
+        pool_fee_bps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+        block_template_policy:
+          type: string
+        stratum_endpoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/MiningEndpoint"
+    MiningConfigurationResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, active_configuration_id, configurations]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.mining-configuration.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        active_configuration_id:
+          type: string
+        configurations:
+          type: array
+          items:
+            $ref: "#/components/schemas/MiningConfiguration"
+    MinerHashrateRollups:
+      type: object
+      additionalProperties: false
+      required: [m1, m5, m10, h3, h24]
+      properties:
+        m1:
+          $ref: "#/components/schemas/DecimalString"
+        m5:
+          $ref: "#/components/schemas/DecimalString"
+        m10:
+          $ref: "#/components/schemas/DecimalString"
+        h3:
+          $ref: "#/components/schemas/DecimalString"
+        h24:
+          $ref: "#/components/schemas/DecimalString"
+    MinerShareSummary:
+      type: object
+      additionalProperties: false
+      required: [accepted_3h, accepted_difficulty_3h, last_share_at]
+      properties:
+        accepted_3h:
+          type: integer
+          minimum: 0
+        accepted_difficulty_3h:
+          $ref: "#/components/schemas/DecimalString"
+        last_share_at:
+          $ref: "#/components/schemas/NullableTimestamp"
+    MinerEstimate:
+      type: object
+      additionalProperties: false
+      required: [share_percent, estimated_reward_bits]
+      properties:
+        share_percent:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        estimated_reward_bits:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+    MinerWorker:
+      type: object
+      additionalProperties: false
+      required:
+        - worker_name
+        - status
+        - last_share_at
+        - hashrate_ths_60s
+        - hashrate_ths_3h
+      properties:
+        worker_name:
+          type: string
+        status:
+          type: string
+          enum: [active, inactive]
+        last_share_at:
+          $ref: "#/components/schemas/NullableTimestamp"
+        hashrate_ths_60s:
+          $ref: "#/components/schemas/DecimalString"
+        hashrate_ths_3h:
+          $ref: "#/components/schemas/DecimalString"
+    MinerPayout:
+      type: object
+      additionalProperties: false
+      required:
+        - block_height
+        - block_hash
+        - created_at
+        - transaction_id
+        - transaction_kind
+        - onchain_amount_bits
+        - carry_forward_balance_bits
+        - action
+        - maturity_state
+        - explorer_url
+      properties:
+        block_height:
+          type: integer
+          minimum: 0
+        block_hash:
+          $ref: "#/components/schemas/HexHash"
+        created_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        transaction_id:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        transaction_kind:
+          type: string
+          enum: [coinbase, ctv_fanout, carry_forward]
+        onchain_amount_bits:
+          $ref: "#/components/schemas/Bits"
+        carry_forward_balance_bits:
+          $ref: "#/components/schemas/Bits"
+        action:
+          type: string
+          enum: [onchain, accrued]
+        maturity_state:
+          type: string
+          enum: [immature, mature, reversed]
+        explorer_url:
+          oneOf:
+            - type: string
+              format: uri
+            - type: "null"
+    MinerEarning:
+      type: object
+      additionalProperties: false
+      required:
+        - block_height
+        - block_hash
+        - found_at
+        - reward_share_percent
+        - gross_earning_bits
+        - settlement_fee_bits
+        - net_earning_bits
+        - maturity_state
+        - settlement_artifacts_url
+        - explorer_url
+      properties:
+        block_height:
+          type: integer
+          minimum: 0
+        block_hash:
+          $ref: "#/components/schemas/HexHash"
+        found_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        reward_share_percent:
+          $ref: "#/components/schemas/DecimalString"
+        gross_earning_bits:
+          $ref: "#/components/schemas/Bits"
+        settlement_fee_bits:
+          $ref: "#/components/schemas/Bits"
+        net_earning_bits:
+          $ref: "#/components/schemas/Bits"
+        maturity_state:
+          type: string
+          enum: [immature, mature, reversed]
+        settlement_artifacts_url:
+          oneOf:
+            - type: string
+              format: uri-reference
+            - type: "null"
+        explorer_url:
+          oneOf:
+            - type: string
+              format: uri
+            - type: "null"
+    MinerEarningsResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, recipient_id, pagination, rows]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.miner-earnings.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        recipient_id:
+          type: string
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/MinerEarning"
+    MinerPayoutsResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, recipient_id, pagination, rows]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.miner-payouts.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        recipient_id:
+          type: string
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/MinerPayout"
+    MinerWorkersResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, recipient_id, pagination, rows]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.miner-workers.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        recipient_id:
+          type: string
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/MinerWorker"
+    MinerResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - generated_at
+        - recipient_id
+        - display_name
+        - owed_balance_bits
+        - lifetime_earnings_bits
+        - unpaid_earnings_bits
+        - minimum_payout_bits
+        - hashrate_ths
+        - shares
+        - estimated_next_block
+        - estimated_time_to_minimum_payout_seconds
+        - reward_window_percent
+        - workers_currently_hashing
+        - workers
+        - recent_payouts
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.miner.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        recipient_id:
+          type: string
+        display_name:
+          $ref: "#/components/schemas/NullableString"
+        owed_balance_bits:
+          $ref: "#/components/schemas/Bits"
+        lifetime_earnings_bits:
+          $ref: "#/components/schemas/Bits"
+        unpaid_earnings_bits:
+          $ref: "#/components/schemas/Bits"
+        minimum_payout_bits:
+          $ref: "#/components/schemas/Bits"
+        hashrate_ths:
+          $ref: "#/components/schemas/MinerHashrateRollups"
+        shares:
+          $ref: "#/components/schemas/MinerShareSummary"
+        estimated_next_block:
+          $ref: "#/components/schemas/MinerEstimate"
+        estimated_time_to_minimum_payout_seconds:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        reward_window_percent:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        workers_currently_hashing:
+          type: integer
+          minimum: 0
+        workers:
+          type: array
+          maxItems: 5
+          items:
+            $ref: "#/components/schemas/MinerWorker"
+        recent_payouts:
+          type: array
+          maxItems: 5
+          items:
+            $ref: "#/components/schemas/MinerPayout"
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      required: [code, message, request_id]
+      properties:
+        code:
+          type: string
+          enum:
+            - bad_request
+            - not_found
+            - rate_limited
+            - internal_error
+            - upstream_unavailable
+        message:
+          type: string
+        request_id:
+          $ref: "#/components/schemas/NullableString"
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.error.v1
+        error:
+          $ref: "#/components/schemas/ErrorDetail"

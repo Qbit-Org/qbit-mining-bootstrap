@@ -21,7 +21,7 @@ class CkpoolVersionMaskTests(unittest.TestCase):
     def test_selects_advertised_qbit_versionrollingmask(self) -> None:
         result = ckpool_version_mask.select_version_mask(
             {"versionrollingmask": "1fffe000"},
-            "1fffe000",
+            "0000007f",
         )
 
         self.assertEqual(result.selected_mask, "1fffe000")
@@ -35,15 +35,22 @@ class CkpoolVersionMaskTests(unittest.TestCase):
         self.assertEqual(result.source, "fallback")
         self.assertEqual(result.detail, "missing_versionrollingmask")
 
-    def test_invalid_advertised_mask_falls_back_to_configured_mask(self) -> None:
+    def test_zero_advertised_mask_disables_version_rolling(self) -> None:
         result = ckpool_version_mask.select_version_mask(
-            {"versionrollingmask": "not-hex"},
+            {"versionrollingmask": "00000000"},
             "1fffe000",
         )
 
-        self.assertEqual(result.selected_mask, "1fffe000")
-        self.assertEqual(result.source, "fallback")
-        self.assertTrue(result.detail.startswith("invalid_versionrollingmask:"))
+        self.assertEqual(result.selected_mask, "00000000")
+        self.assertEqual(result.source, "qbit_getblocktemplate")
+        self.assertEqual(result.detail, "disabled_by_zero_mask")
+
+    def test_invalid_advertised_mask_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid getblocktemplate.versionrollingmask"):
+            ckpool_version_mask.select_version_mask(
+                {"versionrollingmask": "not-hex"},
+                "1fffe000",
+            )
 
     def test_normalizes_integer_and_short_hex_masks(self) -> None:
         self.assertEqual(ckpool_version_mask.normalize_mask(0x1FFFE000, field="mask"), "1fffe000")
@@ -53,6 +60,11 @@ class CkpoolVersionMaskTests(unittest.TestCase):
     def test_rejects_invalid_fallback_mask(self) -> None:
         with self.assertRaisesRegex(ValueError, "invalid fallback CKPOOL_VERSION_MASK"):
             ckpool_version_mask.select_version_mask({}, "not-hex")
+
+    def test_accepts_current_production_fallback_mask(self) -> None:
+        result = ckpool_version_mask.select_version_mask({}, "1fffe000")
+
+        self.assertEqual(result.selected_mask, "1fffe000")
 
     def test_mode_parsing(self) -> None:
         self.assertTrue(ckpool_version_mask.mode_is_dynamic("dynamic"))

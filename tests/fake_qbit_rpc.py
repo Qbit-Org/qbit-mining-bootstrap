@@ -20,6 +20,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 28552
 DEFAULT_BITS = "1d00ffff"
 DEFAULT_TARGET = "00000000ffff0000000000000000000000000000000000000000000000000000"
+DEFAULT_VERSION_ROLLING_MASK = "1fffe000"
 
 
 class FakeQbitState:
@@ -33,6 +34,7 @@ class FakeQbitState:
         initialblockdownload: bool = False,
         connections: int = 1,
         weightlimit: int = 2_000_000,
+        versionrollingmask: str | None = DEFAULT_VERSION_ROLLING_MASK,
     ) -> None:
         self.bits = bits
         self.target = target
@@ -41,6 +43,7 @@ class FakeQbitState:
         self.initialblockdownload = initialblockdownload
         self.connections = connections
         self.weightlimit = weightlimit
+        self.versionrollingmask = versionrollingmask
         self.height = 1
         self.requests = 0
         self.submits = 0
@@ -80,7 +83,7 @@ class FakeQbitState:
         if method == "getblocktemplate":
             now = int(time.time())
             height = self.height
-            return {
+            template = {
                 "capabilities": ["proposal"],
                 "version": 0x20000000,
                 "rules": ["csv", "segwit"],
@@ -101,7 +104,10 @@ class FakeQbitState:
                 "curtime": now,
                 "bits": self.bits,
                 "height": height,
-            }, None
+            }
+            if self.versionrollingmask is not None:
+                template["versionrollingmask"] = self.versionrollingmask
+            return template, None
 
         if method == "submitblock":
             self.submits += 1
@@ -168,6 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initialblockdownload", action="store_true")
     parser.add_argument("--connections", type=int, default=1)
     parser.add_argument("--weightlimit", type=int, default=2_000_000)
+    parser.add_argument(
+        "--versionrollingmask",
+        default=DEFAULT_VERSION_ROLLING_MASK,
+        help="versionrollingmask advertised in getblocktemplate; set to empty to omit",
+    )
     return parser
 
 
@@ -181,6 +192,7 @@ def main() -> int:
         initialblockdownload=args.initialblockdownload,
         connections=args.connections,
         weightlimit=args.weightlimit,
+        versionrollingmask=args.versionrollingmask or None,
     )
     server = ThreadingHTTPServer((args.host, args.port), build_handler(state))
     print(f"fake qbit RPC listening on {args.host}:{args.port}", flush=True)

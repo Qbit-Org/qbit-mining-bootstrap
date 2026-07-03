@@ -56,11 +56,12 @@ def install_test_framework_stubs() -> None:
         return hashlib.sha256(hashlib.sha256(data).digest()).digest()
 
     auxpow.AuxPowPayload = AuxPowPayload
-    auxpow.MERGED_MINING_HEADER = bytes.fromhex("fabe6d6d")
-
-    def check_merkle_branch(leaf: int, branch: list[int], index: int) -> int:
+    def check_merkle_branch(*, leaf: int, branch: list[int], index: int) -> int:
+        if branch:
+            raise NotImplementedError("test stub only supports empty chain merkle branches")
         return leaf
 
+    auxpow.MERGED_MINING_HEADER = bytes.fromhex("fabe6d6d")
     auxpow.check_merkle_branch = check_merkle_branch
     auxpow.get_expected_index = lambda *args, **kwargs: 0
     blocktools.add_witness_commitment = lambda *args, **kwargs: None
@@ -93,9 +94,8 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
         commitment, chain_index = coordinator.build_chain_commitment(aux_template, chain_nonce=0x11223344)
 
         self.assertEqual(chain_index, 0)
-        self.assertEqual(commitment[:4], bytes.fromhex("fabe6d6d"))
+        self.assertEqual(commitment[:4], coordinator.MERGED_MINING_HEADER)
         self.assertEqual(commitment[4:36], bytes.fromhex(root_hex))
-        self.assertNotEqual(commitment[4:36], int(root_hex, 16).to_bytes(32, "little"))
         self.assertEqual(commitment[36:40], (1).to_bytes(4, "little"))
         self.assertEqual(commitment[40:44], (0x11223344).to_bytes(4, "little"))
 

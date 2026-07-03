@@ -274,7 +274,7 @@ AuxPoW Stratum vardiff is enabled by default in compose so mixed miner hardware 
 
 The bridge reconstructs one canonical parent header from each Stratum submit. Diagnostic header variants remain available with `AUXPOW_STRATUM_DIAG_VARIANTS=1`, but they are not accepted by default. Use `AUXPOW_STRATUM_HEADER_VARIANT=<variant>` or `AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT=1` only while debugging a miner compatibility issue.
 
-BIP310 version rolling defaults to `AUXPOW_STRATUM_VERSION_MASK=1fffe000`, and the bridge grants miners the intersection of that mask and the requested mask. qbit nodes with permissionless `getblocktemplate.versionrollingmask` support expose the compatible child-chain mask directly, but AuxPoW Stratum mode does not depend on that field because it serves parent-chain headers and submits child work through `createauxblock` / `submitauxblock`. When the connected qbit node exposes `versionrollingmask`, the bridge logs it at startup as compatibility context.
+BIP310 version rolling defaults to `AUXPOW_STRATUM_VERSION_MASK=1fffe000`, and the bridge grants miners the intersection of that parent-chain mask and the requested mask. Permissionless qbit, ckpool, and direct PRISM Stratum use the connected qbit node's `getblocktemplate.versionrollingmask` as the server mask, falling back to `1fffe000` only when GBT is unavailable or does not expose the field. AuxPoW Stratum mode still serves parent-chain headers and submits child work through `createauxblock` / `submitauxblock`; when the connected qbit node exposes `versionrollingmask`, the bridge logs it at startup as compatibility context.
 
 Useful diagnostics:
 
@@ -315,6 +315,10 @@ Important behavior:
 - Many Bitcoin-oriented pool stacks hardcode `100`. Override this explicitly before enabling payouts.
 - Use a dedicated payout wallet or descriptor set for pool rewards.
 - Public qbit networks use P2MR-only wallet output types. Generate payout addresses with qbit itself, and keep pool payout transactions inside qbit's allowed output policy.
+- Direct PRISM Stratum uses the leading username segment as the payout address. On qbit test chains, invalid username payouts fall back to `tq1zlsq9dpxz8mennhdpr9nf9s0f2tjtq6gxs9m84k6xglhkfp92q2zszzu4m3`; set `PRISM_USERNAME_FALLBACK_ADDRESS` to override that address.
+- Direct PRISM Stratum does not emit miner outputs below the payout floor. The default floor is `14,720` bits from `3,680` P2MR spend bytes, `1` bit/byte, and a `4x` safety multiplier. Set `PRISM_PAYOUT_MIN_OUTPUT_BITS` for a fixed absolute floor, or tune `PRISM_PAYOUT_P2MR_SPEND_INPUT_BYTES`, `PRISM_PAYOUT_TARGET_FEERATE_BITS_PER_BYTE`, and `PRISM_PAYOUT_SAFETY_MULTIPLIER`. The old `_SATS` payout env names are still accepted as legacy aliases.
+- Until DATUM-style per-hardware templates are supported, use conservative non-DATUM settlement caps for one stock-firmware-safe Stratum template. The qbit-prism launch defaults are `12` direct recipient coinbase outputs, `16` total settlement coinbase outputs, and `1,000` recipients per CTV fanout chunk. These are hardware policy defaults, not qbit consensus limits.
+- Monitor `/audit/carry-forward-integrity` for carry-forward replay mismatches and mirror the published `audit_head_sha256`. Launch policy is no compaction of carry-forward rows until signed checkpoints cover the old row range and replacement opening balances.
 - Expect more frequent UTXO creation than on Bitcoin if you pay out on a block-count schedule instead of a balance threshold.
 
 ## Share difficulty guidance

@@ -44,15 +44,15 @@ class AuxPowStratumCodecTests(unittest.TestCase):
 
     def test_apply_version_bits_uses_negotiated_mask_only(self) -> None:
         self.assertEqual(
-            stratum_codec.apply_version_bits("20000000", "1fffe000", 0x1FFFE000),
-            "3fffe000",
+            stratum_codec.apply_version_bits("20000000", "000000ff", 0x000000FF),
+            "200000ff",
         )
         self.assertEqual(
-            stratum_codec.apply_version_bits("20000000", "00002000", 0x1FFFE000),
-            "20002000",
+            stratum_codec.apply_version_bits("20000000", "00000020", 0x000000FF),
+            "20000020",
         )
         with self.assertRaisesRegex(ValueError, "outside the negotiated mask"):
-            stratum_codec.apply_version_bits("20000000", "00000001", 0x1FFFE000)
+            stratum_codec.apply_version_bits("20000000", "00000100", 0x000000FF)
 
     def test_legacy_prevhash_explains_display_revfields_variant(self) -> None:
         legacy_header = stratum_codec.serialize_header_from_stratum_fields(

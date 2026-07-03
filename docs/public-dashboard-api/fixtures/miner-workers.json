@@ -1,0 +1,27 @@
+{
+  "schema": "prism.dashboard.miner-workers.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "recipient_id": "qbrt1prismminer000000000000000000000000000000000000001",
+  "pagination": {
+    "page": 1,
+    "limit": 15,
+    "total_count": 2,
+    "total_pages": 1
+  },
+  "rows": [
+    {
+      "worker_name": "rig-a",
+      "status": "active",
+      "last_share_at": "2026-06-26T20:44:53Z",
+      "hashrate_ths_60s": "315000.0",
+      "hashrate_ths_3h": "320000.5"
+    },
+    {
+      "worker_name": "rig-b",
+      "status": "active",
+      "last_share_at": "2026-06-26T20:44:10Z",
+      "hashrate_ths_60s": "300000.0",
+      "hashrate_ths_3h": "300000.0"
+    }
+  ]
+}

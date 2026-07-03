@@ -1,0 +1,31 @@
+{
+  "schema": "prism.dashboard.hashrate-series.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "subject": {
+    "type": "pool",
+    "id": null
+  },
+  "range": "1m",
+  "bucket": "1h",
+  "unit": "ths",
+  "points": [
+    {
+      "timestamp": "2026-06-26T18:00:00Z",
+      "hashrate_ths": "2110000.0",
+      "accepted_share_count": 620,
+      "accepted_share_difficulty": "136000000000"
+    },
+    {
+      "timestamp": "2026-06-26T19:00:00Z",
+      "hashrate_ths": "2325000.5",
+      "accepted_share_count": 688,
+      "accepted_share_difficulty": "149000000000"
+    },
+    {
+      "timestamp": "2026-06-26T20:00:00Z",
+      "hashrate_ths": "2440000.25",
+      "accepted_share_count": 711,
+      "accepted_share_difficulty": "156000000000"
+    }
+  ]
+}

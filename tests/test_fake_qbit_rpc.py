@@ -45,6 +45,7 @@ class FakeQbitStateTests(unittest.TestCase):
         self.assertEqual(result["target"], fake_qbit_rpc.DEFAULT_TARGET)
         self.assertEqual(result["height"], 1)
         self.assertEqual(result["transactions"], [])
+        self.assertEqual(result["versionrollingmask"], fake_qbit_rpc.DEFAULT_VERSION_ROLLING_MASK)
         self.assertIn("segwit", result["rules"])
 
     def test_submitblock_advances_height(self) -> None:

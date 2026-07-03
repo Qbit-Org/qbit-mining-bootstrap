@@ -130,6 +130,7 @@ class CkpoolStartupTests(unittest.TestCase):
         self.assertEqual(config["btcaddress"], REGTEST_ADDRESS)
         self.assertEqual(config["mindiff"], 0.00390625)
         self.assertEqual(config["startdiff"], 0.00390625)
+        self.assertEqual(config["version_mask"], "1fffe000")
 
     def test_explicit_public_difficulty_and_knobs_render(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer("--chain", "testnet4") as rpc:

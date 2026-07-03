@@ -1,0 +1,8 @@
+{
+  "schema": "prism.dashboard.error.v1",
+  "error": {
+    "code": "not_found",
+    "message": "miner not found",
+    "request_id": null
+  }
+}
