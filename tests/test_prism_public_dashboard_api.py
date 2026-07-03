@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -11,12 +13,13 @@ import urllib.error
 import urllib.request
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from lab.prism import direct_stratum, public_api
 from lab.prism.prism_coordinator import make_audit_handler
-from lab.prism.share_ledger import PendingShare, SingleWriterShareLedger
+from lab.prism.share_ledger import PendingShare, PsqlShareLedger, SingleWriterShareLedger
 
 
 class FanoutPublicRowTests(unittest.TestCase):
@@ -403,6 +406,47 @@ class DirectCoinbasePublicLedger(FakePublicLedger):
                 "settlement_mode_decision": {"mode": "direct_coinbase"},
             },
         }
+
+
+class ExternalizedAuditBodyResolver(PsqlShareLedger):
+    def __init__(self, audit_body_dir: str | Path) -> None:
+        self._audit_body_dir = Path(audit_body_dir)
+        self.body_read_count = 0
+
+    def _read_external_body(self, body_uri: object, *, expected_sha256: object) -> dict[str, object] | None:
+        self.body_read_count += 1
+        return super()._read_external_body(body_uri, expected_sha256=expected_sha256)
+
+
+class ExternalizedDirectCoinbasePublicLedger(DirectCoinbasePublicLedger):
+    def __init__(self, audit_body_dir: str | Path) -> None:
+        bundle = {
+            "schema": "qbit.prism.audit-bundle.v1",
+            "found_block": {"block_height": self.block_height},
+            "settlement_mode_decision": {"mode": "direct_coinbase"},
+        }
+        body_bytes = json.dumps(bundle, separators=(",", ":")).encode()
+        self.audit_bundle_sha256 = hashlib.sha256(body_bytes).hexdigest()
+        self.body_uri = (
+            Path(audit_body_dir)
+            / f"prism-audit-bundle-body-{self.block_hash}-{self.audit_bundle_sha256}.json"
+        )
+        self.body_uri.write_bytes(body_bytes)
+        self.resolver = ExternalizedAuditBodyResolver(audit_body_dir)
+
+    def audit_bundle(self, *, block_hash: str) -> dict[str, object] | None:
+        if block_hash != self.block_hash:
+            return None
+        return self.resolver._resolve_audit_bundle_row(
+            {
+                "block_hash": self.block_hash,
+                "block_height": self.block_height,
+                "payout_manifest_sha256": self.payout_manifest_sha256,
+                "audit_bundle_sha256": self.audit_bundle_sha256,
+                "audit_bundle": None,
+                "body_uri": str(self.body_uri),
+            }
+        )
 
 
 class ValueErrorPublicLedger(FakePublicLedger):
@@ -977,6 +1021,32 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(settlement["artifact_links"][0]["kind"], "audit_bundle")
         self.assertEqual(settlement["artifact_links"][0]["url"], f"/public/v1/artifacts/{ledger.audit_bundle_sha256}")
         self.assertEqual(settlement["fanouts"], [])
+
+    def test_settlement_artifacts_supports_externalized_direct_coinbase_audit_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = ExternalizedDirectCoinbasePublicLedger(tmp)
+            handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/public/v1/blocks/{ledger.block_hash}/settlement-artifacts",
+                    timeout=5,
+                ) as response:
+                    self.assertEqual(response.status, 200)
+                    settlement = json.loads(response.read())
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(ledger.resolver.body_read_count, 1)
+            self.assertEqual(settlement["settlement_mode"], "direct_coinbase")
+            self.assertEqual(settlement["block_height"], ledger.block_height)
+            self.assertEqual(settlement["audit_bundle_sha256"], ledger.audit_bundle_sha256)
+            self.assertEqual(settlement["payout_manifest_sha256"], ledger.payout_manifest_sha256)
+            self.assertEqual(settlement["fanouts"], [])
 
     def test_settlement_artifacts_omit_unavailable_audit_bundle_link(self) -> None:
         ledger = MissingAuditBundleBodyLedger()
