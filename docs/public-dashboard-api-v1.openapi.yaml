@@ -162,7 +162,8 @@ paths:
         Returns a public index of artifact hashes, canonical artifact URLs, and
         broadcastable fanout transaction data. Exact canonical artifacts may use
         their own `qbit.prism.*` schemas; this wrapper keeps dashboard-facing
-        fields stable.
+        fields stable. Direct coinbase settlements return
+        `settlement_mode: direct_coinbase` with an empty `fanouts` array.
       parameters:
         - name: block_hash
           in: path

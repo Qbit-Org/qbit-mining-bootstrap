@@ -1,0 +1,19 @@
+{
+  "schema": "prism.dashboard.settlement-artifacts.v1",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "block_hash": "00000000000026e9383a5aeae5fe5c3297f24884f29c4cf1585f71829491f0d9",
+  "block_height": 23342,
+  "settlement_mode": "direct_coinbase",
+  "audit_bundle_sha256": "92adad1828dfe2b68deceddf1bfcd153e9a4fd3e9ec8516fd2c13c295129b49f",
+  "payout_manifest_sha256": "8c37b6b595e76f69c3f7c68a04c5acf34ca4ba10e508be6d56f8398d4a70ba9a",
+  "artifact_links": [
+    {
+      "kind": "audit_bundle",
+      "sha256": "92adad1828dfe2b68deceddf1bfcd153e9a4fd3e9ec8516fd2c13c295129b49f",
+      "url": "/public/v1/artifacts/92adad1828dfe2b68deceddf1bfcd153e9a4fd3e9ec8516fd2c13c295129b49f",
+      "content_type": "application/json",
+      "byte_length": null
+    }
+  ],
+  "fanouts": []
+}

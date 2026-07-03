@@ -93,6 +93,11 @@ as PRISM audit bundles and CTV manifest JSON, are linked by URL and SHA-256 so
 they can be mirrored or downloaded without making dashboard clients depend on
 internal audit routes.
 
+Direct-coinbase blocks return the same settlement-artifacts wrapper with
+`settlement_mode: direct_coinbase` and `fanouts: []`. A `404` means no public
+settlement artifact index is known for that block, not an implied direct
+coinbase settlement.
+
 The public API must not expose `/audit/*`, `/metrics`, `/healthz`, operator
 controls, raw private sockets, credentials, or unrestricted internal manifests.
 

@@ -663,6 +663,8 @@ def settlement_artifacts(coordinator: Any, *, block_hash: str) -> dict[str, obje
     generated_at = utc_now_iso()
     payload = coordinator.ledger.audit_ctv_fanout_manifest_set(block_hash=block_hash)
     if payload is None:
+        payload = direct_coinbase_settlement_payload(coordinator.ledger, block_hash=block_hash)
+    if payload is None:
         raise PublicApiError(404, "not_found", "unknown PRISM settlement artifact block")
     artifacts = payload.get("artifacts", [])
     if not isinstance(artifacts, list):
@@ -693,6 +695,48 @@ def settlement_artifacts(coordinator: Any, *, block_hash: str) -> dict[str, obje
         "artifact_links": artifact_links,
         "fanouts": [fanout_public_row(row) for row in fanout_rows],
     }
+
+
+def direct_coinbase_settlement_payload(ledger: Any, *, block_hash: str) -> dict[str, object] | None:
+    getter = getattr(ledger, "audit_bundle", None)
+    if not callable(getter):
+        return None
+    row = getter(block_hash=block_hash)
+    if not isinstance(row, dict):
+        return None
+    bundle = row.get("audit_bundle")
+    if not isinstance(bundle, dict):
+        return None
+    if audit_bundle_settlement_mode(bundle) != "direct_coinbase":
+        return None
+    return {
+        "block_hash": optional_hex_hash(row.get("block_hash")) or block_hash,
+        "block_height": first_int(
+            row.get("block_height"),
+            audit_bundle_section_value(bundle, "found_block", "block_height"),
+            audit_bundle_section_value(bundle, "reward_manifest", "block_height"),
+            audit_bundle_section_value(bundle, "ledger_window_attestation", "block_height"),
+            default=0,
+        ),
+        "settlement_mode": "direct_coinbase",
+        "audit_bundle_sha256": nullable_str(row.get("audit_bundle_sha256")),
+        "payout_manifest_sha256": nullable_str(row.get("payout_manifest_sha256")),
+        "artifacts": [],
+    }
+
+
+def audit_bundle_settlement_mode(bundle: dict[str, object]) -> str | None:
+    decision = bundle.get("settlement_mode_decision")
+    if not isinstance(decision, dict):
+        return None
+    return nullable_str(decision.get("mode"))
+
+
+def audit_bundle_section_value(bundle: dict[str, object], section_name: str, key: str) -> object:
+    section = bundle.get(section_name)
+    if not isinstance(section, dict):
+        return None
+    return section.get(key)
 
 
 def pending_fanouts(coordinator: Any, *, page: int, limit: int) -> dict[str, object]:

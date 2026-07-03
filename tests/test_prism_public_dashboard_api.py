@@ -380,6 +380,31 @@ class MissingAuditBundleBodyLedger(FakePublicLedger):
         return super().dashboard_public_artifact(sha256=sha256)
 
 
+class DirectCoinbasePublicLedger(FakePublicLedger):
+    block_hash = "00000000000026e9383a5aeae5fe5c3297f24884f29c4cf1585f71829491f0d9"
+    block_height = 23342
+    audit_bundle_sha256 = "92adad1828dfe2b68deceddf1bfcd153e9a4fd3e9ec8516fd2c13c295129b49f"
+    payout_manifest_sha256 = "8c37b6b595e76f69c3f7c68a04c5acf34ca4ba10e508be6d56f8398d4a70ba9a"
+
+    def audit_ctv_fanout_manifest_set(self, *, block_hash: str) -> dict[str, object] | None:
+        return None
+
+    def audit_bundle(self, *, block_hash: str) -> dict[str, object] | None:
+        if block_hash != self.block_hash:
+            return None
+        return {
+            "block_hash": self.block_hash,
+            "block_height": self.block_height,
+            "payout_manifest_sha256": self.payout_manifest_sha256,
+            "audit_bundle_sha256": self.audit_bundle_sha256,
+            "audit_bundle": {
+                "schema": "qbit.prism.audit-bundle.v1",
+                "found_block": {"block_height": self.block_height},
+                "settlement_mode_decision": {"mode": "direct_coinbase"},
+            },
+        }
+
+
 class ValueErrorPublicLedger(FakePublicLedger):
     def dashboard_leaderboard(self, *, page: int, limit: int, search: str | None = None) -> dict[str, object]:
         self.leaderboard_calls += 1
@@ -925,6 +950,34 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(artifact["schema"], "qbit.prism.ctv-fanout-manifest-set.v1")
         self.assertEqual(audit_bundle["schema"], "qbit.prism.audit-bundle.v1")
 
+    def test_settlement_artifacts_returns_direct_coinbase_bundle_without_fanouts(self) -> None:
+        ledger = DirectCoinbasePublicLedger()
+        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/public/v1/blocks/{ledger.block_hash}/settlement-artifacts",
+                timeout=5,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                settlement = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(settlement["schema"], "prism.dashboard.settlement-artifacts.v1")
+        self.assertEqual(settlement["block_hash"], ledger.block_hash)
+        self.assertEqual(settlement["block_height"], ledger.block_height)
+        self.assertEqual(settlement["settlement_mode"], "direct_coinbase")
+        self.assertEqual(settlement["audit_bundle_sha256"], ledger.audit_bundle_sha256)
+        self.assertEqual(settlement["payout_manifest_sha256"], ledger.payout_manifest_sha256)
+        self.assertEqual(settlement["artifact_links"][0]["kind"], "audit_bundle")
+        self.assertEqual(settlement["artifact_links"][0]["url"], f"/public/v1/artifacts/{ledger.audit_bundle_sha256}")
+        self.assertEqual(settlement["fanouts"], [])
+
     def test_settlement_artifacts_omit_unavailable_audit_bundle_link(self) -> None:
         ledger = MissingAuditBundleBodyLedger()
 
@@ -975,6 +1028,12 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
         with self.assertRaises(urllib.error.HTTPError) as raised:
             self.get_json(f"/public/v1/fanouts/{'9' * 64}")
+
+        self.assertEqual(raised.exception.code, 404)
+        raised.exception.close()
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.get_json(f"/public/v1/blocks/{'9' * 64}/settlement-artifacts")
 
         self.assertEqual(raised.exception.code, 404)
         raised.exception.close()

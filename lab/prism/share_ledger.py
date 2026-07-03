@@ -1499,14 +1499,18 @@ SELECT json_build_object(
 SELECT COALESCE(
     (
         SELECT json_build_object(
-            'block_hash', block_hash,
-            'audit_bundle_sha256', audit_bundle_sha256,
-            'coinbase_tx_hex', coinbase_tx_hex,
-            'audit_bundle', audit_bundle,
-            'body_uri', body_uri
+            'block_hash', bundle.block_hash,
+            'block_height', block.block_height,
+            'payout_manifest_sha256', block.payout_manifest_sha256,
+            'audit_bundle_sha256', bundle.audit_bundle_sha256,
+            'coinbase_tx_hex', bundle.coinbase_tx_hex,
+            'audit_bundle', bundle.audit_bundle,
+            'body_uri', bundle.body_uri
         )
-        FROM qbit_pool_audit_bundles
-        WHERE block_hash = {self._text_literal(block_hash)}
+        FROM qbit_pool_audit_bundles bundle
+        JOIN qbit_pool_blocks block
+          ON block.block_hash = bundle.block_hash
+        WHERE bundle.block_hash = {self._text_literal(block_hash)}
     ),
     'null'::json
 );
@@ -1522,6 +1526,8 @@ SELECT COALESCE(
     (
         SELECT json_build_object(
             'block_hash', bundle.block_hash,
+            'block_height', block.block_height,
+            'payout_manifest_sha256', block.payout_manifest_sha256,
             'audit_commitment_leaf_hex', {leaf},
             'audit_bundle_sha256', bundle.audit_bundle_sha256,
             'coinbase_tx_hex', bundle.coinbase_tx_hex,

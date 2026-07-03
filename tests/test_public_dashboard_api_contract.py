@@ -23,6 +23,7 @@ EXPECTED_FIXTURES = {
     "leaderboard.json": "prism.dashboard.leaderboard.v1",
     "blocks.json": "prism.dashboard.blocks.v1",
     "settlement-artifacts.json": "prism.dashboard.settlement-artifacts.v1",
+    "settlement-artifacts-direct-coinbase.json": "prism.dashboard.settlement-artifacts.v1",
     "pending-fanouts.json": "prism.dashboard.pending-fanouts.v1",
     "fanout.json": "prism.dashboard.fanout.v1",
     "mining-configuration.json": "prism.dashboard.mining-configuration.v1",

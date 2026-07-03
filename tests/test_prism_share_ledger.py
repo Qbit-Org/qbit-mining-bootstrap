@@ -1274,11 +1274,16 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         ledger.audit_bundle(block_hash="aa" * 32)
         by_hash_query = ledger.lease_queries[-1]
-        self.assertIn("'body_uri', body_uri", by_hash_query)
+        self.assertIn("'body_uri', bundle.body_uri", by_hash_query)
+        self.assertIn("'block_height', block.block_height", by_hash_query)
+        self.assertIn("'payout_manifest_sha256', block.payout_manifest_sha256", by_hash_query)
+        self.assertIn("JOIN qbit_pool_blocks block", by_hash_query)
 
         ledger.audit_bundle_by_commitment(commitment_leaf_hex="ab" * 32)
         by_commitment_query = ledger.lease_queries[-1]
         self.assertIn("'body_uri', bundle.body_uri", by_commitment_query)
+        self.assertIn("'block_height', block.block_height", by_commitment_query)
+        self.assertIn("'payout_manifest_sha256', block.payout_manifest_sha256", by_commitment_query)
         # Queries the promoted leaf columns (new rows) plus the inline JSONB
         # (legacy rows), and orders by chain height rather than row creation time.
         self.assertIn("bundle.audit_commitment_leaves_hex ?", by_commitment_query)
