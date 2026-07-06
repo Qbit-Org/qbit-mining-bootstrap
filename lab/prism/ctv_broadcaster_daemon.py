@@ -10,6 +10,7 @@ packages, journal attempts, and update durable state.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from lab.prism.ctv_broadcaster import (
@@ -92,6 +93,8 @@ class CtvFanoutBroadcastDaemon:
                 "failed",
             }:
                 continue
+            if not broadcast_attempt_due(row.get("next_broadcast_attempt_at")):
+                continue
             artifact = artifact_from_status_row(row)
             attempt = self.broadcaster.broadcast(artifact, self.fee_sats)
             if attempt.submitted:
@@ -141,3 +144,27 @@ class CtvFanoutBroadcastDaemon:
             },
             error=None if attempt.submitted else attempt.detail,
         )
+
+
+def broadcast_attempt_due(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, datetime):
+        candidate = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return True
+        if " " in text and "T" not in text:
+            text = text.replace(" ", "T", 1)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        elif text.endswith("+00"):
+            text = text[:-3] + "+00:00"
+        try:
+            candidate = datetime.fromisoformat(text)
+        except ValueError:
+            return True
+    if candidate.tzinfo is None:
+        candidate = candidate.replace(tzinfo=timezone.utc)
+    return candidate <= datetime.now(timezone.utc)

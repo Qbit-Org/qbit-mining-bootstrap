@@ -11,7 +11,7 @@ import threading
 import time
 import unittest
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -540,6 +540,29 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual([row["attempt_seq"] for row in status["broadcast_attempts"]], [3, 4])
         self.assertEqual(status["broadcast_attempt_summary"]["status_counts"]["planned"], 4)  # type: ignore[index]
 
+    def test_memory_ledger_ctv_broadcast_pending_respects_retry_backoff(self) -> None:
+        ledger = SingleWriterShareLedger(ctv_broadcast_retry_backoff_seconds=300)
+        fanout_txid = "22" * 32
+        ledger.persist_ctv_fanout_manifest_set(
+            block_hash="aa" * 32,
+            manifest_set=sample_ctv_manifest_set(),
+            manifest_set_sha256="66" * 32,
+        )
+
+        ledger.record_ctv_fanout_broadcast_attempt(
+            fanout_txid=fanout_txid,
+            attempt_status="planned",
+            package_txids=[fanout_txid],
+            submit_result={"package_msg": "error", "submitted": False},
+            error="transient",
+        )
+        self.assertEqual(ledger.pending_ctv_fanout_statuses(), [])
+
+        ledger._ctv_fanout_statuses[fanout_txid]["next_broadcast_attempt_at"] = (  # type: ignore[attr-defined]
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        )
+        self.assertEqual(ledger.pending_ctv_fanout_statuses()[0]["fanout_txid"], fanout_txid)
+
     def test_postgres_miner_worker_query_treats_percent_and_underscore_literally(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
             [
@@ -835,6 +858,16 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("'broadcast_attempt_summary'", query)
         self.assertIn("broadcast_attempt_count", query)
         self.assertIn("qbit_ctv_fanout_broadcast_attempts", query)
+        self.assertIn("settlement_status NOT IN ('confirmed', 'reorged', 'failed')", query)
+
+    def test_postgres_ctv_broadcast_pending_respects_retry_backoff(self) -> None:
+        ledger = FakeLeasePsqlShareLedger([acquired_lease(), []])
+
+        self.assertEqual(ledger.pending_ctv_fanout_statuses(), [])
+        query = ledger.lease_queries[-1]
+
+        self.assertIn("artifact.next_broadcast_attempt_at IS NULL", query)
+        self.assertIn("artifact.next_broadcast_attempt_at <= clock_timestamp()", query)
         self.assertIn("settlement_status NOT IN ('confirmed', 'reorged', 'failed')", query)
 
     def test_postgres_records_ctv_broadcast_summary_and_caps_detail_rows(self) -> None:

@@ -265,11 +265,13 @@ class SingleWriterShareLedger:
 
     def pending_ctv_fanout_statuses(self, *, limit: int = 100) -> list[dict[str, object]]:
         limit = max(1, min(int(limit), 1_000))
+        now = datetime.now(timezone.utc)
         with self._lock:
             rows = [
                 copy.deepcopy(payload)
                 for payload in self._ctv_fanout_statuses.values()
                 if payload.get("settlement_status") not in {"confirmed", "reorged", "failed"}
+                and _ctv_broadcast_attempt_due(payload.get("next_broadcast_attempt_at"), now)
             ]
         rows.sort(key=lambda row: (str(row.get("block_hash", "")), int(row.get("chunk_index", 0))))
         return rows[:limit]
@@ -1960,6 +1962,10 @@ FROM (
     LEFT JOIN qbit_pool_audit_bundles bundle
       ON bundle.block_hash = artifact.block_hash
     WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged', 'failed')
+      AND (
+          artifact.next_broadcast_attempt_at IS NULL
+          OR artifact.next_broadcast_attempt_at <= clock_timestamp()
+      )
     ORDER BY block.block_height ASC, artifact.chunk_index ASC
     LIMIT {limit}
 ) pending;
@@ -4201,6 +4207,30 @@ def _ctv_broadcast_attempt_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "next_attempt_at": payload.get("next_broadcast_attempt_at"),
         "retry_backoff_seconds": int(payload.get("broadcast_retry_backoff_seconds") or 0),
     }
+
+
+def _ctv_broadcast_attempt_due(value: object, now: datetime) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, datetime):
+        candidate = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return True
+        if " " in text and "T" not in text:
+            text = text.replace(" ", "T", 1)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        elif text.endswith("+00"):
+            text = text[:-3] + "+00:00"
+        try:
+            candidate = datetime.fromisoformat(text)
+        except ValueError:
+            return True
+    if candidate.tzinfo is None:
+        candidate = candidate.replace(tzinfo=timezone.utc)
+    return candidate <= now
 
 
 def validate_ctv_fanout_status(status: str) -> None:
