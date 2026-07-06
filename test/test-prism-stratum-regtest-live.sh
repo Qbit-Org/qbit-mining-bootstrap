@@ -330,6 +330,8 @@ def local_audit_payload(path):
         return local_audit_payload(payload["body_uri"])
     if payload.get("schema") == "qbit.prism.audit-body-ref.v1":
         return payload["bundle_without_shares"]
+    if payload.get("schema") == "qbit.prism.audit-bundle.v2":
+        return payload["bundle_without_shares"]
     return payload
 
 bundle = local_audit_payload(evidence["audit_bundle_path"])

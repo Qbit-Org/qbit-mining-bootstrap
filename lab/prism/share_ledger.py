@@ -281,11 +281,13 @@ class SingleWriterShareLedger:
     def dashboard_pending_fanout_rows(self, *, page: int, limit: int) -> dict[str, object]:
         from lab.prism import public_api
 
+        now = datetime.now(timezone.utc)
         with self._lock:
             rows = [
                 copy.deepcopy(payload)
                 for payload in self._ctv_fanout_statuses.values()
                 if payload.get("settlement_status") not in {"confirmed", "reorged", "failed"}
+                and _ctv_broadcast_attempt_due(payload.get("next_broadcast_attempt_at"), now)
             ]
         rows.sort(key=lambda row: (str(row.get("block_hash", "")), int(row.get("chunk_index", 0))))
         offset = (page - 1) * limit
@@ -2393,6 +2395,8 @@ updated AS (
 SELECT CASE
     WHEN (SELECT count(*) FROM lease) = 0 THEN
         json_build_object('error', 'writer lease is not active')
+    WHEN (SELECT count(*) FROM artifact_row) = 0 THEN
+        json_build_object('error', 'unknown CTV fanout txid')
     ELSE
         json_build_object(
             'backend', 'postgres-psql',

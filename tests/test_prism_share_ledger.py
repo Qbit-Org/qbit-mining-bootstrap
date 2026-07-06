@@ -559,11 +559,16 @@ class PrismShareLedgerTests(unittest.TestCase):
             error="transient",
         )
         self.assertEqual(ledger.pending_ctv_fanout_statuses(), [])
+        self.assertEqual(ledger.dashboard_pending_fanout_rows(page=1, limit=10)["rows"], [])
 
         ledger._ctv_fanout_statuses[fanout_txid]["next_broadcast_attempt_at"] = (  # type: ignore[attr-defined]
             datetime.now(timezone.utc) - timedelta(seconds=1)
         )
         self.assertEqual(ledger.pending_ctv_fanout_statuses()[0]["fanout_txid"], fanout_txid)
+        self.assertEqual(
+            ledger.dashboard_pending_fanout_rows(page=1, limit=10)["rows"][0]["fanout_txid"],
+            fanout_txid,
+        )
 
     def test_postgres_miner_worker_query_treats_percent_and_underscore_literally(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
@@ -907,6 +912,21 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("broadcast_attempt_status_counts = jsonb_set", query)
         self.assertIn("OFFSET GREATEST((data->>'attempt_detail_limit')::integer - 1, 0)", query)
         self.assertIn("next_broadcast_attempt_at = CASE", query)
+        self.assertIn("unknown CTV fanout txid", query)
+
+    def test_postgres_ctv_broadcast_attempt_rejects_unknown_fanout(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"error": "unknown CTV fanout txid"},
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unknown CTV fanout txid"):
+            ledger.record_ctv_fanout_broadcast_attempt(
+                fanout_txid="22" * 32,
+                attempt_status="planned",
+            )
 
     def test_postgres_miner_earnings_block_gross_keeps_reversed_rows_in_denominator(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
