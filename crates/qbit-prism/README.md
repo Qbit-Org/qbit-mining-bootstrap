@@ -126,6 +126,13 @@ accepted share slice, found-block anchor, prior carry-forward balances, payout
 floor parameters, PRISM reward manifest, payout-policy/accrual manifest, and the
 signed deterministic coinbase manifest.
 
+The verifier and canonicalizer also accept storage-oriented compact artifacts:
+legacy `qbit.prism.audit-body-ref.v1` files and
+`qbit.prism.audit-bundle.v2` proof bodies. Those formats keep share payloads in
+referenced segment files, verify each segment or range hash, and reconstruct the
+same canonical v1 bundle before checking payout math. Public `/public/v1`
+responses remain logical v1 bundles.
+
 `verify_audit_bundle` recomputes the full path from exported data and a
 verifier-supplied trusted ledger writer public key. The ledger attestation binds
 the share slice, prior-balance digest, anchor metadata, `block_height`, and

@@ -16,7 +16,14 @@ from typing import Any
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from lab.prism.share_ledger import PsqlShareLedger, canonical_hex, require_mapping, sha256_json_hex
+from lab.prism.share_ledger import (
+    AUDIT_BODY_REF_SCHEMA,
+    AUDIT_BUNDLE_V2_SCHEMA,
+    PsqlShareLedger,
+    canonical_hex,
+    require_mapping,
+    sha256_json_hex,
+)
 
 
 HEX64_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{64})(?![0-9a-fA-F])")
@@ -35,6 +42,32 @@ def load_json_file(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise SystemExit(f"{path}: invalid JSON: {exc}") from exc
+
+
+def resolve_local_audit_payload(payload: dict[str, Any], *, source_path: Path) -> dict[str, Any]:
+    schema = payload.get("schema")
+    if schema == "qbit.prism.live-audit-bundle-envelope.v1":
+        body_uri = payload.get("body_uri")
+        if not body_uri:
+            raise SystemExit(f"{source_path}: audit envelope has no body_uri")
+        body_path = Path(str(body_uri)).expanduser()
+        if not body_path.is_absolute():
+            body_path = source_path.parent / body_path
+        body_payload = load_json_file(body_path)
+        if not isinstance(body_payload, dict):
+            raise SystemExit(f"{body_path}: top-level JSON must be an object")
+        return resolve_local_audit_payload(body_payload, source_path=body_path)
+    if schema == AUDIT_BODY_REF_SCHEMA:
+        bundle_without_shares = payload.get("bundle_without_shares")
+        if not isinstance(bundle_without_shares, dict):
+            raise SystemExit(f"{source_path}: compact audit body has no bundle_without_shares")
+        return bundle_without_shares
+    if schema == AUDIT_BUNDLE_V2_SCHEMA:
+        bundle_without_shares = payload.get("bundle_without_shares")
+        if not isinstance(bundle_without_shares, dict):
+            raise SystemExit(f"{source_path}: audit-bundle.v2 has no bundle_without_shares")
+        return bundle_without_shares
+    return payload
 
 
 def infer_block_hash_from_path(path: Path) -> str | None:
@@ -108,6 +141,7 @@ def backfill_input_from_path(
     payload = load_json_file(path)
     if not isinstance(payload, dict):
         raise SystemExit(f"{path}: top-level JSON must be an object")
+    payload = resolve_local_audit_payload(payload, source_path=path)
     inferred_hash = block_hash or block_hash_from_payload(payload) or infer_block_hash_from_path(path)
     try:
         return backfill_input_from_payload(

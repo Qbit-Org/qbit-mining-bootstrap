@@ -53,6 +53,8 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_CTV_BROADCASTER_FEE_BITS": "0",
                 "PRISM_CTV_BROADCASTER_LIMIT": "7",
                 "PRISM_CTV_BROADCASTER_INTERVAL_SECONDS": "11",
+                "PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT": "9",
+                "PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS": "17",
             }
         )
         completed = subprocess.run(
@@ -124,6 +126,9 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_PUBLIC_CACHE_DEBUG_HEADERS"], "0")
         self.assertEqual(env["PRISM_AUDIT_BIND"], "127.0.0.1")
         self.assertEqual(env["PRISM_AUDIT_PORT"], "3341")
+        self.assertEqual(env["PRISM_AUDIT_SHARE_SEGMENT_SIZE"], "10000")
+        self.assertEqual(env["PRISM_AUDIT_LIVE_BUNDLE_RETENTION"], "5")
+        self.assertEqual(env["PRISM_AUDIT_CANDIDATE_RETENTION_SECONDS"], "86400")
         self.assertEqual(env["PRISM_STOP_AFTER_BLOCK"], "0")
         self.assertEqual(env["PRISM_CTV_SETTLEMENT_ENABLED"], "1")
         self.assertEqual(env["PRISM_DIRECT_COINBASE_PAYOUT_FLOOR_BITS"], "20971520")
@@ -138,6 +143,8 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_CTV_BROADCASTER_FEE_BITS"], "0")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_LIMIT"], "7")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_INTERVAL_SECONDS"], "11")
+        self.assertEqual(env["PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT"], "9")
+        self.assertEqual(env["PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS"], "17")
         self.assertEqual(env["PRISM_USERNAME_FALLBACK_ADDRESS"], "")
         self.assertEqual(env["PRISM_ALLOW_MEMORY_LEDGER"], "0")
         self.assertEqual(env["PRISM_ALLOW_TEST_SIGNING_SEEDS"], "0")

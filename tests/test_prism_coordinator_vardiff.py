@@ -776,6 +776,35 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_qbitd_initial_block_download 0", metrics)
         self.assertIn("qbit_prism_qbitd_peers 4", metrics)
 
+    def test_metrics_include_audit_artifact_storage_gauges(self) -> None:
+        server = coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            files = {
+                f"prism-audit-bundle-body-{'aa' * 32}-{'bb' * 32}.json": b"abc",
+                f"prism-audit-share-segment-1-1-{'cc' * 32}.json": b"defg",
+                f"prism-live-audit-bundle-1-{'dd' * 32}.json": b"hi",
+                f"prism-live-audit-bundle-candidate-{'ee' * 32}.json": b"j",
+                f".prism-live-audit-bundle-candidate-{'ff' * 32}.json.tmp": b"klmno",
+                "operator-note.txt": b"pqrstu",
+            }
+            for name, body in files.items():
+                (Path(tempdir) / name).write_bytes(body)
+
+            metrics = server.metrics_payload()
+
+        self.assertIn('qbit_prism_audit_artifact_bytes{kind="body"} 3', metrics)
+        self.assertIn('qbit_prism_audit_artifact_files{kind="body"} 1', metrics)
+        self.assertIn('qbit_prism_audit_artifact_bytes{kind="share_segment"} 4', metrics)
+        self.assertIn('qbit_prism_audit_artifact_files{kind="share_segment"} 1', metrics)
+        self.assertIn('qbit_prism_audit_artifact_bytes{kind="live_bundle"} 2', metrics)
+        self.assertIn('qbit_prism_audit_artifact_files{kind="live_bundle"} 1', metrics)
+        self.assertIn('qbit_prism_audit_artifact_bytes{kind="candidate"} 6', metrics)
+        self.assertIn('qbit_prism_audit_artifact_files{kind="candidate"} 2', metrics)
+        self.assertIn('qbit_prism_audit_artifact_bytes{kind="other"} 6', metrics)
+        self.assertIn('qbit_prism_audit_artifact_files{kind="other"} 1', metrics)
+        self.assertIn("qbit_prism_audit_artifact_scan_error 0", metrics)
+
     def test_send_error_includes_canonical_reason_id_data(self) -> None:
         server = coordinator()
         sent: list[dict[str, object]] = []
@@ -2608,6 +2637,18 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 client=state,
             )
 
+            live_files = sorted(Path(tempdir).glob("prism-live-audit-bundle-[0-9]*.json"))
+            self.assertEqual(len(live_files), 1)
+            self.assertEqual(list(Path(tempdir).glob("prism-live-audit-bundle-candidate-*.json")), [])
+            self.assertEqual(list(Path(tempdir).glob(".prism-live-audit-bundle-candidate-*.tmp")), [])
+            envelope = json.loads(live_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(envelope["schema"], "qbit.prism.live-audit-bundle-envelope.v1")
+            self.assertEqual(envelope["block_hash"], block_hash)
+            self.assertEqual(envelope["block_height"], 10)
+            self.assertEqual(envelope["audit_bundle_sha256"], "33" * 32)
+            self.assertNotIn("signed_coinbase_manifest", envelope)
+            self.assertEqual(server.latest_evidence["audit_bundle_path"], str(live_files[0]))
+
         self.assertTrue(rpc.submitted)
         self.assertEqual(
             build_kwargs[0]["witness_merkle_leaves_hex"],
@@ -2625,6 +2666,55 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertEqual(server.latest_evidence["persistence"]["block_count"], 1)
         self.assertEqual(server.latest_evidence["confirmation"]["confirmed_count"], 1)
+
+    def test_audit_retention_prunes_only_live_and_candidate_files(self) -> None:
+        server = coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.audit_live_bundle_retention = 2
+            server.audit_candidate_retention_seconds = 0
+            for index in range(4):
+                path = Path(tempdir) / f"prism-live-audit-bundle-{index + 1}-{'aa' * 32}.json"
+                path.write_text("{}", encoding="utf-8")
+                os.utime(path, (100 + index, 100 + index))
+            candidate = Path(tempdir) / f"prism-live-audit-bundle-candidate-{'bb' * 32}.json"
+            candidate.write_text("{}", encoding="utf-8")
+            temp_candidate = Path(tempdir) / f".prism-live-audit-bundle-candidate-{'bb' * 32}.json.tmp"
+            temp_candidate.write_text("{}", encoding="utf-8")
+            body = Path(tempdir) / f"prism-audit-bundle-body-{'cc' * 32}-{'dd' * 32}.json"
+            body.write_text("{}", encoding="utf-8")
+            segment = Path(tempdir) / f"prism-audit-share-segment-1-2-{'ee' * 32}.json"
+            segment.write_text("{}", encoding="utf-8")
+
+            server.prune_audit_artifacts()
+
+            live_names = sorted(path.name for path in Path(tempdir).glob("prism-live-audit-bundle-[0-9]*.json"))
+            self.assertEqual(
+                live_names,
+                [
+                    f"prism-live-audit-bundle-3-{'aa' * 32}.json",
+                    f"prism-live-audit-bundle-4-{'aa' * 32}.json",
+                ],
+            )
+            self.assertFalse(candidate.exists())
+            self.assertFalse(temp_candidate.exists())
+            self.assertTrue(body.exists())
+            self.assertTrue(segment.exists())
+
+    def test_audit_retention_zero_preserves_current_live_envelope(self) -> None:
+        server = coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.audit_live_bundle_retention = 0
+            old = Path(tempdir) / f"prism-live-audit-bundle-1-{'aa' * 32}.json"
+            old.write_text("{}", encoding="utf-8")
+            current = Path(tempdir) / f"prism-live-audit-bundle-2-{'bb' * 32}.json"
+            current.write_text("{}", encoding="utf-8")
+
+            server.prune_audit_artifacts(keep_live_path=current)
+
+            self.assertFalse(old.exists())
+            self.assertTrue(current.exists())
 
     def test_accepted_direct_block_refreshes_clean_job_after_submit_response(self) -> None:
         old_tip = "00" * 32

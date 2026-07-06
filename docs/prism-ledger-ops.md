@@ -97,21 +97,32 @@ databases. In particular, it drops the old `NOT NULL` constraint from
 `qbit_ctv_fanout_artifacts.anchor_vout` so fee-bearing, anchorless CTV fanouts
 can persist with `anchor_vout = NULL`.
 
+The same schema init path also adds bounded broadcast-attempt summaries to
+`qbit_ctv_fanout_artifacts`. Operators can tune retained detail rows with
+`PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT`; the summary columns retain total
+attempt count, latest package/result/error context, and per-status counts after
+old detail rows are no longer retained.
+
 If a block was mined while the old constraint was still present, backfill the
-missing fanout artifact rows from the persisted audit bundle or a local
-`prism-live-audit-bundle-*.json` file:
+missing fanout artifact rows from the persisted audit bundle, a local
+`prism-live-audit-bundle-*.json` envelope, or a local audit body file:
 
 ```bash
 PRISM_DATABASE_URL='postgres://...' \
 python3 -m lab.prism.backfill_ctv_fanouts --db-block-height 21883
 ```
 
-The repair tool also accepts `--db-block-hash <hash>` or local JSON paths. For a
-local candidate/final audit bundle whose filename does not include the block
-hash, pass `--path-block-hash <hash>`. The tool runs schema init by default
-before backfilling and then calls the same fenced `persist_ctv_fanout_manifest_set`
-path as the coordinator. Stop the active coordinator or otherwise ensure the
-repair process can acquire the ledger writer lease before running a backfill.
+The repair tool also accepts `--db-block-hash <hash>` or local JSON paths. Local
+paths may be full v1 bundles, live envelopes, legacy compact audit body refs,
+or `qbit.prism.audit-bundle.v2` proof bodies; the tool follows envelope
+`body_uri` pointers and reads `bundle_without_shares` from compact bodies
+because CTV backfill does not need share rows. For a local candidate/final
+audit bundle whose filename does not include the block hash, pass
+`--path-block-hash <hash>`. The tool runs schema init by default before
+backfilling and then calls the same fenced
+`persist_ctv_fanout_manifest_set` path as the coordinator. Stop the active
+coordinator or otherwise ensure the repair process can acquire the ledger
+writer lease before running a backfill.
 
 ## Compaction and Archive Contract
 

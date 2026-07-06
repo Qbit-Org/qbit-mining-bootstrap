@@ -11,16 +11,19 @@ import threading
 import time
 import unittest
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from lab.prism.backfill_ctv_fanouts import backfill_input_from_payload, infer_block_hash_from_path
+from lab.prism.backfill_ctv_fanouts import backfill_input_from_path, backfill_input_from_payload, infer_block_hash_from_path
 from lab.prism import public_api
 from lab.prism.share_ledger import (
+    AUDIT_BODY_REF_SCHEMA,
+    AUDIT_BUNDLE_V2_SCHEMA,
     PendingShare,
     PsqlShareLedger,
+    AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
     SingleWriterShareLedger,
     _prism_window_shares,
     sha256_json_hex,
@@ -369,6 +372,39 @@ class PrismShareLedgerTests(unittest.TestCase):
             "dd" * 32,
         )
 
+    def test_ctv_backfill_path_follows_live_envelope_to_compact_body_ref(self) -> None:
+        manifest_set = sample_no_anchor_fee_ctv_manifest_set()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            body_ref = {
+                "schema": AUDIT_BODY_REF_SCHEMA,
+                "bundle_without_shares": {
+                    "schema": "qbit.prism.audit-bundle.v1",
+                    "found_block": {"block_hash": "aa" * 32},
+                    "ctv_fanout_manifest_set": manifest_set,
+                },
+                "share_parts": [],
+                "share_count": 0,
+            }
+            body_path = root / f"prism-audit-bundle-body-{'aa' * 32}-{'bb' * 32}.json"
+            body_path.write_text(json.dumps(body_ref), encoding="utf-8")
+            envelope_path = root / f"prism-live-audit-bundle-10-{'aa' * 32}.json"
+            envelope_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "qbit.prism.live-audit-bundle-envelope.v1",
+                        "block_hash": "aa" * 32,
+                        "body_uri": str(body_path),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            item = backfill_input_from_path(envelope_path)
+
+        self.assertEqual(item.block_hash, "aa" * 32)
+        self.assertEqual(item.manifest_set, manifest_set)
+
     def test_ctv_backfill_requires_block_hash(self) -> None:
         with self.assertRaisesRegex(ValueError, "block hash"):
             backfill_input_from_payload(
@@ -468,12 +504,71 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         self.assertIsNotNone(status)
         self.assertEqual(status["settlement_status"], "failed")  # type: ignore[index]
+        self.assertEqual(status["broadcast_attempt_count"], 1)  # type: ignore[index]
+        self.assertEqual(status["broadcast_attempt_detail_count"], 1)  # type: ignore[index]
+        self.assertEqual(status["last_broadcast_attempt_status"], "rejected")  # type: ignore[index]
+        self.assertEqual(status["last_broadcast_error"], "insufficient fee")  # type: ignore[index]
+        self.assertEqual(status["broadcast_attempt_summary"]["attempt_count"], 1)  # type: ignore[index]
         self.assertEqual(status["broadcast_attempts"][0]["attempt_status"], "rejected")  # type: ignore[index]
         self.assertEqual(status["broadcast_attempts"][0]["package_tx_hexes"], ["parent", "child"])  # type: ignore[index]
-        self.assertEqual(pending[0]["fanout_txid"], fanout_txid)
+        self.assertEqual(pending, [])
 
         ledger.update_ctv_fanout_status(fanout_txid=fanout_txid, settlement_status="confirmed")
         self.assertEqual(ledger.pending_ctv_fanout_statuses(), [])
+
+    def test_memory_ledger_caps_ctv_fanout_broadcast_attempt_details(self) -> None:
+        ledger = SingleWriterShareLedger(ctv_broadcast_attempt_detail_limit=2)
+        fanout_txid = "22" * 32
+        ledger.persist_ctv_fanout_manifest_set(
+            block_hash="aa" * 32,
+            manifest_set=sample_ctv_manifest_set(),
+            manifest_set_sha256="66" * 32,
+        )
+
+        for index in range(4):
+            ledger.record_ctv_fanout_broadcast_attempt(
+                fanout_txid=fanout_txid,
+                attempt_status="planned",
+                package_txids=[fanout_txid],
+                submit_result={"package_msg": "error", "submitted": False},
+                error=f"transient-{index}",
+            )
+
+        status = ledger.ctv_fanout_status(fanout_txid=fanout_txid)
+        assert status is not None
+        self.assertEqual(status["broadcast_attempt_count"], 4)
+        self.assertEqual(status["broadcast_attempt_detail_count"], 2)
+        self.assertEqual(status["last_broadcast_error"], "transient-3")
+        self.assertEqual([row["attempt_seq"] for row in status["broadcast_attempts"]], [3, 4])
+        self.assertEqual(status["broadcast_attempt_summary"]["status_counts"]["planned"], 4)  # type: ignore[index]
+
+    def test_memory_ledger_ctv_broadcast_pending_respects_retry_backoff(self) -> None:
+        ledger = SingleWriterShareLedger(ctv_broadcast_retry_backoff_seconds=300)
+        fanout_txid = "22" * 32
+        ledger.persist_ctv_fanout_manifest_set(
+            block_hash="aa" * 32,
+            manifest_set=sample_ctv_manifest_set(),
+            manifest_set_sha256="66" * 32,
+        )
+
+        ledger.record_ctv_fanout_broadcast_attempt(
+            fanout_txid=fanout_txid,
+            attempt_status="planned",
+            package_txids=[fanout_txid],
+            submit_result={"package_msg": "error", "submitted": False},
+            error="transient",
+        )
+        self.assertEqual(ledger.pending_ctv_fanout_statuses(), [])
+        self.assertEqual(ledger.dashboard_pending_fanout_rows(page=1, limit=10)["rows"], [])
+
+        ledger._ctv_fanout_statuses[fanout_txid]["next_broadcast_attempt_at"] = (  # type: ignore[attr-defined]
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        )
+        self.assertEqual(ledger.pending_ctv_fanout_statuses()[0]["fanout_txid"], fanout_txid)
+        self.assertEqual(
+            ledger.dashboard_pending_fanout_rows(page=1, limit=10)["rows"][0]["fanout_txid"],
+            fanout_txid,
+        )
 
     def test_postgres_miner_worker_query_treats_percent_and_underscore_literally(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
@@ -767,7 +862,71 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         self.assertEqual(payload["pagination"], {"page": 1, "limit": 15, "total_count": 0, "total_pages": 0})
         self.assertIn("'broadcast_attempts'", query)
+        self.assertIn("'broadcast_attempt_summary'", query)
+        self.assertIn("broadcast_attempt_count", query)
         self.assertIn("qbit_ctv_fanout_broadcast_attempts", query)
+        self.assertIn("settlement_status NOT IN ('confirmed', 'reorged', 'failed')", query)
+        self.assertIn("artifact.next_broadcast_attempt_at IS NULL", query)
+        self.assertIn("artifact.next_broadcast_attempt_at <= clock_timestamp()", query)
+
+    def test_postgres_ctv_broadcast_pending_respects_retry_backoff(self) -> None:
+        ledger = FakeLeasePsqlShareLedger([acquired_lease(), []])
+
+        self.assertEqual(ledger.pending_ctv_fanout_statuses(), [])
+        query = ledger.lease_queries[-1]
+
+        self.assertIn("artifact.next_broadcast_attempt_at IS NULL", query)
+        self.assertIn("artifact.next_broadcast_attempt_at <= clock_timestamp()", query)
+        self.assertIn("settlement_status NOT IN ('confirmed', 'reorged', 'failed')", query)
+
+    def test_postgres_records_ctv_broadcast_summary_and_caps_detail_rows(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "backend": "postgres-psql",
+                    "attempt_count": 1,
+                    "updated_count": 1,
+                    "broadcast_attempt_count": 5,
+                    "broadcast_attempt_detail_count": 2,
+                },
+            ],
+            ctv_broadcast_attempt_detail_limit=2,
+            ctv_broadcast_retry_backoff_seconds=17,
+        )
+
+        payload = ledger.record_ctv_fanout_broadcast_attempt(
+            fanout_txid="22" * 32,
+            attempt_status="planned",
+            package_txids=["22" * 32],
+            submit_result={"package_msg": "error", "submitted": False},
+            error="rpc unavailable",
+        )
+        query = ledger.lease_queries[-1]
+
+        self.assertEqual(payload["attempt_count"], 1)
+        self.assertIn('"attempt_detail_limit":2', query)
+        self.assertIn('"retry_backoff_seconds":17', query)
+        self.assertIn("last_broadcast_attempt_status = data->>'attempt_status'", query)
+        self.assertIn("last_broadcast_error = data->>'error'", query)
+        self.assertIn("broadcast_attempt_status_counts = jsonb_set", query)
+        self.assertIn("OFFSET GREATEST((data->>'attempt_detail_limit')::integer - 1, 0)", query)
+        self.assertIn("next_broadcast_attempt_at = CASE", query)
+        self.assertIn("unknown CTV fanout txid", query)
+
+    def test_postgres_ctv_broadcast_attempt_rejects_unknown_fanout(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"error": "unknown CTV fanout txid"},
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unknown CTV fanout txid"):
+            ledger.record_ctv_fanout_broadcast_attempt(
+                fanout_txid="22" * 32,
+                attempt_status="planned",
+            )
 
     def test_postgres_miner_earnings_block_gross_keeps_reversed_rows_in_denominator(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
@@ -1021,6 +1180,141 @@ class PrismShareLedgerTests(unittest.TestCase):
             self.assertEqual(resolved["audit_bundle"], bundle)
             self.assertNotIn("body_uri", resolved)
 
+    def test_psql_compact_audit_body_writes_v2_range_proof_and_resolves_v1_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = {
+                "schema": "qbit.prism.audit-bundle.v1",
+                "shares": [
+                    {"share_seq": 1, "share_id": "s1"},
+                    {"share_seq": 2, "share_id": "s2"},
+                    {"share_seq": 3, "share_id": "s3"},
+                    {"share_seq": 4, "share_id": "s4"},
+                    {"share_seq": 5, "share_id": "s5"},
+                ],
+                "found_block": {"bits": "207fffff"},
+                "settlement_mode_decision": {"mode": "direct_coinbase"},
+            }
+            body_sha = fake_audit_bundle_sha256(bundle)
+            writer = FakeLeasePsqlShareLedger(
+                [acquired_lease(), {"existing_block": False, "existing_body_uri": None}],
+                audit_body_dir=tmp,
+                audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+                audit_share_segment_size=2,
+            )
+            body_uri = writer._prepare_external_audit_body(
+                {
+                    "block_hash": "aa" * 32,
+                    "audit_bundle_sha256": body_sha,
+                    "coinbase_tx_hex": "00",
+                    "coinbase_txid": "11" * 32,
+                    "payout_manifest_sha256": "22" * 32,
+                    "block_height": 10,
+                    "parent_hash": "bb" * 32,
+                    "writer_id": writer._writer_id,
+                    "writer_epoch": writer._writer_epoch,
+                    "writer_session_token": writer._writer_session_token,
+                },
+                bundle,
+            )
+            assert body_uri is not None
+            body_path = Path(body_uri)
+            artifact = json.loads(body_path.read_text(encoding="utf-8"))
+            self.assertEqual(artifact["schema"], AUDIT_BUNDLE_V2_SCHEMA)
+            self.assertEqual(artifact["share_count"], 5)
+            self.assertNotIn("shares", artifact["bundle_without_shares"])
+            proof = artifact["share_window_proof"]
+            self.assertEqual(proof["schema"], AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA)
+            self.assertEqual([part["kind"] for part in proof["share_parts"]], ["segment_range", "segment_range", "segment_range"])
+            segment_files = sorted(Path(tmp).glob("prism-audit-share-segment-slot-*.json"))
+            self.assertEqual(len(segment_files), 3)
+            self.assertNotIn('"kind":"inline"', body_path.read_text(encoding="utf-8"))
+
+            reader = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                audit_body_dir=tmp,
+                audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+            )
+            resolved = reader._read_external_body(body_uri, expected_sha256=body_sha)
+            self.assertEqual(resolved, bundle)
+
+    def test_psql_v2_range_segments_grow_without_breaking_old_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first_bundle = {
+                "schema": "qbit.prism.audit-bundle.v1",
+                "shares": [
+                    {"share_seq": 1, "share_id": "s1"},
+                    {"share_seq": 2, "share_id": "s2"},
+                    {"share_seq": 3, "share_id": "s3"},
+                ],
+            }
+            second_bundle = {
+                "schema": "qbit.prism.audit-bundle.v1",
+                "shares": [
+                    {"share_seq": 2, "share_id": "s2"},
+                    {"share_seq": 3, "share_id": "s3"},
+                    {"share_seq": 4, "share_id": "s4"},
+                ],
+            }
+            first_sha = fake_audit_bundle_sha256(first_bundle)
+            second_sha = fake_audit_bundle_sha256(second_bundle)
+            writer = FakeLeasePsqlShareLedger(
+                [
+                    acquired_lease(),
+                    {"existing_block": False, "existing_body_uri": None},
+                    {"existing_block": False, "existing_body_uri": None},
+                ],
+                audit_body_dir=tmp,
+                audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+                audit_share_segment_size=2,
+            )
+            first_uri = writer._prepare_external_audit_body(
+                {
+                    "block_hash": "aa" * 32,
+                    "audit_bundle_sha256": first_sha,
+                    "coinbase_tx_hex": "00",
+                    "coinbase_txid": "11" * 32,
+                    "payout_manifest_sha256": "22" * 32,
+                    "block_height": 10,
+                    "parent_hash": "bb" * 32,
+                    "writer_id": writer._writer_id,
+                    "writer_epoch": writer._writer_epoch,
+                    "writer_session_token": writer._writer_session_token,
+                },
+                first_bundle,
+            )
+            second_uri = writer._prepare_external_audit_body(
+                {
+                    "block_hash": "cc" * 32,
+                    "audit_bundle_sha256": second_sha,
+                    "coinbase_tx_hex": "00",
+                    "coinbase_txid": "33" * 32,
+                    "payout_manifest_sha256": "44" * 32,
+                    "block_height": 11,
+                    "parent_hash": "aa" * 32,
+                    "writer_id": writer._writer_id,
+                    "writer_epoch": writer._writer_epoch,
+                    "writer_session_token": writer._writer_session_token,
+                },
+                second_bundle,
+            )
+            assert first_uri is not None
+            assert second_uri is not None
+            segment_files = sorted(Path(tmp).glob("prism-audit-share-segment-slot-*.json"))
+            self.assertEqual([path.name for path in segment_files], [
+                "prism-audit-share-segment-slot-1-2.json",
+                "prism-audit-share-segment-slot-3-4.json",
+            ])
+            slot_3_4 = json.loads((Path(tmp) / "prism-audit-share-segment-slot-3-4.json").read_text(encoding="utf-8"))
+            self.assertEqual([share["share_seq"] for share in slot_3_4["shares"]], [3, 4])
+
+            reader = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                audit_body_dir=tmp,
+                audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+            )
+            self.assertEqual(reader._read_external_body(first_uri, expected_sha256=first_sha), first_bundle)
+            self.assertEqual(reader._read_external_body(second_uri, expected_sha256=second_sha), second_bundle)
+
     def test_psql_public_artifact_resolves_external_audit_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             writer = FakeLeasePsqlShareLedger(
@@ -1050,6 +1344,162 @@ class PrismShareLedgerTests(unittest.TestCase):
             self.assertEqual(ledger.dashboard_public_artifact(sha256=body_sha), bundle)
             query = ledger.lease_queries[-1]
             self.assertIn("SELECT audit_bundle, audit_bundle_sha256, body_uri", query)
+
+    def test_psql_public_artifact_exists_uses_metadata_only(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "has_audit_row": True,
+                    "audit_bundle_inline": True,
+                    "body_uri": None,
+                    "fallback_exists": False,
+                },
+            ]
+        )
+
+        self.assertTrue(ledger.dashboard_public_artifact_exists(sha256="aa" * 32))
+        query = ledger.lease_queries[-1]
+        self.assertIn("FROM qbit_pool_audit_bundles", query)
+        self.assertIn("body_uri", query)
+
+    def test_psql_public_artifact_exists_rejects_missing_external_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = FakeLeasePsqlShareLedger(
+                [
+                    acquired_lease(),
+                    {
+                        "has_audit_row": True,
+                        "audit_bundle_inline": False,
+                        "body_uri": str(Path(tmp) / "missing.json"),
+                        "fallback_exists": False,
+                    },
+                ],
+                audit_body_dir=tmp,
+            )
+
+            self.assertFalse(ledger.dashboard_public_artifact_exists(sha256="aa" * 32))
+
+    def test_psql_public_artifact_exists_validates_compact_body_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            segment = {
+                "schema": "qbit.prism.audit-share-segment.v1",
+                "first_share_seq": 1,
+                "last_share_seq": 1,
+                "share_count": 1,
+                "shares": [{"share_seq": 1, "share_id": "s1"}],
+            }
+            segment_bytes = json.dumps(segment, separators=(",", ":")).encode("utf-8")
+            segment_sha256 = hashlib.sha256(segment_bytes).hexdigest()
+            segment_path = root / f"prism-audit-share-segment-1-1-{segment_sha256}.json"
+            segment_path.write_bytes(segment_bytes)
+            body_ref = {
+                "schema": AUDIT_BODY_REF_SCHEMA,
+                "audit_bundle_sha256": "aa" * 32,
+                "bundle_without_shares": {"schema": "qbit.prism.audit-bundle.v1"},
+                "share_count": 1,
+                "share_parts": [
+                    {
+                        "kind": "segment",
+                        "first_share_seq": 1,
+                        "last_share_seq": 1,
+                        "share_count": 1,
+                        "sha256": segment_sha256,
+                        "body_uri": str(segment_path),
+                    }
+                ],
+            }
+            body_path = root / f"prism-audit-bundle-body-{'bb' * 32}-{'aa' * 32}.json"
+            body_path.write_text(json.dumps(body_ref, separators=(",", ":")), encoding="utf-8")
+            ledger = FakeLeasePsqlShareLedger(
+                [
+                    acquired_lease(),
+                    {
+                        "has_audit_row": True,
+                        "audit_bundle_inline": False,
+                        "body_uri": str(body_path),
+                        "fallback_exists": False,
+                    },
+                ],
+                audit_body_dir=tmp,
+            )
+
+            self.assertTrue(ledger.dashboard_public_artifact_exists(sha256="aa" * 32))
+            segment_path.unlink()
+            ledger = FakeLeasePsqlShareLedger(
+                [
+                    acquired_lease(),
+                    {
+                        "has_audit_row": True,
+                        "audit_bundle_inline": False,
+                        "body_uri": str(body_path),
+                        "fallback_exists": False,
+                    },
+                ],
+                audit_body_dir=tmp,
+            )
+            self.assertFalse(ledger.dashboard_public_artifact_exists(sha256="aa" * 32))
+
+    def test_psql_public_artifact_exists_rejects_overstated_inline_share_count(self) -> None:
+        body_ref = {
+            "schema": AUDIT_BODY_REF_SCHEMA,
+            "audit_bundle_sha256": "aa" * 32,
+            "bundle_without_shares": {"schema": "qbit.prism.audit-bundle.v1"},
+            "share_count": 2,
+            "share_parts": [
+                {
+                    "kind": "inline",
+                    "first_share_seq": 1,
+                    "last_share_seq": 2,
+                    "share_count": 2,
+                    "shares": [{"share_seq": 1, "share_id": "s1"}],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            body_path = Path(tmp) / "body-ref.json"
+            body_path.write_text(json.dumps(body_ref, separators=(",", ":")), encoding="utf-8")
+            ledger = FakeLeasePsqlShareLedger([acquired_lease()], audit_body_dir=tmp)
+
+            self.assertFalse(ledger._external_body_available_for_sha(str(body_path), "aa" * 32))
+
+    def test_psql_body_ref_respects_zero_shares_key_index(self) -> None:
+        bundle = {
+            "shares": [{"share_seq": 1, "share_id": "s1"}],
+            "schema": "qbit.prism.audit-bundle.v1",
+            "found_block": {"bits": "207fffff"},
+        }
+        body_sha = fake_audit_bundle_sha256(bundle)
+        body_ref = {
+            "schema": AUDIT_BODY_REF_SCHEMA,
+            "audit_bundle_sha256": body_sha,
+            "share_count": 1,
+            "shares_key_index": 0,
+            "bundle_without_shares": {
+                "schema": "qbit.prism.audit-bundle.v1",
+                "found_block": {"bits": "207fffff"},
+            },
+            "share_parts": [
+                {
+                    "kind": "inline",
+                    "first_share_seq": 1,
+                    "last_share_seq": 1,
+                    "share_count": 1,
+                    "shares": [{"share_seq": 1, "share_id": "s1"}],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            body_path = Path(tmp) / "body-ref.json"
+            body_path.write_text(json.dumps(body_ref, separators=(",", ":")), encoding="utf-8")
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                audit_body_dir=tmp,
+                audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+            )
+
+            self.assertEqual(ledger._read_external_body(str(body_path), expected_sha256=body_sha), bundle)
 
     def test_psql_external_body_hash_mismatch_fails_readers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1221,9 +1671,11 @@ class PrismShareLedgerTests(unittest.TestCase):
                 [acquired_lease(), {"error": "writer lease is not active"}],
                 audit_body_dir=tmp,
                 audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+                audit_share_segment_size=1,
             )
             bundle = {
                 "schema": "qbit.prism.audit-bundle.v1",
+                "shares": [{"share_seq": 1, "share_id": "s1"}],
                 "signed_coinbase_manifest": {"manifest": {"payout_count": 0}},
                 "payout_policy_manifest": {"accounts": []},
             }
@@ -1243,6 +1695,7 @@ class PrismShareLedgerTests(unittest.TestCase):
                     audit_report=report,
                 )
             self.assertEqual(list(Path(tmp).glob("prism-audit-bundle-body-*.json")), [])
+            self.assertEqual(list(Path(tmp).glob("prism-audit-share-segment-*.json")), [])
 
     def test_psql_external_body_path_must_stay_under_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -21,6 +21,14 @@ from typing import Any, Callable
 
 from lab.prism.prism_tools import prism_tool_command
 
+AUDIT_BODY_REF_SCHEMA = "qbit.prism.audit-body-ref.v1"
+AUDIT_BUNDLE_V2_SCHEMA = "qbit.prism.audit-bundle.v2"
+AUDIT_SHARE_SEGMENT_SCHEMA = "qbit.prism.audit-share-segment.v1"
+AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA = "qbit.prism.window-completeness-proof.v1"
+DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
+DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
+DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
+
 
 @dataclass(frozen=True)
 class AcceptedShareRecord:
@@ -83,9 +91,23 @@ class SingleWriterShareLedger:
     while moving storage to `qbit_share_ledger`.
     """
 
-    def __init__(self, *, first_share_seq: int = 1):
+    def __init__(
+        self,
+        *,
+        first_share_seq: int = 1,
+        ctv_broadcast_attempt_detail_limit: int = DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
+        ctv_broadcast_retry_backoff_seconds: int = DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+    ):
         if first_share_seq < 1:
             raise ValueError("first_share_seq must be >= 1")
+        ctv_broadcast_attempt_detail_limit = int(ctv_broadcast_attempt_detail_limit)
+        if ctv_broadcast_attempt_detail_limit < 0:
+            raise ValueError("ctv_broadcast_attempt_detail_limit must be non-negative")
+        ctv_broadcast_retry_backoff_seconds = int(ctv_broadcast_retry_backoff_seconds)
+        if ctv_broadcast_retry_backoff_seconds < 0:
+            raise ValueError("ctv_broadcast_retry_backoff_seconds must be non-negative")
+        self._ctv_broadcast_attempt_detail_limit = ctv_broadcast_attempt_detail_limit
+        self._ctv_broadcast_retry_backoff_seconds = ctv_broadcast_retry_backoff_seconds
         self._next_share_seq = first_share_seq
         self._shares: list[AcceptedShareRecord] = []
         self._share_ids: set[str] = set()
@@ -209,9 +231,16 @@ class SingleWriterShareLedger:
                     else "awaiting_maturity",
                     "broadcast_attempts": self._ctv_fanout_attempts.get(fanout_txid, []),
                 }
+                if existing_status:
+                    for key in _ctv_broadcast_summary_fields():
+                        if key in existing_status:
+                            status_payload[key] = copy.deepcopy(existing_status[key])
+                else:
+                    status_payload.update(_empty_ctv_broadcast_summary())
                 audit_bundle_sha256 = payload.get("audit_bundle_sha256")
                 if audit_bundle_sha256 is not None:
                     status_payload["audit_bundle_sha256"] = audit_bundle_sha256
+                status_payload["broadcast_attempt_summary"] = _ctv_broadcast_attempt_summary(status_payload)
                 self._ctv_fanout_statuses[fanout_txid] = status_payload
         return {
             "backend": "memory",
@@ -238,11 +267,13 @@ class SingleWriterShareLedger:
 
     def pending_ctv_fanout_statuses(self, *, limit: int = 100) -> list[dict[str, object]]:
         limit = max(1, min(int(limit), 1_000))
+        now = datetime.now(timezone.utc)
         with self._lock:
             rows = [
                 copy.deepcopy(payload)
                 for payload in self._ctv_fanout_statuses.values()
-                if payload.get("settlement_status") not in {"confirmed", "reorged"}
+                if payload.get("settlement_status") not in {"confirmed", "reorged", "failed"}
+                and _ctv_broadcast_attempt_due(payload.get("next_broadcast_attempt_at"), now)
             ]
         rows.sort(key=lambda row: (str(row.get("block_hash", "")), int(row.get("chunk_index", 0))))
         return rows[:limit]
@@ -250,11 +281,13 @@ class SingleWriterShareLedger:
     def dashboard_pending_fanout_rows(self, *, page: int, limit: int) -> dict[str, object]:
         from lab.prism import public_api
 
+        now = datetime.now(timezone.utc)
         with self._lock:
             rows = [
                 copy.deepcopy(payload)
                 for payload in self._ctv_fanout_statuses.values()
-                if payload.get("settlement_status") not in {"confirmed", "reorged"}
+                if payload.get("settlement_status") not in {"confirmed", "reorged", "failed"}
+                and _ctv_broadcast_attempt_due(payload.get("next_broadcast_attempt_at"), now)
             ]
         rows.sort(key=lambda row: (str(row.get("block_hash", "")), int(row.get("chunk_index", 0))))
         offset = (page - 1) * limit
@@ -303,21 +336,56 @@ class SingleWriterShareLedger:
             if fanout_txid not in self._ctv_fanout_statuses:
                 raise RuntimeError("unknown CTV fanout txid")
             attempts = self._ctv_fanout_attempts.setdefault(fanout_txid, [])
+            attempted_at = datetime.now(timezone.utc)
+            status_payload = self._ctv_fanout_statuses[fanout_txid]
+            total_attempts = int(status_payload.get("broadcast_attempt_count") or 0) + 1
             attempt = {
-                "attempt_seq": len(attempts) + 1,
+                "attempt_seq": total_attempts,
+                "attempted_at": attempted_at,
                 "attempt_status": attempt_status,
                 "package_tx_hexes": package_tx_hexes or [],
                 "package_txids": package_txids or [],
                 "submit_result": submit_result,
                 "error": error,
             }
-            attempts.append(attempt)
+            if self._ctv_broadcast_attempt_detail_limit > 0:
+                if len(attempts) >= self._ctv_broadcast_attempt_detail_limit:
+                    del attempts[0 : len(attempts) - self._ctv_broadcast_attempt_detail_limit + 1]
+                attempts.append(attempt)
+            counts = copy.deepcopy(status_payload.get("broadcast_attempt_status_counts") or {})
+            if not isinstance(counts, dict):
+                counts = {}
+            counts[attempt_status] = int(counts.get(attempt_status) or 0) + 1
+            next_attempt_at = None
+            retry_backoff_seconds = 0
+            if attempt_status == "planned" and self._ctv_broadcast_retry_backoff_seconds > 0:
+                retry_backoff_seconds = self._ctv_broadcast_retry_backoff_seconds
+                next_attempt_at = attempted_at + timedelta(seconds=retry_backoff_seconds)
+            status_payload.update(
+                {
+                    "broadcast_attempt_count": total_attempts,
+                    "broadcast_attempt_detail_count": len(attempts),
+                    "first_broadcast_attempt_at": status_payload.get("first_broadcast_attempt_at") or attempted_at,
+                    "last_broadcast_attempt_at": attempted_at,
+                    "last_broadcast_attempt_status": attempt_status,
+                    "last_broadcast_package_tx_hexes": package_tx_hexes or [],
+                    "last_broadcast_package_txids": package_txids or [],
+                    "last_broadcast_submit_result": submit_result,
+                    "last_broadcast_error": error,
+                    "broadcast_attempt_status_counts": counts,
+                    "next_broadcast_attempt_at": next_attempt_at,
+                    "broadcast_retry_backoff_seconds": retry_backoff_seconds,
+                }
+            )
             self._ctv_fanout_statuses[fanout_txid]["broadcast_attempts"] = copy.deepcopy(attempts)
             if attempt_status in {"submitted", "accepted"}:
                 self._ctv_fanout_statuses[fanout_txid]["settlement_status"] = "broadcast_submitted"
             elif attempt_status in {"rejected", "failed"}:
                 self._ctv_fanout_statuses[fanout_txid]["settlement_status"] = "failed"
-        return {"backend": "memory", "attempt_count": len(attempts)}
+            self._ctv_fanout_statuses[fanout_txid]["broadcast_attempt_summary"] = _ctv_broadcast_attempt_summary(
+                self._ctv_fanout_statuses[fanout_txid]
+            )
+        return {"backend": "memory", "attempt_count": 1, "updated_count": 1 if attempt_status in {"submitted", "accepted", "rejected", "failed"} else 0}
 
     def metrics(self) -> dict[str, int]:
         return {
@@ -329,6 +397,13 @@ class SingleWriterShareLedger:
             "reversed_blocks": 0,
             "payout_entries": 0,
             "owed_accounts": 0,
+            "ctv_fanouts_failed": len(
+                [
+                    payload
+                    for payload in self._ctv_fanout_statuses.values()
+                    if payload.get("settlement_status") == "failed"
+                ]
+            ),
         }
 
     def dashboard_pool_snapshot(
@@ -705,6 +780,9 @@ class PsqlShareLedger:
         read_concurrency: int = 4,
         audit_body_dir: str | Path | None = None,
         audit_bundle_canonicalizer: Callable[[dict[str, Any]], bytes] | None = None,
+        audit_share_segment_size: int = 0,
+        ctv_broadcast_attempt_detail_limit: int = DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
+        ctv_broadcast_retry_backoff_seconds: int = DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
     ):
         if writer_epoch < 0:
             raise ValueError("writer_epoch must be >= 0")
@@ -737,6 +815,18 @@ class PsqlShareLedger:
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         self._audit_body_dir = Path(audit_body_dir) if audit_body_dir else None
         self._audit_bundle_canonicalizer = audit_bundle_canonicalizer
+        audit_share_segment_size = int(audit_share_segment_size)
+        if audit_share_segment_size < 0:
+            raise ValueError("audit_share_segment_size must be non-negative")
+        self._audit_share_segment_size = audit_share_segment_size
+        ctv_broadcast_attempt_detail_limit = int(ctv_broadcast_attempt_detail_limit)
+        if ctv_broadcast_attempt_detail_limit < 0:
+            raise ValueError("ctv_broadcast_attempt_detail_limit must be non-negative")
+        self._ctv_broadcast_attempt_detail_limit = ctv_broadcast_attempt_detail_limit
+        ctv_broadcast_retry_backoff_seconds = int(ctv_broadcast_retry_backoff_seconds)
+        if ctv_broadcast_retry_backoff_seconds < 0:
+            raise ValueError("ctv_broadcast_retry_backoff_seconds must be non-negative")
+        self._ctv_broadcast_retry_backoff_seconds = ctv_broadcast_retry_backoff_seconds
         if initialize_schema:
             path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
             self._run_sql(path.read_text(encoding="utf-8"))
@@ -1825,6 +1915,32 @@ FROM (
         'fanout_output_sum_sats', artifact.fanout_output_sum_sats,
         'settlement_status', artifact.settlement_status,
         'updated_at', artifact.updated_at::text,
+        'broadcast_attempt_count', artifact.broadcast_attempt_count,
+        'broadcast_attempt_detail_count', artifact.broadcast_attempt_detail_count,
+        'first_broadcast_attempt_at', artifact.first_broadcast_attempt_at::text,
+        'last_broadcast_attempt_at', artifact.last_broadcast_attempt_at::text,
+        'last_broadcast_attempt_status', artifact.last_broadcast_attempt_status,
+        'last_broadcast_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+        'last_broadcast_package_txids', artifact.last_broadcast_package_txids,
+        'last_broadcast_submit_result', artifact.last_broadcast_submit_result,
+        'last_broadcast_error', artifact.last_broadcast_error,
+        'broadcast_attempt_status_counts', artifact.broadcast_attempt_status_counts,
+        'next_broadcast_attempt_at', artifact.next_broadcast_attempt_at::text,
+        'broadcast_retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds,
+        'broadcast_attempt_summary', json_build_object(
+            'attempt_count', artifact.broadcast_attempt_count,
+            'detail_count', artifact.broadcast_attempt_detail_count,
+            'first_attempt_at', artifact.first_broadcast_attempt_at::text,
+            'last_attempt_at', artifact.last_broadcast_attempt_at::text,
+            'last_attempt_status', artifact.last_broadcast_attempt_status,
+            'last_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+            'last_package_txids', artifact.last_broadcast_package_txids,
+            'last_submit_result', artifact.last_broadcast_submit_result,
+            'last_error', artifact.last_broadcast_error,
+            'status_counts', artifact.broadcast_attempt_status_counts,
+            'next_attempt_at', artifact.next_broadcast_attempt_at::text,
+            'retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds
+        ),
         'broadcast_attempts', COALESCE(
             (
                 SELECT json_agg(json_build_object(
@@ -1849,7 +1965,11 @@ FROM (
       ON block.block_hash = artifact.block_hash
     LEFT JOIN qbit_pool_audit_bundles bundle
       ON bundle.block_hash = artifact.block_hash
-    WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged')
+    WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged', 'failed')
+      AND (
+          artifact.next_broadcast_attempt_at IS NULL
+          OR artifact.next_broadcast_attempt_at <= clock_timestamp()
+      )
     ORDER BY block.block_height ASC, artifact.chunk_index ASC
     LIMIT {limit}
 ) pending;
@@ -1886,13 +2006,29 @@ WITH filtered AS (
         artifact.covenant_output_value_sats,
         artifact.fanout_output_sum_sats,
         artifact.settlement_status,
-        artifact.updated_at
+        artifact.updated_at,
+        artifact.broadcast_attempt_count,
+        artifact.broadcast_attempt_detail_count,
+        artifact.first_broadcast_attempt_at,
+        artifact.last_broadcast_attempt_at,
+        artifact.last_broadcast_attempt_status,
+        artifact.last_broadcast_package_tx_hexes,
+        artifact.last_broadcast_package_txids,
+        artifact.last_broadcast_submit_result,
+        artifact.last_broadcast_error,
+        artifact.broadcast_attempt_status_counts,
+        artifact.next_broadcast_attempt_at,
+        artifact.broadcast_retry_backoff_seconds
     FROM qbit_ctv_fanout_artifacts artifact
     JOIN qbit_pool_blocks block
       ON block.block_hash = artifact.block_hash
     LEFT JOIN qbit_pool_audit_bundles bundle
       ON bundle.block_hash = artifact.block_hash
-    WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged')
+    WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged', 'failed')
+      AND (
+          artifact.next_broadcast_attempt_at IS NULL
+          OR artifact.next_broadcast_attempt_at <= clock_timestamp()
+      )
 ),
 page_rows AS (
     SELECT *
@@ -1929,6 +2065,32 @@ SELECT json_build_object(
             'fanout_output_sum_sats', fanout_output_sum_sats,
             'settlement_status', settlement_status,
             'updated_at', updated_at::text,
+            'broadcast_attempt_count', broadcast_attempt_count,
+            'broadcast_attempt_detail_count', broadcast_attempt_detail_count,
+            'first_broadcast_attempt_at', first_broadcast_attempt_at::text,
+            'last_broadcast_attempt_at', last_broadcast_attempt_at::text,
+            'last_broadcast_attempt_status', last_broadcast_attempt_status,
+            'last_broadcast_package_tx_hexes', last_broadcast_package_tx_hexes,
+            'last_broadcast_package_txids', last_broadcast_package_txids,
+            'last_broadcast_submit_result', last_broadcast_submit_result,
+            'last_broadcast_error', last_broadcast_error,
+            'broadcast_attempt_status_counts', broadcast_attempt_status_counts,
+            'next_broadcast_attempt_at', next_broadcast_attempt_at::text,
+            'broadcast_retry_backoff_seconds', broadcast_retry_backoff_seconds,
+            'broadcast_attempt_summary', json_build_object(
+                'attempt_count', broadcast_attempt_count,
+                'detail_count', broadcast_attempt_detail_count,
+                'first_attempt_at', first_broadcast_attempt_at::text,
+                'last_attempt_at', last_broadcast_attempt_at::text,
+                'last_attempt_status', last_broadcast_attempt_status,
+                'last_package_tx_hexes', last_broadcast_package_tx_hexes,
+                'last_package_txids', last_broadcast_package_txids,
+                'last_submit_result', last_broadcast_submit_result,
+                'last_error', last_broadcast_error,
+                'status_counts', broadcast_attempt_status_counts,
+                'next_attempt_at', next_broadcast_attempt_at::text,
+                'retry_backoff_seconds', broadcast_retry_backoff_seconds
+            ),
             'broadcast_attempts', COALESCE(
                 (
                     SELECT json_agg(json_build_object(
@@ -2002,6 +2164,46 @@ SELECT json_build_object(
         fallback = row.get("fallback")
         return fallback if isinstance(fallback, dict) else None
 
+    def dashboard_public_artifact_exists(self, *, sha256: str) -> bool:
+        sha256 = str(sha256).lower()
+        lit = self._text_literal(sha256)
+        sql = f"""
+WITH audit AS (
+    SELECT audit_bundle, body_uri
+    FROM qbit_pool_audit_bundles
+    WHERE audit_bundle_sha256 = {lit}
+    ORDER BY created_at DESC
+    LIMIT 1
+)
+SELECT json_build_object(
+    'has_audit_row', (SELECT count(*) FROM audit) > 0,
+    'audit_bundle_inline', (SELECT audit_bundle IS NOT NULL FROM audit),
+    'body_uri', (SELECT body_uri FROM audit),
+    'fallback_exists',
+        EXISTS (
+            SELECT 1
+            FROM qbit_ctv_fanout_sets
+            WHERE manifest_set_sha256 = {lit}
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM qbit_ctv_fanout_artifacts
+            WHERE manifest_sha256 = {lit}
+        )
+);
+"""
+        row = self._run_read_json(sql)
+        if not isinstance(row, dict):
+            return False
+        if row.get("has_audit_row"):
+            if row.get("audit_bundle_inline"):
+                return True
+            body_uri = row.get("body_uri")
+            if not body_uri:
+                return False
+            return self._external_body_available_for_sha(body_uri, sha256)
+        return bool(row.get("fallback_exists"))
+
     def update_ctv_fanout_status(self, *, fanout_txid: str, settlement_status: str) -> dict[str, int | str]:
         validate_ctv_fanout_status(settlement_status)
         payload = {
@@ -2073,6 +2275,8 @@ END;
             "submit_result": submit_result,
             "error": error,
             "next_status": next_status,
+            "attempt_detail_limit": self._ctv_broadcast_attempt_detail_limit,
+            "retry_backoff_seconds": self._ctv_broadcast_retry_backoff_seconds,
             "writer_id": self._writer_id,
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
@@ -2092,6 +2296,32 @@ lease AS (
       AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
     RETURNING qbit_ledger_writer_lease.writer_id
 ),
+artifact_row AS (
+    SELECT fanout_txid
+    FROM qbit_ctv_fanout_artifacts
+    WHERE fanout_txid = (SELECT data->>'fanout_txid' FROM payload)
+),
+existing_detail_count AS (
+    SELECT count(*)::bigint AS detail_count
+    FROM qbit_ctv_fanout_broadcast_attempts
+    WHERE fanout_txid = (SELECT data->>'fanout_txid' FROM payload)
+),
+pruned AS (
+    DELETE FROM qbit_ctv_fanout_broadcast_attempts old_attempt
+    USING payload, artifact_row
+    WHERE old_attempt.fanout_txid = artifact_row.fanout_txid
+      AND old_attempt.attempt_seq IN (
+          SELECT retained.attempt_seq
+          FROM qbit_ctv_fanout_broadcast_attempts retained
+          WHERE retained.fanout_txid = artifact_row.fanout_txid
+          ORDER BY retained.attempt_seq DESC
+          OFFSET GREATEST((data->>'attempt_detail_limit')::integer - 1, 0)
+      )
+    RETURNING old_attempt.attempt_seq
+),
+pruned_count AS (
+    SELECT count(*)::bigint AS pruned_count FROM pruned
+),
 inserted AS (
     INSERT INTO qbit_ctv_fanout_broadcast_attempts (
         fanout_txid,
@@ -2108,26 +2338,72 @@ inserted AS (
         data->'package_txids',
         data->'submit_result',
         data->>'error'
-    FROM payload, lease
+    FROM payload, lease, artifact_row, pruned_count
+    WHERE (data->>'attempt_detail_limit')::integer > 0
     RETURNING attempt_seq
 ),
+inserted_count AS (
+    SELECT count(*)::bigint AS inserted_count FROM inserted
+),
 updated AS (
-    UPDATE qbit_ctv_fanout_artifacts
-    SET settlement_status = (SELECT data->>'next_status' FROM payload),
-        updated_at = clock_timestamp()
-    FROM inserted
-    WHERE fanout_txid = (SELECT data->>'fanout_txid' FROM payload)
-      AND (SELECT data->>'next_status' FROM payload) IS NOT NULL
-    RETURNING fanout_txid
+    UPDATE qbit_ctv_fanout_artifacts artifact
+    SET settlement_status = COALESCE(data->>'next_status', artifact.settlement_status),
+        updated_at = clock_timestamp(),
+        broadcast_attempt_count = artifact.broadcast_attempt_count + 1,
+        broadcast_attempt_detail_count = CASE
+            WHEN (data->>'attempt_detail_limit')::integer <= 0 THEN 0
+            ELSE LEAST(
+                (data->>'attempt_detail_limit')::bigint,
+                GREATEST(
+                    0,
+                    existing_detail_count.detail_count
+                    - pruned_count.pruned_count
+                    + inserted_count.inserted_count
+                )
+            )
+        END,
+        first_broadcast_attempt_at = COALESCE(artifact.first_broadcast_attempt_at, clock_timestamp()),
+        last_broadcast_attempt_at = clock_timestamp(),
+        last_broadcast_attempt_status = data->>'attempt_status',
+        last_broadcast_package_tx_hexes = data->'package_tx_hexes',
+        last_broadcast_package_txids = data->'package_txids',
+        last_broadcast_submit_result = data->'submit_result',
+        last_broadcast_error = data->>'error',
+        broadcast_attempt_status_counts = jsonb_set(
+            COALESCE(artifact.broadcast_attempt_status_counts, '{{}}'::jsonb),
+            ARRAY[data->>'attempt_status'],
+            to_jsonb(
+                COALESCE((artifact.broadcast_attempt_status_counts->>(data->>'attempt_status'))::bigint, 0)
+                + 1
+            ),
+            true
+        ),
+        next_broadcast_attempt_at = CASE
+            WHEN data->>'attempt_status' = 'planned'
+              AND (data->>'retry_backoff_seconds')::bigint > 0 THEN
+                clock_timestamp() + make_interval(secs => (data->>'retry_backoff_seconds')::double precision)
+            ELSE NULL
+        END,
+        broadcast_retry_backoff_seconds = CASE
+            WHEN data->>'attempt_status' = 'planned' THEN (data->>'retry_backoff_seconds')::bigint
+            ELSE 0
+        END
+    FROM payload, lease, artifact_row, existing_detail_count, pruned_count, inserted_count
+    WHERE artifact.fanout_txid = artifact_row.fanout_txid
+    RETURNING artifact.fanout_txid, artifact.broadcast_attempt_count, artifact.broadcast_attempt_detail_count
 )
 SELECT CASE
     WHEN (SELECT count(*) FROM lease) = 0 THEN
         json_build_object('error', 'writer lease is not active')
+    WHEN (SELECT count(*) FROM artifact_row) = 0 THEN
+        json_build_object('error', 'unknown CTV fanout txid')
     ELSE
         json_build_object(
             'backend', 'postgres-psql',
             'attempt_count', (SELECT count(*) FROM inserted),
-            'updated_count', (SELECT count(*) FROM updated)
+            'updated_count', (SELECT count(*) FROM updated),
+            'broadcast_attempt_count', (SELECT broadcast_attempt_count FROM updated LIMIT 1),
+            'broadcast_attempt_detail_count', (SELECT broadcast_attempt_detail_count FROM updated LIMIT 1)
         )
 END;
 """
@@ -2150,7 +2426,8 @@ SELECT json_build_object(
     'rejected_blocks', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'rejected'),
     'reversed_blocks', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'reversed'),
     'payout_entries', (SELECT count(*) FROM qbit_pool_payout_entries),
-    'owed_accounts', (SELECT count(*) FROM qbit_current_owed_balances() WHERE owed_balance_sats > 0)
+    'owed_accounts', (SELECT count(*) FROM qbit_current_owed_balances() WHERE owed_balance_sats > 0),
+    'ctv_fanouts_failed', (SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE settlement_status = 'failed')
 );
 """
         with self._lock:
@@ -2588,6 +2865,358 @@ FROM bucketed;
             )
         return body_bytes
 
+    def _external_audit_storage_bytes(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        final_bundle: dict[str, Any],
+        canonical_body_bytes: bytes,
+    ) -> bytes:
+        v2_bundle = self._audit_bundle_v2(
+            block_hash=block_hash,
+            audit_bundle_sha256=audit_bundle_sha256,
+            final_bundle=final_bundle,
+        )
+        if v2_bundle is not None:
+            return self._storage_json_bytes(v2_bundle)
+        body_ref = self._audit_body_ref(
+            block_hash=block_hash,
+            audit_bundle_sha256=audit_bundle_sha256,
+            final_bundle=final_bundle,
+        )
+        if body_ref is None:
+            return canonical_body_bytes
+        return self._storage_json_bytes(body_ref)
+
+    def _audit_body_ref(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        final_bundle: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self._audit_body_dir is None or self._audit_share_segment_size <= 0:
+            return None
+        shares = final_bundle.get("shares")
+        if not isinstance(shares, list) or not shares:
+            return None
+        share_parts = self._audit_share_parts(shares)
+        if share_parts is None or not any(part.get("kind") == "segment" for part in share_parts):
+            return None
+        bundle_without_shares = copy.deepcopy(final_bundle)
+        shares_key_index = list(bundle_without_shares).index("shares")
+        bundle_without_shares.pop("shares", None)
+        return {
+            "schema": AUDIT_BODY_REF_SCHEMA,
+            "block_hash": block_hash,
+            "audit_bundle_sha256": audit_bundle_sha256,
+            "audit_bundle_schema": str(final_bundle.get("schema") or ""),
+            "share_count": len(shares),
+            "share_segment_size": self._audit_share_segment_size,
+            "shares_key_index": shares_key_index,
+            "bundle_without_shares": bundle_without_shares,
+            "share_parts": share_parts,
+        }
+
+    def _audit_bundle_v2(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        final_bundle: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self._audit_body_dir is None or self._audit_share_segment_size <= 0:
+            return None
+        shares = final_bundle.get("shares")
+        if not isinstance(shares, list) or not shares:
+            return None
+        share_parts = self._audit_share_range_parts(shares)
+        if share_parts is None:
+            return None
+        bundle_without_shares = copy.deepcopy(final_bundle)
+        shares_key_index = list(bundle_without_shares).index("shares")
+        bundle_without_shares.pop("shares", None)
+        reward_manifest = final_bundle.get("reward_manifest")
+        proof: dict[str, Any] = {
+            "schema": AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
+            "share_segment_size": self._audit_share_segment_size,
+            "first_share_seq": int(shares[0]["share_seq"]),
+            "last_share_seq": int(shares[-1]["share_seq"]),
+            "share_count": len(shares),
+            "share_parts_digest_hex": sha256_bytes_hex(
+                self._storage_json_bytes({"share_parts": share_parts})
+            ),
+            "share_parts": share_parts,
+        }
+        if isinstance(reward_manifest, dict):
+            for key in (
+                "anchor_job_issued_at_ms",
+                "anchor_share_seq",
+                "newest_share_seq",
+                "oldest_share_seq",
+                "included_share_count",
+                "requested_window_weight",
+                "counted_window_weight",
+                "share_slice_digest_hex",
+            ):
+                if key in reward_manifest:
+                    proof[key] = copy.deepcopy(reward_manifest[key])
+        return {
+            "schema": AUDIT_BUNDLE_V2_SCHEMA,
+            "block_hash": block_hash,
+            "audit_bundle_sha256": audit_bundle_sha256,
+            "logical_audit_bundle_schema": str(final_bundle.get("schema") or ""),
+            "share_count": len(shares),
+            "shares_key_index": shares_key_index,
+            "bundle_without_shares": bundle_without_shares,
+            "share_window_proof": proof,
+        }
+
+    def _audit_share_parts(self, shares: list[Any]) -> list[dict[str, Any]] | None:
+        share_seqs: list[int] = []
+        for share in shares:
+            if not isinstance(share, dict):
+                return None
+            try:
+                share_seq = int(share["share_seq"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            share_seqs.append(share_seq)
+        if any(current + 1 != nxt for current, nxt in zip(share_seqs, share_seqs[1:])):
+            return None
+
+        parts: list[dict[str, Any]] = []
+        index = 0
+        segment_size = self._audit_share_segment_size
+        while index < len(shares):
+            first_seq = share_seqs[index]
+            segment_start = ((first_seq - 1) // segment_size) * segment_size + 1
+            segment_end = segment_start + segment_size - 1
+            end = index
+            while end < len(shares) and share_seqs[end] <= segment_end:
+                end += 1
+            chunk = shares[index:end]
+            chunk_seqs = share_seqs[index:end]
+            if len(chunk) == segment_size and chunk_seqs[0] == segment_start and chunk_seqs[-1] == segment_end:
+                segment_uri, segment_sha256 = self._write_audit_share_segment(
+                    first_share_seq=segment_start,
+                    last_share_seq=segment_end,
+                    shares=chunk,
+                )
+                parts.append(
+                    {
+                        "kind": "segment",
+                        "first_share_seq": segment_start,
+                        "last_share_seq": segment_end,
+                        "share_count": len(chunk),
+                        "sha256": segment_sha256,
+                        "body_uri": segment_uri,
+                    }
+                )
+            else:
+                parts.append(
+                    {
+                        "kind": "inline",
+                        "first_share_seq": chunk_seqs[0],
+                        "last_share_seq": chunk_seqs[-1],
+                        "share_count": len(chunk),
+                        "shares": copy.deepcopy(chunk),
+                    }
+                )
+            index = end
+        return parts
+
+    def _audit_share_range_parts(self, shares: list[Any]) -> list[dict[str, Any]] | None:
+        share_seqs: list[int] = []
+        for share in shares:
+            if not isinstance(share, dict):
+                return None
+            try:
+                share_seq = int(share["share_seq"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            share_seqs.append(share_seq)
+        if any(current + 1 != nxt for current, nxt in zip(share_seqs, share_seqs[1:])):
+            return None
+
+        parts: list[dict[str, Any]] = []
+        index = 0
+        segment_size = self._audit_share_segment_size
+        while index < len(shares):
+            first_seq = share_seqs[index]
+            segment_start = ((first_seq - 1) // segment_size) * segment_size + 1
+            segment_end = segment_start + segment_size - 1
+            end = index
+            while end < len(shares) and share_seqs[end] <= segment_end:
+                end += 1
+            chunk = shares[index:end]
+            chunk_seqs = share_seqs[index:end]
+            segment_uri, range_sha256 = self._write_audit_share_segment_range(
+                segment_first_share_seq=segment_start,
+                segment_last_share_seq=segment_end,
+                first_share_seq=chunk_seqs[0],
+                last_share_seq=chunk_seqs[-1],
+                shares=chunk,
+            )
+            parts.append(
+                {
+                    "kind": "segment_range",
+                    "segment_first_share_seq": segment_start,
+                    "segment_last_share_seq": segment_end,
+                    "first_share_seq": chunk_seqs[0],
+                    "last_share_seq": chunk_seqs[-1],
+                    "share_count": len(chunk),
+                    "range_sha256": range_sha256,
+                    "body_uri": segment_uri,
+                }
+            )
+            index = end
+        return parts
+
+    def _audit_share_segment_payload(self, *, first_share_seq: int, last_share_seq: int, shares: list[Any]) -> dict[str, Any]:
+        return {
+            "schema": AUDIT_SHARE_SEGMENT_SCHEMA,
+            "first_share_seq": first_share_seq,
+            "last_share_seq": last_share_seq,
+            "share_count": len(shares),
+            "shares": copy.deepcopy(shares),
+        }
+
+    def _write_audit_share_segment(
+        self,
+        *,
+        first_share_seq: int,
+        last_share_seq: int,
+        shares: list[Any],
+    ) -> tuple[str, str]:
+        if self._audit_body_dir is None:
+            raise RuntimeError("audit body store is not configured")
+        segment = self._audit_share_segment_payload(
+            first_share_seq=first_share_seq,
+            last_share_seq=last_share_seq,
+            shares=shares,
+        )
+        segment_bytes = self._storage_json_bytes(segment)
+        segment_sha256 = sha256_bytes_hex(segment_bytes)
+        segment_path = self._audit_body_dir.resolve() / (
+            f"prism-audit-share-segment-{first_share_seq}-{last_share_seq}-{segment_sha256}.json"
+        )
+        if segment_path.exists():
+            if segment_path.read_bytes() != segment_bytes:
+                raise RuntimeError(f"existing audit share segment does not match payload at {segment_path}")
+        else:
+            self._write_bytes_atomically(segment_path, segment_bytes)
+        return str(segment_path), segment_sha256
+
+    def _write_audit_share_segment_range(
+        self,
+        *,
+        segment_first_share_seq: int,
+        segment_last_share_seq: int,
+        first_share_seq: int,
+        last_share_seq: int,
+        shares: list[Any],
+    ) -> tuple[str, str]:
+        if self._audit_body_dir is None:
+            raise RuntimeError("audit body store is not configured")
+        if not shares:
+            raise RuntimeError("audit share segment range cannot be empty")
+        segment_path = self._audit_body_dir.resolve() / (
+            f"prism-audit-share-segment-slot-{segment_first_share_seq}-{segment_last_share_seq}.json"
+        )
+        merged_shares = copy.deepcopy(shares)
+        if segment_path.exists():
+            try:
+                existing = json.loads(segment_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"existing audit share segment is not valid JSON at {segment_path}") from exc
+            if not isinstance(existing, dict) or existing.get("schema") != AUDIT_SHARE_SEGMENT_SCHEMA:
+                raise RuntimeError(f"existing audit share segment has invalid schema at {segment_path}")
+            existing_shares = existing.get("shares")
+            if not isinstance(existing_shares, list):
+                raise RuntimeError(f"existing audit share segment has no shares at {segment_path}")
+            merged_shares = self._merge_audit_share_ranges(
+                existing_shares,
+                shares,
+                segment_path=segment_path,
+            )
+        segment_first = int(merged_shares[0]["share_seq"])
+        segment_last = int(merged_shares[-1]["share_seq"])
+        segment = self._audit_share_segment_payload(
+            first_share_seq=segment_first,
+            last_share_seq=segment_last,
+            shares=merged_shares,
+        )
+        segment_bytes = self._storage_json_bytes(segment)
+        if not segment_path.exists() or segment_path.read_bytes() != segment_bytes:
+            self._write_bytes_atomically(segment_path, segment_bytes)
+
+        range_payload = self._audit_share_segment_payload(
+            first_share_seq=first_share_seq,
+            last_share_seq=last_share_seq,
+            shares=shares,
+        )
+        range_sha256 = sha256_bytes_hex(self._storage_json_bytes(range_payload))
+        return str(segment_path), range_sha256
+
+    def _merge_audit_share_ranges(
+        self,
+        existing_shares: list[Any],
+        incoming_shares: list[Any],
+        *,
+        segment_path: Path,
+    ) -> list[Any]:
+        if not existing_shares:
+            return copy.deepcopy(incoming_shares)
+        existing_by_seq = self._audit_shares_by_seq(existing_shares, segment_path=segment_path)
+        incoming_by_seq = self._audit_shares_by_seq(incoming_shares, segment_path=segment_path)
+        for share_seq, incoming in incoming_by_seq.items():
+            existing = existing_by_seq.get(share_seq)
+            if existing is not None and existing != incoming:
+                raise RuntimeError(f"existing audit share segment conflicts at share_seq {share_seq} in {segment_path}")
+        merged_by_seq = {**existing_by_seq, **incoming_by_seq}
+        ordered_seqs = sorted(merged_by_seq)
+        if any(current + 1 != nxt for current, nxt in zip(ordered_seqs, ordered_seqs[1:])):
+            raise RuntimeError(f"existing audit share segment would become non-contiguous at {segment_path}")
+        return [copy.deepcopy(merged_by_seq[share_seq]) for share_seq in ordered_seqs]
+
+    def _audit_shares_by_seq(self, shares: list[Any], *, segment_path: Path) -> dict[int, Any]:
+        by_seq: dict[int, Any] = {}
+        for share in shares:
+            if not isinstance(share, dict):
+                raise RuntimeError(f"audit share segment has invalid share payload at {segment_path}")
+            try:
+                share_seq = int(share["share_seq"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"audit share segment has invalid share_seq at {segment_path}") from exc
+            existing = by_seq.get(share_seq)
+            if existing is not None and existing != share:
+                raise RuntimeError(f"audit share segment has duplicate conflicting share_seq {share_seq} at {segment_path}")
+            by_seq[share_seq] = copy.deepcopy(share)
+        ordered = sorted(by_seq)
+        if any(current + 1 != nxt for current, nxt in zip(ordered, ordered[1:])):
+            raise RuntimeError(f"audit share segment has non-contiguous share_seq values at {segment_path}")
+        return by_seq
+
+    def _storage_json_bytes(self, payload: dict[str, Any]) -> bytes:
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    def _write_bytes_atomically(self, path: Path, payload: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with tmp_path.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            tmp_path.replace(path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
     def _write_external_audit_body(
         self,
         block_hash: str,
@@ -2603,18 +3232,7 @@ FROM bucketed;
             if existing != body_bytes:
                 raise RuntimeError(f"existing audit bundle body does not match payload at {body_path}")
             return str(body_path)
-        tmp_path = body_path.with_name(f".{body_path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            with tmp_path.open("xb") as handle:
-                handle.write(body_bytes)
-                handle.flush()
-                os.fsync(handle.fileno())
-            tmp_path.replace(body_path)
-        finally:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
+        self._write_bytes_atomically(body_path, body_bytes)
         return str(body_path)
 
     def _canonical_audit_bundle_bytes(self, final_bundle: dict[str, Any]) -> bytes:
@@ -2734,6 +3352,11 @@ END;
             return None
         return str(self._audit_body_path(payload["block_hash"], payload["audit_bundle_sha256"]))
 
+    def _audit_body_byte_len(self, body_uri: object | None, final_bundle: dict[str, Any]) -> int:
+        if body_uri:
+            return self._resolve_audit_body_path(body_uri).stat().st_size
+        return len(self._canonical_audit_bundle_bytes(final_bundle))
+
     def _prepare_external_audit_body(
         self,
         payload: dict[str, Any],
@@ -2759,7 +3382,7 @@ END;
             return None
         body_path = self._resolve_audit_body_path(body_uri)
         if body_path.exists():
-            if body_path.read_bytes() != body_bytes:
+            if not self._external_body_matches_sha(body_path, str(payload["audit_bundle_sha256"])):
                 raise RuntimeError(f"existing audit bundle body does not match payload at {body_path}")
             return str(body_path)
         canonical_body_path = self._audit_body_path(
@@ -2771,10 +3394,16 @@ END;
                 "existing audit bundle body pointer does not match canonical external path: "
                 f"{body_uri}"
             )
+        storage_bytes = self._external_audit_storage_bytes(
+            block_hash=str(payload["block_hash"]),
+            audit_bundle_sha256=str(payload["audit_bundle_sha256"]),
+            final_bundle=final_bundle,
+            canonical_body_bytes=body_bytes,
+        )
         restored_body_uri = self._write_external_audit_body(
             str(payload["block_hash"]),
             str(payload["audit_bundle_sha256"]),
-            body_bytes,
+            storage_bytes,
         )
         if restored_body_uri is None:
             raise RuntimeError("audit body store is not configured")
@@ -2801,6 +3430,14 @@ END;
             raise RuntimeError(
                 f"audit bundle body is not retrievable at {body_uri}: {exc}"
             ) from exc
+        try:
+            body = json.loads(body_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: {exc}") from exc
+        if isinstance(body, dict) and body.get("schema") == AUDIT_BODY_REF_SCHEMA:
+            return self._resolve_audit_body_ref(body, expected_sha256=expected_sha256, body_uri=body_uri)
+        if isinstance(body, dict) and body.get("schema") == AUDIT_BUNDLE_V2_SCHEMA:
+            return self._resolve_audit_bundle_v2(body, expected_sha256=expected_sha256, body_uri=body_uri)
         if expected_sha256:
             expected = str(expected_sha256).lower()
             actual = sha256_bytes_hex(body_bytes)
@@ -2808,11 +3445,317 @@ END;
                 raise RuntimeError(
                     f"audit bundle body hash mismatch at {body_uri}: expected {expected}, got {actual}"
                 )
+        return body
+
+    def _external_body_matches_sha(self, body_path: Path, expected_sha256: str) -> bool:
+        try:
+            self._read_external_body(str(body_path), expected_sha256=expected_sha256)
+        except RuntimeError:
+            return False
+        return True
+
+    def _external_body_available_for_sha(self, body_uri: object, expected_sha256: str) -> bool:
+        try:
+            body_path = self._resolve_audit_body_path(body_uri)
+            body_bytes = body_path.read_bytes()
+        except (OSError, RuntimeError):
+            return False
         try:
             body = json.loads(body_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            body = None
+        if isinstance(body, dict) and body.get("schema") == AUDIT_BODY_REF_SCHEMA:
+            if str(body.get("audit_bundle_sha256") or "").lower() != expected_sha256:
+                return False
+            bundle_without_shares = body.get("bundle_without_shares")
+            share_parts = body.get("share_parts")
+            if not isinstance(bundle_without_shares, dict) or not isinstance(share_parts, list):
+                return False
+            expected_share_count = int(body.get("share_count") or 0)
+            actual_share_count = 0
+            for part in share_parts:
+                if not isinstance(part, dict):
+                    return False
+                kind = part.get("kind")
+                if kind == "segment":
+                    if not self._audit_share_segment_available(part, parent_body_uri=body_uri):
+                        return False
+                elif kind in {"segment_range", "segment_prefix"}:
+                    if not self._audit_share_segment_available(part, parent_body_uri=body_uri):
+                        return False
+                elif kind == "inline":
+                    inline_shares = part.get("shares")
+                    if not isinstance(inline_shares, list) or len(inline_shares) != int(part.get("share_count") or 0):
+                        return False
+                else:
+                    return False
+                actual_share_count += int(part.get("share_count") or 0)
+            return actual_share_count == expected_share_count
+        if isinstance(body, dict) and body.get("schema") == AUDIT_BUNDLE_V2_SCHEMA:
+            try:
+                self._resolve_audit_bundle_v2(body, expected_sha256=expected_sha256, body_uri=body_uri)
+            except RuntimeError:
+                return False
+            return True
+        return sha256_bytes_hex(body_bytes) == expected_sha256
+
+    def _audit_share_segment_available(self, part: dict[str, Any], *, parent_body_uri: object) -> bool:
+        try:
+            self._read_audit_share_segment(part, parent_body_uri=parent_body_uri)
+        except RuntimeError:
+            return False
+        return True
+
+    def _resolve_audit_body_ref(
+        self,
+        body_ref: dict[str, Any],
+        *,
+        expected_sha256: object | None,
+        body_uri: object,
+    ) -> dict[str, object]:
+        expected = str(expected_sha256).lower() if expected_sha256 else None
+        declared_sha256 = str(body_ref.get("audit_bundle_sha256") or "").lower()
+        if expected and declared_sha256 != expected:
+            raise RuntimeError(
+                f"audit bundle body hash mismatch at {body_uri}: expected {expected}, got {declared_sha256}"
+            )
+        bundle_without_shares = body_ref.get("bundle_without_shares")
+        if not isinstance(bundle_without_shares, dict):
+            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing bundle_without_shares")
+        share_parts = body_ref.get("share_parts")
+        if not isinstance(share_parts, list):
+            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing share_parts")
+        shares: list[Any] = []
+        for part in share_parts:
+            if not isinstance(part, dict):
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part")
+            kind = part.get("kind")
+            if kind == "segment":
+                shares.extend(self._read_audit_share_segment(part, parent_body_uri=body_uri))
+            elif kind in {"segment_range", "segment_prefix"}:
+                shares.extend(self._read_audit_share_segment(part, parent_body_uri=body_uri))
+            elif kind == "inline":
+                inline_shares = part.get("shares")
+                if not isinstance(inline_shares, list):
+                    raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid inline shares")
+                if len(inline_shares) != int(part.get("share_count") or 0):
+                    raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: inline share count mismatch")
+                shares.extend(copy.deepcopy(inline_shares))
+            else:
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part kind")
+        expected_share_count = int(body_ref.get("share_count") or 0)
+        if len(shares) != expected_share_count:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {body_uri}: expected "
+                f"{expected_share_count} shares, reconstructed {len(shares)}"
+            )
+        shares_key_index_raw = body_ref.get("shares_key_index")
+        shares_key_index = len(bundle_without_shares) if shares_key_index_raw is None else int(shares_key_index_raw)
+        bundle: dict[str, object] = {}
+        shares_inserted = False
+        for index, (key, value) in enumerate(bundle_without_shares.items()):
+            if index == shares_key_index:
+                bundle["shares"] = shares
+                shares_inserted = True
+            bundle[str(key)] = copy.deepcopy(value)
+        if not shares_inserted:
+            bundle["shares"] = shares
+        if expected:
+            actual = sha256_bytes_hex(self._canonical_audit_bundle_bytes(bundle))
+            if actual != expected:
+                raise RuntimeError(
+                    f"audit bundle body hash mismatch at {body_uri}: expected {expected}, got {actual}"
+                )
+        return bundle
+
+    def _resolve_audit_bundle_v2(
+        self,
+        body: dict[str, Any],
+        *,
+        expected_sha256: object | None,
+        body_uri: object,
+    ) -> dict[str, object]:
+        expected = str(expected_sha256).lower() if expected_sha256 else None
+        declared_sha256 = str(body.get("audit_bundle_sha256") or "").lower()
+        if expected and declared_sha256 != expected:
+            raise RuntimeError(
+                f"audit bundle body hash mismatch at {body_uri}: expected {expected}, got {declared_sha256}"
+            )
+        bundle_without_shares = body.get("bundle_without_shares")
+        if not isinstance(bundle_without_shares, dict):
+            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing bundle_without_shares")
+        proof = body.get("share_window_proof")
+        if not isinstance(proof, dict) or proof.get("schema") != AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA:
+            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing share_window_proof")
+        share_parts = proof.get("share_parts")
+        if not isinstance(share_parts, list):
+            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing share_parts")
+        expected_parts_digest = str(proof.get("share_parts_digest_hex") or "").lower()
+        if expected_parts_digest:
+            actual_parts_digest = sha256_bytes_hex(self._storage_json_bytes({"share_parts": share_parts}))
+            if actual_parts_digest != expected_parts_digest:
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {body_uri}: share_parts_digest_hex mismatch"
+                )
+        shares: list[Any] = []
+        for part in share_parts:
+            if not isinstance(part, dict):
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part")
+            shares.extend(self._read_audit_share_segment(part, parent_body_uri=body_uri))
+        expected_share_count = int(body.get("share_count") or proof.get("share_count") or 0)
+        if len(shares) != expected_share_count:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {body_uri}: expected "
+                f"{expected_share_count} shares, reconstructed {len(shares)}"
+            )
+        if shares:
+            first_share_seq = int(shares[0].get("share_seq")) if isinstance(shares[0], dict) else None
+            last_share_seq = int(shares[-1].get("share_seq")) if isinstance(shares[-1], dict) else None
+            if int(proof.get("first_share_seq") or 0) != first_share_seq:
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: proof first_share_seq mismatch")
+            if int(proof.get("last_share_seq") or 0) != last_share_seq:
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: proof last_share_seq mismatch")
+        reward_manifest = bundle_without_shares.get("reward_manifest")
+        proof_share_digest = str(proof.get("share_slice_digest_hex") or "")
+        if proof_share_digest and isinstance(reward_manifest, dict):
+            reward_share_digest = str(reward_manifest.get("share_slice_digest_hex") or "")
+            if not proof_share_digest.lower() == reward_share_digest.lower():
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: proof share digest mismatch")
+        shares_key_index_raw = body.get("shares_key_index")
+        shares_key_index = len(bundle_without_shares) if shares_key_index_raw is None else int(shares_key_index_raw)
+        bundle: dict[str, object] = {}
+        shares_inserted = False
+        for index, (key, value) in enumerate(bundle_without_shares.items()):
+            if index == shares_key_index:
+                bundle["shares"] = shares
+                shares_inserted = True
+            bundle[str(key)] = copy.deepcopy(value)
+        if not shares_inserted:
+            bundle["shares"] = shares
+        actual = sha256_bytes_hex(self._canonical_audit_bundle_bytes(bundle))
+        if declared_sha256 and actual != declared_sha256:
+            raise RuntimeError(
+                f"audit bundle body hash mismatch at {body_uri}: expected {declared_sha256}, got {actual}"
+            )
+        return bundle
+
+    def _read_audit_share_segment(self, part: dict[str, Any], *, parent_body_uri: object) -> list[Any]:
+        body_uri = part.get("body_uri")
+        kind = str(part.get("kind") or "")
+        try:
+            body_path = self._resolve_audit_body_path(body_uri)
+            segment_bytes = body_path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"audit bundle body is not retrievable at {parent_body_uri}: share segment {body_uri}: {exc}"
+            ) from exc
+        expected_sha256 = str(part.get("sha256") or "").lower()
+        if kind == "segment" and sha256_bytes_hex(segment_bytes) != expected_sha256:
+            raise RuntimeError(
+                f"audit bundle body hash mismatch at {parent_body_uri}: "
+                f"share segment {body_uri} expected {expected_sha256}, got {sha256_bytes_hex(segment_bytes)}"
+            )
+        try:
+            segment = json.loads(segment_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: {exc}") from exc
-        return body
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri}: {exc}"
+            ) from exc
+        if not isinstance(segment, dict) or segment.get("schema") != AUDIT_SHARE_SEGMENT_SCHEMA:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {parent_body_uri}: invalid share segment {body_uri}"
+            )
+        shares = segment.get("shares")
+        if not isinstance(shares, list):
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} has no shares"
+            )
+        expected_count = int(part.get("share_count") or 0)
+        first_share_seq = int(part.get("first_share_seq") or 0)
+        last_share_seq = int(part.get("last_share_seq") or 0)
+        selected_shares = self._select_audit_share_segment_range(
+            shares,
+            first_share_seq=first_share_seq,
+            last_share_seq=last_share_seq,
+            parent_body_uri=parent_body_uri,
+            body_uri=body_uri,
+        )
+        if len(selected_shares) != expected_count:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} "
+                f"expected {expected_count} shares, found {len(selected_shares)}"
+            )
+        if kind == "segment_range":
+            expected_range_sha256 = str(part.get("range_sha256") or "").lower()
+            actual_range_sha256 = sha256_bytes_hex(
+                self._storage_json_bytes(
+                    self._audit_share_segment_payload(
+                        first_share_seq=first_share_seq,
+                        last_share_seq=last_share_seq,
+                        shares=selected_shares,
+                    )
+                )
+            )
+            if actual_range_sha256 != expected_range_sha256:
+                raise RuntimeError(
+                    f"audit bundle body hash mismatch at {parent_body_uri}: "
+                    f"share segment range {body_uri} expected {expected_range_sha256}, got {actual_range_sha256}"
+                )
+        elif kind == "segment_prefix":
+            expected_prefix_sha256 = str(part.get("prefix_sha256") or "").lower()
+            actual_prefix_sha256 = sha256_bytes_hex(
+                self._storage_json_bytes(
+                    self._audit_share_segment_payload(
+                        first_share_seq=first_share_seq,
+                        last_share_seq=last_share_seq,
+                        shares=selected_shares,
+                    )
+                )
+            )
+            if actual_prefix_sha256 != expected_prefix_sha256:
+                raise RuntimeError(
+                    f"audit bundle body hash mismatch at {parent_body_uri}: "
+                    f"share segment prefix {body_uri} expected {expected_prefix_sha256}, got {actual_prefix_sha256}"
+                )
+        elif kind != "segment":
+            raise RuntimeError(f"audit bundle body is not valid JSON at {parent_body_uri}: invalid share part kind")
+        return copy.deepcopy(selected_shares)
+
+    def _select_audit_share_segment_range(
+        self,
+        shares: list[Any],
+        *,
+        first_share_seq: int,
+        last_share_seq: int,
+        parent_body_uri: object,
+        body_uri: object,
+    ) -> list[Any]:
+        selected: list[Any] = []
+        previous_seq: int | None = None
+        for share in shares:
+            if not isinstance(share, dict):
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} has invalid share"
+                )
+            share_seq = int(share.get("share_seq") or 0)
+            if previous_seq is not None and previous_seq + 1 != share_seq:
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} is not contiguous"
+                )
+            previous_seq = share_seq
+            if first_share_seq <= share_seq <= last_share_seq:
+                selected.append(share)
+        if selected:
+            if int(selected[0].get("share_seq") or 0) != first_share_seq:
+                selected = []
+            elif int(selected[-1].get("share_seq") or 0) != last_share_seq:
+                selected = []
+        if not selected and first_share_seq <= last_share_seq:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                f"share segment {body_uri} does not contain requested range"
+            )
+        return selected
 
     def _resolve_audit_bundle_row(self, row: object) -> dict[str, object] | None:
         """Return an audit-bundle row with its body resolved inline.
@@ -2867,12 +3810,14 @@ END;
             "writer_session_token": self._writer_session_token,
         }
         body_uri = self._prepare_external_audit_body(payload, final_bundle)
+        audit_body_byte_len = self._audit_body_byte_len(body_uri, final_bundle)
         payload = {
             **payload,
             # Externalized rows store the body in body_uri and NULL here; legacy
             # rows (no body store configured) keep the inline body.
             "audit_bundle": None if body_uri is not None else final_bundle,
             "body_uri": body_uri,
+            "audit_body_byte_len": audit_body_byte_len,
             "schema_version": str(final_bundle.get("schema") or "qbit.prism.audit-bundle.v1"),
             "found_block_network_difficulty": found_block.get("network_difficulty"),
             "found_block_bits": found_block.get("bits"),
@@ -2947,6 +3892,7 @@ bundle_insert AS (
         audit_bundle_sha256,
         coinbase_tx_hex,
         body_uri,
+        audit_body_byte_len,
         schema_version,
         found_block_network_difficulty,
         found_block_bits,
@@ -2960,6 +3906,7 @@ bundle_insert AS (
         data->>'audit_bundle_sha256',
         data->>'coinbase_tx_hex',
         data->>'body_uri',
+        (data->>'audit_body_byte_len')::bigint,
         data->>'schema_version',
         (data->>'found_block_network_difficulty')::numeric,
         data->>'found_block_bits',
@@ -3179,6 +4126,9 @@ END;
             "payout_entry_count": int(result["payout_entry_count"]),
             "carry_forward_count": int(result["carry_forward_count"]),
             "onchain_output_count": int(result["onchain_output_count"]),
+            "audit_bundle_sha256": audit_bundle_sha256,
+            "body_uri": str(body_uri) if body_uri is not None else "",
+            "audit_body_byte_len": audit_body_byte_len,
         }
 
     def reverse_immature_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
@@ -3569,6 +4519,81 @@ CTV_FANOUT_STATUSES = {
 }
 
 CTV_FANOUT_ATTEMPT_STATUSES = {"planned", "submitted", "accepted", "rejected", "failed"}
+
+
+def _ctv_broadcast_summary_fields() -> tuple[str, ...]:
+    return (
+        "broadcast_attempt_count",
+        "broadcast_attempt_detail_count",
+        "first_broadcast_attempt_at",
+        "last_broadcast_attempt_at",
+        "last_broadcast_attempt_status",
+        "last_broadcast_package_tx_hexes",
+        "last_broadcast_package_txids",
+        "last_broadcast_submit_result",
+        "last_broadcast_error",
+        "broadcast_attempt_status_counts",
+        "next_broadcast_attempt_at",
+        "broadcast_retry_backoff_seconds",
+    )
+
+
+def _empty_ctv_broadcast_summary() -> dict[str, Any]:
+    return {
+        "broadcast_attempt_count": 0,
+        "broadcast_attempt_detail_count": 0,
+        "first_broadcast_attempt_at": None,
+        "last_broadcast_attempt_at": None,
+        "last_broadcast_attempt_status": None,
+        "last_broadcast_package_tx_hexes": [],
+        "last_broadcast_package_txids": [],
+        "last_broadcast_submit_result": None,
+        "last_broadcast_error": None,
+        "broadcast_attempt_status_counts": {},
+        "next_broadcast_attempt_at": None,
+        "broadcast_retry_backoff_seconds": 0,
+    }
+
+
+def _ctv_broadcast_attempt_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attempt_count": int(payload.get("broadcast_attempt_count") or 0),
+        "detail_count": int(payload.get("broadcast_attempt_detail_count") or 0),
+        "first_attempt_at": payload.get("first_broadcast_attempt_at"),
+        "last_attempt_at": payload.get("last_broadcast_attempt_at"),
+        "last_attempt_status": payload.get("last_broadcast_attempt_status"),
+        "last_package_tx_hexes": copy.deepcopy(payload.get("last_broadcast_package_tx_hexes") or []),
+        "last_package_txids": copy.deepcopy(payload.get("last_broadcast_package_txids") or []),
+        "last_submit_result": copy.deepcopy(payload.get("last_broadcast_submit_result")),
+        "last_error": payload.get("last_broadcast_error"),
+        "status_counts": copy.deepcopy(payload.get("broadcast_attempt_status_counts") or {}),
+        "next_attempt_at": payload.get("next_broadcast_attempt_at"),
+        "retry_backoff_seconds": int(payload.get("broadcast_retry_backoff_seconds") or 0),
+    }
+
+
+def _ctv_broadcast_attempt_due(value: object, now: datetime) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, datetime):
+        candidate = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return True
+        if " " in text and "T" not in text:
+            text = text.replace(" ", "T", 1)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        elif text.endswith("+00"):
+            text = text[:-3] + "+00:00"
+        try:
+            candidate = datetime.fromisoformat(text)
+        except ValueError:
+            return True
+    if candidate.tzinfo is None:
+        candidate = candidate.replace(tzinfo=timezone.utc)
+    return candidate <= now
 
 
 def validate_ctv_fanout_status(status: str) -> None:

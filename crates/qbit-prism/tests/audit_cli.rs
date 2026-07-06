@@ -34,6 +34,19 @@ fn power_law_prior_balances() -> Vec<CarryForwardBalance> {
     }]
 }
 
+fn canonical_share_segment_bytes(
+    first_share_seq: u64,
+    last_share_seq: u64,
+    shares: &[AcceptedShare],
+) -> Vec<u8> {
+    let shares_json = String::from_utf8(serde_json::to_vec(shares).unwrap()).unwrap();
+    format!(
+        "{{\"schema\":\"qbit.prism.audit-share-segment.v1\",\"first_share_seq\":{first_share_seq},\"last_share_seq\":{last_share_seq},\"share_count\":{},\"shares\":{shares_json}}}",
+        shares.len()
+    )
+    .into_bytes()
+}
+
 #[test]
 fn verifier_cli_accepts_exported_power_law_bundle() {
     let fixture: Fixture = serde_json::from_str(include_str!(
@@ -161,13 +174,211 @@ fn canonicalize_cli_emits_verifier_hash_bytes() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, canonical_audit_bundle_bytes(&bundle).unwrap());
+    assert_eq!(
+        output.stdout,
+        canonical_audit_bundle_bytes(&bundle).unwrap()
+    );
     assert_eq!(
         hex::encode(Sha256::digest(&output.stdout)),
         report.audit_bundle_sha256_hex
     );
     let reparsed: AuditBundle = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(reparsed, bundle);
+}
+
+#[test]
+fn audit_clis_accept_compact_body_ref_bundle() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    let bundle = build_audit_bundle(
+        fixture.shares,
+        fixture.found_block,
+        power_law_prior_balances(),
+        PayoutPolicy::day_one_default(),
+        &manifest_signing_key(),
+        &ledger_signing_key(),
+    )
+    .unwrap();
+    let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "qbit-prism-compact-body-ref-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let first_share_seq = bundle.shares.first().unwrap().share_seq;
+    let last_share_seq = bundle.shares.last().unwrap().share_seq;
+    let segment = serde_json::json!({
+        "schema": "qbit.prism.audit-share-segment.v1",
+        "first_share_seq": first_share_seq,
+        "last_share_seq": last_share_seq,
+        "share_count": bundle.shares.len(),
+        "shares": &bundle.shares,
+    });
+    let segment_bytes = serde_json::to_vec(&segment).unwrap();
+    let segment_sha256 = hex::encode(Sha256::digest(&segment_bytes));
+    let segment_path = tmp_dir.join("segment.json");
+    fs::write(&segment_path, &segment_bytes).unwrap();
+
+    let mut bundle_without_shares = serde_json::to_value(&bundle).unwrap();
+    bundle_without_shares
+        .as_object_mut()
+        .unwrap()
+        .remove("shares");
+    let body_ref = serde_json::json!({
+        "schema": "qbit.prism.audit-body-ref.v1",
+        "audit_bundle_sha256": report.audit_bundle_sha256_hex,
+        "share_count": bundle.shares.len(),
+        "bundle_without_shares": bundle_without_shares,
+        "share_parts": [
+            {
+                "kind": "segment",
+                "first_share_seq": first_share_seq,
+                "last_share_seq": last_share_seq,
+                "share_count": bundle.shares.len(),
+                "sha256": segment_sha256,
+                "body_uri": "segment.json",
+            }
+        ],
+    });
+    let body_ref_path = tmp_dir.join("body-ref.json");
+    fs::write(&body_ref_path, serde_json::to_vec(&body_ref).unwrap()).unwrap();
+
+    let verify_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-verify"))
+        .arg(&body_ref_path)
+        .arg("--coinbase-tx-hex")
+        .arg(&report.coinbase_tx_hex)
+        .arg("--ledger-writer-public-key-hex")
+        .arg(ledger_public_key_hex())
+        .arg("--expected-coinbase-value-sats")
+        .arg(report.coinbase_value_sats.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        verify_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verify_output.stdout),
+        String::from_utf8_lossy(&verify_output.stderr)
+    );
+
+    let canonical_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-canonicalize"))
+        .arg("--input")
+        .arg(&body_ref_path)
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    assert!(
+        canonical_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&canonical_output.stdout),
+        String::from_utf8_lossy(&canonical_output.stderr)
+    );
+    assert_eq!(
+        canonical_output.stdout,
+        canonical_audit_bundle_bytes(&bundle).unwrap()
+    );
+}
+
+#[test]
+fn audit_clis_accept_v2_range_proof_bundle() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    let bundle = build_audit_bundle(
+        fixture.shares,
+        fixture.found_block,
+        power_law_prior_balances(),
+        PayoutPolicy::day_one_default(),
+        &manifest_signing_key(),
+        &ledger_signing_key(),
+    )
+    .unwrap();
+    let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "qbit-prism-audit-bundle-v2-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let first_share_seq = bundle.shares.first().unwrap().share_seq;
+    let last_share_seq = bundle.shares.last().unwrap().share_seq;
+    let segment_bytes =
+        canonical_share_segment_bytes(first_share_seq, last_share_seq, &bundle.shares);
+    let range_sha256 = hex::encode(Sha256::digest(&segment_bytes));
+    let segment_path = tmp_dir.join("segment-slot.json");
+    fs::write(&segment_path, &segment_bytes).unwrap();
+
+    let mut bundle_without_shares = serde_json::to_value(&bundle).unwrap();
+    bundle_without_shares
+        .as_object_mut()
+        .unwrap()
+        .remove("shares");
+    let body_v2 = serde_json::json!({
+        "schema": "qbit.prism.audit-bundle.v2",
+        "audit_bundle_sha256": report.audit_bundle_sha256_hex,
+        "logical_audit_bundle_schema": "qbit.prism.audit-bundle.v1",
+        "share_count": bundle.shares.len(),
+        "shares_key_index": 1,
+        "bundle_without_shares": bundle_without_shares,
+        "share_window_proof": {
+            "schema": "qbit.prism.window-completeness-proof.v1",
+            "first_share_seq": first_share_seq,
+            "last_share_seq": last_share_seq,
+            "share_count": bundle.shares.len(),
+            "share_slice_digest_hex": bundle.reward_manifest.share_slice_digest_hex,
+            "share_parts": [
+                {
+                    "kind": "segment_range",
+                    "first_share_seq": first_share_seq,
+                    "last_share_seq": last_share_seq,
+                    "share_count": bundle.shares.len(),
+                    "range_sha256": range_sha256,
+                    "body_uri": "segment-slot.json",
+                }
+            ],
+        },
+    });
+    let body_v2_path = tmp_dir.join("audit-bundle-v2.json");
+    fs::write(&body_v2_path, serde_json::to_vec(&body_v2).unwrap()).unwrap();
+
+    let verify_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-verify"))
+        .arg(&body_v2_path)
+        .arg("--coinbase-tx-hex")
+        .arg(&report.coinbase_tx_hex)
+        .arg("--ledger-writer-public-key-hex")
+        .arg(ledger_public_key_hex())
+        .arg("--expected-coinbase-value-sats")
+        .arg(report.coinbase_value_sats.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        verify_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verify_output.stdout),
+        String::from_utf8_lossy(&verify_output.stderr)
+    );
+
+    let canonical_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-canonicalize"))
+        .arg("--input")
+        .arg(&body_v2_path)
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    assert!(
+        canonical_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&canonical_output.stdout),
+        String::from_utf8_lossy(&canonical_output.stderr)
+    );
+    assert_eq!(
+        canonical_output.stdout,
+        canonical_audit_bundle_bytes(&bundle).unwrap()
+    );
 }
 
 #[test]

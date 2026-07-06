@@ -1,6 +1,8 @@
-use qbit_prism::{canonical_audit_bundle_bytes, AuditBundle};
+use qbit_prism::{
+    canonical_audit_bundle_bytes, load_audit_bundle_from_path, parse_audit_bundle_json,
+};
 use std::io::{self, Read, Write};
-use std::{env, error::Error, fs, process};
+use std::{env, error::Error, process};
 
 fn main() {
     if let Err(error) = run() {
@@ -25,15 +27,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let input_json = match input_path.as_deref() {
+    let bundle = match input_path.as_deref() {
         Some("-") | None => {
             let mut buffer = String::new();
             io::stdin().read_to_string(&mut buffer)?;
-            buffer
+            parse_audit_bundle_json(&buffer, None)?
         }
-        Some(path) => fs::read_to_string(path)?,
+        Some(path) => load_audit_bundle_from_path(path)?,
     };
-    let bundle: AuditBundle = serde_json::from_str(&input_json)?;
     let canonical = canonical_audit_bundle_bytes(&bundle)?;
     io::stdout().write_all(&canonical)?;
     Ok(())

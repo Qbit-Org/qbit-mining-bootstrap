@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS qbit_pool_audit_bundles (
 -- reader falls back to it, so this migration loses no data.
 ALTER TABLE qbit_pool_audit_bundles
     ADD COLUMN IF NOT EXISTS body_uri text,
+    ADD COLUMN IF NOT EXISTS audit_body_byte_len bigint,
     ADD COLUMN IF NOT EXISTS schema_version text,
     ADD COLUMN IF NOT EXISTS found_block_network_difficulty numeric(78,0),
     ADD COLUMN IF NOT EXISTS found_block_bits text,
@@ -150,6 +151,13 @@ ALTER TABLE qbit_pool_audit_bundles
 ALTER TABLE qbit_pool_audit_bundles
     ADD CONSTRAINT qbit_pool_audit_bundles_body_present_check
     CHECK (audit_bundle IS NOT NULL OR body_uri IS NOT NULL);
+
+ALTER TABLE qbit_pool_audit_bundles
+    DROP CONSTRAINT IF EXISTS qbit_pool_audit_bundles_audit_body_byte_len_check;
+
+ALTER TABLE qbit_pool_audit_bundles
+    ADD CONSTRAINT qbit_pool_audit_bundles_audit_body_byte_len_check
+    CHECK (audit_body_byte_len IS NULL OR audit_body_byte_len >= 0);
 
 CREATE INDEX IF NOT EXISTS qbit_pool_audit_bundles_commitment_leaves_idx
     ON qbit_pool_audit_bundles USING gin (audit_commitment_leaves_hex);
@@ -215,6 +223,48 @@ CREATE TABLE IF NOT EXISTS qbit_ctv_fanout_artifacts (
     CHECK (chunk_index < chunk_count)
 );
 
+ALTER TABLE qbit_ctv_fanout_artifacts
+    ADD COLUMN IF NOT EXISTS broadcast_attempt_count bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS broadcast_attempt_detail_count bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS first_broadcast_attempt_at timestamptz,
+    ADD COLUMN IF NOT EXISTS last_broadcast_attempt_at timestamptz,
+    ADD COLUMN IF NOT EXISTS last_broadcast_attempt_status text,
+    ADD COLUMN IF NOT EXISTS last_broadcast_package_tx_hexes jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS last_broadcast_package_txids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS last_broadcast_submit_result jsonb,
+    ADD COLUMN IF NOT EXISTS last_broadcast_error text,
+    ADD COLUMN IF NOT EXISTS broadcast_attempt_status_counts jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS next_broadcast_attempt_at timestamptz,
+    ADD COLUMN IF NOT EXISTS broadcast_retry_backoff_seconds bigint NOT NULL DEFAULT 0;
+
+ALTER TABLE qbit_ctv_fanout_artifacts
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_broadcast_attempt_count_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_broadcast_attempt_detail_count_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_last_broadcast_attempt_status_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_last_broadcast_package_tx_hexes_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_last_broadcast_package_txids_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_broadcast_attempt_status_counts_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_broadcast_retry_backoff_seconds_check;
+
+ALTER TABLE qbit_ctv_fanout_artifacts
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_broadcast_attempt_count_check
+        CHECK (broadcast_attempt_count >= 0),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_broadcast_attempt_detail_count_check
+        CHECK (broadcast_attempt_detail_count >= 0),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_last_broadcast_attempt_status_check
+        CHECK (
+            last_broadcast_attempt_status IS NULL
+            OR last_broadcast_attempt_status IN ('planned', 'submitted', 'accepted', 'rejected', 'failed')
+        ),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_last_broadcast_package_tx_hexes_check
+        CHECK (jsonb_typeof(last_broadcast_package_tx_hexes) = 'array'),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_last_broadcast_package_txids_check
+        CHECK (jsonb_typeof(last_broadcast_package_txids) = 'array'),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_broadcast_attempt_status_counts_check
+        CHECK (jsonb_typeof(broadcast_attempt_status_counts) = 'object'),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_broadcast_retry_backoff_seconds_check
+        CHECK (broadcast_retry_backoff_seconds >= 0);
+
 -- Anchorless, fee-bearing CTV fanouts store NULL here. Existing
 -- deployments created before the nullable schema need the startup repair.
 ALTER TABLE qbit_ctv_fanout_artifacts
@@ -276,6 +326,9 @@ CREATE INDEX IF NOT EXISTS qbit_ctv_fanout_artifacts_block_idx
 
 CREATE INDEX IF NOT EXISTS qbit_ctv_fanout_artifacts_status_idx
     ON qbit_ctv_fanout_artifacts (settlement_status, block_hash);
+
+CREATE INDEX IF NOT EXISTS qbit_ctv_fanout_artifacts_broadcast_candidate_idx
+    ON qbit_ctv_fanout_artifacts (settlement_status, next_broadcast_attempt_at, block_hash, chunk_index);
 
 CREATE INDEX IF NOT EXISTS qbit_ctv_fanout_broadcast_attempts_txid_idx
     ON qbit_ctv_fanout_broadcast_attempts (fanout_txid, attempt_seq DESC);
@@ -766,7 +819,33 @@ AS $$
                                 'covenant_output_value_sats', artifact.covenant_output_value_sats,
                                 'fanout_output_sum_sats', artifact.fanout_output_sum_sats,
                                 'settlement_status', artifact.settlement_status,
-                                'updated_at', artifact.updated_at::text
+                                'updated_at', artifact.updated_at::text,
+                                'broadcast_attempt_count', artifact.broadcast_attempt_count,
+                                'broadcast_attempt_detail_count', artifact.broadcast_attempt_detail_count,
+                                'first_broadcast_attempt_at', artifact.first_broadcast_attempt_at::text,
+                                'last_broadcast_attempt_at', artifact.last_broadcast_attempt_at::text,
+                                'last_broadcast_attempt_status', artifact.last_broadcast_attempt_status,
+                                'last_broadcast_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+                                'last_broadcast_package_txids', artifact.last_broadcast_package_txids,
+                                'last_broadcast_submit_result', artifact.last_broadcast_submit_result,
+                                'last_broadcast_error', artifact.last_broadcast_error,
+                                'broadcast_attempt_status_counts', artifact.broadcast_attempt_status_counts,
+                                'next_broadcast_attempt_at', artifact.next_broadcast_attempt_at::text,
+                                'broadcast_retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds,
+                                'broadcast_attempt_summary', jsonb_build_object(
+                                    'attempt_count', artifact.broadcast_attempt_count,
+                                    'detail_count', artifact.broadcast_attempt_detail_count,
+                                    'first_attempt_at', artifact.first_broadcast_attempt_at::text,
+                                    'last_attempt_at', artifact.last_broadcast_attempt_at::text,
+                                    'last_attempt_status', artifact.last_broadcast_attempt_status,
+                                    'last_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+                                    'last_package_txids', artifact.last_broadcast_package_txids,
+                                    'last_submit_result', artifact.last_broadcast_submit_result,
+                                    'last_error', artifact.last_broadcast_error,
+                                    'status_counts', artifact.broadcast_attempt_status_counts,
+                                    'next_attempt_at', artifact.next_broadcast_attempt_at::text,
+                                    'retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds
+                                )
                             )
                             ORDER BY artifact.chunk_index
                         )
@@ -825,6 +904,32 @@ AS $$
                 'fanout_output_sum_sats', artifact.fanout_output_sum_sats,
                 'settlement_status', artifact.settlement_status,
                 'updated_at', artifact.updated_at::text,
+                'broadcast_attempt_count', artifact.broadcast_attempt_count,
+                'broadcast_attempt_detail_count', artifact.broadcast_attempt_detail_count,
+                'first_broadcast_attempt_at', artifact.first_broadcast_attempt_at::text,
+                'last_broadcast_attempt_at', artifact.last_broadcast_attempt_at::text,
+                'last_broadcast_attempt_status', artifact.last_broadcast_attempt_status,
+                'last_broadcast_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+                'last_broadcast_package_txids', artifact.last_broadcast_package_txids,
+                'last_broadcast_submit_result', artifact.last_broadcast_submit_result,
+                'last_broadcast_error', artifact.last_broadcast_error,
+                'broadcast_attempt_status_counts', artifact.broadcast_attempt_status_counts,
+                'next_broadcast_attempt_at', artifact.next_broadcast_attempt_at::text,
+                'broadcast_retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds,
+                'broadcast_attempt_summary', jsonb_build_object(
+                    'attempt_count', artifact.broadcast_attempt_count,
+                    'detail_count', artifact.broadcast_attempt_detail_count,
+                    'first_attempt_at', artifact.first_broadcast_attempt_at::text,
+                    'last_attempt_at', artifact.last_broadcast_attempt_at::text,
+                    'last_attempt_status', artifact.last_broadcast_attempt_status,
+                    'last_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+                    'last_package_txids', artifact.last_broadcast_package_txids,
+                    'last_submit_result', artifact.last_broadcast_submit_result,
+                    'last_error', artifact.last_broadcast_error,
+                    'status_counts', artifact.broadcast_attempt_status_counts,
+                    'next_attempt_at', artifact.next_broadcast_attempt_at::text,
+                    'retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds
+                ),
                 'broadcast_attempts', COALESCE(
                     (
                         SELECT jsonb_agg(

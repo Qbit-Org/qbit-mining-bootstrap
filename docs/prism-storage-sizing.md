@@ -137,7 +137,9 @@ These can have bounded retention once the policy is explicit:
 - dashboard caches and rollups that can be regenerated or are intentionally
   lower resolution over time
 - verbose broadcast attempts after terminal status, if latest status, error
-  summary, attempt count, and final artifacts are retained
+  summary, attempt count, and final artifacts are retained. The live schema
+  now stores this summary on `qbit_ctv_fanout_artifacts` and caps retained
+  detail rows with `PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT`.
 - Docker images, Docker build cache, and old non-active TIDES volumes after
   backup or decommission confirmation
 
@@ -146,19 +148,44 @@ inactive. They can reactivate after a reorg.
 
 ## Artifact Storage Strategy
 
-There are two distinct optimization stages:
+The live coordinator stores accepted-block audit artifacts with these rules:
 
-1. Exact artifact externalization: store the current full
-   `qbit.prism.audit-bundle.v1` body in immutable artifact storage by content
-   hash, and keep hash, size, schema, and pointer metadata in Postgres. This
-   preserves current verifier semantics.
-2. Reduced/window proof artifacts: introduce a new proof schema that verifies a
-   TIDES reward window against retained ledger checkpoints or archive roots.
-   This is a verifier-contract change and must prove window completeness,
-   including the oldest partial-share boundary.
+1. Exact artifact externalization: Postgres stores hash/pointer metadata while
+   every reader still resolves the body to the logical
+   `qbit.prism.audit-bundle.v1` expected by public API and verifier callers.
+   New rows also store `audit_body_byte_len` so the canonical row has the
+   artifact hash, stored byte size, schema version, and body pointer.
+2. Share-segment proof bodies: when `PRISM_AUDIT_SHARE_SEGMENT_SIZE` is
+   positive, new external body files use `qbit.prism.audit-bundle.v2`. The v2
+   body keeps non-share bundle sections inline, stores a
+   `qbit.prism.window-completeness-proof.v1`, and points at stable
+   `qbit.prism.audit-share-segment.v1` segment-slot files with per-range hashes.
+   This removes the old repeated inline tail/partial-window share arrays while
+   preserving the same reconstructed v1 bundle hash.
+3. Legacy body refs: older compact files using `qbit.prism.audit-body-ref.v1`
+   remain readable. The Rust `qbit-prism-audit-verify` and
+   `qbit-prism-audit-canonicalize` tools accept full v1 bundles, legacy body
+   refs, and v2 proof bodies, verifying referenced segment/range hashes before
+   reconstructing the canonical v1 bundle.
 
-Stage 1 is the safe first production step. Stage 2 should be designed and
-landed separately.
+`prism-live-audit-bundle-*.json` files are now small operator envelopes that
+point at the canonical body URI. They are not the durable audit body. Retention
+may prune live envelopes and old candidates; it must not prune
+`prism-audit-bundle-body-*` or `prism-audit-share-segment-*` unless those
+artifacts have first been archived and the resolver policy is explicit. Stable
+`prism-audit-share-segment-slot-*` files may grow as adjacent ranges are first
+referenced, so old body files verify their original range hash against the
+selected slice rather than against the whole mutable slot file.
+
+CTV broadcast retries are bounded separately from audit bodies:
+
+- `PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT` keeps only the newest N detailed
+  rows per fanout in `qbit_ctv_fanout_broadcast_attempts`.
+- `qbit_ctv_fanout_artifacts` retains total attempt count, per-status counts,
+  first/last timestamps, last package txids/hexes, last submit result, last
+  error, and retry backoff state.
+- `rejected` and `failed` attempts move a fanout to terminal `failed`, and
+  terminal failed fanouts are not selected for broadcast work.
 
 ## VM Recommendations
 
@@ -227,3 +254,8 @@ Add alerts for:
 - `qbit_pool_audit_bundles` rows whose inline body remains large after artifact
   externalization lands
 - missing or hash-mismatched artifact objects
+- `/metrics` gauges `qbit_prism_audit_artifact_bytes` and
+  `qbit_prism_audit_artifact_files`, split by body, share segment, live bundle,
+  candidate, and other artifact kinds
+- CTV retry pressure via `qbit_prism_ctv_fanouts_failed` and the fanout-row
+  broadcast summary fields
