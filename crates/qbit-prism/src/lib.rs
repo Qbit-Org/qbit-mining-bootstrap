@@ -13,6 +13,9 @@ pub use ctv::*;
 mod broadcast;
 pub use broadcast::*;
 
+mod audit_body_ref;
+pub use audit_body_ref::*;
+
 mod settlement;
 pub use settlement::*;
 

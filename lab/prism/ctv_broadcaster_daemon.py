@@ -86,6 +86,12 @@ class CtvFanoutBroadcastDaemon:
         failed_count = 0
 
         for row in rows:
+            if str(row.get("settlement_status") or row.get("status") or "") in {
+                "confirmed",
+                "reorged",
+                "failed",
+            }:
+                continue
             artifact = artifact_from_status_row(row)
             attempt = self.broadcaster.broadcast(artifact, self.fee_sats)
             if attempt.submitted:

@@ -1,8 +1,8 @@
 use qbit_prism::{
-    verify_audit_bundle_against_coinbase_tx_hex,
-    verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value, AuditBundle,
+    load_audit_bundle_from_path, verify_audit_bundle_against_coinbase_tx_hex,
+    verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value,
 };
-use std::{env, error::Error, fs, process};
+use std::{env, error::Error, process};
 
 fn main() {
     if let Err(error) = run() {
@@ -52,8 +52,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let coinbase_tx_hex = coinbase_tx_hex.ok_or("--coinbase-tx-hex is required")?;
     let ledger_writer_public_key_hex =
         ledger_writer_public_key_hex.ok_or("--ledger-writer-public-key-hex is required")?;
-    let bundle_json = fs::read_to_string(bundle_path)?;
-    let bundle: AuditBundle = serde_json::from_str(&bundle_json)?;
+    let bundle = load_audit_bundle_from_path(bundle_path)?;
     let report = if let Some(expected_coinbase_value_sats) = expected_coinbase_value_sats {
         verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value(
             &bundle,

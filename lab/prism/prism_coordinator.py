@@ -39,6 +39,8 @@ from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
 from lab.prism.ctv_broadcaster_daemon import CtvFanoutBroadcastDaemon, CtvFanoutDaemonResult
 from lab.prism.share_ledger import (
     DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
+    DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
+    DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -635,6 +637,14 @@ class PrismCoordinator:
             "PRISM_AUDIT_CANDIDATE_RETENTION_SECONDS",
             24 * 60 * 60,
         )
+        self.ctv_broadcast_attempt_detail_limit = env_nonnegative_int(
+            "PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT",
+            DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
+        )
+        self.ctv_broadcast_retry_backoff_seconds = env_nonnegative_int(
+            "PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS",
+            DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+        )
         self.audit_bind = os.environ.get("PRISM_AUDIT_BIND")
         self.audit_port = int(os.environ.get("PRISM_AUDIT_PORT", "0") or "0")
         self.stop_after_block = env("PRISM_STOP_AFTER_BLOCK", "1") in {"1", "true", "yes"}
@@ -790,7 +800,18 @@ class PrismCoordinator:
                     "PRISM_DATABASE_URL or PRISM_POSTGRES_PSQL_COMMAND is required; "
                     "set PRISM_ALLOW_MEMORY_LEDGER=1 only for local tests"
                 )
-            return SingleWriterShareLedger()
+            return SingleWriterShareLedger(
+                ctv_broadcast_attempt_detail_limit=getattr(
+                    self,
+                    "ctv_broadcast_attempt_detail_limit",
+                    DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
+                ),
+                ctv_broadcast_retry_backoff_seconds=getattr(
+                    self,
+                    "ctv_broadcast_retry_backoff_seconds",
+                    DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+                ),
+            )
         writer_session_token = env_optional("PRISM_LEDGER_WRITER_SESSION_TOKEN")
         if writer_session_token is not None and not env_bool("PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN", "0"):
             raise SystemExit(
@@ -808,6 +829,16 @@ class PrismCoordinator:
             read_concurrency=env_positive_int("PRISM_POSTGRES_READ_CONCURRENCY", 4),
             audit_body_dir=str(audit_body_dir) if audit_body_dir is not None else None,
             audit_share_segment_size=getattr(self, "audit_share_segment_size", DEFAULT_AUDIT_SHARE_SEGMENT_SIZE),
+            ctv_broadcast_attempt_detail_limit=getattr(
+                self,
+                "ctv_broadcast_attempt_detail_limit",
+                DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
+            ),
+            ctv_broadcast_retry_backoff_seconds=getattr(
+                self,
+                "ctv_broadcast_retry_backoff_seconds",
+                DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+            ),
         )
 
     def load_trusted_ledger_writer_public_key(self) -> str | None:
@@ -2952,6 +2983,8 @@ class PrismCoordinator:
                 ctv_pending = -1
                 ctv_broadcastable = -1
                 ctv_failed = -1
+        if ctv_failed >= 0:
+            ctv_failed = int(ledger_metrics.get("ctv_fanouts_failed", ctv_failed))
         ibd = 0
         peers = 0
         try:

@@ -137,7 +137,9 @@ These can have bounded retention once the policy is explicit:
 - dashboard caches and rollups that can be regenerated or are intentionally
   lower resolution over time
 - verbose broadcast attempts after terminal status, if latest status, error
-  summary, attempt count, and final artifacts are retained
+  summary, attempt count, and final artifacts are retained. The live schema
+  now stores this summary on `qbit_ctv_fanout_artifacts` and caps retained
+  detail rows with `PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT`.
 - Docker images, Docker build cache, and old non-active TIDES volumes after
   backup or decommission confirmation
 
@@ -151,14 +153,17 @@ The live coordinator stores accepted-block audit artifacts in two layers:
 1. Exact artifact externalization: Postgres stores hash/pointer metadata while
    the external artifact path resolves to the exact
    `qbit.prism.audit-bundle.v1` body expected by public API and verifier
-   callers.
+   callers. New rows also store `audit_body_byte_len` so the canonical row has
+   the artifact hash, stored byte size, schema version, and body pointer.
 2. Share-segment body refs: when `PRISM_AUDIT_SHARE_SEGMENT_SIZE` is positive,
    the external body file may be a compact `qbit.prism.audit-body-ref.v1`
    storage envelope. It keeps all non-share bundle sections inline and points
    at immutable `qbit.prism.audit-share-segment.v1` files for full contiguous
    share ranges. Readers reconstruct and hash-check the original v1 bundle
-   before returning it, so API/verifier semantics remain v1-compatible while
-   accepted shares are written to artifact storage once per sealed segment.
+   before returning it, so API/verifier semantics remain v1-compatible. The
+   Rust `qbit-prism-audit-verify` and `qbit-prism-audit-canonicalize` tools
+   now accept either full v1 bundles or compact body-ref files and verify each
+   referenced segment hash before reconstructing the canonical v1 bundle.
 
 `prism-live-audit-bundle-*.json` files are now small operator envelopes that
 point at the canonical body URI. They are not the durable audit body. Retention
@@ -169,6 +174,16 @@ artifacts have first been archived and the resolver policy is explicit.
 A future Rust-native reduced/window proof schema can further reduce verifier
 inputs. That remains a verifier-contract change and must prove window
 completeness, including the oldest partial-share boundary.
+
+CTV broadcast retries are bounded separately from audit bodies:
+
+- `PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT` keeps only the newest N detailed
+  rows per fanout in `qbit_ctv_fanout_broadcast_attempts`.
+- `qbit_ctv_fanout_artifacts` retains total attempt count, per-status counts,
+  first/last timestamps, last package txids/hexes, last submit result, last
+  error, and retry backoff state.
+- `rejected` and `failed` attempts move a fanout to terminal `failed`, and
+  terminal failed fanouts are not selected for broadcast work.
 
 ## VM Recommendations
 
@@ -240,3 +255,5 @@ Add alerts for:
 - `/metrics` gauges `qbit_prism_audit_artifact_bytes` and
   `qbit_prism_audit_artifact_files`, split by body, share segment, live bundle,
   candidate, and other artifact kinds
+- CTV retry pressure via `qbit_prism_ctv_fanouts_failed` and the fanout-row
+  broadcast summary fields

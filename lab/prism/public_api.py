@@ -821,6 +821,12 @@ def fanout_public_row(payload: dict[str, object]) -> dict[str, object]:
     last_attempt = None
     if isinstance(attempts, list) and attempts:
         last_attempt = attempts[-1]
+    last_broadcast_attempt_at = payload.get("last_broadcast_attempt_at")
+    last_broadcast_error = payload.get("last_broadcast_error")
+    if last_broadcast_attempt_at is None and isinstance(last_attempt, dict):
+        last_broadcast_attempt_at = last_attempt.get("attempted_at")
+    if last_broadcast_error is None and isinstance(last_attempt, dict):
+        last_broadcast_error = last_attempt.get("error")
     status = str(payload.get("settlement_status") or payload.get("status") or "awaiting_maturity")
     manifest_sha256 = str(payload.get("manifest_sha256") or "")
     explorer_prefix = os.environ.get("PRISM_PUBLIC_EXPLORER_TX_URL_PREFIX")
@@ -847,8 +853,8 @@ def fanout_public_row(payload: dict[str, object]) -> dict[str, object]:
         "fanout_tx_hex": fanout_tx_hex,
         "fanout_tx_sha256": fanout_transaction_hash(payload, fanout_tx_hex),
         "cpfp_anchor_spendable": status == "broadcastable" and anchor_vout is not None and fee_bits == 0,
-        "last_broadcast_attempt_at": public_timestamp(last_attempt.get("attempted_at")) if isinstance(last_attempt, dict) else None,
-        "last_broadcast_error": nullable_str(last_attempt.get("error")) if isinstance(last_attempt, dict) else None,
+        "last_broadcast_attempt_at": public_timestamp(last_broadcast_attempt_at),
+        "last_broadcast_error": nullable_str(last_broadcast_error),
         "explorer_url": explorer_prefix.rstrip("/") + "/" + fanout_txid if explorer_prefix and fanout_txid else None,
     }
 

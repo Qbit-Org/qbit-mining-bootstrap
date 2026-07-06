@@ -24,6 +24,8 @@ from lab.prism.prism_tools import prism_tool_command
 AUDIT_BODY_REF_SCHEMA = "qbit.prism.audit-body-ref.v1"
 AUDIT_SHARE_SEGMENT_SCHEMA = "qbit.prism.audit-share-segment.v1"
 DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
+DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
+DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -87,9 +89,23 @@ class SingleWriterShareLedger:
     while moving storage to `qbit_share_ledger`.
     """
 
-    def __init__(self, *, first_share_seq: int = 1):
+    def __init__(
+        self,
+        *,
+        first_share_seq: int = 1,
+        ctv_broadcast_attempt_detail_limit: int = DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
+        ctv_broadcast_retry_backoff_seconds: int = DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+    ):
         if first_share_seq < 1:
             raise ValueError("first_share_seq must be >= 1")
+        ctv_broadcast_attempt_detail_limit = int(ctv_broadcast_attempt_detail_limit)
+        if ctv_broadcast_attempt_detail_limit < 0:
+            raise ValueError("ctv_broadcast_attempt_detail_limit must be non-negative")
+        ctv_broadcast_retry_backoff_seconds = int(ctv_broadcast_retry_backoff_seconds)
+        if ctv_broadcast_retry_backoff_seconds < 0:
+            raise ValueError("ctv_broadcast_retry_backoff_seconds must be non-negative")
+        self._ctv_broadcast_attempt_detail_limit = ctv_broadcast_attempt_detail_limit
+        self._ctv_broadcast_retry_backoff_seconds = ctv_broadcast_retry_backoff_seconds
         self._next_share_seq = first_share_seq
         self._shares: list[AcceptedShareRecord] = []
         self._share_ids: set[str] = set()
@@ -213,9 +229,16 @@ class SingleWriterShareLedger:
                     else "awaiting_maturity",
                     "broadcast_attempts": self._ctv_fanout_attempts.get(fanout_txid, []),
                 }
+                if existing_status:
+                    for key in _ctv_broadcast_summary_fields():
+                        if key in existing_status:
+                            status_payload[key] = copy.deepcopy(existing_status[key])
+                else:
+                    status_payload.update(_empty_ctv_broadcast_summary())
                 audit_bundle_sha256 = payload.get("audit_bundle_sha256")
                 if audit_bundle_sha256 is not None:
                     status_payload["audit_bundle_sha256"] = audit_bundle_sha256
+                status_payload["broadcast_attempt_summary"] = _ctv_broadcast_attempt_summary(status_payload)
                 self._ctv_fanout_statuses[fanout_txid] = status_payload
         return {
             "backend": "memory",
@@ -246,7 +269,7 @@ class SingleWriterShareLedger:
             rows = [
                 copy.deepcopy(payload)
                 for payload in self._ctv_fanout_statuses.values()
-                if payload.get("settlement_status") not in {"confirmed", "reorged"}
+                if payload.get("settlement_status") not in {"confirmed", "reorged", "failed"}
             ]
         rows.sort(key=lambda row: (str(row.get("block_hash", "")), int(row.get("chunk_index", 0))))
         return rows[:limit]
@@ -258,7 +281,7 @@ class SingleWriterShareLedger:
             rows = [
                 copy.deepcopy(payload)
                 for payload in self._ctv_fanout_statuses.values()
-                if payload.get("settlement_status") not in {"confirmed", "reorged"}
+                if payload.get("settlement_status") not in {"confirmed", "reorged", "failed"}
             ]
         rows.sort(key=lambda row: (str(row.get("block_hash", "")), int(row.get("chunk_index", 0))))
         offset = (page - 1) * limit
@@ -307,21 +330,56 @@ class SingleWriterShareLedger:
             if fanout_txid not in self._ctv_fanout_statuses:
                 raise RuntimeError("unknown CTV fanout txid")
             attempts = self._ctv_fanout_attempts.setdefault(fanout_txid, [])
+            attempted_at = datetime.now(timezone.utc)
+            status_payload = self._ctv_fanout_statuses[fanout_txid]
+            total_attempts = int(status_payload.get("broadcast_attempt_count") or 0) + 1
             attempt = {
-                "attempt_seq": len(attempts) + 1,
+                "attempt_seq": total_attempts,
+                "attempted_at": attempted_at,
                 "attempt_status": attempt_status,
                 "package_tx_hexes": package_tx_hexes or [],
                 "package_txids": package_txids or [],
                 "submit_result": submit_result,
                 "error": error,
             }
-            attempts.append(attempt)
+            if self._ctv_broadcast_attempt_detail_limit > 0:
+                if len(attempts) >= self._ctv_broadcast_attempt_detail_limit:
+                    del attempts[0 : len(attempts) - self._ctv_broadcast_attempt_detail_limit + 1]
+                attempts.append(attempt)
+            counts = copy.deepcopy(status_payload.get("broadcast_attempt_status_counts") or {})
+            if not isinstance(counts, dict):
+                counts = {}
+            counts[attempt_status] = int(counts.get(attempt_status) or 0) + 1
+            next_attempt_at = None
+            retry_backoff_seconds = 0
+            if attempt_status == "planned" and self._ctv_broadcast_retry_backoff_seconds > 0:
+                retry_backoff_seconds = self._ctv_broadcast_retry_backoff_seconds
+                next_attempt_at = attempted_at + timedelta(seconds=retry_backoff_seconds)
+            status_payload.update(
+                {
+                    "broadcast_attempt_count": total_attempts,
+                    "broadcast_attempt_detail_count": len(attempts),
+                    "first_broadcast_attempt_at": status_payload.get("first_broadcast_attempt_at") or attempted_at,
+                    "last_broadcast_attempt_at": attempted_at,
+                    "last_broadcast_attempt_status": attempt_status,
+                    "last_broadcast_package_tx_hexes": package_tx_hexes or [],
+                    "last_broadcast_package_txids": package_txids or [],
+                    "last_broadcast_submit_result": submit_result,
+                    "last_broadcast_error": error,
+                    "broadcast_attempt_status_counts": counts,
+                    "next_broadcast_attempt_at": next_attempt_at,
+                    "broadcast_retry_backoff_seconds": retry_backoff_seconds,
+                }
+            )
             self._ctv_fanout_statuses[fanout_txid]["broadcast_attempts"] = copy.deepcopy(attempts)
             if attempt_status in {"submitted", "accepted"}:
                 self._ctv_fanout_statuses[fanout_txid]["settlement_status"] = "broadcast_submitted"
             elif attempt_status in {"rejected", "failed"}:
                 self._ctv_fanout_statuses[fanout_txid]["settlement_status"] = "failed"
-        return {"backend": "memory", "attempt_count": len(attempts)}
+            self._ctv_fanout_statuses[fanout_txid]["broadcast_attempt_summary"] = _ctv_broadcast_attempt_summary(
+                self._ctv_fanout_statuses[fanout_txid]
+            )
+        return {"backend": "memory", "attempt_count": 1, "updated_count": 1 if attempt_status in {"submitted", "accepted", "rejected", "failed"} else 0}
 
     def metrics(self) -> dict[str, int]:
         return {
@@ -333,6 +391,13 @@ class SingleWriterShareLedger:
             "reversed_blocks": 0,
             "payout_entries": 0,
             "owed_accounts": 0,
+            "ctv_fanouts_failed": len(
+                [
+                    payload
+                    for payload in self._ctv_fanout_statuses.values()
+                    if payload.get("settlement_status") == "failed"
+                ]
+            ),
         }
 
     def dashboard_pool_snapshot(
@@ -710,6 +775,8 @@ class PsqlShareLedger:
         audit_body_dir: str | Path | None = None,
         audit_bundle_canonicalizer: Callable[[dict[str, Any]], bytes] | None = None,
         audit_share_segment_size: int = 0,
+        ctv_broadcast_attempt_detail_limit: int = DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
+        ctv_broadcast_retry_backoff_seconds: int = DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
     ):
         if writer_epoch < 0:
             raise ValueError("writer_epoch must be >= 0")
@@ -746,6 +813,14 @@ class PsqlShareLedger:
         if audit_share_segment_size < 0:
             raise ValueError("audit_share_segment_size must be non-negative")
         self._audit_share_segment_size = audit_share_segment_size
+        ctv_broadcast_attempt_detail_limit = int(ctv_broadcast_attempt_detail_limit)
+        if ctv_broadcast_attempt_detail_limit < 0:
+            raise ValueError("ctv_broadcast_attempt_detail_limit must be non-negative")
+        self._ctv_broadcast_attempt_detail_limit = ctv_broadcast_attempt_detail_limit
+        ctv_broadcast_retry_backoff_seconds = int(ctv_broadcast_retry_backoff_seconds)
+        if ctv_broadcast_retry_backoff_seconds < 0:
+            raise ValueError("ctv_broadcast_retry_backoff_seconds must be non-negative")
+        self._ctv_broadcast_retry_backoff_seconds = ctv_broadcast_retry_backoff_seconds
         if initialize_schema:
             path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
             self._run_sql(path.read_text(encoding="utf-8"))
@@ -1834,6 +1909,32 @@ FROM (
         'fanout_output_sum_sats', artifact.fanout_output_sum_sats,
         'settlement_status', artifact.settlement_status,
         'updated_at', artifact.updated_at::text,
+        'broadcast_attempt_count', artifact.broadcast_attempt_count,
+        'broadcast_attempt_detail_count', artifact.broadcast_attempt_detail_count,
+        'first_broadcast_attempt_at', artifact.first_broadcast_attempt_at::text,
+        'last_broadcast_attempt_at', artifact.last_broadcast_attempt_at::text,
+        'last_broadcast_attempt_status', artifact.last_broadcast_attempt_status,
+        'last_broadcast_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+        'last_broadcast_package_txids', artifact.last_broadcast_package_txids,
+        'last_broadcast_submit_result', artifact.last_broadcast_submit_result,
+        'last_broadcast_error', artifact.last_broadcast_error,
+        'broadcast_attempt_status_counts', artifact.broadcast_attempt_status_counts,
+        'next_broadcast_attempt_at', artifact.next_broadcast_attempt_at::text,
+        'broadcast_retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds,
+        'broadcast_attempt_summary', json_build_object(
+            'attempt_count', artifact.broadcast_attempt_count,
+            'detail_count', artifact.broadcast_attempt_detail_count,
+            'first_attempt_at', artifact.first_broadcast_attempt_at::text,
+            'last_attempt_at', artifact.last_broadcast_attempt_at::text,
+            'last_attempt_status', artifact.last_broadcast_attempt_status,
+            'last_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+            'last_package_txids', artifact.last_broadcast_package_txids,
+            'last_submit_result', artifact.last_broadcast_submit_result,
+            'last_error', artifact.last_broadcast_error,
+            'status_counts', artifact.broadcast_attempt_status_counts,
+            'next_attempt_at', artifact.next_broadcast_attempt_at::text,
+            'retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds
+        ),
         'broadcast_attempts', COALESCE(
             (
                 SELECT json_agg(json_build_object(
@@ -1858,7 +1959,7 @@ FROM (
       ON block.block_hash = artifact.block_hash
     LEFT JOIN qbit_pool_audit_bundles bundle
       ON bundle.block_hash = artifact.block_hash
-    WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged')
+    WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged', 'failed')
     ORDER BY block.block_height ASC, artifact.chunk_index ASC
     LIMIT {limit}
 ) pending;
@@ -1895,13 +1996,25 @@ WITH filtered AS (
         artifact.covenant_output_value_sats,
         artifact.fanout_output_sum_sats,
         artifact.settlement_status,
-        artifact.updated_at
+        artifact.updated_at,
+        artifact.broadcast_attempt_count,
+        artifact.broadcast_attempt_detail_count,
+        artifact.first_broadcast_attempt_at,
+        artifact.last_broadcast_attempt_at,
+        artifact.last_broadcast_attempt_status,
+        artifact.last_broadcast_package_tx_hexes,
+        artifact.last_broadcast_package_txids,
+        artifact.last_broadcast_submit_result,
+        artifact.last_broadcast_error,
+        artifact.broadcast_attempt_status_counts,
+        artifact.next_broadcast_attempt_at,
+        artifact.broadcast_retry_backoff_seconds
     FROM qbit_ctv_fanout_artifacts artifact
     JOIN qbit_pool_blocks block
       ON block.block_hash = artifact.block_hash
     LEFT JOIN qbit_pool_audit_bundles bundle
       ON bundle.block_hash = artifact.block_hash
-    WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged')
+    WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged', 'failed')
 ),
 page_rows AS (
     SELECT *
@@ -1938,6 +2051,32 @@ SELECT json_build_object(
             'fanout_output_sum_sats', fanout_output_sum_sats,
             'settlement_status', settlement_status,
             'updated_at', updated_at::text,
+            'broadcast_attempt_count', broadcast_attempt_count,
+            'broadcast_attempt_detail_count', broadcast_attempt_detail_count,
+            'first_broadcast_attempt_at', first_broadcast_attempt_at::text,
+            'last_broadcast_attempt_at', last_broadcast_attempt_at::text,
+            'last_broadcast_attempt_status', last_broadcast_attempt_status,
+            'last_broadcast_package_tx_hexes', last_broadcast_package_tx_hexes,
+            'last_broadcast_package_txids', last_broadcast_package_txids,
+            'last_broadcast_submit_result', last_broadcast_submit_result,
+            'last_broadcast_error', last_broadcast_error,
+            'broadcast_attempt_status_counts', broadcast_attempt_status_counts,
+            'next_broadcast_attempt_at', next_broadcast_attempt_at::text,
+            'broadcast_retry_backoff_seconds', broadcast_retry_backoff_seconds,
+            'broadcast_attempt_summary', json_build_object(
+                'attempt_count', broadcast_attempt_count,
+                'detail_count', broadcast_attempt_detail_count,
+                'first_attempt_at', first_broadcast_attempt_at::text,
+                'last_attempt_at', last_broadcast_attempt_at::text,
+                'last_attempt_status', last_broadcast_attempt_status,
+                'last_package_tx_hexes', last_broadcast_package_tx_hexes,
+                'last_package_txids', last_broadcast_package_txids,
+                'last_submit_result', last_broadcast_submit_result,
+                'last_error', last_broadcast_error,
+                'status_counts', broadcast_attempt_status_counts,
+                'next_attempt_at', next_broadcast_attempt_at::text,
+                'retry_backoff_seconds', broadcast_retry_backoff_seconds
+            ),
             'broadcast_attempts', COALESCE(
                 (
                     SELECT json_agg(json_build_object(
@@ -2122,6 +2261,8 @@ END;
             "submit_result": submit_result,
             "error": error,
             "next_status": next_status,
+            "attempt_detail_limit": self._ctv_broadcast_attempt_detail_limit,
+            "retry_backoff_seconds": self._ctv_broadcast_retry_backoff_seconds,
             "writer_id": self._writer_id,
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
@@ -2141,6 +2282,32 @@ lease AS (
       AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
     RETURNING qbit_ledger_writer_lease.writer_id
 ),
+artifact_row AS (
+    SELECT fanout_txid
+    FROM qbit_ctv_fanout_artifacts
+    WHERE fanout_txid = (SELECT data->>'fanout_txid' FROM payload)
+),
+existing_detail_count AS (
+    SELECT count(*)::bigint AS detail_count
+    FROM qbit_ctv_fanout_broadcast_attempts
+    WHERE fanout_txid = (SELECT data->>'fanout_txid' FROM payload)
+),
+pruned AS (
+    DELETE FROM qbit_ctv_fanout_broadcast_attempts old_attempt
+    USING payload, artifact_row
+    WHERE old_attempt.fanout_txid = artifact_row.fanout_txid
+      AND old_attempt.attempt_seq IN (
+          SELECT retained.attempt_seq
+          FROM qbit_ctv_fanout_broadcast_attempts retained
+          WHERE retained.fanout_txid = artifact_row.fanout_txid
+          ORDER BY retained.attempt_seq DESC
+          OFFSET GREATEST((data->>'attempt_detail_limit')::integer - 1, 0)
+      )
+    RETURNING old_attempt.attempt_seq
+),
+pruned_count AS (
+    SELECT count(*)::bigint AS pruned_count FROM pruned
+),
 inserted AS (
     INSERT INTO qbit_ctv_fanout_broadcast_attempts (
         fanout_txid,
@@ -2157,17 +2324,59 @@ inserted AS (
         data->'package_txids',
         data->'submit_result',
         data->>'error'
-    FROM payload, lease
+    FROM payload, lease, artifact_row, pruned_count
+    WHERE (data->>'attempt_detail_limit')::integer > 0
     RETURNING attempt_seq
 ),
+inserted_count AS (
+    SELECT count(*)::bigint AS inserted_count FROM inserted
+),
 updated AS (
-    UPDATE qbit_ctv_fanout_artifacts
-    SET settlement_status = (SELECT data->>'next_status' FROM payload),
-        updated_at = clock_timestamp()
-    FROM inserted
-    WHERE fanout_txid = (SELECT data->>'fanout_txid' FROM payload)
-      AND (SELECT data->>'next_status' FROM payload) IS NOT NULL
-    RETURNING fanout_txid
+    UPDATE qbit_ctv_fanout_artifacts artifact
+    SET settlement_status = COALESCE(data->>'next_status', artifact.settlement_status),
+        updated_at = clock_timestamp(),
+        broadcast_attempt_count = artifact.broadcast_attempt_count + 1,
+        broadcast_attempt_detail_count = CASE
+            WHEN (data->>'attempt_detail_limit')::integer <= 0 THEN 0
+            ELSE LEAST(
+                (data->>'attempt_detail_limit')::bigint,
+                GREATEST(
+                    0,
+                    existing_detail_count.detail_count
+                    - pruned_count.pruned_count
+                    + inserted_count.inserted_count
+                )
+            )
+        END,
+        first_broadcast_attempt_at = COALESCE(artifact.first_broadcast_attempt_at, clock_timestamp()),
+        last_broadcast_attempt_at = clock_timestamp(),
+        last_broadcast_attempt_status = data->>'attempt_status',
+        last_broadcast_package_tx_hexes = data->'package_tx_hexes',
+        last_broadcast_package_txids = data->'package_txids',
+        last_broadcast_submit_result = data->'submit_result',
+        last_broadcast_error = data->>'error',
+        broadcast_attempt_status_counts = jsonb_set(
+            COALESCE(artifact.broadcast_attempt_status_counts, '{{}}'::jsonb),
+            ARRAY[data->>'attempt_status'],
+            to_jsonb(
+                COALESCE((artifact.broadcast_attempt_status_counts->>(data->>'attempt_status'))::bigint, 0)
+                + 1
+            ),
+            true
+        ),
+        next_broadcast_attempt_at = CASE
+            WHEN data->>'attempt_status' = 'planned'
+              AND (data->>'retry_backoff_seconds')::bigint > 0 THEN
+                clock_timestamp() + make_interval(secs => (data->>'retry_backoff_seconds')::double precision)
+            ELSE NULL
+        END,
+        broadcast_retry_backoff_seconds = CASE
+            WHEN data->>'attempt_status' = 'planned' THEN (data->>'retry_backoff_seconds')::bigint
+            ELSE 0
+        END
+    FROM payload, lease, artifact_row, existing_detail_count, pruned_count, inserted_count
+    WHERE artifact.fanout_txid = artifact_row.fanout_txid
+    RETURNING artifact.fanout_txid, artifact.broadcast_attempt_count, artifact.broadcast_attempt_detail_count
 )
 SELECT CASE
     WHEN (SELECT count(*) FROM lease) = 0 THEN
@@ -2176,7 +2385,9 @@ SELECT CASE
         json_build_object(
             'backend', 'postgres-psql',
             'attempt_count', (SELECT count(*) FROM inserted),
-            'updated_count', (SELECT count(*) FROM updated)
+            'updated_count', (SELECT count(*) FROM updated),
+            'broadcast_attempt_count', (SELECT broadcast_attempt_count FROM updated LIMIT 1),
+            'broadcast_attempt_detail_count', (SELECT broadcast_attempt_detail_count FROM updated LIMIT 1)
         )
 END;
 """
@@ -2199,7 +2410,8 @@ SELECT json_build_object(
     'rejected_blocks', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'rejected'),
     'reversed_blocks', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'reversed'),
     'payout_entries', (SELECT count(*) FROM qbit_pool_payout_entries),
-    'owed_accounts', (SELECT count(*) FROM qbit_current_owed_balances() WHERE owed_balance_sats > 0)
+    'owed_accounts', (SELECT count(*) FROM qbit_current_owed_balances() WHERE owed_balance_sats > 0),
+    'ctv_fanouts_failed', (SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE settlement_status = 'failed')
 );
 """
         with self._lock:
@@ -2923,6 +3135,11 @@ END;
             return None
         return str(self._audit_body_path(payload["block_hash"], payload["audit_bundle_sha256"]))
 
+    def _audit_body_byte_len(self, body_uri: object | None, final_bundle: dict[str, Any]) -> int:
+        if body_uri:
+            return self._resolve_audit_body_path(body_uri).stat().st_size
+        return len(self._canonical_audit_bundle_bytes(final_bundle))
+
     def _prepare_external_audit_body(
         self,
         payload: dict[str, Any],
@@ -3224,12 +3441,14 @@ END;
             "writer_session_token": self._writer_session_token,
         }
         body_uri = self._prepare_external_audit_body(payload, final_bundle)
+        audit_body_byte_len = self._audit_body_byte_len(body_uri, final_bundle)
         payload = {
             **payload,
             # Externalized rows store the body in body_uri and NULL here; legacy
             # rows (no body store configured) keep the inline body.
             "audit_bundle": None if body_uri is not None else final_bundle,
             "body_uri": body_uri,
+            "audit_body_byte_len": audit_body_byte_len,
             "schema_version": str(final_bundle.get("schema") or "qbit.prism.audit-bundle.v1"),
             "found_block_network_difficulty": found_block.get("network_difficulty"),
             "found_block_bits": found_block.get("bits"),
@@ -3304,6 +3523,7 @@ bundle_insert AS (
         audit_bundle_sha256,
         coinbase_tx_hex,
         body_uri,
+        audit_body_byte_len,
         schema_version,
         found_block_network_difficulty,
         found_block_bits,
@@ -3317,6 +3537,7 @@ bundle_insert AS (
         data->>'audit_bundle_sha256',
         data->>'coinbase_tx_hex',
         data->>'body_uri',
+        (data->>'audit_body_byte_len')::bigint,
         data->>'schema_version',
         (data->>'found_block_network_difficulty')::numeric,
         data->>'found_block_bits',
@@ -3538,6 +3759,7 @@ END;
             "onchain_output_count": int(result["onchain_output_count"]),
             "audit_bundle_sha256": audit_bundle_sha256,
             "body_uri": str(body_uri) if body_uri is not None else "",
+            "audit_body_byte_len": audit_body_byte_len,
         }
 
     def reverse_immature_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
@@ -3928,6 +4150,57 @@ CTV_FANOUT_STATUSES = {
 }
 
 CTV_FANOUT_ATTEMPT_STATUSES = {"planned", "submitted", "accepted", "rejected", "failed"}
+
+
+def _ctv_broadcast_summary_fields() -> tuple[str, ...]:
+    return (
+        "broadcast_attempt_count",
+        "broadcast_attempt_detail_count",
+        "first_broadcast_attempt_at",
+        "last_broadcast_attempt_at",
+        "last_broadcast_attempt_status",
+        "last_broadcast_package_tx_hexes",
+        "last_broadcast_package_txids",
+        "last_broadcast_submit_result",
+        "last_broadcast_error",
+        "broadcast_attempt_status_counts",
+        "next_broadcast_attempt_at",
+        "broadcast_retry_backoff_seconds",
+    )
+
+
+def _empty_ctv_broadcast_summary() -> dict[str, Any]:
+    return {
+        "broadcast_attempt_count": 0,
+        "broadcast_attempt_detail_count": 0,
+        "first_broadcast_attempt_at": None,
+        "last_broadcast_attempt_at": None,
+        "last_broadcast_attempt_status": None,
+        "last_broadcast_package_tx_hexes": [],
+        "last_broadcast_package_txids": [],
+        "last_broadcast_submit_result": None,
+        "last_broadcast_error": None,
+        "broadcast_attempt_status_counts": {},
+        "next_broadcast_attempt_at": None,
+        "broadcast_retry_backoff_seconds": 0,
+    }
+
+
+def _ctv_broadcast_attempt_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attempt_count": int(payload.get("broadcast_attempt_count") or 0),
+        "detail_count": int(payload.get("broadcast_attempt_detail_count") or 0),
+        "first_attempt_at": payload.get("first_broadcast_attempt_at"),
+        "last_attempt_at": payload.get("last_broadcast_attempt_at"),
+        "last_attempt_status": payload.get("last_broadcast_attempt_status"),
+        "last_package_tx_hexes": copy.deepcopy(payload.get("last_broadcast_package_tx_hexes") or []),
+        "last_package_txids": copy.deepcopy(payload.get("last_broadcast_package_txids") or []),
+        "last_submit_result": copy.deepcopy(payload.get("last_broadcast_submit_result")),
+        "last_error": payload.get("last_broadcast_error"),
+        "status_counts": copy.deepcopy(payload.get("broadcast_attempt_status_counts") or {}),
+        "next_attempt_at": payload.get("next_broadcast_attempt_at"),
+        "retry_backoff_seconds": int(payload.get("broadcast_retry_backoff_seconds") or 0),
+    }
 
 
 def validate_ctv_fanout_status(status: str) -> None:

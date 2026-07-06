@@ -169,6 +169,22 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
         self.assertEqual(ledger.attempts[0]["attempt_status"], "rejected")
         self.assertIn("insufficient fee", str(ledger.attempts[0]["error"]))
 
+    def test_failed_rows_are_not_rebroadcast(self) -> None:
+        fanout_txid = "44" * 32
+        row = pending_row(fanout_txid)
+        row["settlement_status"] = "failed"
+        ledger = FakeLedger([row])
+        broadcaster = FakeBroadcaster({})
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=900).run_once()
+
+        self.assertEqual(result.scanned_count, 1)
+        self.assertEqual(result.submitted_count, 0)
+        self.assertEqual(result.updated_count, 0)
+        self.assertEqual(result.failed_count, 0)
+        self.assertEqual(ledger.attempts, [])
+        self.assertEqual(broadcaster.fees, [])
+
     def test_direct_parent_failure_is_journaled_without_terminal_rejection(self) -> None:
         fanout_txid = "45" * 32
         ledger = FakeLedger([pending_row(fanout_txid)])

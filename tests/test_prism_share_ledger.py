@@ -502,12 +502,43 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         self.assertIsNotNone(status)
         self.assertEqual(status["settlement_status"], "failed")  # type: ignore[index]
+        self.assertEqual(status["broadcast_attempt_count"], 1)  # type: ignore[index]
+        self.assertEqual(status["broadcast_attempt_detail_count"], 1)  # type: ignore[index]
+        self.assertEqual(status["last_broadcast_attempt_status"], "rejected")  # type: ignore[index]
+        self.assertEqual(status["last_broadcast_error"], "insufficient fee")  # type: ignore[index]
+        self.assertEqual(status["broadcast_attempt_summary"]["attempt_count"], 1)  # type: ignore[index]
         self.assertEqual(status["broadcast_attempts"][0]["attempt_status"], "rejected")  # type: ignore[index]
         self.assertEqual(status["broadcast_attempts"][0]["package_tx_hexes"], ["parent", "child"])  # type: ignore[index]
-        self.assertEqual(pending[0]["fanout_txid"], fanout_txid)
+        self.assertEqual(pending, [])
 
         ledger.update_ctv_fanout_status(fanout_txid=fanout_txid, settlement_status="confirmed")
         self.assertEqual(ledger.pending_ctv_fanout_statuses(), [])
+
+    def test_memory_ledger_caps_ctv_fanout_broadcast_attempt_details(self) -> None:
+        ledger = SingleWriterShareLedger(ctv_broadcast_attempt_detail_limit=2)
+        fanout_txid = "22" * 32
+        ledger.persist_ctv_fanout_manifest_set(
+            block_hash="aa" * 32,
+            manifest_set=sample_ctv_manifest_set(),
+            manifest_set_sha256="66" * 32,
+        )
+
+        for index in range(4):
+            ledger.record_ctv_fanout_broadcast_attempt(
+                fanout_txid=fanout_txid,
+                attempt_status="planned",
+                package_txids=[fanout_txid],
+                submit_result={"package_msg": "error", "submitted": False},
+                error=f"transient-{index}",
+            )
+
+        status = ledger.ctv_fanout_status(fanout_txid=fanout_txid)
+        assert status is not None
+        self.assertEqual(status["broadcast_attempt_count"], 4)
+        self.assertEqual(status["broadcast_attempt_detail_count"], 2)
+        self.assertEqual(status["last_broadcast_error"], "transient-3")
+        self.assertEqual([row["attempt_seq"] for row in status["broadcast_attempts"]], [3, 4])
+        self.assertEqual(status["broadcast_attempt_summary"]["status_counts"]["planned"], 4)  # type: ignore[index]
 
     def test_postgres_miner_worker_query_treats_percent_and_underscore_literally(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
@@ -801,7 +832,44 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         self.assertEqual(payload["pagination"], {"page": 1, "limit": 15, "total_count": 0, "total_pages": 0})
         self.assertIn("'broadcast_attempts'", query)
+        self.assertIn("'broadcast_attempt_summary'", query)
+        self.assertIn("broadcast_attempt_count", query)
         self.assertIn("qbit_ctv_fanout_broadcast_attempts", query)
+        self.assertIn("settlement_status NOT IN ('confirmed', 'reorged', 'failed')", query)
+
+    def test_postgres_records_ctv_broadcast_summary_and_caps_detail_rows(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "backend": "postgres-psql",
+                    "attempt_count": 1,
+                    "updated_count": 1,
+                    "broadcast_attempt_count": 5,
+                    "broadcast_attempt_detail_count": 2,
+                },
+            ],
+            ctv_broadcast_attempt_detail_limit=2,
+            ctv_broadcast_retry_backoff_seconds=17,
+        )
+
+        payload = ledger.record_ctv_fanout_broadcast_attempt(
+            fanout_txid="22" * 32,
+            attempt_status="planned",
+            package_txids=["22" * 32],
+            submit_result={"package_msg": "error", "submitted": False},
+            error="rpc unavailable",
+        )
+        query = ledger.lease_queries[-1]
+
+        self.assertEqual(payload["attempt_count"], 1)
+        self.assertIn('"attempt_detail_limit":2', query)
+        self.assertIn('"retry_backoff_seconds":17', query)
+        self.assertIn("last_broadcast_attempt_status = data->>'attempt_status'", query)
+        self.assertIn("last_broadcast_error = data->>'error'", query)
+        self.assertIn("broadcast_attempt_status_counts = jsonb_set", query)
+        self.assertIn("OFFSET GREATEST((data->>'attempt_detail_limit')::integer - 1, 0)", query)
+        self.assertIn("next_broadcast_attempt_at = CASE", query)
 
     def test_postgres_miner_earnings_block_gross_keeps_reversed_rows_in_denominator(self) -> None:
         ledger = FakeLeasePsqlShareLedger(

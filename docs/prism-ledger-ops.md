@@ -97,6 +97,12 @@ databases. In particular, it drops the old `NOT NULL` constraint from
 `qbit_ctv_fanout_artifacts.anchor_vout` so fee-bearing, anchorless CTV fanouts
 can persist with `anchor_vout = NULL`.
 
+The same schema init path also adds bounded broadcast-attempt summaries to
+`qbit_ctv_fanout_artifacts`. Operators can tune retained detail rows with
+`PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT`; the summary columns retain total
+attempt count, latest package/result/error context, and per-status counts after
+old detail rows are no longer retained.
+
 If a block was mined while the old constraint was still present, backfill the
 missing fanout artifact rows from the persisted audit bundle, a local
 `prism-live-audit-bundle-*.json` envelope, or a local audit body file:

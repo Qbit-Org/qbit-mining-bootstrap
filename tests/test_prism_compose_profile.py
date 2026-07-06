@@ -53,6 +53,8 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_CTV_BROADCASTER_FEE_BITS": "0",
                 "PRISM_CTV_BROADCASTER_LIMIT": "7",
                 "PRISM_CTV_BROADCASTER_INTERVAL_SECONDS": "11",
+                "PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT": "9",
+                "PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS": "17",
             }
         )
         completed = subprocess.run(
@@ -141,6 +143,8 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_CTV_BROADCASTER_FEE_BITS"], "0")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_LIMIT"], "7")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_INTERVAL_SECONDS"], "11")
+        self.assertEqual(env["PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT"], "9")
+        self.assertEqual(env["PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS"], "17")
         self.assertEqual(env["PRISM_USERNAME_FALLBACK_ADDRESS"], "")
         self.assertEqual(env["PRISM_ALLOW_MEMORY_LEDGER"], "0")
         self.assertEqual(env["PRISM_ALLOW_TEST_SIGNING_SEEDS"], "0")
