@@ -792,6 +792,9 @@ def artifact(coordinator: Any, *, sha256: str) -> object:
 
 
 def public_artifact_available(ledger: Any, *, sha256: str) -> bool:
+    exists = getattr(ledger, "dashboard_public_artifact_exists", None)
+    if callable(exists):
+        return bool(exists(sha256=sha256))
     getter = getattr(ledger, "dashboard_public_artifact", None)
     return bool(callable(getter) and getter(sha256=sha256) is not None)
 

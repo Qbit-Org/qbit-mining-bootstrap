@@ -408,6 +408,20 @@ class DirectCoinbasePublicLedger(FakePublicLedger):
         }
 
 
+class ArtifactExistsDirectCoinbasePublicLedger(DirectCoinbasePublicLedger):
+    def __init__(self) -> None:
+        self.exists_calls = 0
+        self.artifact_calls = 0
+
+    def dashboard_public_artifact_exists(self, *, sha256: str) -> bool:
+        self.exists_calls += 1
+        return sha256 == self.audit_bundle_sha256
+
+    def dashboard_public_artifact(self, *, sha256: str) -> dict[str, object] | None:
+        self.artifact_calls += 1
+        raise AssertionError("settlement link availability should use metadata-only exists hook")
+
+
 class ExternalizedAuditBodyResolver(PsqlShareLedger):
     def __init__(self, audit_body_dir: str | Path) -> None:
         self._audit_body_dir = Path(audit_body_dir)
@@ -1021,6 +1035,15 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(settlement["artifact_links"][0]["kind"], "audit_bundle")
         self.assertEqual(settlement["artifact_links"][0]["url"], f"/public/v1/artifacts/{ledger.audit_bundle_sha256}")
         self.assertEqual(settlement["fanouts"], [])
+
+    def test_settlement_artifacts_uses_metadata_only_artifact_availability_when_present(self) -> None:
+        ledger = ArtifactExistsDirectCoinbasePublicLedger()
+
+        settlement = public_api.settlement_artifacts(FakeCoordinator(ledger=ledger), block_hash=ledger.block_hash)
+
+        self.assertEqual(ledger.exists_calls, 1)
+        self.assertEqual(ledger.artifact_calls, 0)
+        self.assertEqual(settlement["artifact_links"][0]["kind"], "audit_bundle")
 
     def test_settlement_artifacts_supports_externalized_direct_coinbase_audit_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

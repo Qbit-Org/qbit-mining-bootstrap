@@ -323,7 +323,16 @@ base_url = f"http://127.0.0.1:{os.environ['AUDIT_PORT']}"
 evidence_path = Path(os.environ["EVIDENCE_PATH"])
 datadir = Path(os.environ["DATADIR"])
 evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-bundle = json.loads(Path(evidence["audit_bundle_path"]).read_text(encoding="utf-8"))
+
+def local_audit_payload(path):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("schema") == "qbit.prism.live-audit-bundle-envelope.v1":
+        return local_audit_payload(payload["body_uri"])
+    if payload.get("schema") == "qbit.prism.audit-body-ref.v1":
+        return payload["bundle_without_shares"]
+    return payload
+
+bundle = local_audit_payload(evidence["audit_bundle_path"])
 
 def get_json(path):
     with urllib.request.urlopen(base_url + path, timeout=10) as response:

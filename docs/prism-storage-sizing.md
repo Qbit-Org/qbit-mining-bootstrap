@@ -146,19 +146,29 @@ inactive. They can reactivate after a reorg.
 
 ## Artifact Storage Strategy
 
-There are two distinct optimization stages:
+The live coordinator stores accepted-block audit artifacts in two layers:
 
-1. Exact artifact externalization: store the current full
-   `qbit.prism.audit-bundle.v1` body in immutable artifact storage by content
-   hash, and keep hash, size, schema, and pointer metadata in Postgres. This
-   preserves current verifier semantics.
-2. Reduced/window proof artifacts: introduce a new proof schema that verifies a
-   TIDES reward window against retained ledger checkpoints or archive roots.
-   This is a verifier-contract change and must prove window completeness,
-   including the oldest partial-share boundary.
+1. Exact artifact externalization: Postgres stores hash/pointer metadata while
+   the external artifact path resolves to the exact
+   `qbit.prism.audit-bundle.v1` body expected by public API and verifier
+   callers.
+2. Share-segment body refs: when `PRISM_AUDIT_SHARE_SEGMENT_SIZE` is positive,
+   the external body file may be a compact `qbit.prism.audit-body-ref.v1`
+   storage envelope. It keeps all non-share bundle sections inline and points
+   at immutable `qbit.prism.audit-share-segment.v1` files for full contiguous
+   share ranges. Readers reconstruct and hash-check the original v1 bundle
+   before returning it, so API/verifier semantics remain v1-compatible while
+   accepted shares are written to artifact storage once per sealed segment.
 
-Stage 1 is the safe first production step. Stage 2 should be designed and
-landed separately.
+`prism-live-audit-bundle-*.json` files are now small operator envelopes that
+point at the canonical body URI. They are not the durable audit body. Retention
+may prune live envelopes and old candidates; it must not prune
+`prism-audit-bundle-body-*` or `prism-audit-share-segment-*` unless those
+artifacts have first been archived and the resolver policy is explicit.
+
+A future Rust-native reduced/window proof schema can further reduce verifier
+inputs. That remains a verifier-contract change and must prove window
+completeness, including the oldest partial-share boundary.
 
 ## VM Recommendations
 
@@ -227,3 +237,6 @@ Add alerts for:
 - `qbit_pool_audit_bundles` rows whose inline body remains large after artifact
   externalization lands
 - missing or hash-mismatched artifact objects
+- `/metrics` gauges `qbit_prism_audit_artifact_bytes` and
+  `qbit_prism_audit_artifact_files`, split by body, share segment, live bundle,
+  candidate, and other artifact kinds

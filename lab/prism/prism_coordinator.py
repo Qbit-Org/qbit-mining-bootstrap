@@ -14,11 +14,13 @@ import signal
 import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field, replace as dataclass_replace
 from decimal import Decimal, ROUND_CEILING
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,6 +38,7 @@ from lab.prism.prism_tools import prism_tool_command
 from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
 from lab.prism.ctv_broadcaster_daemon import CtvFanoutBroadcastDaemon, CtvFanoutDaemonResult
 from lab.prism.share_ledger import (
+    DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -623,6 +626,15 @@ class PrismCoordinator:
         self.evidence_path = Path(env("PRISM_EVIDENCE_PATH", "prism-live-evidence.json"))
         self.audit_dir = Path(env("PRISM_AUDIT_DIR", str(self.evidence_path.parent)))
         self.audit_dir.mkdir(parents=True, exist_ok=True)
+        self.audit_share_segment_size = env_nonnegative_int(
+            "PRISM_AUDIT_SHARE_SEGMENT_SIZE",
+            DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
+        )
+        self.audit_live_bundle_retention = env_nonnegative_int("PRISM_AUDIT_LIVE_BUNDLE_RETENTION", 5)
+        self.audit_candidate_retention_seconds = env_nonnegative_int(
+            "PRISM_AUDIT_CANDIDATE_RETENTION_SECONDS",
+            24 * 60 * 60,
+        )
         self.audit_bind = os.environ.get("PRISM_AUDIT_BIND")
         self.audit_port = int(os.environ.get("PRISM_AUDIT_PORT", "0") or "0")
         self.stop_after_block = env("PRISM_STOP_AFTER_BLOCK", "1") in {"1", "true", "yes"}
@@ -795,6 +807,7 @@ class PrismCoordinator:
             lease_ttl_seconds=env_positive_float("PRISM_LEDGER_LEASE_TTL_SECONDS", 60.0),
             read_concurrency=env_positive_int("PRISM_POSTGRES_READ_CONCURRENCY", 4),
             audit_body_dir=str(audit_body_dir) if audit_body_dir is not None else None,
+            audit_share_segment_size=getattr(self, "audit_share_segment_size", DEFAULT_AUDIT_SHARE_SEGMENT_SIZE),
         )
 
     def load_trusted_ledger_writer_public_key(self) -> str | None:
@@ -2506,115 +2519,130 @@ class PrismCoordinator:
                     PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
                     "final audit bundle coinbase does not match submitted coinbase",
                 )
-            bundle_path = self.audit_dir / f"prism-live-audit-bundle-candidate-{submission.block_hash_hex}.json"
-            bundle_path.write_text(json.dumps(final_bundle, indent=2), encoding="utf-8")
-            report = self.verify_bundle(
-                bundle_path,
-                submission.coinbase_tx_hex,
-                self.trusted_ledger_writer_public_key_hex(final_bundle),
-                expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
-            )
-            current_tip = str(self.rpc.call("getbestblockhash"))
-            if str(context.template["previousblockhash"]) != current_tip:
-                self.reject_stratum(21, PRISM_REJECTION_STALE_JOB, "stale job")
-            before_height = int(self.rpc.call("getblockcount"))
-            expected_height = int(context.template["height"])
-            if before_height + 1 != expected_height:
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_BLOCK_STALE,
-                    f"stale block height: template={expected_height} tip={before_height}",
-                )
-            persistence = self.ledger.persist_accepted_block(
+            candidate_bundle_path = self.write_temporary_audit_bundle(
+                final_bundle,
                 block_hash=submission.block_hash_hex,
-                block_height=expected_height,
-                parent_hash=str(context.template["previousblockhash"]),
-                final_bundle=final_bundle,
-                audit_report=report,
             )
-            result = self.rpc.call("submitblock", [submission.block_hex])
-            after_height = int(self.rpc.call("getblockcount"))
-            if result not in (None, "duplicate"):
-                self.reject_prepared_block(
+            try:
+                report = self.verify_bundle(
+                    candidate_bundle_path,
+                    submission.coinbase_tx_hex,
+                    self.trusted_ledger_writer_public_key_hex(final_bundle),
+                    expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
+                )
+                current_tip = str(self.rpc.call("getbestblockhash"))
+                if str(context.template["previousblockhash"]) != current_tip:
+                    self.reject_stratum(21, PRISM_REJECTION_STALE_JOB, "stale job")
+                before_height = int(self.rpc.call("getblockcount"))
+                expected_height = int(context.template["height"])
+                if before_height + 1 != expected_height:
+                    self.reject_stratum(
+                        21,
+                        PRISM_REJECTION_BLOCK_STALE,
+                        f"stale block height: template={expected_height} tip={before_height}",
+                    )
+                persistence = self.ledger.persist_accepted_block(
                     block_hash=submission.block_hash_hex,
-                    active_tip_height=after_height,
+                    block_height=expected_height,
+                    parent_hash=str(context.template["previousblockhash"]),
+                    final_bundle=final_bundle,
+                    audit_report=report,
                 )
-                self.reject_stratum(20, PRISM_REJECTION_SUBMITBLOCK_REJECTED, f"submitblock rejected candidate: {result}")
-            if after_height != before_height + 1:
-                self.reject_prepared_block(
-                    block_hash=submission.block_hash_hex,
-                    active_tip_height=after_height,
-                )
-                self.reject_stratum(
-                    20,
-                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                    f"submitblock did not advance height: {before_height}->{after_height}",
-                )
-            block_hash = str(self.rpc.call("getblockhash", [after_height]))
-            if block_hash.lower() != submission.block_hash_hex.lower():
-                self.stop_event.set()
-                self.reject_prepared_block(
-                    block_hash=submission.block_hash_hex,
-                    active_tip_height=after_height,
-                )
-                self.reject_stratum(
-                    20,
-                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                    f"submitted block hash mismatch: expected {submission.block_hash_hex} got {block_hash}",
-                )
-            confirmation = self.ledger.confirm_accepted_block(
-                block_hash=block_hash,
-                active_tip_height=after_height,
-            )
-            if int(confirmation.get("confirmed_count", 0)) != 1:
-                self.stop_event.set()
-                self.reject_stratum(
-                    20,
-                    PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
-                    f"ledger did not confirm accepted block {block_hash}",
-                )
-            ctv_persistence = None
-            ctv_manifest_set = final_bundle.get("ctv_fanout_manifest_set")
-            if isinstance(ctv_manifest_set, dict):
-                ctv_persistence = self.ledger.persist_ctv_fanout_manifest_set(
+                result = self.rpc.call("submitblock", [submission.block_hex])
+                after_height = int(self.rpc.call("getblockcount"))
+                if result not in (None, "duplicate"):
+                    self.reject_prepared_block(
+                        block_hash=submission.block_hash_hex,
+                        active_tip_height=after_height,
+                    )
+                    self.reject_stratum(20, PRISM_REJECTION_SUBMITBLOCK_REJECTED, f"submitblock rejected candidate: {result}")
+                if after_height != before_height + 1:
+                    self.reject_prepared_block(
+                        block_hash=submission.block_hash_hex,
+                        active_tip_height=after_height,
+                    )
+                    self.reject_stratum(
+                        20,
+                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                        f"submitblock did not advance height: {before_height}->{after_height}",
+                    )
+                block_hash = str(self.rpc.call("getblockhash", [after_height]))
+                if block_hash.lower() != submission.block_hash_hex.lower():
+                    self.stop_event.set()
+                    self.reject_prepared_block(
+                        block_hash=submission.block_hash_hex,
+                        active_tip_height=after_height,
+                    )
+                    self.reject_stratum(
+                        20,
+                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                        f"submitted block hash mismatch: expected {submission.block_hash_hex} got {block_hash}",
+                    )
+                confirmation = self.ledger.confirm_accepted_block(
                     block_hash=block_hash,
-                    manifest_set=ctv_manifest_set,
-                    manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
+                    active_tip_height=after_height,
                 )
-            final_bundle_path = self.audit_dir / f"prism-live-audit-bundle-{after_height}-{block_hash}.json"
-            bundle_path.replace(final_bundle_path)
-            bundle_path = final_bundle_path
-            self.append_accepted_share(client, context, submission, pending_share)
-            evidence = {
-                "schema": "qbit.prism.live-stratum-evidence.v1",
-                "block_hash": block_hash,
-                "block_height": after_height,
-                "coinbase_tx_hex": submission.coinbase_tx_hex,
-                "audit_bundle_path": str(bundle_path),
-                "audit_report": report,
-                "ledger_backend": self.ledger.backend_name,
-                "persistence": persistence,
-                "confirmation": confirmation,
-                "ctv_persistence": ctv_persistence,
-                "accepted_share_count": len(self.ledger.all_shares()),
-                "distinct_miners": sorted({share.miner_id for share in self.ledger.all_shares()}),
-                "job_share_count": len(context.shares_json),
-            }
-            self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
-            self.accepted_block_count += 1
-            self.latest_bundle = final_bundle
-            self.latest_evidence = evidence
-            print(
-                "prism coordinator: qbit accepted direct PRISM block "
-                f"height={after_height} hash={block_hash}",
-                flush=True,
-            )
-            should_stop = self.stop_after_block or self.accepted_block_count >= self.max_blocks
-            if not should_stop:
-                client.post_accept_refresh_block = (after_height, block_hash)
-            if should_stop:
-                self.stop_event.set()
-            return False
+                if int(confirmation.get("confirmed_count", 0)) != 1:
+                    self.stop_event.set()
+                    self.reject_stratum(
+                        20,
+                        PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+                        f"ledger did not confirm accepted block {block_hash}",
+                    )
+                ctv_persistence = None
+                ctv_manifest_set = final_bundle.get("ctv_fanout_manifest_set")
+                if isinstance(ctv_manifest_set, dict):
+                    ctv_persistence = self.ledger.persist_ctv_fanout_manifest_set(
+                        block_hash=block_hash,
+                        manifest_set=ctv_manifest_set,
+                        manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
+                    )
+                final_bundle_path = self.audit_dir / f"prism-live-audit-bundle-{after_height}-{block_hash}.json"
+                self.write_audit_bundle_envelope(
+                    final_bundle_path,
+                    block_hash=block_hash,
+                    block_height=after_height,
+                    report=report,
+                    persistence=persistence,
+                )
+                self.prune_audit_artifacts(keep_live_path=final_bundle_path)
+                bundle_path = final_bundle_path
+                self.append_accepted_share(client, context, submission, pending_share)
+                evidence = {
+                    "schema": "qbit.prism.live-stratum-evidence.v1",
+                    "block_hash": block_hash,
+                    "block_height": after_height,
+                    "coinbase_tx_hex": submission.coinbase_tx_hex,
+                    "audit_bundle_path": str(bundle_path),
+                    "audit_report": report,
+                    "ledger_backend": self.ledger.backend_name,
+                    "persistence": persistence,
+                    "confirmation": confirmation,
+                    "ctv_persistence": ctv_persistence,
+                    "accepted_share_count": len(self.ledger.all_shares()),
+                    "distinct_miners": sorted({share.miner_id for share in self.ledger.all_shares()}),
+                    "job_share_count": len(context.shares_json),
+                }
+                self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+                self.accepted_block_count += 1
+                self.latest_bundle = final_bundle
+                self.latest_evidence = evidence
+                print(
+                    "prism coordinator: qbit accepted direct PRISM block "
+                    f"height={after_height} hash={block_hash}",
+                    flush=True,
+                )
+                should_stop = self.stop_after_block or self.accepted_block_count >= self.max_blocks
+                if not should_stop:
+                    client.post_accept_refresh_block = (after_height, block_hash)
+                if should_stop:
+                    self.stop_event.set()
+                return False
+            finally:
+                try:
+                    candidate_bundle_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def reject_prepared_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
         reject = getattr(self.ledger, "reject_prepared_block", None)
@@ -2624,6 +2652,107 @@ class PrismCoordinator:
             block_hash=block_hash,
             active_tip_height=active_tip_height,
         )
+
+    def write_temporary_audit_bundle(self, bundle: dict[str, Any], *, block_hash: str) -> Path:
+        self.audit_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=self.audit_dir,
+            prefix=f".prism-live-audit-bundle-candidate-{block_hash}-",
+            suffix=".json.tmp",
+            delete=False,
+        ) as handle:
+            json.dump(bundle, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+            return Path(handle.name)
+
+    def write_audit_bundle_envelope(
+        self,
+        path: Path,
+        *,
+        block_hash: str,
+        block_height: int,
+        report: dict[str, Any],
+        persistence: dict[str, Any],
+    ) -> None:
+        audit_bundle_sha256 = str(
+            persistence.get("audit_bundle_sha256")
+            or report.get("audit_bundle_sha256_hex")
+            or ""
+        ).lower()
+        body_uri = str(persistence.get("body_uri") or "")
+        envelope = {
+            "schema": "qbit.prism.live-audit-bundle-envelope.v1",
+            "block_hash": block_hash,
+            "block_height": block_height,
+            "audit_bundle_sha256": audit_bundle_sha256,
+            "body_uri": body_uri,
+            "body_filename": Path(body_uri).name if body_uri else None,
+            "coinbase_txid": report.get("coinbase_txid"),
+            "coinbase_manifest_sha256": report.get("coinbase_manifest_sha256_hex"),
+            "coinbase_tx_hex": report.get("coinbase_tx_hex"),
+            "created_at": public_api.utc_now_iso(),
+        }
+        self.write_json_atomically(path, envelope)
+
+    def write_json_atomically(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with tmp_path.open("xb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            tmp_path.replace(path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def prune_audit_artifacts(self, *, keep_live_path: Path | None = None) -> None:
+        self.prune_live_audit_envelopes(keep_path=keep_live_path)
+        self.prune_candidate_audit_bundles()
+
+    def prune_live_audit_envelopes(self, *, keep_path: Path | None = None) -> None:
+        retention = int(getattr(self, "audit_live_bundle_retention", 5))
+        if retention < 0:
+            return
+        keep_resolved = keep_path.resolve() if keep_path is not None else None
+        retained_non_keep = max(retention - 1, 0) if keep_resolved is not None else retention
+        paths = sorted(
+            self.audit_dir.glob("prism-live-audit-bundle-[0-9]*.json"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0,
+            reverse=True,
+        )
+        retained_count = 0
+        for path in paths:
+            if keep_resolved is not None and path.resolve() == keep_resolved:
+                continue
+            if retained_count < retained_non_keep:
+                retained_count += 1
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def prune_candidate_audit_bundles(self) -> None:
+        retention_seconds = int(getattr(self, "audit_candidate_retention_seconds", 24 * 60 * 60))
+        now = time.time()
+        for pattern in (
+            "prism-live-audit-bundle-candidate-*.json",
+            ".prism-live-audit-bundle-candidate-*.json.tmp",
+        ):
+            for path in self.audit_dir.glob(pattern):
+                try:
+                    if retention_seconds == 0 or now - path.stat().st_mtime > retention_seconds:
+                        path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def verify_bundle(
         self,
@@ -2794,6 +2923,7 @@ class PrismCoordinator:
 
     def metrics_payload(self) -> str:
         ledger_metrics = self.ledger.metrics()
+        audit_metrics = self.audit_artifact_metrics()
         accepted_share_count = self.accepted_share_stats()[0]
         elapsed = max(0.001, time.monotonic() - self.started_monotonic)
         shares_per_second = accepted_share_count / elapsed
@@ -2930,9 +3060,68 @@ class PrismCoordinator:
             "# HELP qbit_prism_qbitd_peers qbitd peer count, or -1 if unavailable.",
             "# TYPE qbit_prism_qbitd_peers gauge",
             f"qbit_prism_qbitd_peers {peers}",
+            "# HELP qbit_prism_audit_artifact_bytes Bytes used by PRISM audit artifacts in PRISM_AUDIT_DIR by artifact kind.",
+            "# TYPE qbit_prism_audit_artifact_bytes gauge",
+            *[
+                f'qbit_prism_audit_artifact_bytes{{kind="{kind}"}} {audit_metrics[kind]["bytes"]}'
+                for kind in ("body", "share_segment", "live_bundle", "candidate", "other")
+            ],
+            "# HELP qbit_prism_audit_artifact_files PRISM audit artifact file count in PRISM_AUDIT_DIR by artifact kind.",
+            "# TYPE qbit_prism_audit_artifact_files gauge",
+            *[
+                f'qbit_prism_audit_artifact_files{{kind="{kind}"}} {audit_metrics[kind]["files"]}'
+                for kind in ("body", "share_segment", "live_bundle", "candidate", "other")
+            ],
+            "# HELP qbit_prism_audit_artifact_scan_error Whether the latest PRISM_AUDIT_DIR metric scan failed.",
+            "# TYPE qbit_prism_audit_artifact_scan_error gauge",
+            f"qbit_prism_audit_artifact_scan_error {audit_metrics['scan_error']}",
         ]
         lines.extend(self.job_build_metrics_lines())
         return "\n".join(lines) + "\n"
+
+    def audit_artifact_metrics(self) -> dict[str, dict[str, int] | int]:
+        metrics: dict[str, dict[str, int] | int] = {
+            kind: {"files": 0, "bytes": 0}
+            for kind in ("body", "share_segment", "live_bundle", "candidate", "other")
+        }
+        metrics["scan_error"] = 0
+        audit_dir = getattr(self, "audit_dir", None)
+        if audit_dir is None:
+            metrics["scan_error"] = 1
+            return metrics
+        try:
+            paths = list(Path(audit_dir).iterdir())
+        except OSError:
+            metrics["scan_error"] = 1
+            return metrics
+        for path in paths:
+            try:
+                if not path.is_file():
+                    continue
+                size = path.stat().st_size
+            except OSError:
+                metrics["scan_error"] = 1
+                continue
+            kind = self.audit_artifact_kind(path.name)
+            bucket = metrics[kind]
+            assert isinstance(bucket, dict)
+            bucket["files"] += 1
+            bucket["bytes"] += size
+        return metrics
+
+    @staticmethod
+    def audit_artifact_kind(name: str) -> str:
+        if name.startswith("prism-audit-bundle-body-") and name.endswith(".json"):
+            return "body"
+        if name.startswith("prism-audit-share-segment-") and name.endswith(".json"):
+            return "share_segment"
+        if name.startswith("prism-live-audit-bundle-candidate-") or name.startswith(
+            ".prism-live-audit-bundle-candidate-"
+        ):
+            return "candidate"
+        if name.startswith("prism-live-audit-bundle-") and name.endswith(".json"):
+            return "live_bundle"
+        return "other"
 
     def job_build_metrics_lines(self) -> list[str]:
         self._ensure_job_cache_state()

@@ -98,20 +98,24 @@ databases. In particular, it drops the old `NOT NULL` constraint from
 can persist with `anchor_vout = NULL`.
 
 If a block was mined while the old constraint was still present, backfill the
-missing fanout artifact rows from the persisted audit bundle or a local
-`prism-live-audit-bundle-*.json` file:
+missing fanout artifact rows from the persisted audit bundle, a local
+`prism-live-audit-bundle-*.json` envelope, or a local audit body file:
 
 ```bash
 PRISM_DATABASE_URL='postgres://...' \
 python3 -m lab.prism.backfill_ctv_fanouts --db-block-height 21883
 ```
 
-The repair tool also accepts `--db-block-hash <hash>` or local JSON paths. For a
+The repair tool also accepts `--db-block-hash <hash>` or local JSON paths. Local
+paths may be full v1 bundles, live envelopes, or compact audit body refs; the
+tool follows envelope `body_uri` pointers and reads `bundle_without_shares`
+from compact body refs because CTV backfill does not need share rows. For a
 local candidate/final audit bundle whose filename does not include the block
 hash, pass `--path-block-hash <hash>`. The tool runs schema init by default
-before backfilling and then calls the same fenced `persist_ctv_fanout_manifest_set`
-path as the coordinator. Stop the active coordinator or otherwise ensure the
-repair process can acquire the ledger writer lease before running a backfill.
+before backfilling and then calls the same fenced
+`persist_ctv_fanout_manifest_set` path as the coordinator. Stop the active
+coordinator or otherwise ensure the repair process can acquire the ledger
+writer lease before running a backfill.
 
 ## Compaction and Archive Contract
 

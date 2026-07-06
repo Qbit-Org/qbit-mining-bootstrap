@@ -273,7 +273,16 @@ import os
 from pathlib import Path
 
 evidence = json.loads(Path(os.environ["EVIDENCE_PATH"]).read_text(encoding="utf-8"))
-bundle = json.loads(Path(evidence["audit_bundle_path"]).read_text(encoding="utf-8"))
+
+def local_audit_payload(path):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("schema") == "qbit.prism.live-audit-bundle-envelope.v1":
+        return local_audit_payload(payload["body_uri"])
+    if payload.get("schema") == "qbit.prism.audit-body-ref.v1":
+        return payload["bundle_without_shares"]
+    return payload
+
+bundle = local_audit_payload(evidence["audit_bundle_path"])
 if evidence["ledger_backend"] != "postgres-psql":
     raise SystemExit("combined proof did not use the Postgres ledger")
 if len(evidence["distinct_miners"]) < int(os.environ["MINER_COUNT"]):
