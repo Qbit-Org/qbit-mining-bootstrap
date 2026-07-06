@@ -148,32 +148,34 @@ inactive. They can reactivate after a reorg.
 
 ## Artifact Storage Strategy
 
-The live coordinator stores accepted-block audit artifacts in two layers:
+The live coordinator stores accepted-block audit artifacts with these rules:
 
 1. Exact artifact externalization: Postgres stores hash/pointer metadata while
-   the external artifact path resolves to the exact
-   `qbit.prism.audit-bundle.v1` body expected by public API and verifier
-   callers. New rows also store `audit_body_byte_len` so the canonical row has
-   the artifact hash, stored byte size, schema version, and body pointer.
-2. Share-segment body refs: when `PRISM_AUDIT_SHARE_SEGMENT_SIZE` is positive,
-   the external body file may be a compact `qbit.prism.audit-body-ref.v1`
-   storage envelope. It keeps all non-share bundle sections inline and points
-   at immutable `qbit.prism.audit-share-segment.v1` files for full contiguous
-   share ranges. Readers reconstruct and hash-check the original v1 bundle
-   before returning it, so API/verifier semantics remain v1-compatible. The
-   Rust `qbit-prism-audit-verify` and `qbit-prism-audit-canonicalize` tools
-   now accept either full v1 bundles or compact body-ref files and verify each
-   referenced segment hash before reconstructing the canonical v1 bundle.
+   every reader still resolves the body to the logical
+   `qbit.prism.audit-bundle.v1` expected by public API and verifier callers.
+   New rows also store `audit_body_byte_len` so the canonical row has the
+   artifact hash, stored byte size, schema version, and body pointer.
+2. Share-segment proof bodies: when `PRISM_AUDIT_SHARE_SEGMENT_SIZE` is
+   positive, new external body files use `qbit.prism.audit-bundle.v2`. The v2
+   body keeps non-share bundle sections inline, stores a
+   `qbit.prism.window-completeness-proof.v1`, and points at stable
+   `qbit.prism.audit-share-segment.v1` segment-slot files with per-range hashes.
+   This removes the old repeated inline tail/partial-window share arrays while
+   preserving the same reconstructed v1 bundle hash.
+3. Legacy body refs: older compact files using `qbit.prism.audit-body-ref.v1`
+   remain readable. The Rust `qbit-prism-audit-verify` and
+   `qbit-prism-audit-canonicalize` tools accept full v1 bundles, legacy body
+   refs, and v2 proof bodies, verifying referenced segment/range hashes before
+   reconstructing the canonical v1 bundle.
 
 `prism-live-audit-bundle-*.json` files are now small operator envelopes that
 point at the canonical body URI. They are not the durable audit body. Retention
 may prune live envelopes and old candidates; it must not prune
 `prism-audit-bundle-body-*` or `prism-audit-share-segment-*` unless those
-artifacts have first been archived and the resolver policy is explicit.
-
-A future Rust-native reduced/window proof schema can further reduce verifier
-inputs. That remains a verifier-contract change and must prove window
-completeness, including the oldest partial-share boundary.
+artifacts have first been archived and the resolver policy is explicit. Stable
+`prism-audit-share-segment-slot-*` files may grow as adjacent ranges are first
+referenced, so old body files verify their original range hash against the
+selected slice rather than against the whole mutable slot file.
 
 CTV broadcast retries are bounded separately from audit bodies:
 

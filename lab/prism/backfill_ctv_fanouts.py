@@ -18,6 +18,7 @@ if not __package__:
 
 from lab.prism.share_ledger import (
     AUDIT_BODY_REF_SCHEMA,
+    AUDIT_BUNDLE_V2_SCHEMA,
     PsqlShareLedger,
     canonical_hex,
     require_mapping,
@@ -60,6 +61,11 @@ def resolve_local_audit_payload(payload: dict[str, Any], *, source_path: Path) -
         bundle_without_shares = payload.get("bundle_without_shares")
         if not isinstance(bundle_without_shares, dict):
             raise SystemExit(f"{source_path}: compact audit body has no bundle_without_shares")
+        return bundle_without_shares
+    if schema == AUDIT_BUNDLE_V2_SCHEMA:
+        bundle_without_shares = payload.get("bundle_without_shares")
+        if not isinstance(bundle_without_shares, dict):
+            raise SystemExit(f"{source_path}: audit-bundle.v2 has no bundle_without_shares")
         return bundle_without_shares
     return payload
 

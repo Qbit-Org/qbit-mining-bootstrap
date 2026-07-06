@@ -22,7 +22,9 @@ from typing import Any, Callable
 from lab.prism.prism_tools import prism_tool_command
 
 AUDIT_BODY_REF_SCHEMA = "qbit.prism.audit-body-ref.v1"
+AUDIT_BUNDLE_V2_SCHEMA = "qbit.prism.audit-bundle.v2"
 AUDIT_SHARE_SEGMENT_SCHEMA = "qbit.prism.audit-share-segment.v1"
+AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA = "qbit.prism.window-completeness-proof.v1"
 DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
 DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
 DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
@@ -2021,6 +2023,10 @@ WITH filtered AS (
     LEFT JOIN qbit_pool_audit_bundles bundle
       ON bundle.block_hash = artifact.block_hash
     WHERE artifact.settlement_status NOT IN ('confirmed', 'reorged', 'failed')
+      AND (
+          artifact.next_broadcast_attempt_at IS NULL
+          OR artifact.next_broadcast_attempt_at <= clock_timestamp()
+      )
 ),
 page_rows AS (
     SELECT *
@@ -2863,6 +2869,13 @@ FROM bucketed;
         final_bundle: dict[str, Any],
         canonical_body_bytes: bytes,
     ) -> bytes:
+        v2_bundle = self._audit_bundle_v2(
+            block_hash=block_hash,
+            audit_bundle_sha256=audit_bundle_sha256,
+            final_bundle=final_bundle,
+        )
+        if v2_bundle is not None:
+            return self._storage_json_bytes(v2_bundle)
         body_ref = self._audit_body_ref(
             block_hash=block_hash,
             audit_bundle_sha256=audit_bundle_sha256,
@@ -2902,6 +2915,60 @@ FROM bucketed;
             "share_parts": share_parts,
         }
 
+    def _audit_bundle_v2(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        final_bundle: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self._audit_body_dir is None or self._audit_share_segment_size <= 0:
+            return None
+        shares = final_bundle.get("shares")
+        if not isinstance(shares, list) or not shares:
+            return None
+        share_parts = self._audit_share_range_parts(shares)
+        if share_parts is None:
+            return None
+        bundle_without_shares = copy.deepcopy(final_bundle)
+        shares_key_index = list(bundle_without_shares).index("shares")
+        bundle_without_shares.pop("shares", None)
+        reward_manifest = final_bundle.get("reward_manifest")
+        proof: dict[str, Any] = {
+            "schema": AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
+            "share_segment_size": self._audit_share_segment_size,
+            "first_share_seq": int(shares[0]["share_seq"]),
+            "last_share_seq": int(shares[-1]["share_seq"]),
+            "share_count": len(shares),
+            "share_parts_digest_hex": sha256_bytes_hex(
+                self._storage_json_bytes({"share_parts": share_parts})
+            ),
+            "share_parts": share_parts,
+        }
+        if isinstance(reward_manifest, dict):
+            for key in (
+                "anchor_job_issued_at_ms",
+                "anchor_share_seq",
+                "newest_share_seq",
+                "oldest_share_seq",
+                "included_share_count",
+                "requested_window_weight",
+                "counted_window_weight",
+                "share_slice_digest_hex",
+            ):
+                if key in reward_manifest:
+                    proof[key] = copy.deepcopy(reward_manifest[key])
+        return {
+            "schema": AUDIT_BUNDLE_V2_SCHEMA,
+            "block_hash": block_hash,
+            "audit_bundle_sha256": audit_bundle_sha256,
+            "logical_audit_bundle_schema": str(final_bundle.get("schema") or ""),
+            "share_count": len(shares),
+            "shares_key_index": shares_key_index,
+            "bundle_without_shares": bundle_without_shares,
+            "share_window_proof": proof,
+        }
+
     def _audit_share_parts(self, shares: list[Any]) -> list[dict[str, Any]] | None:
         share_seqs: list[int] = []
         for share in shares:
@@ -2927,11 +2994,7 @@ FROM bucketed;
                 end += 1
             chunk = shares[index:end]
             chunk_seqs = share_seqs[index:end]
-            if (
-                len(chunk) == segment_size
-                and chunk_seqs[0] == segment_start
-                and chunk_seqs[-1] == segment_end
-            ):
+            if len(chunk) == segment_size and chunk_seqs[0] == segment_start and chunk_seqs[-1] == segment_end:
                 segment_uri, segment_sha256 = self._write_audit_share_segment(
                     first_share_seq=segment_start,
                     last_share_seq=segment_end,
@@ -2960,6 +3023,62 @@ FROM bucketed;
             index = end
         return parts
 
+    def _audit_share_range_parts(self, shares: list[Any]) -> list[dict[str, Any]] | None:
+        share_seqs: list[int] = []
+        for share in shares:
+            if not isinstance(share, dict):
+                return None
+            try:
+                share_seq = int(share["share_seq"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            share_seqs.append(share_seq)
+        if any(current + 1 != nxt for current, nxt in zip(share_seqs, share_seqs[1:])):
+            return None
+
+        parts: list[dict[str, Any]] = []
+        index = 0
+        segment_size = self._audit_share_segment_size
+        while index < len(shares):
+            first_seq = share_seqs[index]
+            segment_start = ((first_seq - 1) // segment_size) * segment_size + 1
+            segment_end = segment_start + segment_size - 1
+            end = index
+            while end < len(shares) and share_seqs[end] <= segment_end:
+                end += 1
+            chunk = shares[index:end]
+            chunk_seqs = share_seqs[index:end]
+            segment_uri, range_sha256 = self._write_audit_share_segment_range(
+                segment_first_share_seq=segment_start,
+                segment_last_share_seq=segment_end,
+                first_share_seq=chunk_seqs[0],
+                last_share_seq=chunk_seqs[-1],
+                shares=chunk,
+            )
+            parts.append(
+                {
+                    "kind": "segment_range",
+                    "segment_first_share_seq": segment_start,
+                    "segment_last_share_seq": segment_end,
+                    "first_share_seq": chunk_seqs[0],
+                    "last_share_seq": chunk_seqs[-1],
+                    "share_count": len(chunk),
+                    "range_sha256": range_sha256,
+                    "body_uri": segment_uri,
+                }
+            )
+            index = end
+        return parts
+
+    def _audit_share_segment_payload(self, *, first_share_seq: int, last_share_seq: int, shares: list[Any]) -> dict[str, Any]:
+        return {
+            "schema": AUDIT_SHARE_SEGMENT_SCHEMA,
+            "first_share_seq": first_share_seq,
+            "last_share_seq": last_share_seq,
+            "share_count": len(shares),
+            "shares": copy.deepcopy(shares),
+        }
+
     def _write_audit_share_segment(
         self,
         *,
@@ -2969,13 +3088,11 @@ FROM bucketed;
     ) -> tuple[str, str]:
         if self._audit_body_dir is None:
             raise RuntimeError("audit body store is not configured")
-        segment = {
-            "schema": AUDIT_SHARE_SEGMENT_SCHEMA,
-            "first_share_seq": first_share_seq,
-            "last_share_seq": last_share_seq,
-            "share_count": len(shares),
-            "shares": copy.deepcopy(shares),
-        }
+        segment = self._audit_share_segment_payload(
+            first_share_seq=first_share_seq,
+            last_share_seq=last_share_seq,
+            shares=shares,
+        )
         segment_bytes = self._storage_json_bytes(segment)
         segment_sha256 = sha256_bytes_hex(segment_bytes)
         segment_path = self._audit_body_dir.resolve() / (
@@ -2987,6 +3104,96 @@ FROM bucketed;
         else:
             self._write_bytes_atomically(segment_path, segment_bytes)
         return str(segment_path), segment_sha256
+
+    def _write_audit_share_segment_range(
+        self,
+        *,
+        segment_first_share_seq: int,
+        segment_last_share_seq: int,
+        first_share_seq: int,
+        last_share_seq: int,
+        shares: list[Any],
+    ) -> tuple[str, str]:
+        if self._audit_body_dir is None:
+            raise RuntimeError("audit body store is not configured")
+        if not shares:
+            raise RuntimeError("audit share segment range cannot be empty")
+        segment_path = self._audit_body_dir.resolve() / (
+            f"prism-audit-share-segment-slot-{segment_first_share_seq}-{segment_last_share_seq}.json"
+        )
+        merged_shares = copy.deepcopy(shares)
+        if segment_path.exists():
+            try:
+                existing = json.loads(segment_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"existing audit share segment is not valid JSON at {segment_path}") from exc
+            if not isinstance(existing, dict) or existing.get("schema") != AUDIT_SHARE_SEGMENT_SCHEMA:
+                raise RuntimeError(f"existing audit share segment has invalid schema at {segment_path}")
+            existing_shares = existing.get("shares")
+            if not isinstance(existing_shares, list):
+                raise RuntimeError(f"existing audit share segment has no shares at {segment_path}")
+            merged_shares = self._merge_audit_share_ranges(
+                existing_shares,
+                shares,
+                segment_path=segment_path,
+            )
+        segment_first = int(merged_shares[0]["share_seq"])
+        segment_last = int(merged_shares[-1]["share_seq"])
+        segment = self._audit_share_segment_payload(
+            first_share_seq=segment_first,
+            last_share_seq=segment_last,
+            shares=merged_shares,
+        )
+        segment_bytes = self._storage_json_bytes(segment)
+        if not segment_path.exists() or segment_path.read_bytes() != segment_bytes:
+            self._write_bytes_atomically(segment_path, segment_bytes)
+
+        range_payload = self._audit_share_segment_payload(
+            first_share_seq=first_share_seq,
+            last_share_seq=last_share_seq,
+            shares=shares,
+        )
+        range_sha256 = sha256_bytes_hex(self._storage_json_bytes(range_payload))
+        return str(segment_path), range_sha256
+
+    def _merge_audit_share_ranges(
+        self,
+        existing_shares: list[Any],
+        incoming_shares: list[Any],
+        *,
+        segment_path: Path,
+    ) -> list[Any]:
+        if not existing_shares:
+            return copy.deepcopy(incoming_shares)
+        existing_by_seq = self._audit_shares_by_seq(existing_shares, segment_path=segment_path)
+        incoming_by_seq = self._audit_shares_by_seq(incoming_shares, segment_path=segment_path)
+        for share_seq, incoming in incoming_by_seq.items():
+            existing = existing_by_seq.get(share_seq)
+            if existing is not None and existing != incoming:
+                raise RuntimeError(f"existing audit share segment conflicts at share_seq {share_seq} in {segment_path}")
+        merged_by_seq = {**existing_by_seq, **incoming_by_seq}
+        ordered_seqs = sorted(merged_by_seq)
+        if any(current + 1 != nxt for current, nxt in zip(ordered_seqs, ordered_seqs[1:])):
+            raise RuntimeError(f"existing audit share segment would become non-contiguous at {segment_path}")
+        return [copy.deepcopy(merged_by_seq[share_seq]) for share_seq in ordered_seqs]
+
+    def _audit_shares_by_seq(self, shares: list[Any], *, segment_path: Path) -> dict[int, Any]:
+        by_seq: dict[int, Any] = {}
+        for share in shares:
+            if not isinstance(share, dict):
+                raise RuntimeError(f"audit share segment has invalid share payload at {segment_path}")
+            try:
+                share_seq = int(share["share_seq"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"audit share segment has invalid share_seq at {segment_path}") from exc
+            existing = by_seq.get(share_seq)
+            if existing is not None and existing != share:
+                raise RuntimeError(f"audit share segment has duplicate conflicting share_seq {share_seq} at {segment_path}")
+            by_seq[share_seq] = copy.deepcopy(share)
+        ordered = sorted(by_seq)
+        if any(current + 1 != nxt for current, nxt in zip(ordered, ordered[1:])):
+            raise RuntimeError(f"audit share segment has non-contiguous share_seq values at {segment_path}")
+        return by_seq
 
     def _storage_json_bytes(self, payload: dict[str, Any]) -> bytes:
         return json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -3225,6 +3432,8 @@ END;
             raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: {exc}") from exc
         if isinstance(body, dict) and body.get("schema") == AUDIT_BODY_REF_SCHEMA:
             return self._resolve_audit_body_ref(body, expected_sha256=expected_sha256, body_uri=body_uri)
+        if isinstance(body, dict) and body.get("schema") == AUDIT_BUNDLE_V2_SCHEMA:
+            return self._resolve_audit_bundle_v2(body, expected_sha256=expected_sha256, body_uri=body_uri)
         if expected_sha256:
             expected = str(expected_sha256).lower()
             actual = sha256_bytes_hex(body_bytes)
@@ -3267,36 +3476,31 @@ END;
                 if kind == "segment":
                     if not self._audit_share_segment_available(part, parent_body_uri=body_uri):
                         return False
+                elif kind in {"segment_range", "segment_prefix"}:
+                    if not self._audit_share_segment_available(part, parent_body_uri=body_uri):
+                        return False
                 elif kind == "inline":
                     inline_shares = part.get("shares")
-                    if not isinstance(inline_shares, list):
+                    if not isinstance(inline_shares, list) or len(inline_shares) != int(part.get("share_count") or 0):
                         return False
                 else:
                     return False
                 actual_share_count += int(part.get("share_count") or 0)
             return actual_share_count == expected_share_count
+        if isinstance(body, dict) and body.get("schema") == AUDIT_BUNDLE_V2_SCHEMA:
+            try:
+                self._resolve_audit_bundle_v2(body, expected_sha256=expected_sha256, body_uri=body_uri)
+            except RuntimeError:
+                return False
+            return True
         return sha256_bytes_hex(body_bytes) == expected_sha256
 
     def _audit_share_segment_available(self, part: dict[str, Any], *, parent_body_uri: object) -> bool:
-        body_uri = part.get("body_uri")
-        expected_sha256 = str(part.get("sha256") or "").lower()
-        if not expected_sha256:
-            return False
         try:
-            body_path = self._resolve_audit_body_path(body_uri)
-            segment_bytes = body_path.read_bytes()
-        except (OSError, RuntimeError):
+            self._read_audit_share_segment(part, parent_body_uri=parent_body_uri)
+        except RuntimeError:
             return False
-        if sha256_bytes_hex(segment_bytes) != expected_sha256:
-            return False
-        try:
-            segment = json.loads(segment_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return False
-        if not isinstance(segment, dict) or segment.get("schema") != AUDIT_SHARE_SEGMENT_SCHEMA:
-            return False
-        shares = segment.get("shares")
-        return isinstance(shares, list) and len(shares) == int(part.get("share_count") or 0)
+        return True
 
     def _resolve_audit_body_ref(
         self,
@@ -3324,10 +3528,14 @@ END;
             kind = part.get("kind")
             if kind == "segment":
                 shares.extend(self._read_audit_share_segment(part, parent_body_uri=body_uri))
+            elif kind in {"segment_range", "segment_prefix"}:
+                shares.extend(self._read_audit_share_segment(part, parent_body_uri=body_uri))
             elif kind == "inline":
                 inline_shares = part.get("shares")
                 if not isinstance(inline_shares, list):
                     raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid inline shares")
+                if len(inline_shares) != int(part.get("share_count") or 0):
+                    raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: inline share count mismatch")
                 shares.extend(copy.deepcopy(inline_shares))
             else:
                 raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part kind")
@@ -3337,7 +3545,8 @@ END;
                 f"audit bundle body is not valid JSON at {body_uri}: expected "
                 f"{expected_share_count} shares, reconstructed {len(shares)}"
             )
-        shares_key_index = int(body_ref.get("shares_key_index") or len(bundle_without_shares))
+        shares_key_index_raw = body_ref.get("shares_key_index")
+        shares_key_index = len(bundle_without_shares) if shares_key_index_raw is None else int(shares_key_index_raw)
         bundle: dict[str, object] = {}
         shares_inserted = False
         for index, (key, value) in enumerate(bundle_without_shares.items()):
@@ -3355,9 +3564,80 @@ END;
                 )
         return bundle
 
+    def _resolve_audit_bundle_v2(
+        self,
+        body: dict[str, Any],
+        *,
+        expected_sha256: object | None,
+        body_uri: object,
+    ) -> dict[str, object]:
+        expected = str(expected_sha256).lower() if expected_sha256 else None
+        declared_sha256 = str(body.get("audit_bundle_sha256") or "").lower()
+        if expected and declared_sha256 != expected:
+            raise RuntimeError(
+                f"audit bundle body hash mismatch at {body_uri}: expected {expected}, got {declared_sha256}"
+            )
+        bundle_without_shares = body.get("bundle_without_shares")
+        if not isinstance(bundle_without_shares, dict):
+            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing bundle_without_shares")
+        proof = body.get("share_window_proof")
+        if not isinstance(proof, dict) or proof.get("schema") != AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA:
+            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing share_window_proof")
+        share_parts = proof.get("share_parts")
+        if not isinstance(share_parts, list):
+            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing share_parts")
+        expected_parts_digest = str(proof.get("share_parts_digest_hex") or "").lower()
+        if expected_parts_digest:
+            actual_parts_digest = sha256_bytes_hex(self._storage_json_bytes({"share_parts": share_parts}))
+            if actual_parts_digest != expected_parts_digest:
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {body_uri}: share_parts_digest_hex mismatch"
+                )
+        shares: list[Any] = []
+        for part in share_parts:
+            if not isinstance(part, dict):
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part")
+            shares.extend(self._read_audit_share_segment(part, parent_body_uri=body_uri))
+        expected_share_count = int(body.get("share_count") or proof.get("share_count") or 0)
+        if len(shares) != expected_share_count:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {body_uri}: expected "
+                f"{expected_share_count} shares, reconstructed {len(shares)}"
+            )
+        if shares:
+            first_share_seq = int(shares[0].get("share_seq")) if isinstance(shares[0], dict) else None
+            last_share_seq = int(shares[-1].get("share_seq")) if isinstance(shares[-1], dict) else None
+            if int(proof.get("first_share_seq") or 0) != first_share_seq:
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: proof first_share_seq mismatch")
+            if int(proof.get("last_share_seq") or 0) != last_share_seq:
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: proof last_share_seq mismatch")
+        reward_manifest = bundle_without_shares.get("reward_manifest")
+        proof_share_digest = str(proof.get("share_slice_digest_hex") or "")
+        if proof_share_digest and isinstance(reward_manifest, dict):
+            reward_share_digest = str(reward_manifest.get("share_slice_digest_hex") or "")
+            if not proof_share_digest.lower() == reward_share_digest.lower():
+                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: proof share digest mismatch")
+        shares_key_index_raw = body.get("shares_key_index")
+        shares_key_index = len(bundle_without_shares) if shares_key_index_raw is None else int(shares_key_index_raw)
+        bundle: dict[str, object] = {}
+        shares_inserted = False
+        for index, (key, value) in enumerate(bundle_without_shares.items()):
+            if index == shares_key_index:
+                bundle["shares"] = shares
+                shares_inserted = True
+            bundle[str(key)] = copy.deepcopy(value)
+        if not shares_inserted:
+            bundle["shares"] = shares
+        actual = sha256_bytes_hex(self._canonical_audit_bundle_bytes(bundle))
+        if declared_sha256 and actual != declared_sha256:
+            raise RuntimeError(
+                f"audit bundle body hash mismatch at {body_uri}: expected {declared_sha256}, got {actual}"
+            )
+        return bundle
+
     def _read_audit_share_segment(self, part: dict[str, Any], *, parent_body_uri: object) -> list[Any]:
         body_uri = part.get("body_uri")
-        expected_sha256 = str(part.get("sha256") or "").lower()
+        kind = str(part.get("kind") or "")
         try:
             body_path = self._resolve_audit_body_path(body_uri)
             segment_bytes = body_path.read_bytes()
@@ -3365,11 +3645,11 @@ END;
             raise RuntimeError(
                 f"audit bundle body is not retrievable at {parent_body_uri}: share segment {body_uri}: {exc}"
             ) from exc
-        actual_sha256 = sha256_bytes_hex(segment_bytes)
-        if actual_sha256 != expected_sha256:
+        expected_sha256 = str(part.get("sha256") or "").lower()
+        if kind == "segment" and sha256_bytes_hex(segment_bytes) != expected_sha256:
             raise RuntimeError(
                 f"audit bundle body hash mismatch at {parent_body_uri}: "
-                f"share segment {body_uri} expected {expected_sha256}, got {actual_sha256}"
+                f"share segment {body_uri} expected {expected_sha256}, got {sha256_bytes_hex(segment_bytes)}"
             )
         try:
             segment = json.loads(segment_bytes.decode("utf-8"))
@@ -3387,12 +3667,91 @@ END;
                 f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} has no shares"
             )
         expected_count = int(part.get("share_count") or 0)
-        if len(shares) != expected_count:
+        first_share_seq = int(part.get("first_share_seq") or 0)
+        last_share_seq = int(part.get("last_share_seq") or 0)
+        selected_shares = self._select_audit_share_segment_range(
+            shares,
+            first_share_seq=first_share_seq,
+            last_share_seq=last_share_seq,
+            parent_body_uri=parent_body_uri,
+            body_uri=body_uri,
+        )
+        if len(selected_shares) != expected_count:
             raise RuntimeError(
                 f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} "
-                f"expected {expected_count} shares, found {len(shares)}"
+                f"expected {expected_count} shares, found {len(selected_shares)}"
             )
-        return copy.deepcopy(shares)
+        if kind == "segment_range":
+            expected_range_sha256 = str(part.get("range_sha256") or "").lower()
+            actual_range_sha256 = sha256_bytes_hex(
+                self._storage_json_bytes(
+                    self._audit_share_segment_payload(
+                        first_share_seq=first_share_seq,
+                        last_share_seq=last_share_seq,
+                        shares=selected_shares,
+                    )
+                )
+            )
+            if actual_range_sha256 != expected_range_sha256:
+                raise RuntimeError(
+                    f"audit bundle body hash mismatch at {parent_body_uri}: "
+                    f"share segment range {body_uri} expected {expected_range_sha256}, got {actual_range_sha256}"
+                )
+        elif kind == "segment_prefix":
+            expected_prefix_sha256 = str(part.get("prefix_sha256") or "").lower()
+            actual_prefix_sha256 = sha256_bytes_hex(
+                self._storage_json_bytes(
+                    self._audit_share_segment_payload(
+                        first_share_seq=first_share_seq,
+                        last_share_seq=last_share_seq,
+                        shares=selected_shares,
+                    )
+                )
+            )
+            if actual_prefix_sha256 != expected_prefix_sha256:
+                raise RuntimeError(
+                    f"audit bundle body hash mismatch at {parent_body_uri}: "
+                    f"share segment prefix {body_uri} expected {expected_prefix_sha256}, got {actual_prefix_sha256}"
+                )
+        elif kind != "segment":
+            raise RuntimeError(f"audit bundle body is not valid JSON at {parent_body_uri}: invalid share part kind")
+        return copy.deepcopy(selected_shares)
+
+    def _select_audit_share_segment_range(
+        self,
+        shares: list[Any],
+        *,
+        first_share_seq: int,
+        last_share_seq: int,
+        parent_body_uri: object,
+        body_uri: object,
+    ) -> list[Any]:
+        selected: list[Any] = []
+        previous_seq: int | None = None
+        for share in shares:
+            if not isinstance(share, dict):
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} has invalid share"
+                )
+            share_seq = int(share.get("share_seq") or 0)
+            if previous_seq is not None and previous_seq + 1 != share_seq:
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} is not contiguous"
+                )
+            previous_seq = share_seq
+            if first_share_seq <= share_seq <= last_share_seq:
+                selected.append(share)
+        if selected:
+            if int(selected[0].get("share_seq") or 0) != first_share_seq:
+                selected = []
+            elif int(selected[-1].get("share_seq") or 0) != last_share_seq:
+                selected = []
+        if not selected and first_share_seq <= last_share_seq:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                f"share segment {body_uri} does not contain requested range"
+            )
+        return selected
 
     def _resolve_audit_bundle_row(self, row: object) -> dict[str, object] | None:
         """Return an audit-bundle row with its body resolved inline.
