@@ -1,4 +1,6 @@
-use crate::{build_prism_reward_manifest, canonical_audit_bundle_bytes, AcceptedShare, AuditBundle};
+use crate::{
+    build_prism_reward_manifest, canonical_audit_bundle_bytes, AcceptedShare, AuditBundle,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -10,8 +12,7 @@ use std::{
 pub const AUDIT_BODY_REF_SCHEMA: &str = "qbit.prism.audit-body-ref.v1";
 pub const AUDIT_BUNDLE_V2_SCHEMA: &str = "qbit.prism.audit-bundle.v2";
 pub const AUDIT_SHARE_SEGMENT_SCHEMA: &str = "qbit.prism.audit-share-segment.v1";
-pub const AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA: &str =
-    "qbit.prism.window-completeness-proof.v1";
+pub const AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA: &str = "qbit.prism.window-completeness-proof.v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuditBodyRefError {
@@ -23,6 +24,12 @@ pub enum AuditBodyRefError {
     Invalid(String),
     #[error("audit body ref hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditArtifactSchema {
+    #[serde(default)]
+    schema: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,8 +129,14 @@ pub fn parse_audit_bundle_json(
     input_json: &str,
     base_dir: Option<&Path>,
 ) -> Result<AuditBundle, AuditBodyRefError> {
-    let value: Value = serde_json::from_str(input_json)?;
-    parse_audit_bundle_value(value, base_dir)
+    let header: AuditArtifactSchema = serde_json::from_str(input_json)?;
+    match header.schema.as_deref() {
+        Some(AUDIT_BODY_REF_SCHEMA | AUDIT_BUNDLE_V2_SCHEMA) => {
+            let value: Value = serde_json::from_str(input_json)?;
+            parse_audit_bundle_value(value, base_dir)
+        }
+        _ => Ok(serde_json::from_str(input_json)?),
+    }
 }
 
 pub fn parse_audit_bundle_value(
@@ -255,9 +268,9 @@ fn resolve_audit_bundle_v2(
             ))
         })?;
     if let Some(share_slice_digest_hex) = proof.share_slice_digest_hex {
-        if !share_slice_digest_hex.eq_ignore_ascii_case(
-            &expected_reward_manifest.share_slice_digest_hex,
-        ) {
+        if !share_slice_digest_hex
+            .eq_ignore_ascii_case(&expected_reward_manifest.share_slice_digest_hex)
+        {
             return Err(AuditBodyRefError::Invalid(
                 "window proof share_slice_digest_hex mismatch".to_string(),
             ));
