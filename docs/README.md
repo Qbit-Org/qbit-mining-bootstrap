@@ -1,6 +1,6 @@
 # Documentation Map
 
-This directory contains operator docs, API contracts, and supporting design
+This directory contains operator docs, API contracts, and durable supporting
 references. For public-facing navigation, prefer the short path below.
 
 ## Public Entry Points
@@ -23,18 +23,12 @@ references. For public-facing navigation, prefer the short path below.
 - [router-integration-notes.md](router-integration-notes.md): router/hash
   aggregator guidance for the qbit ckpool comparison path.
 
-## Supporting References
+## Supporting Reference
 
-These are useful for reviewers and operators who need implementation detail:
+This is useful for reviewers and operators who need implementation detail:
 
 - [prism-ledger-ops.md](prism-ledger-ops.md): formal ledger invariants,
   writer-lease behavior, compaction contract, and readiness probes.
-- [prism-pool-ha.md](prism-pool-ha.md): deferred high-availability design
-  reference.
-- [pool-base-decision.md](pool-base-decision.md): historical decision record
-  for choosing the repo-owned direct PRISM Stratum path.
-- [prism-claim-evidence.md](prism-claim-evidence.md): evidence inventory that
-  maps PRISM claims to tests and implementation files.
 
 ## Public-Site Guidance
 

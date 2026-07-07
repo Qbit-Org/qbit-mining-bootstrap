@@ -76,7 +76,6 @@ Treat this patched ckpool overlay as the default single-address
 permissionless-mining story for qbit. It remains useful as a Stratum/BIP310
 comparison target and as a smoke test for qbit P2MR-only block acceptance.
 
-For non-custodial PRISM mining, use the builder-owned transport decision in
-[`docs/pool-base-decision.md`](../docs/pool-base-decision.md). ckpool should not
-own the multi-output payout split unless a later spike proves that external
-coinbase injection is less invasive than the repo-owned Stratum path.
+For non-custodial PRISM mining, use the direct PRISM Stratum path documented in
+[`PRISM.md`](../PRISM.md). ckpool remains the single-address permissionless
+comparison path rather than the multi-output PRISM payout engine.
