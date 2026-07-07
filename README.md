@@ -9,7 +9,7 @@ over the active share window, and published audit data lets miners recompute the
 split independently. TIDES, Transparent Index of Distinct Extended Shares, was
 originally documented by OCEAN for Bitcoin mining pools; PRISM is independent
 qbit pool software with qbit-specific P2MR settlement, carry-forward, maturity,
-and reorg policy.
+and reorg policy. For the full PRISM guide, see [`PRISM.md`](PRISM.md).
 
 ## Scope
 

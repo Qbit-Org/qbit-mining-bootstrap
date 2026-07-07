@@ -25,32 +25,21 @@ The current production storage target is:
 - keep large exact audit artifact bodies outside hot Postgres once the artifact
   externalization work lands
 
-## Live Testnet4 Baseline
+## Pilot Baseline
 
-Measured on `qbit-pool-testnet4` on 2026-06-30:
+A small pilot deployment measured on 2026-06-30 showed active PRISM state at
+about 1.2 GB before long-term growth. The useful planning signal is the
+composition of that active state:
 
-| Item | Size / count |
+| Active PRISM item | Size / count |
 | --- | ---: |
-| Root disk | 234 GB total, 116 GB used, 106 GB free |
-| `/var/lib/docker` | 69 GB |
-| `/var/lib/containerd` | 34 GB |
-| Active PRISM Postgres volume | 195 MB |
-| Active PRISM database size | 140 MB |
-| Active PRISM audit file volume | 989 MB |
-| Active qbit data volume | 61 MB |
+| Postgres volume | about 195 MB |
+| Database size | about 140 MB |
+| Audit file volume | about 989 MB |
+| qbit data volume | about 61 MB |
 | Active PRISM total | about 1.2 GB |
 
-Largest non-PRISM or legacy consumers on the same host:
-
-| Item | Size |
-| --- | ---: |
-| old `qbit-mining-testnet4_tides-audit-data` | 41 GB |
-| old `qbit-mining-testnet4_tides-postgres-data` | 5.4 GB |
-| `qbit-mining-testnet4_bitcoin-data` | 14 GB |
-| Docker images | 34.4 GB |
-| Docker build cache | 16.8 GB |
-
-Active PRISM table breakdown:
+The active table breakdown was:
 
 | Table | Size / rows |
 | --- | ---: |
@@ -58,8 +47,9 @@ Active PRISM table breakdown:
 | `qbit_share_ledger` | 3.7 MB, 5,624 accepted shares |
 | payout, carry-forward, and block tables | about 2.5 MB combined |
 
-The accepted-share ledger is not the current testnet4 disk driver. Inline audit
-bundle bodies dominate the hot database footprint.
+The accepted-share ledger was not the disk driver in that pilot. Inline audit
+bundle bodies dominated the hot database footprint, which is why newer artifact
+externalization and share-segment formats matter for production planning.
 
 ## Growth Model
 
@@ -76,9 +66,9 @@ hot_share_ledger_bytes = accepted_shares_per_year * 1.2 KB
 pool_blocks_per_day = 1,440 * pool_share_of_blocks
 ```
 
-The measured share-ledger cost is about 0.7 to 0.8 KB per accepted share on the
-live testnet4 data and local schema probes. Use 1.2 KB per share for planning
-to cover indexes, bloat, and operational headroom.
+The measured share-ledger cost is about 0.7 to 0.8 KB per accepted share across
+pilot data and local schema probes. Use 1.2 KB per share for planning to cover
+indexes, bloat, and operational headroom.
 
 The estimates below assume the optimized Postgres pattern: hot Postgres keeps
 the canonical ledger, block/payout/carry rows, and artifact metadata, not the
@@ -188,14 +178,6 @@ CTV broadcast retries are bounded separately from audit bodies:
   terminal failed fanouts are not selected for broadcast work.
 
 ## VM Recommendations
-
-For the current testnet4 host:
-
-- The 234 GB root disk is enough for active PRISM itself.
-- It is not roomy once old TIDES volumes, Docker image/build cache, Bitcoin
-  data, and operational headroom are included.
-- Clean old TIDES volumes/build cache or move to a larger disk before prolonged
-  public testing.
 
 For near-term production or a pilot after audit artifact externalization:
 
