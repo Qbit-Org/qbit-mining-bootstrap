@@ -10,6 +10,8 @@ RPC_PORT="${RPC_PORT:-18455}"
 WALLET_NAME="${WALLET_NAME:-prism-live}"
 STRATUM_PORT="${PRISM_STRATUM_PORT:-3340}"
 AUDIT_PORT="${PRISM_AUDIT_PORT:-3341}"
+HIGHDIFF_PORT="${PRISM_STRATUM_HIGHDIFF_PORT:-4334}"
+HIGHDIFF_START_DIFF="${PRISM_STRATUM_HIGHDIFF_START_DIFF:-500000}"
 POWER_LAW_ENABLED="${QBIT_PRISM_LIVE_POWER_LAW:-0}"
 if [[ "${POWER_LAW_ENABLED}" == "1" ]]; then
   MINER_COUNT="${QBIT_PRISM_LIVE_MINERS:-6}"
@@ -148,6 +150,9 @@ done
   export QBIT_RPC_PASSWORD="${RPC_PASSWORD}"
   export PRISM_STRATUM_BIND=127.0.0.1
   export PRISM_STRATUM_PORT="${STRATUM_PORT}"
+  export PRISM_STRATUM_HIGHDIFF_PORT="${HIGHDIFF_PORT}"
+  export PRISM_STRATUM_HIGHDIFF_START_DIFF="${HIGHDIFF_START_DIFF}"
+  export PRISM_STRATUM_HIGHDIFF_MIN_DIFF="${HIGHDIFF_START_DIFF}"
   export PRISM_MIN_READY_MINERS="${MINER_COUNT}"
   export PRISM_EVIDENCE_PATH="${EVIDENCE_PATH}"
   export PRISM_AUDIT_DIR="${DATADIR}"
@@ -194,6 +199,77 @@ if ! kill -0 "${coordinator_pid}" >/dev/null 2>&1; then
   cat "${COORDINATOR_LOG}" >&2 || true
   exit 1
 fi
+
+STRATUM_PORT="${HIGHDIFF_PORT}" python3 <<'PY'
+import os
+import socket
+import time
+
+deadline = time.time() + 30
+port = int(os.environ["STRATUM_PORT"])
+while time.time() < deadline:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            raise SystemExit(0)
+    except OSError:
+        time.sleep(0.25)
+raise SystemExit("timed out waiting for PRISM high-diff Stratum port")
+PY
+if ! kill -0 "${coordinator_pid}" >/dev/null 2>&1; then
+  echo "PRISM coordinator exited before opening high-diff Stratum port" >&2
+  cat "${COORDINATOR_LOG}" >&2 || true
+  exit 1
+fi
+
+# Handshake-only difficulty probes: the first mining.set_difficulty must be the
+# listener's start difficulty (the high-diff floor is what rental marketplaces
+# verify), and a password d= request must override it within listener bounds.
+probe_first_difficulty() {
+  PROBE_PORT="$1" PROBE_USERNAME="$2" PROBE_PASSWORD="$3" PROBE_EXPECTED_DIFF="$4" python3 <<'PY'
+import json
+import os
+import socket
+
+port = int(os.environ["PROBE_PORT"])
+username = os.environ["PROBE_USERNAME"]
+password = os.environ["PROBE_PASSWORD"]
+expected = float(os.environ["PROBE_EXPECTED_DIFF"])
+
+with socket.create_connection(("127.0.0.1", port), timeout=15) as sock:
+    stream = sock.makefile("rw", encoding="utf-8", newline="\n")
+
+    def send(payload):
+        stream.write(json.dumps(payload) + "\n")
+        stream.flush()
+
+    send({"id": 1, "method": "mining.subscribe", "params": ["difficulty-probe/1.0"]})
+    send({"id": 2, "method": "mining.authorize", "params": [username, password]})
+    difficulty = None
+    saw_notify_before_difficulty = False
+    for _ in range(50):
+        line = stream.readline()
+        if not line:
+            break
+        message = json.loads(line)
+        if message.get("method") == "mining.set_difficulty":
+            difficulty = float(message["params"][0])
+            break
+        if message.get("method") == "mining.notify":
+            saw_notify_before_difficulty = True
+
+if saw_notify_before_difficulty:
+    raise SystemExit(f"port {port}: mining.notify arrived before any mining.set_difficulty")
+if difficulty is None:
+    raise SystemExit(f"port {port}: no mining.set_difficulty received")
+if abs(difficulty - expected) > expected * 1e-9:
+    raise SystemExit(f"port {port}: first difficulty {difficulty} != expected {expected}")
+print(f"difficulty probe PASS port={port} password={password!r} difficulty={difficulty}")
+PY
+}
+
+probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[0]}" "x" "0.000000001"
+probe_first_difficulty "${HIGHDIFF_PORT}" "${miner_usernames[0]}" "x" "${HIGHDIFF_START_DIFF}"
+probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[0]}" "d=0.5,md=0.25" "0.5"
 
 if [[ "${AUDIT_API_ENABLED}" == "1" ]]; then
   AUDIT_PORT="${AUDIT_PORT}" python3 <<'PY'

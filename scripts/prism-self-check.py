@@ -289,6 +289,29 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
     else:
         reporter.warn("mining.vardiff", "vardiff is disabled")
 
+    if env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"):
+        try:
+            highdiff_port = int(env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"))
+            if not 0 < highdiff_port < 65536:
+                raise ValueError("PRISM_STRATUM_HIGHDIFF_PORT must be a valid TCP port")
+            highdiff_min = parse_decimal(env_value(env, "PRISM_STRATUM_HIGHDIFF_MIN_DIFF", "500000"))
+            highdiff_start = parse_decimal(env_value(env, "PRISM_STRATUM_HIGHDIFF_START_DIFF", "500000"))
+            highdiff_max = parse_decimal(env_value(env, "PRISM_STRATUM_HIGHDIFF_MAX_DIFF", "4294967296"))
+            if highdiff_min <= 0 or highdiff_start <= 0 or highdiff_max <= 0:
+                raise ValueError("high-diff difficulty values must be positive")
+            if highdiff_min > highdiff_start:
+                raise ValueError("PRISM_STRATUM_HIGHDIFF_MIN_DIFF exceeds PRISM_STRATUM_HIGHDIFF_START_DIFF")
+            if highdiff_start > highdiff_max:
+                raise ValueError("PRISM_STRATUM_HIGHDIFF_START_DIFF exceeds PRISM_STRATUM_HIGHDIFF_MAX_DIFF")
+            reporter.pass_(
+                "mining.highdiff",
+                f"enabled port={highdiff_port} start={highdiff_start} range={highdiff_min}..{highdiff_max}",
+            )
+        except ValueError as exc:
+            reporter.fail("mining.highdiff", str(exc))
+    else:
+        reporter.pass_("mining.highdiff", "disabled (single stratum listener)")
+
     if is_true(env_value(env, "PRISM_POOL_FEE_ENABLED", "0")):
         fee_bps = env_value(env, "PRISM_POOL_FEE_BPS")
         fee_address = env_value(env, "PRISM_POOL_FEE_ADDRESS")
@@ -401,6 +424,22 @@ def coordinator_live_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.fail("stratum.port", str(exc))
     else:
         tcp_connect_check("stratum.tcp", stratum_host, stratum_port, reporter)
+
+    if env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"):
+        try:
+            highdiff_host, highdiff_port = parse_host_port(
+                env_value(
+                    env,
+                    "PRISM_STRATUM_HIGHDIFF_PORT_HOST",
+                    env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"),
+                ),
+                default_host="127.0.0.1",
+                default_port=4334,
+            )
+        except ValueError as exc:
+            reporter.fail("stratum.highdiff_port", str(exc))
+        else:
+            tcp_connect_check("stratum.highdiff_tcp", highdiff_host, highdiff_port, reporter)
 
     health_code = r"""
 import json

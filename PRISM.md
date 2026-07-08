@@ -111,6 +111,52 @@ scaled later, but all accepted shares must still converge through one logical
 ledger writer before rewards are computed. Active-active independent ledgers are
 not compatible with the audit model.
 
+## Stratum Difficulty And The High-Diff Port
+
+Each PRISM Stratum listener carries its own difficulty policy. The default
+listener (`PRISM_STRATUM_PORT`, 3340) runs per-connection vardiff tuned for
+small miners. An optional second listener serves rental-scale hashrate
+(marketplaces such as NiceHash require a share difficulty of at least 500,000
+for SHA-256 from the first `mining.set_difficulty` a connection sees, so a
+vardiff ramp from a small-miner start can never satisfy their pool
+verification). This mirrors the two-port pattern used by solo.ckpool.org
+(3333 plus the high-diff rental port 4334), except both PRISM listeners feed
+the same coordinator, share ledger, and settlement path. Because the reward
+window is difficulty-weighted, shares from either port earn proportional
+credit with no settlement changes.
+
+The high-diff listener is disabled unless `PRISM_STRATUM_HIGHDIFF_PORT` is
+set:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PRISM_STRATUM_HIGHDIFF_PORT` | unset (disabled) | enable the listener on this port (compose maps host 4334) |
+| `PRISM_STRATUM_HIGHDIFF_BIND` | `PRISM_STRATUM_BIND` | bind address |
+| `PRISM_STRATUM_HIGHDIFF_START_DIFF` | `500000` | first advertised difficulty |
+| `PRISM_STRATUM_HIGHDIFF_MIN_DIFF` | `500000` | vardiff floor; never advertised below |
+| `PRISM_STRATUM_HIGHDIFF_MAX_DIFF` | `4294967296` | vardiff ceiling |
+| `PRISM_STRATUM_HIGHDIFF_SHARE_DIFF` | `500000` | fixed difficulty when vardiff is disabled |
+
+All other vardiff knobs (target share interval, retarget cadence, step
+bounds, smoothing) inherit the `PRISM_STRATUM_VARDIFF_*` configuration.
+Startup fails loudly when the bounds are inconsistent (floor above start, or
+start above ceiling).
+
+Clients can also steer their own difficulty on either listener, always
+clamped to that listener's bounds so a high-diff floor cannot be undercut:
+
+- Password options `d=N` (requested difficulty) and `md=N` (personal floor),
+  the common pool convention, e.g. password `d=500000,md=500000`. Unknown
+  or malformed password content is ignored.
+- `mining.suggest_difficulty` is honored the same way; an explicit password
+  `d=` outranks a suggestion.
+
+Sizing intuition: shares/second = hashrate / (difficulty x 2^32). At
+difficulty 500,000 a 1 PH/s connection submits roughly one share every two
+seconds, while a 500 GH/s device would find one share every ~72 minutes --
+which is why the floor lives on a dedicated port instead of the default
+listener.
+
 ## How Reward Accounting Works
 
 1. A miner connects to direct PRISM Stratum and authorizes with
