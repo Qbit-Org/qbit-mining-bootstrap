@@ -1371,6 +1371,23 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             ],
         )
 
+    def test_mining_configuration_derives_highdiff_endpoint_from_public_stratum_url(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://public-pool.example:3335",
+                "PRISM_STRATUM_HIGHDIFF_PORT": "4334",
+            },
+            clear=True,
+        ):
+            config = public_api.mining_configuration(FakeCoordinator())
+
+        endpoints = config["configurations"][0]["stratum_endpoints"]
+        self.assertEqual(endpoints[0]["url"], "stratum+tcp://public-pool.example:3335")
+        self.assertEqual(endpoints[1]["label"], "High-diff")
+        self.assertEqual(endpoints[1]["url"], "stratum+tcp://public-pool.example:4334")
+        self.assertEqual(endpoints[1]["default_port"], 4334)
+
     def test_mining_configuration_uses_public_highdiff_stratum_url_override(self) -> None:
         with patch.dict(
             os.environ,

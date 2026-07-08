@@ -121,7 +121,8 @@ and Stratum endpoint metadata for a dashboard configuration or "next block" tab.
 When `PRISM_STRATUM_HIGHDIFF_PORT` enables the rental-scale high-diff listener,
 the response includes a second `stratum_endpoints` entry. Set
 `PRISM_PUBLIC_STRATUM_HIGHDIFF_URL` when the externally advertised URL differs
-from `PRISM_PUBLIC_STRATUM_HOST` plus the high-diff listener port.
+from the primary `PRISM_PUBLIC_STRATUM_URL` host/scheme plus the high-diff
+listener port.
 
 ## Deferred Surfaces
 

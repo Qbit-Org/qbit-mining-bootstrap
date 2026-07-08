@@ -493,8 +493,27 @@ def public_highdiff_stratum_endpoint(*, host: str) -> dict[str, object] | None:
     highdiff_port = optional_tcp_port(os.environ.get("PRISM_STRATUM_HIGHDIFF_PORT"))
     if highdiff_port is None:
         return None
-    url = os.environ.get("PRISM_PUBLIC_STRATUM_HIGHDIFF_URL") or f"stratum+tcp://{host}:{highdiff_port}"
+    url = (
+        os.environ.get("PRISM_PUBLIC_STRATUM_HIGHDIFF_URL")
+        or public_stratum_url_with_port(os.environ.get("PRISM_PUBLIC_STRATUM_URL"), highdiff_port)
+        or f"stratum+tcp://{host}:{highdiff_port}"
+    )
     return mining_endpoint("High-diff", url, fallback_port=highdiff_port)
+
+
+def public_stratum_url_with_port(url: str | None, port: int) -> str | None:
+    if url is None or url.strip() == "":
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    if not parsed.scheme or parsed.hostname is None:
+        return None
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{parsed.scheme}://{host}:{port}"
 
 
 def optional_tcp_port(value: str | None) -> int | None:

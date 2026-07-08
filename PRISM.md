@@ -132,7 +132,7 @@ set:
 | --- | --- | --- |
 | `PRISM_STRATUM_HIGHDIFF_PORT` | unset (disabled) | enable the listener on this container port (conventionally 4334) |
 | `PRISM_STRATUM_HIGHDIFF_PORT_HOST` | ephemeral loopback | compose host publish mapping; set (e.g. `4334`) when enabling the listener |
-| `PRISM_PUBLIC_STRATUM_HIGHDIFF_URL` | derived from public host and high-diff port | optional external URL shown by `/public/v1/mining-configuration` |
+| `PRISM_PUBLIC_STRATUM_HIGHDIFF_URL` | derived from primary public URL or host and high-diff port | optional external URL shown by `/public/v1/mining-configuration` |
 | `PRISM_STRATUM_HIGHDIFF_BIND` | `PRISM_STRATUM_BIND` | bind address |
 | `PRISM_STRATUM_HIGHDIFF_START_DIFF` | `500000` | first advertised difficulty |
 | `PRISM_STRATUM_HIGHDIFF_MIN_DIFF` | `500000` | floor; never advertised below, even while qbit network difficulty is under it |
