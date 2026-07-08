@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -16,21 +17,26 @@ from unittest.mock import patch
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism.prism_coordinator import (
+    CachedJobBundle,
     ClientState,
     DEFAULT_TESTNET_USERNAME_FALLBACK_ADDRESS,
     MAX_ACTIVE_PRISM_JOBS_PER_CLIENT,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+    PRISM_REJECTION_LOW_DIFFICULTY,
     PRISM_REJECTION_REASON_IDS,
     PRISM_REJECTION_STALE_JOB,
     PRISM_REJECTION_SUBMITBLOCK_REJECTED,
     PRISM_REJECTION_UNKNOWN_JOB,
     QbitTipTemplateSnapshot,
     StratumError,
+    StratumListenerProfile,
     PrismCoordinator,
     WorkerIdentity,
     default_prism_coinbase_tag_hex,
     default_prism_username_fallback_address,
+    load_prism_highdiff_listener,
     load_prism_vardiff_config,
+    parse_stratum_password_options,
     qbit_template_fingerprint,
     qbit_gbt_rules,
     env_positive_float,
@@ -3074,6 +3080,694 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
 
         # Shutdown must not raise even if the lease release fails.
         server.release_ledger_lease()
+
+
+def highdiff_vardiff_config(**overrides: object) -> vardiff.VardiffConfig:
+    values: dict[str, object] = dict(
+        enabled=True,
+        target_share_interval_seconds=Decimal("15"),
+        min_difficulty=Decimal("500000"),
+        max_difficulty=Decimal("4294967296"),
+        retarget_interval_seconds=Decimal("1"),
+        max_step_factor=Decimal("4"),
+        startup_difficulty=Decimal("500000"),
+        max_step_down_factor=Decimal("4"),
+        ewma_alpha=Decimal("1"),
+        retarget_tolerance=Decimal("0"),
+    )
+    values.update(overrides)
+    return vardiff.VardiffConfig(**values)  # type: ignore[arg-type]
+
+
+def clear_stratum_diff_env() -> None:
+    for name in [
+        name
+        for name in os.environ
+        if name.startswith("PRISM_STRATUM_HIGHDIFF") or name.startswith("PRISM_STRATUM_VARDIFF")
+    ]:
+        os.environ.pop(name, None)
+
+
+class PrismListenerProfileTests(unittest.TestCase):
+    def test_highdiff_listener_disabled_without_port(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            base = load_prism_vardiff_config(Decimal("0.000000001"))
+            self.assertIsNone(load_prism_highdiff_listener("0.0.0.0", base))
+
+    def test_highdiff_listener_defaults_to_nicehash_floor(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+            base = load_prism_vardiff_config(Decimal("0.000000001"))
+            profile = load_prism_highdiff_listener("10.0.0.1", base)
+
+        assert profile is not None
+        self.assertEqual(profile.name, "highdiff")
+        self.assertEqual(profile.bind, "10.0.0.1")
+        self.assertEqual(profile.port, 4334)
+        self.assertEqual(profile.heartbeat_name, "stratum_accept_highdiff")
+        self.assertEqual(profile.share_difficulty, Decimal("500000"))
+        self.assertEqual(profile.minimum_advertised_difficulty, Decimal("500000"))
+        self.assertEqual(profile.vardiff_config.min_difficulty, Decimal("500000"))
+        self.assertEqual(profile.vardiff_config.startup_difficulty, Decimal("500000"))
+        self.assertEqual(profile.vardiff_config.max_difficulty, Decimal("4294967296"))
+        # Everything but the difficulty bounds is inherited from the base config.
+        self.assertEqual(profile.vardiff_config.enabled, base.enabled)
+        self.assertEqual(
+            profile.vardiff_config.target_share_interval_seconds,
+            base.target_share_interval_seconds,
+        )
+        self.assertEqual(
+            profile.vardiff_config.retarget_interval_seconds,
+            base.retarget_interval_seconds,
+        )
+        self.assertEqual(profile.vardiff_config.max_step_factor, base.max_step_factor)
+
+    def test_highdiff_listener_env_overrides(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4335"
+            os.environ["PRISM_STRATUM_HIGHDIFF_BIND"] = "127.0.0.2"
+            os.environ["PRISM_STRATUM_HIGHDIFF_MIN_DIFF"] = "600000"
+            os.environ["PRISM_STRATUM_HIGHDIFF_START_DIFF"] = "1000000"
+            os.environ["PRISM_STRATUM_HIGHDIFF_MAX_DIFF"] = "8000000"
+            os.environ["PRISM_STRATUM_HIGHDIFF_SHARE_DIFF"] = "700000"
+            base = load_prism_vardiff_config(Decimal("0.000000001"))
+            profile = load_prism_highdiff_listener("0.0.0.0", base)
+
+        assert profile is not None
+        self.assertEqual(profile.bind, "127.0.0.2")
+        self.assertEqual(profile.port, 4335)
+        self.assertEqual(profile.share_difficulty, Decimal("700000"))
+        self.assertEqual(profile.minimum_advertised_difficulty, Decimal("600000"))
+        self.assertEqual(profile.vardiff_config.min_difficulty, Decimal("600000"))
+        self.assertEqual(profile.vardiff_config.startup_difficulty, Decimal("1000000"))
+        self.assertEqual(profile.vardiff_config.max_difficulty, Decimal("8000000"))
+
+    def test_highdiff_listener_rejects_inconsistent_bounds(self) -> None:
+        base = load_prism_vardiff_config(Decimal("0.000000001"))
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+            os.environ["PRISM_STRATUM_HIGHDIFF_MIN_DIFF"] = "1000000"
+            with self.assertRaises(SystemExit):
+                load_prism_highdiff_listener("0.0.0.0", base)
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+            os.environ["PRISM_STRATUM_HIGHDIFF_MAX_DIFF"] = "400000"
+            with self.assertRaises(SystemExit):
+                load_prism_highdiff_listener("0.0.0.0", base)
+        for bad_port in ("not-a-port", "0", "70000"):
+            with patch.dict(os.environ, {}, clear=False):
+                clear_stratum_diff_env()
+                os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = bad_port
+                with self.assertRaises(SystemExit):
+                    load_prism_highdiff_listener("0.0.0.0", base)
+
+    def test_client_startup_difficulty_uses_listener_profile(self) -> None:
+        server = coordinator()
+        profile = StratumListenerProfile(
+            name="highdiff",
+            bind="0.0.0.0",
+            port=4334,
+            share_difficulty=Decimal("700000"),
+            vardiff_config=highdiff_vardiff_config(),
+            heartbeat_name="stratum_accept_highdiff",
+        )
+        self.assertEqual(server.client_startup_difficulty(profile), Decimal("500000"))
+        # Without a profile the default listener behavior is unchanged.
+        self.assertEqual(server.client_startup_difficulty(), Decimal("0.000000001"))
+        # With vardiff disabled the listener's fixed share difficulty applies.
+        fixed_profile = StratumListenerProfile(
+            name="highdiff",
+            bind="0.0.0.0",
+            port=4334,
+            share_difficulty=Decimal("700000"),
+            vardiff_config=highdiff_vardiff_config(enabled=False),
+            heartbeat_name="stratum_accept_highdiff",
+        )
+        self.assertEqual(server.client_startup_difficulty(fixed_profile), Decimal("700000"))
+
+    def test_stratum_accept_heartbeat_names(self) -> None:
+        server = coordinator()
+        # Coordinators built without listener profiles (tests, legacy) keep the
+        # historical single heartbeat name.
+        self.assertEqual(server.stratum_accept_heartbeat_names(), ("stratum_accept",))
+        server.listener_profiles = [
+            StratumListenerProfile(
+                name="default",
+                bind="0.0.0.0",
+                port=3340,
+                share_difficulty=Decimal("1"),
+                vardiff_config=server.vardiff_config,
+                heartbeat_name="stratum_accept",
+            ),
+            StratumListenerProfile(
+                name="highdiff",
+                bind="0.0.0.0",
+                port=4334,
+                share_difficulty=Decimal("500000"),
+                vardiff_config=highdiff_vardiff_config(),
+                heartbeat_name="stratum_accept_highdiff",
+            ),
+        ]
+        self.assertEqual(
+            server.stratum_accept_heartbeat_names(),
+            ("stratum_accept", "stratum_accept_highdiff"),
+        )
+
+    def test_parse_stratum_password_options(self) -> None:
+        self.assertEqual(parse_stratum_password_options(""), (None, None))
+        self.assertEqual(parse_stratum_password_options("x"), (None, None))
+        self.assertEqual(parse_stratum_password_options("d=8192"), (Decimal("8192"), None))
+        self.assertEqual(
+            parse_stratum_password_options("md=4096,d=8192"),
+            (Decimal("8192"), Decimal("4096")),
+        )
+        self.assertEqual(
+            parse_stratum_password_options("D=500000, MD=500000"),
+            (Decimal("500000"), Decimal("500000")),
+        )
+        self.assertEqual(parse_stratum_password_options("d=abc"), (None, None))
+        self.assertEqual(parse_stratum_password_options("d=-5,md=0"), (None, None))
+        self.assertEqual(parse_stratum_password_options("foo=1,md=2048"), (None, Decimal("2048")))
+
+    def test_password_d_below_highdiff_floor_is_clamped(self) -> None:
+        server = coordinator()
+        state = client()
+        state.listener_vardiff_config = highdiff_vardiff_config()
+        state.share_difficulty = Decimal("500000")
+        state.requested_difficulty = Decimal("1000")
+
+        target = server.apply_client_difficulty_requests(state)
+
+        self.assertEqual(target, Decimal("500000"))
+        assert state.vardiff_config is not None
+        self.assertEqual(state.vardiff_config.min_difficulty, Decimal("500000"))
+        self.assertEqual(state.vardiff_config.startup_difficulty, Decimal("500000"))
+
+    def test_password_md_raises_personal_floor_and_retarget_respects_it(self) -> None:
+        server = coordinator()
+        state = client()
+        state.requested_min_difficulty = Decimal("256")
+        state.share_difficulty = Decimal("1")
+
+        target = server.apply_client_difficulty_requests(state)
+
+        self.assertEqual(target, Decimal("256"))
+        assert state.vardiff_config is not None
+        self.assertEqual(state.vardiff_config.min_difficulty, Decimal("256"))
+        self.assertEqual(state.vardiff_config.max_difficulty, Decimal("1024"))
+
+        # A zero-share retarget window wants to step down 4x; the personal
+        # floor must hold it at 256.
+        state.share_difficulty = Decimal("256")
+        server.retarget_client(
+            state,
+            current_difficulty=Decimal("256"),
+            accepted_shares=0,
+            submitted_shares=0,
+            accepted_difficulty=Decimal("0"),
+            elapsed_seconds=Decimal("2"),
+        )
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(state.share_difficulty, Decimal("256"))
+
+    def test_apply_requests_is_stable_across_reapplication(self) -> None:
+        server = coordinator()
+        state = client()
+        state.listener_vardiff_config = highdiff_vardiff_config()
+        state.requested_min_difficulty = Decimal("600000")
+        state.requested_difficulty = Decimal("700000")
+
+        first = server.apply_client_difficulty_requests(state)
+        second = server.apply_client_difficulty_requests(state)
+
+        self.assertEqual(first, Decimal("700000"))
+        self.assertEqual(second, Decimal("700000"))
+        assert state.vardiff_config is not None
+        # Recomputed from the pristine listener config: the floor is the md=
+        # value, not a compounded one.
+        self.assertEqual(state.vardiff_config.min_difficulty, Decimal("600000"))
+
+    def test_suggest_difficulty_before_subscribe_applies_directly(self) -> None:
+        server = coordinator()
+        state = ClientState(sock=object(), address=("127.0.0.1", 1), connection_id=2, extranonce1_hex="00000002")
+        sent: list[object] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+
+        server.handle_suggest_difficulty(state, 7, [512])
+
+        self.assertEqual(state.suggested_difficulty, Decimal("512"))
+        self.assertEqual(state.share_difficulty, Decimal("512"))
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(sent, [{"id": 7, "result": True, "error": None}])
+
+    def test_suggest_difficulty_post_authorize_advertises_with_job(self) -> None:
+        server = coordinator()
+        state = client()
+        state.share_difficulty = Decimal("1")
+        sent: list[object] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+        jobs: dict[str, object] = {"count": 0}
+
+        def fake_send_job(client: object, clean_jobs: bool) -> bool:
+            jobs.update({"count": jobs["count"] + 1, "clean": clean_jobs})
+            return True
+
+        server.maybe_send_job = fake_send_job  # type: ignore[method-assign]
+
+        server.handle_suggest_difficulty(state, 8, [512])
+
+        self.assertEqual(state.pending_share_difficulty, Decimal("512"))
+        self.assertEqual(jobs["count"], 1)
+        self.assertTrue(jobs["clean"])
+        self.assertEqual(sent, [{"id": 8, "result": True, "error": None}])
+
+    def test_suggest_difficulty_rolls_back_pending_on_build_failure(self) -> None:
+        server = coordinator()
+        state = client()
+        state.share_difficulty = Decimal("1")
+        state.send = lambda payload: None  # type: ignore[method-assign]
+        server.maybe_send_job = lambda client, *, clean_jobs: False  # type: ignore[method-assign]
+
+        server.handle_suggest_difficulty(state, 9, [512])
+
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(state.share_difficulty, Decimal("1"))
+
+    def test_suggest_difficulty_yields_to_password_d_option(self) -> None:
+        server = coordinator()
+        state = client()
+        state.requested_difficulty = Decimal("512")
+        state.share_difficulty = Decimal("512")
+        state.send = lambda payload: None  # type: ignore[method-assign]
+        server.maybe_send_job = lambda client, *, clean_jobs: True  # type: ignore[method-assign]
+
+        server.handle_suggest_difficulty(state, 10, [128])
+
+        # d= wins: the suggestion is recorded but the resolved target stays at
+        # the explicit password difficulty, so nothing is re-advertised.
+        self.assertEqual(state.suggested_difficulty, Decimal("128"))
+        self.assertEqual(state.share_difficulty, Decimal("512"))
+        self.assertIsNone(state.pending_share_difficulty)
+
+    def test_suggest_difficulty_ignores_junk_values(self) -> None:
+        server = coordinator()
+        state = client()
+        state.share_difficulty = Decimal("1")
+        sent: list[object] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+
+        for junk in ([], ["nan"], ["-4"], ["0"], [None]):
+            server.handle_suggest_difficulty(state, 11, junk)  # type: ignore[arg-type]
+
+        self.assertIsNone(state.vardiff_config)
+        self.assertEqual(state.share_difficulty, Decimal("1"))
+        self.assertEqual(len(sent), 5)
+
+    def test_highdiff_share_diff_tracks_start_and_validates_bounds(self) -> None:
+        base = load_prism_vardiff_config(Decimal("0.000000001"))
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+            os.environ["PRISM_STRATUM_HIGHDIFF_MIN_DIFF"] = "1000000"
+            os.environ["PRISM_STRATUM_HIGHDIFF_START_DIFF"] = "1000000"
+            profile = load_prism_highdiff_listener("0.0.0.0", base)
+        assert profile is not None
+        # Unset fixed difficulty tracks the start difficulty instead of a
+        # constant that could fall below a raised floor.
+        self.assertEqual(profile.share_difficulty, Decimal("1000000"))
+
+        # An explicit fixed difficulty outside the listener bounds must fail
+        # startup: advertising below the floor is exactly what the high-diff
+        # listener exists to prevent.
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+            os.environ["PRISM_STRATUM_HIGHDIFF_SHARE_DIFF"] = "1000"
+            with self.assertRaises(SystemExit):
+                load_prism_highdiff_listener("0.0.0.0", base)
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+            os.environ["PRISM_STRATUM_HIGHDIFF_SHARE_DIFF"] = "8589934592"
+            with self.assertRaises(SystemExit):
+                load_prism_highdiff_listener("0.0.0.0", base)
+
+    def authorize_server_and_client(self) -> tuple[PrismCoordinator, ClientState, list[object]]:
+        server = coordinator()
+        server.rpc = AddressValidationRpc()
+        server.username_fallback_address = None
+        server.maybe_send_job = lambda client, *, clean_jobs: True  # type: ignore[method-assign]
+        state = ClientState(sock=object(), address=("127.0.0.1", 1), connection_id=3, extranonce1_hex="00000003")
+        state.subscribed = True
+        sent: list[object] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+        return server, state, sent
+
+    def test_authorize_password_applies_before_first_job(self) -> None:
+        server, state, sent = self.authorize_server_and_client()
+
+        server.handle_request(
+            state,
+            {"id": 5, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "d=0.5,md=0.25"]},
+        )
+
+        self.assertTrue(state.authorized)
+        self.assertEqual(state.requested_difficulty, Decimal("0.5"))
+        self.assertEqual(state.requested_min_difficulty, Decimal("0.25"))
+        # Applied directly (no job exists yet), so the first
+        # set_difficulty/notify pair advertises the requested value.
+        self.assertEqual(state.share_difficulty, Decimal("0.5"))
+        self.assertIsNone(state.pending_share_difficulty)
+        assert state.vardiff_config is not None
+        self.assertEqual(state.vardiff_config.min_difficulty, Decimal("0.25"))
+        self.assertEqual(sent, [{"id": 5, "result": True, "error": None}])
+
+    def test_reauthorize_with_plain_password_clears_stale_overrides(self) -> None:
+        server, state, _ = self.authorize_server_and_client()
+        server.handle_request(
+            state,
+            {"id": 5, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "d=0.5,md=0.25"]},
+        )
+        assert state.vardiff_config is not None
+
+        server.handle_request(
+            state,
+            {"id": 6, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "x"]},
+        )
+
+        # The new password carries no options: prior overrides are dropped and
+        # the client falls back to the pristine listener policy (its current
+        # difficulty is left alone; vardiff drifts it under listener bounds).
+        self.assertIsNone(state.requested_difficulty)
+        self.assertIsNone(state.requested_min_difficulty)
+        self.assertIsNone(state.vardiff_config)
+        self.assertEqual(state.share_difficulty, Decimal("0.5"))
+
+    def test_reauthorize_with_new_difficulty_sends_single_job_pair(self) -> None:
+        server, state, _ = self.authorize_server_and_client()
+        send_job_calls: list[bool] = []
+
+        def counting_send_job(client: object, *, clean_jobs: bool) -> bool:
+            send_job_calls.append(clean_jobs)
+            return True
+
+        server.maybe_send_job = counting_send_job  # type: ignore[method-assign]
+
+        server.handle_request(
+            state,
+            {"id": 5, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "x"]},
+        )
+        self.assertEqual(len(send_job_calls), 1)
+
+        # A re-authorize whose new d= advertises a fresh difficulty/job pair
+        # must not be followed by a second back-to-back pair.
+        server.handle_request(
+            state,
+            {"id": 6, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "d=0.5"]},
+        )
+        self.assertEqual(len(send_job_calls), 2)
+        self.assertEqual(state.pending_share_difficulty, Decimal("0.5"))
+
+    def test_accept_loop_assigns_listener_profiles_and_unique_extranonce(self) -> None:
+        server = coordinator()
+        server.connection_counter = 0
+        server.stratum_send_timeout_seconds = 0.0
+
+        def listening_socket() -> socket.socket:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(0.1)
+            return listener
+
+        default_listener = listening_socket()
+        highdiff_listener = listening_socket()
+        default_profile = StratumListenerProfile(
+            name="default",
+            bind="127.0.0.1",
+            port=default_listener.getsockname()[1],
+            share_difficulty=server.share_difficulty,
+            vardiff_config=server.vardiff_config,
+            heartbeat_name="stratum_accept",
+        )
+        highdiff_profile = StratumListenerProfile(
+            name="highdiff",
+            bind="127.0.0.1",
+            port=highdiff_listener.getsockname()[1],
+            share_difficulty=Decimal("500000"),
+            vardiff_config=highdiff_vardiff_config(),
+            heartbeat_name="stratum_accept_highdiff",
+            minimum_advertised_difficulty=Decimal("500000"),
+        )
+        threads = [
+            threading.Thread(target=server.accept_loop, args=(default_listener, default_profile), daemon=True),
+            threading.Thread(target=server.accept_loop, args=(highdiff_listener, highdiff_profile), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        connections = []
+        try:
+            connections.append(socket.create_connection(("127.0.0.1", default_profile.port), timeout=5))
+            connections.append(socket.create_connection(("127.0.0.1", highdiff_profile.port), timeout=5))
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with server.lock:
+                    if len(server.clients) == 2:
+                        break
+                time.sleep(0.01)
+            with server.lock:
+                clients_by_listener = {c.listener_name: c for c in server.clients}
+            self.assertEqual(set(clients_by_listener), {"default", "highdiff"})
+            self.assertEqual(
+                clients_by_listener["default"].share_difficulty,
+                Decimal("0.000000001"),
+            )
+            self.assertEqual(
+                clients_by_listener["highdiff"].share_difficulty,
+                Decimal("500000"),
+            )
+            self.assertIs(
+                clients_by_listener["highdiff"].listener_vardiff_config,
+                highdiff_profile.vardiff_config,
+            )
+            self.assertEqual(
+                clients_by_listener["highdiff"].minimum_advertised_difficulty,
+                Decimal("500000"),
+            )
+            self.assertEqual(
+                clients_by_listener["default"].minimum_advertised_difficulty,
+                Decimal("0"),
+            )
+            extranonces = {c.extranonce1_hex for c in clients_by_listener.values()}
+            self.assertEqual(extranonces, {"00000001", "00000002"})
+            self.assertIn("stratum_accept", server._heartbeats)
+            self.assertIn("stratum_accept_highdiff", server._heartbeats)
+        finally:
+            server.stop_event.set()
+            for connection in connections:
+                connection.close()
+            default_listener.close()
+            highdiff_listener.close()
+            for thread in threads:
+                thread.join(timeout=5)
+
+
+class PrismStampedJobFloorTests(unittest.TestCase):
+    """The listener floor must hold on the wire, not just in vardiff policy.
+
+    Stamped jobs are the single choke point for every mining.set_difficulty
+    the coordinator sends, and marketplace verification judges the first one.
+    The regression here is a young chain: qbit network difficulty below the
+    high-diff floor used to drag the advertised difficulty down with it.
+    """
+
+    def stamp_coordinator(self) -> PrismCoordinator:
+        server = coordinator()
+        server.job_counter = 0
+        server.share_weights_by_username = {}
+        server.default_share_weight = 1
+        return server
+
+    def cached_bundle(self) -> CachedJobBundle:
+        # bits 207fffff: regtest-grade network difficulty (~4.7e-10), far
+        # below the 500k marketplace floor.
+        qbit_target = target_from_compact("207fffff")
+        base_job = direct_stratum.DirectQbitStratumJob(
+            job_id="prism-template-base",
+            previousblockhash_display="00" * 32,
+            prevhash="00" * 32,
+            coinb1="",
+            coinb2="",
+            full_coinbase_prefix="",
+            full_coinbase_suffix="",
+            merkle_branch=(),
+            transaction_hexes=(),
+            version="20000000",
+            nbits="207fffff",
+            ntime="6553f100",
+            qbit_target=qbit_target,
+            share_target=qbit_target,
+            share_difficulty=Decimal("1"),
+            extranonce1_hex="ffffffff",
+            extranonce2_size=8,
+            clean_jobs=True,
+        )
+        return CachedJobBundle(
+            key=("test",),
+            template=gbt_template("00" * 32),
+            template_fingerprint="fp",
+            bundle={},
+            shares_json=[],
+            prior_balances=[],
+            found_block={"network_difficulty": 1},
+            collection_only=False,
+            issued_at_ms=12345,
+            base_job=base_job,
+            built_monotonic=time.monotonic(),
+        )
+
+    def highdiff_client(self) -> ClientState:
+        state = client()
+        state.worker = worker_identity()
+        state.listener_vardiff_config = highdiff_vardiff_config()
+        state.minimum_advertised_difficulty = Decimal("500000")
+        state.share_difficulty = Decimal("500000")
+        return state
+
+    def test_stamped_job_enforces_floor_below_network_difficulty(self) -> None:
+        server = self.stamp_coordinator()
+        state = self.highdiff_client()
+
+        context = server.stamp_job_for_client(state, self.cached_bundle(), clean_jobs=True)
+
+        self.assertEqual(
+            context.job.share_target,
+            direct_stratum.difficulty_target(Decimal("500000")),
+        )
+        # Decimal round-tripping can land within 1e-27 of the floor; the wire
+        # value is float(difficulty), which is what marketplaces judge.
+        self.assertGreaterEqual(float(context.job.share_difficulty), 500000.0)
+
+    def test_stamped_job_keeps_network_cap_without_listener_floor(self) -> None:
+        server = self.stamp_coordinator()
+        state = client()
+        state.worker = worker_identity()
+        # Even an absurd desired difficulty stays capped at the network
+        # target on the default listener: shares are never required to be
+        # harder than blocks there.
+        state.share_difficulty = Decimal("500000")
+
+        context = server.stamp_job_for_client(state, self.cached_bundle(), clean_jobs=True)
+
+        self.assertEqual(context.job.share_target, target_from_compact("207fffff"))
+        self.assertLess(context.job.share_difficulty, Decimal("1"))
+
+    def test_stamped_job_honors_md_raised_floor_on_highdiff_listener(self) -> None:
+        server = self.stamp_coordinator()
+        state = self.highdiff_client()
+        state.requested_min_difficulty = Decimal("2000000")
+        server.apply_client_difficulty_requests(state)
+
+        context = server.stamp_job_for_client(state, self.cached_bundle(), clean_jobs=True)
+
+        self.assertEqual(
+            context.job.share_target,
+            direct_stratum.difficulty_target(Decimal("2000000")),
+        )
+        self.assertGreaterEqual(float(context.job.share_difficulty), 2000000.0)
+
+    def test_block_worthy_submission_below_share_target_still_submits_block(self) -> None:
+        # With the floor above network difficulty a hash can solve a block
+        # while missing the advertised share target. The block must be
+        # submitted, not rejected as a low-difficulty share.
+        server, state, ledger = submit_coordinator()
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="bb" * 32,
+            share_pass=False,
+            block_pass=True,
+        )
+        submitted: dict[str, object] = {}
+
+        def fake_submit_block_candidate(
+            context: object,
+            sub: object,
+            extranonce1_hex: str,
+            extranonce2_hex: str,
+            *,
+            pending_share: object,
+            client: ClientState,
+        ) -> bool:
+            submitted.update({"submission": sub, "pending_share": pending_share})
+            return True
+
+        server.submit_block_candidate = fake_submit_block_candidate  # type: ignore[method-assign]
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertTrue(should_close)
+        self.assertIs(submitted["submission"], submission)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 0)
+        self.assertEqual(len(ledger.pending), 0)
+
+    def test_low_difficulty_submission_without_block_solve_is_rejected(self) -> None:
+        server, state, ledger = submit_coordinator()
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="bb" * 32,
+            share_pass=False,
+            block_pass=False,
+        )
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.code, 23)
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_LOW_DIFFICULTY)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 1)
+        self.assertEqual(len(ledger.pending), 0)
+
+    def test_collection_only_block_worthy_low_difficulty_submission_is_rejected(self) -> None:
+        # Collection bundles cannot submit blocks, so block-worthiness does
+        # not rescue a below-target share there.
+        server, state, ledger = submit_coordinator()
+        server.jobs["job-1"].collection_only = True
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="bb" * 32,
+            share_pass=False,
+            block_pass=True,
+        )
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.code, 23)
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_LOW_DIFFICULTY)
+        self.assertEqual(len(ledger.pending), 0)
 
 
 if __name__ == "__main__":

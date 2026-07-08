@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import math
@@ -332,6 +332,131 @@ def load_prism_vardiff_config(startup_difficulty: Decimal) -> vardiff.VardiffCon
     )
 
 
+@dataclass(frozen=True)
+class StratumListenerProfile:
+    """One stratum listener with its own difficulty policy.
+
+    Every listener feeds the same coordinator, ledger, and settlement path;
+    the profile only decides where to listen and which difficulty bounds its
+    clients get.
+    """
+
+    name: str
+    bind: str
+    port: int
+    share_difficulty: Decimal
+    vardiff_config: vardiff.VardiffConfig
+    heartbeat_name: str
+    # Difficulty this listener never advertises below, even when the qbit
+    # network target is easier. Zero means no floor: stamped jobs keep the
+    # network cap (a share is never required to be harder than a block). The
+    # high-diff listener sets its configured minimum because marketplace
+    # verification (NiceHash-style) checks the first advertised difficulty,
+    # which must hold even while network difficulty sits below the floor.
+    minimum_advertised_difficulty: Decimal = Decimal("0")
+
+
+DEFAULT_HIGHDIFF_DIFFICULTY = "500000"
+DEFAULT_HIGHDIFF_MAX_DIFFICULTY = "4294967296"
+
+
+def load_prism_highdiff_listener(
+    base_bind: str,
+    base_vardiff_config: vardiff.VardiffConfig,
+) -> StratumListenerProfile | None:
+    """Optional high-difficulty listener for rental-scale miners.
+
+    Disabled unless PRISM_STRATUM_HIGHDIFF_PORT is set. The 500k default floor
+    matches the NiceHash SHA-256 pool-verification minimum, which must hold
+    from the first mining.set_difficulty a client sees.
+    """
+
+    port_value = env_optional("PRISM_STRATUM_HIGHDIFF_PORT")
+    if port_value is None:
+        return None
+    try:
+        port = int(port_value)
+    except ValueError as exc:
+        raise SystemExit("PRISM_STRATUM_HIGHDIFF_PORT must be an integer") from exc
+    if not 0 < port < 65536:
+        raise SystemExit("PRISM_STRATUM_HIGHDIFF_PORT must be a valid TCP port")
+    min_difficulty = env_decimal("PRISM_STRATUM_HIGHDIFF_MIN_DIFF", DEFAULT_HIGHDIFF_DIFFICULTY)
+    start_difficulty = env_decimal("PRISM_STRATUM_HIGHDIFF_START_DIFF", DEFAULT_HIGHDIFF_DIFFICULTY)
+    max_difficulty = env_decimal("PRISM_STRATUM_HIGHDIFF_MAX_DIFF", DEFAULT_HIGHDIFF_MAX_DIFFICULTY)
+    if min_difficulty > start_difficulty:
+        raise SystemExit("PRISM_STRATUM_HIGHDIFF_MIN_DIFF exceeds PRISM_STRATUM_HIGHDIFF_START_DIFF")
+    if start_difficulty > max_difficulty:
+        raise SystemExit("PRISM_STRATUM_HIGHDIFF_START_DIFF exceeds PRISM_STRATUM_HIGHDIFF_MAX_DIFF")
+    # The fixed difficulty (used when vardiff is disabled) tracks the start
+    # difficulty unless explicitly set, and must respect the listener bounds:
+    # advertising below the floor would break the marketplace verification
+    # this listener exists for.
+    share_value = env_optional("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF")
+    if share_value is None:
+        share_difficulty = start_difficulty
+    else:
+        try:
+            share_difficulty = Decimal(share_value)
+        except Exception as exc:
+            raise SystemExit("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF must be a decimal") from exc
+        if not share_difficulty.is_finite() or share_difficulty <= 0:
+            raise SystemExit("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF must be positive")
+        if share_difficulty < min_difficulty:
+            raise SystemExit("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF is below PRISM_STRATUM_HIGHDIFF_MIN_DIFF")
+        if share_difficulty > max_difficulty:
+            raise SystemExit("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF exceeds PRISM_STRATUM_HIGHDIFF_MAX_DIFF")
+    try:
+        config = dataclass_replace(
+            base_vardiff_config,
+            min_difficulty=min_difficulty,
+            max_difficulty=max_difficulty,
+            startup_difficulty=start_difficulty,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"invalid PRISM_STRATUM_HIGHDIFF_* difficulty bounds: {exc}") from exc
+    return StratumListenerProfile(
+        name="highdiff",
+        # env_optional so an empty value (compose default passthrough) means
+        # "inherit the default listener bind" instead of a startup failure.
+        bind=env_optional("PRISM_STRATUM_HIGHDIFF_BIND") or base_bind,
+        port=port,
+        share_difficulty=share_difficulty,
+        vardiff_config=config,
+        heartbeat_name="stratum_accept_highdiff",
+        minimum_advertised_difficulty=min_difficulty,
+    )
+
+
+def parse_stratum_password_options(password: str) -> tuple[Decimal | None, Decimal | None]:
+    """Extract the pool-side d=N / md=N difficulty convention from a password.
+
+    Unknown tokens and malformed values are ignored: miners routinely send
+    junk passwords ("x") and rejecting them would break every such rig.
+    Returns (requested_difficulty, requested_min_difficulty).
+    """
+
+    requested: Decimal | None = None
+    requested_min: Decimal | None = None
+    for token in password.split(","):
+        key, separator, raw_value = token.strip().partition("=")
+        if not separator:
+            continue
+        key = key.strip().lower()
+        if key not in {"d", "md"}:
+            continue
+        try:
+            value = Decimal(raw_value.strip())
+        except Exception:
+            continue
+        if not value.is_finite() or value <= 0:
+            continue
+        if key == "d":
+            requested = value
+        else:
+            requested_min = value
+    return requested, requested_min
+
+
 def default_prism_payout_policy() -> dict[str, object]:
     policy: dict[str, object] = {
         "p2mr_spend_input_bytes": env_positive_int(
@@ -523,6 +648,20 @@ class ClientState:
     worker: WorkerIdentity | None = None
     version_mask: int = 0
     active_job: PrismJobContext | None = None
+    listener_name: str = "default"
+    # Pristine difficulty policy of the accepting listener; never mutated.
+    listener_vardiff_config: vardiff.VardiffConfig | None = None
+    # Floor below which stamped jobs never advertise, copied from the
+    # accepting listener profile. Zero (default listener) keeps the network
+    # cap authoritative.
+    minimum_advertised_difficulty: Decimal = Decimal("0")
+    # Per-client specialization of the listener policy (password d=/md= or
+    # mining.suggest_difficulty); recomputed from the pristine base on every
+    # request so repeat applications cannot compound.
+    vardiff_config: vardiff.VardiffConfig | None = None
+    requested_difficulty: Decimal | None = None
+    requested_min_difficulty: Decimal | None = None
+    suggested_difficulty: Decimal | None = None
     share_difficulty: Decimal = Decimal("1")
     pending_share_difficulty: Decimal | None = None
     vardiff_window_started_monotonic: float = field(default_factory=time.monotonic)
@@ -610,6 +749,21 @@ class PrismCoordinator:
         self.coinbase_tag_hex = default_prism_coinbase_tag_hex()
         self.share_difficulty = env_decimal("PRISM_STRATUM_SHARE_DIFF", "0.000000001")
         self.vardiff_config = load_prism_vardiff_config(self.share_difficulty)
+        self.listener_profiles = [
+            StratumListenerProfile(
+                name="default",
+                bind=self.bind,
+                port=self.port,
+                share_difficulty=self.share_difficulty,
+                vardiff_config=self.vardiff_config,
+                heartbeat_name="stratum_accept",
+            )
+        ]
+        highdiff_profile = load_prism_highdiff_listener(self.bind, self.vardiff_config)
+        if highdiff_profile is not None:
+            if highdiff_profile.port == self.port and highdiff_profile.bind == self.bind:
+                raise SystemExit("PRISM_STRATUM_HIGHDIFF_PORT must differ from PRISM_STRATUM_PORT")
+            self.listener_profiles.append(highdiff_profile)
         self.default_share_weight = env_int("PRISM_STRATUM_SHARE_WEIGHT", 1)
         if self.default_share_weight <= 0:
             raise SystemExit("PRISM_STRATUM_SHARE_WEIGHT must be positive")
@@ -1307,6 +1461,7 @@ class PrismCoordinator:
         share_target = direct_stratum.effective_share_target(
             self.desired_client_share_difficulty(client),
             cached.base_job.qbit_target,
+            minimum_advertised_difficulty=self.client_minimum_advertised_difficulty(client),
         )
         job = dataclass_replace(
             cached.base_job,
@@ -1387,6 +1542,12 @@ class PrismCoordinator:
                 self._watchdog_pauses[name] = depth - 1
             self._heartbeats[name] = time.monotonic()
 
+    def stratum_accept_heartbeat_names(self) -> tuple[str, ...]:
+        profiles = getattr(self, "listener_profiles", None)
+        if not profiles:
+            return ("stratum_accept",)
+        return tuple(profile.heartbeat_name for profile in profiles)
+
     @contextmanager
     def _watchdog_paused(self, *names: str) -> Iterator[None]:
         for name in names:
@@ -1445,16 +1606,32 @@ class PrismCoordinator:
             f"ledger={self.ledger.backend_name}",
             flush=True,
         )
+        for profile in self.listener_profiles[1:]:
+            print(
+                f"prism coordinator: {profile.name} listener on {profile.bind}:{profile.port} "
+                f"start_diff={profile.vardiff_config.startup_difficulty} "
+                f"min_diff={profile.vardiff_config.min_difficulty} "
+                f"max_diff={profile.vardiff_config.max_difficulty} "
+                f"share_diff={profile.share_difficulty}",
+                flush=True,
+            )
         if self.audit_bind and self.audit_port:
             self.start_audit_server()
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind((self.bind, self.port))
-            server.listen()
-            server.settimeout(1)
+        with ExitStack() as listener_stack:
+            listeners: list[tuple[socket.socket, StratumListenerProfile]] = []
+            for profile in self.listener_profiles:
+                server = listener_stack.enter_context(
+                    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                )
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind((profile.bind, profile.port))
+                server.listen()
+                server.settimeout(1)
+                listeners.append((server, profile))
             # Seed liveness before starting monitored loops so the watchdog
             # never fires during startup.
-            self._record_heartbeat("stratum_accept")
+            for _, profile in listeners:
+                self._record_heartbeat(profile.heartbeat_name)
             self._record_heartbeat("qbit_blockpoll")
             blockpoll_thread = threading.Thread(target=self.blockpoll_loop, daemon=True)
             blockpoll_thread.start()
@@ -1483,31 +1660,50 @@ class PrismCoordinator:
                     f"interval={self.watchdog_interval_seconds:g}s",
                     flush=True,
                 )
-            while not self.stop_event.is_set():
-                self._record_heartbeat("stratum_accept")
-                try:
-                    sock, address = server.accept()
-                except socket.timeout:
-                    continue
-                sock.settimeout(None)
-                self.apply_stratum_send_timeout(sock)
-                with self.lock:
-                    self.connection_counter += 1
-                    connection_id = self.connection_counter
-                client = ClientState(
-                    sock=sock,
-                    address=address,
-                    connection_id=connection_id,
-                    extranonce1_hex=f"{connection_id & 0xFFFFFFFF:08x}",
-                    share_difficulty=self.client_startup_difficulty(),
-                )
-                with self.lock:
-                    self.clients.add(client)
-                thread = threading.Thread(target=self.handle_client, args=(client,), daemon=True)
-                thread.start()
+            for extra_server, extra_profile in listeners[1:]:
+                threading.Thread(
+                    target=self.accept_loop,
+                    args=(extra_server, extra_profile),
+                    daemon=True,
+                ).start()
+            self.accept_loop(*listeners[0])
             blockpoll_thread.join(timeout=1)
             if ctv_broadcaster_thread is not None:
                 ctv_broadcaster_thread.join(timeout=1)
+
+    def accept_loop(self, server: socket.socket, profile: StratumListenerProfile) -> None:
+        while not self.stop_event.is_set():
+            self._record_heartbeat(profile.heartbeat_name)
+            try:
+                sock, address = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                # The listener socket is torn down by serve()'s ExitStack on
+                # shutdown while secondary accept threads may still be blocked
+                # in accept(); anything else is a real error.
+                if self.stop_event.is_set():
+                    return
+                raise
+            sock.settimeout(None)
+            self.apply_stratum_send_timeout(sock)
+            with self.lock:
+                self.connection_counter += 1
+                connection_id = self.connection_counter
+            client = ClientState(
+                sock=sock,
+                address=address,
+                connection_id=connection_id,
+                extranonce1_hex=f"{connection_id & 0xFFFFFFFF:08x}",
+                listener_name=profile.name,
+                listener_vardiff_config=profile.vardiff_config,
+                minimum_advertised_difficulty=profile.minimum_advertised_difficulty,
+                share_difficulty=self.client_startup_difficulty(profile),
+            )
+            with self.lock:
+                self.clients.add(client)
+            thread = threading.Thread(target=self.handle_client, args=(client,), daemon=True)
+            thread.start()
 
     def start_audit_server(self) -> None:
         self.start_health_snapshot_refresher()
@@ -1936,17 +2132,31 @@ class PrismCoordinator:
             return
         if method == "mining.authorize":
             username = str(params[0]) if params else ""
+            password = str(params[1]) if len(params) > 1 and params[1] is not None else ""
             client.worker = self.resolve_worker(username)
             client.username = username
+            # The password is authoritative for password-derived options: a
+            # re-authorize without d=/md= clears any prior override (a stored
+            # suggest_difficulty still applies via the request resolution).
+            client.requested_difficulty, client.requested_min_difficulty = (
+                parse_stratum_password_options(password)
+            )
+            target = self.apply_client_difficulty_requests(client)
+            difficulty_job_delivered = False
+            if target is not None:
+                difficulty_job_delivered = self.advertise_client_difficulty(client, target)
             client.authorized = True
             self.send_result(client, request_id, True)
-            self.maybe_send_job(client, clean_jobs=True)
+            # On a re-authorize whose new options already advertised a fresh
+            # difficulty/job pair, do not send a second back-to-back pair.
+            if not difficulty_job_delivered:
+                self.maybe_send_job(client, clean_jobs=True)
             return
         if method == "mining.extranonce.subscribe":
             self.send_result(client, request_id, True)
             return
         if method == "mining.suggest_difficulty":
-            self.send_result(client, request_id, True)
+            self.handle_suggest_difficulty(client, request_id, params)
             return
         if method == "mining.submit":
             accepted_and_closed = self.handle_submit(client, params)
@@ -1958,6 +2168,22 @@ class PrismCoordinator:
                 client.close()
             return
         raise StratumError(20, f"unsupported method {method}")
+
+    def handle_suggest_difficulty(self, client: ClientState, request_id: object, params: list[object]) -> None:
+        suggested: Decimal | None = None
+        if params:
+            try:
+                suggested = Decimal(str(params[0]))
+            except Exception:
+                suggested = None
+            if suggested is not None and (not suggested.is_finite() or suggested <= 0):
+                suggested = None
+        if suggested is not None:
+            client.suggested_difficulty = suggested
+            target = self.apply_client_difficulty_requests(client)
+            if target is not None:
+                self.advertise_client_difficulty(client, target)
+        self.send_result(client, request_id, True)
 
     def handle_configure(self, client: ClientState, request_id: object, params: list[object]) -> None:
         extensions = params[0] if params else []
@@ -2117,22 +2343,48 @@ class PrismCoordinator:
             }
         )
 
-    def client_startup_difficulty(self) -> Decimal:
-        if not self.vardiff_config.enabled:
-            return self.share_difficulty
+    def client_vardiff_config(self, client: ClientState) -> vardiff.VardiffConfig:
+        """The difficulty policy for one client: its per-client specialization
+        if any, else its listener profile, else the default listener's config
+        (clients created without one: tests, legacy callers)."""
+        return client.vardiff_config or client.listener_vardiff_config or self.vardiff_config
+
+    def client_startup_difficulty(self, profile: StratumListenerProfile | None = None) -> Decimal:
+        config = profile.vardiff_config if profile is not None else self.vardiff_config
+        fixed_difficulty = profile.share_difficulty if profile is not None else self.share_difficulty
+        if not config.enabled:
+            return fixed_difficulty
         return vardiff.clamp(
-            self.vardiff_config.startup_difficulty,
-            self.vardiff_config.min_difficulty,
-            self.vardiff_config.max_difficulty,
+            config.startup_difficulty,
+            config.min_difficulty,
+            config.max_difficulty,
         )
 
     def desired_client_share_difficulty(self, client: ClientState) -> Decimal:
-        if not self.vardiff_config.enabled:
-            return self.share_difficulty
+        # pending_share_difficulty is set by vardiff retargets and by explicit
+        # difficulty requests (d=/suggest_difficulty); either way it applies to
+        # the next stamped job regardless of whether vardiff is enabled.
         return client.pending_share_difficulty or client.share_difficulty
 
+    def client_minimum_advertised_difficulty(self, client: ClientState) -> Decimal:
+        """The difficulty stamped jobs never advertise below for this client.
+
+        Zero everywhere except floor-bearing listeners (the high-diff port),
+        where the effective policy floor governs: the listener minimum, raised
+        by any md= specialization. The floor overrides the network-difficulty
+        cap because the listener's marketplace contract is checked against the
+        first advertised difficulty, even while qbit network difficulty sits
+        below the floor.
+        """
+        if client.minimum_advertised_difficulty <= 0:
+            return Decimal("0")
+        return max(
+            client.minimum_advertised_difficulty,
+            self.client_vardiff_config(client).min_difficulty,
+        )
+
     def apply_job_difficulty(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
-        if not self.vardiff_config.enabled:
+        if not self.client_vardiff_config(client).enabled:
             client.share_difficulty = job.share_difficulty
             client.pending_share_difficulty = None
             return
@@ -2140,6 +2392,66 @@ class PrismCoordinator:
         client.share_difficulty = job.share_difficulty
         if pending is not None and job.share_difficulty == pending:
             client.pending_share_difficulty = None
+
+    def apply_client_difficulty_requests(self, client: ClientState) -> Decimal | None:
+        """Specialize the client's difficulty policy from its recorded requests
+        (password ``d=``/``md=`` and ``mining.suggest_difficulty``), clamped to
+        the pristine listener bounds. The listener floor always wins: on a
+        high-diff listener no request can drop a client below the configured
+        minimum. Explicit ``d=`` outranks a suggestion. Returns the resolved
+        target difficulty, or None when the client requested nothing."""
+        base = client.listener_vardiff_config or self.vardiff_config
+        requested = (
+            client.requested_difficulty
+            if client.requested_difficulty is not None
+            else client.suggested_difficulty
+        )
+        if requested is None and client.requested_min_difficulty is None:
+            # No live requests: drop any stale specialization so the client
+            # falls back to the pristine listener policy.
+            client.vardiff_config = None
+            return None
+        floor = base.min_difficulty
+        if client.requested_min_difficulty is not None:
+            floor = vardiff.clamp(
+                client.requested_min_difficulty,
+                base.min_difficulty,
+                base.max_difficulty,
+            )
+        if requested is None:
+            requested = client.share_difficulty
+        target = vardiff.clamp(requested, floor, base.max_difficulty)
+        client.vardiff_config = dataclass_replace(
+            base,
+            min_difficulty=floor,
+            startup_difficulty=target,
+        )
+        return target
+
+    def advertise_client_difficulty(self, client: ClientState, target: Decimal) -> bool:
+        """Move a client to an explicitly requested difficulty.
+
+        Before the client can receive jobs the value is applied directly (the
+        first set_difficulty/notify pair picks it up). Afterwards it uses the
+        same job-gated pending mechanism as vardiff retargets: the difficulty
+        is advertised together with the job it applies to, or not at all.
+        Returns True only when a fresh set_difficulty/notify pair went out, so
+        callers about to send their own job can skip a duplicate pair."""
+        with self.lock:
+            current = client.pending_share_difficulty or client.share_difficulty
+            if target == current:
+                return False
+            if not (client.subscribed and client.authorized):
+                client.share_difficulty = target
+                return False
+            prior_pending = client.pending_share_difficulty
+            client.pending_share_difficulty = target
+        if not self.stop_event.is_set() and self.maybe_send_job(client, clean_jobs=True):
+            return True
+        with self.lock:
+            if client.pending_share_difficulty == target:
+                client.pending_share_difficulty = prior_pending
+        return False
 
     def normalized_prior_balances(self, balances: list[dict[str, object]]) -> list[dict[str, object]]:
         rows = [
@@ -2328,7 +2640,13 @@ class PrismCoordinator:
             if len(self.recent_share_keys) > 50_000:
                 self.recent_share_keys.clear()
             self.recent_share_keys.add(share_key)
-        if not submission.share_pass:
+        # A floor-bearing listener holds the advertised share target above the
+        # qbit network target while network difficulty sits below the floor,
+        # so a submission can solve a block yet miss the share target. Never
+        # discard a block over share bookkeeping: reject as low-difficulty
+        # only when the hash is not block-worthy.
+        block_worthy = submission.block_pass and not context.collection_only
+        if not submission.share_pass and not block_worthy:
             self.reject_stratum(23, PRISM_REJECTION_LOW_DIFFICULTY, "low difficulty share")
 
         pending_share = self.pending_share_from_submission(
@@ -2337,7 +2655,7 @@ class PrismCoordinator:
             submission=submission,
             ntime_hex=ntime_hex,
         )
-        if context.collection_only or not submission.block_pass:
+        if not block_worthy:
             self.append_accepted_share(client, context, submission, pending_share)
             return False
         return self.submit_block_candidate(
@@ -2398,20 +2716,21 @@ class PrismCoordinator:
 
     def note_vardiff_submitted_share(self, client: ClientState) -> None:
         self.submitted_share_count += 1
-        if not self.vardiff_config.enabled:
+        if not self.client_vardiff_config(client).enabled:
             return
         with self.lock:
             client.vardiff_window_submitted += 1
 
     def note_vardiff_accepted_share(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
-        if not self.vardiff_config.enabled:
+        config = self.client_vardiff_config(client)
+        if not config.enabled:
             return
         now = time.monotonic()
         with self.lock:
             client.vardiff_window_accepted += 1
             client.vardiff_window_work += job.share_difficulty
             elapsed_seconds = Decimal(str(max(0.001, now - client.vardiff_window_started_monotonic)))
-            if elapsed_seconds < self.vardiff_config.retarget_interval_seconds:
+            if elapsed_seconds < config.retarget_interval_seconds:
                 return
             accepted_shares = client.vardiff_window_accepted
             submitted_shares = client.vardiff_window_submitted
@@ -2440,12 +2759,13 @@ class PrismCoordinator:
         accepted_difficulty: Decimal,
         elapsed_seconds: Decimal,
     ) -> None:
-        if not self.vardiff_config.enabled:
+        config = self.client_vardiff_config(client)
+        if not config.enabled:
             return
         observed_difficulty = vardiff.observed_difficulty(
             accepted_difficulty=accepted_difficulty,
             elapsed_seconds=elapsed_seconds,
-            target_share_interval_seconds=self.vardiff_config.target_share_interval_seconds,
+            target_share_interval_seconds=config.target_share_interval_seconds,
         )
         with self.lock:
             previous_estimate = client.vardiff_difficulty_estimate
@@ -2457,7 +2777,7 @@ class PrismCoordinator:
             difficulty_estimate = vardiff.smooth_difficulty_estimate(
                 observed=observed_difficulty,
                 previous=previous_estimate,
-                config=self.vardiff_config,
+                config=config,
             )
             with self.lock:
                 client.vardiff_difficulty_estimate = difficulty_estimate
@@ -2465,14 +2785,14 @@ class PrismCoordinator:
             current_difficulty=current_difficulty,
             accepted_shares=accepted_shares,
             elapsed_seconds=elapsed_seconds,
-            config=self.vardiff_config,
+            config=config,
             accepted_difficulty=accepted_difficulty,
             difficulty_estimate=difficulty_estimate,
         )
         if not vardiff.should_retarget(
             current_difficulty,
             next_difficulty,
-            self.vardiff_config.retarget_tolerance,
+            config.retarget_tolerance,
         ):
             return
         with self.lock:
@@ -2510,7 +2830,7 @@ class PrismCoordinator:
         pending_share: PendingShare,
         client: ClientState,
     ) -> bool:
-        with self._watchdog_paused("qbit_blockpoll", "stratum_accept"), self.lock:
+        with self._watchdog_paused("qbit_blockpoll", *self.stratum_accept_heartbeat_names()), self.lock:
             if self.accepted_block_count >= self.max_blocks:
                 self.reject_stratum(21, PRISM_REJECTION_POOL_CLOSED, "pool is no longer accepting shares")
             current_tip = str(self.rpc.call("getbestblockhash"))

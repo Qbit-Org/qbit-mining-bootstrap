@@ -496,5 +496,47 @@ class PrismDirectStratumTests(unittest.TestCase):
             )
 
 
+class EffectiveShareTargetTests(unittest.TestCase):
+    def test_network_cap_governs_without_minimum(self) -> None:
+        # bits 207fffff: network difficulty ~4.7e-10, so a 500k desired
+        # difficulty is capped down to the (easier) network target.
+        qbit_target = direct_stratum.target_from_compact_hex("207fffff")
+
+        share_target = direct_stratum.effective_share_target(Decimal("500000"), qbit_target)
+
+        self.assertEqual(share_target, qbit_target)
+        self.assertLess(direct_stratum.target_difficulty(share_target), Decimal("1"))
+
+    def test_minimum_advertised_difficulty_overrides_network_cap(self) -> None:
+        qbit_target = direct_stratum.target_from_compact_hex("207fffff")
+
+        share_target = direct_stratum.effective_share_target(
+            Decimal("500000"),
+            qbit_target,
+            minimum_advertised_difficulty=Decimal("500000"),
+        )
+
+        self.assertEqual(share_target, direct_stratum.difficulty_target(Decimal("500000")))
+        # Compare at wire precision: set_difficulty sends float(difficulty),
+        # and Decimal round-tripping can sit within 1e-27 of the floor.
+        self.assertGreaterEqual(
+            float(direct_stratum.target_difficulty(share_target)),
+            500000.0,
+        )
+
+    def test_minimum_is_inert_when_desired_already_meets_it(self) -> None:
+        # Mature chain: network target harder than the floor target, desired
+        # difficulty above the floor. The floor changes nothing.
+        qbit_target = direct_stratum.difficulty_target(Decimal("80000000"))
+
+        share_target = direct_stratum.effective_share_target(
+            Decimal("600000"),
+            qbit_target,
+            minimum_advertised_difficulty=Decimal("500000"),
+        )
+
+        self.assertEqual(share_target, direct_stratum.difficulty_target(Decimal("600000")))
+
+
 if __name__ == "__main__":
     unittest.main()

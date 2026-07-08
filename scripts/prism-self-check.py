@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -289,6 +290,35 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
     else:
         reporter.warn("mining.vardiff", "vardiff is disabled")
 
+    if env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"):
+        try:
+            highdiff_port = int(env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"))
+            if not 0 < highdiff_port < 65536:
+                raise ValueError("PRISM_STRATUM_HIGHDIFF_PORT must be a valid TCP port")
+            highdiff_min = parse_decimal(env_value(env, "PRISM_STRATUM_HIGHDIFF_MIN_DIFF", "500000"))
+            highdiff_start = parse_decimal(env_value(env, "PRISM_STRATUM_HIGHDIFF_START_DIFF", "500000"))
+            highdiff_max = parse_decimal(env_value(env, "PRISM_STRATUM_HIGHDIFF_MAX_DIFF", "4294967296"))
+            if highdiff_min <= 0 or highdiff_start <= 0 or highdiff_max <= 0:
+                raise ValueError("high-diff difficulty values must be positive")
+            if highdiff_min > highdiff_start:
+                raise ValueError("PRISM_STRATUM_HIGHDIFF_MIN_DIFF exceeds PRISM_STRATUM_HIGHDIFF_START_DIFF")
+            if highdiff_start > highdiff_max:
+                raise ValueError("PRISM_STRATUM_HIGHDIFF_START_DIFF exceeds PRISM_STRATUM_HIGHDIFF_MAX_DIFF")
+            # Match the coordinator: an unset OR empty fixed difficulty tracks
+            # the start difficulty (compose resolves the default to "").
+            highdiff_share_raw = env_value(env, "PRISM_STRATUM_HIGHDIFF_SHARE_DIFF", "").strip()
+            highdiff_share = parse_decimal(highdiff_share_raw) if highdiff_share_raw else highdiff_start
+            if highdiff_share < highdiff_min or highdiff_share > highdiff_max:
+                raise ValueError("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF is outside the min/max bounds")
+            reporter.pass_(
+                "mining.highdiff",
+                f"enabled port={highdiff_port} start={highdiff_start} range={highdiff_min}..{highdiff_max}",
+            )
+        except ValueError as exc:
+            reporter.fail("mining.highdiff", str(exc))
+    else:
+        reporter.pass_("mining.highdiff", "disabled (single stratum listener)")
+
     if is_true(env_value(env, "PRISM_POOL_FEE_ENABLED", "0")):
         fee_bps = env_value(env, "PRISM_POOL_FEE_BPS")
         fee_address = env_value(env, "PRISM_POOL_FEE_ADDRESS")
@@ -303,6 +333,22 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.pass_("pool.fee", "disabled")
 
 
+def highdiff_probe_target(env: dict[str, str]) -> tuple[str, int] | None:
+    """Host/port for probing the published high-diff listener.
+
+    Only the host publish mapping counts: probing the container listen port
+    would pass even when miners cannot reach the published port. Returns None
+    when nothing usable is published (unset, empty, or the ephemeral
+    loopback-port-0 default used while the listener is disabled)."""
+    value = env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT_HOST", "").strip()
+    if not value:
+        return None
+    host, port = parse_host_port(value, default_host="127.0.0.1", default_port=4334)
+    if port <= 0:
+        return None
+    return host, port
+
+
 def tcp_connect_check(name: str, host: str, port: int, reporter: Reporter) -> None:
     try:
         with socket.create_connection((host, port), timeout=3):
@@ -311,6 +357,87 @@ def tcp_connect_check(name: str, host: str, port: int, reporter: Reporter) -> No
         reporter.fail(name, f"cannot connect to {host}:{port}: {exc}", hint="Start the PRISM profile or check host port mapping.")
     else:
         reporter.pass_(name, f"reachable at {host}:{port}")
+
+
+def stratum_first_advertised_difficulty(
+    host: str,
+    port: int,
+    *,
+    username: str,
+    password: str = "x",
+    timeout: float = 10.0,
+) -> Decimal:
+    """Subscribe and authorize like a rig, returning the first
+    mining.set_difficulty the pool advertises on this connection.
+
+    This mirrors the marketplace verification handshake: NiceHash-style
+    probes judge the first advertised difficulty, so TCP reachability alone
+    is not evidence that a listener honors its floor."""
+    deadline = time.monotonic() + timeout
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        for request in (
+            {"id": 1, "method": "mining.subscribe", "params": ["prism-self-check/1"]},
+            {"id": 2, "method": "mining.authorize", "params": [username, password]},
+        ):
+            sock.sendall((json.dumps(request) + "\n").encode())
+        buffer = b""
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout as exc:
+                raise RuntimeError("timed out waiting for mining.set_difficulty") from exc
+            if not chunk:
+                raise RuntimeError("connection closed before mining.set_difficulty")
+            buffer += chunk
+            while b"\n" in buffer:
+                line, _, buffer = buffer.partition(b"\n")
+                if not line.strip():
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("id") == 2 and (message.get("error") or message.get("result") is False):
+                    raise RuntimeError(f"mining.authorize rejected: {message.get('error')}")
+                if message.get("method") == "mining.set_difficulty":
+                    params = message.get("params")
+                    if not isinstance(params, list) or not params:
+                        raise RuntimeError("mining.set_difficulty carried no difficulty")
+                    return parse_decimal(str(params[0]))
+        raise RuntimeError("timed out waiting for mining.set_difficulty")
+
+
+def check_highdiff_advertised_floor(env: dict[str, str], host: str, port: int, reporter: Reporter) -> None:
+    floor_raw = env_value(env, "PRISM_STRATUM_HIGHDIFF_MIN_DIFF", "").strip() or "500000"
+    try:
+        floor = parse_decimal(floor_raw)
+    except ValueError as exc:
+        reporter.fail("stratum.highdiff_floor", f"PRISM_STRATUM_HIGHDIFF_MIN_DIFF: {exc}")
+        return
+    username = env_value(env, "PRISM_USERNAME_FALLBACK_ADDRESS", "").strip() or "prism-self-check"
+    try:
+        advertised = stratum_first_advertised_difficulty(host, port, username=username)
+    except (OSError, RuntimeError, ValueError) as exc:
+        reporter.fail(
+            "stratum.highdiff_floor",
+            f"stratum handshake with {host}:{port} failed: {exc}",
+            hint="Marketplace verification needs subscribe/authorize to answer with mining.set_difficulty; check coordinator logs and PRISM_USERNAME_FALLBACK_ADDRESS.",
+        )
+        return
+    if advertised < floor:
+        reporter.fail(
+            "stratum.highdiff_floor",
+            f"first mining.set_difficulty advertises {advertised}, below the {floor} floor",
+            hint="Rental marketplaces judge the first advertised difficulty; the high-diff listener must clamp stamped jobs to its floor.",
+        )
+    else:
+        reporter.pass_(
+            "stratum.highdiff_floor",
+            f"first mining.set_difficulty advertises {advertised} (floor {floor})",
+        )
 
 
 def qbit_rpc_call(env: dict[str, str], method: str) -> object:
@@ -401,6 +528,22 @@ def coordinator_live_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.fail("stratum.port", str(exc))
     else:
         tcp_connect_check("stratum.tcp", stratum_host, stratum_port, reporter)
+
+    if env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"):
+        try:
+            highdiff_target = highdiff_probe_target(env)
+        except ValueError as exc:
+            reporter.fail("stratum.highdiff_port", str(exc))
+        else:
+            if highdiff_target is None:
+                reporter.fail(
+                    "stratum.highdiff_port",
+                    "PRISM_STRATUM_HIGHDIFF_PORT is set but PRISM_STRATUM_HIGHDIFF_PORT_HOST does not publish a host port",
+                    hint="Set PRISM_STRATUM_HIGHDIFF_PORT_HOST (e.g. 4334) so miners can reach the high-diff listener.",
+                )
+            else:
+                tcp_connect_check("stratum.highdiff_tcp", highdiff_target[0], highdiff_target[1], reporter)
+                check_highdiff_advertised_floor(env, highdiff_target[0], highdiff_target[1], reporter)
 
     health_code = r"""
 import json
