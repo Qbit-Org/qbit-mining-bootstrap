@@ -617,9 +617,11 @@ services:
       PRISM_CARGO: ${PRISM_CARGO:-cargo}
     ports:
       - "${PRISM_STRATUM_PORT_HOST:-3340}:${PRISM_STRATUM_PORT:-3340}"
-      # High-diff listener host mapping; harmless (connection refused) while
-      # PRISM_STRATUM_HIGHDIFF_PORT is unset and the listener is disabled.
-      - "${PRISM_STRATUM_HIGHDIFF_PORT_HOST:-4334}:${PRISM_STRATUM_HIGHDIFF_PORT:-4334}"
+      # High-diff listener host mapping. The default publishes an ephemeral
+      # loopback port so deployments that leave the listener disabled never
+      # occupy host 4334; set PRISM_STRATUM_HIGHDIFF_PORT_HOST (e.g. 4334)
+      # together with PRISM_STRATUM_HIGHDIFF_PORT when enabling it.
+      - "${PRISM_STRATUM_HIGHDIFF_PORT_HOST:-127.0.0.1:0}:${PRISM_STRATUM_HIGHDIFF_PORT:-4334}"
     healthcheck:
       test:
         - CMD-SHELL

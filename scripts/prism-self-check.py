@@ -332,6 +332,22 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.pass_("pool.fee", "disabled")
 
 
+def highdiff_probe_target(env: dict[str, str]) -> tuple[str, int] | None:
+    """Host/port for probing the published high-diff listener.
+
+    Only the host publish mapping counts: probing the container listen port
+    would pass even when miners cannot reach the published port. Returns None
+    when nothing usable is published (unset, empty, or the ephemeral
+    loopback-port-0 default used while the listener is disabled)."""
+    value = env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT_HOST", "").strip()
+    if not value:
+        return None
+    host, port = parse_host_port(value, default_host="127.0.0.1", default_port=4334)
+    if port <= 0:
+        return None
+    return host, port
+
+
 def tcp_connect_check(name: str, host: str, port: int, reporter: Reporter) -> None:
     try:
         with socket.create_connection((host, port), timeout=3):
@@ -433,19 +449,18 @@ def coordinator_live_checks(env: dict[str, str], reporter: Reporter) -> None:
 
     if env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"):
         try:
-            highdiff_host, highdiff_port = parse_host_port(
-                env_value(
-                    env,
-                    "PRISM_STRATUM_HIGHDIFF_PORT_HOST",
-                    env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"),
-                ),
-                default_host="127.0.0.1",
-                default_port=4334,
-            )
+            highdiff_target = highdiff_probe_target(env)
         except ValueError as exc:
             reporter.fail("stratum.highdiff_port", str(exc))
         else:
-            tcp_connect_check("stratum.highdiff_tcp", highdiff_host, highdiff_port, reporter)
+            if highdiff_target is None:
+                reporter.fail(
+                    "stratum.highdiff_port",
+                    "PRISM_STRATUM_HIGHDIFF_PORT is set but PRISM_STRATUM_HIGHDIFF_PORT_HOST does not publish a host port",
+                    hint="Set PRISM_STRATUM_HIGHDIFF_PORT_HOST (e.g. 4334) so miners can reach the high-diff listener.",
+                )
+            else:
+                tcp_connect_check("stratum.highdiff_tcp", highdiff_target[0], highdiff_target[1], reporter)
 
     health_code = r"""
 import json

@@ -228,7 +228,12 @@ up-prism-pool:
 	printf 'PRISM operator mode: direct qbit Stratum with Postgres ledger\n'; \
 	printf 'connect to stratum+tcp://%s\n' "$$(stratum_endpoint "$$(compose_env_value PRISM_STRATUM_PORT_HOST 3340)")"; \
 	if [ -n "$$(compose_env_value PRISM_STRATUM_HIGHDIFF_PORT "")" ]; then \
-		printf 'high-diff rental port: stratum+tcp://%s\n' "$$(stratum_endpoint "$$(compose_env_value PRISM_STRATUM_HIGHDIFF_PORT_HOST 4334)")"; \
+		highdiff_port_host="$$(compose_env_value PRISM_STRATUM_HIGHDIFF_PORT_HOST "")"; \
+		if [ -n "$$highdiff_port_host" ]; then \
+			printf 'high-diff rental port: stratum+tcp://%s\n' "$$(stratum_endpoint "$$highdiff_port_host")"; \
+		else \
+			printf 'high-diff listener enabled but not published; set PRISM_STRATUM_HIGHDIFF_PORT_HOST (e.g. 4334)\n'; \
+		fi; \
 	fi; \
 	printf 'audit HTTP stays inside the coordinator namespace at %s:%s\n' "$$(compose_env_value PRISM_AUDIT_BIND 127.0.0.1)" "$$(compose_env_value PRISM_AUDIT_PORT 3341)"; \
 	$(COMPOSE) --profile prism up --build qbitd prism-postgres prism-coordinator

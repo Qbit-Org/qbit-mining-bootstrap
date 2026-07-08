@@ -116,6 +116,32 @@ class PrismSelfCheckTests(unittest.TestCase):
             {(row.status, row.name) for row in reporter.rows},
         )
 
+    def test_highdiff_probe_target_uses_published_host_port_only(self) -> None:
+        # The published host mapping is the only valid probe target: falling
+        # back to the container listen port could pass while miners cannot
+        # reach the listener.
+        self.assertEqual(
+            self.self_check.highdiff_probe_target({"PRISM_STRATUM_HIGHDIFF_PORT_HOST": "4334"}),
+            ("127.0.0.1", 4334),
+        )
+        self.assertEqual(
+            self.self_check.highdiff_probe_target(
+                {"PRISM_STRATUM_HIGHDIFF_PORT_HOST": "0.0.0.0:14334"}
+            ),
+            ("0.0.0.0", 14334),
+        )
+        # Unset, empty, and the disabled-default ephemeral loopback mapping all
+        # mean "not published".
+        self.assertIsNone(self.self_check.highdiff_probe_target({}))
+        self.assertIsNone(
+            self.self_check.highdiff_probe_target({"PRISM_STRATUM_HIGHDIFF_PORT_HOST": ""})
+        )
+        self.assertIsNone(
+            self.self_check.highdiff_probe_target(
+                {"PRISM_STRATUM_HIGHDIFF_PORT_HOST": "127.0.0.1:0"}
+            )
+        )
+
     def test_static_checks_accept_highdiff_with_empty_share_diff(self) -> None:
         # Compose resolves the fixed difficulty default to an empty string; the
         # coordinator treats that as "track the start difficulty" and the

@@ -130,7 +130,8 @@ set:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PRISM_STRATUM_HIGHDIFF_PORT` | unset (disabled) | enable the listener on this port (compose maps host 4334) |
+| `PRISM_STRATUM_HIGHDIFF_PORT` | unset (disabled) | enable the listener on this container port (conventionally 4334) |
+| `PRISM_STRATUM_HIGHDIFF_PORT_HOST` | ephemeral loopback | compose host publish mapping; set (e.g. `4334`) when enabling the listener |
 | `PRISM_STRATUM_HIGHDIFF_BIND` | `PRISM_STRATUM_BIND` | bind address |
 | `PRISM_STRATUM_HIGHDIFF_START_DIFF` | `500000` | first advertised difficulty |
 | `PRISM_STRATUM_HIGHDIFF_MIN_DIFF` | `500000` | vardiff floor; never advertised below |
