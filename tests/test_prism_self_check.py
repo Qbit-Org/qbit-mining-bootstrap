@@ -116,6 +116,37 @@ class PrismSelfCheckTests(unittest.TestCase):
             {(row.status, row.name) for row in reporter.rows},
         )
 
+    def test_static_checks_accept_highdiff_with_empty_share_diff(self) -> None:
+        # Compose resolves the fixed difficulty default to an empty string; the
+        # coordinator treats that as "track the start difficulty" and the
+        # self-check must agree instead of failing mining.highdiff.
+        env = self.valid_env()
+        env["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+        env["PRISM_STRATUM_HIGHDIFF_SHARE_DIFF"] = ""
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        self.assertFalse(reporter.failed)
+        self.assertIn(
+            "PASS",
+            {row.status for row in reporter.rows if row.name == "mining.highdiff"},
+        )
+
+    def test_static_checks_fail_highdiff_share_diff_below_floor(self) -> None:
+        env = self.valid_env()
+        env["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+        env["PRISM_STRATUM_HIGHDIFF_SHARE_DIFF"] = "1000"
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        self.assertTrue(reporter.failed)
+        self.assertIn(
+            ("FAIL", "mining.highdiff"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
     def test_ready_miner_threshold_fails_when_below_minimum(self) -> None:
         env = self.valid_env()
         env["PRISM_MIN_READY_MINERS"] = "3"

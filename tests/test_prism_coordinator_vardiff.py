@@ -3464,6 +3464,31 @@ class PrismListenerProfileTests(unittest.TestCase):
         self.assertIsNone(state.vardiff_config)
         self.assertEqual(state.share_difficulty, Decimal("0.5"))
 
+    def test_reauthorize_with_new_difficulty_sends_single_job_pair(self) -> None:
+        server, state, _ = self.authorize_server_and_client()
+        send_job_calls: list[bool] = []
+
+        def counting_send_job(client: object, *, clean_jobs: bool) -> bool:
+            send_job_calls.append(clean_jobs)
+            return True
+
+        server.maybe_send_job = counting_send_job  # type: ignore[method-assign]
+
+        server.handle_request(
+            state,
+            {"id": 5, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "x"]},
+        )
+        self.assertEqual(len(send_job_calls), 1)
+
+        # A re-authorize whose new d= advertises a fresh difficulty/job pair
+        # must not be followed by a second back-to-back pair.
+        server.handle_request(
+            state,
+            {"id": 6, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "d=0.5"]},
+        )
+        self.assertEqual(len(send_job_calls), 2)
+        self.assertEqual(state.pending_share_difficulty, Decimal("0.5"))
+
     def test_accept_loop_assigns_listener_profiles_and_unique_extranonce(self) -> None:
         server = coordinator()
         server.connection_counter = 0

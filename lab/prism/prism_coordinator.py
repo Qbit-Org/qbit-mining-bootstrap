@@ -2128,11 +2128,15 @@ class PrismCoordinator:
                 parse_stratum_password_options(password)
             )
             target = self.apply_client_difficulty_requests(client)
+            difficulty_job_delivered = False
             if target is not None:
-                self.advertise_client_difficulty(client, target)
+                difficulty_job_delivered = self.advertise_client_difficulty(client, target)
             client.authorized = True
             self.send_result(client, request_id, True)
-            self.maybe_send_job(client, clean_jobs=True)
+            # On a re-authorize whose new options already advertised a fresh
+            # difficulty/job pair, do not send a second back-to-back pair.
+            if not difficulty_job_delivered:
+                self.maybe_send_job(client, clean_jobs=True)
             return
         if method == "mining.extranonce.subscribe":
             self.send_result(client, request_id, True)
@@ -2393,27 +2397,30 @@ class PrismCoordinator:
         )
         return target
 
-    def advertise_client_difficulty(self, client: ClientState, target: Decimal) -> None:
+    def advertise_client_difficulty(self, client: ClientState, target: Decimal) -> bool:
         """Move a client to an explicitly requested difficulty.
 
         Before the client can receive jobs the value is applied directly (the
         first set_difficulty/notify pair picks it up). Afterwards it uses the
         same job-gated pending mechanism as vardiff retargets: the difficulty
-        is advertised together with the job it applies to, or not at all."""
+        is advertised together with the job it applies to, or not at all.
+        Returns True only when a fresh set_difficulty/notify pair went out, so
+        callers about to send their own job can skip a duplicate pair."""
         with self.lock:
             current = client.pending_share_difficulty or client.share_difficulty
             if target == current:
-                return
+                return False
             if not (client.subscribed and client.authorized):
                 client.share_difficulty = target
-                return
+                return False
             prior_pending = client.pending_share_difficulty
             client.pending_share_difficulty = target
         if not self.stop_event.is_set() and self.maybe_send_job(client, clean_jobs=True):
-            return
+            return True
         with self.lock:
             if client.pending_share_difficulty == target:
                 client.pending_share_difficulty = prior_pending
+        return False
 
     def normalized_prior_balances(self, balances: list[dict[str, object]]) -> list[dict[str, object]]:
         rows = [
