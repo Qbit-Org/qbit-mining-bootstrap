@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -3382,6 +3383,160 @@ class PrismListenerProfileTests(unittest.TestCase):
         self.assertIsNone(state.vardiff_config)
         self.assertEqual(state.share_difficulty, Decimal("1"))
         self.assertEqual(len(sent), 5)
+
+    def test_highdiff_share_diff_tracks_start_and_validates_bounds(self) -> None:
+        base = load_prism_vardiff_config(Decimal("0.000000001"))
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+            os.environ["PRISM_STRATUM_HIGHDIFF_MIN_DIFF"] = "1000000"
+            os.environ["PRISM_STRATUM_HIGHDIFF_START_DIFF"] = "1000000"
+            profile = load_prism_highdiff_listener("0.0.0.0", base)
+        assert profile is not None
+        # Unset fixed difficulty tracks the start difficulty instead of a
+        # constant that could fall below a raised floor.
+        self.assertEqual(profile.share_difficulty, Decimal("1000000"))
+
+        # An explicit fixed difficulty outside the listener bounds must fail
+        # startup: advertising below the floor is exactly what the high-diff
+        # listener exists to prevent.
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+            os.environ["PRISM_STRATUM_HIGHDIFF_SHARE_DIFF"] = "1000"
+            with self.assertRaises(SystemExit):
+                load_prism_highdiff_listener("0.0.0.0", base)
+        with patch.dict(os.environ, {}, clear=False):
+            clear_stratum_diff_env()
+            os.environ["PRISM_STRATUM_HIGHDIFF_PORT"] = "4334"
+            os.environ["PRISM_STRATUM_HIGHDIFF_SHARE_DIFF"] = "8589934592"
+            with self.assertRaises(SystemExit):
+                load_prism_highdiff_listener("0.0.0.0", base)
+
+    def authorize_server_and_client(self) -> tuple[PrismCoordinator, ClientState, list[object]]:
+        server = coordinator()
+        server.rpc = AddressValidationRpc()
+        server.username_fallback_address = None
+        server.maybe_send_job = lambda client, *, clean_jobs: True  # type: ignore[method-assign]
+        state = ClientState(sock=object(), address=("127.0.0.1", 1), connection_id=3, extranonce1_hex="00000003")
+        state.subscribed = True
+        sent: list[object] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+        return server, state, sent
+
+    def test_authorize_password_applies_before_first_job(self) -> None:
+        server, state, sent = self.authorize_server_and_client()
+
+        server.handle_request(
+            state,
+            {"id": 5, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "d=0.5,md=0.25"]},
+        )
+
+        self.assertTrue(state.authorized)
+        self.assertEqual(state.requested_difficulty, Decimal("0.5"))
+        self.assertEqual(state.requested_min_difficulty, Decimal("0.25"))
+        # Applied directly (no job exists yet), so the first
+        # set_difficulty/notify pair advertises the requested value.
+        self.assertEqual(state.share_difficulty, Decimal("0.5"))
+        self.assertIsNone(state.pending_share_difficulty)
+        assert state.vardiff_config is not None
+        self.assertEqual(state.vardiff_config.min_difficulty, Decimal("0.25"))
+        self.assertEqual(sent, [{"id": 5, "result": True, "error": None}])
+
+    def test_reauthorize_with_plain_password_clears_stale_overrides(self) -> None:
+        server, state, _ = self.authorize_server_and_client()
+        server.handle_request(
+            state,
+            {"id": 5, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "d=0.5,md=0.25"]},
+        )
+        assert state.vardiff_config is not None
+
+        server.handle_request(
+            state,
+            {"id": 6, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "x"]},
+        )
+
+        # The new password carries no options: prior overrides are dropped and
+        # the client falls back to the pristine listener policy (its current
+        # difficulty is left alone; vardiff drifts it under listener bounds).
+        self.assertIsNone(state.requested_difficulty)
+        self.assertIsNone(state.requested_min_difficulty)
+        self.assertIsNone(state.vardiff_config)
+        self.assertEqual(state.share_difficulty, Decimal("0.5"))
+
+    def test_accept_loop_assigns_listener_profiles_and_unique_extranonce(self) -> None:
+        server = coordinator()
+        server.connection_counter = 0
+        server.stratum_send_timeout_seconds = 0.0
+
+        def listening_socket() -> socket.socket:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(0.1)
+            return listener
+
+        default_listener = listening_socket()
+        highdiff_listener = listening_socket()
+        default_profile = StratumListenerProfile(
+            name="default",
+            bind="127.0.0.1",
+            port=default_listener.getsockname()[1],
+            share_difficulty=server.share_difficulty,
+            vardiff_config=server.vardiff_config,
+            heartbeat_name="stratum_accept",
+        )
+        highdiff_profile = StratumListenerProfile(
+            name="highdiff",
+            bind="127.0.0.1",
+            port=highdiff_listener.getsockname()[1],
+            share_difficulty=Decimal("500000"),
+            vardiff_config=highdiff_vardiff_config(),
+            heartbeat_name="stratum_accept_highdiff",
+        )
+        threads = [
+            threading.Thread(target=server.accept_loop, args=(default_listener, default_profile), daemon=True),
+            threading.Thread(target=server.accept_loop, args=(highdiff_listener, highdiff_profile), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        connections = []
+        try:
+            connections.append(socket.create_connection(("127.0.0.1", default_profile.port), timeout=5))
+            connections.append(socket.create_connection(("127.0.0.1", highdiff_profile.port), timeout=5))
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with server.lock:
+                    if len(server.clients) == 2:
+                        break
+                time.sleep(0.01)
+            with server.lock:
+                clients_by_listener = {c.listener_name: c for c in server.clients}
+            self.assertEqual(set(clients_by_listener), {"default", "highdiff"})
+            self.assertEqual(
+                clients_by_listener["default"].share_difficulty,
+                Decimal("0.000000001"),
+            )
+            self.assertEqual(
+                clients_by_listener["highdiff"].share_difficulty,
+                Decimal("500000"),
+            )
+            self.assertIs(
+                clients_by_listener["highdiff"].listener_vardiff_config,
+                highdiff_profile.vardiff_config,
+            )
+            extranonces = {c.extranonce1_hex for c in clients_by_listener.values()}
+            self.assertEqual(extranonces, {"00000001", "00000002"})
+            self.assertIn("stratum_accept", server._heartbeats)
+            self.assertIn("stratum_accept_highdiff", server._heartbeats)
+        finally:
+            server.stop_event.set()
+            for connection in connections:
+                connection.close()
+            default_listener.close()
+            highdiff_listener.close()
+            for thread in threads:
+                thread.join(timeout=5)
 
 
 if __name__ == "__main__":

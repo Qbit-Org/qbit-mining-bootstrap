@@ -303,6 +303,11 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
                 raise ValueError("PRISM_STRATUM_HIGHDIFF_MIN_DIFF exceeds PRISM_STRATUM_HIGHDIFF_START_DIFF")
             if highdiff_start > highdiff_max:
                 raise ValueError("PRISM_STRATUM_HIGHDIFF_START_DIFF exceeds PRISM_STRATUM_HIGHDIFF_MAX_DIFF")
+            highdiff_share = parse_decimal(
+                env_value(env, "PRISM_STRATUM_HIGHDIFF_SHARE_DIFF", str(highdiff_start))
+            )
+            if highdiff_share < highdiff_min or highdiff_share > highdiff_max:
+                raise ValueError("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF is outside the min/max bounds")
             reporter.pass_(
                 "mining.highdiff",
                 f"enabled port={highdiff_port} start={highdiff_start} range={highdiff_min}..{highdiff_max}",

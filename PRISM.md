@@ -135,7 +135,7 @@ set:
 | `PRISM_STRATUM_HIGHDIFF_START_DIFF` | `500000` | first advertised difficulty |
 | `PRISM_STRATUM_HIGHDIFF_MIN_DIFF` | `500000` | vardiff floor; never advertised below |
 | `PRISM_STRATUM_HIGHDIFF_MAX_DIFF` | `4294967296` | vardiff ceiling |
-| `PRISM_STRATUM_HIGHDIFF_SHARE_DIFF` | `500000` | fixed difficulty when vardiff is disabled |
+| `PRISM_STRATUM_HIGHDIFF_SHARE_DIFF` | `PRISM_STRATUM_HIGHDIFF_START_DIFF` | fixed difficulty when vardiff is disabled; must stay within the min/max bounds |
 
 All other vardiff knobs (target share interval, retarget cadence, step
 bounds, smoothing) inherit the `PRISM_STRATUM_VARDIFF_*` configuration.

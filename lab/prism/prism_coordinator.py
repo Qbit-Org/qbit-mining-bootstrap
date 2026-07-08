@@ -373,7 +373,6 @@ def load_prism_highdiff_listener(
         raise SystemExit("PRISM_STRATUM_HIGHDIFF_PORT must be an integer") from exc
     if not 0 < port < 65536:
         raise SystemExit("PRISM_STRATUM_HIGHDIFF_PORT must be a valid TCP port")
-    share_difficulty = env_decimal("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF", DEFAULT_HIGHDIFF_DIFFICULTY)
     min_difficulty = env_decimal("PRISM_STRATUM_HIGHDIFF_MIN_DIFF", DEFAULT_HIGHDIFF_DIFFICULTY)
     start_difficulty = env_decimal("PRISM_STRATUM_HIGHDIFF_START_DIFF", DEFAULT_HIGHDIFF_DIFFICULTY)
     max_difficulty = env_decimal("PRISM_STRATUM_HIGHDIFF_MAX_DIFF", DEFAULT_HIGHDIFF_MAX_DIFFICULTY)
@@ -381,6 +380,24 @@ def load_prism_highdiff_listener(
         raise SystemExit("PRISM_STRATUM_HIGHDIFF_MIN_DIFF exceeds PRISM_STRATUM_HIGHDIFF_START_DIFF")
     if start_difficulty > max_difficulty:
         raise SystemExit("PRISM_STRATUM_HIGHDIFF_START_DIFF exceeds PRISM_STRATUM_HIGHDIFF_MAX_DIFF")
+    # The fixed difficulty (used when vardiff is disabled) tracks the start
+    # difficulty unless explicitly set, and must respect the listener bounds:
+    # advertising below the floor would break the marketplace verification
+    # this listener exists for.
+    share_value = env_optional("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF")
+    if share_value is None:
+        share_difficulty = start_difficulty
+    else:
+        try:
+            share_difficulty = Decimal(share_value)
+        except Exception as exc:
+            raise SystemExit("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF must be a decimal") from exc
+        if not share_difficulty.is_finite() or share_difficulty <= 0:
+            raise SystemExit("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF must be positive")
+        if share_difficulty < min_difficulty:
+            raise SystemExit("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF is below PRISM_STRATUM_HIGHDIFF_MIN_DIFF")
+        if share_difficulty > max_difficulty:
+            raise SystemExit("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF exceeds PRISM_STRATUM_HIGHDIFF_MAX_DIFF")
     try:
         config = dataclass_replace(
             base_vardiff_config,
@@ -2104,11 +2121,12 @@ class PrismCoordinator:
             password = str(params[1]) if len(params) > 1 and params[1] is not None else ""
             client.worker = self.resolve_worker(username)
             client.username = username
-            requested, requested_min = parse_stratum_password_options(password)
-            if requested is not None:
-                client.requested_difficulty = requested
-            if requested_min is not None:
-                client.requested_min_difficulty = requested_min
+            # The password is authoritative for password-derived options: a
+            # re-authorize without d=/md= clears any prior override (a stored
+            # suggest_difficulty still applies via the request resolution).
+            client.requested_difficulty, client.requested_min_difficulty = (
+                parse_stratum_password_options(password)
+            )
             target = self.apply_client_difficulty_requests(client)
             if target is not None:
                 self.advertise_client_difficulty(client, target)
@@ -2354,6 +2372,9 @@ class PrismCoordinator:
             else client.suggested_difficulty
         )
         if requested is None and client.requested_min_difficulty is None:
+            # No live requests: drop any stale specialization so the client
+            # falls back to the pristine listener policy.
+            client.vardiff_config = None
             return None
         floor = base.min_difficulty
         if client.requested_min_difficulty is not None:
