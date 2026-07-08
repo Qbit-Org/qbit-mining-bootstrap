@@ -266,6 +266,7 @@ class PublicDashboardApiContractTests(unittest.TestCase):
         self.assertIn("Cache-Control: no-store", readme_text)
         self.assertIn("PRISM_PUBLIC_CACHE_TTL_SECONDS", readme_text)
         self.assertIn("PRISM_PUBLIC_CACHE_MAX_ENTRIES", readme_text)
+        self.assertIn("PRISM_PUBLIC_STRATUM_HIGHDIFF_URL", readme_text)
 
     def load_fixture(self, fixture_name: str) -> dict[str, Any]:
         with (FIXTURE_DIR / fixture_name).open(encoding="utf-8") as fixture_file:
