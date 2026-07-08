@@ -36,6 +36,7 @@ def pending_share(
     share_difficulty: int | None = None,
     job_issued_at_ms: int | None = None,
     accepted_at_ms: int | None = None,
+    credit_policy: str | None = None,
 ) -> PendingShare:
     return PendingShare(
         share_id=f"share-{index}",
@@ -49,6 +50,7 @@ def pending_share(
         job_issued_at_ms=job_issued_at_ms if job_issued_at_ms is not None else 1_000 + index,
         accepted_at_ms=accepted_at_ms if accepted_at_ms is not None else 2_000 + index,
         ntime=1_700_000_000 + index,
+        credit_policy=credit_policy,
     )
 
 
@@ -212,6 +214,26 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual([record.share_seq for record in records], [1, 2, 3, 4, 5])
         self.assertEqual(len(ledger), 5)
         self.assertEqual([record["share_seq"] for record in (item.to_prism_json() for item in records)], [1, 2, 3, 4, 5])
+
+    def test_credit_policy_round_trips_only_when_present(self) -> None:
+        ledger = SingleWriterShareLedger()
+
+        normal = ledger.append(pending_share(1))
+        grace = ledger.append(pending_share(2, credit_policy="stale-grace"))
+
+        self.assertNotIn("credit_policy", normal.to_prism_json())
+        self.assertEqual(grace.credit_policy, "stale-grace")
+        self.assertEqual(grace.to_prism_json()["credit_policy"], "stale-grace")
+
+    def test_invalid_credit_policy_is_rejected_before_storage(self) -> None:
+        ledger = SingleWriterShareLedger()
+
+        for policy in ("", "bogus"):
+            with self.subTest(policy=policy), self.assertRaisesRegex(
+                ValueError,
+                "unsupported credit_policy",
+            ):
+                ledger.append(pending_share(1, credit_policy=policy))
 
     def test_job_issue_snapshot_excludes_later_job_shares(self) -> None:
         ledger = SingleWriterShareLedger()
@@ -730,6 +752,11 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("AND ledger.share_seq < eligible.share_seq", schema)
         self.assertIn("ON qbit_share_ledger ((lower(right(share_id, 64))), accepted_at DESC, share_seq DESC)", schema)
         self.assertIn("ALTER COLUMN anchor_vout DROP NOT NULL", schema)
+        self.assertIn("CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace'))", schema)
+        self.assertIn("NOT VALID", schema)
+        self.assertNotIn("DROP CONSTRAINT IF EXISTS qbit_share_ledger_credit_policy_check", schema)
+        self.assertLess(schema.index("writer_epoch bigint"), schema.index("credit_policy text"))
+        self.assertLess(schema.index("credit_policy text"), schema.index("CHECK (accepted OR reject_reason IS NOT NULL)"))
         self.assertNotIn("sum(ledger.share_difficulty) OVER", schema)
 
     def test_memory_pool_snapshot_reward_window_uses_anchor_eligible_shares(self) -> None:

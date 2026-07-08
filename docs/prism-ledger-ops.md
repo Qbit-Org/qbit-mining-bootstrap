@@ -65,6 +65,19 @@ arrives after the found-block anchor from entering the published payout split.
 public audit wrapper. It fixes the TIDES-style window multiplier at 8x network
 difficulty and returns the counted difficulty for every included share.
 
+Accepted rows may carry a nullable `credit_policy`. Normal shares leave it
+empty; `stale-grace` marks a prior-tip share credited by the coordinator's short
+stale-grace policy. Reward-window queries still count these rows because they
+are accepted shares, while audits can distinguish them from normal current-tip
+shares. Audit bundles containing a credited row use
+`qbit.prism.audit-bundle.v1.1`; external auditors must upgrade before operators
+enable stale-grace crediting.
+
+Deployments that run with `PRISM_POSTGRES_INIT_SCHEMA=0` must apply
+`crates/qbit-prism/sql/001_share_ledger.sql` before starting upgraded
+coordinators. Otherwise share inserts will fail because the `credit_policy`
+column and updated window function signatures are missing.
+
 `qbit_shares_since_template_height(min_template_height)` supports operational
 replay and frontend recovery. It returns accepted shares at or above the
 template height in ascending `share_seq` order and excludes rejected shares.

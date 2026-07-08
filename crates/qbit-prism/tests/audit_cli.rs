@@ -54,6 +54,7 @@ fn live_testnet_scale_bundle() -> AuditBundle {
         job_issued_at_ms: 1_800_000_000_000,
         accepted_at_ms: 1_800_000_000_000,
         ntime: 1_800_000_000,
+        credit_policy: None,
     };
     build_audit_bundle(
         vec![share],

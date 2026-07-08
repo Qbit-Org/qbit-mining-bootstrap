@@ -6,7 +6,7 @@ dashboard/API surfaces should use these IDs instead of parsing human messages.
 
 | Reason ID | Meaning |
 | --- | --- |
-| `stale-job` | The submitted share or block candidate was built on an obsolete qbit tip/template. |
+| `stale-job` | The submitted share or block candidate was built on an obsolete qbit tip/template outside the stale-grace credit window. |
 | `duplicate-share` | The same miner submitted a share with an already-seen header. |
 | `low-difficulty` | The submitted share did not satisfy the miner's assigned share target. |
 | `malformed-submit` | The `mining.submit` payload could not be parsed or assembled. |
@@ -16,7 +16,7 @@ dashboard/API surfaces should use these IDs instead of parsing human messages.
 | `invalid-ntime-or-nonce` | `ntime` or `nonce` was not a 4-byte hex string. |
 | `candidate-audit-mismatch` | The final PRISM audit bundle did not match the submitted coinbase. |
 | `submitblock-rejected` | qbit `submitblock` rejected the candidate or did not advance to the submitted block. |
-| `backend-rpc-unavailable` | A backend RPC dependency was unavailable while classifying a submission. |
+| `backend-rpc-unavailable` | A backend RPC dependency was unavailable while classifying a submission, including stale-grace parent lookup. |
 | `internal-error` | An internal coordinator failure prevented normal classification. |
 | `pool-closed` | The coordinator was no longer accepting shares. |
 | `block-stale` | The block candidate height was stale against the active qbit tip. |
@@ -28,8 +28,27 @@ The coordinator exposes these IDs in:
   classified.
 - Prometheus as `qbit_prism_rejections_total{reason_id="<id>"}`.
 
+Stale-grace credited shares are accepted shares, not rejections. When
+`PRISM_STRATUM_STALE_GRACE_SECONDS` is non-zero, a same-connection share whose
+job parent is the parent of the current tip may be credited during that short
+window. PRISM never submits the old-tip header as a block; the share still has
+to satisfy the assigned share target and is recorded with
+`credit_policy=stale-grace`.
+
 The existing broad counters remain for compatibility:
 
 - `qbit_prism_stale_shares_total`
 - `qbit_prism_duplicate_shares_total`
 - `qbit_prism_low_difficulty_shares_total`
+
+Additional private metrics relevant to attribution and grace behavior:
+
+- `qbit_prism_grace_credited_shares_total`
+- `qbit_prism_vardiff_idle_retargets_total`
+- `qbit_prism_worker_submitted_shares_total{worker="<bounded-label>"}`
+- `qbit_prism_worker_accepted_shares_total{worker="<bounded-label>"}`
+- `qbit_prism_worker_grace_credited_shares_total{worker="<bounded-label>"}`
+- `qbit_prism_worker_rejections_total{worker="<bounded-label>",reason_id="<id>"}`
+
+`PRISM_WORKER_METRICS_LIMIT` caps distinct worker labels. New workers beyond
+the cap aggregate into `_other`.

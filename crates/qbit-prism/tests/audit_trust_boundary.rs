@@ -39,6 +39,7 @@ fn share(
         job_issued_at_ms: job,
         accepted_at_ms: acc,
         ntime: 1_800_000_000,
+        credit_policy: None,
     }
 }
 

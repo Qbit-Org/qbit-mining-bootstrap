@@ -28,6 +28,15 @@ AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA = "qbit.prism.window-completeness-proof.v
 DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
 DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
 DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
+VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
+
+
+def validate_credit_policy(credit_policy: str | None) -> str | None:
+    if credit_policy is None:
+        return None
+    if credit_policy not in VALID_CREDIT_POLICIES:
+        raise ValueError(f"unsupported credit_policy: {credit_policy!r}")
+    return credit_policy
 
 
 @dataclass(frozen=True)
@@ -44,9 +53,10 @@ class AcceptedShareRecord:
     job_issued_at_ms: int
     accepted_at_ms: int
     ntime: int
+    credit_policy: str | None = None
 
     def to_prism_json(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "share_seq": self.share_seq,
             "share_id": self.share_id,
             "miner_id": self.miner_id,
@@ -60,6 +70,9 @@ class AcceptedShareRecord:
             "accepted_at_ms": self.accepted_at_ms,
             "ntime": self.ntime,
         }
+        if self.credit_policy is not None:
+            payload["credit_policy"] = self.credit_policy
+        return payload
 
 
 @dataclass(frozen=True)
@@ -81,6 +94,7 @@ class PendingShare:
     job_issued_at_ms: int
     accepted_at_ms: int
     ntime: int
+    credit_policy: str | None = None
 
 
 class SingleWriterShareLedger:
@@ -121,6 +135,7 @@ class SingleWriterShareLedger:
             raise ValueError("share_difficulty must be positive")
         if pending.network_difficulty <= 0:
             raise ValueError("network_difficulty must be positive")
+        credit_policy = validate_credit_policy(pending.credit_policy)
         with self._lock:
             if pending.share_id in self._share_ids:
                 raise ValueError("duplicate share_id")
@@ -137,6 +152,7 @@ class SingleWriterShareLedger:
                 job_issued_at_ms=pending.job_issued_at_ms,
                 accepted_at_ms=pending.accepted_at_ms,
                 ntime=pending.ntime,
+                credit_policy=credit_policy,
             )
             self._shares.append(record)
             self._share_ids.add(pending.share_id)
@@ -841,8 +857,10 @@ class PsqlShareLedger:
             raise ValueError("share_difficulty must be positive")
         if pending.network_difficulty <= 0:
             raise ValueError("network_difficulty must be positive")
+        credit_policy = validate_credit_policy(pending.credit_policy)
         payload = {
             **pending.__dict__,
+            "credit_policy": credit_policy,
             "writer_id": self._writer_id,
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
@@ -880,6 +898,7 @@ inserted AS (
         job_issued_at,
         ntime,
         accepted_at,
+        credit_policy,
         accepted,
         writer_id,
         writer_epoch
@@ -896,6 +915,7 @@ inserted AS (
         to_timestamp(((data->>'job_issued_at_ms')::double precision / 1000.0)),
         (data->>'ntime')::bigint,
         to_timestamp(((data->>'accepted_at_ms')::double precision / 1000.0)),
+        data->>'credit_policy',
         true,
         data->>'writer_id',
         (data->>'writer_epoch')::bigint
@@ -921,7 +941,8 @@ SELECT CASE
             'job_id', job_id,
             'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
             'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
-            'ntime', ntime
+            'ntime', ntime,
+            'credit_policy', credit_policy
         ) FROM inserted)
 END;
 """
@@ -952,7 +973,8 @@ SELECT COALESCE(json_agg(json_build_object(
     'job_id', job_id,
     'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
     'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
-    'ntime', ntime
+    'ntime', ntime,
+    'credit_policy', credit_policy
 ) ORDER BY share_seq ASC), '[]'::json)
 FROM rows;
 """
@@ -973,7 +995,8 @@ SELECT COALESCE(json_agg(json_build_object(
     'job_id', job_id,
     'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
     'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
-    'ntime', ntime
+    'ntime', ntime,
+    'credit_policy', credit_policy
 ) ORDER BY share_seq ASC), '[]'::json)
 FROM qbit_share_ledger
 WHERE accepted;
@@ -1115,7 +1138,8 @@ SELECT COALESCE(json_agg(json_build_object(
     'share_difficulty', share_difficulty::text,
     'counted_difficulty', counted_difficulty::text,
     'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
-    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint
+    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
+    'credit_policy', credit_policy
 ) ORDER BY share_seq DESC), '[]'::json)
 FROM qbit_audit_share_window(
     to_timestamp(({int(anchor_job_issued_at_ms)}::double precision / 1000.0)),
@@ -4494,6 +4518,11 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             job_issued_at_ms=int(payload["job_issued_at_ms"]),
             accepted_at_ms=int(payload["accepted_at_ms"]),
             ntime=int(payload["ntime"]),
+            credit_policy=(
+                str(payload["credit_policy"])
+                if payload.get("credit_policy") is not None
+                else None
+            ),
         )
 
     @staticmethod

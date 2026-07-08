@@ -44,6 +44,7 @@ fn share(
         job_issued_at_ms: job_ms,
         accepted_at_ms: accept_ms,
         ntime: 1_800_000_000,
+        credit_policy: None,
     }
 }
 
@@ -65,7 +66,7 @@ fn ledger_public_key_hex() -> String {
 
 // What snapshot_at_job_issue (Python) and qbit_prism_window (SQL) actually filter on:
 // BOTH job_issued_at_ms <= anchor AND accepted_at_ms <= anchor.
-// This mirrors lab/prism/share_ledger.py:106-107 and sql/001_share_ledger.sql:144-145.
+// This mirrors snapshot_at_job_issue and qbit_prism_window.
 fn python_sql_eligible(shares: &[AcceptedShare], anchor_ms: i64) -> Vec<AcceptedShare> {
     shares
         .iter()
@@ -810,7 +811,9 @@ fn builder_rejects_overweight_coinbase() {
     let err = build_manifest(equal_weight_request(800_000, 2_000_000_000, n)).unwrap_err();
     match err {
         qbit_pool_builder::BuilderError::CoinbaseWeightTooHigh { weight, max_weight } => {
-            println!("[coinbase] {n}-output coinbase rejected at {weight} bytes (limit {max_weight})");
+            println!(
+                "[coinbase] {n}-output coinbase rejected at {weight} bytes (limit {max_weight})"
+            );
             assert!(weight > MAX_BLOCK_WEIGHT);
             assert_eq!(max_weight, MAX_BLOCK_WEIGHT);
         }

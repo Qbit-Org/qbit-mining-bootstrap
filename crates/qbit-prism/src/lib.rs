@@ -25,6 +25,8 @@ pub const DEFAULT_MIN_OUTPUT_FEERATE_SATS_PER_BYTE: u64 = 1;
 pub const DEFAULT_MIN_OUTPUT_SAFETY_MULTIPLIER: u64 = 4;
 pub const QBIT_COINBASE_MATURITY_BLOCKS: u64 = 1_000;
 pub const PRISM_AUDIT_COMMITMENT_LEAF_TAG: &str = "qbit.prism.audit.commitment.v1";
+pub const AUDIT_BUNDLE_SCHEMA_V1: &str = "qbit.prism.audit-bundle.v1";
+pub const AUDIT_BUNDLE_SCHEMA_V1_1: &str = "qbit.prism.audit-bundle.v1.1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrismError {
@@ -111,6 +113,8 @@ pub struct AcceptedShare {
     pub job_issued_at_ms: i64,
     pub accepted_at_ms: i64,
     pub ntime: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -337,6 +341,8 @@ pub struct CountedShare {
     pub counted_difficulty: u128,
     pub job_issued_at_ms: i64,
     pub accepted_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -443,6 +449,7 @@ pub fn compute_prism_window(
             counted_difficulty: counted,
             job_issued_at_ms: share.job_issued_at_ms,
             accepted_at_ms: share.accepted_at_ms,
+            credit_policy: share.credit_policy.clone(),
         });
         remaining -= counted;
     }
@@ -1073,6 +1080,14 @@ pub fn canonical_ledger_window_attestation_bytes(
     })
 }
 
+fn audit_bundle_schema_for_shares(shares: &[AcceptedShare]) -> &'static str {
+    if shares.iter().any(|share| share.credit_policy.is_some()) {
+        AUDIT_BUNDLE_SCHEMA_V1_1
+    } else {
+        AUDIT_BUNDLE_SCHEMA_V1
+    }
+}
+
 pub fn build_audit_bundle(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,
@@ -1150,7 +1165,7 @@ pub fn build_audit_bundle_with_coinbase_options(
     let signed_coinbase_manifest = build_signed_manifest(coinbase_request, coinbase_signing_key)?;
 
     Ok(AuditBundle {
-        schema: "qbit.prism.audit-bundle.v1".to_string(),
+        schema: audit_bundle_schema_for_shares(&shares).to_string(),
         shares,
         found_block,
         prior_balances,
@@ -1306,7 +1321,7 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
     };
 
     Ok(AuditBundle {
-        schema: "qbit.prism.audit-bundle.v1".to_string(),
+        schema: audit_bundle_schema_for_shares(&shares).to_string(),
         shares,
         found_block,
         prior_balances,
@@ -1553,7 +1568,7 @@ pub fn verify_audit_bundle(
     bundle: &AuditBundle,
     ledger_writer_public_key_hex: &str,
 ) -> Result<AuditVerificationReport, PrismError> {
-    if bundle.schema != "qbit.prism.audit-bundle.v1" {
+    if bundle.schema != audit_bundle_schema_for_shares(&bundle.shares) {
         return Err(PrismError::AuditMismatch { artifact: "schema" });
     }
     verify_ledger_window_attestation(bundle, ledger_writer_public_key_hex)?;
@@ -1828,6 +1843,10 @@ fn share_slice_digest_hex(shares: &[CountedShare]) -> String {
         update_u128(&mut hasher, share.counted_difficulty);
         update_i64(&mut hasher, share.job_issued_at_ms);
         update_i64(&mut hasher, share.accepted_at_ms);
+        if let Some(credit_policy) = &share.credit_policy {
+            update_string(&mut hasher, "credit_policy");
+            update_string(&mut hasher, credit_policy);
+        }
     }
     hex::encode(hasher.finalize())
 }
@@ -2188,6 +2207,7 @@ mod tests {
             job_issued_at_ms,
             accepted_at_ms: job_issued_at_ms,
             ntime: 1_800_000_000,
+            credit_policy: None,
         }
     }
 
@@ -2254,6 +2274,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             fixture.expected_entitlements
         );
+    }
+
+    #[test]
+    fn credit_policy_is_preserved_on_counted_shares() {
+        let mut shares = vec![share(1, "miner-a", "01", 0x11, 10, 1000)];
+        shares[0].credit_policy = Some("stale-grace".to_string());
+
+        let window = compute_prism_window(&shares, &found_block(10, 1000)).unwrap();
+
+        assert_eq!(
+            window.shares[0].credit_policy.as_deref(),
+            Some("stale-grace")
+        );
+    }
+
+    #[test]
+    fn stale_grace_shares_use_upgraded_audit_bundle_schema() {
+        let mut shares = vec![share(1, "miner-a", "01", 0x11, 10, 1000)];
+        shares[0].credit_policy = Some("stale-grace".to_string());
+        let bundle = build_audit_bundle(
+            shares,
+            found_block(10, 1000),
+            vec![],
+            PayoutPolicy::day_one_default(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+
+        assert_eq!(bundle.schema, AUDIT_BUNDLE_SCHEMA_V1_1);
+        verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+
+        let mut mislabeled = bundle.clone();
+        mislabeled.schema = AUDIT_BUNDLE_SCHEMA_V1.to_string();
+        assert!(matches!(
+            verify_audit_bundle(&mislabeled, &ledger_public_key_hex()),
+            Err(PrismError::AuditMismatch { artifact: "schema" })
+        ));
     }
 
     #[derive(Debug, Deserialize)]

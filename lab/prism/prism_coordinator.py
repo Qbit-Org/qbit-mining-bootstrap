@@ -62,11 +62,19 @@ DEFAULT_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION = 1_000
 DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS = 12_000
 TESTNET_QBIT_CHAINS = {"testnet", "testnet3", "testnet4", "signet"}
 DEFAULT_PRISM_BLOCKPOLL_SECONDS = 2.0
+DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS = 5.0
 DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS = 10.0
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS = 20.0
+DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
+DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
+DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
+# Evicted jobs are retained briefly so shares already in flight when a
+# clean_jobs refresh evicted their job can still be validated instead of
+# bouncing as unknown-job. Retention is age-bounded by the stale-grace window;
+# a global count cap would create false unknown-job rejects on large refreshes.
 # Extranonce1 placeholder used for the shared per-template job build. The
 # stratum coinbase split cuts the whole extranonce window (extranonce1 +
 # zeroed extranonce2) out of coinb1/coinb2, so the placeholder value never
@@ -103,6 +111,13 @@ PRISM_REJECTION_INTERNAL_ERROR = "internal-error"
 PRISM_REJECTION_POOL_CLOSED = "pool-closed"
 PRISM_REJECTION_BLOCK_STALE = "block-stale"
 PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED = "ledger-confirmation-failed"
+# Credit policies recorded on accepted ledger rows. Normal shares carry no
+# policy; a policy marks a share that was credited by an explicit pool rule
+# (documented in docs/prism-rejections.md) so audits can distinguish them.
+PRISM_CREDIT_POLICY_STALE_GRACE = "stale-grace"
+# Aggregation bucket for per-worker share metrics once the distinct-worker
+# label budget is exhausted.
+PRISM_WORKER_METRICS_OVERFLOW_LABEL = "_other"
 PRISM_REJECTION_REASON_IDS = (
     PRISM_REJECTION_STALE_JOB,
     PRISM_REJECTION_DUPLICATE_SHARE,
@@ -534,7 +549,14 @@ class JsonRpc:
         credentials = f"{user}:{password}".encode()
         self.auth = f"Basic {base64.b64encode(credentials).decode()}"
 
-    def call(self, method: str, params: list[object] | None = None, *, wallet: str | None = None) -> Any:
+    def call(
+        self,
+        method: str,
+        params: list[object] | None = None,
+        *,
+        wallet: str | None = None,
+        timeout: float = 10,
+    ) -> Any:
         body = json.dumps(
             {
                 "jsonrpc": "1.0",
@@ -555,7 +577,7 @@ class JsonRpc:
                 "User-Agent": "qbit-prism-coordinator/0.1",
             },
         )
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read())
         if payload["error"] is not None:
             raise RuntimeError(f"qbit RPC {method} failed: {payload['error']}")
@@ -723,6 +745,29 @@ class PrismCoordinator:
             "PRISM_BLOCKPOLL_SECONDS",
             DEFAULT_PRISM_BLOCKPOLL_SECONDS,
         )
+        # Push-style tip detection rides waitfornewblock; the poll loop above
+        # stays as the fallback and still covers same-tip template refreshes.
+        self.blockwait_enabled = env_bool("PRISM_BLOCKWAIT_ENABLED", "1")
+        self.blockwait_timeout_seconds = env_positive_float(
+            "PRISM_BLOCKWAIT_TIMEOUT_SECONDS",
+            DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS,
+        )
+        # Zero disables stale-grace crediting (every prior-tip share rejects,
+        # the pre-grace behavior).
+        self.stale_grace_seconds = env_nonnegative_float(
+            "PRISM_STRATUM_STALE_GRACE_SECONDS",
+            DEFAULT_PRISM_STALE_GRACE_SECONDS,
+        )
+        self.vardiff_idle_sweep_seconds = env_nonnegative_float(
+            "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS",
+            DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS,
+        )
+        # Zero collapses every worker into the overflow label (per-worker
+        # metrics effectively off) without touching the aggregate counters.
+        self.worker_metrics_limit = env_nonnegative_int(
+            "PRISM_WORKER_METRICS_LIMIT",
+            DEFAULT_PRISM_WORKER_METRICS_LIMIT,
+        )
         self.reorg_reconciler_enabled = env_bool("PRISM_REORG_RECONCILER_ENABLED", "1")
         # Per-template job caching. A zero disables the corresponding cache
         # (every build redoes that stage), which is also the legacy behavior.
@@ -855,7 +900,22 @@ class PrismCoordinator:
         self.stale_share_count = 0
         self.duplicate_share_count = 0
         self.low_difficulty_share_count = 0
+        self.grace_credited_share_count = 0
+        self.idle_retarget_count = 0
         self.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
+        # Per-worker share accounting with a bounded label set; see
+        # worker_metric_label for the admission rule.
+        self.worker_metrics_lock = threading.Lock()
+        self.worker_share_counts: dict[str, dict[str, int]] = {}
+        self.worker_rejection_counts: dict[tuple[str, str], int] = {}
+        # job_id -> (context, connection_id, evicted_monotonic); see
+        # bury_evicted_job.
+        self.evicted_job_graveyard: dict[str, tuple[PrismJobContext, int, float]] = {}
+        # (tip_hash, first_seen_monotonic) / (tip_hash, parent_hash) caches
+        # anchoring the stale-grace window to when this process first observed
+        # the current tip.
+        self.current_tip_first_seen: tuple[str, float] | None = None
+        self.current_tip_parent: tuple[str, str] | None = None
         self.job_build_failure_count = 0
         self.tip_refresh_job_count = 0
         self.post_accept_refresh_failure_count = 0
@@ -867,6 +927,7 @@ class PrismCoordinator:
         self.latest_evidence: dict[str, Any] | None = None
         self.latest_bundle: dict[str, Any] | None = None
         self.tip_template_snapshot: QbitTipTemplateSnapshot | None = None
+        self._tip_refresh_lock = threading.Lock()
         self.last_reorg_reconciled_tip_hash: str | None = None
         self.last_reorg_reconciled_trusted = False
         self.last_reorg_reconciled_monotonic: float | None = None
@@ -884,24 +945,85 @@ class PrismCoordinator:
         self.watchdog_timeout_seconds = env_positive_float("PRISM_WATCHDOG_TIMEOUT_SECONDS", 120.0)
         self.watchdog_interval_seconds = env_positive_float("PRISM_WATCHDOG_INTERVAL_SECONDS", 15.0)
 
-    def record_rejection(self, reason: str) -> None:
+    def record_rejection(self, reason: str, *, worker: str | None = None) -> None:
         if reason not in PRISM_REJECTION_REASON_IDS:
             raise ValueError(f"unknown PRISM rejection reason: {reason}")
-        counts = getattr(self, "rejection_counts_by_reason", None)
-        if counts is None:
-            counts = {reason_id: 0 for reason_id in PRISM_REJECTION_REASON_IDS}
-            self.rejection_counts_by_reason = counts
-        counts[reason] = int(counts.get(reason, 0)) + 1
-        if reason in {PRISM_REJECTION_STALE_JOB, PRISM_REJECTION_UNKNOWN_JOB, PRISM_REJECTION_BLOCK_STALE}:
-            self.stale_share_count += 1
-        elif reason == PRISM_REJECTION_DUPLICATE_SHARE:
-            self.duplicate_share_count += 1
-        elif reason == PRISM_REJECTION_LOW_DIFFICULTY:
-            self.low_difficulty_share_count += 1
+        with self.lock:
+            counts = getattr(self, "rejection_counts_by_reason", None)
+            if counts is None:
+                counts = {reason_id: 0 for reason_id in PRISM_REJECTION_REASON_IDS}
+                self.rejection_counts_by_reason = counts
+            counts[reason] = int(counts.get(reason, 0)) + 1
+            if reason in {PRISM_REJECTION_STALE_JOB, PRISM_REJECTION_UNKNOWN_JOB, PRISM_REJECTION_BLOCK_STALE}:
+                self.stale_share_count += 1
+            elif reason == PRISM_REJECTION_DUPLICATE_SHARE:
+                self.duplicate_share_count += 1
+            elif reason == PRISM_REJECTION_LOW_DIFFICULTY:
+                self.low_difficulty_share_count += 1
+            if worker is not None:
+                self._ensure_worker_metrics_state()
+                with self.worker_metrics_lock:
+                    label = self._worker_metric_label_locked(worker)
+                    key = (label, reason)
+                    self.worker_rejection_counts[key] = (
+                        int(self.worker_rejection_counts.get(key, 0)) + 1
+                    )
 
-    def reject_stratum(self, code: int, reason: str, message: str) -> None:
-        self.record_rejection(reason)
+    def reject_stratum(self, code: int, reason: str, message: str, *, worker: str | None = None) -> None:
+        self.record_rejection(reason, worker=worker)
         raise StratumError(code, message, reason=reason)
+
+    def worker_metric_label(self, worker: str) -> str:
+        """Metric label for one worker, from a bounded label set.
+
+        The label is the stratum username as authorized (payout address plus
+        optional worker suffix). Usernames are miner-supplied, so the set of
+        distinct labels is capped: new workers past the cap aggregate into the
+        overflow label instead of growing metric cardinality without bound.
+        """
+        self._ensure_worker_metrics_state()
+        with self.worker_metrics_lock:
+            return self._worker_metric_label_locked(worker)
+
+    def _worker_metric_label_locked(self, worker: str) -> str:
+        label = worker or "_unauthenticated"
+        if len(label) > 128:
+            label = label[:128]
+        share_counts = self.worker_share_counts
+        if label in share_counts:
+            return label
+        limit = getattr(self, "worker_metrics_limit", DEFAULT_PRISM_WORKER_METRICS_LIMIT)
+        if len(share_counts) >= max(0, int(limit)):
+            label = PRISM_WORKER_METRICS_OVERFLOW_LABEL
+        share_counts.setdefault(label, {"submitted": 0, "accepted": 0, "grace": 0})
+        return label
+
+    def note_worker_submitted_share(self, worker: str) -> None:
+        self._ensure_worker_metrics_state()
+        with self.worker_metrics_lock:
+            label = self._worker_metric_label_locked(worker)
+            self.worker_share_counts[label]["submitted"] += 1
+
+    def note_worker_accepted_share(self, worker: str, credit_policy: str | None) -> None:
+        self._ensure_worker_metrics_state()
+        with self.worker_metrics_lock:
+            label = self._worker_metric_label_locked(worker)
+            counts = self.worker_share_counts[label]
+            counts["accepted"] += 1
+            if credit_policy == PRISM_CREDIT_POLICY_STALE_GRACE:
+                counts["grace"] += 1
+                self.grace_credited_share_count = (
+                    int(getattr(self, "grace_credited_share_count", 0)) + 1
+                )
+
+    @staticmethod
+    def prometheus_label_value(value: str) -> str:
+        return (
+            value.replace("\\", "\\\\")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace('"', '\\"')
+        )
 
     def resolve_version_rolling_mask(self, fallback_mask: int) -> direct_stratum.VersionRollingMaskSelection:
         try:
@@ -1511,6 +1633,18 @@ class PrismCoordinator:
         if not hasattr(self, "_watchdog_pauses"):
             self._watchdog_pauses = {}
 
+    def _ensure_worker_metrics_state(self) -> None:
+        if not hasattr(self, "worker_metrics_lock"):
+            self.worker_metrics_lock = threading.Lock()
+        if not hasattr(self, "worker_share_counts"):
+            self.worker_share_counts = {}
+        if not hasattr(self, "worker_rejection_counts"):
+            self.worker_rejection_counts = {}
+
+    def _ensure_tip_refresh_state(self) -> None:
+        if not hasattr(self, "_tip_refresh_lock"):
+            self._tip_refresh_lock = threading.Lock()
+
     def _record_heartbeat(self, name: str) -> None:
         self._ensure_watchdog_state()
         with self._heartbeats_lock:
@@ -1541,6 +1675,17 @@ class PrismCoordinator:
             else:
                 self._watchdog_pauses[name] = depth - 1
             self._heartbeats[name] = time.monotonic()
+
+    def _remove_watchdog_heartbeat(self, name: str) -> None:
+        self._ensure_watchdog_state()
+        with self._heartbeats_lock:
+            self._heartbeats.pop(name, None)
+            self._watchdog_pauses.pop(name, None)
+
+    def _registered_watchdog_heartbeat_names(self, *names: str) -> tuple[str, ...]:
+        self._ensure_watchdog_state()
+        with self._heartbeats_lock:
+            return tuple(name for name in names if name in self._heartbeats)
 
     def stratum_accept_heartbeat_names(self) -> tuple[str, ...]:
         profiles = getattr(self, "listener_profiles", None)
@@ -1635,6 +1780,19 @@ class PrismCoordinator:
             self._record_heartbeat("qbit_blockpoll")
             blockpoll_thread = threading.Thread(target=self.blockpoll_loop, daemon=True)
             blockpoll_thread.start()
+            blockwait_thread: threading.Thread | None = None
+            if self.blockwait_enabled:
+                self._record_heartbeat("qbit_blockwait")
+                blockwait_thread = threading.Thread(target=self.blockwait_loop, daemon=True)
+                blockwait_thread.start()
+            vardiff_idle_sweep_thread: threading.Thread | None = None
+            if self.vardiff_idle_sweep_seconds > 0:
+                self._record_heartbeat("vardiff_idle_sweep")
+                vardiff_idle_sweep_thread = threading.Thread(
+                    target=self.vardiff_idle_sweep_loop,
+                    daemon=True,
+                )
+                vardiff_idle_sweep_thread.start()
             ctv_broadcaster_thread: threading.Thread | None = None
             if self.ctv_broadcaster_enabled:
                 self._record_heartbeat("ctv_fanout_broadcaster")
@@ -1668,6 +1826,10 @@ class PrismCoordinator:
                 ).start()
             self.accept_loop(*listeners[0])
             blockpoll_thread.join(timeout=1)
+            if blockwait_thread is not None:
+                blockwait_thread.join(timeout=1)
+            if vardiff_idle_sweep_thread is not None:
+                vardiff_idle_sweep_thread.join(timeout=1)
             if ctv_broadcaster_thread is not None:
                 ctv_broadcaster_thread.join(timeout=1)
 
@@ -1763,6 +1925,93 @@ class PrismCoordinator:
                 print("prism coordinator: qbit tip/template poll failed", flush=True)
                 traceback.print_exc()
 
+    def blockwait_once(self, known_tip: str) -> str:
+        """One waitfornewblock round: returns the tip after the wait.
+
+        qbitd returns as soon as its tip differs from ``known_tip`` (or after
+        the server-side timeout, echoing the current tip), so a tip observed
+        between our last poll and this call is reported immediately rather
+        than being missed for a cycle.
+        """
+        timeout_seconds = getattr(
+            self,
+            "blockwait_timeout_seconds",
+            DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS,
+        )
+        watchdog_timeout = float(getattr(self, "watchdog_timeout_seconds", 120.0))
+        max_rpc_timeout = max(1.0, watchdog_timeout * 0.8)
+        timeout_seconds = min(float(timeout_seconds), max(1.0, max_rpc_timeout - 1.0))
+        result = self.rpc.call(
+            "waitfornewblock",
+            [max(1, int(timeout_seconds * 1000)), known_tip],
+            timeout=timeout_seconds + 10.0,
+        )
+        if isinstance(result, dict):
+            new_tip = str(result.get("hash", "") or "")
+            if new_tip:
+                return new_tip
+        return known_tip
+
+    def blockwait_loop(self) -> None:
+        """Push-style tip detection alongside the interval poller.
+
+        Stale rejects are dominated by the window between a block connecting
+        and miners receiving fresh work; the poller alone leaves up to a full
+        PRISM_BLOCKPOLL_SECONDS of that window. This loop parks inside
+        waitfornewblock and triggers the same refresh path within milliseconds
+        of a new tip. The poller stays on as the fallback and still owns
+        same-tip template refreshes, which waitfornewblock does not signal.
+        Disabled cleanly when qbitd does not support the RPC.
+        """
+        known_tip: str | None = None
+        while not self.stop_event.is_set():
+            self._record_heartbeat("qbit_blockwait")
+            try:
+                if known_tip is None:
+                    known_tip = str(self.rpc.call("getbestblockhash"))
+                    self.observe_tip_first_seen(known_tip)
+                new_tip = self.blockwait_once(known_tip)
+                if new_tip == known_tip:
+                    if self.stop_event.wait(0.25):
+                        return
+                    continue
+                known_tip = new_tip
+                self.observe_tip_first_seen(new_tip)
+                refreshed = self.poll_qbit_tip_template_once(heartbeat_name="qbit_blockwait")
+                print(
+                    f"prism coordinator: blockwait saw new tip {new_tip}; "
+                    f"refreshed {refreshed} client job(s)",
+                    flush=True,
+                )
+            except Exception as exc:
+                if known_tip is not None and self._blockwait_unsupported(exc):
+                    print(
+                        "prism coordinator: waitfornewblock unavailable on this qbitd; "
+                        "tip detection falls back to blockpoll only",
+                        flush=True,
+                    )
+                    self._remove_watchdog_heartbeat("qbit_blockwait")
+                    return
+                print("prism coordinator: blockwait pass failed", flush=True)
+                traceback.print_exc()
+                if self.stop_event.wait(min(5.0, self.blockpoll_seconds)):
+                    return
+
+    @staticmethod
+    def _blockwait_unsupported(exc: Exception) -> bool:
+        detail = str(exc).lower()
+        return (
+            "-32601" in detail
+            or "-32602" in detail
+            or "method not found" in detail
+            or "unknown method" in detail
+            or "invalid params" in detail
+            or "invalid parameter" in detail
+            or "wrong number of" in detail
+            or "too many parameters" in detail
+            or "incorrect number of" in detail
+        )
+
     def make_ctv_fanout_broadcast_daemon(self) -> CtvFanoutBroadcastDaemon:
         if self.ctv_broadcaster_fee_sats > 0 and not self.ctv_broadcaster_wallet:
             raise ValueError(
@@ -1803,49 +2052,156 @@ class PrismCoordinator:
             if self.stop_event.wait(self.ctv_broadcaster_interval_seconds):
                 break
 
-    def poll_qbit_tip_template_once(self) -> int:
-        snapshot = self.fetch_qbit_tip_template_snapshot()
-        if not self.ensure_reorg_reconciled_for_tip(snapshot.bestblockhash):
-            return 0
-        with self.lock:
-            previous_snapshot = self.tip_template_snapshot
-            snapshot_changed = previous_snapshot is not None and previous_snapshot != snapshot
-            self.tip_template_snapshot = snapshot
-            if snapshot_changed:
-                clients = [
-                    client
-                    for client in self.clients
-                    if self.client_can_receive_jobs(client)
-                ]
-            else:
-                clients = [
-                    client
-                    for client in self.clients
-                    if self.client_can_receive_jobs(client)
-                    and self.client_needs_tip_template_refresh(client, snapshot)
-                ]
-
-        refreshed = 0
-        for client in clients:
+    def poll_qbit_tip_template_once(self, *, heartbeat_name: str = "qbit_blockpoll") -> int:
+        self._ensure_tip_refresh_state()
+        while not self._tip_refresh_lock.acquire(timeout=1.0):
+            self._record_heartbeat(heartbeat_name)
             if self.stop_event.is_set():
-                break
-            # The refresh loop runs on the blockpoll thread; keep its liveness
-            # heartbeat fresh per client so a long refresh pass (many clients,
-            # or one blocked send) is never mistaken for a hung poller.
-            self._record_heartbeat("qbit_blockpoll")
-            try:
-                if self.maybe_send_job(
-                    client,
-                    clean_jobs=self.client_tip_changed_for_snapshot(client, snapshot),
-                ):
-                    refreshed += 1
-            except OSError:
-                self.disconnect_client(client)
-
-        if refreshed:
+                return 0
+        try:
+            snapshot = self.fetch_qbit_tip_template_snapshot()
+            self.observe_tip_first_seen(snapshot.bestblockhash)
+            if not self.ensure_reorg_reconciled_for_tip(snapshot.bestblockhash):
+                return 0
             with self.lock:
-                self.tip_refresh_job_count += refreshed
-        return refreshed
+                previous_snapshot = self.tip_template_snapshot
+                snapshot_changed = previous_snapshot is not None and previous_snapshot != snapshot
+                self.tip_template_snapshot = snapshot
+                if snapshot_changed:
+                    clients = [
+                        client
+                        for client in self.clients
+                        if self.client_can_receive_jobs(client)
+                    ]
+                else:
+                    clients = [
+                        client
+                        for client in self.clients
+                        if self.client_can_receive_jobs(client)
+                        and self.client_needs_tip_template_refresh(client, snapshot)
+                    ]
+
+            refreshed = 0
+            for client in clients:
+                if self.stop_event.is_set():
+                    break
+                # The refresh loop runs on the blockpoll/blockwait/post-accept
+                # path; keep its liveness heartbeat fresh per client so a long
+                # refresh pass (many clients, or one blocked send) is never
+                # mistaken for a hung poller.
+                self._record_heartbeat(heartbeat_name)
+                try:
+                    if self.maybe_send_job(
+                        client,
+                        clean_jobs=self.client_tip_changed_for_snapshot(client, snapshot),
+                    ):
+                        refreshed += 1
+                except OSError:
+                    self.disconnect_client(client)
+
+            if refreshed:
+                with self.lock:
+                    self.tip_refresh_job_count += refreshed
+            return refreshed
+        finally:
+            self._tip_refresh_lock.release()
+
+    def observe_tip_first_seen(self, tip_hash: str) -> None:
+        now = time.monotonic()
+        with self.lock:
+            first_seen = getattr(self, "current_tip_first_seen", None)
+            if first_seen is None or first_seen[0] != tip_hash:
+                self.current_tip_first_seen = (tip_hash, now)
+                self.current_tip_parent = None
+
+    def current_tip_parent_hash(self, tip_hash: str) -> str | None:
+        with self.lock:
+            cached = getattr(self, "current_tip_parent", None)
+            if cached is not None and cached[0] == tip_hash:
+                return cached[1]
+        block = self.rpc.call("getblock", [tip_hash])
+        if not isinstance(block, dict):
+            return None
+        parent = str(block.get("previousblockhash", "") or "")
+        if not parent:
+            return None
+        with self.lock:
+            self.current_tip_parent = (tip_hash, parent)
+        return parent
+
+    def stale_grace_deadline_open(self, current_tip: str, now: float | None = None) -> bool:
+        grace_seconds = float(getattr(self, "stale_grace_seconds", DEFAULT_PRISM_STALE_GRACE_SECONDS))
+        if grace_seconds <= 0:
+            return False
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            first_seen = getattr(self, "current_tip_first_seen", None)
+        if first_seen is None or first_seen[0] != current_tip:
+            self.observe_tip_first_seen(current_tip)
+            with self.lock:
+                first_seen = self.current_tip_first_seen
+        if first_seen is None:
+            return False
+        return now - first_seen[1] <= grace_seconds
+
+    def context_eligible_for_stale_grace(self, context: PrismJobContext, current_tip: str) -> bool:
+        if not self.stale_grace_deadline_open(current_tip):
+            return False
+        parent_hash = self.current_tip_parent_hash(current_tip)
+        return bool(parent_hash) and str(context.template["previousblockhash"]) == parent_hash
+
+    def bury_evicted_job(self, client: ClientState, job_id: str, *, now: float | None = None) -> None:
+        context = self.jobs.get(job_id)
+        if context is None:
+            return
+        graveyard = getattr(self, "evicted_job_graveyard", None)
+        if graveyard is None:
+            graveyard = {}
+            self.evicted_job_graveyard = graveyard
+        graveyard[job_id] = (context, client.connection_id, time.monotonic() if now is None else now)
+        self.prune_evicted_job_graveyard(now=now)
+
+    def prune_evicted_job_graveyard(self, *, now: float | None = None) -> None:
+        graveyard = getattr(self, "evicted_job_graveyard", None)
+        if not graveyard:
+            return
+        now = time.monotonic() if now is None else now
+        grace_seconds = float(getattr(self, "stale_grace_seconds", DEFAULT_PRISM_STALE_GRACE_SECONDS))
+        max_age = max(1.0, grace_seconds)
+        for job_id, (_context, _connection_id, evicted_at) in tuple(graveyard.items()):
+            if now - evicted_at > max_age:
+                graveyard.pop(job_id, None)
+        # Do not apply a global count cap here. Dropping unexpired entries
+        # creates false unknown-job rejects for shares already in flight during
+        # a clean_jobs refresh burst, exactly the case stale-grace exists to
+        # cover. The grace age bound still limits retention.
+
+    def evicted_job_entry(
+        self,
+        client: ClientState,
+        job_id: str,
+    ) -> tuple[PrismJobContext, int, float] | None:
+        with self.lock:
+            self.prune_evicted_job_graveyard()
+            entry = getattr(self, "evicted_job_graveyard", {}).get(job_id)
+        if entry is None:
+            return None
+        _context, connection_id, _evicted_at = entry
+        if connection_id != client.connection_id:
+            return None
+        return entry
+
+    def evicted_submit_context(
+        self,
+        entry: tuple[PrismJobContext, int, float],
+        current_tip: str,
+    ) -> tuple[PrismJobContext, str | None] | None:
+        context, _connection_id, _evicted_at = entry
+        if str(context.template["previousblockhash"]) == current_tip:
+            return context, None
+        if not self.context_eligible_for_stale_grace(context, current_tip):
+            return None
+        return context, PRISM_CREDIT_POLICY_STALE_GRACE
 
     def refresh_jobs_after_pending_accepted_block(self, client: ClientState) -> int:
         with self.lock:
@@ -2296,6 +2652,7 @@ class PrismCoordinator:
         with self.lock:
             if clean_jobs:
                 for job_id in client.active_job_ids:
+                    self.bury_evicted_job(client, job_id)
                     self.jobs.pop(job_id, None)
                 client.active_job_ids.clear()
             self.jobs[context.job.job_id] = context
@@ -2329,6 +2686,7 @@ class PrismCoordinator:
         while len(ordered_active_job_ids) > MAX_ACTIVE_PRISM_JOBS_PER_CLIENT:
             oldest_job_id = ordered_active_job_ids.pop(0)
             client.active_job_ids.remove(oldest_job_id)
+            self.bury_evicted_job(client, oldest_job_id)
             self.jobs.pop(oldest_job_id, None)
 
     def send_difficulty(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
@@ -2598,29 +2956,103 @@ class PrismCoordinator:
 
     def handle_submit(self, client: ClientState, params: list[object]) -> bool:
         if len(params) < 5:
-            self.reject_stratum(20, PRISM_REJECTION_MALFORMED_SUBMIT, "submit params are incomplete")
+            self.reject_stratum(
+                20,
+                PRISM_REJECTION_MALFORMED_SUBMIT,
+                "submit params are incomplete",
+                worker=client.username or None,
+            )
         worker_name, job_id, extranonce2_hex, ntime_hex, nonce_hex = [str(item) for item in params[:5]]
         version_bits_hex = str(params[5]) if len(params) > 5 else None
         if worker_name != client.username:
-            self.reject_stratum(20, PRISM_REJECTION_UNAUTHORIZED_WORKER, "submit username does not match authorized username")
+            self.reject_stratum(
+                20,
+                PRISM_REJECTION_UNAUTHORIZED_WORKER,
+                "submit username does not match authorized username",
+                worker=client.username or None,
+            )
+        self.note_worker_submitted_share(worker_name)
         if len(extranonce2_hex) != self.extranonce2_size * 2:
-            self.reject_stratum(20, PRISM_REJECTION_INVALID_EXTRANONCE, "unexpected extranonce2 size")
+            self.reject_stratum(
+                20,
+                PRISM_REJECTION_INVALID_EXTRANONCE,
+                "unexpected extranonce2 size",
+                worker=worker_name,
+            )
         if len(ntime_hex) != 8 or len(nonce_hex) != 8:
-            self.reject_stratum(20, PRISM_REJECTION_INVALID_NTIME_OR_NONCE, "ntime and nonce must be 4-byte hex strings")
+            self.reject_stratum(
+                20,
+                PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
+                "ntime and nonce must be 4-byte hex strings",
+                worker=worker_name,
+            )
         self.note_vardiff_submitted_share(client)
+        with self.lock:
+            if self.accepted_block_count >= self.max_blocks:
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_POOL_CLOSED,
+                    "pool is no longer accepting shares",
+                    worker=worker_name,
+                )
+        credit_policy: str | None = None
         with self.lock:
             context = self.jobs.get(job_id)
             if context is not None and job_id not in client.active_job_ids:
                 context = None
+        evicted_entry: tuple[PrismJobContext, int, float] | None = None
         if context is None:
-            self.reject_stratum(21, PRISM_REJECTION_UNKNOWN_JOB, "stale job")
-        with self.lock:
-            if self.accepted_block_count >= self.max_blocks:
-                self.reject_stratum(21, PRISM_REJECTION_POOL_CLOSED, "pool is no longer accepting shares")
-
+            evicted_entry = self.evicted_job_entry(client, job_id)
+            if evicted_entry is None:
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_UNKNOWN_JOB,
+                    "stale job",
+                    worker=worker_name,
+                )
         current_tip = str(self.rpc.call("getbestblockhash"))
-        if str(context.template["previousblockhash"]) != current_tip:
-            self.reject_stratum(21, PRISM_REJECTION_STALE_JOB, "stale job")
+        self.observe_tip_first_seen(current_tip)
+        if context is None:
+            try:
+                evicted_context = self.evicted_submit_context(evicted_entry, current_tip)
+            except Exception:
+                print("prism coordinator: failed to classify evicted submit context", flush=True)
+                traceback.print_exc()
+                self.reject_stratum(
+                    20,
+                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                    "failed to classify stale-grace parent tip",
+                    worker=worker_name,
+                )
+            if evicted_context is None:
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_UNKNOWN_JOB,
+                    "stale job",
+                    worker=worker_name,
+                )
+            context, credit_policy = evicted_context
+        elif str(context.template["previousblockhash"]) != current_tip:
+            try:
+                eligible_for_grace = self.context_eligible_for_stale_grace(context, current_tip)
+            except Exception:
+                print("prism coordinator: failed to classify stale-grace parent tip", flush=True)
+                traceback.print_exc()
+                self.reject_stratum(
+                    20,
+                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                    "failed to classify stale-grace parent tip",
+                    worker=worker_name,
+                )
+            if eligible_for_grace:
+                credit_policy = PRISM_CREDIT_POLICY_STALE_GRACE
+            else:
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_STALE_JOB,
+                    "stale job",
+                    worker=worker_name,
+                )
 
         try:
             submission = direct_stratum.assemble_submission(
@@ -2632,11 +3064,21 @@ class PrismCoordinator:
                 version_mask=client.version_mask,
             )
         except ValueError as exc:
-            self.reject_stratum(20, PRISM_REJECTION_MALFORMED_SUBMIT, f"malformed submit: {exc}")
+            self.reject_stratum(
+                20,
+                PRISM_REJECTION_MALFORMED_SUBMIT,
+                f"malformed submit: {exc}",
+                worker=worker_name,
+            )
         share_key = (client.username, submission.header_hex)
         with self.lock:
             if share_key in self.recent_share_keys:
-                self.reject_stratum(22, PRISM_REJECTION_DUPLICATE_SHARE, "duplicate share")
+                self.reject_stratum(
+                    22,
+                    PRISM_REJECTION_DUPLICATE_SHARE,
+                    "duplicate share",
+                    worker=worker_name,
+                )
             if len(self.recent_share_keys) > 50_000:
                 self.recent_share_keys.clear()
             self.recent_share_keys.add(share_key)
@@ -2645,18 +3087,34 @@ class PrismCoordinator:
         # so a submission can solve a block yet miss the share target. Never
         # discard a block over share bookkeeping: reject as low-difficulty
         # only when the hash is not block-worthy.
-        block_worthy = submission.block_pass and not context.collection_only
+        block_worthy = (
+            submission.block_pass
+            and not context.collection_only
+            and credit_policy != PRISM_CREDIT_POLICY_STALE_GRACE
+        )
         if not submission.share_pass and not block_worthy:
-            self.reject_stratum(23, PRISM_REJECTION_LOW_DIFFICULTY, "low difficulty share")
+            self.reject_stratum(
+                23,
+                PRISM_REJECTION_LOW_DIFFICULTY,
+                "low difficulty share",
+                worker=worker_name,
+            )
 
         pending_share = self.pending_share_from_submission(
             client=client,
             context=context,
             submission=submission,
             ntime_hex=ntime_hex,
+            credit_policy=credit_policy,
         )
         if not block_worthy:
-            self.append_accepted_share(client, context, submission, pending_share)
+            self.append_accepted_share(
+                client,
+                context,
+                submission,
+                pending_share,
+                credit_policy=credit_policy,
+            )
             return False
         return self.submit_block_candidate(
             context,
@@ -2674,6 +3132,7 @@ class PrismCoordinator:
         context: PrismJobContext,
         submission: direct_stratum.DirectQbitSubmission,
         ntime_hex: str,
+        credit_policy: str | None = None,
     ) -> PendingShare:
         return PendingShare(
             share_id=f"{client.username}:{submission.block_hash_hex}",
@@ -2687,6 +3146,7 @@ class PrismCoordinator:
             job_issued_at_ms=context.issued_at_ms,
             accepted_at_ms=now_ms(),
             ntime=int(ntime_hex, 16),
+            credit_policy=credit_policy,
         )
 
     def append_accepted_share(
@@ -2695,14 +3155,18 @@ class PrismCoordinator:
         context: PrismJobContext,
         submission: direct_stratum.DirectQbitSubmission,
         pending_share: PendingShare,
+        *,
+        credit_policy: str | None = None,
     ) -> None:
         record = self.ledger.append(pending_share)
         print(
             "prism coordinator: accepted share "
             f"seq={record.share_seq} miner={client.username} job={context.job.job_id} "
-            f"hash={submission.block_hash_hex} collection={context.collection_only}",
+            f"hash={submission.block_hash_hex} collection={context.collection_only} "
+            f"credit_policy={credit_policy or 'normal'}",
             flush=True,
         )
+        self.note_worker_accepted_share(client.username, credit_policy)
         self.note_vardiff_accepted_share(client, context.job)
 
     def accepted_share_difficulty(self, context: PrismJobContext) -> int:
@@ -2749,6 +3213,64 @@ class PrismCoordinator:
             elapsed_seconds=elapsed_seconds,
         )
 
+    def vardiff_idle_sweep_loop(self) -> None:
+        while not self.stop_event.wait(self.vardiff_idle_sweep_seconds):
+            self._record_heartbeat("vardiff_idle_sweep")
+            try:
+                retargeted = self.vardiff_idle_sweep_once()
+                if retargeted:
+                    print(
+                        f"prism coordinator: idle vardiff sweep retargeted {retargeted} client(s)",
+                        flush=True,
+                    )
+            except Exception:
+                print("prism coordinator: idle vardiff sweep failed", flush=True)
+                traceback.print_exc()
+
+    def vardiff_idle_sweep_once(self) -> int:
+        now = time.monotonic()
+        with self.lock:
+            clients = [
+                client
+                for client in self.clients
+                if self.client_can_receive_jobs(client)
+                and self.client_vardiff_config(client).enabled
+                and client.active_job is not None
+            ]
+        retargeted = 0
+        for client in clients:
+            self._record_heartbeat("vardiff_idle_sweep")
+            config = self.client_vardiff_config(client)
+            with self.lock:
+                elapsed = Decimal(str(max(0.001, now - client.vardiff_window_started_monotonic)))
+                if elapsed < config.retarget_interval_seconds:
+                    continue
+                if client.vardiff_window_accepted != 0:
+                    continue
+                submitted_shares = client.vardiff_window_submitted
+                if submitted_shares != 0:
+                    continue
+                current_difficulty = client.pending_share_difficulty or client.share_difficulty
+                client.vardiff_window_started_monotonic = now
+                client.vardiff_window_submitted = 0
+                client.vardiff_window_work = Decimal("0")
+            try:
+                if self.retarget_client(
+                    client,
+                    current_difficulty=current_difficulty,
+                    accepted_shares=0,
+                    submitted_shares=submitted_shares,
+                    accepted_difficulty=Decimal("0"),
+                    elapsed_seconds=elapsed,
+                ):
+                    retargeted += 1
+            except OSError:
+                self.disconnect_client(client)
+        if retargeted:
+            with self.lock:
+                self.idle_retarget_count += retargeted
+        return retargeted
+
     def retarget_client(
         self,
         client: ClientState,
@@ -2758,10 +3280,10 @@ class PrismCoordinator:
         submitted_shares: int,
         accepted_difficulty: Decimal,
         elapsed_seconds: Decimal,
-    ) -> None:
+    ) -> bool:
         config = self.client_vardiff_config(client)
         if not config.enabled:
-            return
+            return False
         observed_difficulty = vardiff.observed_difficulty(
             accepted_difficulty=accepted_difficulty,
             elapsed_seconds=elapsed_seconds,
@@ -2794,11 +3316,11 @@ class PrismCoordinator:
             next_difficulty,
             config.retarget_tolerance,
         ):
-            return
+            return False
         with self.lock:
             previous_difficulty = client.pending_share_difficulty or client.share_difficulty
             if previous_difficulty != current_difficulty:
-                return
+                return False
             prior_pending = client.pending_share_difficulty
             client.pending_share_difficulty = next_difficulty
         # Advertise the new difficulty together with the new job, gated on a
@@ -2809,16 +3331,23 @@ class PrismCoordinator:
         # the next one retargets again -- rather than advertising a difficulty for
         # a job it never received, which (since retargets only fire on accepted
         # shares) could wedge a client whose easier shares now miss the old target.
-        if (
-            client.authorized
-            and client.subscribed
-            and not self.stop_event.is_set()
-            and self.maybe_send_job(client, clean_jobs=True)
-        ):
-            return
+        try:
+            if (
+                client.authorized
+                and client.subscribed
+                and not self.stop_event.is_set()
+                and self.maybe_send_job(client, clean_jobs=True)
+            ):
+                return True
+        except OSError:
+            with self.lock:
+                if client.pending_share_difficulty == next_difficulty:
+                    client.pending_share_difficulty = prior_pending
+            raise
         with self.lock:
             if client.pending_share_difficulty == next_difficulty:
                 client.pending_share_difficulty = prior_pending
+        return False
 
     def submit_block_candidate(
         self,
@@ -2830,12 +3359,28 @@ class PrismCoordinator:
         pending_share: PendingShare,
         client: ClientState,
     ) -> bool:
-        with self._watchdog_paused("qbit_blockpoll", *self.stratum_accept_heartbeat_names()), self.lock:
+        pause_names = self._registered_watchdog_heartbeat_names(
+            "qbit_blockpoll",
+            "qbit_blockwait",
+            "vardiff_idle_sweep",
+            *self.stratum_accept_heartbeat_names(),
+        )
+        with self._watchdog_paused(*pause_names), self.lock:
             if self.accepted_block_count >= self.max_blocks:
-                self.reject_stratum(21, PRISM_REJECTION_POOL_CLOSED, "pool is no longer accepting shares")
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_POOL_CLOSED,
+                    "pool is no longer accepting shares",
+                    worker=client.username,
+                )
             current_tip = str(self.rpc.call("getbestblockhash"))
             if str(context.template["previousblockhash"]) != current_tip:
-                self.reject_stratum(21, PRISM_REJECTION_STALE_JOB, "stale job")
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_STALE_JOB,
+                    "stale job",
+                    worker=client.username,
+                )
             try:
                 reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
             except Exception:
@@ -2845,11 +3390,22 @@ class PrismCoordinator:
                     20,
                     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                     "reorg reconciliation failed before block submit",
+                    worker=client.username,
                 )
             if not reorg_reconciled:
-                self.reject_stratum(21, PRISM_REJECTION_STALE_JOB, "stale job")
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_STALE_JOB,
+                    "stale job",
+                    worker=client.username,
+                )
             if not self.prior_balances_match_current(context.prior_balances):
-                self.reject_stratum(21, PRISM_REJECTION_STALE_JOB, "stale job")
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_STALE_JOB,
+                    "stale job",
+                    worker=client.username,
+                )
             final_bundle = self.build_audit_bundle(
                 shares=context.shares_json,
                 found_block=context.found_block,
@@ -2869,6 +3425,7 @@ class PrismCoordinator:
                     20,
                     PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
                     "final audit bundle coinbase does not match submitted coinbase",
+                    worker=client.username,
                 )
             candidate_bundle_path = self.write_temporary_audit_bundle(
                 final_bundle,
@@ -2883,7 +3440,12 @@ class PrismCoordinator:
                 )
                 current_tip = str(self.rpc.call("getbestblockhash"))
                 if str(context.template["previousblockhash"]) != current_tip:
-                    self.reject_stratum(21, PRISM_REJECTION_STALE_JOB, "stale job")
+                    self.reject_stratum(
+                        21,
+                        PRISM_REJECTION_STALE_JOB,
+                        "stale job",
+                        worker=client.username,
+                    )
                 before_height = int(self.rpc.call("getblockcount"))
                 expected_height = int(context.template["height"])
                 if before_height + 1 != expected_height:
@@ -2891,6 +3453,7 @@ class PrismCoordinator:
                         21,
                         PRISM_REJECTION_BLOCK_STALE,
                         f"stale block height: template={expected_height} tip={before_height}",
+                        worker=client.username,
                     )
                 persistence = self.ledger.persist_accepted_block(
                     block_hash=submission.block_hash_hex,
@@ -2906,7 +3469,12 @@ class PrismCoordinator:
                         block_hash=submission.block_hash_hex,
                         active_tip_height=after_height,
                     )
-                    self.reject_stratum(20, PRISM_REJECTION_SUBMITBLOCK_REJECTED, f"submitblock rejected candidate: {result}")
+                    self.reject_stratum(
+                        20,
+                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                        f"submitblock rejected candidate: {result}",
+                        worker=client.username,
+                    )
                 if after_height != before_height + 1:
                     self.reject_prepared_block(
                         block_hash=submission.block_hash_hex,
@@ -2916,6 +3484,7 @@ class PrismCoordinator:
                         20,
                         PRISM_REJECTION_SUBMITBLOCK_REJECTED,
                         f"submitblock did not advance height: {before_height}->{after_height}",
+                        worker=client.username,
                     )
                 block_hash = str(self.rpc.call("getblockhash", [after_height]))
                 if block_hash.lower() != submission.block_hash_hex.lower():
@@ -2928,6 +3497,7 @@ class PrismCoordinator:
                         20,
                         PRISM_REJECTION_SUBMITBLOCK_REJECTED,
                         f"submitted block hash mismatch: expected {submission.block_hash_hex} got {block_hash}",
+                        worker=client.username,
                     )
                 confirmation = self.ledger.confirm_accepted_block(
                     block_hash=block_hash,
@@ -2939,6 +3509,7 @@ class PrismCoordinator:
                         20,
                         PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                         f"ledger did not confirm accepted block {block_hash}",
+                        worker=client.username,
                     )
                 ctv_persistence = None
                 ctv_manifest_set = final_bundle.get("ctv_fanout_manifest_set")
@@ -3282,6 +3853,15 @@ class PrismCoordinator:
         if self.submitted_share_count > 0:
             stale_percent = (self.stale_share_count / self.submitted_share_count) * 100.0
         rejection_counts = getattr(self, "rejection_counts_by_reason", {})
+        grace_credited_share_count = int(getattr(self, "grace_credited_share_count", 0))
+        idle_retarget_count = int(getattr(self, "idle_retarget_count", 0))
+        self._ensure_worker_metrics_state()
+        with self.worker_metrics_lock:
+            worker_share_counts = {
+                label: dict(counts)
+                for label, counts in self.worker_share_counts.items()
+            }
+            worker_rejection_counts = dict(self.worker_rejection_counts)
         coinbase_weight_headroom = 2_000_000
         if self.latest_bundle is not None:
             coinbase_hex = self.latest_bundle["signed_coinbase_manifest"]["manifest"]["coinbase_tx_hex"]
@@ -3335,11 +3915,38 @@ class PrismCoordinator:
             "# HELP qbit_prism_low_difficulty_shares_total Low-difficulty Stratum shares rejected.",
             "# TYPE qbit_prism_low_difficulty_shares_total counter",
             f"qbit_prism_low_difficulty_shares_total {self.low_difficulty_share_count}",
+            "# HELP qbit_prism_grace_credited_shares_total Accepted shares credited by the stale-grace policy.",
+            "# TYPE qbit_prism_grace_credited_shares_total counter",
+            f"qbit_prism_grace_credited_shares_total {grace_credited_share_count}",
             "# HELP qbit_prism_rejections_total PRISM share or block rejections by canonical reason ID.",
             "# TYPE qbit_prism_rejections_total counter",
             *[
                 f'qbit_prism_rejections_total{{reason_id="{reason}"}} {int(rejection_counts.get(reason, 0))}'
                 for reason in PRISM_REJECTION_REASON_IDS
+            ],
+            "# HELP qbit_prism_worker_submitted_shares_total Stratum share submissions by bounded worker label.",
+            "# TYPE qbit_prism_worker_submitted_shares_total counter",
+            *[
+                f'qbit_prism_worker_submitted_shares_total{{worker="{self.prometheus_label_value(label)}"}} {int(counts.get("submitted", 0))}'
+                for label, counts in sorted(worker_share_counts.items())
+            ],
+            "# HELP qbit_prism_worker_accepted_shares_total Accepted shares by bounded worker label.",
+            "# TYPE qbit_prism_worker_accepted_shares_total counter",
+            *[
+                f'qbit_prism_worker_accepted_shares_total{{worker="{self.prometheus_label_value(label)}"}} {int(counts.get("accepted", 0))}'
+                for label, counts in sorted(worker_share_counts.items())
+            ],
+            "# HELP qbit_prism_worker_grace_credited_shares_total Stale-grace credited shares by bounded worker label.",
+            "# TYPE qbit_prism_worker_grace_credited_shares_total counter",
+            *[
+                f'qbit_prism_worker_grace_credited_shares_total{{worker="{self.prometheus_label_value(label)}"}} {int(counts.get("grace", 0))}'
+                for label, counts in sorted(worker_share_counts.items())
+            ],
+            "# HELP qbit_prism_worker_rejections_total PRISM share or block rejections by bounded worker label and reason ID.",
+            "# TYPE qbit_prism_worker_rejections_total counter",
+            *[
+                f'qbit_prism_worker_rejections_total{{worker="{self.prometheus_label_value(label)}",reason_id="{reason}"}} {int(count)}'
+                for (label, reason), count in sorted(worker_rejection_counts.items())
             ],
             "# HELP qbit_prism_job_build_failures_total Job builds skipped after a template/coinbase error without dropping the client.",
             "# TYPE qbit_prism_job_build_failures_total counter",
@@ -3368,6 +3975,9 @@ class PrismCoordinator:
             "# HELP qbit_prism_matured_payouts_total Payout entries marked mature by the coordinator tip reconciliation path.",
             "# TYPE qbit_prism_matured_payouts_total counter",
             f"qbit_prism_matured_payouts_total {self.matured_payout_count}",
+            "# HELP qbit_prism_vardiff_idle_retargets_total Vardiff retargets triggered by the idle zero-accepted-share sweep.",
+            "# TYPE qbit_prism_vardiff_idle_retargets_total counter",
+            f"qbit_prism_vardiff_idle_retargets_total {idle_retarget_count}",
             "# HELP qbit_prism_shares_per_second Accepted shares per second since coordinator start.",
             "# TYPE qbit_prism_shares_per_second gauge",
             f"qbit_prism_shares_per_second {shares_per_second:.12g}",

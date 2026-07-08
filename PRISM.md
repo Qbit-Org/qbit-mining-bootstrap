@@ -178,6 +178,24 @@ seconds, while a 500 GH/s device would find one share every ~72 minutes --
 which is why the floor lives on a dedicated port instead of the default
 listener.
 
+Operational knobs shared by the PRISM listeners:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PRISM_BLOCKPOLL_SECONDS` | `2` | fallback qbit tip/template poll interval |
+| `PRISM_BLOCKWAIT_ENABLED` | `1` | enables a `waitfornewblock` thread so new tips trigger immediate clean-job refreshes |
+| `PRISM_BLOCKWAIT_TIMEOUT_SECONDS` | `5` | server-side timeout for each `waitfornewblock` call |
+| `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | credits same-connection prior-tip shares that arrive just after a tip flip; set `0` to reject all prior-tip shares |
+| `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` | `15` | cadence for checking zero-submitted, zero-accepted vardiff windows so over-diffed idle miners can step down; set `0` to disable |
+| `PRISM_WORKER_METRICS_LIMIT` | `100` | maximum distinct worker labels in private metrics before new workers aggregate into `_other` |
+
+Stale-grace crediting never submits a block candidate. The submitted header must
+still satisfy the assigned share target, is marked with `credit_policy:
+stale-grace` in the accepted-share record, and participates in vardiff and the
+PRISM reward window like any other accepted share. Audit bundles containing any
+`credit_policy` row use `qbit.prism.audit-bundle.v1.1`; upgrade mirrors and
+verifiers before enabling a non-zero stale-grace window in production.
+
 ## How Reward Accounting Works
 
 1. A miner connects to direct PRISM Stratum and authorizes with
@@ -331,7 +349,9 @@ silently rewritten.
 
 ## Audit Bundles And Verification
 
-The main per-block public artifact is `qbit.prism.audit-bundle.v1`. It contains:
+The main per-block public artifact is `qbit.prism.audit-bundle.v1` for ordinary
+share windows and `qbit.prism.audit-bundle.v1.1` when the window contains
+`credit_policy` rows such as stale-grace shares. It contains:
 
 - accepted shares in the reward window;
 - found-block anchor data;

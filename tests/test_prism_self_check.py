@@ -44,6 +44,8 @@ class PrismSelfCheckTests(unittest.TestCase):
             "PRISM_DATABASE_URL": "postgresql://qbit:secret@prism-postgres:5432/qbit",
             "PRISM_AUDIT_DIR": "/var/lib/qbit-prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit-prism/audit/prism-live-evidence.json",
+            "PRISM_BLOCKWAIT_ENABLED": "1",
+            "PRISM_BLOCKWAIT_TIMEOUT_SECONDS": "5",
             "PRISM_ALLOW_MEMORY_LEDGER": "0",
             "PRISM_ALLOW_TEST_SIGNING_SEEDS": "0",
             "PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY": "0",
@@ -54,6 +56,9 @@ class PrismSelfCheckTests(unittest.TestCase):
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "0.000000001",
             "PRISM_STRATUM_VARDIFF_MAX_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "0.000000001",
+            "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "15",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
+            "PRISM_WORKER_METRICS_LIMIT": "100",
             "PRISM_POOL_FEE_ENABLED": "0",
         }
 

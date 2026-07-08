@@ -55,6 +55,11 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_CTV_BROADCASTER_INTERVAL_SECONDS": "11",
                 "PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT": "9",
                 "PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS": "17",
+                "PRISM_BLOCKWAIT_ENABLED": "0",
+                "PRISM_BLOCKWAIT_TIMEOUT_SECONDS": "13",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "4",
+                "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "19",
+                "PRISM_WORKER_METRICS_LIMIT": "8",
             }
         )
         completed = subprocess.run(
@@ -110,6 +115,11 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_WATCHDOG_ENABLED"], "1")
         self.assertEqual(env["PRISM_WATCHDOG_TIMEOUT_SECONDS"], "120")
         self.assertEqual(env["PRISM_WATCHDOG_INTERVAL_SECONDS"], "15")
+        self.assertEqual(env["PRISM_BLOCKWAIT_ENABLED"], "0")
+        self.assertEqual(env["PRISM_BLOCKWAIT_TIMEOUT_SECONDS"], "13")
+        self.assertEqual(env["PRISM_STRATUM_STALE_GRACE_SECONDS"], "4")
+        self.assertEqual(env["PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS"], "19")
+        self.assertEqual(env["PRISM_WORKER_METRICS_LIMIT"], "8")
         self.assertEqual(env["PRISM_STRATUM_BIND"], "0.0.0.0")
         self.assertEqual(env["PRISM_STRATUM_PORT"], "43340")
         self.assertEqual(env["PRISM_PUBLIC_STRATUM_URL"], "stratum+tcp://public-pool.example:3335")

@@ -21,12 +21,15 @@ from lab.prism.prism_coordinator import (
     ClientState,
     DEFAULT_TESTNET_USERNAME_FALLBACK_ADDRESS,
     MAX_ACTIVE_PRISM_JOBS_PER_CLIENT,
+    PRISM_CREDIT_POLICY_STALE_GRACE,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
     PRISM_REJECTION_LOW_DIFFICULTY,
     PRISM_REJECTION_REASON_IDS,
     PRISM_REJECTION_STALE_JOB,
     PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+    PRISM_REJECTION_UNAUTHORIZED_WORKER,
     PRISM_REJECTION_UNKNOWN_JOB,
+    PRISM_WORKER_METRICS_OVERFLOW_LABEL,
     QbitTipTemplateSnapshot,
     StratumError,
     StratumListenerProfile,
@@ -221,6 +224,39 @@ class TipRpc(FakeRpc):
     def call(self, method: str, params: list[object] | None = None) -> object:
         if method == "getbestblockhash":
             return self.tip
+        return super().call(method, params)
+
+
+class ParentTipRpc(TipRpc):
+    def __init__(self, *, tip: str, parent: str) -> None:
+        super().__init__(tip)
+        self.parent = parent
+        self.submitblock_calls = 0
+
+    def call(self, method: str, params: list[object] | None = None) -> object:
+        if method == "getblock":
+            self.assert_tip_param(params)
+            return {"hash": self.tip, "previousblockhash": self.parent}
+        if method == "submitblock":
+            self.submitblock_calls += 1
+            return None
+        return super().call(method, params)
+
+    def assert_tip_param(self, params: list[object] | None) -> None:
+        if not params or str(params[0]) != self.tip:
+            raise AssertionError(f"expected getblock current tip {self.tip}, got {params!r}")
+
+
+class UnsupportedBlockwaitRpc(TipRpc):
+    def call(
+        self,
+        method: str,
+        params: list[object] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> object:
+        if method == "waitfornewblock":
+            raise RuntimeError("Method not found")
         return super().call(method, params)
 
 
@@ -498,7 +534,20 @@ def coordinator() -> PrismCoordinator:
     server.stale_share_count = 0
     server.duplicate_share_count = 0
     server.low_difficulty_share_count = 0
+    server.grace_credited_share_count = 0
+    server.idle_retarget_count = 0
     server.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
+    server.worker_metrics_limit = 100
+    server.worker_metrics_lock = threading.Lock()
+    server.worker_share_counts = {}
+    server.worker_rejection_counts = {}
+    server.evicted_job_graveyard = {}
+    server.current_tip_first_seen = None
+    server.current_tip_parent = None
+    server.stale_grace_seconds = 3.0
+    server.blockwait_enabled = True
+    server.blockwait_timeout_seconds = 5.0
+    server.vardiff_idle_sweep_seconds = 15.0
     server.job_build_failure_count = 0
     server.tip_refresh_job_count = 0
     server.post_accept_refresh_failure_count = 0
@@ -531,6 +580,7 @@ def coordinator() -> PrismCoordinator:
     server.ctv_fanout_broadcast_daemon = None
     server._ctv_fanout_market_fee_rate_cache = {}
     server.tip_template_snapshot = None
+    server._tip_refresh_lock = threading.Lock()
     server.extranonce2_size = 8
     server.coinbase_tag_hex = default_prism_coinbase_tag_hex()
     server.version_mask = direct_stratum.QBIT_VERSION_ROLLING_MASK
@@ -662,6 +712,86 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(set(server.jobs), {"old-job"})
         self.assertEqual(advertised, [])  # no set_difficulty / notify advertised for the skipped build
 
+    def test_idle_vardiff_sweep_steps_down_zero_share_window(self) -> None:
+        server = coordinator()
+        state = client()
+        state.worker = worker_identity()
+        state.active_job = prism_context("job-1", "00" * 32, worker=state.worker)
+        state.share_difficulty = Decimal("16")
+        state.vardiff_window_started_monotonic = time.monotonic() - 2
+        server.clients = {state}
+        sent: dict[str, object] = {}
+
+        def fake_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
+            sent.update(
+                {
+                    "client": client,
+                    "clean_jobs": clean_jobs,
+                    "difficulty": client.pending_share_difficulty,
+                }
+            )
+            return True
+
+        server.maybe_send_job = fake_send_job  # type: ignore[method-assign]
+
+        retargeted = server.vardiff_idle_sweep_once()
+
+        self.assertEqual(retargeted, 1)
+        self.assertEqual(server.idle_retarget_count, 1)
+        self.assertEqual(sent["client"], state)
+        self.assertTrue(sent["clean_jobs"])
+        self.assertEqual(sent["difficulty"], Decimal("4"))
+        self.assertEqual(state.pending_share_difficulty, Decimal("4"))
+        self.assertEqual(state.vardiff_window_submitted, 0)
+
+    def test_idle_vardiff_sweep_skips_submitted_reject_storm_window(self) -> None:
+        server = coordinator()
+        state = client()
+        state.worker = worker_identity()
+        state.active_job = prism_context("job-1", "00" * 32, worker=state.worker)
+        state.share_difficulty = Decimal("16")
+        state.vardiff_window_started_monotonic = time.monotonic() - 2
+        state.vardiff_window_submitted = 3
+        server.clients = {state}
+
+        def fail_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
+            raise AssertionError("reject-storm windows must not idle-retarget")
+
+        server.maybe_send_job = fail_send_job  # type: ignore[method-assign]
+
+        retargeted = server.vardiff_idle_sweep_once()
+
+        self.assertEqual(retargeted, 0)
+        self.assertEqual(state.pending_share_difficulty, None)
+        self.assertEqual(state.vardiff_window_submitted, 3)
+
+    def test_idle_vardiff_sweep_disconnects_send_failure_and_rolls_back_pending_difficulty(self) -> None:
+        server = coordinator()
+        state = client()
+        state.worker = worker_identity()
+        state.active_job = prism_context("job-1", "00" * 32, worker=state.worker)
+        state.share_difficulty = Decimal("16")
+        state.vardiff_window_started_monotonic = time.monotonic() - 2
+        server.clients = {state}
+        disconnected: list[ClientState] = []
+
+        def failing_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
+            self.assertEqual(client.pending_share_difficulty, Decimal("4"))
+            raise OSError("socket send failed")
+
+        def fake_disconnect(client: ClientState) -> None:
+            disconnected.append(client)
+            server.clients.discard(client)
+
+        server.maybe_send_job = failing_send_job  # type: ignore[method-assign]
+        server.disconnect_client = fake_disconnect  # type: ignore[method-assign]
+
+        retargeted = server.vardiff_idle_sweep_once()
+
+        self.assertEqual(retargeted, 0)
+        self.assertEqual(disconnected, [state])
+        self.assertIsNone(state.pending_share_difficulty)
+
     def test_maybe_send_job_isolates_build_failure_and_keeps_client_connected(self) -> None:
         server = coordinator()
         server.jobs = {}
@@ -759,6 +889,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.stale_share_count = 2
         server.duplicate_share_count = 1
         server.low_difficulty_share_count = 3
+        server.grace_credited_share_count = 6
+        server.idle_retarget_count = 7
         server.rejection_counts_by_reason[PRISM_REJECTION_STALE_JOB] = 2
         server.rejection_counts_by_reason["duplicate-share"] = 1
         server.rejection_counts_by_reason["low-difficulty"] = 3
@@ -771,16 +903,70 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_stale_shares_total 2", metrics)
         self.assertIn("qbit_prism_duplicate_shares_total 1", metrics)
         self.assertIn("qbit_prism_low_difficulty_shares_total 3", metrics)
+        self.assertIn("qbit_prism_grace_credited_shares_total 6", metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="stale-job"} 2', metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="duplicate-share"} 1', metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="low-difficulty"} 3', metrics)
         self.assertIn("qbit_prism_tip_refresh_jobs_total 4", metrics)
         self.assertIn("qbit_prism_post_accept_refresh_failures_total 5", metrics)
+        self.assertIn("qbit_prism_vardiff_idle_retargets_total 7", metrics)
         self.assertIn("qbit_prism_stale_share_percent 20", metrics)
         self.assertIn("qbit_prism_coinbase_weight_headroom_bytes 1999750", metrics)
         self.assertIn("qbit_prism_vardiff_enabled 1", metrics)
         self.assertIn("qbit_prism_qbitd_initial_block_download 0", metrics)
         self.assertIn("qbit_prism_qbitd_peers 4", metrics)
+
+    def test_metrics_include_bounded_worker_share_and_rejection_counters(self) -> None:
+        server = coordinator()
+        server.worker_metrics_limit = 1
+
+        server.note_worker_submitted_share("miner-a")
+        server.note_worker_accepted_share("miner-a", PRISM_CREDIT_POLICY_STALE_GRACE)
+        server.note_worker_submitted_share("miner-b")
+        server.record_rejection(PRISM_REJECTION_LOW_DIFFICULTY, worker="miner-b")
+
+        metrics = server.metrics_payload()
+
+        self.assertIn('qbit_prism_worker_submitted_shares_total{worker="miner-a"} 1', metrics)
+        self.assertIn('qbit_prism_worker_accepted_shares_total{worker="miner-a"} 1', metrics)
+        self.assertIn('qbit_prism_worker_grace_credited_shares_total{worker="miner-a"} 1', metrics)
+        self.assertIn('qbit_prism_worker_submitted_shares_total{worker="_other"} 1', metrics)
+        self.assertIn(
+            'qbit_prism_worker_rejections_total{worker="_other",reason_id="low-difficulty"} 1',
+            metrics,
+        )
+
+    def test_zero_worker_metric_limit_uses_overflow_bucket(self) -> None:
+        server = coordinator()
+        server.worker_metrics_limit = 0
+
+        server.note_worker_submitted_share("miner-a")
+
+        self.assertEqual(set(server.worker_share_counts), {"_other"})
+        self.assertEqual(server.worker_share_counts["_other"]["submitted"], 1)
+
+    def test_unauthorized_submit_does_not_admit_payload_worker_metric_label(self) -> None:
+        server, state, _ledger = submit_coordinator()
+        server.worker_metrics_limit = 1
+
+        with self.assertRaises(StratumError) as raised:
+            server.handle_submit(
+                state,
+                ["spoofed-miner", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_UNAUTHORIZED_WORKER)
+        self.assertNotIn("spoofed-miner", server.worker_share_counts)
+        self.assertEqual(server.worker_share_counts["miner-a"]["submitted"], 0)
+        self.assertEqual(
+            server.worker_rejection_counts[("miner-a", PRISM_REJECTION_UNAUTHORIZED_WORKER)],
+            1,
+        )
+
+        server.note_worker_submitted_share("miner-a")
+
+        self.assertNotIn(PRISM_WORKER_METRICS_OVERFLOW_LABEL, server.worker_share_counts)
+        self.assertEqual(server.worker_share_counts["miner-a"]["submitted"], 1)
 
     def test_metrics_include_audit_artifact_storage_gauges(self) -> None:
         server = coordinator()
@@ -1693,6 +1879,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.accepted_block_count = 0
         server.max_blocks = 1
         server.stop_after_block = True
+        server.stale_grace_seconds = 0
         server.jobs = {}
         server.recent_share_keys = set()
         server.share_weights_by_username = {}
@@ -2345,6 +2532,175 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertEqual(ledger.pending[0].share_id, "miner-a:" + "bb" * 32)
 
+    def test_prior_tip_share_inside_grace_is_credited_without_submitblock(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        rpc = ParentTipRpc(tip=new_tip, parent=old_tip)
+        server.rpc = rpc
+        server.current_tip_first_seen = (new_tip, time.monotonic())
+        server.stale_grace_seconds = 3
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="cc" * 32,
+            share_pass=True,
+            block_pass=True,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(rpc.submitblock_calls, 0)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.pending[0].credit_policy, PRISM_CREDIT_POLICY_STALE_GRACE)
+        self.assertEqual(server.grace_credited_share_count, 1)
+        self.assertEqual(server.worker_share_counts["miner-a"]["grace"], 1)
+
+    def test_evicted_prior_tip_share_inside_grace_is_credited(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        rpc = ParentTipRpc(tip=new_tip, parent=old_tip)
+        server.rpc = rpc
+        server.current_tip_first_seen = (new_tip, time.monotonic())
+        server.bury_evicted_job(state, "job-1")
+        server.jobs.pop("job-1")
+        state.active_job_ids.clear()
+        submission = SimpleNamespace(
+            header_hex="ad" * 80,
+            block_hash_hex="cd" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.pending[0].credit_policy, PRISM_CREDIT_POLICY_STALE_GRACE)
+
+    def test_evicted_same_tip_share_is_credited_without_stale_grace_policy(self) -> None:
+        tip = "00" * 32
+        server, state, ledger = submit_coordinator(tip=tip)
+        server.bury_evicted_job(state, "job-1")
+        server.jobs.pop("job-1")
+        state.active_job_ids.clear()
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertIsNone(ledger.pending[0].credit_policy)
+
+    def test_evicted_graveyard_keeps_unexpired_entries_above_previous_cap_for_grace_credit(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        rpc = ParentTipRpc(tip=new_tip, parent=old_tip)
+        server.rpc = rpc
+        server.current_tip_first_seen = (new_tip, time.monotonic())
+        context = server.jobs["job-1"]
+        evicted_at = time.monotonic()
+        server.evicted_job_graveyard = {
+            "job-1": (context, state.connection_id, evicted_at),
+        }
+        previous_hard_cap = 512
+        for index in range(previous_hard_cap):
+            server.evicted_job_graveyard[f"filler-{index}"] = (
+                context,
+                state.connection_id,
+                evicted_at + 0.001 + (index / 1_000_000),
+            )
+        server.prune_evicted_job_graveyard(now=evicted_at + 0.5)
+        self.assertIn("job-1", server.evicted_job_graveyard)
+        server.jobs.pop("job-1")
+        state.active_job_ids.clear()
+        submission = SimpleNamespace(
+            header_hex="ae" * 80,
+            block_hash_hex="ce" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.pending[0].credit_policy, PRISM_CREDIT_POLICY_STALE_GRACE)
+
+    def test_stale_grace_parent_rpc_failure_rejects_as_backend_unavailable(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, _ledger = submit_coordinator(tip=old_tip)
+        server.rpc = TipRpc(new_tip)
+        server.current_tip_first_seen = (new_tip, time.monotonic())
+
+        with self.assertRaises(StratumError) as raised:
+            server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE)
+
+    def test_unknown_job_rejects_before_getbestblockhash_rpc(self) -> None:
+        class CountingTipRpc(TipRpc):
+            def __init__(self, tip: str) -> None:
+                super().__init__(tip)
+                self.getbest_calls = 0
+
+            def call(self, method: str, params: list[object] | None = None) -> object:
+                if method == "getbestblockhash":
+                    self.getbest_calls += 1
+                return super().call(method, params)
+
+        server, state, _ledger = submit_coordinator()
+        rpc = CountingTipRpc("00" * 32)
+        server.rpc = rpc
+
+        with self.assertRaises(StratumError) as raised:
+            server.handle_submit(
+                state,
+                ["miner-a", "garbage-job", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_UNKNOWN_JOB)
+        self.assertEqual(rpc.getbest_calls, 0)
+
     def test_submit_passes_negotiated_version_bits_and_mask_to_stratum_assembly(self) -> None:
         server, state, _ledger = submit_coordinator()
         state.version_mask = 0x1FFFE000
@@ -2548,8 +2904,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual([pending.order_key for pending in ledger.pending], [PAYOUT_ADDRESS, PAYOUT_ADDRESS])
 
     def test_stale_tip_rejects_without_appending_share(self) -> None:
-        server, state, ledger = submit_coordinator(tip="00" * 32)
-        server.rpc = TipRpc("11" * 32)
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        server.rpc = ParentTipRpc(tip=new_tip, parent="22" * 32)
 
         with self.assertRaises(StratumError) as raised:
             server.handle_submit(
@@ -2791,6 +3149,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("fresh-job", server.jobs)
         self.assertEqual(state.active_job_ids, {"fresh-job"})
         self.assertIn(state, server.clients)
+        server.stale_grace_seconds = 0
 
         with self.assertRaises(StratumError) as raised:
             server.handle_submit(
@@ -3051,6 +3410,55 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             self.assertEqual(server._overdue_heartbeats(now + 1_000.0), [])
 
         self.assertEqual(server._overdue_heartbeats(time.monotonic()), [])
+
+    def test_block_submit_pause_names_cover_registered_refresh_and_idle_threads(self) -> None:
+        server = self._bare_coordinator()
+        for name in ("stratum_accept", "qbit_blockpoll", "qbit_blockwait", "vardiff_idle_sweep"):
+            server._record_heartbeat(name)
+        now = time.monotonic()
+        with server._heartbeats_lock:
+            for name in server._heartbeats:
+                server._heartbeats[name] = now - 1_000.0
+
+        pause_names = server._registered_watchdog_heartbeat_names(
+            "qbit_blockpoll",
+            "qbit_blockwait",
+            "vardiff_idle_sweep",
+            "stratum_accept",
+        )
+
+        with server._watchdog_paused(*pause_names):
+            self.assertEqual(server._overdue_heartbeats(now + 1_000.0), [])
+
+    def test_pause_names_skip_removed_blockwait_without_resurrecting_heartbeat(self) -> None:
+        server = self._bare_coordinator()
+        server._record_heartbeat("qbit_blockpoll")
+        server._record_heartbeat("qbit_blockwait")
+        server._remove_watchdog_heartbeat("qbit_blockwait")
+
+        pause_names = server._registered_watchdog_heartbeat_names("qbit_blockpoll", "qbit_blockwait")
+
+        self.assertEqual(pause_names, ("qbit_blockpoll",))
+        with server._watchdog_paused(*pause_names):
+            pass
+        self.assertNotIn("qbit_blockwait", server._heartbeats)
+
+    def test_blockwait_parameter_mismatch_is_treated_as_unsupported(self) -> None:
+        self.assertTrue(
+            PrismCoordinator._blockwait_unsupported(
+                RuntimeError("RPC error -32602: invalid params: wrong number of parameters")
+            )
+        )
+
+    def test_blockwait_unsupported_removes_watchdog_heartbeat(self) -> None:
+        server = coordinator()
+        server.rpc = UnsupportedBlockwaitRpc("00" * 32)
+        server._record_heartbeat("qbit_blockwait")
+
+        server.blockwait_loop()
+
+        self.assertNotIn("qbit_blockwait", server._heartbeats)
+        self.assertNotIn("qbit_blockwait", server._watchdog_pauses)
 
     def test_release_ledger_lease_is_noop_without_lease_support(self) -> None:
         server = self._bare_coordinator()

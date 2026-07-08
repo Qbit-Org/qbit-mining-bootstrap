@@ -58,8 +58,30 @@ CREATE TABLE IF NOT EXISTS qbit_share_ledger (
     ),
     writer_id text NOT NULL,
     writer_epoch bigint NOT NULL CHECK (writer_epoch >= 0),
+    credit_policy text,
+    CONSTRAINT qbit_share_ledger_credit_policy_check
+        CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace')),
     CHECK (accepted OR reject_reason IS NOT NULL)
 );
+
+ALTER TABLE qbit_share_ledger
+    ADD COLUMN IF NOT EXISTS credit_policy text;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'qbit_share_ledger'::regclass
+          AND conname = 'qbit_share_ledger_credit_policy_check'
+    ) THEN
+        ALTER TABLE qbit_share_ledger
+            ADD CONSTRAINT qbit_share_ledger_credit_policy_check
+            CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace'))
+            NOT VALID;
+    END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS qbit_payout_carry_forward (
     carry_forward_seq bigserial PRIMARY KEY,
@@ -414,6 +436,9 @@ CREATE INDEX IF NOT EXISTS qbit_payout_carry_forward_block_amount_idx
     ON qbit_payout_carry_forward (block_hash)
     INCLUDE (gross_amount_sats);
 
+DROP FUNCTION IF EXISTS qbit_audit_share_window(timestamptz, numeric);
+DROP FUNCTION IF EXISTS qbit_prism_window(timestamptz, numeric);
+
 CREATE OR REPLACE FUNCTION qbit_prism_window(
     anchor_job_issued_at timestamptz,
     window_weight numeric
@@ -427,7 +452,8 @@ RETURNS TABLE (
     share_difficulty numeric,
     counted_difficulty numeric,
     job_issued_at timestamptz,
-    accepted_at timestamptz
+    accepted_at timestamptz,
+    credit_policy text
 )
 LANGUAGE sql
 STABLE
@@ -473,7 +499,8 @@ AS $$
             ELSE eligible.share_difficulty - (eligible.cumulative_difficulty - window_weight)
         END AS counted_difficulty,
         eligible.job_issued_at,
-        eligible.accepted_at
+        eligible.accepted_at,
+        eligible.credit_policy
     FROM eligible
     WHERE eligible.cumulative_difficulty - eligible.share_difficulty < window_weight
     ORDER BY eligible.share_seq DESC;
@@ -708,7 +735,8 @@ RETURNS TABLE (
     share_difficulty numeric,
     counted_difficulty numeric,
     job_issued_at timestamptz,
-    accepted_at timestamptz
+    accepted_at timestamptz,
+    credit_policy text
 )
 LANGUAGE sql
 STABLE
@@ -724,7 +752,8 @@ AS $$
         ledger_window.share_difficulty,
         ledger_window.counted_difficulty,
         ledger_window.job_issued_at,
-        ledger_window.accepted_at
+        ledger_window.accepted_at,
+        ledger_window.credit_policy
     FROM qbit_prism_window(anchor_job_issued_at, network_difficulty * 8::numeric) AS ledger_window;
 $$;
 
