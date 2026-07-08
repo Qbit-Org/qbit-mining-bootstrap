@@ -15,6 +15,12 @@
           "url": "stratum+tcp://mine.prism.example:3340",
           "protocol": "stratum_v1",
           "default_port": 3340
+        },
+        {
+          "label": "High-diff",
+          "url": "stratum+tcp://mine.prism.example:4334",
+          "protocol": "stratum_v1",
+          "default_port": 4334
         }
       ]
     }
