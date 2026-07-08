@@ -134,7 +134,7 @@ set:
 | `PRISM_STRATUM_HIGHDIFF_PORT_HOST` | ephemeral loopback | compose host publish mapping; set (e.g. `4334`) when enabling the listener |
 | `PRISM_STRATUM_HIGHDIFF_BIND` | `PRISM_STRATUM_BIND` | bind address |
 | `PRISM_STRATUM_HIGHDIFF_START_DIFF` | `500000` | first advertised difficulty |
-| `PRISM_STRATUM_HIGHDIFF_MIN_DIFF` | `500000` | vardiff floor; never advertised below |
+| `PRISM_STRATUM_HIGHDIFF_MIN_DIFF` | `500000` | floor; never advertised below, even while qbit network difficulty is under it |
 | `PRISM_STRATUM_HIGHDIFF_MAX_DIFF` | `4294967296` | vardiff ceiling |
 | `PRISM_STRATUM_HIGHDIFF_SHARE_DIFF` | `PRISM_STRATUM_HIGHDIFF_START_DIFF` | fixed difficulty when vardiff is disabled; must stay within the min/max bounds |
 
@@ -142,6 +142,22 @@ All other vardiff knobs (target share interval, retarget cadence, step
 bounds, smoothing) inherit the `PRISM_STRATUM_VARDIFF_*` configuration.
 Startup fails loudly when the bounds are inconsistent (floor above start, or
 start above ceiling).
+
+The floor is a wire guarantee, not just a vardiff bound. On the default
+listener the advertised difficulty is capped at the qbit network difficulty
+(a share is never required to be harder than a block), but on the high-diff
+listener the floor overrides that cap: while qbit network difficulty sits
+below the floor -- a young chain, or any test network -- the listener still
+advertises the floor from the first `mining.set_difficulty`, because that
+first value is what marketplace verification judges. Two consequences while
+the chain is below the floor: rigs only surface hashes at or above the floor
+(rented hashrate overshoots young blocks; that is the marketplace's minimum,
+not a pool choice), and a submission that solves a block while missing the
+share target is still submitted as a block rather than rejected as a
+low-difficulty share. `scripts/prism-self-check.py` verifies the guarantee
+live: it performs a real subscribe/authorize handshake against the published
+high-diff port and fails `stratum.highdiff_floor` unless the first advertised
+difficulty meets the configured floor.
 
 Clients can also steer their own difficulty on either listener, always
 clamped to that listener's bounds so a high-diff floor cannot be undercut:
@@ -151,6 +167,10 @@ clamped to that listener's bounds so a high-diff floor cannot be undercut:
   or malformed password content is ignored.
 - `mining.suggest_difficulty` is honored the same way; an explicit password
   `d=` outranks a suggestion.
+
+On the high-diff listener an `md=` above the listener floor raises the wire
+guarantee with it; on the default listener `d=`/`md=` steer vardiff within
+its bounds but stay subject to the network-difficulty cap.
 
 Sizing intuition: shares/second = hashrate / (difficulty x 2^32). At
 difficulty 500,000 a 1 PH/s connection submits roughly one share every two

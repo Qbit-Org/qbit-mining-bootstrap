@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -358,6 +359,87 @@ def tcp_connect_check(name: str, host: str, port: int, reporter: Reporter) -> No
         reporter.pass_(name, f"reachable at {host}:{port}")
 
 
+def stratum_first_advertised_difficulty(
+    host: str,
+    port: int,
+    *,
+    username: str,
+    password: str = "x",
+    timeout: float = 10.0,
+) -> Decimal:
+    """Subscribe and authorize like a rig, returning the first
+    mining.set_difficulty the pool advertises on this connection.
+
+    This mirrors the marketplace verification handshake: NiceHash-style
+    probes judge the first advertised difficulty, so TCP reachability alone
+    is not evidence that a listener honors its floor."""
+    deadline = time.monotonic() + timeout
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        for request in (
+            {"id": 1, "method": "mining.subscribe", "params": ["prism-self-check/1"]},
+            {"id": 2, "method": "mining.authorize", "params": [username, password]},
+        ):
+            sock.sendall((json.dumps(request) + "\n").encode())
+        buffer = b""
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout as exc:
+                raise RuntimeError("timed out waiting for mining.set_difficulty") from exc
+            if not chunk:
+                raise RuntimeError("connection closed before mining.set_difficulty")
+            buffer += chunk
+            while b"\n" in buffer:
+                line, _, buffer = buffer.partition(b"\n")
+                if not line.strip():
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("id") == 2 and (message.get("error") or message.get("result") is False):
+                    raise RuntimeError(f"mining.authorize rejected: {message.get('error')}")
+                if message.get("method") == "mining.set_difficulty":
+                    params = message.get("params")
+                    if not isinstance(params, list) or not params:
+                        raise RuntimeError("mining.set_difficulty carried no difficulty")
+                    return parse_decimal(str(params[0]))
+        raise RuntimeError("timed out waiting for mining.set_difficulty")
+
+
+def check_highdiff_advertised_floor(env: dict[str, str], host: str, port: int, reporter: Reporter) -> None:
+    floor_raw = env_value(env, "PRISM_STRATUM_HIGHDIFF_MIN_DIFF", "").strip() or "500000"
+    try:
+        floor = parse_decimal(floor_raw)
+    except ValueError as exc:
+        reporter.fail("stratum.highdiff_floor", f"PRISM_STRATUM_HIGHDIFF_MIN_DIFF: {exc}")
+        return
+    username = env_value(env, "PRISM_USERNAME_FALLBACK_ADDRESS", "").strip() or "prism-self-check"
+    try:
+        advertised = stratum_first_advertised_difficulty(host, port, username=username)
+    except (OSError, RuntimeError, ValueError) as exc:
+        reporter.fail(
+            "stratum.highdiff_floor",
+            f"stratum handshake with {host}:{port} failed: {exc}",
+            hint="Marketplace verification needs subscribe/authorize to answer with mining.set_difficulty; check coordinator logs and PRISM_USERNAME_FALLBACK_ADDRESS.",
+        )
+        return
+    if advertised < floor:
+        reporter.fail(
+            "stratum.highdiff_floor",
+            f"first mining.set_difficulty advertises {advertised}, below the {floor} floor",
+            hint="Rental marketplaces judge the first advertised difficulty; the high-diff listener must clamp stamped jobs to its floor.",
+        )
+    else:
+        reporter.pass_(
+            "stratum.highdiff_floor",
+            f"first mining.set_difficulty advertises {advertised} (floor {floor})",
+        )
+
+
 def qbit_rpc_call(env: dict[str, str], method: str) -> object:
     host, port = parse_host_port(env_value(env, "QBIT_RPC_PORT_HOST", "127.0.0.1:18452"), default_host="127.0.0.1", default_port=18452)
     user = env_value(env, "QBIT_RPC_USER", "qbitrpc")
@@ -461,6 +543,7 @@ def coordinator_live_checks(env: dict[str, str], reporter: Reporter) -> None:
                 )
             else:
                 tcp_connect_check("stratum.highdiff_tcp", highdiff_target[0], highdiff_target[1], reporter)
+                check_highdiff_advertised_floor(env, highdiff_target[0], highdiff_target[1], reporter)
 
     health_code = r"""
 import json

@@ -17,10 +17,12 @@ from unittest.mock import patch
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism.prism_coordinator import (
+    CachedJobBundle,
     ClientState,
     DEFAULT_TESTNET_USERNAME_FALLBACK_ADDRESS,
     MAX_ACTIVE_PRISM_JOBS_PER_CLIENT,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+    PRISM_REJECTION_LOW_DIFFICULTY,
     PRISM_REJECTION_REASON_IDS,
     PRISM_REJECTION_STALE_JOB,
     PRISM_REJECTION_SUBMITBLOCK_REJECTED,
@@ -3126,6 +3128,7 @@ class PrismListenerProfileTests(unittest.TestCase):
         self.assertEqual(profile.port, 4334)
         self.assertEqual(profile.heartbeat_name, "stratum_accept_highdiff")
         self.assertEqual(profile.share_difficulty, Decimal("500000"))
+        self.assertEqual(profile.minimum_advertised_difficulty, Decimal("500000"))
         self.assertEqual(profile.vardiff_config.min_difficulty, Decimal("500000"))
         self.assertEqual(profile.vardiff_config.startup_difficulty, Decimal("500000"))
         self.assertEqual(profile.vardiff_config.max_difficulty, Decimal("4294967296"))
@@ -3157,6 +3160,7 @@ class PrismListenerProfileTests(unittest.TestCase):
         self.assertEqual(profile.bind, "127.0.0.2")
         self.assertEqual(profile.port, 4335)
         self.assertEqual(profile.share_difficulty, Decimal("700000"))
+        self.assertEqual(profile.minimum_advertised_difficulty, Decimal("600000"))
         self.assertEqual(profile.vardiff_config.min_difficulty, Decimal("600000"))
         self.assertEqual(profile.vardiff_config.startup_difficulty, Decimal("1000000"))
         self.assertEqual(profile.vardiff_config.max_difficulty, Decimal("8000000"))
@@ -3518,6 +3522,7 @@ class PrismListenerProfileTests(unittest.TestCase):
             share_difficulty=Decimal("500000"),
             vardiff_config=highdiff_vardiff_config(),
             heartbeat_name="stratum_accept_highdiff",
+            minimum_advertised_difficulty=Decimal("500000"),
         )
         threads = [
             threading.Thread(target=server.accept_loop, args=(default_listener, default_profile), daemon=True),
@@ -3550,6 +3555,14 @@ class PrismListenerProfileTests(unittest.TestCase):
                 clients_by_listener["highdiff"].listener_vardiff_config,
                 highdiff_profile.vardiff_config,
             )
+            self.assertEqual(
+                clients_by_listener["highdiff"].minimum_advertised_difficulty,
+                Decimal("500000"),
+            )
+            self.assertEqual(
+                clients_by_listener["default"].minimum_advertised_difficulty,
+                Decimal("0"),
+            )
             extranonces = {c.extranonce1_hex for c in clients_by_listener.values()}
             self.assertEqual(extranonces, {"00000001", "00000002"})
             self.assertIn("stratum_accept", server._heartbeats)
@@ -3562,6 +3575,199 @@ class PrismListenerProfileTests(unittest.TestCase):
             highdiff_listener.close()
             for thread in threads:
                 thread.join(timeout=5)
+
+
+class PrismStampedJobFloorTests(unittest.TestCase):
+    """The listener floor must hold on the wire, not just in vardiff policy.
+
+    Stamped jobs are the single choke point for every mining.set_difficulty
+    the coordinator sends, and marketplace verification judges the first one.
+    The regression here is a young chain: qbit network difficulty below the
+    high-diff floor used to drag the advertised difficulty down with it.
+    """
+
+    def stamp_coordinator(self) -> PrismCoordinator:
+        server = coordinator()
+        server.job_counter = 0
+        server.share_weights_by_username = {}
+        server.default_share_weight = 1
+        return server
+
+    def cached_bundle(self) -> CachedJobBundle:
+        # bits 207fffff: regtest-grade network difficulty (~4.7e-10), far
+        # below the 500k marketplace floor.
+        qbit_target = target_from_compact("207fffff")
+        base_job = direct_stratum.DirectQbitStratumJob(
+            job_id="prism-template-base",
+            previousblockhash_display="00" * 32,
+            prevhash="00" * 32,
+            coinb1="",
+            coinb2="",
+            full_coinbase_prefix="",
+            full_coinbase_suffix="",
+            merkle_branch=(),
+            transaction_hexes=(),
+            version="20000000",
+            nbits="207fffff",
+            ntime="6553f100",
+            qbit_target=qbit_target,
+            share_target=qbit_target,
+            share_difficulty=Decimal("1"),
+            extranonce1_hex="ffffffff",
+            extranonce2_size=8,
+            clean_jobs=True,
+        )
+        return CachedJobBundle(
+            key=("test",),
+            template=gbt_template("00" * 32),
+            template_fingerprint="fp",
+            bundle={},
+            shares_json=[],
+            prior_balances=[],
+            found_block={"network_difficulty": 1},
+            collection_only=False,
+            issued_at_ms=12345,
+            base_job=base_job,
+            built_monotonic=time.monotonic(),
+        )
+
+    def highdiff_client(self) -> ClientState:
+        state = client()
+        state.worker = worker_identity()
+        state.listener_vardiff_config = highdiff_vardiff_config()
+        state.minimum_advertised_difficulty = Decimal("500000")
+        state.share_difficulty = Decimal("500000")
+        return state
+
+    def test_stamped_job_enforces_floor_below_network_difficulty(self) -> None:
+        server = self.stamp_coordinator()
+        state = self.highdiff_client()
+
+        context = server.stamp_job_for_client(state, self.cached_bundle(), clean_jobs=True)
+
+        self.assertEqual(
+            context.job.share_target,
+            direct_stratum.difficulty_target(Decimal("500000")),
+        )
+        # Decimal round-tripping can land within 1e-27 of the floor; the wire
+        # value is float(difficulty), which is what marketplaces judge.
+        self.assertGreaterEqual(float(context.job.share_difficulty), 500000.0)
+
+    def test_stamped_job_keeps_network_cap_without_listener_floor(self) -> None:
+        server = self.stamp_coordinator()
+        state = client()
+        state.worker = worker_identity()
+        # Even an absurd desired difficulty stays capped at the network
+        # target on the default listener: shares are never required to be
+        # harder than blocks there.
+        state.share_difficulty = Decimal("500000")
+
+        context = server.stamp_job_for_client(state, self.cached_bundle(), clean_jobs=True)
+
+        self.assertEqual(context.job.share_target, target_from_compact("207fffff"))
+        self.assertLess(context.job.share_difficulty, Decimal("1"))
+
+    def test_stamped_job_honors_md_raised_floor_on_highdiff_listener(self) -> None:
+        server = self.stamp_coordinator()
+        state = self.highdiff_client()
+        state.requested_min_difficulty = Decimal("2000000")
+        server.apply_client_difficulty_requests(state)
+
+        context = server.stamp_job_for_client(state, self.cached_bundle(), clean_jobs=True)
+
+        self.assertEqual(
+            context.job.share_target,
+            direct_stratum.difficulty_target(Decimal("2000000")),
+        )
+        self.assertGreaterEqual(float(context.job.share_difficulty), 2000000.0)
+
+    def test_block_worthy_submission_below_share_target_still_submits_block(self) -> None:
+        # With the floor above network difficulty a hash can solve a block
+        # while missing the advertised share target. The block must be
+        # submitted, not rejected as a low-difficulty share.
+        server, state, ledger = submit_coordinator()
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="bb" * 32,
+            share_pass=False,
+            block_pass=True,
+        )
+        submitted: dict[str, object] = {}
+
+        def fake_submit_block_candidate(
+            context: object,
+            sub: object,
+            extranonce1_hex: str,
+            extranonce2_hex: str,
+            *,
+            pending_share: object,
+            client: ClientState,
+        ) -> bool:
+            submitted.update({"submission": sub, "pending_share": pending_share})
+            return True
+
+        server.submit_block_candidate = fake_submit_block_candidate  # type: ignore[method-assign]
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertTrue(should_close)
+        self.assertIs(submitted["submission"], submission)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 0)
+        self.assertEqual(len(ledger.pending), 0)
+
+    def test_low_difficulty_submission_without_block_solve_is_rejected(self) -> None:
+        server, state, ledger = submit_coordinator()
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="bb" * 32,
+            share_pass=False,
+            block_pass=False,
+        )
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.code, 23)
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_LOW_DIFFICULTY)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 1)
+        self.assertEqual(len(ledger.pending), 0)
+
+    def test_collection_only_block_worthy_low_difficulty_submission_is_rejected(self) -> None:
+        # Collection bundles cannot submit blocks, so block-worthiness does
+        # not rescue a below-target share there.
+        server, state, ledger = submit_coordinator()
+        server.jobs["job-1"].collection_only = True
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="bb" * 32,
+            share_pass=False,
+            block_pass=True,
+        )
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.code, 23)
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_LOW_DIFFICULTY)
+        self.assertEqual(len(ledger.pending), 0)
 
 
 if __name__ == "__main__":

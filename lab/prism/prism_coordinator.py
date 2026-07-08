@@ -347,6 +347,13 @@ class StratumListenerProfile:
     share_difficulty: Decimal
     vardiff_config: vardiff.VardiffConfig
     heartbeat_name: str
+    # Difficulty this listener never advertises below, even when the qbit
+    # network target is easier. Zero means no floor: stamped jobs keep the
+    # network cap (a share is never required to be harder than a block). The
+    # high-diff listener sets its configured minimum because marketplace
+    # verification (NiceHash-style) checks the first advertised difficulty,
+    # which must hold even while network difficulty sits below the floor.
+    minimum_advertised_difficulty: Decimal = Decimal("0")
 
 
 DEFAULT_HIGHDIFF_DIFFICULTY = "500000"
@@ -416,6 +423,7 @@ def load_prism_highdiff_listener(
         share_difficulty=share_difficulty,
         vardiff_config=config,
         heartbeat_name="stratum_accept_highdiff",
+        minimum_advertised_difficulty=min_difficulty,
     )
 
 
@@ -643,6 +651,10 @@ class ClientState:
     listener_name: str = "default"
     # Pristine difficulty policy of the accepting listener; never mutated.
     listener_vardiff_config: vardiff.VardiffConfig | None = None
+    # Floor below which stamped jobs never advertise, copied from the
+    # accepting listener profile. Zero (default listener) keeps the network
+    # cap authoritative.
+    minimum_advertised_difficulty: Decimal = Decimal("0")
     # Per-client specialization of the listener policy (password d=/md= or
     # mining.suggest_difficulty); recomputed from the pristine base on every
     # request so repeat applications cannot compound.
@@ -1449,6 +1461,7 @@ class PrismCoordinator:
         share_target = direct_stratum.effective_share_target(
             self.desired_client_share_difficulty(client),
             cached.base_job.qbit_target,
+            minimum_advertised_difficulty=self.client_minimum_advertised_difficulty(client),
         )
         job = dataclass_replace(
             cached.base_job,
@@ -1684,6 +1697,7 @@ class PrismCoordinator:
                 extranonce1_hex=f"{connection_id & 0xFFFFFFFF:08x}",
                 listener_name=profile.name,
                 listener_vardiff_config=profile.vardiff_config,
+                minimum_advertised_difficulty=profile.minimum_advertised_difficulty,
                 share_difficulty=self.client_startup_difficulty(profile),
             )
             with self.lock:
@@ -2352,6 +2366,23 @@ class PrismCoordinator:
         # the next stamped job regardless of whether vardiff is enabled.
         return client.pending_share_difficulty or client.share_difficulty
 
+    def client_minimum_advertised_difficulty(self, client: ClientState) -> Decimal:
+        """The difficulty stamped jobs never advertise below for this client.
+
+        Zero everywhere except floor-bearing listeners (the high-diff port),
+        where the effective policy floor governs: the listener minimum, raised
+        by any md= specialization. The floor overrides the network-difficulty
+        cap because the listener's marketplace contract is checked against the
+        first advertised difficulty, even while qbit network difficulty sits
+        below the floor.
+        """
+        if client.minimum_advertised_difficulty <= 0:
+            return Decimal("0")
+        return max(
+            client.minimum_advertised_difficulty,
+            self.client_vardiff_config(client).min_difficulty,
+        )
+
     def apply_job_difficulty(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
         if not self.client_vardiff_config(client).enabled:
             client.share_difficulty = job.share_difficulty
@@ -2609,7 +2640,13 @@ class PrismCoordinator:
             if len(self.recent_share_keys) > 50_000:
                 self.recent_share_keys.clear()
             self.recent_share_keys.add(share_key)
-        if not submission.share_pass:
+        # A floor-bearing listener holds the advertised share target above the
+        # qbit network target while network difficulty sits below the floor,
+        # so a submission can solve a block yet miss the share target. Never
+        # discard a block over share bookkeeping: reject as low-difficulty
+        # only when the hash is not block-worthy.
+        block_worthy = submission.block_pass and not context.collection_only
+        if not submission.share_pass and not block_worthy:
             self.reject_stratum(23, PRISM_REJECTION_LOW_DIFFICULTY, "low difficulty share")
 
         pending_share = self.pending_share_from_submission(
@@ -2618,7 +2655,7 @@ class PrismCoordinator:
             submission=submission,
             ntime_hex=ntime_hex,
         )
-        if context.collection_only or not submission.block_pass:
+        if not block_worthy:
             self.append_accepted_share(client, context, submission, pending_share)
             return False
         return self.submit_block_candidate(
