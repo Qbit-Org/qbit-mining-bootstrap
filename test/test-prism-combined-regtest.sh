@@ -287,7 +287,7 @@ def local_audit_payload(path):
 bundle = local_audit_payload(evidence["audit_bundle_path"])
 if evidence["ledger_backend"] != "postgres-psql":
     raise SystemExit("combined proof did not use the Postgres ledger")
-if len(evidence["distinct_miners"]) < int(os.environ["MINER_COUNT"]):
+if evidence["distinct_miner_count"] < int(os.environ["MINER_COUNT"]):
     raise SystemExit("combined proof did not include all skewed miners")
 if evidence["job_share_count"] < int(os.environ["MINER_COUNT"]):
     raise SystemExit("live block did not use the 6-miner PRISM snapshot")

@@ -3093,7 +3093,6 @@ class PrismCoordinator:
                     "pool is no longer accepting shares",
                     worker=worker_name,
                 )
-        self.note_worker_submitted_share(worker_name)
         if len(extranonce2_hex) != self.extranonce2_size * 2:
             self.reject_stratum(
                 20,
@@ -3108,6 +3107,11 @@ class PrismCoordinator:
                 "ntime and nonce must be 4-byte hex strings",
                 worker=worker_name,
             )
+        # Count submitted shares once, after the format checks, so the
+        # per-worker counter and the aggregate qbit_prism_submitted_shares_total
+        # (via note_vardiff_submitted_share) cover the same population; malformed
+        # extranonce/ntime submits are recorded only as rejections, not submits.
+        self.note_worker_submitted_share(worker_name)
         self.note_vardiff_submitted_share(client)
         credit_policy: str | None = None
         with self.lock:

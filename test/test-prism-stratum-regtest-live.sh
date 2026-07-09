@@ -632,8 +632,8 @@ evidence = json.load(open(os.environ["EVIDENCE_PATH"], encoding="utf-8"))
 miner_count = int(os.environ["MINER_COUNT"])
 if evidence["schema"] != "qbit.prism.live-stratum-evidence.v1":
     raise SystemExit("unexpected live evidence schema")
-if len(evidence["distinct_miners"]) < miner_count:
-    raise SystemExit(f"expected >= {miner_count} distinct miners, got {len(evidence['distinct_miners'])}")
+if evidence["distinct_miner_count"] < miner_count:
+    raise SystemExit(f"expected >= {miner_count} distinct miners, got {evidence['distinct_miner_count']}")
 if evidence["accepted_share_count"] < miner_count:
     raise SystemExit("live ledger did not record enough accepted shares")
 if evidence["job_share_count"] < miner_count:

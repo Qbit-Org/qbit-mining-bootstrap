@@ -23,6 +23,7 @@ from lab.prism.prism_coordinator import (
     MAX_ACTIVE_PRISM_JOBS_PER_CLIENT,
     PRISM_CREDIT_POLICY_STALE_GRACE,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+    PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
     PRISM_REJECTION_LOW_DIFFICULTY,
     PRISM_REJECTION_POOL_CLOSED,
     PRISM_REJECTION_REASON_IDS,
@@ -2718,6 +2719,26 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 0)
         self.assertEqual(
             server.worker_rejection_counts[("miner-a", PRISM_REJECTION_POOL_CLOSED)], 1
+        )
+
+    def test_malformed_submit_does_not_diverge_worker_and_aggregate_submitted(self) -> None:
+        # A malformed-ntime submit must count identically in the per-worker and
+        # aggregate submitted counters (i.e. not at all) so the two never drift.
+        server, state, _ledger = submit_coordinator()
+        submitted_before = server.submitted_share_count
+
+        with self.assertRaises(StratumError) as raised:
+            server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "bad-ntime", "00000002"],
+            )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_INVALID_NTIME_OR_NONCE)
+        self.assertEqual(server.submitted_share_count, submitted_before)
+        self.assertEqual(server.worker_share_counts["miner-a"]["submitted"], 0)
+        self.assertEqual(
+            server.worker_rejection_counts[("miner-a", PRISM_REJECTION_INVALID_NTIME_OR_NONCE)],
+            1,
         )
 
     def test_stale_grace_closed_when_refresh_path_has_not_observed_tip(self) -> None:
