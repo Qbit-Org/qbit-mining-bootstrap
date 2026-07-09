@@ -3324,6 +3324,8 @@ class PrismCoordinator:
             config.retarget_tolerance,
         ):
             return False
+        idle_window_started: float | None = None
+        idle_window_reset_at: float | None = None
         with self.lock:
             previous_difficulty = client.pending_share_difficulty or client.share_difficulty
             if previous_difficulty != current_difficulty:
@@ -3338,8 +3340,12 @@ class PrismCoordinator:
             if require_idle:
                 # Restart the window atomically with the step-down so a genuinely
                 # idle client only retargets once per interval, and only when the
-                # commit actually fires.
-                client.vardiff_window_started_monotonic = time.monotonic()
+                # commit actually fires. The pre-reset clock is kept so a failed
+                # send below can un-restart it (counters are provably zero here,
+                # so restoring the clock alone reconstructs the window).
+                idle_window_started = client.vardiff_window_started_monotonic
+                idle_window_reset_at = time.monotonic()
+                client.vardiff_window_started_monotonic = idle_window_reset_at
                 client.vardiff_window_accepted = 0
                 client.vardiff_window_submitted = 0
                 client.vardiff_window_work = Decimal("0")
@@ -3365,11 +3371,29 @@ class PrismCoordinator:
             with self.lock:
                 if client.pending_share_difficulty == next_difficulty:
                     client.pending_share_difficulty = prior_pending
+                self._restore_idle_window_clock(client, idle_window_started, idle_window_reset_at)
             raise
         with self.lock:
             if client.pending_share_difficulty == next_difficulty:
                 client.pending_share_difficulty = prior_pending
+            self._restore_idle_window_clock(client, idle_window_started, idle_window_reset_at)
         return False
+
+    @staticmethod
+    def _restore_idle_window_clock(
+        client: ClientState,
+        idle_window_started: float | None,
+        idle_window_reset_at: float | None,
+    ) -> None:
+        """Un-restart the idle vardiff window after a step-down that never
+        reached the miner (skipped build/send), so the next sweep can retry
+        immediately instead of waiting out another full retarget interval.
+        Caller must hold self.lock. No-op unless this retarget did the reset
+        and nothing else has restarted the window since."""
+        if idle_window_reset_at is None or idle_window_started is None:
+            return
+        if client.vardiff_window_started_monotonic == idle_window_reset_at:
+            client.vardiff_window_started_monotonic = idle_window_started
 
     def submit_block_candidate(
         self,

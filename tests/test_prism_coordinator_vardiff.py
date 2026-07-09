@@ -826,6 +826,43 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(disconnected, [state])
         self.assertIsNone(state.pending_share_difficulty)
 
+    def test_idle_vardiff_sweep_skipped_send_does_not_restart_idle_window_clock(self) -> None:
+        # A step-down whose job build/send is skipped (maybe_send_job False)
+        # rolls back the pending difficulty; the idle window clock must roll
+        # back too, so the next sweep retries immediately instead of waiting
+        # out another full retarget interval with the miner still over-diffed.
+        server = coordinator()
+        state = client()
+        state.worker = worker_identity()
+        state.active_job = prism_context("job-1", "00" * 32, worker=state.worker)
+        state.share_difficulty = Decimal("16")
+        window_started = time.monotonic() - 2
+        state.vardiff_window_started_monotonic = window_started
+        server.clients = {state}
+
+        def skipped_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
+            return False
+
+        server.maybe_send_job = skipped_send_job  # type: ignore[method-assign]
+
+        self.assertEqual(server.vardiff_idle_sweep_once(), 0)
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(state.vardiff_window_started_monotonic, window_started)
+
+        sent: dict[str, object] = {}
+
+        def working_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
+            sent["difficulty"] = client.pending_share_difficulty
+            return True
+
+        server.maybe_send_job = working_send_job  # type: ignore[method-assign]
+
+        # The very next sweep can step down; without the clock rollback the
+        # restarted window would gate this behind another full interval.
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        self.assertEqual(sent["difficulty"], Decimal("4"))
+        self.assertEqual(state.pending_share_difficulty, Decimal("4"))
+
     def test_maybe_send_job_isolates_build_failure_and_keeps_client_connected(self) -> None:
         server = coordinator()
         server.jobs = {}
