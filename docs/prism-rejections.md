@@ -31,7 +31,9 @@ The coordinator exposes these IDs in:
 Stale-grace credited shares are accepted shares, not rejections. When
 `PRISM_STRATUM_STALE_GRACE_SECONDS` is non-zero, a same-connection share whose
 job parent is the parent of the current tip may be credited during that short
-window. PRISM never submits the old-tip header as a block; the share still has
+window, measured per connection from when it receives new-tip work (a share
+stays creditable while the refresh pass has not reached its connection yet).
+The window only opens on an observed tip flip, never at coordinator startup. PRISM never submits the old-tip header as a block; the share still has
 to satisfy the assigned share target and is recorded with
 `credit_policy=stale-grace`.
 

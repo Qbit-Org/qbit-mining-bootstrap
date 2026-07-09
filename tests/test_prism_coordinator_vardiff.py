@@ -903,6 +903,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 share_difficulty=Decimal("1"),
                 share_target=target_from_compact("207fffff"),
             ),
+            template={"previousblockhash": "00" * 32},
             collection_only=False,
         )
         server.send_difficulty = lambda client, job: None  # type: ignore[method-assign]
@@ -1883,6 +1884,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             counter["value"] += 1
             return SimpleNamespace(
                 job=SimpleNamespace(job_id=f"job-{counter['value']}", share_difficulty=Decimal("1")),
+                template={"previousblockhash": "00" * 32},
                 collection_only=False,
             )
 
@@ -1922,6 +1924,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             counter["value"] += 1
             return SimpleNamespace(
                 job=SimpleNamespace(job_id=f"job-{counter['value']}", share_difficulty=Decimal("1")),
+                template={"previousblockhash": "00" * 32},
                 collection_only=False,
             )
 
@@ -2726,8 +2729,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIsNone(server.current_tip_first_seen)
 
     def test_stale_grace_rejected_after_window_expires(self) -> None:
-        # Refresh path observed the new tip well outside the grace window; a
-        # prior-tip share arriving now must reject rather than be credited late.
+        # This connection received current-tip work well outside the grace
+        # window; a prior-tip share arriving now must reject rather than be
+        # credited late.
         old_tip = "00" * 32
         new_tip = "11" * 32
         server, state, ledger = submit_coordinator(tip=old_tip)
@@ -2735,6 +2739,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.rpc = rpc
         server.stale_grace_seconds = 3
         server.current_tip_first_seen = (new_tip, time.monotonic() - 10)
+        state.tip_work_delivered = (new_tip, time.monotonic() - 10)
         submission = SimpleNamespace(
             header_hex="ab" * 80,
             block_hash_hex="ce" * 32,
@@ -2755,6 +2760,109 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason, PRISM_REJECTION_STALE_JOB)
         self.assertEqual(len(ledger.pending), 0)
         self.assertEqual(rpc.submitblock_calls, 0)
+
+    def test_stale_grace_open_until_connection_receives_new_tip_work(self) -> None:
+        # The refresh pass may be slow or aborted (reorg reconcile failure,
+        # transient build errors). Until THIS connection is sent current-tip
+        # work, its prior-tip shares are still in flight and must stay
+        # creditable even after the global first-seen stamp ages past the
+        # grace window.
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        rpc = ParentTipRpc(tip=new_tip, parent=old_tip)
+        server.rpc = rpc
+        server.stale_grace_seconds = 3
+        server.current_tip_first_seen = (new_tip, time.monotonic() - 10)
+        state.tip_work_delivered = (old_tip, time.monotonic() - 60)
+        submission = SimpleNamespace(
+            header_hex="ac" * 80,
+            block_hash_hex="cd" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(rpc.submitblock_calls, 0)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.pending[0].credit_policy, PRISM_CREDIT_POLICY_STALE_GRACE)
+
+    def test_stale_grace_window_runs_from_per_connection_delivery_not_first_seen(self) -> None:
+        # A slow refresh pass can deliver current-tip work to a connection
+        # after the global first-seen stamp has already aged past the grace
+        # window. The window for that connection runs from ITS delivery.
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        rpc = ParentTipRpc(tip=new_tip, parent=old_tip)
+        server.rpc = rpc
+        server.stale_grace_seconds = 3
+        server.current_tip_first_seen = (new_tip, time.monotonic() - 10)
+        state.tip_work_delivered = (new_tip, time.monotonic() - 1)
+        submission = SimpleNamespace(
+            header_hex="ae" * 80,
+            block_hash_hex="cb" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.pending[0].credit_policy, PRISM_CREDIT_POLICY_STALE_GRACE)
+
+    def test_startup_baseline_tip_does_not_open_stale_grace_window(self) -> None:
+        # The first tip observed after process start is a baseline, not a tip
+        # flip: it must not open the grace window. A later real flip must.
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, _ledger = submit_coordinator(tip=old_tip)
+        server.stale_grace_seconds = 3
+        server.current_tip_first_seen = None
+
+        server.observe_tip_first_seen(new_tip)
+        self.assertEqual(server.current_tip_first_seen, (new_tip, None))
+        self.assertFalse(server.stale_grace_deadline_open(state, new_tip))
+
+        # A change away from the observed baseline is a real flip and opens
+        # the window for connections that have not yet received the new work.
+        flip_tip = "22" * 32
+        server.observe_tip_first_seen(flip_tip)
+        self.assertIsNotNone(server.current_tip_first_seen[1])
+        self.assertTrue(server.stale_grace_deadline_open(state, flip_tip))
+
+    def test_note_tip_work_delivered_keeps_first_delivery_per_tip(self) -> None:
+        # Same-tip template refreshes must not slide the grace anchor forward.
+        server, state, _ledger = submit_coordinator()
+        tip = "11" * 32
+
+        server.note_tip_work_delivered(state, tip)
+        first = state.tip_work_delivered
+        self.assertEqual(first[0], tip)
+        server.note_tip_work_delivered(state, tip)
+        self.assertEqual(state.tip_work_delivered, first)
+
+        # A new tip re-anchors.
+        server.note_tip_work_delivered(state, "22" * 32)
+        self.assertEqual(state.tip_work_delivered[0], "22" * 32)
+        self.assertGreaterEqual(state.tip_work_delivered[1], first[1])
 
     def test_evicted_graveyard_keeps_unexpired_entries_above_previous_cap_for_grace_credit(self) -> None:
         old_tip = "00" * 32

@@ -693,6 +693,12 @@ class ClientState:
     vardiff_difficulty_estimate: Decimal | None = None
     active_job_ids: set[str] = field(default_factory=set)
     post_accept_refresh_block: tuple[int, str] | None = None
+    # (job previousblockhash, monotonic) of the FIRST job this connection was
+    # sent for that tip. Anchors the per-connection stale-grace window: a
+    # prior-tip share is in flight until shortly after this connection
+    # received replacement work, however long the refresh pass took to reach
+    # it. See stale_grace_deadline_open.
+    tip_work_delivered: tuple[str, float] | None = None
     send_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def send(self, payload: dict[str, object]) -> None:
@@ -911,10 +917,10 @@ class PrismCoordinator:
         # job_id -> (context, connection_id, evicted_monotonic); see
         # bury_evicted_job.
         self.evicted_job_graveyard: dict[str, tuple[PrismJobContext, int, float]] = {}
-        # (tip_hash, first_seen_monotonic) / (tip_hash, parent_hash) caches
-        # anchoring the stale-grace window to when this process first observed
-        # the current tip.
-        self.current_tip_first_seen: tuple[str, float] | None = None
+        # (tip_hash, flip_monotonic_or_None) / (tip_hash, parent_hash) caches.
+        # The stamp is when the refresh path saw the tip CHANGE; None marks the
+        # startup baseline tip, which never opens the stale-grace window.
+        self.current_tip_first_seen: tuple[str, float | None] | None = None
         self.current_tip_parent: tuple[str, str] | None = None
         self.job_build_failure_count = 0
         self.tip_refresh_job_count = 0
@@ -2110,9 +2116,13 @@ class PrismCoordinator:
         now = time.monotonic()
         with self.lock:
             first_seen = getattr(self, "current_tip_first_seen", None)
-            if first_seen is None or first_seen[0] != tip_hash:
-                self.current_tip_first_seen = (tip_hash, now)
-                self.current_tip_parent = None
+            if first_seen is not None and first_seen[0] == tip_hash:
+                return
+            # The first tip this process observes is a startup baseline, not a
+            # tip flip: a None stamp keeps the stale-grace window closed. Only
+            # a change away from a previously observed tip records a flip time.
+            self.current_tip_first_seen = (tip_hash, now if first_seen is not None else None)
+            self.current_tip_parent = None
 
     def current_tip_parent_hash(self, tip_hash: str) -> str | None:
         with self.lock:
@@ -2129,26 +2139,65 @@ class PrismCoordinator:
             self.current_tip_parent = (tip_hash, parent)
         return parent
 
-    def stale_grace_deadline_open(self, current_tip: str, now: float | None = None) -> bool:
+    def stale_grace_deadline_open(
+        self,
+        client: ClientState,
+        current_tip: str,
+        now: float | None = None,
+    ) -> bool:
         grace_seconds = float(getattr(self, "stale_grace_seconds", DEFAULT_PRISM_STALE_GRACE_SECONDS))
         if grace_seconds <= 0:
             return False
         now = time.monotonic() if now is None else now
         with self.lock:
             first_seen = getattr(self, "current_tip_first_seen", None)
+            delivered = client.tip_work_delivered
         # Only blockpoll/blockwait anchor current_tip_first_seen. If the refresh
         # path has not observed this tip yet, the window is not open: self-healing
         # from a lagging submit's tip read would extend grace arbitrarily past the
         # real tip change. Fall through to a plain stale-job reject instead.
         if first_seen is None or first_seen[0] != current_tip:
             return False
-        return now - first_seen[1] <= grace_seconds
+        # A None stamp is the startup baseline (see observe_tip_first_seen): the
+        # tip did not just flip, so there is no in-flight prior-tip work to
+        # rescue and the window stays closed.
+        if first_seen[1] is None:
+            return False
+        if delivered is not None and delivered[0] == current_tip:
+            # This connection already received current-tip work: its window runs
+            # from that delivery, so a slow refresh pass cannot strand shares
+            # that were in flight when replacement work finally arrived.
+            return now - delivered[1] <= grace_seconds
+        # The refresh path saw the flip but has not delivered current-tip work
+        # to this connection yet (slow pass, aborted reorg reconcile, transient
+        # build failure). Its prior-tip shares are still in flight; keep the
+        # window open. Bounded by the exactly-one-tip-back parent rule at the
+        # next flip, by delivery (which starts the grace clock above), and by
+        # disconnect when sends to the client fail.
+        return True
 
-    def context_eligible_for_stale_grace(self, context: PrismJobContext, current_tip: str) -> bool:
-        if not self.stale_grace_deadline_open(current_tip):
+    def context_eligible_for_stale_grace(
+        self,
+        client: ClientState,
+        context: PrismJobContext,
+        current_tip: str,
+    ) -> bool:
+        if not self.stale_grace_deadline_open(client, current_tip):
             return False
         parent_hash = self.current_tip_parent_hash(current_tip)
         return bool(parent_hash) and str(context.template["previousblockhash"]) == parent_hash
+
+    def note_tip_work_delivered(self, client: ClientState, job_parent_hash: str) -> None:
+        """Record the first time this connection was sent work for a tip.
+
+        First delivery wins per tip: same-tip template refreshes must not slide
+        the connection's stale-grace anchor forward.
+        """
+        now = time.monotonic()
+        with self.lock:
+            delivered = client.tip_work_delivered
+            if delivered is None or delivered[0] != job_parent_hash:
+                client.tip_work_delivered = (job_parent_hash, now)
 
     def bury_evicted_job(self, client: ClientState, job_id: str, *, now: float | None = None) -> None:
         context = self.jobs.get(job_id)
@@ -2193,13 +2242,14 @@ class PrismCoordinator:
 
     def evicted_submit_context(
         self,
+        client: ClientState,
         entry: tuple[PrismJobContext, int, float],
         current_tip: str,
     ) -> tuple[PrismJobContext, str | None] | None:
         context, _connection_id, _evicted_at = entry
         if str(context.template["previousblockhash"]) == current_tip:
             return context, None
-        if not self.context_eligible_for_stale_grace(context, current_tip):
+        if not self.context_eligible_for_stale_grace(client, context, current_tip):
             return None
         return context, PRISM_CREDIT_POLICY_STALE_GRACE
 
@@ -2662,6 +2712,7 @@ class PrismCoordinator:
         self.send_difficulty(client, context.job)
         self.send_job(client, context.job)
         self.apply_job_difficulty(client, context.job)
+        self.note_tip_work_delivered(client, str(context.template["previousblockhash"]))
         phases["send"] = time.monotonic() - phase_started
         elapsed = time.monotonic() - started
         self.observe_job_build_elapsed(elapsed, phases)
@@ -3019,7 +3070,7 @@ class PrismCoordinator:
         # tip change.
         if context is None:
             try:
-                evicted_context = self.evicted_submit_context(evicted_entry, current_tip)
+                evicted_context = self.evicted_submit_context(client, evicted_entry, current_tip)
             except Exception:
                 print("prism coordinator: failed to classify evicted submit context", flush=True)
                 traceback.print_exc()
@@ -3039,7 +3090,7 @@ class PrismCoordinator:
             context, credit_policy = evicted_context
         elif str(context.template["previousblockhash"]) != current_tip:
             try:
-                eligible_for_grace = self.context_eligible_for_stale_grace(context, current_tip)
+                eligible_for_grace = self.context_eligible_for_stale_grace(client, context, current_tip)
             except Exception:
                 print("prism coordinator: failed to classify stale-grace parent tip", flush=True)
                 traceback.print_exc()
