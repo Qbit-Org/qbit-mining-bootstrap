@@ -24,6 +24,7 @@ from lab.prism.prism_coordinator import (
     PRISM_CREDIT_POLICY_STALE_GRACE,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
     PRISM_REJECTION_LOW_DIFFICULTY,
+    PRISM_REJECTION_POOL_CLOSED,
     PRISM_REJECTION_REASON_IDS,
     PRISM_REJECTION_STALE_JOB,
     PRISM_REJECTION_SUBMITBLOCK_REJECTED,
@@ -2692,6 +2693,32 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(should_close)
         self.assertEqual(len(ledger.pending), 1)
         self.assertIsNone(ledger.pending[0].credit_policy)
+
+    def test_pool_closed_submit_rejects_before_any_share_accounting(self) -> None:
+        # Post-close submits must not inflate submitted totals (the
+        # stale-percent denominator), per-worker submitted counters, or the
+        # vardiff window; only the pool-closed rejection itself is recorded.
+        server, state, ledger = submit_coordinator()
+        server.accepted_block_count = 1
+        server.max_blocks = 1
+        state.vardiff_config = SimpleNamespace(enabled=True)
+        submitted_before = server.submitted_share_count
+
+        with self.assertRaises(StratumError) as raised:
+            server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_POOL_CLOSED)
+        self.assertEqual(server.submitted_share_count, submitted_before)
+        # The rejection itself may admit the label, but no submission counted.
+        self.assertEqual(server.worker_share_counts["miner-a"]["submitted"], 0)
+        self.assertEqual(state.vardiff_window_submitted, 0)
+        self.assertEqual(len(ledger.pending), 0)
+        self.assertEqual(
+            server.worker_rejection_counts[("miner-a", PRISM_REJECTION_POOL_CLOSED)], 1
+        )
 
     def test_stale_grace_closed_when_refresh_path_has_not_observed_tip(self) -> None:
         # Only blockpoll/blockwait may open the grace window. If the refresh path

@@ -3022,6 +3022,17 @@ class PrismCoordinator:
                 "submit username does not match authorized username",
                 worker=client.username or None,
             )
+        # A closed pool rejects before any share accounting: post-close submits
+        # must not inflate global/per-worker submitted totals (the stale-percent
+        # denominator) or vardiff windows they can never contribute to.
+        with self.lock:
+            if self.accepted_block_count >= self.max_blocks:
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_POOL_CLOSED,
+                    "pool is no longer accepting shares",
+                    worker=worker_name,
+                )
         self.note_worker_submitted_share(worker_name)
         if len(extranonce2_hex) != self.extranonce2_size * 2:
             self.reject_stratum(
@@ -3038,14 +3049,6 @@ class PrismCoordinator:
                 worker=worker_name,
             )
         self.note_vardiff_submitted_share(client)
-        with self.lock:
-            if self.accepted_block_count >= self.max_blocks:
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_POOL_CLOSED,
-                    "pool is no longer accepting shares",
-                    worker=worker_name,
-                )
         credit_policy: str | None = None
         with self.lock:
             context = self.jobs.get(job_id)
@@ -3068,6 +3071,16 @@ class PrismCoordinator:
         # new tip while job refresh still lags, and anchoring here would start
         # the grace clock late and credit prior-tip shares long after the real
         # tip change.
+        #
+        # Share classification (normal and stale-grace alike) is deliberately
+        # point-in-time against this single tip read: a tip that advances
+        # between here and the ledger append does not retroactively invalidate
+        # the share, exactly as a normal current-tip share stays credited when
+        # the tip moves during processing. Re-checking would add an RPC per
+        # share during post-block bursts only to reject valid work over
+        # processing latency. Block submission is different (chain state):
+        # submit_block_candidate re-checks the tip under lock before
+        # submitblock, and stale-grace shares never reach it.
         if context is None:
             try:
                 evicted_context = self.evicted_submit_context(client, evicted_entry, current_tip)
