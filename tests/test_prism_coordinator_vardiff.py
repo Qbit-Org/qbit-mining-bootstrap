@@ -3302,6 +3302,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertEqual(server.latest_evidence["persistence"]["block_count"], 1)
         self.assertEqual(server.latest_evidence["confirmation"]["confirmed_count"], 1)
+        # Evidence carries an aggregate miner count, not a materialized list of
+        # every miner id (which scanned the whole ledger twice under the lock).
+        self.assertEqual(server.latest_evidence["accepted_share_count"], 1)
+        self.assertEqual(server.latest_evidence["distinct_miner_count"], 1)
+        self.assertNotIn("distinct_miners", server.latest_evidence)
 
     def test_audit_retention_prunes_only_live_and_candidate_files(self) -> None:
         server = coordinator()

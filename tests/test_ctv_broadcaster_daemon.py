@@ -321,28 +321,79 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
                 make_daemon_from_env()
 
     def test_json_rpc_wallet_call_uses_wallet_url(self) -> None:
-        seen_urls: list[str] = []
+        seen: list[tuple[str, str]] = []
 
         class FakeResponse:
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *_args: object) -> None:
-                return None
+            status = 200
 
             def read(self) -> bytes:
                 return json.dumps({"error": None, "result": {"ok": True}}).encode()
 
-        def fake_urlopen(request: urllib.request.Request, timeout: int) -> FakeResponse:
-            self.assertEqual(timeout, 10)
-            seen_urls.append(request.full_url)
-            return FakeResponse()
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.host = host
+                self.port = port
+                self.timeout = timeout
+                self.sock = None
+
+            def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
+                seen.append((method, path))
+
+            def getresponse(self) -> FakeResponse:
+                return FakeResponse()
+
+            def close(self) -> None:
+                return None
 
         rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
-        with patch("urllib.request.urlopen", fake_urlopen):
+        with patch("http.client.HTTPConnection", FakeConnection):
             self.assertEqual(rpc.call("getwalletinfo", wallet="fee wallet"), {"ok": True})
 
-        self.assertEqual(seen_urls, ["http://127.0.0.1:18452/wallet/fee%20wallet"])
+        self.assertEqual(seen, [("POST", "/wallet/fee%20wallet")])
+
+    def test_json_rpc_reuses_connection_and_retries_after_stale_drop(self) -> None:
+        # First call establishes a keep-alive connection; the second reuses it;
+        # a mid-call disconnect (idle keep-alive closed by the server) is
+        # retried once on a fresh connection rather than surfacing an error.
+        constructed: list[object] = []
+
+        class FakeResponse:
+            status = 200
+
+            def read(self) -> bytes:
+                return json.dumps({"error": None, "result": "tip"}).encode()
+
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.sock = None
+                self.requests = 0
+                self.closed = False
+                self.fail_next = False
+                constructed.append(self)
+
+            def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
+                self.requests += 1
+                if self.fail_next:
+                    raise ConnectionResetError("stale keep-alive")
+
+            def getresponse(self) -> FakeResponse:
+                return FakeResponse()
+
+            def close(self) -> None:
+                self.closed = True
+
+        rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
+        with patch("http.client.HTTPConnection", FakeConnection):
+            self.assertEqual(rpc.call("getbestblockhash"), "tip")
+            self.assertEqual(rpc.call("getbestblockhash"), "tip")
+            self.assertEqual(len(constructed), 1)  # one connection reused
+            self.assertEqual(constructed[0].requests, 2)
+
+            constructed[0].fail_next = True  # live connection goes stale mid-request
+            self.assertEqual(rpc.call("getbestblockhash"), "tip")
+            self.assertTrue(constructed[0].closed)
+            self.assertEqual(len(constructed), 2)  # reconnected once
+            self.assertEqual(constructed[1].requests, 1)
 
 
 if __name__ == "__main__":
