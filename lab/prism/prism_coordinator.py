@@ -2136,11 +2136,11 @@ class PrismCoordinator:
         now = time.monotonic() if now is None else now
         with self.lock:
             first_seen = getattr(self, "current_tip_first_seen", None)
+        # Only blockpoll/blockwait anchor current_tip_first_seen. If the refresh
+        # path has not observed this tip yet, the window is not open: self-healing
+        # from a lagging submit's tip read would extend grace arbitrarily past the
+        # real tip change. Fall through to a plain stale-job reject instead.
         if first_seen is None or first_seen[0] != current_tip:
-            self.observe_tip_first_seen(current_tip)
-            with self.lock:
-                first_seen = self.current_tip_first_seen
-        if first_seen is None:
             return False
         return now - first_seen[1] <= grace_seconds
 
@@ -3011,7 +3011,12 @@ class PrismCoordinator:
                     worker=worker_name,
                 )
         current_tip = str(self.rpc.call("getbestblockhash"))
-        self.observe_tip_first_seen(current_tip)
+        # Do not anchor the stale-grace window from this submit-path tip read.
+        # Only blockpoll/blockwait may open the window (see
+        # stale_grace_deadline_open): a submit's getbestblockhash can observe a
+        # new tip while job refresh still lags, and anchoring here would start
+        # the grace clock late and credit prior-tip shares long after the real
+        # tip change.
         if context is None:
             try:
                 evicted_context = self.evicted_submit_context(evicted_entry, current_tip)
@@ -3247,21 +3252,22 @@ class PrismCoordinator:
                     continue
                 if client.vardiff_window_accepted != 0:
                     continue
-                submitted_shares = client.vardiff_window_submitted
-                if submitted_shares != 0:
+                if client.vardiff_window_submitted != 0:
                     continue
                 current_difficulty = client.pending_share_difficulty or client.share_difficulty
-                client.vardiff_window_started_monotonic = now
-                client.vardiff_window_submitted = 0
-                client.vardiff_window_work = Decimal("0")
+            # Do not reset the window here. retarget_client(require_idle=True)
+            # resets it atomically with the step-down commit only if the client
+            # is still idle at that point; if a share is accepted meanwhile, the
+            # accept path owns the window and the speculative step-down aborts.
             try:
                 if self.retarget_client(
                     client,
                     current_difficulty=current_difficulty,
                     accepted_shares=0,
-                    submitted_shares=submitted_shares,
+                    submitted_shares=0,
                     accepted_difficulty=Decimal("0"),
                     elapsed_seconds=elapsed,
+                    require_idle=True,
                 ):
                     retargeted += 1
             except OSError:
@@ -3280,6 +3286,7 @@ class PrismCoordinator:
         submitted_shares: int,
         accepted_difficulty: Decimal,
         elapsed_seconds: Decimal,
+        require_idle: bool = False,
     ) -> bool:
         config = self.client_vardiff_config(client)
         if not config.enabled:
@@ -3321,6 +3328,21 @@ class PrismCoordinator:
             previous_difficulty = client.pending_share_difficulty or client.share_difficulty
             if previous_difficulty != current_difficulty:
                 return False
+            if require_idle and (
+                client.vardiff_window_accepted != 0 or client.vardiff_window_submitted != 0
+            ):
+                # A share landed since the idle snapshot; the accept path owns
+                # this window. Abort the speculative step-down rather than
+                # overriding a client that just resumed submitting.
+                return False
+            if require_idle:
+                # Restart the window atomically with the step-down so a genuinely
+                # idle client only retargets once per interval, and only when the
+                # commit actually fires.
+                client.vardiff_window_started_monotonic = time.monotonic()
+                client.vardiff_window_accepted = 0
+                client.vardiff_window_submitted = 0
+                client.vardiff_window_work = Decimal("0")
             prior_pending = client.pending_share_difficulty
             client.pending_share_difficulty = next_difficulty
         # Advertise the new difficulty together with the new job, gated on a

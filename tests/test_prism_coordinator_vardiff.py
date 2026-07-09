@@ -765,6 +765,40 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.pending_share_difficulty, None)
         self.assertEqual(state.vardiff_window_submitted, 3)
 
+    def test_idle_vardiff_sweep_aborts_step_down_when_share_accepted_mid_retarget(self) -> None:
+        # The sweep snapshots an idle window, then computes the retarget outside
+        # the lock. If a concurrent handle_submit accepts a share in that gap, the
+        # require_idle commit re-check must abort the speculative step-down rather
+        # than down-diffing a client that just resumed submitting.
+        server = coordinator()
+        state = client()
+        state.worker = worker_identity()
+        state.active_job = prism_context("job-1", "00" * 32, worker=state.worker)
+        state.share_difficulty = Decimal("16")
+        state.vardiff_window_started_monotonic = time.monotonic() - 2
+        server.clients = {state}
+
+        def fail_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
+            raise AssertionError("a client that resumed submitting must not idle-retarget")
+
+        server.maybe_send_job = fail_send_job  # type: ignore[method-assign]
+
+        real_calc = vardiff.calculate_next_difficulty
+
+        def racing_calc(**kwargs: object) -> Decimal:
+            # Simulate a share accepted on the fresh window between the idle
+            # snapshot and the step-down commit.
+            state.vardiff_window_accepted = 1
+            return real_calc(**kwargs)
+
+        with patch.object(vardiff, "calculate_next_difficulty", side_effect=racing_calc):
+            retargeted = server.vardiff_idle_sweep_once()
+
+        self.assertEqual(retargeted, 0)
+        self.assertIsNone(state.pending_share_difficulty)
+        # The accept path owns the window now; the sweep must not have reset it.
+        self.assertEqual(state.vardiff_window_accepted, 1)
+
     def test_idle_vardiff_sweep_disconnects_send_failure_and_rolls_back_pending_difficulty(self) -> None:
         server = coordinator()
         state = client()
@@ -2618,6 +2652,72 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(should_close)
         self.assertEqual(len(ledger.pending), 1)
         self.assertIsNone(ledger.pending[0].credit_policy)
+
+    def test_stale_grace_closed_when_refresh_path_has_not_observed_tip(self) -> None:
+        # Only blockpoll/blockwait may open the grace window. If the refresh path
+        # has not anchored the new tip (current_tip_first_seen is None) and only
+        # this submit's getbestblockhash sees it, the prior-tip share must reject
+        # as stale-job -- not get credited from a submit-anchored window.
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        rpc = ParentTipRpc(tip=new_tip, parent=old_tip)
+        server.rpc = rpc
+        server.current_tip_first_seen = None
+        server.stale_grace_seconds = 3
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="cc" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_STALE_JOB)
+        self.assertEqual(len(ledger.pending), 0)
+        self.assertEqual(rpc.submitblock_calls, 0)
+        # The submit must not have anchored the window either.
+        self.assertIsNone(server.current_tip_first_seen)
+
+    def test_stale_grace_rejected_after_window_expires(self) -> None:
+        # Refresh path observed the new tip well outside the grace window; a
+        # prior-tip share arriving now must reject rather than be credited late.
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        rpc = ParentTipRpc(tip=new_tip, parent=old_tip)
+        server.rpc = rpc
+        server.stale_grace_seconds = 3
+        server.current_tip_first_seen = (new_tip, time.monotonic() - 10)
+        submission = SimpleNamespace(
+            header_hex="ab" * 80,
+            block_hash_hex="ce" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_STALE_JOB)
+        self.assertEqual(len(ledger.pending), 0)
+        self.assertEqual(rpc.submitblock_calls, 0)
 
     def test_evicted_graveyard_keeps_unexpired_entries_above_previous_cap_for_grace_credit(self) -> None:
         old_tip = "00" * 32
