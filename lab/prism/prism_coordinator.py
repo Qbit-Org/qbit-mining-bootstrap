@@ -78,6 +78,10 @@ MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
 # growth: when it overflows, the OLDEST candidate drops (it was built on the
 # oldest tip and has already lost its race).
 MAX_PENDING_BLOCK_CANDIDATES = 32
+# Accepted-share ledger writes queue to a dedicated writer thread so the
+# miner's ack never waits on a psql round trip. The bound is a multi-hour
+# ledger-outage backstop, not a working depth.
+MAX_PENDING_SHARE_APPENDS = 100_000
 # Evicted jobs are retained briefly so shares already in flight when a
 # clean_jobs refresh evicted their job can still be validated instead of
 # bouncing as unknown-job. Retention is age-bounded by the stale-grace window;
@@ -675,6 +679,23 @@ class PrismJobContext:
 
 
 @dataclass(frozen=True)
+class PendingShareAppend:
+    """An accepted share queued for the share-writer thread.
+
+    The share was acknowledged and counted in-memory on the client thread;
+    this record carries what the writer needs to persist it and emit the
+    canonical accepted-share log line.
+    """
+
+    pending_share: PendingShare
+    username: str
+    job_id: str
+    block_hash_hex: str
+    collection_only: bool
+    credit_policy: str | None
+
+
+@dataclass(frozen=True)
 class PrismBlockCandidate:
     """A block-worthy submission queued for the block-submitter thread.
 
@@ -1017,6 +1038,15 @@ class PrismCoordinator:
             maxsize=MAX_PENDING_BLOCK_CANDIDATES
         )
         self.block_candidates_dropped = 0
+        # Accepted-share ledger writes drain on a dedicated writer thread; the
+        # flag flips on in run() so tooling/tests that never start the writer
+        # keep the synchronous append. See append_accepted_share.
+        self.share_append_queue: queue.Queue[PendingShareAppend] = queue.Queue(
+            maxsize=MAX_PENDING_SHARE_APPENDS
+        )
+        self.share_writer_active = False
+        self.share_appends_dropped = 0
+        self.share_append_failure_count = 0
         self.job_build_failure_count = 0
         self.tip_refresh_job_count = 0
         self.post_accept_refresh_failure_count = 0
@@ -1900,6 +1930,13 @@ class PrismCoordinator:
                 daemon=True,
             )
             block_submitter_thread.start()
+            self._record_heartbeat("share_writer")
+            self.share_writer_active = True
+            share_writer_thread = threading.Thread(
+                target=self.share_append_loop,
+                daemon=True,
+            )
+            share_writer_thread.start()
             ctv_broadcaster_thread: threading.Thread | None = None
             if self.ctv_broadcaster_enabled:
                 self._record_heartbeat("ctv_fanout_broadcaster")
@@ -1938,6 +1975,9 @@ class PrismCoordinator:
             if vardiff_idle_sweep_thread is not None:
                 vardiff_idle_sweep_thread.join(timeout=1)
             block_submitter_thread.join(timeout=1)
+            # Give the share writer a real drain window on shutdown: acked
+            # shares still queued are payouts.
+            share_writer_thread.join(timeout=5)
             if ctv_broadcaster_thread is not None:
                 ctv_broadcaster_thread.join(timeout=1)
 
@@ -3353,16 +3393,112 @@ class PrismCoordinator:
         *,
         credit_policy: str | None = None,
     ) -> None:
-        record = self.ledger.append(pending_share)
-        print(
-            "prism coordinator: accepted share "
-            f"seq={record.share_seq} miner={client.username} job={context.job.job_id} "
-            f"hash={submission.block_hash_hex} collection={context.collection_only} "
-            f"credit_policy={credit_policy or 'normal'}",
-            flush=True,
-        )
+        # In-memory accounting (worker counters, vardiff window) happens on the
+        # calling thread so retargets and metrics see the share immediately;
+        # the ledger write is handed to the share-writer thread when it is
+        # running so the miner's ack never waits on a psql round trip. Without
+        # a writer (tests, tools that never call run()) the append is
+        # synchronous, exactly as before.
         self.note_worker_accepted_share(client.username, credit_policy)
         self.note_vardiff_accepted_share(client, context.job)
+        entry = PendingShareAppend(
+            pending_share=pending_share,
+            username=client.username,
+            job_id=context.job.job_id,
+            block_hash_hex=submission.block_hash_hex,
+            collection_only=bool(context.collection_only),
+            credit_policy=credit_policy,
+        )
+        if getattr(self, "share_writer_active", False):
+            self.enqueue_share_append(entry)
+            return
+        self._append_share_entry(entry)
+
+    def enqueue_share_append(self, entry: PendingShareAppend) -> None:
+        queue_obj = getattr(self, "share_append_queue", None)
+        if queue_obj is None:
+            queue_obj = queue.Queue(maxsize=MAX_PENDING_SHARE_APPENDS)
+            self.share_append_queue = queue_obj
+        try:
+            queue_obj.put_nowait(entry)
+        except queue.Full:
+            # A full backlog means the ledger has been unreachable for a long
+            # time; dropping the oldest keeps the pool serving miners while
+            # counting the loss loudly instead of blocking every ack.
+            try:
+                dropped = queue_obj.get_nowait()
+                print(
+                    "prism coordinator: dropped oldest queued share append "
+                    f"share_id={dropped.pending_share.share_id} (writer backlog full)",
+                    flush=True,
+                )
+                with self.lock:
+                    self.share_appends_dropped = (
+                        int(getattr(self, "share_appends_dropped", 0)) + 1
+                    )
+            except queue.Empty:
+                pass
+            try:
+                queue_obj.put_nowait(entry)
+            except queue.Full:
+                with self.lock:
+                    self.share_appends_dropped = (
+                        int(getattr(self, "share_appends_dropped", 0)) + 1
+                    )
+
+    def share_append_loop(self) -> None:
+        while True:
+            self._record_heartbeat("share_writer")
+            queue_obj = getattr(self, "share_append_queue", None)
+            if queue_obj is None:
+                queue_obj = queue.Queue(maxsize=MAX_PENDING_SHARE_APPENDS)
+                self.share_append_queue = queue_obj
+            stopping = self.stop_event.is_set()
+            try:
+                entry = queue_obj.get(timeout=0.2 if stopping else 1.0)
+            except queue.Empty:
+                if stopping:
+                    return
+                continue
+            self._append_share_entry(entry, retry_until_stopped=True)
+
+    def _append_share_entry(self, entry: PendingShareAppend, *, retry_until_stopped: bool = False) -> None:
+        """Append one accepted share to the ledger, with retry on the writer.
+
+        On the writer thread a transient ledger failure retries with capped
+        backoff so ordering is preserved and nothing is silently lost; the
+        synchronous path (no writer) propagates the exception exactly as the
+        pre-async code did.
+        """
+        backoff_seconds = 0.5
+        while True:
+            try:
+                record = self.ledger.append(entry.pending_share)
+                break
+            except Exception:
+                if not retry_until_stopped:
+                    raise
+                with self.lock:
+                    self.share_append_failure_count = (
+                        int(getattr(self, "share_append_failure_count", 0)) + 1
+                    )
+                print(
+                    "prism coordinator: ledger share append failed; retrying "
+                    f"share_id={entry.pending_share.share_id}",
+                    flush=True,
+                )
+                traceback.print_exc()
+                if self.stop_event.wait(backoff_seconds):
+                    return
+                backoff_seconds = min(backoff_seconds * 2, 5.0)
+                self._record_heartbeat("share_writer")
+        print(
+            "prism coordinator: accepted share "
+            f"seq={record.share_seq} miner={entry.username} job={entry.job_id} "
+            f"hash={entry.block_hash_hex} collection={entry.collection_only} "
+            f"credit_policy={entry.credit_policy or 'normal'}",
+            flush=True,
+        )
 
     def accepted_share_difficulty(self, context: PrismJobContext) -> int:
         override = self.share_weights_by_username.get(
@@ -4279,6 +4415,15 @@ class PrismCoordinator:
             "# HELP qbit_prism_block_candidates_dropped_total Queued block candidates dropped because the submitter queue overflowed.",
             "# TYPE qbit_prism_block_candidates_dropped_total counter",
             f"qbit_prism_block_candidates_dropped_total {int(getattr(self, 'block_candidates_dropped', 0))}",
+            "# HELP qbit_prism_share_append_queue_depth Accepted shares waiting on the ledger writer thread.",
+            "# TYPE qbit_prism_share_append_queue_depth gauge",
+            f"qbit_prism_share_append_queue_depth {self.share_append_queue.qsize() if getattr(self, 'share_append_queue', None) is not None else 0}",
+            "# HELP qbit_prism_share_append_failures_total Ledger share appends that failed and were retried by the writer thread.",
+            "# TYPE qbit_prism_share_append_failures_total counter",
+            f"qbit_prism_share_append_failures_total {int(getattr(self, 'share_append_failure_count', 0))}",
+            "# HELP qbit_prism_share_appends_dropped_total Accepted shares dropped because the writer backlog overflowed.",
+            "# TYPE qbit_prism_share_appends_dropped_total counter",
+            f"qbit_prism_share_appends_dropped_total {int(getattr(self, 'share_appends_dropped', 0))}",
             "# HELP qbit_prism_tip_refresh_jobs_total Client jobs refreshed after qbit tip/template changes.",
             "# TYPE qbit_prism_tip_refresh_jobs_total counter",
             f"qbit_prism_tip_refresh_jobs_total {self.tip_refresh_job_count}",

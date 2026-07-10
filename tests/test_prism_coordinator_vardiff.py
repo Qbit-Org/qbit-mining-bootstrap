@@ -26,6 +26,7 @@ from lab.prism.prism_coordinator import (
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
     PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
     PRISM_REJECTION_LOW_DIFFICULTY,
+    PendingShareAppend,
     PrismBlockCandidate,
     PRISM_REJECTION_POOL_CLOSED,
     PRISM_REJECTION_REASON_IDS,
@@ -548,6 +549,10 @@ def coordinator() -> PrismCoordinator:
     server.evicted_job_graveyard = {}
     server.block_candidate_queue = queue.Queue(maxsize=8)
     server.block_candidates_dropped = 0
+    server.share_append_queue = queue.Queue(maxsize=8)
+    server.share_writer_active = False
+    server.share_appends_dropped = 0
+    server.share_append_failure_count = 0
     server.current_tip_first_seen = None
     server.current_tip_parent = None
     server.stale_grace_seconds = 3.0
@@ -3221,6 +3226,117 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 0)
         self.assertEqual(server.stale_share_count, 1)
         self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_STALE_JOB], 1)
+
+    def test_share_append_is_async_when_writer_active_and_sync_otherwise(self) -> None:
+        # With the writer running, an accepted share is queued (ack never
+        # waits on the ledger) and in-memory accounting still happens
+        # immediately; draining the queue lands the ledger row. Without the
+        # writer the append stays synchronous.
+        server, state, ledger = submit_coordinator()
+        server.share_writer_active = True
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="cc" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 0)
+        self.assertEqual(server.share_append_queue.qsize(), 1)
+        # Worker counters saw the share before the ledger write flushed.
+        self.assertEqual(server.worker_share_counts["miner-a"]["accepted"], 1)
+
+        entry = server.share_append_queue.get_nowait()
+        server._append_share_entry(entry)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.pending[0].share_id, "miner-a:" + "cc" * 32)
+
+        # Writer off: append is synchronous again.
+        server.share_writer_active = False
+        second = SimpleNamespace(
+            header_hex="ab" * 80,
+            block_hash_hex="cd" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=second,
+        ):
+            server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000003"],
+            )
+        self.assertEqual(len(ledger.pending), 2)
+        self.assertEqual(server.share_append_queue.qsize(), 0)
+
+    def test_share_writer_retries_failed_append_until_it_lands(self) -> None:
+        server, state, ledger = submit_coordinator()
+
+        class FlakyLedger(type(ledger)):
+            def __init__(self) -> None:
+                super().__init__()
+                self.failures_remaining = 2
+
+            def append(self, pending: object) -> object:
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("ledger briefly unavailable")
+                return super().append(pending)
+
+        flaky = FlakyLedger()
+        server.ledger = flaky
+        entry = PendingShareAppend(
+            pending_share=SimpleNamespace(share_id="miner-a:" + "ee" * 32),
+            username="miner-a",
+            job_id="job-1",
+            block_hash_hex="ee" * 32,
+            collection_only=False,
+            credit_policy=None,
+        )
+
+        with patch.object(server.stop_event, "wait", return_value=False) as waited:
+            server._append_share_entry(entry, retry_until_stopped=True)
+
+        self.assertEqual(len(flaky.pending), 1)
+        self.assertEqual(server.share_append_failure_count, 2)
+        self.assertEqual(waited.call_count, 2)
+
+    def test_share_append_backlog_overflow_drops_oldest_and_counts(self) -> None:
+        server, _state, _ledger = submit_coordinator()
+        server.share_append_queue = queue.Queue(maxsize=2)
+
+        def entry(tag: str) -> PendingShareAppend:
+            return PendingShareAppend(
+                pending_share=SimpleNamespace(share_id=f"miner-a:{tag}"),
+                username="miner-a",
+                job_id="job-1",
+                block_hash_hex=tag * 32,
+                collection_only=False,
+                credit_policy=None,
+            )
+
+        server.enqueue_share_append(entry("aa"))
+        server.enqueue_share_append(entry("bb"))
+        server.enqueue_share_append(entry("cc"))
+
+        self.assertEqual(server.share_appends_dropped, 1)
+        remaining = [
+            server.share_append_queue.get_nowait().pending_share.share_id
+            for _ in range(2)
+        ]
+        self.assertEqual(remaining, ["miner-a:bb", "miner-a:cc"])
+        self.assertIn("qbit_prism_share_appends_dropped_total 1", server.metrics_payload())
 
     def test_orphaned_block_candidate_keeps_share_credit(self) -> None:
         # Option-A semantics: a share that met its target stays credited even
