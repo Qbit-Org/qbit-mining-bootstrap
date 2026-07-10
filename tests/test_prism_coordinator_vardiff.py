@@ -22,6 +22,7 @@ from lab.prism.prism_coordinator import (
     ClientState,
     DEFAULT_TESTNET_USERNAME_FALLBACK_ADDRESS,
     MAX_ACTIVE_PRISM_JOBS_PER_CLIENT,
+    MAX_PENDING_SHARE_APPENDS,
     PRISM_CREDIT_POLICY_STALE_GRACE,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
     PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
@@ -3322,7 +3323,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.share_append_failure_count, 2)
         self.assertEqual(waited.call_count, 2)
 
-    def _pending_append(self, tag: str) -> PendingShareAppend:
+    def _pending_append(self, tag: str, accepted_at_ms: int = 2) -> PendingShareAppend:
         from lab.prism.share_ledger import PendingShare
 
         return PendingShareAppend(
@@ -3336,7 +3337,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 template_height=10,
                 job_id="job-1",
                 job_issued_at_ms=1,
-                accepted_at_ms=2,
+                accepted_at_ms=accepted_at_ms,
                 ntime=1_700_000_000,
             ),
             username="miner-a",
@@ -3346,7 +3347,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             credit_policy=None,
         )
 
-    def test_share_append_backlog_overflow_recovers_oldest_to_disk(self) -> None:
+    def test_share_append_backlog_overflow_recovers_incoming_to_disk(self) -> None:
         server, _state, _ledger = submit_coordinator()
         server.share_append_queue = queue.Queue(maxsize=2)
         with tempfile.TemporaryDirectory() as tempdir:
@@ -3356,19 +3357,20 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server.enqueue_share_append(self._pending_append("bb"))
             server.enqueue_share_append(self._pending_append("cc"))
 
-            # The oldest was recovered to disk (not lost); the newest two stay
-            # queued.
+            # The incoming (newest) share is recovered to disk (not lost); the
+            # older queued shares stay in acceptance order so they persist with
+            # correct share_seq when the ledger returns.
             self.assertEqual(server.shares_recovered_to_disk, 1)
             remaining = [
                 server.share_append_queue.get_nowait().pending_share.share_id
                 for _ in range(2)
             ]
-            self.assertEqual(remaining, ["miner-a:bb", "miner-a:cc"])
+            self.assertEqual(remaining, ["miner-a:aa", "miner-a:bb"])
             recovered = [
                 json.loads(line)["share_id"]
                 for line in server.share_recovery_path.read_text().splitlines()
             ]
-            self.assertEqual(recovered, ["miner-a:aa"])
+            self.assertEqual(recovered, ["miner-a:cc"])
         self.assertIn("qbit_prism_shares_recovered_to_disk_total 1", server.metrics_payload())
 
     def test_writer_recovers_acked_share_on_shutdown_during_outage(self) -> None:
@@ -3408,6 +3410,108 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             # File is cleared after a clean replay so shares are not re-added.
             self.assertFalse(server.share_recovery_path.exists())
             self.assertEqual(server.replay_recovered_shares(), 0)
+
+    def test_replay_recovered_shares_orders_by_accepted_at(self) -> None:
+        # A share can be recovered out of FIFO order (overflow of the newest, or
+        # a ledger flap during the shutdown drain). Replay must reorder by
+        # accepted_at_ms so share_seq reflects acceptance order, keeping the
+        # reward window correctly ordered.
+        server, _state, ledger = submit_coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            server._recover_share_to_disk(self._pending_append("late", accepted_at_ms=300), "test")
+            server._recover_share_to_disk(self._pending_append("early", accepted_at_ms=100), "test")
+            server._recover_share_to_disk(self._pending_append("mid", accepted_at_ms=200), "test")
+
+            replayed = server.replay_recovered_shares()
+
+            self.assertEqual(replayed, 3)
+            self.assertEqual(
+                [p.share_id for p in ledger.pending],
+                ["miner-a:early", "miner-a:mid", "miner-a:late"],
+            )
+
+    def test_replay_skips_torn_line_and_keeps_file(self) -> None:
+        # A crash mid-append can leave the last line torn. That one line must
+        # not block the intact shares before it, and the file is kept so the
+        # torn line is preserved rather than silently discarded.
+        server, _state, ledger = submit_coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            server._recover_share_to_disk(self._pending_append("g1", accepted_at_ms=100), "test")
+            server._recover_share_to_disk(self._pending_append("g2", accepted_at_ms=200), "test")
+            with open(server.share_recovery_path, "a", encoding="utf-8") as handle:
+                handle.write('{"share_id": "miner-a:torn", "miner_i')  # truncated, no newline
+
+            replayed = server.replay_recovered_shares()
+
+            self.assertEqual(replayed, 2)
+            self.assertEqual(
+                [p.share_id for p in ledger.pending], ["miner-a:g1", "miner-a:g2"]
+            )
+            # File kept because a line could not be parsed.
+            self.assertTrue(server.share_recovery_path.exists())
+            # Re-running dedups the good shares (ledger is idempotent by id).
+            self.assertEqual(server.replay_recovered_shares(), 2)
+
+    def test_append_share_entry_reports_persisted_vs_recovered(self) -> None:
+        server, _state, ledger = submit_coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            # Healthy ledger: reports persisted.
+            self.assertTrue(
+                server._append_share_entry(self._pending_append("ok"), retry_until_stopped=True)
+            )
+
+            class DownLedger(type(ledger)):
+                def append(self, pending: object) -> object:
+                    raise RuntimeError("postgres unavailable")
+
+            server.ledger = DownLedger()
+            with patch.object(server.stop_event, "wait", return_value=True):
+                # Shutdown mid-outage: reports recovered, not persisted.
+                self.assertFalse(
+                    server._append_share_entry(self._pending_append("down"), retry_until_stopped=True)
+                )
+
+    def test_shutdown_drain_recovers_rest_in_order_after_first_recovery(self) -> None:
+        # Once the writer starts recovering during shutdown, it must recover the
+        # remaining queued shares in FIFO order rather than persist a newer one
+        # ahead of an already-recovered older share.
+        server, _state, ledger = submit_coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            server.share_append_queue = queue.Queue(maxsize=MAX_PENDING_SHARE_APPENDS)
+
+            append_calls: list[str] = []
+            real_ledger = server.ledger
+
+            class FlappyLedger(type(real_ledger)):
+                def append(self, pending: object) -> object:
+                    append_calls.append(pending.share_id)
+                    # First drained share can't persist; the rest would succeed
+                    # if tried -- but the order guard must not try them.
+                    if pending.share_id == "miner-a:s1":
+                        raise RuntimeError("postgres unavailable")
+                    return real_ledger.append(pending)
+
+            server.ledger = FlappyLedger()
+            server.stop_event.set()
+            for tag in ("s1", "s2", "s3"):
+                server.enqueue_share_append(self._pending_append(tag))
+
+            with patch.object(server.stop_event, "wait", return_value=True):
+                server.share_append_loop()
+
+            # s1 hit the down ledger and was recovered; s2/s3 were recovered in
+            # order without an out-of-order persist.
+            self.assertEqual(append_calls, ["miner-a:s1"])
+            self.assertEqual(ledger.pending, [])
+            recovered = [
+                json.loads(line)["share_id"]
+                for line in server.share_recovery_path.read_text().splitlines()
+            ]
+            self.assertEqual(recovered, ["miner-a:s1", "miner-a:s2", "miner-a:s3"])
 
     def test_orphaned_block_candidate_keeps_share_credit(self) -> None:
         # Option-A semantics: a share that met its target stays credited even

@@ -3475,20 +3475,15 @@ class PrismCoordinator:
         try:
             queue_obj.put_nowait(entry)
         except queue.Full:
-            # A full backlog means the ledger has been unreachable for a long
-            # time. Make room by taking the oldest, but do not lose it: an acked
-            # share is a payout, so it goes to the recovery file for replay.
-            try:
-                dropped = queue_obj.get_nowait()
-                self._recover_share_to_disk(dropped, "writer backlog full")
-            except queue.Empty:
-                pass
-            try:
-                queue_obj.put_nowait(entry)
-            except queue.Full:
-                self._recover_share_to_disk(entry, "writer backlog full")
+            # A full backlog means the ledger has been unreachable for a very
+            # long time. Recover the INCOMING (newest) share rather than
+            # displacing an older queued one: that keeps the queue in acceptance
+            # order so it persists with correct share_seq when the ledger
+            # returns, and never loses an acked share (a payout).
+            self._recover_share_to_disk(entry, "writer backlog full")
 
     def share_append_loop(self) -> None:
+        drain_to_recovery = False
         while True:
             self._record_heartbeat("share_writer")
             queue_obj = getattr(self, "share_append_queue", None)
@@ -3502,7 +3497,15 @@ class PrismCoordinator:
                 if stopping:
                     return
                 continue
-            self._append_share_entry(entry, retry_until_stopped=True)
+            if drain_to_recovery:
+                # A ledger outage was still unresolved at shutdown. Once we start
+                # recovering, recover the rest in FIFO order rather than persist a
+                # newer share ahead of an already-recovered older one (which
+                # would misorder the reward window on replay).
+                self._recover_share_to_disk(entry, "ledger unavailable at shutdown")
+                continue
+            if not self._append_share_entry(entry, retry_until_stopped=True):
+                drain_to_recovery = True
 
     def _recover_share_to_disk(self, entry: PendingShareAppend, reason: str) -> None:
         """Durably capture an acked share the writer could not persist.
@@ -3565,10 +3568,27 @@ class PrismCoordinator:
             print("prism coordinator: could not read share recovery file", flush=True)
             traceback.print_exc()
             return 0
-        replayed = 0
+        # Parse line-by-line and skip any single unparseable line rather than
+        # aborting the whole replay: a crash mid-append can leave the last line
+        # torn, and one torn line must not block the intact shares before it.
+        pendings: list[PendingShare] = []
+        parse_failed = False
         for line in lines:
             try:
-                pending = PendingShare(**json.loads(line))
+                pendings.append(PendingShare(**json.loads(line)))
+            except Exception:
+                parse_failed = True
+                print("prism coordinator: skipping an unparseable recovered share line", flush=True)
+                traceback.print_exc()
+        # Replay in acceptance order. A share recovered out of FIFO order (a
+        # ledger flap during the shutdown drain, or an overflow-recovered newest
+        # share) otherwise sorts by file order; ordering by accepted_at_ms lands
+        # each share with a share_seq consistent with when it was accepted, so
+        # the reward window stays correctly ordered.
+        pendings.sort(key=lambda pending: pending.accepted_at_ms)
+        replayed = 0
+        for pending in pendings:
+            try:
                 self.ledger.append(pending)
                 replayed += 1
             except Exception:
@@ -3576,6 +3596,14 @@ class PrismCoordinator:
                 traceback.print_exc()
                 self.shares_replayed = int(getattr(self, "shares_replayed", 0)) + replayed
                 return replayed
+        if parse_failed:
+            # Keep the file (with its intact-but-already-replayed lines, which
+            # the ledger dedups on a re-run) so the torn line is preserved for
+            # inspection rather than silently discarded.
+            self.shares_replayed = int(getattr(self, "shares_replayed", 0)) + replayed
+            if replayed:
+                print(f"prism coordinator: replayed {replayed} recovered share(s) into the ledger", flush=True)
+            return replayed
         try:
             path.unlink()
         except FileNotFoundError:
@@ -3585,13 +3613,17 @@ class PrismCoordinator:
             print(f"prism coordinator: replayed {replayed} recovered share(s) into the ledger", flush=True)
         return replayed
 
-    def _append_share_entry(self, entry: PendingShareAppend, *, retry_until_stopped: bool = False) -> None:
+    def _append_share_entry(self, entry: PendingShareAppend, *, retry_until_stopped: bool = False) -> bool:
         """Append one accepted share to the ledger, with retry on the writer.
 
         On the writer thread a transient ledger failure retries with capped
         backoff so ordering is preserved and nothing is silently lost; the
         synchronous path (no writer) propagates the exception exactly as the
         pre-async code did.
+
+        Returns True when the share was persisted to the ledger, or False when
+        it was recovered to disk instead (ledger still down at shutdown). The
+        caller uses that to keep the shutdown drain in order.
         """
         backoff_seconds = 0.5
         while True:
@@ -3616,7 +3648,7 @@ class PrismCoordinator:
                     # already-acked, already-counted share -- recover it to
                     # disk for replay on the next start.
                     self._recover_share_to_disk(entry, "ledger unavailable at shutdown")
-                    return
+                    return False
                 backoff_seconds = min(backoff_seconds * 2, 5.0)
                 self._record_heartbeat("share_writer")
         print(
@@ -3626,6 +3658,7 @@ class PrismCoordinator:
             f"credit_policy={entry.credit_policy or 'normal'}",
             flush=True,
         )
+        return True
 
     def accepted_share_difficulty(self, context: PrismJobContext) -> int:
         override = self.share_weights_by_username.get(
