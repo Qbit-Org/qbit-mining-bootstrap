@@ -1181,6 +1181,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         endpoint = config["configurations"][0]["stratum_endpoints"][0]
         self.assertEqual(config["schema"], "prism.dashboard.mining-configuration.v1")
         self.assertEqual(config["configurations"][0]["pool_fee_bps"], 0)
+        self.assertEqual(len(config["configurations"][0]["stratum_endpoints"]), 1)
         self.assertEqual(endpoint["url"], "stratum+tcp://127.0.0.1:3340")
         self.assertEqual(endpoint["default_port"], 3340)
         self.assertEqual(miner["schema"], "prism.dashboard.miner.v1")
@@ -1339,6 +1340,72 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(config["configurations"][0]["pool_fee_bps"], 200)
         self.assertEqual(endpoint["url"], "stratum+tcp://public-pool.example:3335")
         self.assertEqual(endpoint["default_port"], 3335)
+
+    def test_mining_configuration_includes_highdiff_endpoint_when_enabled(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_PUBLIC_STRATUM_HOST": "mine.prism.example",
+                "PRISM_STRATUM_HIGHDIFF_PORT": "4334",
+            },
+            clear=True,
+        ):
+            config = public_api.mining_configuration(FakeCoordinator())
+
+        endpoints = config["configurations"][0]["stratum_endpoints"]
+        self.assertEqual(
+            endpoints,
+            [
+                {
+                    "label": "Primary",
+                    "url": "stratum+tcp://mine.prism.example:3340",
+                    "protocol": "stratum_v1",
+                    "default_port": 3340,
+                },
+                {
+                    "label": "High-diff",
+                    "url": "stratum+tcp://mine.prism.example:4334",
+                    "protocol": "stratum_v1",
+                    "default_port": 4334,
+                },
+            ],
+        )
+
+    def test_mining_configuration_derives_highdiff_endpoint_from_public_stratum_url(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://public-pool.example:3335",
+                "PRISM_STRATUM_HIGHDIFF_PORT": "4334",
+            },
+            clear=True,
+        ):
+            config = public_api.mining_configuration(FakeCoordinator())
+
+        endpoints = config["configurations"][0]["stratum_endpoints"]
+        self.assertEqual(endpoints[0]["url"], "stratum+tcp://public-pool.example:3335")
+        self.assertEqual(endpoints[1]["label"], "High-diff")
+        self.assertEqual(endpoints[1]["url"], "stratum+tcp://public-pool.example:4334")
+        self.assertEqual(endpoints[1]["default_port"], 4334)
+
+    def test_mining_configuration_uses_public_highdiff_stratum_url_override(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://mine.prism.example:3333",
+                "PRISM_STRATUM_HIGHDIFF_PORT": "4334",
+                "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": "stratum+tcp://rentals.prism.example:14334",
+            },
+            clear=True,
+        ):
+            config = public_api.mining_configuration(FakeCoordinator())
+
+        endpoints = config["configurations"][0]["stratum_endpoints"]
+        self.assertEqual(endpoints[0]["url"], "stratum+tcp://mine.prism.example:3333")
+        self.assertEqual(endpoints[0]["default_port"], 3333)
+        self.assertEqual(endpoints[1]["label"], "High-diff")
+        self.assertEqual(endpoints[1]["url"], "stratum+tcp://rentals.prism.example:14334")
+        self.assertEqual(endpoints[1]["default_port"], 14334)
 
     def test_miner_worker_search_and_pagination_use_real_worker_names(self) -> None:
         page_two = self.get_json("/public/v1/miners/miner-a/workers?hide_inactive=false&page=2&limit=1")

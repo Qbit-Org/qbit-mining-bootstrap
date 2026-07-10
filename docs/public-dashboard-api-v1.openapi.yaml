@@ -304,7 +304,9 @@ paths:
       description: >
         Supports a dashboard "next block" or configuration tab without
         hardcoding pool fee policy, block template policy, or public mining
-        endpoints into the frontend.
+        endpoints into the frontend. When the high-diff Stratum listener is
+        enabled, it is advertised as an additional endpoint in
+        `stratum_endpoints`.
       responses:
         "200":
           description: Public mining configuration.
@@ -1203,6 +1205,7 @@ components:
           type: string
         stratum_endpoints:
           type: array
+          description: Primary mining endpoint plus any optional alternate endpoints, such as the high-diff rental port.
           items:
             $ref: "#/components/schemas/MiningEndpoint"
     MiningConfigurationResponse:

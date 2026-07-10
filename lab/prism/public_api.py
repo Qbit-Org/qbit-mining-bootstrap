@@ -449,7 +449,10 @@ def mining_configuration(coordinator: Any) -> dict[str, object]:
     port = int(getattr(coordinator, "port", os.environ.get("PRISM_STRATUM_PORT", "3340")))
     host = os.environ.get("PRISM_PUBLIC_STRATUM_HOST") or str(getattr(coordinator, "bind", "127.0.0.1"))
     url = os.environ.get("PRISM_PUBLIC_STRATUM_URL") or f"stratum+tcp://{host}:{port}"
-    default_port = stratum_url_default_port(url, fallback_port=port)
+    stratum_endpoints = [mining_endpoint("Primary", url, fallback_port=port)]
+    highdiff_endpoint = public_highdiff_stratum_endpoint(host=host)
+    if highdiff_endpoint is not None:
+        stratum_endpoints.append(highdiff_endpoint)
     # Read the fee through the same clamped/robust helper the reward estimate uses so
     # the displayed fee and estimated_reward_bits never diverge (and a bad env value
     # can't 500 this endpoint).
@@ -471,17 +474,56 @@ def mining_configuration(coordinator: Any) -> dict[str, object]:
                     "PRISM_PUBLIC_BLOCK_TEMPLATE_POLICY",
                     "pool-selected qbit block template with PRISM payout settlement",
                 ),
-                "stratum_endpoints": [
-                    {
-                        "label": "Primary",
-                        "url": url,
-                        "protocol": "stratum_v1",
-                        "default_port": default_port,
-                    }
-                ],
+                "stratum_endpoints": stratum_endpoints,
             }
         ],
     }
+
+
+def mining_endpoint(label: str, url: str, *, fallback_port: int) -> dict[str, object]:
+    return {
+        "label": label,
+        "url": url,
+        "protocol": "stratum_v1",
+        "default_port": stratum_url_default_port(url, fallback_port=fallback_port),
+    }
+
+
+def public_highdiff_stratum_endpoint(*, host: str) -> dict[str, object] | None:
+    highdiff_port = optional_tcp_port(os.environ.get("PRISM_STRATUM_HIGHDIFF_PORT"))
+    if highdiff_port is None:
+        return None
+    url = (
+        os.environ.get("PRISM_PUBLIC_STRATUM_HIGHDIFF_URL")
+        or public_stratum_url_with_port(os.environ.get("PRISM_PUBLIC_STRATUM_URL"), highdiff_port)
+        or f"stratum+tcp://{host}:{highdiff_port}"
+    )
+    return mining_endpoint("High-diff", url, fallback_port=highdiff_port)
+
+
+def public_stratum_url_with_port(url: str | None, port: int) -> str | None:
+    if url is None or url.strip() == "":
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    if not parsed.scheme or parsed.hostname is None:
+        return None
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{parsed.scheme}://{host}:{port}"
+
+
+def optional_tcp_port(value: str | None) -> int | None:
+    if value is None or value.strip() == "":
+        return None
+    try:
+        port = int(value)
+    except ValueError:
+        return None
+    return port if 0 < port < 65536 else None
 
 
 def stratum_url_default_port(url: str, *, fallback_port: int) -> int:

@@ -39,6 +39,7 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_STRATUM_PORT": "43340",
                 "PRISM_STRATUM_PORT_HOST": "127.0.0.1:43340",
                 "PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://public-pool.example:3335",
+                "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": "stratum+tcp://public-pool.example:4334",
                 "PRISM_PUBLIC_POOL_FEE_BPS": "200",
                 "PRISM_CTV_SETTLEMENT_ENABLED": "1",
                 "PRISM_DIRECT_COINBASE_PAYOUT_FLOOR_BITS": "20971520",
@@ -123,6 +124,7 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_STRATUM_BIND"], "0.0.0.0")
         self.assertEqual(env["PRISM_STRATUM_PORT"], "43340")
         self.assertEqual(env["PRISM_PUBLIC_STRATUM_URL"], "stratum+tcp://public-pool.example:3335")
+        self.assertEqual(env["PRISM_PUBLIC_STRATUM_HIGHDIFF_URL"], "stratum+tcp://public-pool.example:4334")
         self.assertEqual(env["PRISM_PUBLIC_POOL_FEE_BPS"], "200")
         self.assertEqual(env["PRISM_PUBLIC_CACHE_ENABLED"], "1")
         self.assertEqual(env["PRISM_PUBLIC_CACHE_TTL_SECONDS"], "5")
