@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import ExitStack, contextmanager
+import dataclasses
 import hashlib
 import http.client
 import json
@@ -1045,8 +1046,18 @@ class PrismCoordinator:
             maxsize=MAX_PENDING_SHARE_APPENDS
         )
         self.share_writer_active = False
-        self.share_appends_dropped = 0
         self.share_append_failure_count = 0
+        # An accepted share that the writer cannot persist (a ledger outage that
+        # outlasts shutdown, or a backlog overflow) is written to this recovery
+        # file instead of being silently lost, and replayed into the ledger on
+        # the next start -- an acked share is a payout. The ledger dedups by
+        # share_id, so replay is idempotent.
+        self.share_recovery_path = Path(
+            env("PRISM_SHARE_RECOVERY_PATH", str(self.audit_dir / "prism-unpersisted-shares.jsonl"))
+        )
+        self.share_recovery_lock = threading.Lock()
+        self.shares_recovered_to_disk = 0
+        self.shares_replayed = 0
         self.job_build_failure_count = 0
         self.tip_refresh_job_count = 0
         self.post_accept_refresh_failure_count = 0
@@ -1930,6 +1941,9 @@ class PrismCoordinator:
                 daemon=True,
             )
             block_submitter_thread.start()
+            # Replay any shares stranded on disk by a prior ledger-outage
+            # shutdown before serving, so no acked share is lost across restart.
+            self.replay_recovered_shares()
             self._record_heartbeat("share_writer")
             self.share_writer_active = True
             share_writer_thread = threading.Thread(
@@ -3436,28 +3450,17 @@ class PrismCoordinator:
             queue_obj.put_nowait(entry)
         except queue.Full:
             # A full backlog means the ledger has been unreachable for a long
-            # time; dropping the oldest keeps the pool serving miners while
-            # counting the loss loudly instead of blocking every ack.
+            # time. Make room by taking the oldest, but do not lose it: an acked
+            # share is a payout, so it goes to the recovery file for replay.
             try:
                 dropped = queue_obj.get_nowait()
-                print(
-                    "prism coordinator: dropped oldest queued share append "
-                    f"share_id={dropped.pending_share.share_id} (writer backlog full)",
-                    flush=True,
-                )
-                with self.lock:
-                    self.share_appends_dropped = (
-                        int(getattr(self, "share_appends_dropped", 0)) + 1
-                    )
+                self._recover_share_to_disk(dropped, "writer backlog full")
             except queue.Empty:
                 pass
             try:
                 queue_obj.put_nowait(entry)
             except queue.Full:
-                with self.lock:
-                    self.share_appends_dropped = (
-                        int(getattr(self, "share_appends_dropped", 0)) + 1
-                    )
+                self._recover_share_to_disk(entry, "writer backlog full")
 
     def share_append_loop(self) -> None:
         while True:
@@ -3474,6 +3477,87 @@ class PrismCoordinator:
                     return
                 continue
             self._append_share_entry(entry, retry_until_stopped=True)
+
+    def _recover_share_to_disk(self, entry: PendingShareAppend, reason: str) -> None:
+        """Durably capture an acked share the writer could not persist.
+
+        Appends the canonical pending-share JSON to the recovery file (fsynced)
+        so a ledger outage or shutdown never silently loses a share the miner
+        was told was accepted; replayed on the next start. Best-effort: if even
+        the recovery write fails, log loudly rather than raise on the writer.
+        """
+        path = getattr(self, "share_recovery_path", None)
+        if path is None:
+            print(
+                "prism coordinator: WOULD LOSE acked share (no recovery path) "
+                f"share_id={entry.pending_share.share_id} reason={reason}",
+                flush=True,
+            )
+            return
+        try:
+            payload = json.dumps(dataclasses.asdict(entry.pending_share), separators=(",", ":"))
+        except Exception:
+            payload = None
+        with getattr(self, "share_recovery_lock", threading.Lock()):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if payload is None:
+                    raise ValueError("pending share is not serializable")
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(payload + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                self.shares_recovered_to_disk = (
+                    int(getattr(self, "shares_recovered_to_disk", 0)) + 1
+                )
+                print(
+                    "prism coordinator: recovered unpersisted acked share to disk "
+                    f"share_id={entry.pending_share.share_id} reason={reason}",
+                    flush=True,
+                )
+            except Exception:
+                print(
+                    "prism coordinator: FAILED to recover acked share to disk; "
+                    f"share may be lost share_id={entry.pending_share.share_id} reason={reason}",
+                    flush=True,
+                )
+                traceback.print_exc()
+
+    def replay_recovered_shares(self) -> int:
+        """Replay any recovery-file shares into the ledger at startup.
+
+        Idempotent: the ledger dedups by share_id, so a share partially handled
+        before a crash is not double-counted. The file is cleared only after a
+        clean pass so a failure here never drops shares.
+        """
+        path = getattr(self, "share_recovery_path", None)
+        if path is None or not path.exists():
+            return 0
+        try:
+            lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except Exception:
+            print("prism coordinator: could not read share recovery file", flush=True)
+            traceback.print_exc()
+            return 0
+        replayed = 0
+        for line in lines:
+            try:
+                pending = PendingShare(**json.loads(line))
+                self.ledger.append(pending)
+                replayed += 1
+            except Exception:
+                print("prism coordinator: failed to replay a recovered share; keeping the file", flush=True)
+                traceback.print_exc()
+                self.shares_replayed = int(getattr(self, "shares_replayed", 0)) + replayed
+                return replayed
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        self.shares_replayed = int(getattr(self, "shares_replayed", 0)) + replayed
+        if replayed:
+            print(f"prism coordinator: replayed {replayed} recovered share(s) into the ledger", flush=True)
+        return replayed
 
     def _append_share_entry(self, entry: PendingShareAppend, *, retry_until_stopped: bool = False) -> None:
         """Append one accepted share to the ledger, with retry on the writer.
@@ -3502,6 +3586,10 @@ class PrismCoordinator:
                 )
                 traceback.print_exc()
                 if self.stop_event.wait(backoff_seconds):
+                    # Shutting down mid-outage: do not silently drop this
+                    # already-acked, already-counted share -- recover it to
+                    # disk for replay on the next start.
+                    self._recover_share_to_disk(entry, "ledger unavailable at shutdown")
                     return
                 backoff_seconds = min(backoff_seconds * 2, 5.0)
                 self._record_heartbeat("share_writer")
@@ -4441,9 +4529,12 @@ class PrismCoordinator:
             "# HELP qbit_prism_share_append_failures_total Ledger share appends that failed and were retried by the writer thread.",
             "# TYPE qbit_prism_share_append_failures_total counter",
             f"qbit_prism_share_append_failures_total {int(getattr(self, 'share_append_failure_count', 0))}",
-            "# HELP qbit_prism_share_appends_dropped_total Accepted shares dropped because the writer backlog overflowed.",
-            "# TYPE qbit_prism_share_appends_dropped_total counter",
-            f"qbit_prism_share_appends_dropped_total {int(getattr(self, 'share_appends_dropped', 0))}",
+            "# HELP qbit_prism_shares_recovered_to_disk_total Acked shares written to the recovery file after a ledger outage instead of being lost.",
+            "# TYPE qbit_prism_shares_recovered_to_disk_total counter",
+            f"qbit_prism_shares_recovered_to_disk_total {int(getattr(self, 'shares_recovered_to_disk', 0))}",
+            "# HELP qbit_prism_shares_replayed_total Recovery-file shares replayed into the ledger at startup.",
+            "# TYPE qbit_prism_shares_replayed_total counter",
+            f"qbit_prism_shares_replayed_total {int(getattr(self, 'shares_replayed', 0))}",
             "# HELP qbit_prism_tip_refresh_jobs_total Client jobs refreshed after qbit tip/template changes.",
             "# TYPE qbit_prism_tip_refresh_jobs_total counter",
             f"qbit_prism_tip_refresh_jobs_total {self.tip_refresh_job_count}",

@@ -551,8 +551,11 @@ def coordinator() -> PrismCoordinator:
     server.block_candidates_dropped = 0
     server.share_append_queue = queue.Queue(maxsize=8)
     server.share_writer_active = False
-    server.share_appends_dropped = 0
     server.share_append_failure_count = 0
+    server.share_recovery_path = None
+    server.share_recovery_lock = threading.Lock()
+    server.shares_recovered_to_disk = 0
+    server.shares_replayed = 0
     server.current_tip_first_seen = None
     server.current_tip_parent = None
     server.stale_grace_seconds = 3.0
@@ -3312,31 +3315,92 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.share_append_failure_count, 2)
         self.assertEqual(waited.call_count, 2)
 
-    def test_share_append_backlog_overflow_drops_oldest_and_counts(self) -> None:
+    def _pending_append(self, tag: str) -> PendingShareAppend:
+        from lab.prism.share_ledger import PendingShare
+
+        return PendingShareAppend(
+            pending_share=PendingShare(
+                share_id=f"miner-a:{tag}",
+                miner_id="miner-a",
+                order_key="miner-a",
+                p2mr_program_hex="11" * 32,
+                share_difficulty=1,
+                network_difficulty=1,
+                template_height=10,
+                job_id="job-1",
+                job_issued_at_ms=1,
+                accepted_at_ms=2,
+                ntime=1_700_000_000,
+            ),
+            username="miner-a",
+            job_id="job-1",
+            block_hash_hex=tag * 32,
+            collection_only=False,
+            credit_policy=None,
+        )
+
+    def test_share_append_backlog_overflow_recovers_oldest_to_disk(self) -> None:
         server, _state, _ledger = submit_coordinator()
         server.share_append_queue = queue.Queue(maxsize=2)
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
 
-        def entry(tag: str) -> PendingShareAppend:
-            return PendingShareAppend(
-                pending_share=SimpleNamespace(share_id=f"miner-a:{tag}"),
-                username="miner-a",
-                job_id="job-1",
-                block_hash_hex=tag * 32,
-                collection_only=False,
-                credit_policy=None,
+            server.enqueue_share_append(self._pending_append("aa"))
+            server.enqueue_share_append(self._pending_append("bb"))
+            server.enqueue_share_append(self._pending_append("cc"))
+
+            # The oldest was recovered to disk (not lost); the newest two stay
+            # queued.
+            self.assertEqual(server.shares_recovered_to_disk, 1)
+            remaining = [
+                server.share_append_queue.get_nowait().pending_share.share_id
+                for _ in range(2)
+            ]
+            self.assertEqual(remaining, ["miner-a:bb", "miner-a:cc"])
+            recovered = [
+                json.loads(line)["share_id"]
+                for line in server.share_recovery_path.read_text().splitlines()
+            ]
+            self.assertEqual(recovered, ["miner-a:aa"])
+        self.assertIn("qbit_prism_shares_recovered_to_disk_total 1", server.metrics_payload())
+
+    def test_writer_recovers_acked_share_on_shutdown_during_outage(self) -> None:
+        server, _state, ledger = submit_coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+
+            class DownLedger(type(ledger)):
+                def append(self, pending: object) -> object:
+                    raise RuntimeError("postgres unavailable")
+
+            server.ledger = DownLedger()
+            entry = self._pending_append("ee")
+            # First backoff wait returns True (stop requested): the share must
+            # be recovered, not silently dropped.
+            with patch.object(server.stop_event, "wait", return_value=True):
+                server._append_share_entry(entry, retry_until_stopped=True)
+
+            self.assertEqual(server.shares_recovered_to_disk, 1)
+            recovered = json.loads(server.share_recovery_path.read_text().strip())
+            self.assertEqual(recovered["share_id"], "miner-a:ee")
+
+    def test_replay_recovered_shares_appends_and_clears_file(self) -> None:
+        server, _state, ledger = submit_coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            server._recover_share_to_disk(self._pending_append("f1"), "test")
+            server._recover_share_to_disk(self._pending_append("f2"), "test")
+
+            replayed = server.replay_recovered_shares()
+
+            self.assertEqual(replayed, 2)
+            self.assertEqual(server.shares_replayed, 2)
+            self.assertEqual(
+                [p.share_id for p in ledger.pending], ["miner-a:f1", "miner-a:f2"]
             )
-
-        server.enqueue_share_append(entry("aa"))
-        server.enqueue_share_append(entry("bb"))
-        server.enqueue_share_append(entry("cc"))
-
-        self.assertEqual(server.share_appends_dropped, 1)
-        remaining = [
-            server.share_append_queue.get_nowait().pending_share.share_id
-            for _ in range(2)
-        ]
-        self.assertEqual(remaining, ["miner-a:bb", "miner-a:cc"])
-        self.assertIn("qbit_prism_share_appends_dropped_total 1", server.metrics_payload())
+            # File is cleared after a clean replay so shares are not re-added.
+            self.assertFalse(server.share_recovery_path.exists())
+            self.assertEqual(server.replay_recovered_shares(), 0)
 
     def test_orphaned_block_candidate_keeps_share_credit(self) -> None:
         # Option-A semantics: a share that met its target stays credited even
