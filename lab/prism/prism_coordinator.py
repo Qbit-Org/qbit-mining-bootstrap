@@ -2464,9 +2464,11 @@ class PrismCoordinator:
             block_hash=block_hash,
         )
 
-    def refresh_jobs_after_accepted_block(self, *, block_height: int, block_hash: str) -> int:
+    def refresh_jobs_after_accepted_block(
+        self, *, block_height: int, block_hash: str, heartbeat_name: str = "qbit_blockpoll"
+    ) -> int:
         try:
-            refreshed = self.poll_qbit_tip_template_once()
+            refreshed = self.poll_qbit_tip_template_once(heartbeat_name=heartbeat_name)
         except Exception:
             with self.lock:
                 self.post_accept_refresh_failure_count += 1
@@ -3407,12 +3409,17 @@ class PrismCoordinator:
             # below its assigned target), so it does not affect the async
             # common-path latency. On failure the submitter already recorded
             # the specific block-failure reason; reject the miner as
-            # low-difficulty (the share was, after all, below its target).
+            # low-difficulty (the share was, after all, below its target). The
+            # submitter already recorded the specific block-failure reason in
+            # block_candidate_abandoned_counts; reject_stratum additionally counts
+            # the miner-facing rejection (globally and per worker) so this rare
+            # synchronous path is not missing from the rejection metrics.
             if not self.submit_block_candidate(candidate):
-                raise StratumError(
+                self.reject_stratum(
                     23,
+                    PRISM_REJECTION_LOW_DIFFICULTY,
                     "low difficulty share",
-                    reason=PRISM_REJECTION_LOW_DIFFICULTY,
+                    worker=worker_name,
                 )
             return False
         # A block-worthy submission that met the share target is a valid share
@@ -4258,10 +4265,14 @@ class PrismCoordinator:
             else:
                 # Fresh work is the most urgent post-block action: push it
                 # directly from the submitter instead of waiting for the
-                # winning client's next message.
+                # winning client's next message. Stamp the block_submitter
+                # heartbeat (not the poller's) through the refresh so a long
+                # multi-client push on this thread is not mistaken for a hang
+                # and does not trip a false liveness-watchdog exit.
                 self.refresh_jobs_after_accepted_block(
                     block_height=after_height,
                     block_hash=block_hash,
+                    heartbeat_name="block_submitter",
                 )
             return True
         finally:

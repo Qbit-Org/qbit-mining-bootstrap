@@ -4889,6 +4889,32 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason, PRISM_REJECTION_LOW_DIFFICULTY)
         self.assertEqual(len(ledger.pending), 0)
         self.assertEqual(server.block_candidate_queue.qsize(), 0)
+        # The reject is counted (globally and for the worker), not just the
+        # block-abandonment reason -- this synchronous path used to skip it.
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 1)
+        self.assertEqual(server.low_difficulty_share_count, 1)
+
+    def test_post_block_refresh_stamps_block_submitter_heartbeat(self) -> None:
+        # The post-block job push runs on the block-submitter thread, so it must
+        # stamp block_submitter (not the poller heartbeat) through the refresh,
+        # or a long multi-client push trips a false liveness-watchdog exit.
+        server, _state, _ledger = submit_coordinator()
+        seen: list[str] = []
+
+        def fake_poll(*, heartbeat_name: str = "qbit_blockpoll") -> int:
+            seen.append(heartbeat_name)
+            return 0
+
+        server.poll_qbit_tip_template_once = fake_poll  # type: ignore[method-assign]
+        server.refresh_jobs_after_accepted_block(
+            block_height=10, block_hash="bb" * 32, heartbeat_name="block_submitter"
+        )
+        self.assertEqual(seen, ["block_submitter"])
+
+        # The client-thread pending refresh keeps the default poller heartbeat.
+        seen.clear()
+        server.refresh_jobs_after_accepted_block(block_height=11, block_hash="cc" * 32)
+        self.assertEqual(seen, ["qbit_blockpoll"])
 
     def test_low_difficulty_submission_without_block_solve_is_rejected(self) -> None:
         server, state, ledger = submit_coordinator()
