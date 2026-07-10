@@ -699,13 +699,13 @@ class PendingShareAppend:
 class PrismBlockCandidate:
     """A block-worthy submission queued for the block-submitter thread.
 
-    The share that produced it was acknowledged (and, when it met the share
-    target, credited) on the client thread at submit time; this record carries
-    everything the submitter needs to land the block itself. When the hash
-    solved the block but missed the share target (floor above network
-    difficulty), credit_share_on_accept defers the share credit until qbitd
-    accepts the block, preserving the pre-async payout semantics for that
-    edge.
+    A share that met its target is acknowledged and credited on the client
+    thread, then queued here for the submitter to land the block off the hot
+    path. When the hash solved the block but missed the share target (floor
+    above network difficulty), credit_share_on_accept is set and the candidate
+    is instead submitted synchronously by handle_submit: that share is valid
+    only if the block lands, so its credit and the miner's accept/reject follow
+    the block outcome directly rather than being queued.
     """
 
     context: PrismJobContext
@@ -3331,33 +3331,46 @@ class PrismCoordinator:
                 credit_policy=credit_policy,
             )
             return False
+        candidate = PrismBlockCandidate(
+            context=context,
+            submission=submission,
+            extranonce1_hex=client.extranonce1_hex,
+            extranonce2_hex=extranonce2_hex,
+            pending_share=pending_share,
+            client=client,
+            credit_share_on_accept=not submission.share_pass,
+        )
+        if candidate.credit_share_on_accept:
+            # The hash solved a block but missed the assigned share target
+            # (possible only while the listener floor sits above network
+            # difficulty). It is a valid share ONLY if the block lands, so land
+            # it synchronously: the miner's accept/reject and the ledger credit
+            # then both reflect the real outcome -- never an "accepted" ack with
+            # no ledger row. This path is rare (an honest miner does not submit
+            # below its assigned target), so it does not affect the async
+            # common-path latency. On failure the submitter already recorded
+            # the specific block-failure reason; reject the miner as
+            # low-difficulty (the share was, after all, below its target).
+            if not self.submit_block_candidate(candidate):
+                raise StratumError(
+                    23,
+                    "low difficulty share",
+                    reason=PRISM_REJECTION_LOW_DIFFICULTY,
+                )
+            return False
         # A block-worthy submission that met the share target is a valid share
         # regardless of the block's fate: credit it now, acknowledge the miner
         # immediately, and land the block from the dedicated submitter thread
         # (ckpool/btcpool/StratumV2 semantics). An orphaned candidate keeps its
-        # share credit. Sub-share-target block solves (floor above network
-        # difficulty) defer their share credit to block acceptance, exactly as
-        # before the submitter went asynchronous.
-        credit_share_on_accept = not submission.share_pass
-        if not credit_share_on_accept:
-            self.append_accepted_share(
-                client,
-                context,
-                submission,
-                pending_share,
-                credit_policy=credit_policy,
-            )
-        self.enqueue_block_candidate(
-            PrismBlockCandidate(
-                context=context,
-                submission=submission,
-                extranonce1_hex=client.extranonce1_hex,
-                extranonce2_hex=extranonce2_hex,
-                pending_share=pending_share,
-                client=client,
-                credit_share_on_accept=credit_share_on_accept,
-            )
+        # share credit.
+        self.append_accepted_share(
+            client,
+            context,
+            submission,
+            pending_share,
+            credit_policy=credit_policy,
         )
+        self.enqueue_block_candidate(candidate)
         return False
 
     def pending_share_from_submission(
@@ -3899,6 +3912,10 @@ class PrismCoordinator:
                     worker=worker,
                 )
                 return False
+            # Heartbeat around each blocking step of the persist -> submitblock
+            # -> confirm stretch so a healthy-but-slow submit never trips the
+            # liveness watchdog, while a genuinely wedged call still does.
+            self._record_heartbeat("block_submitter")
             persistence = self.ledger.persist_accepted_block(
                 block_hash=submission.block_hash_hex,
                 block_height=expected_height,
@@ -3906,8 +3923,10 @@ class PrismCoordinator:
                 final_bundle=final_bundle,
                 audit_report=report,
             )
+            self._record_heartbeat("block_submitter")
             result = self.rpc.call("submitblock", [submission.block_hex])
             after_height = int(self.rpc.call("getblockcount"))
+            self._record_heartbeat("block_submitter")
             if result not in (None, "duplicate"):
                 self.reject_prepared_block(
                     block_hash=submission.block_hash_hex,
@@ -3943,6 +3962,7 @@ class PrismCoordinator:
                     worker=worker,
                 )
                 return False
+            self._record_heartbeat("block_submitter")
             confirmation = self.ledger.confirm_accepted_block(
                 block_hash=block_hash,
                 active_tip_height=after_height,

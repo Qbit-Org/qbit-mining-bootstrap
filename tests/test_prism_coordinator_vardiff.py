@@ -4586,10 +4586,11 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         )
         self.assertGreaterEqual(float(context.job.share_difficulty), 2000000.0)
 
-    def test_block_worthy_submission_below_share_target_still_submits_block(self) -> None:
+    def test_block_worthy_submission_below_share_target_submits_synchronously(self) -> None:
         # With the floor above network difficulty a hash can solve a block
-        # while missing the advertised share target. The block must be
-        # submitted, not rejected as a low-difficulty share.
+        # while missing the advertised share target. It is a valid share only
+        # if the block lands, so it submits synchronously (not via the async
+        # queue) and the share credit lands with it.
         server, state, ledger = submit_coordinator()
         submission = SimpleNamespace(
             header_hex="aa" * 80,
@@ -4597,6 +4598,16 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             share_pass=False,
             block_pass=True,
         )
+        submitted: list[object] = []
+
+        def fake_submit(candidate: object) -> bool:
+            submitted.append(candidate)
+            server.append_accepted_share(
+                candidate.client, candidate.context, candidate.submission, candidate.pending_share
+            )
+            return True
+
+        server.submit_block_candidate = fake_submit  # type: ignore[method-assign]
         with patch(
             "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
             return_value=submission,
@@ -4608,14 +4619,37 @@ class PrismStampedJobFloorTests(unittest.TestCase):
 
         self.assertFalse(should_close)
         self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 0)
-        # Below the share target nothing is credited up front: the candidate
-        # carries credit_share_on_accept so the share credit lands only if the
-        # block does (the pre-async payout semantics for this floor edge).
+        self.assertEqual(len(submitted), 1)
+        self.assertTrue(submitted[0].credit_share_on_accept)
+        # Nothing was queued to the async submitter; it landed inline.
+        self.assertEqual(server.block_candidate_queue.qsize(), 0)
+        self.assertEqual(len(ledger.pending), 1)
+
+    def test_block_worthy_below_target_rejects_low_difficulty_when_block_fails(self) -> None:
+        # If the block does not land, the below-share-target hash earns nothing
+        # and the miner is rejected as low-difficulty -- never acked accepted
+        # with no ledger row.
+        server, state, ledger = submit_coordinator()
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="bb" * 32,
+            share_pass=False,
+            block_pass=True,
+        )
+        server.submit_block_candidate = lambda candidate: False  # type: ignore[method-assign]
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_LOW_DIFFICULTY)
         self.assertEqual(len(ledger.pending), 0)
-        self.assertEqual(server.block_candidate_queue.qsize(), 1)
-        queued = server.block_candidate_queue.get_nowait()
-        self.assertIs(queued.submission, submission)
-        self.assertTrue(queued.credit_share_on_accept)
+        self.assertEqual(server.block_candidate_queue.qsize(), 0)
 
     def test_low_difficulty_submission_without_block_solve_is_rejected(self) -> None:
         server, state, ledger = submit_coordinator()
