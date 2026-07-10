@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import tempfile
 import threading
@@ -25,6 +26,7 @@ from lab.prism.prism_coordinator import (
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
     PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
     PRISM_REJECTION_LOW_DIFFICULTY,
+    PrismBlockCandidate,
     PRISM_REJECTION_POOL_CLOSED,
     PRISM_REJECTION_REASON_IDS,
     PRISM_REJECTION_STALE_JOB,
@@ -544,6 +546,8 @@ def coordinator() -> PrismCoordinator:
     server.worker_share_counts = {}
     server.worker_rejection_counts = {}
     server.evicted_job_graveyard = {}
+    server.block_candidate_queue = queue.Queue(maxsize=8)
+    server.block_candidates_dropped = 0
     server.current_tip_first_seen = None
     server.current_tip_parent = None
     server.stale_grace_seconds = 3.0
@@ -635,6 +639,27 @@ def submit_coordinator(tip: str = "00" * 32) -> tuple[PrismCoordinator, ClientSt
     state.active_job_ids = {"job-1"}
     server.jobs["job-1"] = context
     return server, state, ledger
+
+
+def block_candidate(
+    server: PrismCoordinator,
+    state: ClientState,
+    submission: object,
+    *,
+    job_id: str = "job-1",
+    pending_share: object | None = None,
+    credit_share_on_accept: bool = False,
+) -> PrismBlockCandidate:
+    return PrismBlockCandidate(
+        context=server.jobs[job_id],
+        submission=submission,
+        extranonce1_hex=state.extranonce1_hex,
+        extranonce2_hex="00" * 8,
+        pending_share=pending_share
+        or SimpleNamespace(share_id="miner-a:" + submission.block_hash_hex),
+        client=state,
+        credit_share_on_accept=credit_share_on_accept,
+    )
 
 
 class PrismCoordinatorVardiffTests(unittest.TestCase):
@@ -3095,17 +3120,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             block_hex="00",
         )
 
-        with self.assertRaises(StratumError) as raised:
-            server.submit_block_candidate(
-                server.jobs["job-1"],
-                submission,
-                state.extranonce1_hex,
-                "00" * 8,
-                pending_share=SimpleNamespace(share_id="miner-a:" + "ef" * 32),
-                client=state,
-            )
+        accepted = server.submit_block_candidate(block_candidate(server, state, submission))
 
-        self.assertEqual(raised.exception.code, 21)
+        self.assertFalse(accepted)
         self.assertEqual(server.stale_share_count, 1)
         self.assertEqual(ledger.persisted, [])
         self.assertEqual(ledger.pending, [])
@@ -3136,18 +3153,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             block_hex="00",
         )
 
-        with self.assertRaises(StratumError) as raised:
-            server.submit_block_candidate(
-                server.jobs["job-1"],
-                submission,
-                state.extranonce1_hex,
-                "00" * 8,
-                pending_share=SimpleNamespace(share_id="miner-a:" + "f1" * 32),
-                client=state,
-            )
+        accepted = server.submit_block_candidate(block_candidate(server, state, submission))
 
-        self.assertEqual(raised.exception.code, 20)
-        self.assertEqual(raised.exception.reason, PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE)
+        self.assertFalse(accepted)
         self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE], 1)
         self.assertEqual(ledger.persisted, [])
         self.assertEqual(ledger.pending, [])
@@ -3214,7 +3222,88 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.stale_share_count, 1)
         self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_STALE_JOB], 1)
 
-    def test_block_candidate_is_not_appended_before_submit_path(self) -> None:
+    def test_orphaned_block_candidate_keeps_share_credit(self) -> None:
+        # Option-A semantics: a share that met its target stays credited even
+        # when its block candidate loses the tip race in the submitter.
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="cc" * 32,
+            share_pass=True,
+            block_pass=True,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertEqual(len(ledger.pending), 1)
+        # The tip moves before the submitter drains the candidate.
+        server.rpc = TipRpc(new_tip)
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(server.accepted_block_count, 0)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_STALE_JOB], 1)
+        # The credited share survives the lost block race.
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.persisted, [])
+
+    def test_block_candidate_queue_overflow_drops_oldest(self) -> None:
+        server, state, _ledger = submit_coordinator()
+        server.block_candidate_queue = queue.Queue(maxsize=2)
+
+        def candidate(tag: str) -> PrismBlockCandidate:
+            return block_candidate(
+                server,
+                state,
+                SimpleNamespace(block_hash_hex=tag * 32, share_pass=True, block_pass=True),
+            )
+
+        server.enqueue_block_candidate(candidate("aa"))
+        server.enqueue_block_candidate(candidate("bb"))
+        server.enqueue_block_candidate(candidate("cc"))
+
+        self.assertEqual(server.block_candidates_dropped, 1)
+        self.assertEqual(server.block_candidate_queue.qsize(), 2)
+        remaining = [
+            server.block_candidate_queue.get_nowait().submission.block_hash_hex
+            for _ in range(2)
+        ]
+        # The oldest candidate (built on the oldest tip) was dropped.
+        self.assertEqual(remaining, ["bb" * 32, "cc" * 32])
+        self.assertIn(
+            "qbit_prism_block_candidates_dropped_total 1", server.metrics_payload()
+        )
+
+    def test_block_submitter_drops_candidate_when_pool_closed(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server.accepted_block_count = 1
+        server.max_blocks = 1
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="dd" * 32,
+            block_hex="00",
+        )
+
+        accepted = server.submit_block_candidate(block_candidate(server, state, submission))
+
+        self.assertFalse(accepted)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_POOL_CLOSED], 1)
+        self.assertEqual(ledger.persisted, [])
+
+    def test_block_worthy_share_is_credited_and_enqueued_before_block_submission(self) -> None:
+        # The share ack must never wait on the block path: a block-worthy
+        # share that met its target is credited immediately and the candidate
+        # is queued for the submitter thread. Nothing submits synchronously
+        # (the fixture RPC would raise on an unexpected submitblock call).
         server, state, ledger = submit_coordinator()
         submission = SimpleNamespace(
             header_hex="aa" * 80,
@@ -3222,14 +3311,6 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             share_pass=True,
             block_pass=True,
         )
-        captured: dict[str, object] = {}
-
-        def fake_submit(*args: object, **kwargs: object) -> bool:
-            self.assertEqual(len(ledger.pending), 0)
-            captured["pending"] = kwargs["pending_share"]
-            return False
-
-        server.submit_block_candidate = fake_submit  # type: ignore[method-assign]
 
         with patch(
             "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
@@ -3241,8 +3322,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
 
         self.assertFalse(should_close)
-        self.assertIn("pending", captured)
-        self.assertEqual(len(ledger.pending), 0)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertIsNone(ledger.pending[0].credit_policy)
+        self.assertEqual(server.block_candidate_queue.qsize(), 1)
+        queued = server.block_candidate_queue.get_nowait()
+        self.assertIs(queued.submission, submission)
+        self.assertFalse(queued.credit_share_on_accept)
 
     def test_block_candidate_persists_verified_bundle_before_submitblock(self) -> None:
         server, state, ledger = submit_coordinator()
@@ -3285,14 +3370,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
             pending = SimpleNamespace(share_id="miner-a:" + block_hash)
 
-            server.submit_block_candidate(
-                server.jobs["job-1"],
-                submission,
-                state.extranonce1_hex,
-                "00" * 8,
-                pending_share=pending,
-                client=state,
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission, pending_share=pending)
             )
+            self.assertTrue(accepted)
 
             live_files = sorted(Path(tempdir).glob("prism-live-audit-bundle-[0-9]*.json"))
             self.assertEqual(len(live_files), 1)
@@ -3320,13 +3401,17 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(ledger.persisted[0]["submit_seen_at_persist"])
         self.assertEqual(ledger.confirmed[0]["block_hash"], block_hash)
         self.assertTrue(ledger.confirmed[0]["submit_seen_at_confirm"])
-        self.assertEqual(len(ledger.pending), 1)
+        # The share credit happens on the client thread at submit time now;
+        # the block path itself appends nothing.
+        self.assertEqual(len(ledger.pending), 0)
+        # stop_after_block fires from the submitter once the block confirms.
+        self.assertTrue(server.stop_event.is_set())
         self.assertEqual(server.latest_evidence["persistence"]["block_count"], 1)
         self.assertEqual(server.latest_evidence["confirmation"]["confirmed_count"], 1)
         # Evidence carries an aggregate miner count, not a materialized list of
         # every miner id (which scanned the whole ledger twice under the lock).
-        self.assertEqual(server.latest_evidence["accepted_share_count"], 1)
-        self.assertEqual(server.latest_evidence["distinct_miner_count"], 1)
+        self.assertEqual(server.latest_evidence["accepted_share_count"], 0)
+        self.assertEqual(server.latest_evidence["distinct_miner_count"], 0)
         self.assertNotIn("distinct_miners", server.latest_evidence)
 
     def test_audit_retention_prunes_only_live_and_candidate_files(self) -> None:
@@ -3435,6 +3520,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                         "params": ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
                     },
                 )
+                # The ack goes out before the block path runs; draining the
+                # submitter queue lands the block and pushes fresh work.
+                self.assertEqual(sent, [{"id": "submit-1", "result": True, "error": None}])
+                self.assertTrue(server.submit_next_block_candidate())
 
         self.assertEqual(sent[0], {"id": "submit-1", "result": True, "error": None})
         self.assertEqual([payload.get("method") for payload in sent[1:]], ["mining.set_difficulty", "mining.notify"])
@@ -3523,6 +3612,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                         "params": ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
                     },
                 )
+                self.assertTrue(server.submit_next_block_candidate())
 
         self.assertEqual(sent, [{"id": "submit-1", "result": True, "error": None}])
         self.assertEqual(server.accepted_block_count, 1)
@@ -3599,6 +3689,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                         "params": ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
                     },
                 )
+                self.assertTrue(server.submit_next_block_candidate())
 
         self.assertEqual(sent[0], {"id": "submit-1", "result": True, "error": None})
         self.assertEqual(sent[1]["method"], "mining.set_difficulty")
@@ -3642,22 +3733,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 block_hex="00",
             )
 
-            with self.assertRaises(StratumError) as raised:
-                server.submit_block_candidate(
-                    server.jobs["job-1"],
-                    submission,
-                    state.extranonce1_hex,
-                    "00" * 8,
-                    pending_share=SimpleNamespace(share_id="miner-a:" + block_hash),
-                    client=state,
-                )
+            accepted = server.submit_block_candidate(block_candidate(server, state, submission))
 
+        self.assertFalse(accepted)
         self.assertEqual(ledger.persisted[0]["block_hash"], block_hash)
         self.assertEqual(ledger.rejected[0]["block_hash"], block_hash)
         self.assertEqual(ledger.rejected[0]["active_tip_height"], 9)
         self.assertEqual(ledger.reversed, [])
         self.assertEqual(len(ledger.pending), 0)
-        self.assertEqual(raised.exception.reason, PRISM_REJECTION_SUBMITBLOCK_REJECTED)
         self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_SUBMITBLOCK_REJECTED], 1)
 
 
@@ -4398,21 +4481,6 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             share_pass=False,
             block_pass=True,
         )
-        submitted: dict[str, object] = {}
-
-        def fake_submit_block_candidate(
-            context: object,
-            sub: object,
-            extranonce1_hex: str,
-            extranonce2_hex: str,
-            *,
-            pending_share: object,
-            client: ClientState,
-        ) -> bool:
-            submitted.update({"submission": sub, "pending_share": pending_share})
-            return True
-
-        server.submit_block_candidate = fake_submit_block_candidate  # type: ignore[method-assign]
         with patch(
             "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
             return_value=submission,
@@ -4422,10 +4490,16 @@ class PrismStampedJobFloorTests(unittest.TestCase):
                 ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
             )
 
-        self.assertTrue(should_close)
-        self.assertIs(submitted["submission"], submission)
+        self.assertFalse(should_close)
         self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 0)
+        # Below the share target nothing is credited up front: the candidate
+        # carries credit_share_on_accept so the share credit lands only if the
+        # block does (the pre-async payout semantics for this floor edge).
         self.assertEqual(len(ledger.pending), 0)
+        self.assertEqual(server.block_candidate_queue.qsize(), 1)
+        queued = server.block_candidate_queue.get_nowait()
+        self.assertIs(queued.submission, submission)
+        self.assertTrue(queued.credit_share_on_accept)
 
     def test_low_difficulty_submission_without_block_solve_is_rejected(self) -> None:
         server, state, ledger = submit_coordinator()

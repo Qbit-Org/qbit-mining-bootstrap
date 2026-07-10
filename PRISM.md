@@ -193,7 +193,17 @@ Operational knobs shared by the PRISM listeners:
 Stale-grace crediting never submits a block candidate. The submitted header must
 still satisfy the assigned share target, is marked with `credit_policy:
 stale-grace` in the accepted-share record, and participates in vardiff and the
-PRISM reward window like any other accepted share. Audit bundles containing any
+PRISM reward window like any other accepted share.
+
+Block-worthy submissions are acknowledged like any other share and the block
+candidate is landed by a dedicated submitter thread (audit build, verify,
+persist, `submitblock`, confirm), so no miner's share acknowledgement ever
+waits on block submission. A share that met its assigned target keeps its
+credit even when its block candidate loses the tip race; block-path failures
+are still counted under the existing rejection reason IDs. The one exception
+is a hash that solves a block while missing the share target (possible while
+the listener floor sits above network difficulty): its share credit lands only
+when qbitd accepts the block, as before. Audit bundles containing any
 `credit_policy` row use `qbit.prism.audit-bundle.v1.1`; upgrade mirrors and
 verifiers before enabling a non-zero stale-grace window in production.
 

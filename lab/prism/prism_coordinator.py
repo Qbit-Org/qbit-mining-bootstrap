@@ -10,6 +10,7 @@ import http.client
 import json
 import math
 import os
+import queue
 import shlex
 import signal
 import socket
@@ -72,6 +73,11 @@ DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
+# Block candidates queue to a dedicated submitter thread so the miner's share
+# ack never waits on audit/persist/submitblock. The bound only guards runaway
+# growth: when it overflows, the OLDEST candidate drops (it was built on the
+# oldest tip and has already lost its race).
+MAX_PENDING_BLOCK_CANDIDATES = 32
 # Evicted jobs are retained briefly so shares already in flight when a
 # clean_jobs refresh evicted their job can still be validated instead of
 # bouncing as unknown-job. Retention is age-bounded by the stale-grace window;
@@ -669,6 +675,28 @@ class PrismJobContext:
 
 
 @dataclass(frozen=True)
+class PrismBlockCandidate:
+    """A block-worthy submission queued for the block-submitter thread.
+
+    The share that produced it was acknowledged (and, when it met the share
+    target, credited) on the client thread at submit time; this record carries
+    everything the submitter needs to land the block itself. When the hash
+    solved the block but missed the share target (floor above network
+    difficulty), credit_share_on_accept defers the share credit until qbitd
+    accepts the block, preserving the pre-async payout semantics for that
+    edge.
+    """
+
+    context: PrismJobContext
+    submission: direct_stratum.DirectQbitSubmission
+    extranonce1_hex: str
+    extranonce2_hex: str
+    pending_share: PendingShare
+    client: ClientState
+    credit_share_on_accept: bool = False
+
+
+@dataclass(frozen=True)
 class QbitTipTemplateSnapshot:
     bestblockhash: str
     previousblockhash: str
@@ -982,6 +1010,13 @@ class PrismCoordinator:
         # startup baseline tip, which never opens the stale-grace window.
         self.current_tip_first_seen: tuple[str, float | None] | None = None
         self.current_tip_parent: tuple[str, str] | None = None
+        # Block candidates are landed by a dedicated submitter thread so a
+        # winning share's ack (and every other client's) never waits on
+        # audit/persist/submitblock; see enqueue_block_candidate.
+        self.block_candidate_queue: queue.Queue[PrismBlockCandidate] = queue.Queue(
+            maxsize=MAX_PENDING_BLOCK_CANDIDATES
+        )
+        self.block_candidates_dropped = 0
         self.job_build_failure_count = 0
         self.tip_refresh_job_count = 0
         self.post_accept_refresh_failure_count = 0
@@ -1859,6 +1894,12 @@ class PrismCoordinator:
                     daemon=True,
                 )
                 vardiff_idle_sweep_thread.start()
+            self._record_heartbeat("block_submitter")
+            block_submitter_thread = threading.Thread(
+                target=self.block_submit_loop,
+                daemon=True,
+            )
+            block_submitter_thread.start()
             ctv_broadcaster_thread: threading.Thread | None = None
             if self.ctv_broadcaster_enabled:
                 self._record_heartbeat("ctv_fanout_broadcaster")
@@ -1896,6 +1937,7 @@ class PrismCoordinator:
                 blockwait_thread.join(timeout=1)
             if vardiff_idle_sweep_thread is not None:
                 vardiff_idle_sweep_thread.join(timeout=1)
+            block_submitter_thread.join(timeout=1)
             if ctv_broadcaster_thread is not None:
                 ctv_broadcaster_thread.join(timeout=1)
 
@@ -3249,14 +3291,34 @@ class PrismCoordinator:
                 credit_policy=credit_policy,
             )
             return False
-        return self.submit_block_candidate(
-            context,
-            submission,
-            client.extranonce1_hex,
-            extranonce2_hex,
-            pending_share=pending_share,
-            client=client,
+        # A block-worthy submission that met the share target is a valid share
+        # regardless of the block's fate: credit it now, acknowledge the miner
+        # immediately, and land the block from the dedicated submitter thread
+        # (ckpool/btcpool/StratumV2 semantics). An orphaned candidate keeps its
+        # share credit. Sub-share-target block solves (floor above network
+        # difficulty) defer their share credit to block acceptance, exactly as
+        # before the submitter went asynchronous.
+        credit_share_on_accept = not submission.share_pass
+        if not credit_share_on_accept:
+            self.append_accepted_share(
+                client,
+                context,
+                submission,
+                pending_share,
+                credit_policy=credit_policy,
+            )
+        self.enqueue_block_candidate(
+            PrismBlockCandidate(
+                context=context,
+                submission=submission,
+                extranonce1_hex=client.extranonce1_hex,
+                extranonce2_hex=extranonce2_hex,
+                pending_share=pending_share,
+                client=client,
+                credit_share_on_accept=credit_share_on_accept,
+            )
         )
+        return False
 
     def pending_share_from_submission(
         self,
@@ -3523,227 +3585,311 @@ class PrismCoordinator:
         if client.vardiff_window_started_monotonic == idle_window_reset_at:
             client.vardiff_window_started_monotonic = idle_window_started
 
-    def submit_block_candidate(
-        self,
-        context: PrismJobContext,
-        submission: direct_stratum.DirectQbitSubmission,
-        extranonce1_hex: str,
-        extranonce2_hex: str,
-        *,
-        pending_share: PendingShare,
-        client: ClientState,
-    ) -> bool:
-        pause_names = self._registered_watchdog_heartbeat_names(
-            "qbit_blockpoll",
-            "qbit_blockwait",
-            "vardiff_idle_sweep",
-            *self.stratum_accept_heartbeat_names(),
-        )
-        with self._watchdog_paused(*pause_names), self.lock:
-            if self.accepted_block_count >= self.max_blocks:
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_POOL_CLOSED,
-                    "pool is no longer accepting shares",
-                    worker=client.username,
+    def enqueue_block_candidate(self, candidate: PrismBlockCandidate) -> None:
+        queue_obj = getattr(self, "block_candidate_queue", None)
+        if queue_obj is None:
+            queue_obj = queue.Queue(maxsize=MAX_PENDING_BLOCK_CANDIDATES)
+            self.block_candidate_queue = queue_obj
+        while True:
+            try:
+                queue_obj.put_nowait(candidate)
+                return
+            except queue.Full:
+                # Never block the client thread. Drop the OLDEST queued
+                # candidate: it was built on the oldest tip and has already
+                # lost its race; the incoming candidate is the freshest.
+                try:
+                    dropped = queue_obj.get_nowait()
+                except queue.Empty:
+                    continue
+                with self.lock:
+                    self.block_candidates_dropped = (
+                        int(getattr(self, "block_candidates_dropped", 0)) + 1
+                    )
+                print(
+                    "prism coordinator: dropped oldest queued block candidate "
+                    f"hash={dropped.submission.block_hash_hex} (submitter queue full)",
+                    flush=True,
                 )
+
+    def block_submit_loop(self) -> None:
+        while not self.stop_event.is_set():
+            self._record_heartbeat("block_submitter")
+            self.submit_next_block_candidate(timeout=1.0)
+
+    def submit_next_block_candidate(self, timeout: float | None = None) -> bool:
+        """Dequeue and land one block candidate; returns True when one ran.
+
+        The block-submitter loop calls this continuously; tests call it
+        directly to drain the queue deterministically.
+        """
+        queue_obj = getattr(self, "block_candidate_queue", None)
+        if queue_obj is None:
+            return False
+        try:
+            if timeout is None:
+                candidate = queue_obj.get_nowait()
+            else:
+                candidate = queue_obj.get(timeout=timeout)
+        except queue.Empty:
+            return False
+        try:
+            self.submit_block_candidate(candidate)
+        except Exception:
+            print(
+                "prism coordinator: block candidate submission failed "
+                f"hash={candidate.submission.block_hash_hex}",
+                flush=True,
+            )
+            traceback.print_exc()
+        return True
+
+    def _abandon_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
+        """Record a lost/failed block candidate without touching share credit.
+
+        The share that produced the candidate was acknowledged (and, when it
+        met the share target, credited) at submit time; the block losing its
+        race afterwards does not un-earn it. Reasons feed the same rejection
+        counters operators already watch for block-path failures.
+        """
+        self.record_rejection(reason, worker=worker)
+        print(
+            f"prism coordinator: block candidate abandoned reason={reason}: {message}",
+            flush=True,
+        )
+
+    def submit_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
+        """Land one block candidate: audit, persist, submitblock, confirm.
+
+        Runs on the block-submitter thread (tests call it synchronously). It
+        never raises for a lost race and holds self.lock only for short
+        in-memory state mutation -- never across RPC, psql, subprocess, or
+        file I/O -- so share acks and job pushes stay fast while a block
+        lands. The persist -> submitblock -> confirm crash-safety ordering is
+        unchanged. Returns True when qbitd accepts the block.
+        """
+        context = candidate.context
+        submission = candidate.submission
+        worker = candidate.client.username or None
+        with self.lock:
+            pool_closed = self.accepted_block_count >= self.max_blocks
+        if pool_closed:
+            self._abandon_block_candidate(
+                PRISM_REJECTION_POOL_CLOSED,
+                "pool is no longer accepting blocks",
+                worker=worker,
+            )
+            return False
+        current_tip = str(self.rpc.call("getbestblockhash"))
+        if str(context.template["previousblockhash"]) != current_tip:
+            self._abandon_block_candidate(
+                PRISM_REJECTION_STALE_JOB,
+                f"tip moved before submit: {current_tip}",
+                worker=worker,
+            )
+            return False
+        try:
+            reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
+        except Exception:
+            traceback.print_exc()
+            self._abandon_block_candidate(
+                PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                "reorg reconciliation failed before block submit",
+                worker=worker,
+            )
+            return False
+        if not reorg_reconciled:
+            self._abandon_block_candidate(
+                PRISM_REJECTION_STALE_JOB,
+                "reorg reconciliation reported an untrusted chain view",
+                worker=worker,
+            )
+            return False
+        if not self.prior_balances_match_current(context.prior_balances):
+            self._abandon_block_candidate(
+                PRISM_REJECTION_STALE_JOB,
+                "prior balances changed since the job was issued",
+                worker=worker,
+            )
+            return False
+        self._record_heartbeat("block_submitter")
+        final_bundle = self.build_audit_bundle(
+            shares=context.shares_json,
+            found_block=context.found_block,
+            prior_balances=context.prior_balances,
+            coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
+                candidate.extranonce1_hex,
+                candidate.extranonce2_hex,
+            ),
+            witness_merkle_leaves_hex=direct_stratum.witness_merkle_leaves_hex(
+                getattr(context.job, "transaction_hexes", ())
+            ),
+            ctv_fee_parent_hash=str(context.template["previousblockhash"]),
+        )
+        final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
+        if final_manifest["coinbase_tx_hex"].lower() != submission.coinbase_tx_hex.lower():
+            self._abandon_block_candidate(
+                PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
+                "final audit bundle coinbase does not match submitted coinbase",
+                worker=worker,
+            )
+            return False
+        candidate_bundle_path = self.write_temporary_audit_bundle(
+            final_bundle,
+            block_hash=submission.block_hash_hex,
+        )
+        try:
+            report = self.verify_bundle(
+                candidate_bundle_path,
+                submission.coinbase_tx_hex,
+                self.trusted_ledger_writer_public_key_hex(final_bundle),
+                expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
+            )
+            self._record_heartbeat("block_submitter")
             current_tip = str(self.rpc.call("getbestblockhash"))
             if str(context.template["previousblockhash"]) != current_tip:
-                self.reject_stratum(
-                    21,
+                self._abandon_block_candidate(
                     PRISM_REJECTION_STALE_JOB,
-                    "stale job",
-                    worker=client.username,
+                    f"tip moved during audit verification: {current_tip}",
+                    worker=worker,
                 )
-            try:
-                reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
-            except Exception:
-                print("prism coordinator: reorg reconciliation failed before block submit", flush=True)
-                traceback.print_exc()
-                self.reject_stratum(
-                    20,
-                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                    "reorg reconciliation failed before block submit",
-                    worker=client.username,
+                return False
+            before_height = int(self.rpc.call("getblockcount"))
+            expected_height = int(context.template["height"])
+            if before_height + 1 != expected_height:
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_BLOCK_STALE,
+                    f"stale block height: template={expected_height} tip={before_height}",
+                    worker=worker,
                 )
-            if not reorg_reconciled:
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_STALE_JOB,
-                    "stale job",
-                    worker=client.username,
-                )
-            if not self.prior_balances_match_current(context.prior_balances):
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_STALE_JOB,
-                    "stale job",
-                    worker=client.username,
-                )
-            final_bundle = self.build_audit_bundle(
-                shares=context.shares_json,
-                found_block=context.found_block,
-                prior_balances=context.prior_balances,
-                coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
-                    extranonce1_hex,
-                    extranonce2_hex,
-                ),
-                witness_merkle_leaves_hex=direct_stratum.witness_merkle_leaves_hex(
-                    getattr(context.job, "transaction_hexes", ())
-                ),
-                ctv_fee_parent_hash=str(context.template["previousblockhash"]),
-            )
-            final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
-            if final_manifest["coinbase_tx_hex"].lower() != submission.coinbase_tx_hex.lower():
-                self.reject_stratum(
-                    20,
-                    PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
-                    "final audit bundle coinbase does not match submitted coinbase",
-                    worker=client.username,
-                )
-            candidate_bundle_path = self.write_temporary_audit_bundle(
-                final_bundle,
+                return False
+            persistence = self.ledger.persist_accepted_block(
                 block_hash=submission.block_hash_hex,
+                block_height=expected_height,
+                parent_hash=str(context.template["previousblockhash"]),
+                final_bundle=final_bundle,
+                audit_report=report,
             )
-            try:
-                report = self.verify_bundle(
-                    candidate_bundle_path,
-                    submission.coinbase_tx_hex,
-                    self.trusted_ledger_writer_public_key_hex(final_bundle),
-                    expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
-                )
-                current_tip = str(self.rpc.call("getbestblockhash"))
-                if str(context.template["previousblockhash"]) != current_tip:
-                    self.reject_stratum(
-                        21,
-                        PRISM_REJECTION_STALE_JOB,
-                        "stale job",
-                        worker=client.username,
-                    )
-                before_height = int(self.rpc.call("getblockcount"))
-                expected_height = int(context.template["height"])
-                if before_height + 1 != expected_height:
-                    self.reject_stratum(
-                        21,
-                        PRISM_REJECTION_BLOCK_STALE,
-                        f"stale block height: template={expected_height} tip={before_height}",
-                        worker=client.username,
-                    )
-                persistence = self.ledger.persist_accepted_block(
+            result = self.rpc.call("submitblock", [submission.block_hex])
+            after_height = int(self.rpc.call("getblockcount"))
+            if result not in (None, "duplicate"):
+                self.reject_prepared_block(
                     block_hash=submission.block_hash_hex,
-                    block_height=expected_height,
-                    parent_hash=str(context.template["previousblockhash"]),
-                    final_bundle=final_bundle,
-                    audit_report=report,
-                )
-                result = self.rpc.call("submitblock", [submission.block_hex])
-                after_height = int(self.rpc.call("getblockcount"))
-                if result not in (None, "duplicate"):
-                    self.reject_prepared_block(
-                        block_hash=submission.block_hash_hex,
-                        active_tip_height=after_height,
-                    )
-                    self.reject_stratum(
-                        20,
-                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                        f"submitblock rejected candidate: {result}",
-                        worker=client.username,
-                    )
-                if after_height != before_height + 1:
-                    self.reject_prepared_block(
-                        block_hash=submission.block_hash_hex,
-                        active_tip_height=after_height,
-                    )
-                    self.reject_stratum(
-                        20,
-                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                        f"submitblock did not advance height: {before_height}->{after_height}",
-                        worker=client.username,
-                    )
-                block_hash = str(self.rpc.call("getblockhash", [after_height]))
-                if block_hash.lower() != submission.block_hash_hex.lower():
-                    self.stop_event.set()
-                    self.reject_prepared_block(
-                        block_hash=submission.block_hash_hex,
-                        active_tip_height=after_height,
-                    )
-                    self.reject_stratum(
-                        20,
-                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                        f"submitted block hash mismatch: expected {submission.block_hash_hex} got {block_hash}",
-                        worker=client.username,
-                    )
-                confirmation = self.ledger.confirm_accepted_block(
-                    block_hash=block_hash,
                     active_tip_height=after_height,
                 )
-                if int(confirmation.get("confirmed_count", 0)) != 1:
-                    self.stop_event.set()
-                    self.reject_stratum(
-                        20,
-                        PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
-                        f"ledger did not confirm accepted block {block_hash}",
-                        worker=client.username,
-                    )
-                ctv_persistence = None
-                ctv_manifest_set = final_bundle.get("ctv_fanout_manifest_set")
-                if isinstance(ctv_manifest_set, dict):
-                    ctv_persistence = self.ledger.persist_ctv_fanout_manifest_set(
-                        block_hash=block_hash,
-                        manifest_set=ctv_manifest_set,
-                        manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
-                    )
-                final_bundle_path = self.audit_dir / f"prism-live-audit-bundle-{after_height}-{block_hash}.json"
-                self.write_audit_bundle_envelope(
-                    final_bundle_path,
-                    block_hash=block_hash,
-                    block_height=after_height,
-                    report=report,
-                    persistence=persistence,
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                    f"submitblock rejected candidate: {result}",
+                    worker=worker,
                 )
-                self.prune_audit_artifacts(keep_live_path=final_bundle_path)
-                bundle_path = final_bundle_path
-                self.append_accepted_share(client, context, submission, pending_share)
-                # Aggregate counts only: materializing the whole share history
-                # (all_shares) here would scan the full ledger twice under the
-                # global lock on every block, stalling every other client's
-                # share ack, and would grow without bound as the ledger grows.
-                evidence_share_count, evidence_distinct_miners = self.accepted_share_stats()
-                evidence = {
-                    "schema": "qbit.prism.live-stratum-evidence.v1",
-                    "block_hash": block_hash,
-                    "block_height": after_height,
-                    "coinbase_tx_hex": submission.coinbase_tx_hex,
-                    "audit_bundle_path": str(bundle_path),
-                    "audit_report": report,
-                    "ledger_backend": self.ledger.backend_name,
-                    "persistence": persistence,
-                    "confirmation": confirmation,
-                    "ctv_persistence": ctv_persistence,
-                    "accepted_share_count": evidence_share_count,
-                    "distinct_miner_count": evidence_distinct_miners,
-                    "job_share_count": len(context.shares_json),
-                }
-                self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+                return False
+            if after_height != before_height + 1:
+                self.reject_prepared_block(
+                    block_hash=submission.block_hash_hex,
+                    active_tip_height=after_height,
+                )
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                    f"submitblock did not advance height: {before_height}->{after_height}",
+                    worker=worker,
+                )
+                return False
+            block_hash = str(self.rpc.call("getblockhash", [after_height]))
+            if block_hash.lower() != submission.block_hash_hex.lower():
+                self.stop_event.set()
+                self.reject_prepared_block(
+                    block_hash=submission.block_hash_hex,
+                    active_tip_height=after_height,
+                )
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                    f"submitted block hash mismatch: expected {submission.block_hash_hex} got {block_hash}",
+                    worker=worker,
+                )
+                return False
+            confirmation = self.ledger.confirm_accepted_block(
+                block_hash=block_hash,
+                active_tip_height=after_height,
+            )
+            if int(confirmation.get("confirmed_count", 0)) != 1:
+                self.stop_event.set()
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+                    f"ledger did not confirm accepted block {block_hash}",
+                    worker=worker,
+                )
+                return False
+            ctv_persistence = None
+            ctv_manifest_set = final_bundle.get("ctv_fanout_manifest_set")
+            if isinstance(ctv_manifest_set, dict):
+                ctv_persistence = self.ledger.persist_ctv_fanout_manifest_set(
+                    block_hash=block_hash,
+                    manifest_set=ctv_manifest_set,
+                    manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
+                )
+            final_bundle_path = self.audit_dir / f"prism-live-audit-bundle-{after_height}-{block_hash}.json"
+            self.write_audit_bundle_envelope(
+                final_bundle_path,
+                block_hash=block_hash,
+                block_height=after_height,
+                report=report,
+                persistence=persistence,
+            )
+            self.prune_audit_artifacts(keep_live_path=final_bundle_path)
+            bundle_path = final_bundle_path
+            if candidate.credit_share_on_accept:
+                self.append_accepted_share(
+                    candidate.client,
+                    context,
+                    submission,
+                    candidate.pending_share,
+                )
+            # Aggregate counts only: materializing the whole share history
+            # (all_shares) here would scan the full ledger twice per block,
+            # and would grow without bound as the ledger grows.
+            evidence_share_count, evidence_distinct_miners = self.accepted_share_stats()
+            evidence = {
+                "schema": "qbit.prism.live-stratum-evidence.v1",
+                "block_hash": block_hash,
+                "block_height": after_height,
+                "coinbase_tx_hex": submission.coinbase_tx_hex,
+                "audit_bundle_path": str(bundle_path),
+                "audit_report": report,
+                "ledger_backend": self.ledger.backend_name,
+                "persistence": persistence,
+                "confirmation": confirmation,
+                "ctv_persistence": ctv_persistence,
+                "accepted_share_count": evidence_share_count,
+                "distinct_miner_count": evidence_distinct_miners,
+                "job_share_count": len(context.shares_json),
+            }
+            self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+            with self.lock:
                 self.accepted_block_count += 1
                 self.latest_bundle = final_bundle
                 self.latest_evidence = evidence
-                print(
-                    "prism coordinator: qbit accepted direct PRISM block "
-                    f"height={after_height} hash={block_hash}",
-                    flush=True,
-                )
                 should_stop = self.stop_after_block or self.accepted_block_count >= self.max_blocks
-                if not should_stop:
-                    client.post_accept_refresh_block = (after_height, block_hash)
-                if should_stop:
-                    self.stop_event.set()
-                return False
-            finally:
-                try:
-                    candidate_bundle_path.unlink()
-                except FileNotFoundError:
-                    pass
+            print(
+                "prism coordinator: qbit accepted direct PRISM block "
+                f"height={after_height} hash={block_hash}",
+                flush=True,
+            )
+            if should_stop:
+                self.stop_event.set()
+            else:
+                # Fresh work is the most urgent post-block action: push it
+                # directly from the submitter instead of waiting for the
+                # winning client's next message.
+                self.refresh_jobs_after_accepted_block(
+                    block_height=after_height,
+                    block_hash=block_hash,
+                )
+            return True
+        finally:
+            try:
+                candidate_bundle_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def reject_prepared_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
         reject = getattr(self.ledger, "reject_prepared_block", None)
@@ -4130,6 +4276,9 @@ class PrismCoordinator:
             "# HELP qbit_prism_job_build_failures_total Job builds skipped after a template/coinbase error without dropping the client.",
             "# TYPE qbit_prism_job_build_failures_total counter",
             f"qbit_prism_job_build_failures_total {self.job_build_failure_count}",
+            "# HELP qbit_prism_block_candidates_dropped_total Queued block candidates dropped because the submitter queue overflowed.",
+            "# TYPE qbit_prism_block_candidates_dropped_total counter",
+            f"qbit_prism_block_candidates_dropped_total {int(getattr(self, 'block_candidates_dropped', 0))}",
             "# HELP qbit_prism_tip_refresh_jobs_total Client jobs refreshed after qbit tip/template changes.",
             "# TYPE qbit_prism_tip_refresh_jobs_total counter",
             f"qbit_prism_tip_refresh_jobs_total {self.tip_refresh_job_count}",
