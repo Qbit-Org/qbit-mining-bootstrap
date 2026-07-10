@@ -1063,8 +1063,14 @@ class PrismCoordinator:
         # An accepted share that the writer cannot persist (a ledger outage that
         # outlasts shutdown, or a backlog overflow) is written to this recovery
         # file instead of being silently lost, and replayed into the ledger on
-        # the next start -- an acked share is a payout. The ledger dedups by
-        # share_id, so replay is idempotent.
+        # the next start -- an acked share is a payout. Replay skips already-
+        # committed share_ids, so it is idempotent across a partial replay.
+        # Durability boundary: acked shares survive a ledger outage, a graceful
+        # shutdown, a backlog overflow, and a watchdog-triggered exit (the queue
+        # is flushed to this file first). A SIGKILL / OOM / host failure can
+        # still lose shares sitting in the in-memory queue -- a bounded window
+        # matching async pool designs (e.g. Miningcore's buffer). A pre-ack
+        # local WAL would close it at the cost of ack latency; not done here.
         self.share_recovery_path = Path(
             env("PRISM_SHARE_RECOVERY_PATH", str(self.audit_dir / "prism-unpersisted-shares.jsonl"))
         )
@@ -1881,6 +1887,17 @@ class PrismCoordinator:
                     "Exiting non-zero so the restart policy recovers the process.",
                     flush=True,
                 )
+                # Flush queued acked shares to the recovery file before the hard
+                # exit so a self-inflicted kill does not lose payouts. Bounded by
+                # a join timeout in a side thread: a wedged disk must not stop the
+                # watchdog from actually killing the hung process.
+                drainer = threading.Thread(
+                    target=self._drain_share_queue_to_recovery,
+                    args=("liveness watchdog exit",),
+                    daemon=True,
+                )
+                drainer.start()
+                drainer.join(timeout=5.0)
                 os._exit(1)
 
     def release_ledger_lease(self) -> None:
@@ -3452,6 +3469,14 @@ class PrismCoordinator:
         # running so the miner's ack never waits on a psql round trip. Without
         # a writer (tests, tools that never call run()) the append is
         # synchronous, exactly as before.
+        #
+        # Reward-window boundary: a job snapshot reads committed ledger rows, so
+        # a share acked just before a job is issued but still in the writer queue
+        # may miss that job's window and land in a later block's window instead.
+        # It is never dropped or double-paid, the effect is bounded by the writer
+        # lag (sub-ms normally) and averages across miners, so we accept it rather
+        # than fence job-build on the writer -- fencing would delay new jobs and
+        # cause stale shares during the very ledger slowness where it would bite.
         self.note_worker_accepted_share(client.username, credit_policy)
         self.note_vardiff_accepted_share(client, context.job)
         entry = PendingShareAppend(
@@ -3552,12 +3577,40 @@ class PrismCoordinator:
                 )
                 traceback.print_exc()
 
+    def _drain_share_queue_to_recovery(self, reason: str) -> int:
+        """Flush queued-but-unpersisted acked shares to the recovery file.
+
+        Best-effort, used before a self-inflicted hard exit (the liveness
+        watchdog) so acked shares still in the in-memory writer queue survive.
+        A duplicate written here -- the writer may have already persisted the
+        same entry -- is harmless: replay skips already-committed share_ids.
+        """
+        queue_obj = getattr(self, "share_append_queue", None)
+        if queue_obj is None:
+            return 0
+        drained = 0
+        while True:
+            try:
+                entry = queue_obj.get_nowait()
+            except queue.Empty:
+                break
+            self._recover_share_to_disk(entry, reason)
+            drained += 1
+        if drained:
+            print(
+                f"prism coordinator: flushed {drained} queued acked share(s) to the "
+                f"recovery file before exit reason={reason}",
+                flush=True,
+            )
+        return drained
+
     def replay_recovered_shares(self) -> int:
         """Replay any recovery-file shares into the ledger at startup.
 
-        Idempotent: the ledger dedups by share_id, so a share partially handled
-        before a crash is not double-counted. The file is cleared only after a
-        clean pass so a failure here never drops shares.
+        Idempotent: both ledgers raise on a duplicate share_id, so a row already
+        committed by an earlier partial replay is skipped (not double-counted)
+        and does not stop the pass. The file is cleared only after a clean pass,
+        so a transient failure here never drops shares.
         """
         path = getattr(self, "share_recovery_path", None)
         if path is None or not path.exists():
@@ -3587,15 +3640,30 @@ class PrismCoordinator:
         # the reward window stays correctly ordered.
         pendings.sort(key=lambda pending: pending.accepted_at_ms)
         replayed = 0
+        skipped_duplicates = 0
         for pending in pendings:
             try:
                 self.ledger.append(pending)
                 replayed += 1
-            except Exception:
+            except Exception as exc:
+                if "duplicate share_id" in str(exc):
+                    # Already committed by an earlier (partial) replay. Both
+                    # ledgers raise on a duplicate share_id; treat it as done and
+                    # keep going so replay is idempotent -- otherwise a retry
+                    # after a partial pass would stop on the first committed row
+                    # and strand every share after it.
+                    skipped_duplicates += 1
+                    continue
                 print("prism coordinator: failed to replay a recovered share; keeping the file", flush=True)
                 traceback.print_exc()
                 self.shares_replayed = int(getattr(self, "shares_replayed", 0)) + replayed
                 return replayed
+        if skipped_duplicates:
+            print(
+                f"prism coordinator: skipped {skipped_duplicates} already-committed "
+                "recovered share(s) during replay",
+                flush=True,
+            )
         if parse_failed:
             # Keep the file (with its intact-but-already-replayed lines, which
             # the ledger dedups on a re-run) so the torn line is preserved for

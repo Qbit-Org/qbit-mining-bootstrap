@@ -3454,6 +3454,65 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             # Re-running dedups the good shares (ledger is idempotent by id).
             self.assertEqual(server.replay_recovered_shares(), 2)
 
+    def test_replay_is_idempotent_across_partial_replay(self) -> None:
+        # Finding: a partial replay (A commits, B fails transiently) kept the
+        # whole file; on retry, replay hit A's duplicate and stopped, stranding
+        # B forever. Replay must skip the already-committed A and reach B.
+        server, _state, _ledger = submit_coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            server._recover_share_to_disk(self._pending_append("A", accepted_at_ms=100), "test")
+            server._recover_share_to_disk(self._pending_append("B", accepted_at_ms=200), "test")
+
+            class DedupLedger:
+                def __init__(self) -> None:
+                    self.ids: list[str] = []
+                    self.fail_b_once = True
+
+                def append(self, pending: object) -> object:
+                    if pending.share_id == "miner-a:B" and self.fail_b_once:
+                        self.fail_b_once = False
+                        raise RuntimeError("postgres unavailable")
+                    if pending.share_id in self.ids:
+                        raise RuntimeError("duplicate share_id")
+                    self.ids.append(pending.share_id)
+                    return SimpleNamespace(share_seq=len(self.ids))
+
+            server.ledger = DedupLedger()
+
+            # Pass 1: A commits, B raises a transient (non-duplicate) error, so
+            # the pass stops and keeps the file.
+            self.assertEqual(server.replay_recovered_shares(), 1)
+            self.assertTrue(server.share_recovery_path.exists())
+            self.assertEqual(server.ledger.ids, ["miner-a:A"])
+
+            # Pass 2: A is now a duplicate (skipped, not fatal); B commits and
+            # the file is cleared.
+            self.assertEqual(server.replay_recovered_shares(), 1)
+            self.assertEqual(server.ledger.ids, ["miner-a:A", "miner-a:B"])
+            self.assertFalse(server.share_recovery_path.exists())
+
+    def test_drain_share_queue_to_recovery_flushes_queued_shares(self) -> None:
+        # A watchdog hard-exit must not lose acked shares still in the writer
+        # queue: they are flushed to the recovery file in FIFO order first.
+        server, _state, _ledger = submit_coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            server.share_append_queue = queue.Queue(maxsize=MAX_PENDING_SHARE_APPENDS)
+            server.enqueue_share_append(self._pending_append("q1"))
+            server.enqueue_share_append(self._pending_append("q2"))
+
+            drained = server._drain_share_queue_to_recovery("watchdog exit")
+
+            self.assertEqual(drained, 2)
+            self.assertEqual(server.share_append_queue.qsize(), 0)
+            self.assertEqual(server.shares_recovered_to_disk, 2)
+            recovered = [
+                json.loads(line)["share_id"]
+                for line in server.share_recovery_path.read_text().splitlines()
+            ]
+            self.assertEqual(recovered, ["miner-a:q1", "miner-a:q2"])
+
     def test_append_share_entry_reports_persisted_vs_recovered(self) -> None:
         server, _state, ledger = submit_coordinator()
         with tempfile.TemporaryDirectory() as tempdir:
