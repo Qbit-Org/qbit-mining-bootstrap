@@ -159,7 +159,16 @@ class SingleWriterShareLedger:
             self._next_share_seq += 1
             return record
 
-    def snapshot_at_job_issue(self, anchor_job_issued_at_ms: int) -> list[AcceptedShareRecord]:
+    def snapshot_at_job_issue(
+        self,
+        anchor_job_issued_at_ms: int,
+        *,
+        window_weight: int | None = None,
+    ) -> list[AcceptedShareRecord]:
+        # window_weight is a bound hint for the large Postgres ledger; the
+        # in-memory ledger is small, so it returns the full eligible set (a
+        # superset of the reward window, which is digest-neutral).
+        del window_weight
         with self._lock:
             return [
                 replace(share)
@@ -951,16 +960,63 @@ END;
             raise RuntimeError(str(result["error"]))
         return self._record_from_json(result)
 
-    def snapshot_at_job_issue(self, anchor_job_issued_at_ms: int) -> list[AcceptedShareRecord]:
-        sql = f"""
+    def snapshot_at_job_issue(
+        self,
+        anchor_job_issued_at_ms: int,
+        *,
+        window_weight: int | None = None,
+    ) -> list[AcceptedShareRecord]:
+        anchor = (
+            f"to_timestamp(({int(anchor_job_issued_at_ms)}::double precision / 1000.0))"
+        )
+        if window_weight is None:
+            # Whole accepted history up to the anchor. Kept for callers that
+            # want the full ledger (tools/tests); the coordinator passes a
+            # window_weight so the hot job-build path stays bounded.
+            rows_cte = f"""
 WITH rows AS (
     SELECT *
     FROM qbit_share_ledger
     WHERE accepted
-      AND job_issued_at <= to_timestamp(({int(anchor_job_issued_at_ms)}::double precision / 1000.0))
-      AND accepted_at <= to_timestamp(({int(anchor_job_issued_at_ms)}::double precision / 1000.0))
-    ORDER BY share_seq ASC
-)
+      AND job_issued_at <= {anchor}
+      AND accepted_at <= {anchor}
+)"""
+        else:
+            # Only the most-recent shares whose cumulative difficulty covers
+            # window_weight -- a superset of the reward window the audit bundle
+            # selects. compute_prism_window re-sorts by share_seq DESC and stops
+            # at 8x network difficulty, dropping anything older, so a superset
+            # yields the identical counted window and digest. Bounding the walk
+            # here keeps the job-build ledger phase O(window), not O(ledger
+            # history), and stops it growing without bound as the ledger grows.
+            rows_cte = f"""
+WITH RECURSIVE eligible AS (
+    (
+        SELECT ledger.*, ledger.share_difficulty::numeric AS cumulative_difficulty
+        FROM qbit_share_ledger ledger
+        WHERE ledger.accepted
+          AND ledger.job_issued_at <= {anchor}
+          AND ledger.accepted_at <= {anchor}
+        ORDER BY ledger.share_seq DESC
+        LIMIT 1
+    )
+    UNION ALL
+    SELECT next_ledger.*, eligible.cumulative_difficulty + next_ledger.share_difficulty
+    FROM eligible
+    CROSS JOIN LATERAL (
+        SELECT ledger.*
+        FROM qbit_share_ledger ledger
+        WHERE ledger.accepted
+          AND ledger.job_issued_at <= {anchor}
+          AND ledger.accepted_at <= {anchor}
+          AND ledger.share_seq < eligible.share_seq
+        ORDER BY ledger.share_seq DESC
+        LIMIT 1
+    ) next_ledger
+    WHERE eligible.cumulative_difficulty < {int(window_weight)}::numeric
+),
+rows AS (SELECT * FROM eligible)"""
+        sql = rows_cte + """
 SELECT COALESCE(json_agg(json_build_object(
     'share_seq', share_seq,
     'share_id', share_id,

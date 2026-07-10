@@ -83,6 +83,13 @@ MAX_PENDING_BLOCK_CANDIDATES = 32
 # miner's ack never waits on a psql round trip. The bound is a multi-hour
 # ledger-outage backstop, not a working depth.
 MAX_PENDING_SHARE_APPENDS = 100_000
+# The reward window is 8x network difficulty (must match PRISM_WINDOW_MULTIPLIER
+# in crates/qbit-prism/src/lib.rs and the SQL). The job-build snapshot only needs
+# the shares that window can cover; requesting a margin above it returns a
+# guaranteed superset (the audit bundle re-selects the exact 8x window, so the
+# digest is unchanged) while keeping the query O(window), not O(ledger history).
+PRISM_REWARD_WINDOW_MULTIPLIER = 8
+PRISM_SNAPSHOT_WINDOW_MARGIN = 2
 # Evicted jobs are retained briefly so shares already in flight when a
 # clean_jobs refresh evicted their job can still be validated instead of
 # bouncing as unknown-job. Retention is age-bounded by the stale-grace window;
@@ -1645,8 +1652,21 @@ class PrismCoordinator:
         started = time.monotonic()
         _, ready_miner_count = self.accepted_share_stats()
         ready = ready_miner_count >= self.min_ready_miners
+        # Bound the snapshot to a superset of the 8x reward window rather than
+        # the whole accepted history: same audit bundle and digest, but the
+        # ledger phase no longer scales with total ledger size.
+        snapshot_window_weight = (
+            PRISM_REWARD_WINDOW_MULTIPLIER
+            * PRISM_SNAPSHOT_WINDOW_MARGIN
+            * int(artifacts.network_difficulty)
+        )
         shares = (
-            [record.to_prism_json() for record in self.ledger.snapshot_at_job_issue(issued_at_ms)]
+            [
+                record.to_prism_json()
+                for record in self.ledger.snapshot_at_job_issue(
+                    issued_at_ms, window_weight=snapshot_window_weight
+                )
+            ]
             if ready
             else []
         )

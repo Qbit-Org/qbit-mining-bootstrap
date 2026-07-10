@@ -248,6 +248,20 @@ class PrismShareLedgerTests(unittest.TestCase):
             ["share-1", "share-2"],
         )
 
+    def test_job_issue_snapshot_accepts_window_weight_hint(self) -> None:
+        # window_weight bounds the heavy Postgres query; the in-memory ledger
+        # returns the full eligible set (a superset of the reward window), so
+        # the result is digest-neutral whether or not the hint is passed.
+        ledger = SingleWriterShareLedger()
+        ledger.append(pending_share(1, job_issued_at_ms=1_000, accepted_at_ms=1_001))
+        ledger.append(pending_share(2, job_issued_at_ms=1_000, accepted_at_ms=1_002))
+
+        unbounded = [s.share_id for s in ledger.snapshot_at_job_issue(1_005)]
+        hinted = [s.share_id for s in ledger.snapshot_at_job_issue(1_005, window_weight=8)]
+
+        self.assertEqual(unbounded, ["share-1", "share-2"])
+        self.assertEqual(hinted, unbounded)
+
     def test_job_issue_snapshot_excludes_old_job_shares_accepted_after_anchor(self) -> None:
         ledger = SingleWriterShareLedger()
         ledger.append(pending_share(1, job_issued_at_ms=1_000, accepted_at_ms=1_001))

@@ -53,7 +53,7 @@ class FakeLedger:
     def all_shares(self) -> list[FakeShare]:
         raise AssertionError("all_shares must not be called when accepted_share_stats exists")
 
-    def snapshot_at_job_issue(self, anchor_job_issued_at_ms: int) -> list[FakeShare]:
+    def snapshot_at_job_issue(self, anchor_job_issued_at_ms: int, *, window_weight: int | None = None) -> list[FakeShare]:
         self.snapshot_calls += 1
         return [FakeShare(miner_id=miner, share_seq=seq + 1) for seq, miner in enumerate(self.miners)]
 
@@ -68,7 +68,7 @@ class ReadyLedgerWithEmptyFirstSnapshot(FakeLedger):
     def __init__(self) -> None:
         super().__init__(miners=["miner-a", "miner-b", "miner-c"])
 
-    def snapshot_at_job_issue(self, anchor_job_issued_at_ms: int) -> list[FakeShare]:
+    def snapshot_at_job_issue(self, anchor_job_issued_at_ms: int, *, window_weight: int | None = None) -> list[FakeShare]:
         self.snapshot_calls += 1
         if self.snapshot_calls == 1:
             return []

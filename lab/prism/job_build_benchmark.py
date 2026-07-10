@@ -116,7 +116,7 @@ class BenchLedger:
     def all_shares(self) -> list[object]:
         raise AssertionError("benchmark expects accepted_share_stats to be used")
 
-    def snapshot_at_job_issue(self, anchor_job_issued_at_ms: int) -> list[object]:
+    def snapshot_at_job_issue(self, anchor_job_issued_at_ms: int, *, window_weight: int | None = None) -> list[object]:
         time.sleep(self.latencies.snapshot_seconds)
         return [self._Record(payload) for payload in self.shares_json]
 
