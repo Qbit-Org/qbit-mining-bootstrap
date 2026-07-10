@@ -549,6 +549,7 @@ def coordinator() -> PrismCoordinator:
     server.evicted_job_graveyard = {}
     server.block_candidate_queue = queue.Queue(maxsize=8)
     server.block_candidates_dropped = 0
+    server.block_candidate_abandoned_counts = {}
     server.share_append_queue = queue.Queue(maxsize=8)
     server.share_writer_active = False
     server.share_append_failure_count = 0
@@ -3131,7 +3132,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         accepted = server.submit_block_candidate(block_candidate(server, state, submission))
 
         self.assertFalse(accepted)
-        self.assertEqual(server.stale_share_count, 1)
+        # The share was already accepted at submit time, so a lost block is a
+        # block-abandonment, not a stale share rejection.
+        self.assertEqual(server.stale_share_count, 0)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
         self.assertEqual(ledger.persisted, [])
         self.assertEqual(ledger.pending, [])
 
@@ -3164,7 +3168,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         accepted = server.submit_block_candidate(block_candidate(server, state, submission))
 
         self.assertFalse(accepted)
-        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE], 1)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE], 1
+        )
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE], 0)
         self.assertEqual(ledger.persisted, [])
         self.assertEqual(ledger.pending, [])
 
@@ -3431,7 +3438,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(server.submit_next_block_candidate())
 
         self.assertEqual(server.accepted_block_count, 0)
-        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_STALE_JOB], 1)
+        # Counted as a block abandonment, not a share rejection.
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(server.stale_share_count, 0)
         # The credited share survives the lost block race.
         self.assertEqual(len(ledger.pending), 1)
         self.assertEqual(ledger.persisted, [])
@@ -3476,7 +3485,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         accepted = server.submit_block_candidate(block_candidate(server, state, submission))
 
         self.assertFalse(accepted)
-        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_POOL_CLOSED], 1)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_POOL_CLOSED], 1)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_POOL_CLOSED], 0)
         self.assertEqual(ledger.persisted, [])
 
     def test_block_worthy_share_is_credited_and_enqueued_before_block_submission(self) -> None:
@@ -3921,7 +3931,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.rejected[0]["active_tip_height"], 9)
         self.assertEqual(ledger.reversed, [])
         self.assertEqual(len(ledger.pending), 0)
-        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_SUBMITBLOCK_REJECTED], 1)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_SUBMITBLOCK_REJECTED], 1
+        )
 
 
 class PrismCoordinatorReliabilityTests(unittest.TestCase):

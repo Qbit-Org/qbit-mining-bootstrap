@@ -1039,6 +1039,12 @@ class PrismCoordinator:
             maxsize=MAX_PENDING_BLOCK_CANDIDATES
         )
         self.block_candidates_dropped = 0
+        # A block candidate that loses its tip race (or fails to submit) is a
+        # BLOCK-path event, not a share rejection: under the async model the
+        # share was already accepted and credited, so it must not touch the
+        # share-reject counters (that would inflate stale_share_percent with
+        # block-race losses). Tracked here by reason instead.
+        self.block_candidate_abandoned_counts: dict[str, int] = {}
         # Accepted-share ledger writes drain on a dedicated writer thread; the
         # flag flips on in run() so tooling/tests that never start the writer
         # keep the synchronous append. See append_accepted_share.
@@ -3882,14 +3888,22 @@ class PrismCoordinator:
         return True
 
     def _abandon_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
-        """Record a lost/failed block candidate without touching share credit.
+        """Record a lost/failed block candidate as a BLOCK-path event.
 
-        The share that produced the candidate was acknowledged (and, when it
-        met the share target, credited) at submit time; the block losing its
-        race afterwards does not un-earn it. Reasons feed the same rejection
-        counters operators already watch for block-path failures.
+        The share that produced the candidate was acknowledged and, when it met
+        the share target, credited at submit time; the block losing its race
+        afterwards does not un-earn it and is NOT a share rejection. It is
+        counted under a dedicated block-abandonment counter (by reason, so a
+        benign 'tip moved' race is distinguishable from a real
+        submitblock-rejected/ledger failure) rather than the share-reject
+        counters, which stay a true measure of shares refused to miners.
         """
-        self.record_rejection(reason, worker=worker)
+        with self.lock:
+            counts = getattr(self, "block_candidate_abandoned_counts", None)
+            if counts is None:
+                counts = {}
+                self.block_candidate_abandoned_counts = counts
+            counts[reason] = int(counts.get(reason, 0)) + 1
         print(
             f"prism coordinator: block candidate abandoned reason={reason}: {message}",
             flush=True,
@@ -4523,6 +4537,12 @@ class PrismCoordinator:
             "# HELP qbit_prism_block_candidates_dropped_total Queued block candidates dropped because the submitter queue overflowed.",
             "# TYPE qbit_prism_block_candidates_dropped_total counter",
             f"qbit_prism_block_candidates_dropped_total {int(getattr(self, 'block_candidates_dropped', 0))}",
+            "# HELP qbit_prism_block_candidates_abandoned_total Block candidates that did not land (lost tip race or failed submit), by reason. Not share rejections: the underlying share was accepted.",
+            "# TYPE qbit_prism_block_candidates_abandoned_total counter",
+            *[
+                f'qbit_prism_block_candidates_abandoned_total{{reason_id="{reason}"}} {int(count)}'
+                for reason, count in sorted(getattr(self, "block_candidate_abandoned_counts", {}).items())
+            ],
             "# HELP qbit_prism_share_append_queue_depth Accepted shares waiting on the ledger writer thread.",
             "# TYPE qbit_prism_share_append_queue_depth gauge",
             f"qbit_prism_share_append_queue_depth {self.share_append_queue.qsize() if getattr(self, 'share_append_queue', None) is not None else 0}",
