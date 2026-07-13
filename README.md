@@ -203,7 +203,12 @@ That starts:
 - `bitcoind`
 - `auxpow-stratum` on `stratum+tcp://127.0.0.1:3335` for parent-chain merged mining
 
-The `auxpow-stratum` service (also reachable via `make up-auxpow-pool`) refreshes miner jobs whenever either chain tip changes and additionally age-refreshes them after `AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS` (default 2700, i.e. 45 minutes). That sits below qbit's default 60 minute `-auxpowtemplateexpiry`, so miners receive replacement work before qbit ages out the cached aux candidate.
+The `auxpow-stratum` service (also reachable via `make up-auxpow-pool`) refreshes
+miner jobs whenever either chain tip changes, when the Bitcoin parent template
+exceeds `AUXPOW_TEMPLATE_MAX_AGE_SECONDS` (default 120), or after
+`AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS` (default 2700, i.e. 45 minutes). The latter
+sits below qbit's default 60 minute `-auxpowtemplateexpiry`, so both parent work
+and the cached qbit candidate receive bounded replacement.
 
 The AuxPoW Stratum bridge advertises parent-chain work, enables per-miner vardiff by default, and uses `AUXPOW_STRATUM_VERSION_MASK=1fffe000` for BIP310 version rolling. qbit child candidates still come from `createauxblock`; permissionless qbit, ckpool, and direct PRISM Stratum prefer the connected qbit node's `getblocktemplate.versionrollingmask` when present. Older or unavailable GBT probes fall back to each service's configured mask: `CKPOOL_VERSION_MASK` for ckpool and `PRISM_VERSION_ROLLING_MASK` for direct PRISM. For byte-order investigations, set `AUXPOW_STRATUM_DIAG_VARIANTS=1` and optionally `AUXPOW_STRATUM_DIAG_JSONL=1`; normal operation uses `AUXPOW_STRATUM_HEADER_VARIANT=canonical`.
 

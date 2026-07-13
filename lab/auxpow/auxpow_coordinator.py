@@ -657,6 +657,25 @@ def validate_node_readiness(
             )
 
 
+def validate_bitcoin_parent_template(
+    parent_template: object,
+    *,
+    max_age_seconds: int,
+) -> int:
+    if not isinstance(parent_template, dict) or not parent_template.get("previousblockhash"):
+        raise RuntimeError("Bitcoin getblocktemplate did not return a usable template")
+    try:
+        template_time = int(parent_template["curtime"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Bitcoin template did not report a numeric curtime") from exc
+    template_age = int(time.time()) - template_time
+    if template_age > max_age_seconds:
+        raise RuntimeError(
+            f"Bitcoin template is stale: age={template_age}s exceeds {max_age_seconds}s"
+        )
+    return template_age
+
+
 def validate_auxpow_templates(
     qbit_rpc: JsonRpc,
     bitcoin_rpc: JsonRpc,
@@ -669,17 +688,10 @@ def validate_auxpow_templates(
         raise RuntimeError("qbit createauxblock did not return a usable template")
 
     parent_template = bitcoin_rpc.call("getblocktemplate", [{"rules": ["segwit"]}])
-    if not isinstance(parent_template, dict) or not parent_template.get("previousblockhash"):
-        raise RuntimeError("Bitcoin getblocktemplate did not return a usable template")
-    try:
-        template_time = int(parent_template["curtime"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("Bitcoin template did not report a numeric curtime") from exc
-    template_age = int(time.time()) - template_time
-    if template_age > max_age_seconds:
-        raise RuntimeError(
-            f"Bitcoin template is stale: age={template_age}s exceeds {max_age_seconds}s"
-        )
+    validate_bitcoin_parent_template(
+        parent_template,
+        max_age_seconds=max_age_seconds,
+    )
 
 
 def validate_auxpow_startup(qbit_rpc: JsonRpc, bitcoin_rpc: JsonRpc) -> None:
@@ -875,6 +887,35 @@ class AuxPowStratumServer:
             and now - job.created_at_monotonic >= AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS
         )
 
+    def parent_template_age_expired(self, job: AuxPowStratumJob | None) -> bool:
+        if job is None:
+            return False
+        try:
+            validate_bitcoin_parent_template(
+                job.btc_template,
+                max_age_seconds=AUXPOW_TEMPLATE_MAX_AGE_SECONDS,
+            )
+        except RuntimeError:
+            return True
+        return False
+
+    def fresh_current_job(self) -> AuxPowStratumJob | None:
+        with self.lock:
+            current_job = self.current_job
+            if not self.parent_template_age_expired(current_job):
+                return current_job
+            self.current_job = None
+            self.jobs = {}
+        return None
+
+    def invalidate_expired_parent_work(self) -> bool:
+        with self.lock:
+            if not self.parent_template_age_expired(self.current_job):
+                return False
+            self.current_job = None
+            self.jobs = {}
+        return True
+
     def next_extranonce1_hex(self) -> str:
         with self.lock:
             self.extranonce_counter += 1
@@ -1032,9 +1073,9 @@ class AuxPowStratumServer:
             if previous_difficulty != current_difficulty:
                 return
             client.pending_share_difficulty = next_difficulty
-            current_job = self.current_job
         if next_difficulty == previous_difficulty:
             return
+        current_job = self.fresh_current_job()
         try:
             if AUXPOW_STRATUM_VARDIFF_APPLY_MODE == "clean_job" and current_job is not None:
                 job = self.send_job_to_client(client, current_job, clean_jobs=True)
@@ -1245,6 +1286,7 @@ class AuxPowStratumServer:
             self.stop_event.wait(AUXPOW_STRATUM_POLL_SECONDS)
 
     def refresh_job(self, *, force: bool) -> bool:
+        parent_template_age_expired = self.invalidate_expired_parent_work()
         qbit_best = str(self.qbit_rpc.call("getbestblockhash"))
         bitcoin_best = str(self.bitcoin_rpc.call("getbestblockhash"))
         snapshot = (qbit_best, bitcoin_best)
@@ -1253,11 +1295,26 @@ class AuxPowStratumServer:
             current_job = self.current_job
             tip_snapshot = self.tip_snapshot
             job_age_expired = self.job_age_expired(current_job, now)
-        if not force and current_job is not None and snapshot == tip_snapshot and not job_age_expired:
+            if self.parent_template_age_expired(current_job):
+                self.current_job = None
+                self.jobs = {}
+                current_job = None
+                parent_template_age_expired = True
+        if (
+            not force
+            and current_job is not None
+            and snapshot == tip_snapshot
+            and not job_age_expired
+            and not parent_template_age_expired
+        ):
             return False
         aux_template = self.qbit_rpc.call("createauxblock", [self.qbit_miner_address])
         commitment_order = auxpow_commitment_order(aux_template)
         btc_template = self.bitcoin_rpc.call("getblocktemplate", [{"rules": ["segwit"]}])
+        validate_bitcoin_parent_template(
+            btc_template,
+            max_age_seconds=AUXPOW_TEMPLATE_MAX_AGE_SECONDS,
+        )
         job = self.make_job(
             job_id=self.next_job_id(),
             aux_template=aux_template,
@@ -1271,13 +1328,20 @@ class AuxPowStratumServer:
                 self.jobs = {}
             else:
                 self.jobs = {job.job_id: job}
+        refresh_reason = self.refresh_reason(
+            force,
+            snapshot,
+            tip_snapshot,
+            job_age_expired,
+            parent_template_age_expired,
+        )
         print(
             "auxpow stratum: new job "
             f"{job.job_id} qbit_height={aux_template['height']} bitcoin_height={btc_template['height']} "
             f"share_diff={job.share_difficulty.normalize()} "
             f"commitment_order={commitment_order} "
             f"prevhash={job.prevhash} parent_prevhash={btc_template['previousblockhash']} "
-            f"reason={self.refresh_reason(force, snapshot, tip_snapshot, job_age_expired)}",
+            f"reason={refresh_reason}",
             flush=True,
         )
         self.log_event(
@@ -1312,6 +1376,7 @@ class AuxPowStratumServer:
         snapshot: tuple[str, str],
         tip_snapshot: tuple[str, str] | None,
         job_age_expired: bool,
+        parent_template_age_expired: bool,
     ) -> str:
         if force:
             return "forced"
@@ -1319,6 +1384,8 @@ class AuxPowStratumServer:
             return "initial"
         if snapshot != tip_snapshot:
             return "tip"
+        if parent_template_age_expired:
+            return "parent-template-age"
         if job_age_expired:
             return "age"
         return "unknown"
@@ -1575,16 +1642,18 @@ class AuxPowStratumServer:
             client.subscribed = True
             client.agent = str(params[0]) if params else ""
             self.send_result(client, request_id, [[], client.extranonce1_hex, AUXPOW_STRATUM_EXTRANONCE2_SIZE])
-            if client.authorized and self.current_job is not None:
-                self.send_job_to_client(client, self.current_job, clean_jobs=self.current_job.clean_jobs)
+            current_job = self.fresh_current_job()
+            if client.authorized and current_job is not None:
+                self.send_job_to_client(client, current_job, clean_jobs=current_job.clean_jobs)
             return
 
         if method == "mining.authorize":
             client.authorized = True
             client.username = str(params[0]) if params else ""
             self.send_result(client, request_id, True)
-            if client.subscribed and self.current_job is not None:
-                self.send_job_to_client(client, self.current_job, clean_jobs=self.current_job.clean_jobs)
+            current_job = self.fresh_current_job()
+            if client.subscribed and current_job is not None:
+                self.send_job_to_client(client, current_job, clean_jobs=current_job.clean_jobs)
             return
 
         if method == "mining.extranonce.subscribe":
@@ -1623,6 +1692,12 @@ class AuxPowStratumServer:
             raise StratumError(20, "version_bits required after version-rolling negotiation")
         with self.lock:
             job = self.jobs.get(job_id)
+            if job is not None and self.parent_template_age_expired(job):
+                self.jobs.pop(job_id, None)
+                if self.parent_template_age_expired(self.current_job):
+                    self.current_job = None
+                    self.jobs = {}
+                job = None
             if self.vardiff_config.enabled and job is not None and job_id not in client.active_job_ids:
                 job = None
         if job is None:

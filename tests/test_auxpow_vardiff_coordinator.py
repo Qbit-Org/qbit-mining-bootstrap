@@ -403,6 +403,150 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
                 max_age_seconds=120,
             )
 
+    def test_same_tip_refreshes_when_parent_template_age_expires(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 0),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            refreshed = server.refresh_job(force=False)
+
+        self.assertTrue(refreshed)
+        self.assertIn("reason=parent-template-age", stdout.getvalue())
+        server.make_job.assert_called_once()
+        server.broadcast_job.assert_called_once()
+
+    def test_parent_template_age_boundary_remains_a_noop(self) -> None:
+        server, current_job = self.refresh_server(parent_curtime=880, replacement_curtime=1000)
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 0),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+        ):
+            refreshed = server.refresh_job(force=False)
+
+        self.assertFalse(refreshed)
+        self.assertIs(server.current_job, current_job)
+        server.make_job.assert_not_called()
+        server.broadcast_job.assert_not_called()
+
+    def test_parent_template_expiring_during_tip_poll_forces_refresh(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=880, replacement_curtime=1001)
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 0),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", side_effect=[1000, 1001, 1001]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            refreshed = server.refresh_job(force=False)
+
+        self.assertTrue(refreshed)
+        server.make_job.assert_called_once()
+        server.broadcast_job.assert_called_once()
+
+    def test_refresh_rejects_stale_parent_template_before_publication(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=879)
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 0),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaisesRegex(RuntimeError, "template is stale"),
+        ):
+            server.refresh_job(force=False)
+
+        self.assertIsNone(server.current_job)
+        self.assertEqual(server.jobs, {})
+        server.make_job.assert_not_called()
+        server.broadcast_job.assert_not_called()
+
+    def test_expired_parent_work_is_invalidated_before_refresh_rpc(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+        server.qbit_rpc.call = Mock(side_effect=RuntimeError("qbit RPC unavailable"))
+        server.bitcoin_rpc.call = Mock()
+
+        with (
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaisesRegex(RuntimeError, "qbit RPC unavailable"),
+        ):
+            server.refresh_job(force=False)
+
+        self.assertIsNone(server.current_job)
+        self.assertEqual(server.jobs, {})
+        server.qbit_rpc.call.assert_called_once_with("getbestblockhash")
+        server.bitcoin_rpc.call.assert_not_called()
+
+    def test_submit_rejects_parent_work_that_expires_between_refresh_polls(self) -> None:
+        server, current_job = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+        client = self.client()
+
+        with (
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaises(coordinator.StratumError) as raised,
+        ):
+            server.handle_submit(
+                client,
+                ["worker", current_job.job_id, "00" * 8, "00000000", "00000000"],
+            )
+
+        self.assertEqual(raised.exception.code, 21)
+        self.assertIsNone(server.current_job)
+        self.assertEqual(server.jobs, {})
+
+    def test_stale_submit_does_not_invalidate_newer_fresh_work(self) -> None:
+        server, stale_job = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+        fresh_job = self.job(job_id="fresh")
+        fresh_job.btc_template = {
+            "previousblockhash": "11" * 32,
+            "curtime": 1000,
+        }
+        server.current_job = fresh_job
+        server.jobs = {stale_job.job_id: stale_job}
+        client = self.client()
+
+        with (
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaises(coordinator.StratumError) as raised,
+        ):
+            server.handle_submit(
+                client,
+                ["worker", stale_job.job_id, "00" * 8, "00000000", "00000000"],
+            )
+
+        self.assertEqual(raised.exception.code, 21)
+        self.assertIs(server.current_job, fresh_job)
+        self.assertEqual(server.jobs, {})
+
+    def test_subscribe_and_authorize_do_not_publish_expired_current_work(self) -> None:
+        for method in ("mining.subscribe", "mining.authorize"):
+            with self.subTest(method=method):
+                server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+                client = self.client()
+                server.send_result = Mock()
+                server.send_job_to_client = Mock()
+
+                with (
+                    patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+                    patch.object(coordinator.time, "time", return_value=1000),
+                ):
+                    server.handle_request(
+                        client,
+                        {"id": 1, "method": method, "params": ["worker"]},
+                    )
+
+                server.send_result.assert_called_once()
+                server.send_job_to_client.assert_not_called()
+                self.assertIsNone(server.current_job)
+                self.assertEqual(server.jobs, {})
+
     def test_build_chain_commitment_uses_display_order_root_bytes(self) -> None:
         root_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         aux_template = {"hash": root_hex, "chainid": 31430, "commitmentorder": "display"}
@@ -528,6 +672,54 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
         server.worker_stats = {}
         server.log_event = lambda *args, **kwargs: None
         return server
+
+    def refresh_server(
+        self,
+        *,
+        parent_curtime: int,
+        replacement_curtime: int,
+    ) -> tuple[coordinator.AuxPowStratumServer, coordinator.AuxPowStratumJob]:
+        server = self.server()
+        current_job = self.job(job_id="current")
+        current_job.btc_template = {
+            "previousblockhash": "00" * 32,
+            "curtime": parent_curtime,
+        }
+        server.current_job = current_job
+        server.jobs = {current_job.job_id: current_job}
+        server.tip_snapshot = ("qbit-tip", "bitcoin-tip")
+
+        server.qbit_rpc = types.SimpleNamespace(
+            call=lambda method, params=None, **kwargs: {
+                "getbestblockhash": "qbit-tip",
+                "createauxblock": {
+                    "height": 1,
+                    "hash": "aux-hash",
+                    "bits": "1d00ffff",
+                },
+            }[method]
+        )
+        server.bitcoin_rpc = types.SimpleNamespace(
+            call=lambda method, params=None, **kwargs: {
+                "getbestblockhash": "bitcoin-tip",
+                "getblocktemplate": {
+                    "height": 1,
+                    "previousblockhash": "00" * 32,
+                    "version": 0x20000000,
+                    "bits": "1d00ffff",
+                    "curtime": replacement_curtime,
+                },
+            }[method]
+        )
+
+        def make_job(**kwargs: object) -> coordinator.AuxPowStratumJob:
+            job = self.job(job_id=str(kwargs["job_id"]))
+            job.btc_template = dict(kwargs["btc_template"])
+            return job
+
+        server.make_job = Mock(side_effect=make_job)
+        server.broadcast_job = Mock()
+        return server, current_job
 
     def client(self) -> coordinator.StratumClientState:
         client = coordinator.StratumClientState(
@@ -671,6 +863,35 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
         self.assertIsNone(client.vardiff_difficulty_estimate)
         self.assertEqual(client.pending_share_difficulty, Decimal("4"))
 
+    def test_clean_job_retarget_does_not_publish_expired_current_work(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+        client = self.client()
+        client.share_difficulty = Decimal("16")
+        server.send_difficulty_value = Mock()
+        server.send_job_to_client = Mock()
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_VARDIFF_APPLY_MODE", "clean_job"),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            server.retarget_client(
+                client,
+                current_difficulty=Decimal("16"),
+                accepted_shares=0,
+                submitted_shares=0,
+                accepted_difficulty=Decimal("0"),
+                elapsed_seconds=Decimal("90"),
+                worker="worker",
+                reason="test",
+            )
+
+        server.send_job_to_client.assert_not_called()
+        server.send_difficulty_value.assert_called_once_with(client, Decimal("4"))
+        self.assertIsNone(server.current_job)
+        self.assertEqual(server.jobs, {})
+
     def test_retarget_does_not_overwrite_newer_client_difficulty(self) -> None:
         server = self.server()
         client = self.client()
@@ -714,7 +935,7 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
                     "previousblockhash": "00" * 32,
                     "version": 0x20000000,
                     "bits": "1d00ffff",
-                    "curtime": 1,
+                    "curtime": int(time.time()),
                 },
             }[method]
         )
