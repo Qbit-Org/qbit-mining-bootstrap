@@ -65,6 +65,8 @@ services:
     depends_on:
       qbitd:
         condition: service_healthy
+    volumes:
+      - real-miner-smoke-address:/run/qbit-real-miner-smoke
     environment:
       QBIT_PRODUCTION: ${QBIT_PRODUCTION:-0}
       QBIT_TOOLS_PRODUCTION: ${QBIT_TOOLS_PRODUCTION:-0}
@@ -74,6 +76,7 @@ services:
       QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
       QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
       QBIT_MINER_ADDRESS: ${QBIT_MINER_ADDRESS:-auto}
+      QBIT_MINER_ADDRESS_FILE: /run/qbit-real-miner-smoke/miner-address.txt
       QBIT_MINER_ADDRESS_FILE_WAIT: 0
       CKPOOL_MINDIFF: ${CKPOOL_MINDIFF:-}
       CKPOOL_STARTDIFF: ${CKPOOL_STARTDIFF:-}
@@ -154,15 +157,13 @@ services:
         condition: service_healthy
       ckpool:
         condition: service_healthy
-      miner-address:
-        condition: service_healthy
     volumes:
-      - real-miner-state:/var/lib/qbit-lab
+      - real-miner-smoke-address:/run/qbit-real-miner-smoke:ro
     environment:
       STRATUM_HOST: ckpool
       STRATUM_PORT: 3333
       MINER_USERNAME: ${REAL_MINER_USERNAME:-auto}
-      MINER_USERNAME_FILE: /var/lib/qbit-lab/miner-address.txt
+      MINER_USERNAME_FILE: /run/qbit-real-miner-smoke/miner-address.txt
       MINER_PASSWORD: x
       MINER_TIMEOUT_SECONDS: ${REAL_MINER_TIMEOUT_SECONDS:-120}
       MINER_USERNAME_TIMEOUT_SECONDS: 60
@@ -173,32 +174,6 @@ services:
       QBIT_RPC_PORT: ${QBIT_RPC_PORT:-18452}
       QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
       QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
-
-  miner-address:
-    profiles: ["real-miner-smoke"]
-    image: qbit-lab-qbitd:local
-    depends_on:
-      qbitd:
-        condition: service_healthy
-    volumes:
-      - real-miner-state:/var/lib/qbit-lab
-      - ./lab/real-miner/bootstrap_miner_address.sh:/usr/local/bin/bootstrap_miner_address.sh:ro
-    environment:
-      QBIT_RPC_HOST: qbitd
-      QBIT_RPC_PORT: ${QBIT_RPC_PORT:-18452}
-      QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
-      QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
-      QBIT_MINER_WALLET_NAME: real-miner-smoke
-      QBIT_MINER_ADDRESS_FILE: /var/lib/qbit-lab/miner-address.txt
-    entrypoint: ["/usr/bin/tini", "--"]
-    command: ["/bin/bash", "/usr/local/bin/bootstrap_miner_address.sh"]
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - test -s /var/lib/qbit-lab/miner-address.txt
-      interval: 5s
-      timeout: 5s
-      retries: 30
 
   bitcoind:
     profiles: ["auxpow"]
@@ -624,7 +599,7 @@ services:
 volumes:
   bitcoin-data:
   qbit-data:
-  real-miner-state:
+  real-miner-smoke-address:
   prism-audit-data:
   prism-postgres-data:
   prism-postgres-wal:

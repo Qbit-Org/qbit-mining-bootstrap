@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import math
@@ -492,17 +493,30 @@ def run_preflight(env: dict[str, str], rpc: RpcClient) -> list[str]:
     return messages
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--production-gate-only",
+        action="store_true",
+        help="validate production-only settings without making RPC calls",
+    )
+    args = parser.parse_args(argv)
     env = dict(os.environ)
     try:
-        messages = run_preflight(env, build_rpc_client(env))
+        if args.production_gate_only:
+            messages = validate_production_gate(env)
+        else:
+            messages = run_preflight(env, build_rpc_client(env))
     except (KeyError, OSError, json.JSONDecodeError, PreflightError) as exc:
         print(f"qbit ckpool preflight: FAIL: {exc}", file=sys.stderr)
         return 1
 
     for message in messages:
         print(f"qbit ckpool preflight: {message}", file=sys.stderr)
-    print("qbit ckpool preflight: PASS", file=sys.stderr)
+    if args.production_gate_only:
+        print("qbit ckpool preflight: production gate-only PASS", file=sys.stderr)
+    else:
+        print("qbit ckpool preflight: PASS", file=sys.stderr)
     return 0
 
 

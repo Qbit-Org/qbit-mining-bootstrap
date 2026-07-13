@@ -132,6 +132,34 @@ class CkpoolStartupTests(unittest.TestCase):
         self.assertEqual(config["startdiff"], 0.00390625)
         self.assertEqual(config["version_mask"], "1fffe000")
 
+    def test_startup_writes_resolved_address_for_real_miner_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer() as rpc:
+            root = Path(tmp)
+            self.run_start_ckpool(root, rpc)
+            address = (root / "state" / "miner-address.txt").read_text(encoding="utf-8").strip()
+
+        self.assertEqual(address, REGTEST_ADDRESS)
+
+    def test_mainnet_rejects_implicit_address_before_wallet_resolution(self) -> None:
+        for address in ("", "auto", " AUTO "):
+            with self.subTest(address=address), tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+                "--chain", "main"
+            ) as rpc:
+                root = Path(tmp)
+                result, config_file = self.run_start_ckpool_raw(
+                    root,
+                    rpc,
+                    QBIT_CHAIN="mainnet",
+                    QBIT_PRODUCTION="0",
+                    QBIT_RPC_PASSWORD="not-default",
+                    QBIT_MINER_ADDRESS=address,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires an explicit QBIT_MINER_ADDRESS", result.stderr)
+                self.assertFalse(config_file.exists())
+                self.assertFalse((root / "state" / "miner-address.txt").exists())
+
     def test_explicit_public_difficulty_and_knobs_render(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer("--chain", "testnet4") as rpc:
             config = self.run_start_ckpool(

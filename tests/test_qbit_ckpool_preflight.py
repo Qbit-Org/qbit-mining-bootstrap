@@ -207,6 +207,23 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
 
         self.assertTrue(any("production gate" in message for message in messages))
 
+    def test_production_gate_only_cli_does_not_construct_an_rpc_client(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(preflight.os.environ, production_env(), clear=True),
+            mock.patch.object(
+                preflight,
+                "build_rpc_client",
+                side_effect=AssertionError("gate-only mode must not construct an RPC client"),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = preflight.main(["--production-gate-only"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("production gate-only PASS", stderr.getvalue())
+        self.assertNotIn("qbit ckpool preflight: PASS\n", stderr.getvalue())
+
     def test_mainnet_implies_production_gate(self) -> None:
         with self.assertRaisesRegex(preflight.PreflightError, "non-default QBIT_RPC_PASSWORD"):
             preflight.run_preflight(

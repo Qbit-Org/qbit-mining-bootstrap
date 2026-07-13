@@ -220,10 +220,10 @@ Compose contract:
 | AuxPoW Stratum | `qbitd bitcoind auxpow-stratum` |
 
 `permissionless-miner`, `real-miner`, `auxpow-real-miner`, and the one-shot
-AuxPoW coordinator are smoke-test clients. `real-miner` and `miner-address`
-belong to the `real-miner-smoke` integration profile; the miner connects to the
-ordinary `ckpool` service. These helpers should not be included in a mainnet
-service set.
+AuxPoW coordinator are smoke-test clients. `real-miner` belongs to the
+`real-miner-smoke` integration profile; it reads the ordinary `ckpool`
+service's resolved payout address and connects on port 3333. These helpers
+should not be included in a mainnet service set.
 
 Use separate service units when independent mining lanes must be deployable or
 restartable without interrupting the others.

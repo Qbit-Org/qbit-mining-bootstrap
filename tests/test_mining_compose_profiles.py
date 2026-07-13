@@ -73,7 +73,7 @@ class MiningComposeProfileTests(unittest.TestCase):
     def test_each_mining_profile_has_an_exact_service_graph(self) -> None:
         expected = {
             "permissionless": {"qbitd", "ckpool", "permissionless-miner"},
-            "real-miner-smoke": {"qbitd", "ckpool", "miner-address", "real-miner"},
+            "real-miner-smoke": {"qbitd", "ckpool", "real-miner"},
             "auxpow": {
                 "qbitd",
                 "bitcoind",
@@ -105,17 +105,32 @@ class MiningComposeProfileTests(unittest.TestCase):
             {("3333", "3333")},
         )
 
-        state_targets = {
-            service: {
-                volume["target"]
-                for volume in services[service].get("volumes", [])
-                if isinstance(volume, dict)
-            }
-            for service in ("ckpool", "miner-address", "real-miner")
-        }
-        self.assertNotIn("/var/lib/qbit-lab", state_targets["ckpool"])
-        self.assertIn("/var/lib/qbit-lab", state_targets["miner-address"])
-        self.assertIn("/var/lib/qbit-lab", state_targets["real-miner"])
+        pool_mount = next(
+            volume
+            for volume in services["ckpool"].get("volumes", [])
+            if volume["target"] == "/run/qbit-real-miner-smoke"
+        )
+        miner_mount = next(
+            volume
+            for volume in miner.get("volumes", [])
+            if volume["target"] == "/run/qbit-real-miner-smoke"
+        )
+        self.assertEqual(pool_mount["source"], miner_mount["source"])
+        self.assertFalse(
+            any(
+                volume["target"] == "/var/lib/ckpool"
+                for volume in services["ckpool"].get("volumes", [])
+            )
+        )
+        self.assertTrue(miner_mount["read_only"])
+        self.assertEqual(
+            services["ckpool"]["environment"]["QBIT_MINER_ADDRESS_FILE"],
+            "/run/qbit-real-miner-smoke/miner-address.txt",
+        )
+        self.assertEqual(
+            miner["environment"]["MINER_USERNAME_FILE"],
+            "/run/qbit-real-miner-smoke/miner-address.txt",
+        )
 
 
 if __name__ == "__main__":

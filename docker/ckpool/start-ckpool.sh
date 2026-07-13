@@ -54,6 +54,10 @@ export QBIT_EXPECTED_ADDRESS_HRP QBIT_EXPECTED_MAX_BLOCK_WEIGHT
 export QBIT_EXPECTED_WITNESS_SCALE_FACTOR QBIT_EXPECTED_COINBASE_MATURITY
 export QBIT_EXPECTED_GENESIS_HASH
 
+# Reject implicit production payouts before file or wallet resolution can hide
+# how the address was supplied.
+qbit-ckpool-preflight --production-gate-only
+
 mkdir -p "$(dirname "${CKPOOL_CONFIG_FILE}")" "${CKPOOL_LOG_DIR}" "${CKPOOL_SOCK_DIR}" "${CKPOOL_STATE_DIR}"
 
 json_string() {

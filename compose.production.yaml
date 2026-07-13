@@ -13,6 +13,7 @@ services:
     image: ${CKPOOL_IMAGE:-invalid.invalid/qbit-mining-bootstrap/ckpool:production-image-not-configured}
     pull_policy: always
     restart: unless-stopped
+    volumes: !override []
 
   bitcoind:
     image: ${BITCOIND_IMAGE:-invalid.invalid/qbit-mining-bootstrap/bitcoind:production-image-not-configured}
@@ -75,9 +76,6 @@ services:
     profiles: !override ["production-disabled"]
 
   real-miner:
-    profiles: !override ["production-disabled"]
-
-  miner-address:
     profiles: !override ["production-disabled"]
 
   auxpow-real-miner:

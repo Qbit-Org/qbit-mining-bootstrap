@@ -244,6 +244,9 @@ class MainnetComposeContractTests(unittest.TestCase):
     def test_ckpool_runtimes_receive_template_freshness_limit(self) -> None:
         self.assertEqual(self._environment("ckpool")["CKPOOL_TEMPLATE_MAX_AGE_SECONDS"], "120")
 
+    def test_ckpool_smoke_address_handoff_is_not_mounted_in_production(self) -> None:
+        self.assertEqual(self.config["services"]["ckpool"].get("volumes", []), [])
+
     def test_operator_services_have_restart_policies(self) -> None:
         expected = {
             "qbitd": "unless-stopped",
@@ -265,7 +268,6 @@ class MainnetComposeContractTests(unittest.TestCase):
             {
                 "permissionless-miner",
                 "real-miner",
-                "miner-address",
                 "auxpow-coordinator",
                 "auxpow-bridge",
                 "auxpow-real-miner",
