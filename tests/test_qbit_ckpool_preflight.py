@@ -272,6 +272,32 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
         self.assertIn("production gate-only PASS", stderr.getvalue())
         self.assertNotIn("qbit ckpool preflight: PASS\n", stderr.getvalue())
 
+    def test_mainnet_gate_only_rejects_missing_or_invalid_genesis_without_rpc(self) -> None:
+        cases = {
+            "": "QBIT_CHAIN=mainnet requires QBIT_EXPECTED_GENESIS_HASH",
+            "not-a-hash": "QBIT_EXPECTED_GENESIS_HASH must be 64 lowercase hex characters",
+        }
+        for value, expected_error in cases.items():
+            with self.subTest(value=value):
+                stderr = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        preflight.os.environ,
+                        mainnet_env(QBIT_EXPECTED_GENESIS_HASH=value),
+                        clear=True,
+                    ),
+                    mock.patch.object(
+                        preflight,
+                        "build_rpc_client",
+                        side_effect=AssertionError("gate-only mode must not construct an RPC client"),
+                    ),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = preflight.main(["--production-gate-only"])
+
+                self.assertEqual(result, 1)
+                self.assertIn(expected_error, stderr.getvalue())
+
     def test_mainnet_implies_production_gate(self) -> None:
         with self.assertRaisesRegex(
             preflight.PreflightError,

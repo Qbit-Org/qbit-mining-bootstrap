@@ -153,12 +153,38 @@ class CkpoolStartupTests(unittest.TestCase):
                     QBIT_PRODUCTION="0",
                     QBIT_RPC_PASSWORD="not-default",
                     QBIT_MINER_ADDRESS=address,
+                    QBIT_EXPECTED_GENESIS_HASH="11" * 32,
                 )
 
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("requires an explicit QBIT_MINER_ADDRESS", result.stderr)
                 self.assertFalse(config_file.exists())
                 self.assertFalse((root / "state" / "miner-address.txt").exists())
+
+    def test_mainnet_rejects_invalid_genesis_before_state_creation(self) -> None:
+        cases = {
+            "": "QBIT_CHAIN=mainnet requires QBIT_EXPECTED_GENESIS_HASH",
+            "not-a-hash": "QBIT_EXPECTED_GENESIS_HASH must be 64 lowercase hex characters",
+        }
+        for value, expected_error in cases.items():
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+                "--chain", "main"
+            ) as rpc:
+                root = Path(tmp)
+                result, config_file = self.run_start_ckpool_raw(
+                    root,
+                    rpc,
+                    QBIT_CHAIN="mainnet",
+                    QBIT_PRODUCTION="0",
+                    QBIT_RPC_PASSWORD="not-default",
+                    QBIT_MINER_ADDRESS="qb1staticqbitaddress",
+                    QBIT_EXPECTED_GENESIS_HASH=value,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(config_file.exists())
+                self.assertFalse((root / "state").exists())
 
     def test_explicit_public_difficulty_and_knobs_render(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer("--chain", "testnet4") as rpc:

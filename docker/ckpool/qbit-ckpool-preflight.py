@@ -219,6 +219,15 @@ def validate_difficulty_policy(env: dict[str, str]) -> list[str]:
     return messages
 
 
+def validated_expected_genesis_hash(env: dict[str, str], chain: str) -> str:
+    expected_genesis = env.get("QBIT_EXPECTED_GENESIS_HASH", "").strip().lower()
+    if chain == "mainnet" and not expected_genesis:
+        raise PreflightError("QBIT_CHAIN=mainnet requires QBIT_EXPECTED_GENESIS_HASH")
+    if expected_genesis and HASH256_RE.fullmatch(expected_genesis) is None:
+        raise PreflightError("QBIT_EXPECTED_GENESIS_HASH must be 64 lowercase hex characters")
+    return expected_genesis
+
+
 def validate_production_gate(env: dict[str, str]) -> list[str]:
     if not production_mode(env):
         return []
@@ -226,6 +235,7 @@ def validate_production_gate(env: dict[str, str]) -> list[str]:
     chain = chain_name(env)
     if chain == "regtest":
         raise PreflightError("production mode rejects regtest QBIT_CHAIN")
+    validated_expected_genesis_hash(env, chain)
 
     policy = env.get("CKPOOL_PUBLIC_DIFF_POLICY", "explicit").strip().lower() or "explicit"
     if policy in DIFF_POLICY_PERMISSIVE:
@@ -328,12 +338,7 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
     if not bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True):
         return [f"readiness gate: disabled for QBIT_CHAIN={chain}"]
 
-    expected_genesis = env.get("QBIT_EXPECTED_GENESIS_HASH", "").strip().lower()
-    if chain == "mainnet" and not expected_genesis:
-        raise PreflightError("QBIT_CHAIN=mainnet requires QBIT_EXPECTED_GENESIS_HASH")
-    if expected_genesis:
-        if HASH256_RE.fullmatch(expected_genesis) is None:
-            raise PreflightError("QBIT_EXPECTED_GENESIS_HASH must be 64 lowercase hex characters")
+    expected_genesis = validated_expected_genesis_hash(env, chain)
 
     min_peers = int_env(env, "CKPOOL_MIN_PEERS", 1)
     if min_peers < 1:
