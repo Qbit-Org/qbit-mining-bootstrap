@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import io
 import importlib.util
+import signal
+import subprocess
 import sys
 import time
 import unittest
@@ -100,6 +102,52 @@ class FakeRpc:
     @staticmethod
     def sequence_value(values: list[Any], index: int) -> Any:
         return values[min(index, len(values) - 1)]
+
+
+class FakeChild:
+    def __init__(self, *, exit_on_wait: int | None = None) -> None:
+        self.returncode: int | None = None
+        self.exit_on_wait = exit_on_wait
+        self.wait_timeouts: list[float | None] = []
+        self.signals: list[int] = []
+        self.terminated = False
+        self.killed = False
+        self.on_wait: Any = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_timeouts.append(timeout)
+        if self.on_wait is not None:
+            callback, self.on_wait = self.on_wait, None
+            callback()
+        if self.returncode is not None:
+            return self.returncode
+        if self.exit_on_wait is not None:
+            self.returncode = self.exit_on_wait
+            return self.returncode
+        raise subprocess.TimeoutExpired("fake-ckpool", timeout)
+
+    def send_signal(self, signum: int) -> None:
+        self.signals.append(signum)
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -signal.SIGTERM
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -signal.SIGKILL
+
+
+class IncrementingClock:
+    def __init__(self) -> None:
+        self.value = -1.0
+
+    def __call__(self) -> float:
+        self.value += 1.0
+        return self.value
 
 
 def base_env(**overrides: str) -> dict[str, str]:
@@ -279,6 +327,145 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 mainnet_env(CKPOOL_TEMPLATE_MAX_AGE_SECONDS="120"),
                 FakeRpc(rpc_chain="main", template_time=int(time.time()) - 121),
             )
+
+    def test_public_readiness_rejects_grossly_future_template(self) -> None:
+        now = int(time.time())
+        with (
+            mock.patch.object(preflight.time, "time", return_value=now),
+            self.assertRaisesRegex(preflight.PreflightError, "future-dated"),
+        ):
+            preflight.run_preflight(
+                mainnet_env(CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS="7200"),
+                FakeRpc(rpc_chain="main", template_time=now + 7201),
+            )
+
+    def test_public_readiness_allows_consensus_future_time_boundary(self) -> None:
+        now = int(time.time())
+        with mock.patch.object(preflight.time, "time", return_value=now):
+            messages = preflight.run_preflight(
+                mainnet_env(CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS="7200"),
+                FakeRpc(rpc_chain="main", template_time=now + 7200),
+            )
+
+        self.assertTrue(any("template_age=-7200s" in message for message in messages))
+
+    def test_public_readiness_requires_positive_template_max_age(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "must be positive"):
+            preflight.run_preflight(
+                mainnet_env(CKPOOL_TEMPLATE_MAX_AGE_SECONDS="0"),
+                FakeRpc(rpc_chain="main"),
+            )
+
+    def test_watchdog_returns_child_exit_status_without_terminating_it(self) -> None:
+        child = FakeChild(exit_on_wait=0)
+        status = preflight.TemplateStatus(0, 120, 7200)
+
+        with mock.patch.object(preflight, "fetch_and_validate_template", return_value=status):
+            result = preflight.supervise_ckpool(
+                mainnet_env(),
+                mock.Mock(),
+                ["fake-ckpool"],
+                popen=lambda _command: child,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(child.terminated)
+        self.assertFalse(child.killed)
+
+    def test_watchdog_stops_child_immediately_for_invalid_template(self) -> None:
+        child = FakeChild()
+        fresh = preflight.TemplateStatus(0, 120, 7200)
+
+        with mock.patch.object(
+            preflight,
+            "fetch_and_validate_template",
+            side_effect=[fresh, preflight.TemplateValidationError("template is stale")],
+        ):
+            result = preflight.supervise_ckpool(
+                mainnet_env(CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="1"),
+                mock.Mock(),
+                ["fake-ckpool"],
+                popen=lambda _command: child,
+                monotonic=IncrementingClock(),
+            )
+
+        self.assertEqual(result, 1)
+        self.assertTrue(child.terminated)
+
+    def test_watchdog_bounds_transient_rpc_failure(self) -> None:
+        child = FakeChild()
+        fresh = preflight.TemplateStatus(0, 120, 7200)
+
+        with mock.patch.object(
+            preflight,
+            "fetch_and_validate_template",
+            side_effect=[fresh, OSError("RPC unavailable"), OSError("RPC unavailable")],
+        ):
+            result = preflight.supervise_ckpool(
+                mainnet_env(
+                    CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="1",
+                    CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS="3",
+                ),
+                mock.Mock(),
+                ["fake-ckpool"],
+                popen=lambda _command: child,
+                monotonic=IncrementingClock(),
+            )
+
+        self.assertEqual(result, 1)
+        self.assertTrue(child.terminated)
+
+    def test_watchdog_forwards_signal_and_forces_ignored_shutdown(self) -> None:
+        child = FakeChild()
+        fresh = preflight.TemplateStatus(0, 120, 7200)
+        installed_handlers: dict[int, Any] = {}
+
+        def install_handler(signum: int, handler: Any) -> Any:
+            installed_handlers[signum] = handler
+            return None
+
+        def signal_on_first_wait() -> None:
+            installed_handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+        child.on_wait = signal_on_first_wait
+        with (
+            mock.patch.object(preflight, "fetch_and_validate_template", return_value=fresh),
+            mock.patch.object(preflight.signal, "getsignal", return_value=signal.SIG_DFL),
+            mock.patch.object(preflight.signal, "signal", side_effect=install_handler),
+        ):
+            result = preflight.supervise_ckpool(
+                mainnet_env(CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="1"),
+                mock.Mock(),
+                ["fake-ckpool"],
+                popen=lambda _command: child,
+                monotonic=IncrementingClock(),
+            )
+
+        self.assertEqual(result, 128 + signal.SIGTERM)
+        self.assertEqual(child.signals, [signal.SIGTERM])
+        self.assertTrue(child.killed)
+
+    def test_watchdog_reaps_child_on_unexpected_exception(self) -> None:
+        child = FakeChild()
+        fresh = preflight.TemplateStatus(0, 120, 7200)
+
+        with (
+            mock.patch.object(
+                preflight,
+                "fetch_and_validate_template",
+                side_effect=[fresh, RuntimeError("unexpected validator bug")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "unexpected validator bug"),
+        ):
+            preflight.supervise_ckpool(
+                mainnet_env(CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="1"),
+                mock.Mock(),
+                ["fake-ckpool"],
+                popen=lambda _command: child,
+                monotonic=IncrementingClock(),
+            )
+
+        self.assertTrue(child.terminated)
 
     def test_mainnet_requires_expected_genesis_hash(self) -> None:
         with self.assertRaisesRegex(preflight.PreflightError, "requires QBIT_EXPECTED_GENESIS_HASH"):
@@ -488,6 +675,28 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 env = base_env(**{name: value})
                 with self.assertRaises(preflight.PreflightError):
                     preflight.run_preflight(env, FakeRpc())
+
+    def test_public_update_interval_must_fit_inside_template_age_limit(self) -> None:
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "CKPOOL_UPDATE_INTERVAL must be less than CKPOOL_TEMPLATE_MAX_AGE_SECONDS",
+        ):
+            preflight.run_preflight(
+                mainnet_env(
+                    CKPOOL_UPDATE_INTERVAL="120",
+                    CKPOOL_TEMPLATE_MAX_AGE_SECONDS="120",
+                ),
+                FakeRpc(rpc_chain="main"),
+            )
+
+        messages = preflight.run_preflight(
+            mainnet_env(
+                CKPOOL_UPDATE_INTERVAL="119",
+                CKPOOL_TEMPLATE_MAX_AGE_SECONDS="120",
+            ),
+            FakeRpc(rpc_chain="main"),
+        )
+        self.assertTrue(any("update_interval=119" in message for message in messages))
 
     def test_rejects_difficulty_ordering_errors(self) -> None:
         cases = [

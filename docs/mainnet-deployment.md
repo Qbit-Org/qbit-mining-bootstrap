@@ -228,6 +228,25 @@ should not be included in a mainnet service set.
 Use separate service units when independent mining lanes must be deployable or
 restartable without interrupting the others.
 
+## CKPool Gate
+
+CKPool fetches and publishes its own qbit jobs on its configured update cycle.
+The container wrapper does not compete with that refresh path. It independently
+validates qbit `getblocktemplate` responses for the expected shape, block
+weight, age, and future-time bound while supervising the CKPool child process.
+A stale, malformed, or grossly future-dated template terminates CKPool and exits
+nonzero so the service supervisor can restart the complete runtime.
+
+`CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` sets the validation cadence.
+`CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS` bounds a transient RPC outage and is
+capped by the last validated template's remaining lifetime. An in-flight check
+may take up to `CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS` before shutdown.
+`CKPOOL_UPDATE_INTERVAL` must be lower than `CKPOOL_TEMPLATE_MAX_AGE_SECONDS`
+so CKPool cannot publish one job beyond that freshness bound. The default
+`CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS=7200` matches qbit's consensus
+maximum-future block window, allowing valid MTP-driven timestamps without
+letting an arbitrary future timestamp bypass the freshness check.
+
 ## AuxPoW Gate
 
 Mainnet AuxPoW requires explicit `QBIT_MINER_ADDRESS` and
@@ -243,7 +262,9 @@ Before binding AuxPoW Stratum, the runtime verifies:
 - qbit returns usable AuxPoW work
 - Bitcoin returns a usable, fresh block template
 
-`AUXPOW_TEMPLATE_MAX_AGE_SECONDS` bounds acceptable parent-template age.
+`AUXPOW_TEMPLATE_MAX_AGE_SECONDS` bounds acceptable parent-template age, while
+`AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS` rejects timestamps beyond Bitcoin's
+two-hour consensus future-time window.
 `AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS` bounds how long Stratum may fail
 to publish fresh work before exiting for supervised restart. Exercise this path
 before exposing the listener.

@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
+README = ROOT / "README.md"
 
 
 class MakefileLifecycleTests(unittest.TestCase):
@@ -192,6 +193,17 @@ class MakefileLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, ["--profile prism down --remove-orphans"])
         self.assertNotIn("-v", calls[0].split())
+
+    def test_upgrade_notes_remove_orphans_without_deleting_retired_volumes(self) -> None:
+        readme = README.read_text(encoding="utf-8")
+        upgrade_notes = readme.split("When upgrading an existing project", 1)[1].split(
+            "For a fresh public-network deployment", 1
+        )[0]
+
+        self.assertIn("`--remove-orphans`", upgrade_notes)
+        self.assertIn("without deleting their named volumes", upgrade_notes)
+        self.assertIn("Retired volumes stay detached", upgrade_notes)
+        self.assertNotIn("down -v", upgrade_notes)
 
     def test_purge_requires_exact_confirmation(self) -> None:
         result, calls = self.run_target("purge-local-volumes")

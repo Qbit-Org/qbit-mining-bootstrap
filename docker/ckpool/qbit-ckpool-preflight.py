@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed ckpool startup checks for qbit operator deployments."""
+"""Fail-closed ckpool startup and runtime checks for qbit deployments."""
 
 from __future__ import annotations
 
@@ -9,10 +9,12 @@ import json
 import math
 import os
 import re
+import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol, Sequence
 from urllib import request
 
 
@@ -46,9 +48,20 @@ class PreflightError(RuntimeError):
     """Raised when startup must fail closed."""
 
 
+class TemplateValidationError(PreflightError):
+    """Raised when a template response is known to be unsafe to mine."""
+
+
 class RpcClient(Protocol):
     def call(self, method: str, params: list[Any] | None = None) -> Any:
         ...
+
+
+@dataclass(frozen=True)
+class TemplateStatus:
+    age_seconds: int
+    max_age_seconds: int
+    max_future_seconds: int
 
 
 @dataclass(frozen=True)
@@ -254,6 +267,17 @@ def validate_ckpool_knobs(env: dict[str, str]) -> list[str]:
         raise PreflightError("CKPOOL_NONCE2LENGTH must be between 2 and 8")
     if update_interval <= 0:
         raise PreflightError("CKPOOL_UPDATE_INTERVAL must be positive")
+    if is_public_chain(chain_name(env)):
+        template_max_age = int_env(env, "CKPOOL_TEMPLATE_MAX_AGE_SECONDS", 120)
+        if template_max_age <= 0:
+            raise PreflightError(
+                "CKPOOL_TEMPLATE_MAX_AGE_SECONDS must be positive on public chains"
+            )
+        if update_interval >= template_max_age:
+            raise PreflightError(
+                "CKPOOL_UPDATE_INTERVAL must be less than "
+                "CKPOOL_TEMPLATE_MAX_AGE_SECONDS on public chains"
+            )
     if donation < 0:
         raise PreflightError("CKPOOL_DONATION must be non-negative")
 
@@ -389,11 +413,63 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
     ]
 
 
+def validate_template_response(
+    env: dict[str, str],
+    template: Any,
+    *,
+    now: int | None = None,
+) -> TemplateStatus:
+    chain = chain_name(env)
+    expected_weight = int_env(env, "QBIT_EXPECTED_MAX_BLOCK_WEIGHT", 2_000_000)
+    if not isinstance(template, dict):
+        raise TemplateValidationError("getblocktemplate result was not an object")
+    weightlimit = template.get("weightlimit")
+    if weightlimit != expected_weight:
+        raise TemplateValidationError(
+            f"getblocktemplate.weightlimit={weightlimit!r}, expected {expected_weight}"
+        )
+    if not is_public_chain(chain):
+        return TemplateStatus(age_seconds=0, max_age_seconds=0, max_future_seconds=0)
+
+    if not isinstance(template.get("previousblockhash"), str) or not template["previousblockhash"]:
+        raise TemplateValidationError("getblocktemplate.previousblockhash was missing")
+    try:
+        template_time = int(template["curtime"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TemplateValidationError("getblocktemplate.curtime must be an integer") from exc
+    max_age = int_env(env, "CKPOOL_TEMPLATE_MAX_AGE_SECONDS", 120)
+    max_future = int_env(env, "CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS", 7200)
+    if max_age <= 0:
+        raise PreflightError("CKPOOL_TEMPLATE_MAX_AGE_SECONDS must be positive on public chains")
+    if max_future < 0:
+        raise PreflightError("CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS must be non-negative")
+    template_age = (int(time.time()) if now is None else now) - template_time
+    if template_age > max_age:
+        raise TemplateValidationError(
+            f"getblocktemplate is stale: age={template_age}s exceeds {max_age}s"
+        )
+    if template_age < -max_future:
+        raise TemplateValidationError(
+            "getblocktemplate is future-dated: "
+            f"ahead={-template_age}s exceeds {max_future}s"
+        )
+    return TemplateStatus(
+        age_seconds=template_age,
+        max_age_seconds=max_age,
+        max_future_seconds=max_future,
+    )
+
+
+def fetch_and_validate_template(env: dict[str, str], rpc: RpcClient) -> TemplateStatus:
+    chain = chain_name(env)
+    template = rpc.call("getblocktemplate", [{"rules": gbt_rules(chain)}])
+    return validate_template_response(env, template)
+
+
 def validate_template_assumptions(env: dict[str, str], rpc: RpcClient) -> list[str]:
     if not bool_env(env, "CKPOOL_VALIDATE_QBIT_ASSUMPTIONS", True):
         return ["qbit assumptions: validation disabled"]
 
-    chain = chain_name(env)
     expected_weight = int_env(env, "QBIT_EXPECTED_MAX_BLOCK_WEIGHT", 2_000_000)
     expected_witness_scale = int_env(env, "QBIT_EXPECTED_WITNESS_SCALE_FACTOR", 1)
     expected_maturity = int_env(env, "QBIT_EXPECTED_COINBASE_MATURITY", 1000)
@@ -404,34 +480,12 @@ def validate_template_assumptions(env: dict[str, str], rpc: RpcClient) -> list[s
     if expected_maturity != 1000:
         raise PreflightError(f"QBIT_EXPECTED_COINBASE_MATURITY must be 1000, got {expected_maturity}")
 
-    template = rpc.call("getblocktemplate", [{"rules": gbt_rules(chain)}])
-    if not isinstance(template, dict):
-        raise PreflightError("getblocktemplate result was not an object")
-    weightlimit = template.get("weightlimit")
-    if weightlimit != expected_weight:
-        raise PreflightError(
-            f"getblocktemplate.weightlimit={weightlimit!r}, expected {expected_weight}"
-        )
-    if is_public_chain(chain):
-        if not isinstance(template.get("previousblockhash"), str) or not template["previousblockhash"]:
-            raise PreflightError("getblocktemplate.previousblockhash was missing")
-        try:
-            template_time = int(template["curtime"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PreflightError("getblocktemplate.curtime must be an integer") from exc
-        max_age = int_env(env, "CKPOOL_TEMPLATE_MAX_AGE_SECONDS", 120)
-        if max_age < 0:
-            raise PreflightError("CKPOOL_TEMPLATE_MAX_AGE_SECONDS must be non-negative")
-        template_age = int(time.time()) - template_time
-        if template_age > max_age:
-            raise PreflightError(
-                f"getblocktemplate is stale: age={template_age}s exceeds {max_age}s"
-            )
+    status = fetch_and_validate_template(env, rpc)
 
     return [
         "qbit assumptions: "
         f"weightlimit={expected_weight} witness_scale={expected_witness_scale} "
-        f"coinbase_maturity={expected_maturity}"
+        f"coinbase_maturity={expected_maturity} template_age={status.age_seconds}s"
     ]
 
 
@@ -482,6 +536,142 @@ def build_rpc_client(env: dict[str, str]) -> HttpRpcClient:
     )
 
 
+def watchdog_required(env: dict[str, str]) -> bool:
+    return is_public_chain(chain_name(env)) and bool_env(
+        env,
+        "CKPOOL_VALIDATE_QBIT_ASSUMPTIONS",
+        True,
+    )
+
+
+def watchdog_settings(env: dict[str, str]) -> tuple[float, float]:
+    poll_seconds = float_env(env, "CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS", 15.0)
+    failure_exit_seconds = float_env(
+        env,
+        "CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS",
+        120.0,
+    )
+    if poll_seconds < 1:
+        raise PreflightError("CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS must be at least 1 second")
+    if failure_exit_seconds <= 0:
+        raise PreflightError("CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS must be positive")
+    return poll_seconds, failure_exit_seconds
+
+
+def normalized_child_status(returncode: int) -> int:
+    return 128 + (-returncode) if returncode < 0 else returncode
+
+
+def stop_child(child: subprocess.Popen[Any], *, timeout: float = 10.0) -> None:
+    if child.poll() is not None:
+        return
+    child.terminate()
+    try:
+        child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait()
+
+
+def supervise_ckpool(
+    env: dict[str, str],
+    rpc: RpcClient,
+    command: Sequence[str],
+    *,
+    popen: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> int:
+    """Run CKPool while independently enforcing the public-chain GBT contract."""
+
+    if not command:
+        raise PreflightError("--supervise requires a CKPool command")
+    poll_seconds, failure_exit_seconds = watchdog_settings(env)
+
+    # The startup preflight has just run, but a separate read here makes this
+    # function safe to use and test independently.
+    status = fetch_and_validate_template(env, rpc)
+    checked_at = monotonic()
+    last_success = checked_at
+    valid_until = checked_at + max(0, status.max_age_seconds - status.age_seconds)
+    child = popen(list(command))
+
+    previous_handlers: dict[int, Any] = {}
+    shutdown_signal: int | None = None
+    shutdown_deadline: float | None = None
+
+    def forward_signal(signum: int, _frame: Any) -> None:
+        nonlocal shutdown_signal, shutdown_deadline
+        shutdown_signal = signum
+        shutdown_deadline = monotonic() + 10.0
+        if child.poll() is None:
+            child.send_signal(signum)
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, forward_signal)
+
+        while True:
+            now = monotonic()
+            if shutdown_deadline is not None:
+                wait_seconds = min(poll_seconds, max(1.0, shutdown_deadline - now))
+            else:
+                wait_seconds = min(poll_seconds, max(1.0, valid_until - now))
+            try:
+                returncode = child.wait(timeout=wait_seconds)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                return normalized_child_status(returncode)
+
+            returncode = child.poll()
+            if returncode is not None:
+                return normalized_child_status(returncode)
+
+            if shutdown_deadline is not None:
+                if monotonic() >= shutdown_deadline:
+                    child.kill()
+                    child.wait()
+                    assert shutdown_signal is not None
+                    return 128 + shutdown_signal
+                continue
+
+            try:
+                status = fetch_and_validate_template(env, rpc)
+            except TemplateValidationError as exc:
+                print(f"qbit ckpool watchdog: FAIL: {exc}", file=sys.stderr)
+                stop_child(child)
+                return 1
+            except (OSError, json.JSONDecodeError, PreflightError) as exc:
+                now = monotonic()
+                failure_deadline = min(last_success + failure_exit_seconds, valid_until)
+                remaining = failure_deadline - now
+                if remaining <= 0:
+                    print(
+                        "qbit ckpool watchdog: FAIL: template validation unavailable "
+                        f"past safe deadline: {exc}",
+                        file=sys.stderr,
+                    )
+                    stop_child(child)
+                    return 1
+                print(
+                    "qbit ckpool watchdog: template validation unavailable; "
+                    f"failing closed in at most {remaining:.1f}s: {exc}",
+                    file=sys.stderr,
+                )
+                valid_until = failure_deadline
+                continue
+
+            checked_at = monotonic()
+            last_success = checked_at
+            valid_until = checked_at + max(0, status.max_age_seconds - status.age_seconds)
+    finally:
+        if child.poll() is None:
+            stop_child(child)
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
 def run_preflight(env: dict[str, str], rpc: RpcClient) -> list[str]:
     messages: list[str] = []
     messages.extend(validate_production_gate(env))
@@ -500,9 +690,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="validate production-only settings without making RPC calls",
     )
+    parser.add_argument(
+        "--supervise",
+        nargs=argparse.REMAINDER,
+        metavar="COMMAND",
+        help="run a CKPool command with the public-chain template watchdog",
+    )
     args = parser.parse_args(argv)
     env = dict(os.environ)
     try:
+        if args.production_gate_only and args.supervise is not None:
+            raise PreflightError("--production-gate-only and --supervise are mutually exclusive")
+        if args.supervise is not None:
+            command = args.supervise
+            if command[:1] == ["--"]:
+                command = command[1:]
+            if not command:
+                raise PreflightError("--supervise requires a CKPool command")
+            if not watchdog_required(env):
+                os.execvp(command[0], command)
+            return supervise_ckpool(env, build_rpc_client(env), command)
         if args.production_gate_only:
             messages = validate_production_gate(env)
         else:

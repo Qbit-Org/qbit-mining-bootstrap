@@ -661,6 +661,7 @@ def validate_bitcoin_parent_template(
     parent_template: object,
     *,
     max_age_seconds: int,
+    max_future_seconds: int = 7200,
 ) -> int:
     if not isinstance(parent_template, dict) or not parent_template.get("previousblockhash"):
         raise RuntimeError("Bitcoin getblocktemplate did not return a usable template")
@@ -673,6 +674,11 @@ def validate_bitcoin_parent_template(
         raise RuntimeError(
             f"Bitcoin template is stale: age={template_age}s exceeds {max_age_seconds}s"
         )
+    if template_age < -max_future_seconds:
+        raise RuntimeError(
+            "Bitcoin template is future-dated: "
+            f"ahead={-template_age}s exceeds {max_future_seconds}s"
+        )
     return template_age
 
 
@@ -682,6 +688,7 @@ def validate_auxpow_templates(
     *,
     qbit_miner_address: str,
     max_age_seconds: int,
+    max_future_seconds: int = 7200,
 ) -> None:
     aux_template = qbit_rpc.call("createauxblock", [qbit_miner_address])
     if not isinstance(aux_template, dict) or not aux_template.get("hash"):
@@ -691,6 +698,7 @@ def validate_auxpow_templates(
     validate_bitcoin_parent_template(
         parent_template,
         max_age_seconds=max_age_seconds,
+        max_future_seconds=max_future_seconds,
     )
 
 
@@ -894,6 +902,7 @@ class AuxPowStratumServer:
             validate_bitcoin_parent_template(
                 job.btc_template,
                 max_age_seconds=AUXPOW_TEMPLATE_MAX_AGE_SECONDS,
+                max_future_seconds=AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS,
             )
         except RuntimeError:
             return True
@@ -1314,6 +1323,7 @@ class AuxPowStratumServer:
         validate_bitcoin_parent_template(
             btc_template,
             max_age_seconds=AUXPOW_TEMPLATE_MAX_AGE_SECONDS,
+            max_future_seconds=AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS,
         )
         job = self.make_job(
             job_id=self.next_job_id(),
@@ -2064,6 +2074,7 @@ def main() -> int:
         bitcoin_rpc,
         qbit_miner_address=qbit_miner_address,
         max_age_seconds=AUXPOW_TEMPLATE_MAX_AGE_SECONDS,
+        max_future_seconds=AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS,
     )
     print(f"auxpow: using qbit payout address {qbit_miner_address}", flush=True)
     print(f"auxpow: using Bitcoin payout address {bitcoin_miner_address.address}", flush=True)
@@ -2094,6 +2105,7 @@ BITCOIN_EXPECTED_GENESIS_HASH = os.environ.get("BITCOIN_EXPECTED_GENESIS_HASH", 
 BITCOIN_MINER_ADDRESS = env("BITCOIN_MINER_ADDRESS", "auto")
 BITCOIN_MINER_WALLET_NAME = env("BITCOIN_MINER_WALLET_NAME", "auxpow-parent")
 AUXPOW_TEMPLATE_MAX_AGE_SECONDS = env_nonnegative_int("AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120)
+AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS = env_nonnegative_int("AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS", 7200)
 AUXPOW_MODE = env("AUXPOW_MODE", "once")
 AUXPOW_BRIDGE_INTERVAL_SECONDS = env_int("AUXPOW_BRIDGE_INTERVAL_SECONDS", 15)
 AUXPOW_STRATUM_BIND = env("AUXPOW_STRATUM_BIND", "0.0.0.0")

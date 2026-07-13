@@ -403,6 +403,40 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
                 max_age_seconds=120,
             )
 
+    def test_auxpow_template_preflight_rejects_grossly_future_parent_work(self) -> None:
+        qbit_rpc = ReadinessRpc(chain="main")
+        bitcoin_rpc = ReadinessRpc(chain="main")
+        bitcoin_rpc.call = Mock(
+            return_value={
+                "previousblockhash": "33" * 32,
+                "curtime": 8201,
+            }
+        )
+        with (
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaisesRegex(RuntimeError, "future-dated"),
+        ):
+            coordinator.validate_auxpow_templates(
+                qbit_rpc,
+                bitcoin_rpc,
+                qbit_miner_address="qb1explicit",
+                max_age_seconds=120,
+                max_future_seconds=7200,
+            )
+
+    def test_auxpow_template_preflight_allows_consensus_future_time_boundary(self) -> None:
+        with patch.object(coordinator.time, "time", return_value=1000):
+            age = coordinator.validate_bitcoin_parent_template(
+                {
+                    "previousblockhash": "33" * 32,
+                    "curtime": 8200,
+                },
+                max_age_seconds=120,
+                max_future_seconds=7200,
+            )
+
+        self.assertEqual(age, -7200)
+
     def test_same_tip_refreshes_when_parent_template_age_expires(self) -> None:
         server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
 

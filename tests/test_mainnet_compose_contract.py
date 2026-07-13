@@ -242,7 +242,17 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(postgres["environment"]["POSTGRES_INITDB_WALDIR"], "/var/lib/postgresql/wal")
 
     def test_ckpool_runtimes_receive_template_freshness_limit(self) -> None:
-        self.assertEqual(self._environment("ckpool")["CKPOOL_TEMPLATE_MAX_AGE_SECONDS"], "120")
+        environment = self._environment("ckpool")
+        self.assertEqual(environment["CKPOOL_TEMPLATE_MAX_AGE_SECONDS"], "120")
+        self.assertEqual(environment["CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS"], "7200")
+        self.assertEqual(environment["CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS"], "15")
+        self.assertEqual(environment["CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS"], "120")
+
+    def test_auxpow_runtime_receives_template_future_time_limit(self) -> None:
+        self.assertEqual(
+            self._environment("auxpow-stratum")["AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS"],
+            "7200",
+        )
 
     def test_ckpool_smoke_address_handoff_is_not_mounted_in_production(self) -> None:
         self.assertEqual(self.config["services"]["ckpool"].get("volumes", []), [])
