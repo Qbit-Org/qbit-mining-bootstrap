@@ -84,7 +84,7 @@ services:
       CKPOOL_LOG_DIR: ${CKPOOL_LOG_DIR:-/var/log/ckpool}
       CKPOOL_SOCK_DIR: ${CKPOOL_SOCK_DIR:-/tmp/qbitlab}
       CKPOOL_NOTIFY: ${CKPOOL_NOTIFY:-false}
-      CKPOOL_BTCSIG: ${CKPOOL_BTCSIG:-/qbit-mining-bootstrap/}
+      CKPOOL_BTCSIG: "${CKPOOL_BTCSIG-/qbit-mining-bootstrap/}"
       CKPOOL_BLOCKPOLL: ${CKPOOL_BLOCKPOLL:-2}
       CKPOOL_DONATION: ${CKPOOL_DONATION:-0.0}
       CKPOOL_NONCE1LENGTH: ${CKPOOL_NONCE1LENGTH:-4}

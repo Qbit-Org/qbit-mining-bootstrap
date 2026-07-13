@@ -25,7 +25,7 @@ set -euo pipefail
 : "${QBIT_MINER_ADDRESS_FILE:=${CKPOOL_STATE_DIR}/miner-address.txt}"
 : "${QBIT_MINER_ADDRESS_FILE_WAIT:=0}"
 : "${CKPOOL_NOTIFY:=false}"
-: "${CKPOOL_BTCSIG:=/qbit-mining-bootstrap/}"
+: "${CKPOOL_BTCSIG=/qbit-mining-bootstrap/}"
 : "${CKPOOL_BLOCKPOLL:=2}"
 : "${CKPOOL_DONATION:=0.0}"
 : "${CKPOOL_NONCE1LENGTH:=4}"
