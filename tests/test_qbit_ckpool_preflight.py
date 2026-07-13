@@ -39,8 +39,9 @@ class FakeRpc:
         genesis_hash: str = "11" * 32,
         blocks: int | list[int] = 100,
         headers: int | list[int] = 100,
+        best_block_hash: str | list[str] = "22" * 32,
         template_time: int | None = None,
-        template_previous_hash: str | None = "22" * 32,
+        template_previous_hash: str | None | list[str | None] = "22" * 32,
     ) -> None:
         self.ibd = [ibd] if isinstance(ibd, bool) else ibd
         self.rpc_chain = rpc_chain
@@ -54,9 +55,18 @@ class FakeRpc:
         self.genesis_hash = genesis_hash
         self.blocks = [blocks] if isinstance(blocks, int) else blocks
         self.headers = [headers] if isinstance(headers, int) else headers
+        self.best_block_hashes = (
+            [best_block_hash] if isinstance(best_block_hash, str) else best_block_hash
+        )
+        self.best_block_hash_calls = 0
         self.blockchain_info_calls = 0
         self.template_time = int(time.time()) if template_time is None else template_time
-        self.template_previous_hash = template_previous_hash
+        self.template_previous_hashes = (
+            template_previous_hash
+            if isinstance(template_previous_hash, list)
+            else [template_previous_hash]
+        )
+        self.template_calls = 0
         self.calls: list[tuple[str, list[Any]]] = []
 
     def call(self, method: str, params: list[Any] | None = None) -> Any:
@@ -70,19 +80,26 @@ class FakeRpc:
                 "initialblockdownload": self.sequence_value(self.ibd, index),
                 "blocks": self.sequence_value(self.blocks, index),
                 "headers": self.sequence_value(self.headers, index),
+                "bestblockhash": self.sequence_value(self.best_block_hashes, index),
             }
         if method == "getnetworkinfo":
             index = min(self.network_info_calls, len(self.connections) - 1)
             self.network_info_calls += 1
             return {"connections": self.connections[index]}
+        if method == "getbestblockhash":
+            index = self.best_block_hash_calls
+            self.best_block_hash_calls += 1
+            return self.sequence_value(self.best_block_hashes, index)
         if method == "getblockhash":
             self.assert_genesis_height(params)
             return self.genesis_hash
         if method == "getblocktemplate":
+            index = self.template_calls
+            self.template_calls += 1
             return {
                 "rules": self.template_rules,
                 "weightlimit": self.weightlimit,
-                "previousblockhash": self.template_previous_hash,
+                "previousblockhash": self.sequence_value(self.template_previous_hashes, index),
                 "curtime": self.template_time,
             }
         if method == "validateaddress":
@@ -105,7 +122,12 @@ class FakeRpc:
 
 
 class FakeChild:
-    def __init__(self, *, exit_on_wait: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        exit_on_wait: int | None = None,
+        advance_clock: Callable[[float], None] | None = None,
+    ) -> None:
         self.returncode: int | None = None
         self.exit_on_wait = exit_on_wait
         self.wait_timeouts: list[float | None] = []
@@ -113,6 +135,7 @@ class FakeChild:
         self.terminated = False
         self.killed = False
         self.on_wait: Any = None
+        self.advance_clock = advance_clock
 
     def poll(self) -> int | None:
         return self.returncode
@@ -127,6 +150,8 @@ class FakeChild:
         if self.exit_on_wait is not None:
             self.returncode = self.exit_on_wait
             return self.returncode
+        if timeout is not None and self.advance_clock is not None:
+            self.advance_clock(timeout)
         raise subprocess.TimeoutExpired("fake-ckpool", timeout)
 
     def send_signal(self, signum: int) -> None:
@@ -148,6 +173,17 @@ class IncrementingClock:
     def __call__(self) -> float:
         self.value += 1.0
         return self.value
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
 
 
 def base_env(**overrides: str) -> dict[str, str]:
@@ -199,6 +235,10 @@ def mainnet_env(**overrides: str) -> dict[str, str]:
     )
     env.update(overrides)
     return env
+
+
+def skip_startup_readiness(_env: dict[str, str], _rpc: Any) -> list[str]:
+    return []
 
 
 class QbitCkpoolPreflightTests(unittest.TestCase):
@@ -394,6 +434,46 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 FakeRpc(rpc_chain="main"),
             )
 
+    def test_template_tip_race_retries_one_complete_snapshot(self) -> None:
+        rpc = FakeRpc(
+            rpc_chain="main",
+            best_block_hash=["22" * 32, "22" * 32],
+            template_previous_hash=["11" * 32, "22" * 32],
+        )
+
+        preflight.fetch_and_validate_template(mainnet_env(), rpc)
+
+        self.assertEqual(rpc.template_calls, 2)
+        self.assertEqual(rpc.best_block_hash_calls, 2)
+
+    def test_template_tip_mismatch_fails_after_one_retry(self) -> None:
+        rpc = FakeRpc(
+            rpc_chain="main",
+            best_block_hash="22" * 32,
+            template_previous_hash="11" * 32,
+        )
+
+        with self.assertRaisesRegex(
+            preflight.MiningStateValidationError,
+            "does not match the current qbit tip",
+        ):
+            preflight.fetch_and_validate_template(mainnet_env(), rpc)
+
+        self.assertEqual(rpc.template_calls, 2)
+        self.assertEqual(rpc.best_block_hash_calls, 2)
+
+    def test_watchdog_rejects_initially_unready_node_before_spawning_child(self) -> None:
+        def reject_popen(_command: list[str]) -> FakeChild:
+            raise AssertionError("CKPool must not start while qbit is unready")
+
+        with self.assertRaisesRegex(preflight.PreflightError, "initial block download"):
+            preflight.supervise_ckpool(
+                mainnet_env(CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS="0"),
+                FakeRpc(ibd=True, rpc_chain="main"),
+                ["fake-ckpool"],
+                popen=reject_popen,
+            )
+
     def test_watchdog_returns_child_exit_status_without_terminating_it(self) -> None:
         child = FakeChild(exit_on_wait=0)
         status = preflight.TemplateStatus(0, 120, 7200)
@@ -404,6 +484,7 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 mock.Mock(),
                 ["fake-ckpool"],
                 popen=lambda _command: child,
+                startup_readiness=skip_startup_readiness,
             )
 
         self.assertEqual(result, 0)
@@ -425,10 +506,125 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 ["fake-ckpool"],
                 popen=lambda _command: child,
                 monotonic=IncrementingClock(),
+                startup_readiness=skip_startup_readiness,
             )
 
         self.assertEqual(result, 1)
         self.assertTrue(child.terminated)
+
+    def test_watchdog_stops_child_when_runtime_readiness_is_lost(self) -> None:
+        cases = {
+            "ibd": {"ibd": True},
+            "headers": {"blocks": 99, "headers": 100},
+            "peers": {"connections": 0},
+        }
+        for name, rpc_overrides in cases.items():
+            with self.subTest(name=name):
+                clock = ManualClock()
+                child = FakeChild(advance_clock=clock.advance)
+                rpc = FakeRpc(rpc_chain="main", **rpc_overrides)
+
+                result = preflight.supervise_ckpool(
+                    mainnet_env(
+                        CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="2",
+                        CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS="3",
+                    ),
+                    rpc,
+                    ["fake-ckpool"],
+                    popen=lambda _command: child,
+                    monotonic=clock,
+                    startup_readiness=skip_startup_readiness,
+                )
+
+                self.assertEqual(result, 1)
+                self.assertTrue(child.terminated)
+                self.assertEqual(clock.value, 3.0)
+                self.assertEqual(child.wait_timeouts[:2], [2.0, 1.0])
+
+    def test_watchdog_tolerates_one_runtime_readiness_race(self) -> None:
+        clock = ManualClock()
+        child = FakeChild(advance_clock=clock.advance)
+        fresh = preflight.TemplateStatus(0, 120, 7200)
+        readiness_calls = 0
+
+        def validate_readiness(_env: dict[str, str], _rpc: Any) -> None:
+            nonlocal readiness_calls
+            readiness_calls += 1
+            if readiness_calls == 1:
+                raise preflight.RuntimeReadinessError("blocks briefly trailed headers")
+            if readiness_calls == 2:
+                child.returncode = 0
+
+        with (
+            mock.patch.object(preflight, "fetch_and_validate_template", return_value=fresh),
+            mock.patch.object(
+                preflight,
+                "validate_runtime_readiness",
+                side_effect=validate_readiness,
+            ),
+        ):
+            result = preflight.supervise_ckpool(
+                mainnet_env(CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="1"),
+                mock.Mock(),
+                ["fake-ckpool"],
+                popen=lambda _command: child,
+                monotonic=clock,
+                startup_readiness=skip_startup_readiness,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(readiness_calls, 2)
+        self.assertFalse(child.terminated)
+        self.assertEqual(clock.value, 2.0)
+
+    def test_watchdog_mixed_failures_do_not_extend_readiness_deadline(self) -> None:
+        clock = ManualClock()
+        child = FakeChild(advance_clock=clock.advance)
+        fresh = preflight.TemplateStatus(0, 120, 7200)
+        template_calls = 0
+        readiness_calls = 0
+
+        def validate_template(_env: dict[str, str], _rpc: Any) -> preflight.TemplateStatus:
+            nonlocal template_calls
+            template_calls += 1
+            if template_calls == 3:
+                raise OSError("RPC briefly unavailable")
+            return fresh
+
+        def validate_readiness(_env: dict[str, str], _rpc: Any) -> None:
+            nonlocal readiness_calls
+            readiness_calls += 1
+            raise preflight.RuntimeReadinessError("node remains isolated")
+
+        with (
+            mock.patch.object(
+                preflight,
+                "fetch_and_validate_template",
+                side_effect=validate_template,
+            ),
+            mock.patch.object(
+                preflight,
+                "validate_runtime_readiness",
+                side_effect=validate_readiness,
+            ),
+        ):
+            result = preflight.supervise_ckpool(
+                mainnet_env(
+                    CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="1",
+                    CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS="3",
+                ),
+                mock.Mock(),
+                ["fake-ckpool"],
+                popen=lambda _command: child,
+                monotonic=clock,
+                startup_readiness=skip_startup_readiness,
+            )
+
+        self.assertEqual(result, 1)
+        self.assertTrue(child.terminated)
+        self.assertEqual(clock.value, 3.0)
+        self.assertEqual(template_calls, 4)
+        self.assertEqual(readiness_calls, 2)
 
     def test_watchdog_bounds_transient_rpc_failure(self) -> None:
         child = FakeChild()
@@ -448,6 +644,7 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 ["fake-ckpool"],
                 popen=lambda _command: child,
                 monotonic=IncrementingClock(),
+                startup_readiness=skip_startup_readiness,
             )
 
         self.assertEqual(result, 1)
@@ -477,6 +674,7 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 ["fake-ckpool"],
                 popen=lambda _command: child,
                 monotonic=IncrementingClock(),
+                startup_readiness=skip_startup_readiness,
             )
 
         self.assertEqual(result, 128 + signal.SIGTERM)
@@ -501,6 +699,7 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 ["fake-ckpool"],
                 popen=lambda _command: child,
                 monotonic=IncrementingClock(),
+                startup_readiness=skip_startup_readiness,
             )
 
         self.assertTrue(child.terminated)

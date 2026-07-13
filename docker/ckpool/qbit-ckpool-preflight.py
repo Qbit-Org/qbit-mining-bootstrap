@@ -52,6 +52,14 @@ class TemplateValidationError(PreflightError):
     """Raised when a template response is known to be unsafe to mine."""
 
 
+class MiningStateValidationError(TemplateValidationError):
+    """Raised when the node or template is known not to be mining-ready."""
+
+
+class RuntimeReadinessError(PreflightError):
+    """Raised when a synchronized public node temporarily loses readiness."""
+
+
 class RpcClient(Protocol):
     def call(self, method: str, params: list[Any] | None = None) -> Any:
         ...
@@ -331,6 +339,73 @@ def parse_blockchain_readiness(
     return rpc_chain, initial_block_download, blocks, headers
 
 
+def parse_network_connections(network_info: Any) -> int:
+    if not isinstance(network_info, dict):
+        raise PreflightError("getnetworkinfo result was not an object")
+    connections = network_info.get("connections")
+    if not isinstance(connections, int) or isinstance(connections, bool):
+        raise PreflightError("getnetworkinfo.connections was missing or not an integer")
+    return connections
+
+
+def fetch_public_mining_tip(env: dict[str, str], rpc: RpcClient) -> str:
+    chain = chain_name(env)
+    best_block_hash = rpc.call("getbestblockhash")
+    if not isinstance(best_block_hash, str) or HASH256_RE.fullmatch(best_block_hash.lower()) is None:
+        raise MiningStateValidationError(
+            "getbestblockhash was missing or not a 64-character hex hash"
+        )
+
+    expected_genesis = validated_expected_genesis_hash(env, chain)
+    if expected_genesis:
+        actual_genesis = rpc.call("getblockhash", [0])
+        if not isinstance(actual_genesis, str) or actual_genesis.lower() != expected_genesis:
+            raise MiningStateValidationError(
+                f"qbit genesis hash is {actual_genesis!r}, expected {expected_genesis}"
+            )
+
+    return best_block_hash.lower()
+
+
+def validate_runtime_readiness(env: dict[str, str], rpc: RpcClient) -> None:
+    chain = chain_name(env)
+    if not is_public_chain(chain) or not bool_env(
+        env,
+        "CKPOOL_NON_TEST_READINESS_GATE",
+        True,
+    ):
+        return
+
+    info = rpc.call("getblockchaininfo")
+    try:
+        _rpc_chain, initial_block_download, blocks, headers = parse_blockchain_readiness(
+            chain=chain,
+            info=info,
+        )
+    except PreflightError as exc:
+        raise MiningStateValidationError(f"invalid runtime chain state: {exc}") from exc
+
+    min_peers = int_env(env, "CKPOOL_MIN_PEERS", 1)
+    if min_peers < 1:
+        raise PreflightError("CKPOOL_MIN_PEERS must be at least 1 for public-chain readiness")
+    try:
+        connections = parse_network_connections(rpc.call("getnetworkinfo"))
+    except PreflightError as exc:
+        raise MiningStateValidationError(f"invalid runtime network state: {exc}") from exc
+
+    reasons: list[str] = []
+    if initial_block_download:
+        reasons.append("initial block download is active")
+    if blocks != headers:
+        reasons.append(f"not caught up (blocks={blocks}, headers={headers})")
+    if connections < min_peers:
+        reasons.append(f"{connections} peer connection(s), requires at least {min_peers}")
+    if reasons:
+        raise RuntimeReadinessError(
+            f"QBIT_CHAIN={chain} is not mining-ready: {'; '.join(reasons)}"
+        )
+
+
 def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
     chain = chain_name(env)
     if not is_public_chain(chain):
@@ -364,12 +439,7 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
     attempts = 0
     while True:
         attempts += 1
-        network_info = rpc.call("getnetworkinfo")
-        if not isinstance(network_info, dict):
-            raise PreflightError("getnetworkinfo result was not an object")
-        connections = network_info.get("connections")
-        if not isinstance(connections, int) or isinstance(connections, bool):
-            raise PreflightError("getnetworkinfo.connections was missing or not an integer")
+        connections = parse_network_connections(rpc.call("getnetworkinfo"))
         if not initial_block_download and blocks == headers and connections >= min_peers:
             break
 
@@ -436,8 +506,13 @@ def validate_template_response(
     if not is_public_chain(chain):
         return TemplateStatus(age_seconds=0, max_age_seconds=0, max_future_seconds=0)
 
-    if not isinstance(template.get("previousblockhash"), str) or not template["previousblockhash"]:
+    previous_block_hash = template.get("previousblockhash")
+    if not isinstance(previous_block_hash, str) or not previous_block_hash:
         raise TemplateValidationError("getblocktemplate.previousblockhash was missing")
+    if HASH256_RE.fullmatch(previous_block_hash.lower()) is None:
+        raise TemplateValidationError(
+            "getblocktemplate.previousblockhash was not a 64-character hex hash"
+        )
     try:
         template_time = int(template["curtime"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -467,8 +542,28 @@ def validate_template_response(
 
 def fetch_and_validate_template(env: dict[str, str], rpc: RpcClient) -> TemplateStatus:
     chain = chain_name(env)
-    template = rpc.call("getblocktemplate", [{"rules": gbt_rules(chain)}])
-    return validate_template_response(env, template)
+    if not is_public_chain(chain):
+        template = rpc.call("getblocktemplate", [{"rules": gbt_rules(chain)}])
+        return validate_template_response(env, template)
+
+    for attempt in range(2):
+        try:
+            template = rpc.call("getblocktemplate", [{"rules": gbt_rules(chain)}])
+            status = validate_template_response(env, template)
+            best_block_hash = fetch_public_mining_tip(env, rpc)
+            previous_block_hash = template["previousblockhash"].lower()
+            if previous_block_hash != best_block_hash:
+                raise MiningStateValidationError(
+                    "getblocktemplate.previousblockhash does not match the current qbit tip: "
+                    f"template={previous_block_hash} tip={best_block_hash}"
+                )
+        except MiningStateValidationError:
+            if attempt == 0:
+                continue
+            raise
+        return status
+
+    raise AssertionError("mining-state validation retry loop exhausted")
 
 
 def validate_template_assumptions(env: dict[str, str], rpc: RpcClient) -> list[str]:
@@ -585,15 +680,17 @@ def supervise_ckpool(
     *,
     popen: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
     monotonic: Callable[[], float] = time.monotonic,
+    startup_readiness: Callable[[dict[str, str], RpcClient], list[str]] = validate_readiness,
 ) -> int:
-    """Run CKPool while independently enforcing the public-chain GBT contract."""
+    """Run CKPool while independently enforcing the public-chain mining contract."""
 
     if not command:
         raise PreflightError("--supervise requires a CKPool command")
     poll_seconds, failure_exit_seconds = watchdog_settings(env)
 
-    # The startup preflight has just run, but a separate read here makes this
-    # function safe to use and test independently.
+    # The startup wrapper has just run the full preflight. Recheck readiness and
+    # the template here so direct supervisor use also stays fail closed.
+    startup_readiness(env, rpc)
     status = fetch_and_validate_template(env, rpc)
     checked_at = monotonic()
     last_success = checked_at
@@ -643,6 +740,26 @@ def supervise_ckpool(
 
             try:
                 status = fetch_and_validate_template(env, rpc)
+                validate_runtime_readiness(env, rpc)
+            except RuntimeReadinessError as exc:
+                now = monotonic()
+                failure_deadline = min(last_success + failure_exit_seconds, valid_until)
+                remaining = failure_deadline - now
+                if remaining <= 0:
+                    print(
+                        "qbit ckpool watchdog: FAIL: runtime readiness remained unsafe "
+                        f"past the failure deadline: {exc}",
+                        file=sys.stderr,
+                    )
+                    stop_child(child)
+                    return 1
+                print(
+                    "qbit ckpool watchdog: runtime readiness is unsafe; "
+                    f"failing closed in at most {remaining:.1f}s: {exc}",
+                    file=sys.stderr,
+                )
+                valid_until = failure_deadline
+                continue
             except TemplateValidationError as exc:
                 print(f"qbit ckpool watchdog: FAIL: {exc}", file=sys.stderr)
                 stop_child(child)
@@ -653,14 +770,14 @@ def supervise_ckpool(
                 remaining = failure_deadline - now
                 if remaining <= 0:
                     print(
-                        "qbit ckpool watchdog: FAIL: template validation unavailable "
+                        "qbit ckpool watchdog: FAIL: mining-state validation unavailable "
                         f"past safe deadline: {exc}",
                         file=sys.stderr,
                     )
                     stop_child(child)
                     return 1
                 print(
-                    "qbit ckpool watchdog: template validation unavailable; "
+                    "qbit ckpool watchdog: mining-state validation unavailable; "
                     f"failing closed in at most {remaining:.1f}s: {exc}",
                     file=sys.stderr,
                 )
@@ -699,7 +816,7 @@ def main(argv: list[str] | None = None) -> int:
         "--supervise",
         nargs=argparse.REMAINDER,
         metavar="COMMAND",
-        help="run a CKPool command with the public-chain template watchdog",
+        help="run a CKPool command with the public-chain mining-state watchdog",
     )
     args = parser.parse_args(argv)
     env = dict(os.environ)

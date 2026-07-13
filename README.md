@@ -196,13 +196,17 @@ has at least `CKPOOL_MIN_PEERS` peer connection, exposes the expected qbit GBT
 shape, and receives explicit `CKPOOL_MINDIFF` and `CKPOOL_STARTDIFF` values.
 Regtest keeps the lab-only `1/256` difficulty floor.
 
-On public chains, the CKPool wrapper continues checking qbit templates while
-CKPool runs. CKPool remains responsible for its normal job refreshes; the
-wrapper independently exits the container when qbit returns stale, malformed,
-or grossly future-dated work. RPC transport failures may recover only within
-`CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS`, capped by the last validated template's
-remaining lifetime. An in-flight validation can consume up to
-`CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS` before shutdown.
+On public chains, the CKPool wrapper continues checking qbit's mining state
+while CKPool runs. CKPool remains responsible for its normal job refreshes; the
+wrapper independently confirms that qbit remains synced and peered, the pinned
+genesis still matches, and each fresh template builds on the node's active tip.
+One immediate retry tolerates a normal tip change between RPC calls. A sync or
+peer-readiness loss may recover within the same bounded failure window as an
+RPC transport error, avoiding restarts for a momentary header-processing race.
+`CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS` caps that window, and the last fully
+validated template's remaining lifetime can end it earlier. Template-only
+success does not extend the deadline. Each sequential RPC in a validation cycle
+can consume up to `CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS` before shutdown.
 `CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` controls the check cadence, and
 `CKPOOL_UPDATE_INTERVAL` must remain below the template age limit. The default
 7200-second future bound matches the node's consensus maximum-future block

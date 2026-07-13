@@ -95,6 +95,8 @@ class MiningComposeProfileTests(unittest.TestCase):
         services = config["services"]
         miner = services["real-miner"]
 
+        self.assertEqual(services["qbitd"]["restart"], "unless-stopped")
+        self.assertEqual(services["ckpool"]["restart"], "unless-stopped")
         self.assertEqual(miner["environment"]["STRATUM_HOST"], "ckpool")
         self.assertEqual(miner["environment"]["STRATUM_PORT"], "3333")
         self.assertIn("ckpool", miner["depends_on"])

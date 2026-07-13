@@ -54,7 +54,7 @@ services:
   ckpool:
     profiles: ["permissionless", "real-miner-smoke"]
     image: ${CKPOOL_IMAGE:-qbit-lab-ckpool:local}
-    restart: on-failure
+    restart: unless-stopped
     build:
       context: .
       dockerfile: docker/ckpool/Dockerfile
