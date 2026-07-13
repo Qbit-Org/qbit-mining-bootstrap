@@ -176,7 +176,9 @@ class MainnetComposeContractTests(unittest.TestCase):
             "/srv/qbit-mining-bootstrap/mainnet/config/prism-capacity-evidence.json",
         )
         self.assertTrue(evidence_mounts[0]["read_only"])
-        self.assertFalse(evidence_mounts[0]["bind"]["create_host_path"])
+        self.assertFalse(
+            evidence_mounts[0].get("bind", {}).get("create_host_path", False)
+        )
 
     def test_operator_images_are_digest_qualified_release_artifacts(self) -> None:
         artifact_services = OPERATOR_SERVICES
@@ -222,7 +224,9 @@ class MainnetComposeContractTests(unittest.TestCase):
                 self.assertEqual(mounts[0]["type"], "bind")
                 self.assertEqual(mounts[0]["source"], source)
                 self.assertTrue(Path(source).is_absolute())
-                self.assertFalse(mounts[0]["bind"]["create_host_path"])
+                self.assertFalse(
+                    mounts[0].get("bind", {}).get("create_host_path", False)
+                )
 
     def test_postgres_wal_has_a_separate_storage_boundary(self) -> None:
         postgres = self.config["services"]["prism-postgres"]
@@ -435,7 +439,9 @@ class MainnetComposeContractTests(unittest.TestCase):
             evidence_mount["source"],
             "/production-source-not-configured/prism/capacity-evidence.json",
         )
-        self.assertFalse(evidence_mount["bind"]["create_host_path"])
+        self.assertFalse(
+            evidence_mount.get("bind", {}).get("create_host_path", False)
+        )
 
     @staticmethod
     def _network_selectors(command: list[str]) -> list[str]:
