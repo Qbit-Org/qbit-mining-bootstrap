@@ -74,9 +74,6 @@ services:
   permissionless-miner:
     profiles: !override ["production-disabled"]
 
-  ckpool-real:
-    profiles: !override ["production-disabled"]
-
   real-miner:
     profiles: !override ["production-disabled"]
 

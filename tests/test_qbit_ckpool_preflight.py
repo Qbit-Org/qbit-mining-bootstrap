@@ -26,7 +26,7 @@ class FakeRpc:
     def __init__(
         self,
         *,
-        ibd: bool = False,
+        ibd: bool | list[bool] = False,
         rpc_chain: str = "regtest",
         connections: int | list[int] = 1,
         weightlimit: int = 2_000_000,
@@ -35,12 +35,12 @@ class FakeRpc:
         iswitness: bool = True,
         witness_version: int | None = 2,
         genesis_hash: str = "11" * 32,
-        blocks: int = 100,
-        headers: int = 100,
+        blocks: int | list[int] = 100,
+        headers: int | list[int] = 100,
         template_time: int | None = None,
         template_previous_hash: str | None = "22" * 32,
     ) -> None:
-        self.ibd = ibd
+        self.ibd = [ibd] if isinstance(ibd, bool) else ibd
         self.rpc_chain = rpc_chain
         self.connections = [connections] if isinstance(connections, int) else connections
         self.network_info_calls = 0
@@ -50,8 +50,9 @@ class FakeRpc:
         self.iswitness = iswitness
         self.witness_version = witness_version
         self.genesis_hash = genesis_hash
-        self.blocks = blocks
-        self.headers = headers
+        self.blocks = [blocks] if isinstance(blocks, int) else blocks
+        self.headers = [headers] if isinstance(headers, int) else headers
+        self.blockchain_info_calls = 0
         self.template_time = int(time.time()) if template_time is None else template_time
         self.template_previous_hash = template_previous_hash
         self.calls: list[tuple[str, list[Any]]] = []
@@ -60,11 +61,13 @@ class FakeRpc:
         params = params or []
         self.calls.append((method, params))
         if method == "getblockchaininfo":
+            index = self.blockchain_info_calls
+            self.blockchain_info_calls += 1
             return {
                 "chain": self.rpc_chain,
-                "initialblockdownload": self.ibd,
-                "blocks": self.blocks,
-                "headers": self.headers,
+                "initialblockdownload": self.sequence_value(self.ibd, index),
+                "blocks": self.sequence_value(self.blocks, index),
+                "headers": self.sequence_value(self.headers, index),
             }
         if method == "getnetworkinfo":
             index = min(self.network_info_calls, len(self.connections) - 1)
@@ -93,6 +96,10 @@ class FakeRpc:
     def assert_genesis_height(params: list[Any]) -> None:
         if params != [0]:
             raise AssertionError(f"expected getblockhash height 0, got {params!r}")
+
+    @staticmethod
+    def sequence_value(values: list[Any], index: int) -> Any:
+        return values[min(index, len(values) - 1)]
 
 
 def base_env(**overrides: str) -> dict[str, str]:
@@ -207,11 +214,19 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 FakeRpc(rpc_chain="main"),
             )
 
-    def test_public_readiness_rejects_initial_block_download(self) -> None:
-        env = mainnet_env()
+    def test_public_readiness_waits_for_initial_block_download_to_finish(self) -> None:
+        rpc = FakeRpc(ibd=[True, True, False], rpc_chain="main")
+        stderr = io.StringIO()
 
-        with self.assertRaisesRegex(preflight.PreflightError, "initial block download"):
-            preflight.run_preflight(env, FakeRpc(ibd=True, rpc_chain="main"))
+        with (
+            mock.patch.object(preflight.time, "sleep", return_value=None),
+            contextlib.redirect_stderr(stderr),
+        ):
+            messages = preflight.run_preflight(mainnet_env(), rpc)
+
+        self.assertEqual(rpc.blockchain_info_calls, 3)
+        self.assertIn("ibd=true", stderr.getvalue())
+        self.assertTrue(any("ibd=false" in message for message in messages))
 
     def test_public_readiness_requires_explicit_false_ibd(self) -> None:
         rpc = FakeRpc(rpc_chain="main")
@@ -227,12 +242,19 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "initial block download"):
             preflight.run_preflight(mainnet_env(), rpc)
 
-    def test_public_readiness_rejects_header_lag(self) -> None:
-        with self.assertRaisesRegex(preflight.PreflightError, "not caught up"):
-            preflight.run_preflight(
-                mainnet_env(),
-                FakeRpc(rpc_chain="main", blocks=99, headers=100),
-            )
+    def test_public_readiness_waits_until_blocks_catch_up_to_headers(self) -> None:
+        rpc = FakeRpc(rpc_chain="main", blocks=[99, 99, 100], headers=100)
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(preflight.time, "sleep", return_value=None),
+            contextlib.redirect_stderr(stderr),
+        ):
+            messages = preflight.run_preflight(mainnet_env(), rpc)
+
+        self.assertEqual(rpc.blockchain_info_calls, 3)
+        self.assertIn("blocks=99 headers=100", stderr.getvalue())
+        self.assertTrue(any("blocks=100 headers=100" in message for message in messages))
 
     def test_public_readiness_rejects_stale_template(self) -> None:
         with self.assertRaisesRegex(preflight.PreflightError, "template is stale"):
@@ -252,7 +274,7 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "genesis hash"):
             preflight.run_preflight(
                 mainnet_env(),
-                FakeRpc(rpc_chain="main", genesis_hash="22" * 32),
+                FakeRpc(ibd=True, rpc_chain="main", genesis_hash="22" * 32),
             )
 
     def test_mainnet_accepts_expected_genesis_hash(self) -> None:
@@ -306,6 +328,30 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
         self.assertIn("readiness wait", stderr.getvalue())
         self.assertTrue(any("peers=2" in message for message in messages))
 
+    def test_public_readiness_waits_for_sync_and_peers_together(self) -> None:
+        env = mainnet_env(
+            CKPOOL_MIN_PEERS="2",
+            CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS="30",
+        )
+        rpc = FakeRpc(
+            rpc_chain="main",
+            connections=[0, 2, 2],
+            blocks=[99, 99, 100],
+            headers=100,
+        )
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(preflight.time, "sleep", return_value=None),
+            contextlib.redirect_stderr(stderr),
+        ):
+            messages = preflight.run_preflight(env, rpc)
+
+        self.assertEqual(rpc.blockchain_info_calls, 3)
+        self.assertEqual(rpc.network_info_calls, 3)
+        self.assertIn("blocks=99 headers=100 peers=2", stderr.getvalue())
+        self.assertTrue(any("blocks=100 headers=100 peers=2" in message for message in messages))
+
     def test_public_readiness_fails_after_peer_timeout(self) -> None:
         env = base_env(
             QBIT_CHAIN="testnet4",
@@ -326,6 +372,34 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
             preflight.run_preflight(env, FakeRpc(connections=0, rpc_chain="testnet4"))
 
         self.assertIn("readiness wait timed out", stderr.getvalue())
+
+    def test_public_readiness_timeout_reports_all_last_observed_signals(self) -> None:
+        env = mainnet_env(
+            CKPOOL_MIN_PEERS="2",
+            CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS="0",
+        )
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr), self.assertRaisesRegex(
+            preflight.PreflightError,
+            r"initial block download.*not caught up.*requires at least 2",
+        ):
+            preflight.run_preflight(
+                env,
+                FakeRpc(
+                    ibd=True,
+                    rpc_chain="main",
+                    blocks=98,
+                    headers=100,
+                    connections=1,
+                ),
+            )
+
+        diagnostic = stderr.getvalue()
+        self.assertIn("ibd=true", diagnostic)
+        self.assertIn("blocks=98 headers=100", diagnostic)
+        self.assertIn("peers=1 min_peers=2", diagnostic)
+        self.assertIn("timeout=0s attempts=1", diagnostic)
 
     def test_public_readiness_rejects_rpc_chain_mismatch(self) -> None:
         env = base_env(

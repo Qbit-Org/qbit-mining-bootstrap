@@ -40,6 +40,7 @@ from lab.prism.prism_coordinator import (
     QbitTipTemplateSnapshot,
     StratumError,
     StratumListenerProfile,
+    TemplateRefreshBlocked,
     PrismCoordinator,
     WorkerIdentity,
     default_prism_coinbase_tag_hex,
@@ -2271,15 +2272,75 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         server.build_job_for_client = failing_build  # type: ignore[method-assign]
 
-        refreshed = server.poll_qbit_tip_template_once()
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "no refreshed work was issued"):
+            server.poll_qbit_tip_template_once()
 
-        self.assertEqual(refreshed, 0)
         self.assertEqual(server.job_build_failure_count, 1)
         self.assertEqual(server.tip_refresh_job_count, 0)
         self.assertIn(state, server.clients)
         self.assertEqual(state.active_job_ids, {"old-job"})
         self.assertIn("old-job", server.jobs)
         self.assertEqual(sent, [])
+
+    def test_tip_refresh_build_failure_is_not_masked_by_disconnected_client(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "33" * 32
+        server = coordinator()
+        server.jobs = {}
+
+        build_failed = client()
+        build_failed.worker = worker_identity("miner-build-failed")
+        build_failed.username = build_failed.worker.username
+        build_failed.active_job = prism_context(
+            "old-build-failed-job", old_tip, worker=build_failed.worker
+        )
+        build_failed.active_job_ids = {"old-build-failed-job"}
+
+        disconnected = client()
+        disconnected.connection_id = 2
+        disconnected.worker = worker_identity("miner-disconnected")
+        disconnected.username = disconnected.worker.username
+        disconnected.active_job = prism_context(
+            "old-disconnected-job", old_tip, worker=disconnected.worker
+        )
+        disconnected.active_job_ids = {"old-disconnected-job"}
+
+        def disconnect_on_send(_payload: object) -> None:
+            raise OSError("socket closed")
+
+        disconnected.send = disconnect_on_send  # type: ignore[method-assign]
+        server.clients = {build_failed, disconnected}
+        server.jobs = {
+            "old-build-failed-job": build_failed.active_job,
+            "old-disconnected-job": disconnected.active_job,
+        }
+        server.tip_template_snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=old_tip,
+            previousblockhash=old_tip,
+            template_fingerprint=qbit_template_fingerprint(build_failed.active_job.template),
+        )
+        server.rpc = TipTemplateRpc(tip=new_tip, template=gbt_template(new_tip, height=11))
+
+        def mixed_build(state: ClientState, *, clean_jobs: bool) -> object:
+            if state is build_failed:
+                raise RuntimeError("template build unavailable")
+            return prism_context(
+                "disconnected-fresh-job",
+                new_tip,
+                worker=state.worker,
+                clean_jobs=clean_jobs,
+            )
+
+        disconnected_clients: list[ClientState] = []
+        server.build_job_for_client = mixed_build  # type: ignore[method-assign]
+        server.disconnect_client = disconnected_clients.append  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "no refreshed work was issued"):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(disconnected_clients, [disconnected])
+        self.assertIn(build_failed, server.clients)
 
     def test_tip_reconciliation_quarantines_disconnected_block_before_refresh_job(self) -> None:
         old_tip = "00" * 32
@@ -2403,9 +2464,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         server.build_job_for_client = unexpected_build  # type: ignore[method-assign]
 
-        refreshed = server.poll_qbit_tip_template_once()
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "chain view remained untrusted"):
+            server.poll_qbit_tip_template_once()
 
-        self.assertEqual(refreshed, 0)
         self.assertEqual(server.reorg_reconcile_skip_count, 1)
         self.assertEqual(ledger.events, [])
         self.assertEqual(state.active_job_ids, {"old-job"})
@@ -2659,6 +2720,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "production mode requires PRISM_DATABASE_URL"):
                 validate_prism_production_gate()
 
+    def test_compatibility_production_flag_implies_production_gate(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "QBIT_CHAIN": "testnet4",
+                "QBIT_TOOLS_PRODUCTION": "1",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(SystemExit, "production mode requires PRISM_DATABASE_URL"):
+                validate_prism_production_gate()
+
     def test_mainnet_ctv_requires_static_fee_rate_before_runtime_startup(self) -> None:
         env = {
             "QBIT_CHAIN": "mainnet",
@@ -2797,6 +2871,140 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         server.last_successful_template_refresh_monotonic = 219.0
         self.assertFalse(server.template_refresh_failure_expired(220.0))
+
+    def test_healthy_noop_template_poll_resets_refresh_failure_clock(self) -> None:
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        snapshot = QbitTipTemplateSnapshot(
+            bestblockhash="11" * 32,
+            previousblockhash="11" * 32,
+            template_fingerprint="22" * 32,
+        )
+        server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
+
+        def trusted_chain_view(_tip: str) -> bool:
+            server.stop_event.set()
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = trusted_chain_view  # type: ignore[method-assign]
+        with patch("lab.prism.prism_coordinator.time.monotonic", return_value=200.0):
+            server.blockpoll_loop()
+
+        self.assertEqual(server.last_successful_template_refresh_monotonic, 200.0)
+
+    def test_shared_template_poll_records_success_for_blockwait_callers(self) -> None:
+        server = coordinator()
+        server.last_successful_template_refresh_monotonic = 100.0
+        snapshot = QbitTipTemplateSnapshot(
+            bestblockhash="11" * 32,
+            previousblockhash="11" * 32,
+            template_fingerprint="22" * 32,
+        )
+        server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+
+        with patch("lab.prism.prism_coordinator.time.monotonic", return_value=200.0):
+            refreshed = server.poll_qbit_tip_template_once(heartbeat_name="qbit_blockwait")
+
+        self.assertEqual(refreshed, 0)
+        self.assertEqual(server.last_successful_template_refresh_monotonic, 200.0)
+
+    def test_untrusted_reconciliation_exhausts_template_refresh_failure_budget(self) -> None:
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        snapshot = QbitTipTemplateSnapshot(
+            bestblockhash="11" * 32,
+            previousblockhash="11" * 32,
+            template_fingerprint="22" * 32,
+        )
+        server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: False  # type: ignore[method-assign]
+
+        with (
+            patch("lab.prism.prism_coordinator.time.monotonic", return_value=110.0),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+            self.assertRaises(SystemExit),
+        ):
+            server.blockpoll_loop()
+
+        exit_process.assert_called_once_with(1)
+        self.assertEqual(server.last_successful_template_refresh_monotonic, 100.0)
+
+    def test_all_refresh_job_builds_failing_exhausts_failure_budget(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "33" * 32
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        state = client()
+        state.username = "miner-a"
+        state.worker = worker_identity()
+        state.active_job = prism_context("old-job", old_tip, worker=state.worker)
+        state.active_job_ids = {"old-job"}
+        server.clients = {state}
+        server.jobs = {"old-job": state.active_job}
+        server.tip_template_snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=old_tip,
+            previousblockhash=old_tip,
+            template_fingerprint=qbit_template_fingerprint(state.active_job.template),
+        )
+        snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=new_tip,
+            previousblockhash=new_tip,
+            template_fingerprint="44" * 32,
+        )
+        server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
+        server.build_job_for_client = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            RuntimeError("template build unavailable")
+        )
+
+        with (
+            patch("lab.prism.prism_coordinator.time.monotonic", return_value=110.0),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+            self.assertRaises(SystemExit),
+        ):
+            server.blockpoll_loop()
+
+        exit_process.assert_called_once_with(1)
+        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(server.last_successful_template_refresh_monotonic, 100.0)
+
+    def test_transient_template_refresh_failure_recovers_on_healthy_noop(self) -> None:
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        poll_count = 0
+
+        def fail_then_noop() -> int:
+            nonlocal poll_count
+            poll_count += 1
+            if poll_count == 1:
+                raise RuntimeError("transient RPC failure")
+            server.last_successful_template_refresh_monotonic = time.monotonic()
+            server.stop_event.set()
+            return 0
+
+        server.poll_qbit_tip_template_once = fail_then_noop  # type: ignore[method-assign]
+        with (
+            patch("lab.prism.prism_coordinator.time.monotonic", side_effect=[105.0, 106.0]),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+        ):
+            server.blockpoll_loop()
+
+        self.assertEqual(poll_count, 2)
+        self.assertEqual(server.last_successful_template_refresh_monotonic, 106.0)
 
     def test_live_chain_identity_rejects_wrong_chain_or_genesis(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)

@@ -278,10 +278,9 @@ logged and rendered into `/etc/ckpool/ckpool.conf`. If qbitd advertises
 node.
 
 CKPool also exposes its private command socket below `CKPOOL_SOCK_DIR`
-(`/tmp/qbitlab` by default for `ckpool`, `/tmp/qbitlab-real` for the optional
-`ckpool-real` service). Override those paths only to share the Unix socket with
-a local private stats exporter or same-host operator tooling. Do not publish the
-socket directory or `/var/log/ckpool` outside the mining-pool host.
+(`/tmp/qbitlab` by default). Override that path only to share the Unix socket
+with a local private stats exporter or same-host operator tooling. Do not
+publish the socket directory or `/var/log/ckpool` outside the mining-pool host.
 
 To prove the repo against a real external miner client instead of the built-in simulator:
 
@@ -289,7 +288,10 @@ To prove the repo against a real external miner client instead of the built-in s
 make test-real-miner
 ```
 
-That uses the bundled `cpuminer-opt`-based path as an operator-facing smoke test.
+That starts the `real-miner-smoke` profile and points the bundled
+`cpuminer-opt` client at the ordinary `ckpool` service on port 3333. The
+`make up-permissionless-real` target remains as a deprecated compatibility
+alias for `make up-real-miner` for one release.
 
 `make test-auxpow` brings up:
 

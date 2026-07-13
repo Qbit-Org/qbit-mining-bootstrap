@@ -20,11 +20,11 @@ export DEPLOY_ENV_FILE
 COMPOSE := docker compose $(COMPOSE_ENV_FILES) -f compose.yaml --project-name $(COMPOSE_PROJECT_NAME)
 PRODUCTION_COMPOSE ?= $(COMPOSE) -f compose.production.yaml
 # Shared profile set for disposable test cleanup; ordinary down adds PRISM but preserves volumes.
-COMPOSE_ALL_PROFILES := $(COMPOSE) --profile permissionless --profile permissionless-real --profile auxpow
+COMPOSE_ALL_PROFILES := $(COMPOSE) --profile permissionless --profile real-miner-smoke --profile auxpow
 # Destructive integration cleanup is confined to a fresh, invocation-specific
 # project. Four dollar signs become the recipe shell PID after Make expansion.
 TEST_COMPOSE = docker compose $(COMPOSE_ENV_FILES) -f compose.yaml --project-name qbit-mining-bootstrap-test-$@-$$$$
-TEST_COMPOSE_ALL_PROFILES = $(TEST_COMPOSE) --profile permissionless --profile permissionless-real --profile auxpow
+TEST_COMPOSE_ALL_PROFILES = $(TEST_COMPOSE) --profile permissionless --profile real-miner-smoke --profile auxpow
 
 define WITH_RESOLVED_QBIT
 set -euo pipefail; \
@@ -214,15 +214,18 @@ test-ckpool-bip310:
 
 up-real-miner:
 	@$(WITH_RESOLVED_QBIT) \
-	$(COMPOSE) --profile permissionless-real up --build
+	$(COMPOSE) --profile real-miner-smoke up --build
 
-up-permissionless-real: up-real-miner
+# Deprecated compatibility alias; use up-real-miner.
+up-permissionless-real:
+	@printf 'up-permissionless-real is deprecated; use make up-real-miner\n'
+	@$(MAKE) up-real-miner
 
 test-real-miner:
 	@$(WITH_RESOLVED_QBIT) \
 	$(TEST_COMPOSE_ALL_PROFILES) down -v --remove-orphans || true; \
 	trap '$(TEST_COMPOSE_ALL_PROFILES) down -v --remove-orphans' EXIT; \
-	$(TEST_COMPOSE) --profile permissionless-real up --build --abort-on-container-exit --exit-code-from real-miner
+	$(TEST_COMPOSE) --profile real-miner-smoke up --build --abort-on-container-exit --exit-code-from real-miner
 
 up-auxpow:
 	@$(WITH_RESOLVED_QBIT) \
@@ -305,6 +308,9 @@ test-auxpow-stratum:
 	@$(WITH_RESOLVED_QBIT) \
 	$(TEST_COMPOSE_ALL_PROFILES) down -v --remove-orphans || true; \
 	trap '$(TEST_COMPOSE_ALL_PROFILES) down -v --remove-orphans' EXIT; \
+	AUXPOW_STRATUM_VARDIFF_ENABLED=0 \
+	AUXPOW_STRATUM_SHARE_DIFF=0.0001 \
+	AUXPOW_STRATUM_MIN_ADVERTISED_DIFF=0.0001 \
 	$(TEST_COMPOSE) --profile auxpow up --build --abort-on-container-exit --exit-code-from auxpow-real-miner qbitd bitcoind auxpow-stratum auxpow-real-miner
 
 test-auxpow-stratum-bip310:

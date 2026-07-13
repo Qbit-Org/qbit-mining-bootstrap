@@ -5,7 +5,7 @@ set -euo pipefail
 : "${QBIT_RPC_PASSWORD:?QBIT_RPC_PASSWORD is required}"
 : "${QBIT_RPC_HOST:=qbitd}"
 : "${QBIT_RPC_PORT:=18452}"
-: "${QBIT_MINER_WALLET_NAME:=ckpool-real}"
+: "${QBIT_MINER_WALLET_NAME:=real-miner-smoke}"
 : "${QBIT_MINER_ADDRESS_FILE:=/var/lib/qbit-lab/miner-address.txt}"
 
 mkdir -p "$(dirname "${QBIT_MINER_ADDRESS_FILE}")"

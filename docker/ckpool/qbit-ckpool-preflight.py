@@ -263,6 +263,39 @@ def validate_ckpool_knobs(env: dict[str, str]) -> list[str]:
     ]
 
 
+def parse_blockchain_readiness(
+    *, chain: str, info: Any
+) -> tuple[str, bool, int, int]:
+    if not isinstance(info, dict):
+        raise PreflightError("getblockchaininfo result was not an object")
+
+    rpc_chain = normalize_rpc_chain(info.get("chain"))
+    expected_rpc_chains = CHAIN_RPC_NAMES.get(chain, {chain})
+    if rpc_chain not in expected_rpc_chains:
+        raise PreflightError(
+            f"QBIT_CHAIN={chain} does not match getblockchaininfo.chain={rpc_chain}"
+        )
+
+    initial_block_download = info.get("initialblockdownload")
+    if not isinstance(initial_block_download, bool):
+        raise PreflightError(
+            "getblockchaininfo initial block download flag was missing or not a boolean"
+        )
+    blocks = info.get("blocks")
+    headers = info.get("headers")
+    if (
+        not isinstance(blocks, int)
+        or isinstance(blocks, bool)
+        or not isinstance(headers, int)
+        or isinstance(headers, bool)
+    ):
+        raise PreflightError("getblockchaininfo blocks and headers must be integers")
+    if blocks < 0 or headers < 0:
+        raise PreflightError("getblockchaininfo blocks and headers must be non-negative")
+
+    return rpc_chain, initial_block_download, blocks, headers
+
+
 def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
     chain = chain_name(env)
     if not is_public_chain(chain):
@@ -270,40 +303,12 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
     if not bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True):
         return [f"readiness gate: disabled for QBIT_CHAIN={chain}"]
 
-    info = rpc.call("getblockchaininfo")
-    if not isinstance(info, dict):
-        raise PreflightError("getblockchaininfo result was not an object")
-    rpc_chain = normalize_rpc_chain(info.get("chain"))
-    expected_rpc_chains = CHAIN_RPC_NAMES.get(chain, {chain})
-    if rpc_chain not in expected_rpc_chains:
-        raise PreflightError(
-            f"QBIT_CHAIN={chain} does not match getblockchaininfo.chain={rpc_chain}"
-        )
-    if info.get("initialblockdownload") is not False:
-        raise PreflightError(f"QBIT_CHAIN={chain} is still in initial block download")
-    try:
-        blocks = int(info["blocks"])
-        headers = int(info["headers"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise PreflightError("getblockchaininfo blocks and headers must be integers") from exc
-    if blocks < 0 or headers < 0:
-        raise PreflightError("getblockchaininfo blocks and headers must be non-negative")
-    if blocks != headers:
-        raise PreflightError(
-            f"QBIT_CHAIN={chain} is not caught up: blocks={blocks}, headers={headers}"
-        )
-
     expected_genesis = env.get("QBIT_EXPECTED_GENESIS_HASH", "").strip().lower()
     if chain == "mainnet" and not expected_genesis:
         raise PreflightError("QBIT_CHAIN=mainnet requires QBIT_EXPECTED_GENESIS_HASH")
     if expected_genesis:
         if HASH256_RE.fullmatch(expected_genesis) is None:
             raise PreflightError("QBIT_EXPECTED_GENESIS_HASH must be 64 lowercase hex characters")
-        actual_genesis = rpc.call("getblockhash", [0])
-        if not isinstance(actual_genesis, str) or actual_genesis.lower() != expected_genesis:
-            raise PreflightError(
-                f"qbit genesis hash is {actual_genesis!r}, expected {expected_genesis}"
-            )
 
     min_peers = int_env(env, "CKPOOL_MIN_PEERS", 1)
     if min_peers < 1:
@@ -312,6 +317,18 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
     readiness_timeout = float_env(env, "CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS", 120.0)
     if readiness_timeout < 0:
         raise PreflightError("CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS must be non-negative")
+
+    info = rpc.call("getblockchaininfo")
+    rpc_chain, initial_block_download, blocks, headers = parse_blockchain_readiness(
+        chain=chain, info=info
+    )
+    if expected_genesis:
+        actual_genesis = rpc.call("getblockhash", [0])
+        if not isinstance(actual_genesis, str) or actual_genesis.lower() != expected_genesis:
+            raise PreflightError(
+                f"qbit genesis hash is {actual_genesis!r}, expected {expected_genesis}"
+            )
+
     deadline = time.monotonic() + readiness_timeout
     connections = 0
     attempts = 0
@@ -321,33 +338,48 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
         if not isinstance(network_info, dict):
             raise PreflightError("getnetworkinfo result was not an object")
         connections = network_info.get("connections")
-        if not isinstance(connections, int):
+        if not isinstance(connections, int) or isinstance(connections, bool):
             raise PreflightError("getnetworkinfo.connections was missing or not an integer")
-        if connections >= min_peers:
+        if not initial_block_download and blocks == headers and connections >= min_peers:
             break
 
         now = time.monotonic()
         if now >= deadline:
             print(
                 "qbit ckpool preflight: readiness wait timed out: "
-                f"chain={chain} peers={connections} min_peers={min_peers} "
+                f"chain={chain} ibd={str(initial_block_download).lower()} "
+                f"blocks={blocks} headers={headers} peers={connections} min_peers={min_peers} "
                 f"timeout={readiness_timeout:g}s attempts={attempts}",
                 file=sys.stderr,
             )
+            reasons: list[str] = []
+            if initial_block_download:
+                reasons.append("initial block download is still active")
+            if blocks != headers:
+                reasons.append(f"not caught up (blocks={blocks}, headers={headers})")
+            if connections < min_peers:
+                reasons.append(
+                    f"{connections} peer connection(s), requires at least {min_peers}"
+                )
             raise PreflightError(
-                f"QBIT_CHAIN={chain} has {connections} peer connection(s), "
-                f"requires at least {min_peers} after waiting {readiness_timeout:g}s"
+                f"QBIT_CHAIN={chain} readiness timed out after waiting "
+                f"{readiness_timeout:g}s: {'; '.join(reasons)}"
             )
 
         remaining = deadline - now
         sleep_for = min(READINESS_POLL_SECONDS, remaining)
         print(
             "qbit ckpool preflight: readiness wait: "
-            f"chain={chain} peers={connections} min_peers={min_peers} "
+            f"chain={chain} ibd={str(initial_block_download).lower()} "
+            f"blocks={blocks} headers={headers} peers={connections} min_peers={min_peers} "
             f"remaining={remaining:.1f}s",
             file=sys.stderr,
         )
         time.sleep(sleep_for)
+        info = rpc.call("getblockchaininfo")
+        rpc_chain, initial_block_download, blocks, headers = parse_blockchain_readiness(
+            chain=chain, info=info
+        )
 
     return [
         f"readiness gate: chain={chain} rpc_chain={rpc_chain} "

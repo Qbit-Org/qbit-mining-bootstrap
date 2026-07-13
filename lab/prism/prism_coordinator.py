@@ -299,10 +299,11 @@ def env_optional(name: str) -> str | None:
 
 
 def production_mode() -> bool:
-    return env_bool("QBIT_PRODUCTION", "0") or env("QBIT_CHAIN", "regtest").lower() in {
-        "main",
-        "mainnet",
-    }
+    return (
+        env_bool("QBIT_PRODUCTION", "0")
+        or env_bool("QBIT_TOOLS_PRODUCTION", "0")
+        or env("QBIT_CHAIN", "regtest").lower() in {"main", "mainnet"}
+    )
 
 
 def require_production_env(name: str) -> str:
@@ -933,6 +934,14 @@ class StratumError(RuntimeError):
         self.code = code
         self.message = message
         self.reason = reason
+
+
+class TemplateRefreshBlocked(RuntimeError):
+    """A live template was fetched, but safe work could not be issued."""
+
+
+class _JobBuildFailed(RuntimeError):
+    """Internal signal used to distinguish a skipped build from a no-op."""
 
 
 def parse_worker_username(username: str) -> tuple[str, str | None]:
@@ -2240,7 +2249,6 @@ class PrismCoordinator:
             self._record_heartbeat("qbit_blockpoll")
             try:
                 refreshed = self.poll_qbit_tip_template_once()
-                self.last_successful_template_refresh_monotonic = time.monotonic()
                 if refreshed:
                     print(
                         f"prism coordinator: refreshed {refreshed} client job(s) after qbit tip/template change",
@@ -2407,7 +2415,9 @@ class PrismCoordinator:
             snapshot = self.fetch_qbit_tip_template_snapshot()
             self.observe_tip_first_seen(snapshot.bestblockhash)
             if not self.ensure_reorg_reconciled_for_tip(snapshot.bestblockhash):
-                return 0
+                raise TemplateRefreshBlocked(
+                    "qbit chain view remained untrusted after reorg reconciliation"
+                )
             with self.lock:
                 previous_snapshot = self.tip_template_snapshot
                 snapshot_changed = previous_snapshot is not None and previous_snapshot != snapshot
@@ -2427,6 +2437,7 @@ class PrismCoordinator:
                     ]
 
             refreshed = 0
+            build_failures = 0
             for client in clients:
                 if self.stop_event.is_set():
                     break
@@ -2439,14 +2450,23 @@ class PrismCoordinator:
                     if self.maybe_send_job(
                         client,
                         clean_jobs=self.client_tip_changed_for_snapshot(client, snapshot),
+                        raise_on_reorg_failure=True,
+                        raise_on_build_failure=True,
                     ):
                         refreshed += 1
+                except _JobBuildFailed:
+                    build_failures += 1
                 except OSError:
                     self.disconnect_client(client)
 
+            if refreshed == 0 and build_failures:
+                raise TemplateRefreshBlocked(
+                    f"job builds failed for {build_failures} client(s); no refreshed work was issued"
+                )
             if refreshed:
                 with self.lock:
                     self.tip_refresh_job_count += refreshed
+            self.last_successful_template_refresh_monotonic = time.monotonic()
             return refreshed
         finally:
             self._tip_refresh_lock.release()
@@ -3125,7 +3145,14 @@ class PrismCoordinator:
             raise StratumError(20, f"{label} does not resolve to a P2MR script: {address}")
         return script, script[4:]
 
-    def maybe_send_job(self, client: ClientState, *, clean_jobs: bool) -> bool:
+    def maybe_send_job(
+        self,
+        client: ClientState,
+        *,
+        clean_jobs: bool,
+        raise_on_reorg_failure: bool = False,
+        raise_on_build_failure: bool = False,
+    ) -> bool:
         if not client.subscribed or not client.authorized or client.worker is None:
             return False
         self._ensure_job_cache_state()
@@ -3139,19 +3166,29 @@ class PrismCoordinator:
         phase_started = time.monotonic()
         try:
             if not self.ensure_reorg_reconciled_for_current_tip():
+                if raise_on_reorg_failure:
+                    raise TemplateRefreshBlocked(
+                        "qbit chain view became untrusted before client job build"
+                    )
                 return False
-        except Exception:
+        except TemplateRefreshBlocked:
+            raise
+        except Exception as exc:
             print(
                 f"prism coordinator: reorg reconciliation failed before job build "
                 f"connection={client.connection_id} username={client.username}; skipping this job",
                 flush=True,
             )
             traceback.print_exc()
+            if raise_on_reorg_failure:
+                raise TemplateRefreshBlocked(
+                    "reorg reconciliation failed before client job build"
+                ) from exc
             return False
         phases["reorg"] = time.monotonic() - phase_started
         try:
             context = self.build_job_for_client(client, clean_jobs=clean_jobs)
-        except Exception:
+        except Exception as exc:
             # A single bad template (e.g. a coinbase whose bytes collide with the
             # extranonce placeholder, or a transient getblocktemplate failure) must
             # never tear down the miner's connection. Log it, count it, and skip
@@ -3167,6 +3204,10 @@ class PrismCoordinator:
                 flush=True,
             )
             traceback.print_exc()
+            if raise_on_build_failure:
+                raise _JobBuildFailed(
+                    f"job build failed for connection {client.connection_id}"
+                ) from exc
             return False
         client.active_job = context
         with self.lock:

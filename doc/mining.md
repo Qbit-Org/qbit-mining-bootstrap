@@ -176,8 +176,8 @@ make up-permissionless-pool
 make test-real-miner
 ```
 
-- `make up-permissionless-pool` starts `qbitd + ckpool` and waits for a real external miner
-- `make test-real-miner` uses the bundled `cpuminer-opt` client as an operator-facing smoke test
+- `make up-permissionless-pool` starts `qbitd + ckpool` on port 3333 and waits for a real external miner
+- `make test-real-miner` points the bundled `cpuminer-opt` client at that same ordinary `ckpool:3333` endpoint
 - `make test-permissionless-p2mr` runs the same permissionless stack with `-p2mronly=1` and forces
   `QBIT_MINER_ADDRESS=auto` so local non-P2MR payout overrides do not mask the restricted-output smoke
 

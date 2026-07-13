@@ -93,7 +93,6 @@ class MainnetComposeContractTests(unittest.TestCase):
         services = set(self.config["services"])
 
         self.assertLessEqual(OPERATOR_SERVICES, services)
-        self.assertNotIn("ckpool-real", services)
 
     def test_node_chain_selectors_are_exact(self) -> None:
         qbit_command = self.config["services"]["qbitd"]["command"]
@@ -243,11 +242,7 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(postgres["environment"]["POSTGRES_INITDB_WALDIR"], "/var/lib/postgresql/wal")
 
     def test_ckpool_runtimes_receive_template_freshness_limit(self) -> None:
-        for service in ("ckpool", "ckpool-real"):
-            if service not in self.config["services"]:
-                continue
-            with self.subTest(service=service):
-                self.assertEqual(self._environment(service)["CKPOOL_TEMPLATE_MAX_AGE_SECONDS"], "120")
+        self.assertEqual(self._environment("ckpool")["CKPOOL_TEMPLATE_MAX_AGE_SECONDS"], "120")
 
     def test_operator_services_have_restart_policies(self) -> None:
         expected = {
@@ -269,7 +264,6 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertTrue(
             {
                 "permissionless-miner",
-                "ckpool-real",
                 "real-miner",
                 "miner-address",
                 "auxpow-coordinator",

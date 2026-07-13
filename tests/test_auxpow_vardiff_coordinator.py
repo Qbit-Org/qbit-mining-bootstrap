@@ -123,7 +123,72 @@ class ReadinessRpc:
         raise AssertionError(f"unexpected RPC method {method}")
 
 
+class AutomaticWalletRpc:
+    def __init__(self, *, successful_address_attempt: int | None) -> None:
+        self.successful_address_attempt = successful_address_attempt
+        self.address_attempts = 0
+        self.calls: list[tuple[str, tuple[object, ...], str | None]] = []
+
+    def call(
+        self,
+        method: str,
+        params: list[object] | None = None,
+        *,
+        wallet: str | None = None,
+    ) -> object:
+        self.calls.append((method, tuple(params or []), wallet))
+        if method in {"createwallet", "loadwallet"}:
+            raise TimeoutError(f"{method} timed out")
+        if method == "getnewaddress":
+            self.address_attempts += 1
+            if self.address_attempts == self.successful_address_attempt:
+                return "qbrt1automatic"
+            raise RuntimeError("getnewaddress unavailable")
+        raise AssertionError(f"unexpected RPC method {method}")
+
+
 class AuxPowVardiffCoordinatorTests(unittest.TestCase):
+    def test_automatic_wallet_address_retries_transient_rpc_failures(self) -> None:
+        rpc = AutomaticWalletRpc(successful_address_attempt=4)
+
+        with patch.object(coordinator.time, "sleep") as sleep:
+            address = coordinator.get_new_address(
+                rpc,
+                "auxpow",
+                timeout_seconds=5,
+                retry_seconds=0.1,
+            )
+
+        self.assertEqual(address, "qbrt1automatic")
+        self.assertEqual(rpc.address_attempts, 4)
+        self.assertEqual(rpc.calls[-1], ("getnewaddress", (), "auxpow"))
+        sleep.assert_called_once_with(0.1)
+
+    def test_automatic_wallet_address_timeout_reports_final_rpc_error(self) -> None:
+        rpc = AutomaticWalletRpc(successful_address_attempt=None)
+        now = [100.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        with (
+            patch.object(coordinator.time, "monotonic", side_effect=lambda: now[0]),
+            patch.object(coordinator.time, "sleep", side_effect=advance),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"auxpow wallet did not return an address within 0\.5s after 2 attempts; "
+                r"last RPC error: getnewaddress unavailable",
+            ),
+        ):
+            coordinator.get_new_address(
+                rpc,
+                "auxpow",
+                timeout_seconds=0.5,
+                retry_seconds=0.25,
+            )
+
+        self.assertEqual(rpc.address_attempts, 6)
+
     def test_public_node_readiness_requires_expected_chain_sync_and_peers(self) -> None:
         coordinator.validate_node_readiness(
             ReadinessRpc(chain="main"),

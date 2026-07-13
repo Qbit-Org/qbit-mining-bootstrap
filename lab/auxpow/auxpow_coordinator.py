@@ -54,6 +54,8 @@ BITCOIN_RPC_CHAIN_NAMES = {
 KNOWN_BITCOIN_GENESIS_HASHES = {
     "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
 }
+AUTOMATIC_WALLET_READY_TIMEOUT_SECONDS = 180.0
+AUTOMATIC_WALLET_RETRY_SECONDS = 1.0
 
 
 def env(name: str, default: str | None = None) -> str:
@@ -259,27 +261,69 @@ class ResolvedAddress:
     script_pubkey_hex: str
 
 
-def ensure_wallet_loaded(rpc: JsonRpc, wallet_name: str) -> None:
-    try:
-        rpc.call("createwallet", [wallet_name])
-    except Exception:
-        pass
-    try:
-        rpc.call("loadwallet", [wallet_name])
-    except Exception:
-        pass
-
-
-def get_new_address(rpc: JsonRpc, wallet_name: str) -> str:
-    ensure_wallet_loaded(rpc, wallet_name)
-    for params in ([], ["", "p2mr"], ["", "bech32"]):
+def ensure_wallet_loaded(
+    rpc: JsonRpc,
+    wallet_name: str,
+    *,
+    deadline: float | None = None,
+) -> Exception | None:
+    last_error: Exception | None = None
+    for method in ("createwallet", "loadwallet"):
+        if deadline is not None and time.monotonic() >= deadline:
+            return last_error or TimeoutError("wallet readiness deadline elapsed")
         try:
-            address = rpc.call("getnewaddress", params, wallet=wallet_name)
-        except Exception:
-            continue
-        if address:
-            return str(address)
-    raise RuntimeError(f"{wallet_name} wallet did not return an address")
+            rpc.call(method, [wallet_name])
+            return None
+        except Exception as exc:
+            last_error = exc
+    return last_error
+
+
+def get_new_address(
+    rpc: JsonRpc,
+    wallet_name: str,
+    *,
+    timeout_seconds: float = AUTOMATIC_WALLET_READY_TIMEOUT_SECONDS,
+    retry_seconds: float = AUTOMATIC_WALLET_RETRY_SECONDS,
+) -> str:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be > 0")
+    if retry_seconds <= 0:
+        raise ValueError("retry_seconds must be > 0")
+
+    deadline = time.monotonic() + timeout_seconds
+    attempts = 0
+    last_error: Exception | None = None
+    while True:
+        if attempts > 0 and time.monotonic() >= deadline:
+            break
+        attempts += 1
+        wallet_error = ensure_wallet_loaded(rpc, wallet_name, deadline=deadline)
+        if wallet_error is not None:
+            last_error = wallet_error
+
+        for params in ([], ["", "p2mr"], ["", "bech32"]):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                address = rpc.call("getnewaddress", params, wallet=wallet_name)
+            except Exception as exc:
+                last_error = exc
+                continue
+            if address:
+                return str(address)
+            last_error = RuntimeError("RPC getnewaddress returned an empty result")
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            break
+        time.sleep(min(retry_seconds, remaining_seconds))
+
+    detail = f"; last RPC error: {last_error}" if last_error is not None else ""
+    raise RuntimeError(
+        f"{wallet_name} wallet did not return an address within "
+        f"{timeout_seconds:g}s after {attempts} attempts{detail}"
+    ) from last_error
 
 
 def resolve_validated_address(rpc: JsonRpc, address: str, *, field_name: str) -> ResolvedAddress:

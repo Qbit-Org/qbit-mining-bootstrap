@@ -97,6 +97,14 @@ class MakefileLifecycleTests(unittest.TestCase):
             ),
         )
 
+    def test_auxpow_real_miner_smoke_uses_deterministic_lab_difficulty(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        recipe = makefile.split("test-auxpow-stratum:\n", 1)[1].split("\ntest-auxpow-stratum-bip310:", 1)[0]
+
+        self.assertIn("AUXPOW_STRATUM_VARDIFF_ENABLED=0", recipe)
+        self.assertIn("AUXPOW_STRATUM_SHARE_DIFF=0.0001", recipe)
+        self.assertIn("AUXPOW_STRATUM_MIN_ADVERTISED_DIFF=0.0001", recipe)
+
     def run_target(
         self,
         target: str,
