@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -90,6 +91,7 @@ class CkpoolStartupTests(unittest.TestCase):
         preflight_helper.chmod(0o755)
 
         env = os.environ.copy()
+        env.pop("CKPOOL_BTCSIG", None)
         env.update(
             {
                 "PATH": f"{bin_dir}:{env['PATH']}",
@@ -172,6 +174,13 @@ class CkpoolStartupTests(unittest.TestCase):
             )
 
         self.assertEqual(config["btcsig"], "")
+
+    def test_default_btcsig_does_not_inherit_empty_parent_value(self) -> None:
+        with mock.patch.dict(os.environ, {"CKPOOL_BTCSIG": ""}):
+            with tempfile.TemporaryDirectory() as tmp, FakeRpcServer() as rpc:
+                config = self.run_start_ckpool(Path(tmp), rpc)
+
+        self.assertEqual(config["btcsig"], "/qbit-mining-bootstrap/")
 
     def test_compose_preserves_explicit_empty_btcsig(self) -> None:
         compose = (ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
