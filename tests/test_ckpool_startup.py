@@ -131,6 +131,7 @@ class CkpoolStartupTests(unittest.TestCase):
         self.assertEqual(config["mindiff"], 0.00390625)
         self.assertEqual(config["startdiff"], 0.00390625)
         self.assertEqual(config["version_mask"], "1fffe000")
+        self.assertEqual(config["btcsig"], "/qbit-mining-bootstrap/")
 
     def test_explicit_public_difficulty_and_knobs_render(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer("--chain", "testnet4") as rpc:
@@ -161,6 +162,30 @@ class CkpoolStartupTests(unittest.TestCase):
         self.assertEqual(config["mindiff"], 1024)
         self.assertEqual(config["startdiff"], 65536)
         self.assertEqual(config["maxdiff"], 4294967296)
+
+    def test_explicit_empty_btcsig_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer() as rpc:
+            config = self.run_start_ckpool(
+                Path(tmp),
+                rpc,
+                CKPOOL_BTCSIG="",
+            )
+
+        self.assertEqual(config["btcsig"], "")
+
+    def test_compose_preserves_explicit_empty_btcsig(self) -> None:
+        compose = (ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            compose.count(
+                'CKPOOL_BTCSIG: "${CKPOOL_BTCSIG-/qbit-mining-bootstrap/}"'
+            ),
+            2,
+        )
+        self.assertNotIn(
+            "CKPOOL_BTCSIG: ${CKPOOL_BTCSIG:-/qbit-mining-bootstrap/}",
+            compose,
+        )
 
     def test_public_chain_missing_explicit_diff_fails_before_config_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer() as rpc:
