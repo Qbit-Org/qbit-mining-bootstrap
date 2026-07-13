@@ -86,7 +86,258 @@ install_test_framework_stubs()
 from lab.auxpow import auxpow_coordinator as coordinator  # noqa: E402
 
 
+class ReadinessRpc:
+    def __init__(
+        self,
+        *,
+        chain: str,
+        blocks: int = 10,
+        headers: int = 10,
+        initial_block_download: bool = False,
+        connections: int = 2,
+        genesis_hash: str = "11" * 32,
+    ) -> None:
+        self.chain = chain
+        self.blocks = blocks
+        self.headers = headers
+        self.initial_block_download = initial_block_download
+        self.connections = connections
+        self.genesis_hash = genesis_hash
+
+    def call(self, method: str, params: list[object] | None = None) -> object:
+        if method == "getblockchaininfo":
+            return {
+                "chain": self.chain,
+                "blocks": self.blocks,
+                "headers": self.headers,
+                "initialblockdownload": self.initial_block_download,
+            }
+        if method == "getnetworkinfo":
+            return {"connections": self.connections}
+        if method == "getblockhash":
+            return self.genesis_hash
+        if method == "createauxblock":
+            return {"hash": "22" * 32}
+        if method == "getblocktemplate":
+            return {"previousblockhash": "33" * 32, "curtime": int(time.time())}
+        raise AssertionError(f"unexpected RPC method {method}")
+
+
 class AuxPowVardiffCoordinatorTests(unittest.TestCase):
+    def test_public_node_readiness_requires_expected_chain_sync_and_peers(self) -> None:
+        coordinator.validate_node_readiness(
+            ReadinessRpc(chain="main"),
+            label="qbit",
+            configured_chain="mainnet",
+            rpc_chain_names=coordinator.QBIT_RPC_CHAIN_NAMES,
+            expected_genesis_hash="11" * 32,
+        )
+
+        cases = (
+            (ReadinessRpc(chain="regtest"), "chain mismatch"),
+            (ReadinessRpc(chain="main", initial_block_download=True), "initial block download"),
+            (ReadinessRpc(chain="main", blocks=9, headers=10), "not caught up"),
+            (ReadinessRpc(chain="main", connections=0), "no peer connections"),
+            (ReadinessRpc(chain="main", genesis_hash="ff" * 32), "genesis mismatch"),
+        )
+        for rpc, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, message):
+                coordinator.validate_node_readiness(
+                    rpc,
+                    label="qbit",
+                    configured_chain="mainnet",
+                    rpc_chain_names=coordinator.QBIT_RPC_CHAIN_NAMES,
+                    expected_genesis_hash="11" * 32,
+                )
+
+    def test_regtest_readiness_does_not_require_public_sync_state(self) -> None:
+        coordinator.validate_node_readiness(
+            ReadinessRpc(
+                chain="regtest",
+                blocks=0,
+                headers=3,
+                initial_block_download=True,
+                connections=0,
+            ),
+            label="qbit",
+            configured_chain="regtest",
+            rpc_chain_names=coordinator.QBIT_RPC_CHAIN_NAMES,
+        )
+
+    def test_mainnet_auxpow_requires_explicit_payouts_and_frozen_genesis(self) -> None:
+        qbit_rpc = ReadinessRpc(chain="main")
+        bitcoin_genesis = coordinator.KNOWN_BITCOIN_GENESIS_HASHES["mainnet"]
+        bitcoin_rpc = ReadinessRpc(chain="main", genesis_hash=bitcoin_genesis)
+        base = {
+            "QBIT_CHAIN": "mainnet",
+            "BITCOIN_CHAIN": "mainnet",
+            "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+            "BITCOIN_EXPECTED_GENESIS_HASH": bitcoin_genesis,
+            "QBIT_MINER_ADDRESS": "qb1explicit",
+            "BITCOIN_MINER_ADDRESS": "bc1explicit",
+            "AUXPOW_MODE": "stratum",
+            "AUXPOW_STRATUM_HEADER_VARIANT": "canonical",
+            "AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT": False,
+        }
+        with (
+            patch.multiple(coordinator, **base),
+        ):
+            coordinator.validate_auxpow_startup(qbit_rpc, bitcoin_rpc)
+
+        for override, message in (
+            ({"QBIT_EXPECTED_GENESIS_HASH": ""}, "GENESIS"),
+            ({"BITCOIN_EXPECTED_GENESIS_HASH": ""}, "BITCOIN_EXPECTED_GENESIS_HASH"),
+            ({"BITCOIN_EXPECTED_GENESIS_HASH": "11" * 32}, "canonical Bitcoin"),
+            ({"QBIT_MINER_ADDRESS": "auto"}, "QBIT_MINER_ADDRESS"),
+            ({"BITCOIN_MINER_ADDRESS": "auto"}, "BITCOIN_MINER_ADDRESS"),
+        ):
+            with (
+                self.subTest(override=override),
+                patch.multiple(coordinator, **{**base, **override}),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                coordinator.validate_auxpow_startup(qbit_rpc, bitcoin_rpc)
+
+    def test_mainnet_auxpow_rejects_lab_only_modes_and_wrong_parent_genesis(self) -> None:
+        bitcoin_genesis = coordinator.KNOWN_BITCOIN_GENESIS_HASHES["mainnet"]
+        base = {
+            "QBIT_CHAIN": "mainnet",
+            "BITCOIN_CHAIN": "mainnet",
+            "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+            "BITCOIN_EXPECTED_GENESIS_HASH": bitcoin_genesis,
+            "QBIT_MINER_ADDRESS": "qb1explicit",
+            "BITCOIN_MINER_ADDRESS": "bc1explicit",
+            "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS": 120,
+            "AUXPOW_STRATUM_HEADER_VARIANT": "canonical",
+            "AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT": False,
+        }
+        for mode in ("once", "bridge"):
+            with (
+                self.subTest(mode=mode),
+                patch.multiple(coordinator, **base, AUXPOW_MODE=mode),
+                self.assertRaisesRegex(RuntimeError, "lab-only"),
+            ):
+                coordinator.validate_auxpow_startup(
+                    ReadinessRpc(chain="main"),
+                    ReadinessRpc(chain="main"),
+                )
+
+        with (
+            patch.multiple(coordinator, **base, AUXPOW_MODE="stratum"),
+            self.assertRaisesRegex(RuntimeError, "Bitcoin genesis mismatch"),
+        ):
+            coordinator.validate_auxpow_startup(
+                ReadinessRpc(chain="main"),
+                ReadinessRpc(chain="main", genesis_hash="22" * 32),
+            )
+
+        with (
+            patch.multiple(
+                coordinator,
+                **{**base, "BITCOIN_CHAIN": "regtest"},
+                AUXPOW_MODE="stratum",
+            ),
+            self.assertRaisesRegex(RuntimeError, "requires BITCOIN_CHAIN=mainnet"),
+        ):
+            coordinator.validate_auxpow_startup(
+                ReadinessRpc(chain="main"),
+                ReadinessRpc(chain="regtest"),
+            )
+
+    def test_mainnet_auxpow_rejects_diagnostic_header_modes(self) -> None:
+        bitcoin_genesis = coordinator.KNOWN_BITCOIN_GENESIS_HASHES["mainnet"]
+        base = {
+            "QBIT_CHAIN": "mainnet",
+            "BITCOIN_CHAIN": "mainnet",
+            "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+            "BITCOIN_EXPECTED_GENESIS_HASH": bitcoin_genesis,
+            "QBIT_MINER_ADDRESS": "qb1explicit",
+            "BITCOIN_MINER_ADDRESS": "bc1explicit",
+            "AUXPOW_MODE": "stratum",
+            "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS": 120,
+            "AUXPOW_STRATUM_HEADER_VARIANT": "canonical",
+            "AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT": False,
+        }
+        for override, message in (
+            ({"AUXPOW_STRATUM_HEADER_VARIANT": "diagnostic"}, "HEADER_VARIANT"),
+            ({"AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT": True}, "ACCEPT_DIAGNOSTIC"),
+        ):
+            with (
+                self.subTest(override=override),
+                patch.multiple(coordinator, **{**base, **override}),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                coordinator.validate_auxpow_startup(
+                    ReadinessRpc(chain="main"),
+                    ReadinessRpc(chain="main", genesis_hash=bitcoin_genesis),
+                )
+
+    def test_refresh_loop_exits_after_sustained_rpc_failure(self) -> None:
+        server = self.server()
+        server.stop_event = threading.Event()
+        server.refresh_now = threading.Event()
+        server.last_successful_refresh_monotonic = 0.0
+        server.refresh_fatal_error = None
+        server.refresh_job = Mock(side_effect=RuntimeError("RPC unavailable"))
+        server.maybe_log_worker_stats = lambda: None
+        server.maybe_retarget_idle_clients = lambda: None
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS", 1),
+            patch.object(coordinator.time, "monotonic", return_value=2.0),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            server.refresh_loop()
+
+        self.assertTrue(server.stop_event.is_set())
+        self.assertIn("budget=1s", server.refresh_fatal_error or "")
+
+    def test_refresh_loop_recovers_from_transient_rpc_failure(self) -> None:
+        server = self.server()
+        server.stop_event = threading.Event()
+        server.refresh_now = threading.Event()
+        server.last_successful_refresh_monotonic = 100.0
+        server.refresh_fatal_error = None
+        server.refresh_job = Mock(side_effect=[RuntimeError("transient"), False])
+        server.maybe_retarget_idle_clients = lambda: None
+        iterations = 0
+
+        def stop_after_second_iteration() -> None:
+            nonlocal iterations
+            iterations += 1
+            if iterations == 2:
+                server.stop_event.set()
+
+        server.maybe_log_worker_stats = stop_after_second_iteration
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS", 10),
+            patch.object(coordinator, "AUXPOW_STRATUM_POLL_SECONDS", 0),
+            patch.object(coordinator.time, "monotonic", side_effect=[105.0, 106.0]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            server.refresh_loop()
+
+        self.assertIsNone(server.refresh_fatal_error)
+        self.assertTrue(server.stop_event.is_set())
+        self.assertEqual(server.last_successful_refresh_monotonic, 106.0)
+
+    def test_auxpow_template_preflight_rejects_stale_parent_work(self) -> None:
+        qbit_rpc = ReadinessRpc(chain="main")
+        bitcoin_rpc = ReadinessRpc(chain="main")
+        bitcoin_rpc.call = Mock(
+            return_value={
+                "previousblockhash": "33" * 32,
+                "curtime": int(time.time()) - 121,
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "template is stale"):
+            coordinator.validate_auxpow_templates(
+                qbit_rpc,
+                bitcoin_rpc,
+                qbit_miner_address="qb1explicit",
+                max_age_seconds=120,
+            )
+
     def test_build_chain_commitment_uses_display_order_root_bytes(self) -> None:
         root_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         aux_template = {"hash": root_hex, "chainid": 31430, "commitmentorder": "display"}

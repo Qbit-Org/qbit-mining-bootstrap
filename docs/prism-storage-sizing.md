@@ -9,11 +9,17 @@ overhead, WAL, and backups because those are different capacity problems.
 PRISM stores permanent accounting data in Postgres and writes public audit
 artifacts under `PRISM_AUDIT_DIR`.
 
-Compose mounts:
+Base Compose uses named volumes for local development:
 
 - `prism-postgres-data` at `/var/lib/postgresql/data`
+- `prism-postgres-wal` at `/var/lib/postgresql/wal`
 - `prism-audit-data` at `/var/lib/qbit-prism/audit`
 - `qbit-data` at `/var/lib/qbit`
+
+Production Compose replaces these with pre-created absolute bind mounts supplied
+through `PRISM_POSTGRES_DATA_SOURCE`, `PRISM_POSTGRES_WAL_SOURCE`,
+`PRISM_AUDIT_DATA_SOURCE`, and `QBIT_DATA_SOURCE`. The data and live WAL sources
+must be distinct paths and should be monitored as separate capacity boundaries.
 
 The current production storage target is:
 
@@ -196,6 +202,75 @@ For a serious public pool:
   fetched bytes are correct; backups and restore tests prove bytes remain
   available.
 
+## Postgres Durability And Recovery
+
+Postgres always uses write-ahead logging (WAL). WAL is the database transaction
+log, not a second application-level share queue: changes are recorded in WAL
+before their modified table pages are written. Keep `fsync=on`,
+`full_page_writes=on`, and `synchronous_commit=on`. Disabling any of those to
+reduce share-accept latency weakens the meaning of a committed share and is not
+a production tuning option.
+
+The production Compose contract sets `POSTGRES_INITDB_WALDIR` to the separately
+mounted live WAL path. That setting is honored only when the official Postgres
+entrypoint creates a fresh cluster. It does not move `pg_wal` for an existing
+cluster. Verify the initialized cluster before admitting shares:
+
+```sql
+SHOW data_directory;
+SELECT pg_current_wal_lsn(), pg_walfile_name(pg_current_wal_lsn());
+```
+
+Also verify that `readlink -f /var/lib/postgresql/data/pg_wal` inside the
+container resolves to `/var/lib/postgresql/wal` and that the container mount
+table maps that target to `PRISM_POSTGRES_WAL_SOURCE`; SQL alone cannot prove
+the storage separation. Losing either the live data path or live WAL path makes
+the primary unavailable, so snapshotting only one is not a recoverable backup.
+
+A commit on one Postgres primary protects against a coordinator restart, but it
+does not by itself protect against loss of that primary and its storage. Choose
+the recovery objective explicitly:
+
+- For a non-zero recovery point objective, use encrypted off-host base backups
+  plus continuous WAL archiving and document the maximum acceptable data loss.
+- For zero loss of acknowledged commits after primary storage failure, add a
+  synchronous standby on independent failure-domain storage. Configure
+  `synchronous_standby_names` and keep `synchronous_commit=on` so commit waits
+  for the selected standby to durably flush WAL. Do not silently fall back to
+  asynchronous replication when that guarantee is required.
+- Replicas do not replace backups. Operator error, corruption, and accidental
+  deletion can replicate immediately, so retain independent point-in-time
+  recovery material.
+
+Point-in-time recovery requires a compatible physical base backup and every WAL
+segment from that backup through the requested recovery time. Store both
+encrypted outside the database host, apply a tested retention policy, and run a
+scheduled restore drill into an isolated Postgres instance. A drill is complete
+only after schema checks, ledger continuity checks, artifact-pointer checks, and
+an application read test pass.
+
+Live WAL and archived WAL are different storage classes. Postgres writes active
+segments to `pg_wal`; an archive command copies completed segments to the
+independent point-in-time-recovery archive. The separate Compose WAL mount holds
+the former, not the latter.
+
+WAL consumes disk according to write volume and checkpoint behavior, not just
+accepted-share row size. Healthy archived segments can be recycled from live
+WAL; a failed archive command or an inactive replication slot can retain live
+WAL without bound and fill its filesystem. Measure WAL generated during a
+production-like load test, reserve several times the measured peak between
+operator response windows, and alert on:
+
+- time and bytes since the last successful archived WAL segment
+- `pg_wal` bytes and growth rate
+- replication slot retained bytes and standby replay/flush lag
+- base-backup age and the last successful restore drill
+- synchronous standby count whenever zero acknowledged-share loss is required
+
+Treat recovery as a release gate: perform at least one full backup, primary-loss
+simulation, point-in-time restore, and application verification before accepting
+shares with economic value.
+
 ## Monitoring
 
 Track at least:
@@ -223,6 +298,8 @@ Filesystem checks:
 
 ```sh
 df -h /
+df -h "$PRISM_POSTGRES_DATA_SOURCE" "$PRISM_POSTGRES_WAL_SOURCE" "$PRISM_AUDIT_DATA_SOURCE"
+du -sh "$PRISM_POSTGRES_DATA_SOURCE" "$PRISM_POSTGRES_WAL_SOURCE" "$PRISM_AUDIT_DATA_SOURCE"
 du -sh /var/lib/docker /var/lib/containerd
 docker system df
 docker volume ls

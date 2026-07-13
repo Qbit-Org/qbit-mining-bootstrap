@@ -6,6 +6,7 @@ import contextlib
 import io
 import importlib.util
 import sys
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,11 @@ class FakeRpc:
         address_valid: bool = True,
         iswitness: bool = True,
         witness_version: int | None = 2,
+        genesis_hash: str = "11" * 32,
+        blocks: int = 100,
+        headers: int = 100,
+        template_time: int | None = None,
+        template_previous_hash: str | None = "22" * 32,
     ) -> None:
         self.ibd = ibd
         self.rpc_chain = rpc_chain
@@ -43,19 +49,37 @@ class FakeRpc:
         self.address_valid = address_valid
         self.iswitness = iswitness
         self.witness_version = witness_version
+        self.genesis_hash = genesis_hash
+        self.blocks = blocks
+        self.headers = headers
+        self.template_time = int(time.time()) if template_time is None else template_time
+        self.template_previous_hash = template_previous_hash
         self.calls: list[tuple[str, list[Any]]] = []
 
     def call(self, method: str, params: list[Any] | None = None) -> Any:
         params = params or []
         self.calls.append((method, params))
         if method == "getblockchaininfo":
-            return {"chain": self.rpc_chain, "initialblockdownload": self.ibd}
+            return {
+                "chain": self.rpc_chain,
+                "initialblockdownload": self.ibd,
+                "blocks": self.blocks,
+                "headers": self.headers,
+            }
         if method == "getnetworkinfo":
             index = min(self.network_info_calls, len(self.connections) - 1)
             self.network_info_calls += 1
             return {"connections": self.connections[index]}
+        if method == "getblockhash":
+            self.assert_genesis_height(params)
+            return self.genesis_hash
         if method == "getblocktemplate":
-            return {"rules": self.template_rules, "weightlimit": self.weightlimit}
+            return {
+                "rules": self.template_rules,
+                "weightlimit": self.weightlimit,
+                "previousblockhash": self.template_previous_hash,
+                "curtime": self.template_time,
+            }
         if method == "validateaddress":
             return {
                 "isvalid": self.address_valid,
@@ -64,6 +88,11 @@ class FakeRpc:
                 "witness_version": self.witness_version,
             }
         raise AssertionError(f"unexpected RPC method {method}")
+
+    @staticmethod
+    def assert_genesis_height(params: list[Any]) -> None:
+        if params != [0]:
+            raise AssertionError(f"expected getblockhash height 0, got {params!r}")
 
 
 def base_env(**overrides: str) -> dict[str, str]:
@@ -101,6 +130,17 @@ def production_env(**overrides: str) -> dict[str, str]:
         CKPOOL_STARTDIFF_EXPLICIT="1",
         CKPOOL_REQUIRE_P2MR_PAYOUT="1",
         CKPOOL_STRATUM_PORT="3333",
+    )
+    env.update(overrides)
+    return env
+
+
+def mainnet_env(**overrides: str) -> dict[str, str]:
+    env = production_env(
+        QBIT_PRODUCTION="0",
+        QBIT_CHAIN="mainnet",
+        QBIT_MINER_ADDRESS="qb1miner",
+        QBIT_EXPECTED_GENESIS_HASH="11" * 32,
     )
     env.update(overrides)
     return env
@@ -146,6 +186,8 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
             "readiness": {"CKPOOL_NON_TEST_READINESS_GATE": "0"},
             "assumptions": {"CKPOOL_VALIDATE_QBIT_ASSUMPTIONS": "0"},
             "p2mr": {"CKPOOL_REQUIRE_P2MR_PAYOUT": "0"},
+            "empty-payout": {"QBIT_MINER_ADDRESS": ""},
+            "automatic-payout": {"QBIT_MINER_ADDRESS": "auto"},
             "password": {"QBIT_RPC_PASSWORD": "change-this"},
             "port": {"CKPOOL_STRATUM_PORT": ""},
         }
@@ -158,18 +200,65 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
 
         self.assertTrue(any("production gate" in message for message in messages))
 
+    def test_mainnet_implies_production_gate(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "non-default QBIT_RPC_PASSWORD"):
+            preflight.run_preflight(
+                mainnet_env(QBIT_RPC_PASSWORD="change-this"),
+                FakeRpc(rpc_chain="main"),
+            )
+
     def test_public_readiness_rejects_initial_block_download(self) -> None:
-        env = base_env(
-            QBIT_CHAIN="mainnet",
-            QBIT_MINER_ADDRESS="qb1miner",
-            CKPOOL_MINDIFF="1024",
-            CKPOOL_STARTDIFF="65536",
-            CKPOOL_MINDIFF_EXPLICIT="1",
-            CKPOOL_STARTDIFF_EXPLICIT="1",
-        )
+        env = mainnet_env()
 
         with self.assertRaisesRegex(preflight.PreflightError, "initial block download"):
             preflight.run_preflight(env, FakeRpc(ibd=True, rpc_chain="main"))
+
+    def test_public_readiness_requires_explicit_false_ibd(self) -> None:
+        rpc = FakeRpc(rpc_chain="main")
+        original_call = rpc.call
+
+        def call_without_ibd(method: str, params: list[Any] | None = None) -> Any:
+            result = original_call(method, params)
+            if method == "getblockchaininfo":
+                result.pop("initialblockdownload")
+            return result
+
+        rpc.call = call_without_ibd  # type: ignore[method-assign]
+        with self.assertRaisesRegex(preflight.PreflightError, "initial block download"):
+            preflight.run_preflight(mainnet_env(), rpc)
+
+    def test_public_readiness_rejects_header_lag(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "not caught up"):
+            preflight.run_preflight(
+                mainnet_env(),
+                FakeRpc(rpc_chain="main", blocks=99, headers=100),
+            )
+
+    def test_public_readiness_rejects_stale_template(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "template is stale"):
+            preflight.run_preflight(
+                mainnet_env(CKPOOL_TEMPLATE_MAX_AGE_SECONDS="120"),
+                FakeRpc(rpc_chain="main", template_time=int(time.time()) - 121),
+            )
+
+    def test_mainnet_requires_expected_genesis_hash(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "requires QBIT_EXPECTED_GENESIS_HASH"):
+            preflight.run_preflight(
+                mainnet_env(QBIT_EXPECTED_GENESIS_HASH=""),
+                FakeRpc(rpc_chain="main"),
+            )
+
+    def test_mainnet_rejects_wrong_genesis_hash(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "genesis hash"):
+            preflight.run_preflight(
+                mainnet_env(),
+                FakeRpc(rpc_chain="main", genesis_hash="22" * 32),
+            )
+
+    def test_mainnet_accepts_expected_genesis_hash(self) -> None:
+        messages = preflight.run_preflight(mainnet_env(), FakeRpc(rpc_chain="main"))
+
+        self.assertTrue(any(f"genesis={'11' * 32}" in message for message in messages))
 
     def test_public_readiness_rejects_insufficient_peers(self) -> None:
         env = base_env(
@@ -288,14 +377,7 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
             preflight.run_preflight(env, FakeRpc(rpc_chain="testnet4"))
 
     def test_public_payout_requires_p2mr_witness_version(self) -> None:
-        env = base_env(
-            QBIT_CHAIN="mainnet",
-            QBIT_MINER_ADDRESS="qb1miner",
-            CKPOOL_MINDIFF="1024",
-            CKPOOL_STARTDIFF="65536",
-            CKPOOL_MINDIFF_EXPLICIT="1",
-            CKPOOL_STARTDIFF_EXPLICIT="1",
-        )
+        env = mainnet_env()
 
         with self.assertRaisesRegex(preflight.PreflightError, "witness_version"):
             preflight.run_preflight(env, FakeRpc(rpc_chain="main", witness_version=1))

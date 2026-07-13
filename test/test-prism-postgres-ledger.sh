@@ -144,6 +144,77 @@ assert_equal(
     "schema initialization exposes current balance functions",
 )
 
+# The live ACK path uses append_batch, including ordinary shares whose
+# candidate value is JSON null. Exercise the real Postgres statement so JSONB
+# null handling, FIFO sequence assignment, exact replay, and terminal outbox
+# compaction cannot regress behind SQL-string unit tests.
+batch_a = pending(90, job_ms=900, accepted_ms=901, share_id="batch-a")
+batch_b = pending(91, job_ms=902, accepted_ms=903, share_id="batch-b")
+batch_rows = ledger.append_batch([(batch_a, None), (batch_b, None)])
+assert_equal([row.share_id for row in batch_rows], ["batch-a", "batch-b"], "batch FIFO ids")
+assert_equal([row.share_seq for row in batch_rows], [1, 2], "batch FIFO sequences")
+assert_equal(ledger.pending_block_candidates(), [], "ordinary shares create no outbox rows")
+
+batch_c = pending(92, job_ms=904, accepted_ms=905, share_id="batch-c")
+candidate_intent = {
+    "schema": "qbit.prism.block-candidate-intent.v1",
+    "block_hash_hex": "ab" * 32,
+    "block_hex": "00",
+}
+candidate_row = ledger.append_batch([(batch_c, candidate_intent)])[0]
+assert_equal(candidate_row.share_seq, 3, "candidate share sequence")
+assert_equal(ledger.append_batch([(batch_c, candidate_intent)])[0].share_seq, 3, "exact replay")
+assert_equal(ledger.pending_block_candidates(), [candidate_intent], "pending candidate replay")
+assert_equal(
+    ledger.pending_block_candidate_rows(),
+    [{"block_hash": "ab" * 32, "candidate": candidate_intent}],
+    "pending candidate replay retains authoritative outbox key",
+)
+assert ledger.mark_block_candidate_submitted(block_hash="ab" * 32)
+assert_equal(ledger.pending_block_candidates(), [], "submitted candidate leaves pending set")
+assert_equal(ledger.append_batch([(batch_c, candidate_intent)])[0].share_seq, 3, "compact exact replay")
+batch_d = pending(93, job_ms=906, accepted_ms=907, share_id="batch-d")
+candidate_only = {
+    **candidate_intent,
+    "block_hash_hex": "cd" * 32,
+    "credit_share_on_accept": True,
+}
+assert ledger.persist_block_candidate_intent(candidate_only)
+assert_equal(ledger.pending_block_candidates(), [candidate_only], "candidate-only intent")
+assert_equal(ledger.append_batch([(batch_d, candidate_only)])[0].share_seq, 4, "linked solver credit")
+assert ledger.mark_block_candidate_submitted(block_hash="cd" * 32)
+assert_equal(ledger.pending_block_candidates(), [], "linked candidate completion")
+poison_hash = "ef" * 32
+poison_candidate = {
+    **candidate_intent,
+    "block_hash_hex": poison_hash,
+}
+assert ledger.persist_block_candidate_intent(poison_candidate)
+ledger._run_sql(
+    "UPDATE qbit_block_candidate_outbox "
+    "SET candidate = candidate - 'block_hash_hex' "
+    f"WHERE block_hash = '{poison_hash}';"
+)
+poison_rows = ledger.pending_block_candidate_rows()
+assert_equal(poison_rows[0]["block_hash"], poison_hash, "poison row keeps durable key")
+assert_equal(
+    poison_rows[0]["candidate"].get("block_hash_hex"),
+    None,
+    "poison fixture removes payload block hash",
+)
+assert ledger.mark_block_candidate_abandoned(
+    block_hash=poison_rows[0]["block_hash"],
+    error="invalid durable candidate intent",
+)
+assert_equal(ledger.pending_block_candidates(), [], "poison row quarantined by durable key")
+ledger._run_sql(
+    """
+DELETE FROM qbit_block_candidate_outbox;
+DELETE FROM qbit_share_ledger;
+ALTER SEQUENCE qbit_share_ledger_share_seq_seq RESTART WITH 1;
+"""
+)
+
 ledger._run_sql(
     """
 ALTER TABLE qbit_ctv_fanout_artifacts
@@ -233,7 +304,12 @@ else:
     raise SystemExit("different writer stole an unexpired lease after idle refresh")
 
 force_expired_idle_lease(ledger)
-replacement = PsqlShareLedger(psql_command=psql, writer_id="writer-b", writer_epoch=1)
+replacement = PsqlShareLedger(
+    psql_command=psql,
+    writer_id="writer-b",
+    writer_epoch=1,
+    audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+)
 try:
     ledger.append(pending(5, job_ms=1_700_000_006_000, accepted_ms=1_700_000_006_100))
 except RuntimeError as exc:
@@ -514,7 +590,12 @@ SELECT json_build_object(
     "stale CTV fanout backfill does not insert missing artifacts",
 )
 force_expired_idle_lease(fanout_backfill_lease_stealer)
-replacement = PsqlShareLedger(psql_command=psql, writer_id="writer-b", writer_epoch=1)
+replacement = PsqlShareLedger(
+    psql_command=psql,
+    writer_id="writer-b",
+    writer_epoch=1,
+    audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+)
 fanout_backfill = replacement.persist_ctv_fanout_manifest_set(
     block_hash="44" * 32,
     manifest_set=fanout_manifest_set,
@@ -974,7 +1055,12 @@ assert_equal(
 )
 
 force_expired_idle_lease(replacement)
-final_writer = PsqlShareLedger(psql_command=psql, writer_id="writer-c", writer_epoch=1)
+final_writer = PsqlShareLedger(
+    psql_command=psql,
+    writer_id="writer-c",
+    writer_epoch=1,
+    audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+)
 try:
     replacement.persist_accepted_block(
         block_hash="88" * 32,

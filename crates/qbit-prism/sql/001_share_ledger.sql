@@ -64,6 +64,36 @@ CREATE TABLE IF NOT EXISTS qbit_share_ledger (
     CHECK (accepted OR reject_reason IS NOT NULL)
 );
 
+-- A block-worthy share and the information needed to finish submitting its
+-- block are committed in the same transaction.  The coordinator's in-memory
+-- queue is only a low-latency wakeup; this outbox is the source of truth after
+-- a process or host restart.
+CREATE TABLE IF NOT EXISTS qbit_block_candidate_outbox (
+    block_hash text PRIMARY KEY,
+    share_id text UNIQUE REFERENCES qbit_share_ledger(share_id),
+    candidate jsonb,
+    candidate_sha256 text NOT NULL CHECK (candidate_sha256 ~ '^[0-9a-f]{64}$'),
+    state text NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'submitted', 'abandoned')),
+    attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    completed_at timestamptz,
+    CHECK (
+        (state = 'pending' AND completed_at IS NULL AND candidate IS NOT NULL)
+        OR (
+            state IN ('submitted', 'abandoned')
+            AND completed_at IS NOT NULL
+            AND candidate IS NULL
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS qbit_block_candidate_outbox_pending_idx
+    ON qbit_block_candidate_outbox (created_at, block_hash)
+    WHERE state = 'pending';
+
 ALTER TABLE qbit_share_ledger
     ADD COLUMN IF NOT EXISTS credit_policy text;
 

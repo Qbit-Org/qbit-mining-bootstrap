@@ -38,6 +38,7 @@ BOOL_FALSE = {"0", "false", "no", "off"}
 DIFF_POLICY_EXPLICIT = {"explicit", "require", "required"}
 DIFF_POLICY_PERMISSIVE = {"permissive", "allow-defaults", "defaults"}
 HEXISH_HRP_RE = re.compile(r"^[a-z0-9]+$")
+HASH256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class PreflightError(RuntimeError):
@@ -127,6 +128,8 @@ def is_public_chain(chain: str) -> bool:
 
 
 def production_mode(env: dict[str, str]) -> bool:
+    if chain_name(env) == "mainnet":
+        return True
     return bool_env(env, "QBIT_PRODUCTION", False) or bool_env(env, "QBIT_TOOLS_PRODUCTION", False)
 
 
@@ -219,6 +222,11 @@ def validate_production_gate(env: dict[str, str]) -> list[str]:
         raise PreflightError("QBIT_PRODUCTION=1 rejects CKPOOL_VALIDATE_QBIT_ASSUMPTIONS=0")
     if is_public_chain(chain) and not bool_env(env, "CKPOOL_REQUIRE_P2MR_PAYOUT", True):
         raise PreflightError("QBIT_PRODUCTION=1 rejects public-chain CKPOOL_REQUIRE_P2MR_PAYOUT=0")
+    payout_address = env.get("QBIT_MINER_ADDRESS", "").strip()
+    if not payout_address or payout_address.lower() == "auto":
+        raise PreflightError(
+            "QBIT_PRODUCTION=1 requires an explicit QBIT_MINER_ADDRESS for CKPool"
+        )
     if env.get("QBIT_RPC_PASSWORD", "") in {"", "change-this"}:
         raise PreflightError("QBIT_PRODUCTION=1 requires a non-default QBIT_RPC_PASSWORD")
     if not env.get("CKPOOL_STRATUM_PORT", ""):
@@ -271,8 +279,31 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
         raise PreflightError(
             f"QBIT_CHAIN={chain} does not match getblockchaininfo.chain={rpc_chain}"
         )
-    if bool(info.get("initialblockdownload")):
+    if info.get("initialblockdownload") is not False:
         raise PreflightError(f"QBIT_CHAIN={chain} is still in initial block download")
+    try:
+        blocks = int(info["blocks"])
+        headers = int(info["headers"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PreflightError("getblockchaininfo blocks and headers must be integers") from exc
+    if blocks < 0 or headers < 0:
+        raise PreflightError("getblockchaininfo blocks and headers must be non-negative")
+    if blocks != headers:
+        raise PreflightError(
+            f"QBIT_CHAIN={chain} is not caught up: blocks={blocks}, headers={headers}"
+        )
+
+    expected_genesis = env.get("QBIT_EXPECTED_GENESIS_HASH", "").strip().lower()
+    if chain == "mainnet" and not expected_genesis:
+        raise PreflightError("QBIT_CHAIN=mainnet requires QBIT_EXPECTED_GENESIS_HASH")
+    if expected_genesis:
+        if HASH256_RE.fullmatch(expected_genesis) is None:
+            raise PreflightError("QBIT_EXPECTED_GENESIS_HASH must be 64 lowercase hex characters")
+        actual_genesis = rpc.call("getblockhash", [0])
+        if not isinstance(actual_genesis, str) or actual_genesis.lower() != expected_genesis:
+            raise PreflightError(
+                f"qbit genesis hash is {actual_genesis!r}, expected {expected_genesis}"
+            )
 
     min_peers = int_env(env, "CKPOOL_MIN_PEERS", 1)
     if min_peers < 1:
@@ -320,7 +351,8 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
 
     return [
         f"readiness gate: chain={chain} rpc_chain={rpc_chain} "
-        f"ibd=false peers={connections} min_peers={min_peers}"
+        f"ibd=false blocks={blocks} headers={headers} peers={connections} min_peers={min_peers} "
+        f"genesis={expected_genesis or '-'}"
     ]
 
 
@@ -347,6 +379,21 @@ def validate_template_assumptions(env: dict[str, str], rpc: RpcClient) -> list[s
         raise PreflightError(
             f"getblocktemplate.weightlimit={weightlimit!r}, expected {expected_weight}"
         )
+    if is_public_chain(chain):
+        if not isinstance(template.get("previousblockhash"), str) or not template["previousblockhash"]:
+            raise PreflightError("getblocktemplate.previousblockhash was missing")
+        try:
+            template_time = int(template["curtime"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PreflightError("getblocktemplate.curtime must be an integer") from exc
+        max_age = int_env(env, "CKPOOL_TEMPLATE_MAX_AGE_SECONDS", 120)
+        if max_age < 0:
+            raise PreflightError("CKPOOL_TEMPLATE_MAX_AGE_SECONDS must be non-negative")
+        template_age = int(time.time()) - template_time
+        if template_age > max_age:
+            raise PreflightError(
+                f"getblocktemplate is stale: age={template_age}s exceeds {max_age}s"
+            )
 
     return [
         "qbit assumptions: "

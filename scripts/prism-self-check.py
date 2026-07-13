@@ -15,17 +15,36 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from prism_capacity_evidence import (  # noqa: E402
+    CONFIGURATION_KEYS as CAPACITY_CONFIGURATION_KEYS,
+    EvidenceError,
+    load_capacity_evidence,
+)
+
+
 PUBLIC_QBIT_CHAINS = {"mainnet", "testnet", "testnet3", "testnet4", "signet"}
-TEST_CHAIN_FLAGS = {"-regtest", "-testnet", "-testnet3", "-testnet4", "-signet"}
 QBIT_CHAIN_FLAGS = {
+    "mainnet": "-chain=main",
     "regtest": "-regtest",
     "testnet": "-testnet",
     "testnet3": "-testnet3",
+    "testnet4": "-testnet4",
+    "signet": "-signet",
+}
+BITCOIN_CHAIN_FLAGS = {
+    "mainnet": "-chain=main",
+    "regtest": "-regtest",
+    "testnet": "-testnet",
+    "testnet3": "-testnet",
     "testnet4": "-testnet4",
     "signet": "-signet",
 }
@@ -69,9 +88,16 @@ def env_file_args() -> list[str]:
     if not upstream.exists():
         upstream = ROOT_DIR / "config" / "upstream.env.example"
     args = ["--env-file", str(upstream)]
-    local_env = ROOT_DIR / ".env"
-    if local_env.exists():
-        args.extend(["--env-file", str(local_env)])
+    deploy_env = os.environ.get("DEPLOY_ENV_FILE", "").strip()
+    if deploy_env:
+        deploy_path = Path(deploy_env)
+        if not deploy_path.is_absolute():
+            deploy_path = ROOT_DIR / deploy_path
+        args.extend(["--env-file", str(deploy_path)])
+    else:
+        local_env = ROOT_DIR / ".env"
+        if local_env.exists():
+            args.extend(["--env-file", str(local_env)])
     return args
 
 
@@ -149,6 +175,28 @@ def parse_decimal(value: str) -> Decimal:
         raise ValueError(f"{value!r} is not a decimal number") from exc
 
 
+def capacity_configuration(env: dict[str, str]) -> dict[str, str]:
+    defaults = {
+        "PRISM_STRATUM_SHARE_DIFF": "0.000000001",
+        "PRISM_STRATUM_VARDIFF": "1",
+        "PRISM_STRATUM_VARDIFF_TARGET_SECONDS": "15",
+        "PRISM_STRATUM_VARDIFF_MIN_DIFF": "0.000000001",
+        "PRISM_STRATUM_VARDIFF_START_DIFF": "0.000000001",
+        "PRISM_STRATUM_VARDIFF_MAX_DIFF": "1024",
+        "PRISM_STRATUM_VARDIFF_RETARGET_SECONDS": "90",
+        "PRISM_STRATUM_VARDIFF_MAX_STEP_UP": "4",
+        "PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN": "4",
+        "PRISM_STRATUM_VARDIFF_EWMA_ALPHA": "0.4",
+        "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE": "0.25",
+        "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "15",
+        "PRISM_SHARE_COMMIT_BATCH_SIZE": "64",
+        "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS": "5",
+        "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS": "15",
+        "PRISM_STRATUM_SEND_TIMEOUT_SECONDS": "20",
+    }
+    return {name: env_value(env, name, defaults[name]) for name in CAPACITY_CONFIGURATION_KEYS}
+
+
 def parse_host_port(value: str, *, default_host: str, default_port: int) -> tuple[str, int]:
     if not value:
         return default_host, default_port
@@ -161,8 +209,8 @@ def parse_host_port(value: str, *, default_host: str, default_port: int) -> tupl
 
 
 def static_checks(env: dict[str, str], reporter: Reporter) -> None:
-    prod = production_mode(env)
     qbit_chain = env_value(env, "QBIT_CHAIN", "regtest")
+    prod = qbit_chain == "mainnet" or production_mode(env)
     qbit_chain_flag = env_value(env, "QBIT_CHAIN_FLAG", "-regtest")
     if prod and qbit_chain == "regtest":
         reporter.fail("qbit.chain", "production mode cannot use regtest", hint="Set QBIT_CHAIN and QBIT_CHAIN_FLAG for the live network.")
@@ -171,12 +219,65 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
     expected_chain_flag = QBIT_CHAIN_FLAGS.get(qbit_chain)
     if expected_chain_flag is not None and qbit_chain_flag != expected_chain_flag:
         reporter.fail("qbit.chain_flag", f"QBIT_CHAIN={qbit_chain} requires QBIT_CHAIN_FLAG={expected_chain_flag}")
-    elif qbit_chain == "mainnet" and qbit_chain_flag in TEST_CHAIN_FLAGS:
-        reporter.fail("qbit.chain_flag", f"QBIT_CHAIN=mainnet cannot use {qbit_chain_flag}")
-    elif qbit_chain not in QBIT_CHAIN_FLAGS and qbit_chain != "mainnet":
+    elif qbit_chain not in QBIT_CHAIN_FLAGS:
         reporter.fail("qbit.chain_flag", f"unknown QBIT_CHAIN={qbit_chain}")
     else:
         reporter.pass_("qbit.chain_flag", "chain flag matches the configured qbit chain")
+
+    bitcoin_chain = env_value(env, "BITCOIN_CHAIN", "regtest")
+    bitcoin_chain_flag = env_value(env, "BITCOIN_CHAIN_FLAG", "-regtest")
+    expected_bitcoin_chain_flag = BITCOIN_CHAIN_FLAGS.get(bitcoin_chain)
+    if expected_bitcoin_chain_flag is None:
+        reporter.fail("bitcoin.chain_flag", f"unknown BITCOIN_CHAIN={bitcoin_chain}")
+    elif bitcoin_chain_flag != expected_bitcoin_chain_flag:
+        reporter.fail(
+            "bitcoin.chain_flag",
+            f"BITCOIN_CHAIN={bitcoin_chain} requires BITCOIN_CHAIN_FLAG={expected_bitcoin_chain_flag}",
+        )
+    else:
+        reporter.pass_("bitcoin.chain_flag", "chain flag matches the configured Bitcoin chain")
+
+    expected_genesis_hash = env_value(env, "QBIT_EXPECTED_GENESIS_HASH").strip()
+    if qbit_chain == "mainnet" and not expected_genesis_hash:
+        reporter.fail(
+            "qbit.genesis_config",
+            "QBIT_CHAIN=mainnet requires QBIT_EXPECTED_GENESIS_HASH",
+            hint="Pin the final release genesis hash before starting the pool.",
+        )
+    elif expected_genesis_hash and (
+        len(expected_genesis_hash) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in expected_genesis_hash)
+    ):
+        reporter.fail("qbit.genesis_config", "QBIT_EXPECTED_GENESIS_HASH must be 64 hex characters")
+    elif expected_genesis_hash:
+        reporter.pass_("qbit.genesis_config", expected_genesis_hash.lower())
+    else:
+        reporter.pass_("qbit.genesis_config", "not pinned for this test chain")
+
+    if prod:
+        qbit_git_commit = env_value(env, "QBIT_GIT_COMMIT").strip()
+        if len(qbit_git_commit) != 40 or any(
+            character not in "0123456789abcdefABCDEF" for character in qbit_git_commit
+        ):
+            reporter.fail(
+                "qbit.source_pin",
+                "production requires QBIT_GIT_COMMIT as exactly 40 hex characters",
+            )
+        else:
+            reporter.pass_("qbit.source_pin", qbit_git_commit.lower())
+
+    if prod:
+        for name in ("CKPOOL_GIT_REF", "CPUMINER_GIT_REF"):
+            source_ref = env_value(env, name).strip()
+            if len(source_ref) != 40 or any(
+                character not in "0123456789abcdefABCDEF" for character in source_ref
+            ):
+                reporter.fail(
+                    f"source.{name}",
+                    f"production requires {name} as exactly 40 hex characters",
+                )
+            else:
+                reporter.pass_(f"source.{name}", source_ref.lower())
 
     required_keys = (
         "PRISM_MANIFEST_SIGNING_SEED_HEX",
@@ -275,6 +376,38 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
     except ValueError as exc:
         reporter.fail("mining.share_diff", str(exc))
 
+    stale_grace = env_value(env, "PRISM_STRATUM_STALE_GRACE_SECONDS", "3").strip()
+    if prod and stale_grace != "0":
+        reporter.fail(
+            "mining.stale_grace",
+            "production requires PRISM_STRATUM_STALE_GRACE_SECONDS=0",
+            hint="Enable stale-credit grace only after proving verifier compatibility for the deployed release.",
+        )
+    else:
+        try:
+            stale_grace_value = int(stale_grace)
+            if stale_grace_value < 0:
+                raise ValueError
+        except ValueError:
+            reporter.fail("mining.stale_grace", "PRISM_STRATUM_STALE_GRACE_SECONDS must be a non-negative integer")
+        else:
+            reporter.pass_("mining.stale_grace", f"{stale_grace_value} seconds")
+
+    if prod and bitcoin_chain != "regtest":
+        qbit_miner_address = env_value(env, "QBIT_MINER_ADDRESS", "auto").strip()
+        bitcoin_miner_address = env_value(env, "BITCOIN_MINER_ADDRESS", "auto").strip()
+        if not qbit_miner_address or qbit_miner_address == "auto":
+            reporter.fail("auxpow.qbit_payout", "production AuxPoW requires an explicit QBIT_MINER_ADDRESS")
+        else:
+            reporter.pass_("auxpow.qbit_payout", "explicit payout configured")
+        if not bitcoin_miner_address or bitcoin_miner_address == "auto":
+            reporter.fail(
+                "auxpow.bitcoin_payout",
+                "production AuxPoW requires an explicit BITCOIN_MINER_ADDRESS",
+            )
+        else:
+            reporter.pass_("auxpow.bitcoin_payout", "explicit payout configured")
+
     if is_true(env_value(env, "PRISM_STRATUM_VARDIFF", "1")):
         try:
             min_diff = parse_decimal(env_value(env, "PRISM_STRATUM_VARDIFF_MIN_DIFF", "0.000000001"))
@@ -284,11 +417,101 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
                 raise ValueError("vardiff difficulty values must be positive")
             if min_diff > max_diff:
                 raise ValueError("PRISM_STRATUM_VARDIFF_MIN_DIFF exceeds PRISM_STRATUM_VARDIFF_MAX_DIFF")
+            if start_diff > max_diff:
+                raise ValueError("PRISM_STRATUM_VARDIFF_START_DIFF exceeds PRISM_STRATUM_VARDIFF_MAX_DIFF")
             reporter.pass_("mining.vardiff", f"enabled start={start_diff} range={min_diff}..{max_diff}")
         except ValueError as exc:
             reporter.fail("mining.vardiff", str(exc))
     else:
         reporter.warn("mining.vardiff", "vardiff is disabled")
+
+    if prod:
+        difficulty_names = (
+            "PRISM_STRATUM_SHARE_DIFF",
+            "PRISM_STRATUM_VARDIFF_MIN_DIFF",
+            "PRISM_STRATUM_VARDIFF_START_DIFF",
+            "PRISM_STRATUM_VARDIFF_MAX_DIFF",
+        )
+        try:
+            production_difficulties: dict[str, Decimal] = {}
+            for name in difficulty_names:
+                raw_value = env_value(env, name).strip()
+                if not raw_value:
+                    raise ValueError(f"production requires an explicit {name}")
+                value = parse_decimal(raw_value)
+                if value <= 0:
+                    raise ValueError(f"{name} must be positive")
+                if value == Decimal("0.000000001"):
+                    raise ValueError(f"{name} cannot use the lab-only 1e-9 difficulty")
+                production_difficulties[name] = value
+            if (
+                production_difficulties["PRISM_STRATUM_VARDIFF_MIN_DIFF"]
+                > production_difficulties["PRISM_STRATUM_VARDIFF_START_DIFF"]
+            ):
+                raise ValueError("production vardiff minimum exceeds its start difficulty")
+            if (
+                production_difficulties["PRISM_STRATUM_VARDIFF_START_DIFF"]
+                > production_difficulties["PRISM_STRATUM_VARDIFF_MAX_DIFF"]
+            ):
+                raise ValueError("production vardiff start exceeds its maximum difficulty")
+        except ValueError as exc:
+            reporter.fail("mining.production_difficulty", str(exc))
+        else:
+            reporter.pass_(
+                "mining.production_difficulty",
+                "reviewed share and bounded vardiff values configured",
+            )
+
+        capacity_path = env_value(env, "PRISM_CAPACITY_EVIDENCE_FILE").strip()
+        if not capacity_path:
+            reporter.fail(
+                "capacity.evidence",
+                "production requires PRISM_CAPACITY_EVIDENCE_FILE",
+                hint="Qualify the deployed Stratum-to-Postgres path before accepting miners.",
+            )
+        else:
+            evidence_path = Path(capacity_path)
+            if not evidence_path.is_absolute():
+                evidence_path = ROOT_DIR / evidence_path
+            expected_subject = {
+                "coordinator_revision": env_value(env, "PRISM_CAPACITY_COORDINATOR_REVISION"),
+                "coordinator_image_digest": env_value(
+                    env, "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST"
+                ),
+                "postgres_server_version": env_value(
+                    env, "PRISM_CAPACITY_POSTGRES_SERVER_VERSION"
+                ),
+                "database_profile_sha256": env_value(
+                    env, "PRISM_CAPACITY_DATABASE_PROFILE_SHA256"
+                ),
+            }
+            try:
+                summary = load_capacity_evidence(
+                    evidence_path,
+                    expected_configuration=capacity_configuration(env),
+                    expected_subject=expected_subject,
+                    expected_forecast_peak_shares_per_second=env_value(
+                        env, "PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND"
+                    ),
+                    expected_ack_p99_limit_milliseconds=env_value(
+                        env, "PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS"
+                    ),
+                    max_age_seconds=int(
+                        env_value(env, "PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS", "86400")
+                    ),
+                )
+            except (EvidenceError, ValueError) as exc:
+                reporter.fail("capacity.evidence", str(exc))
+            else:
+                reporter.pass_(
+                    "capacity.evidence",
+                    f"{summary.capacity_multiple}x forecast; "
+                    f"ACK p50={summary.ack_p50_milliseconds}ms "
+                    f"p99={summary.ack_p99_milliseconds}ms; "
+                    f"committed={summary.acknowledged_shares}",
+                )
+    else:
+        reporter.pass_("capacity.evidence", "not required outside production")
 
     if env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"):
         try:
@@ -331,6 +554,61 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
             reporter.pass_("pool.fee", f"enabled bps={fee_bps}")
     else:
         reporter.pass_("pool.fee", "disabled")
+
+    if is_true(env_value(env, "PRISM_CTV_SETTLEMENT_ENABLED", "0")):
+        market_rate = env_value(
+            env,
+            "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
+        ).strip()
+        premium = env_value(env, "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS", "12000").strip()
+        try:
+            premium_value = int(premium)
+            if premium_value <= 0:
+                raise ValueError
+        except ValueError:
+            reporter.fail("ctv.fee_premium", "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS must be a positive integer")
+        else:
+            reporter.pass_("ctv.fee_premium", f"{premium_value} bps")
+
+        if market_rate:
+            try:
+                market_rate_value = int(market_rate)
+                if market_rate_value <= 0:
+                    raise ValueError
+            except ValueError:
+                reporter.fail(
+                    "ctv.fee_source",
+                    "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT must be a positive integer",
+                )
+            else:
+                reporter.pass_("ctv.fee_source", f"explicit rate={market_rate_value} bits/1000 weight")
+        else:
+            if qbit_chain == "mainnet":
+                reporter.fail(
+                    "ctv.fee_source",
+                    "mainnet requires PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
+                )
+            else:
+                try:
+                    estimate_target = int(env_value(env, "PRISM_CTV_FANOUT_FEE_ESTIMATE_TARGET_BLOCKS", "2"))
+                    if estimate_target <= 0:
+                        raise ValueError
+                except ValueError:
+                    reporter.fail(
+                        "ctv.fee_source",
+                        "PRISM_CTV_FANOUT_FEE_ESTIMATE_TARGET_BLOCKS must be a positive integer",
+                    )
+                else:
+                    reporter.warn(
+                        "ctv.fee_source",
+                        f"estimatesmartfee target={estimate_target}; live preflight required",
+                        hint=(
+                            "Fresh chains and chains with empty blocks have no empirical fee history. "
+                            "Configure a positive explicit fanout fee rate until estimatesmartfee succeeds."
+                        ),
+                    )
+    else:
+        reporter.pass_("ctv.fee_source", "CTV settlement disabled")
 
 
 def highdiff_probe_target(env: dict[str, str]) -> tuple[str, int] | None:
@@ -440,14 +718,21 @@ def check_highdiff_advertised_floor(env: dict[str, str], host: str, port: int, r
         )
 
 
-def qbit_rpc_call(env: dict[str, str], method: str) -> object:
+def qbit_rpc_call(env: dict[str, str], method: str, params: list[object] | None = None) -> object:
     host, port = parse_host_port(env_value(env, "QBIT_RPC_PORT_HOST", "127.0.0.1:18452"), default_host="127.0.0.1", default_port=18452)
     user = env_value(env, "QBIT_RPC_USER", "qbitrpc")
     password = env_value(env, "QBIT_RPC_PASSWORD", "change-this")
     auth = base64.b64encode(f"{user}:{password}".encode()).decode()
     request = urllib.request.Request(
         f"http://{host}:{port}/",
-        data=json.dumps({"jsonrpc": "1.0", "id": "prism-self-check", "method": method, "params": []}).encode(),
+        data=json.dumps(
+            {
+                "jsonrpc": "1.0",
+                "id": "prism-self-check",
+                "method": method,
+                "params": params or [],
+            }
+        ).encode(),
         headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(request, timeout=5) as response:
@@ -467,15 +752,130 @@ def qbit_live_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.fail("qbit.rpc", "getblockchaininfo returned a non-object response")
         return
     expected_chain = env_value(env, "QBIT_CHAIN", "regtest")
+    expected_rpc_chain = "main" if expected_chain == "mainnet" else expected_chain
     actual_chain = str(blockchain_info.get("chain", ""))
-    if actual_chain != expected_chain:
-        reporter.fail("qbit.rpc_chain", f"qbitd reports chain={actual_chain}, expected {expected_chain}")
+    if actual_chain != expected_rpc_chain:
+        reporter.fail("qbit.rpc_chain", f"qbitd reports chain={actual_chain}, expected {expected_rpc_chain}")
     else:
         reporter.pass_("qbit.rpc_chain", f"qbitd reports {actual_chain}")
-    if blockchain_info.get("initialblockdownload"):
-        reporter.fail("qbit.ibd", "qbitd is still in initial block download")
+    public_chain = expected_chain in PUBLIC_QBIT_CHAINS
+    if (
+        blockchain_info.get("initialblockdownload") is not False
+        if public_chain
+        else bool(blockchain_info.get("initialblockdownload"))
+    ):
+        reporter.fail("qbit.ibd", "qbitd is still in initial block download or did not report readiness")
     else:
         reporter.pass_("qbit.ibd", "qbitd is not in initial block download")
+    if public_chain:
+        try:
+            blocks = int(blockchain_info["blocks"])
+            headers = int(blockchain_info["headers"])
+            if blocks < 0 or headers < 0:
+                raise ValueError("negative height")
+        except (KeyError, TypeError, ValueError) as exc:
+            reporter.fail("qbit.headers", f"qbitd did not report valid blocks and headers: {exc}")
+        else:
+            if blocks != headers:
+                reporter.fail("qbit.headers", f"qbitd is not caught up: blocks={blocks} headers={headers}")
+            else:
+                reporter.pass_("qbit.headers", f"blocks={blocks} headers={headers}")
+
+        try:
+            template_rules = ["segwit"]
+            if expected_chain == "signet":
+                template_rules.append("signet")
+            template = qbit_rpc_call(env, "getblocktemplate", [{"rules": template_rules}])
+            if not isinstance(template, dict) or not template.get("previousblockhash"):
+                raise ValueError("missing previousblockhash")
+            template_time = int(template["curtime"])
+            max_age = int(env_value(env, "PRISM_TEMPLATE_MAX_AGE_SECONDS", "120"))
+            if max_age < 0:
+                raise ValueError("PRISM_TEMPLATE_MAX_AGE_SECONDS must be non-negative")
+            template_age = int(time.time()) - template_time
+            if template_age > max_age:
+                raise ValueError(f"template age {template_age}s exceeds {max_age}s")
+        except (OSError, urllib.error.URLError, RuntimeError, ValueError, KeyError) as exc:
+            reporter.fail("qbit.template", f"public-chain template preflight failed: {exc}")
+        else:
+            reporter.pass_("qbit.template", f"fresh template age={template_age}s")
+
+    expected_genesis_hash = env_value(env, "QBIT_EXPECTED_GENESIS_HASH").strip().lower()
+    if expected_genesis_hash:
+        try:
+            actual_genesis_hash = str(qbit_rpc_call(env, "getblockhash", [0])).lower()
+        except (OSError, urllib.error.URLError, RuntimeError, ValueError) as exc:
+            reporter.fail("qbit.genesis", f"could not read genesis hash: {exc}")
+        else:
+            if actual_genesis_hash != expected_genesis_hash:
+                reporter.fail(
+                    "qbit.genesis",
+                    f"qbitd reports genesis={actual_genesis_hash}, expected {expected_genesis_hash}",
+                )
+            else:
+                reporter.pass_("qbit.genesis", actual_genesis_hash)
+
+    if (
+        is_true(env_value(env, "PRISM_CTV_SETTLEMENT_ENABLED", "0"))
+        and not env_value(
+            env,
+            "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
+        ).strip()
+    ):
+        try:
+            estimate_target = int(env_value(env, "PRISM_CTV_FANOUT_FEE_ESTIMATE_TARGET_BLOCKS", "2"))
+            estimate = qbit_rpc_call(env, "estimatesmartfee", [estimate_target])
+            if not isinstance(estimate, dict):
+                raise ValueError("returned a non-object response")
+            if estimate.get("errors"):
+                raise ValueError(f"returned errors: {estimate['errors']}")
+            fee_rate = parse_decimal(str(estimate.get("feerate", "")))
+            if not fee_rate.is_finite() or fee_rate <= 0:
+                raise ValueError(f"returned invalid feerate: {estimate.get('feerate')!r}")
+        except (OSError, urllib.error.URLError, RuntimeError, ValueError) as exc:
+            reporter.fail(
+                "ctv.fee_estimator",
+                f"estimatesmartfee preflight failed: {exc}",
+                hint=(
+                    "Fresh chains and empty blocks do not build fee-estimation history. Set "
+                    "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT to a positive "
+                    "operator-reviewed rate."
+                ),
+            )
+        else:
+            reporter.pass_("ctv.fee_estimator", f"feerate={fee_rate} target={estimate_target}")
+
+    configured_ctv_rate = env_value(
+        env,
+        "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
+    ).strip()
+    if is_true(env_value(env, "PRISM_CTV_SETTLEMENT_ENABLED", "0")) and configured_ctv_rate:
+        try:
+            mempool_info = qbit_rpc_call(env, "getmempoolinfo")
+            if not isinstance(mempool_info, dict):
+                raise ValueError("returned a non-object response")
+            relay_rates = []
+            for name in ("minrelaytxfee", "mempoolminfee"):
+                if mempool_info.get(name) is None:
+                    continue
+                rate = parse_decimal(str(mempool_info[name]))
+                if not rate.is_finite() or rate <= 0:
+                    raise ValueError(f"{name} is not positive")
+                relay_rates.append(
+                    int((rate * Decimal(100_000_000)).to_integral_value(rounding=ROUND_CEILING))
+                )
+            if not relay_rates:
+                raise ValueError("relay fee floor was not reported")
+            configured = int(configured_ctv_rate)
+            required = max(relay_rates)
+            if configured < required:
+                raise ValueError(
+                    f"configured={configured} required={required} bits/1000 weight"
+                )
+        except (OSError, urllib.error.URLError, RuntimeError, ValueError) as exc:
+            reporter.fail("ctv.relay_floor", f"CTV fee rate is below or cannot verify relay floor: {exc}")
+        else:
+            reporter.pass_("ctv.relay_floor", f"configured={configured} required={required}")
 
     try:
         network_info = qbit_rpc_call(env, "getnetworkinfo")

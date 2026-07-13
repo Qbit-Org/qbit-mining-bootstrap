@@ -145,6 +145,16 @@ Useful entrypoints:
 - `make smoke-all`
 - `make down`
 
+`make down` stops every Compose profile and preserves all named volumes. Local
+chain data, the share ledger, and audit artifacts therefore survive an ordinary
+stop/restart cycle. The separate `make purge-local-volumes` target is only for
+disposable development stacks: it refuses production and main-chain
+configurations and requires the exact confirmation token printed by the
+command before it will delete volumes.
+
+For a fresh public-network deployment, use the fail-closed sequence and explicit
+operator service sets in [`docs/mainnet-deployment.md`](docs/mainnet-deployment.md).
+
 ## Signet Mode
 
 The compose stack stays regtest by default so the built-in smokes remain deterministic. To point qbit at a signet instead, set:
@@ -202,6 +212,12 @@ Vardiff defaults target one accepted share every 5 seconds, start miners at diff
 On a VM, expose or relay both Stratum ports if you want both URLs reachable from outside the host.
 
 For a live AuxPoW endpoint, also set the `BITCOIN_RPC_*` and `BITCOIN_MINER_ADDRESS` envs to the parent-chain node you want to mine against. If you leave the defaults alone, the local `bitcoind` container stays in regtest mode and the AuxPoW URL is only a lab smoke.
+
+The bundled Bitcoin Core image verifies its downloaded archive against the
+architecture-specific SHA256 pinned in `config/upstream.env` before extracting
+it. See [`docs/bitcoin-release-integrity.md`](docs/bitcoin-release-integrity.md)
+before changing the Bitcoin Core version, download location, or release
+digests.
 
 ### Bitcoin Testnet4 Parent Node
 

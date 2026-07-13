@@ -34,6 +34,28 @@ from test_framework.script import CScript
 getcontext().prec = 40
 
 
+PUBLIC_CHAINS = {"mainnet", "testnet", "testnet3", "testnet4", "signet"}
+QBIT_RPC_CHAIN_NAMES = {
+    "mainnet": {"main", "mainnet"},
+    "testnet": {"test", "testnet"},
+    "testnet3": {"test", "testnet3"},
+    "testnet4": {"testnet4"},
+    "signet": {"signet"},
+    "regtest": {"regtest"},
+}
+BITCOIN_RPC_CHAIN_NAMES = {
+    "mainnet": {"main"},
+    "testnet": {"test"},
+    "testnet3": {"test"},
+    "testnet4": {"testnet4"},
+    "signet": {"signet"},
+    "regtest": {"regtest"},
+}
+KNOWN_BITCOIN_GENESIS_HASHES = {
+    "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+}
+
+
 def env(name: str, default: str | None = None) -> str:
     value = os.environ.get(name, default)
     if value is None or value == "":
@@ -541,6 +563,139 @@ def wait_for_rpc(rpc: JsonRpc) -> None:
     raise RuntimeError("RPC service never became ready")
 
 
+def validate_node_readiness(
+    rpc: JsonRpc,
+    *,
+    label: str,
+    configured_chain: str,
+    rpc_chain_names: dict[str, set[str]],
+    expected_genesis_hash: str | None = None,
+) -> None:
+    expected_rpc_names = rpc_chain_names.get(configured_chain)
+    if expected_rpc_names is None:
+        raise RuntimeError(f"unsupported {label} chain {configured_chain!r}")
+
+    blockchain_info = rpc.call("getblockchaininfo")
+    if not isinstance(blockchain_info, dict):
+        raise RuntimeError(f"{label} getblockchaininfo returned a non-object response")
+    actual_chain = str(blockchain_info.get("chain", "")).lower()
+    if actual_chain not in expected_rpc_names:
+        expected = ", ".join(sorted(expected_rpc_names))
+        raise RuntimeError(f"{label} RPC chain mismatch: expected {expected}, got {actual_chain or '<unset>'}")
+
+    if configured_chain not in PUBLIC_CHAINS:
+        return
+    if blockchain_info.get("initialblockdownload") is not False:
+        raise RuntimeError(f"{label} is still in initial block download")
+    try:
+        blocks = int(blockchain_info["blocks"])
+        headers = int(blockchain_info["headers"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} did not report numeric blocks and headers") from exc
+    if blocks != headers:
+        raise RuntimeError(f"{label} is not caught up: blocks={blocks}, headers={headers}")
+
+    network_info = rpc.call("getnetworkinfo")
+    if not isinstance(network_info, dict):
+        raise RuntimeError(f"{label} getnetworkinfo returned a non-object response")
+    try:
+        connections = int(network_info["connections"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} did not report a numeric connection count") from exc
+    if connections < 1:
+        raise RuntimeError(f"{label} has no peer connections")
+
+    if expected_genesis_hash:
+        actual_genesis = str(rpc.call("getblockhash", [0])).lower()
+        if actual_genesis != expected_genesis_hash.lower():
+            raise RuntimeError(
+                f"{label} genesis mismatch: expected {expected_genesis_hash.lower()}, got {actual_genesis}"
+            )
+
+
+def validate_auxpow_templates(
+    qbit_rpc: JsonRpc,
+    bitcoin_rpc: JsonRpc,
+    *,
+    qbit_miner_address: str,
+    max_age_seconds: int,
+) -> None:
+    aux_template = qbit_rpc.call("createauxblock", [qbit_miner_address])
+    if not isinstance(aux_template, dict) or not aux_template.get("hash"):
+        raise RuntimeError("qbit createauxblock did not return a usable template")
+
+    parent_template = bitcoin_rpc.call("getblocktemplate", [{"rules": ["segwit"]}])
+    if not isinstance(parent_template, dict) or not parent_template.get("previousblockhash"):
+        raise RuntimeError("Bitcoin getblocktemplate did not return a usable template")
+    try:
+        template_time = int(parent_template["curtime"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Bitcoin template did not report a numeric curtime") from exc
+    template_age = int(time.time()) - template_time
+    if template_age > max_age_seconds:
+        raise RuntimeError(
+            f"Bitcoin template is stale: age={template_age}s exceeds {max_age_seconds}s"
+        )
+
+
+def validate_auxpow_startup(qbit_rpc: JsonRpc, bitcoin_rpc: JsonRpc) -> None:
+    if QBIT_CHAIN == "mainnet" and BITCOIN_CHAIN != "mainnet":
+        raise RuntimeError("qbit mainnet AuxPoW requires BITCOIN_CHAIN=mainnet")
+    if BITCOIN_CHAIN == "mainnet" and AUXPOW_MODE != "stratum":
+        raise RuntimeError(
+            "Bitcoin mainnet AuxPoW requires AUXPOW_MODE=stratum; bridge and once are lab-only"
+        )
+    if BITCOIN_CHAIN == "mainnet" and AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS <= 0:
+        raise RuntimeError(
+            "Bitcoin mainnet AuxPoW requires a positive "
+            "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS"
+        )
+    if BITCOIN_CHAIN == "mainnet":
+        expected_bitcoin_genesis = KNOWN_BITCOIN_GENESIS_HASHES["mainnet"]
+        if not BITCOIN_EXPECTED_GENESIS_HASH:
+            raise RuntimeError(
+                "BITCOIN_EXPECTED_GENESIS_HASH is required for Bitcoin mainnet AuxPoW"
+            )
+        if BITCOIN_EXPECTED_GENESIS_HASH.lower() != expected_bitcoin_genesis:
+            raise RuntimeError(
+                "BITCOIN_EXPECTED_GENESIS_HASH must equal the canonical Bitcoin mainnet genesis"
+            )
+        if AUXPOW_STRATUM_HEADER_VARIANT != "canonical":
+            raise RuntimeError(
+                "Bitcoin mainnet AuxPoW requires AUXPOW_STRATUM_HEADER_VARIANT=canonical"
+            )
+        if AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT:
+            raise RuntimeError(
+                "Bitcoin mainnet AuxPoW rejects AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT=1"
+            )
+    if QBIT_CHAIN == "mainnet":
+        if not QBIT_EXPECTED_GENESIS_HASH:
+            raise RuntimeError("QBIT_EXPECTED_GENESIS_HASH is required for mainnet AuxPoW")
+        if len(QBIT_EXPECTED_GENESIS_HASH) != 64 or any(
+            character not in "0123456789abcdefABCDEF" for character in QBIT_EXPECTED_GENESIS_HASH
+        ):
+            raise RuntimeError("QBIT_EXPECTED_GENESIS_HASH must be 64 hex characters")
+        if QBIT_MINER_ADDRESS == "auto":
+            raise RuntimeError("mainnet AuxPoW requires an explicit QBIT_MINER_ADDRESS")
+    if BITCOIN_CHAIN == "mainnet" and BITCOIN_MINER_ADDRESS == "auto":
+        raise RuntimeError("Bitcoin mainnet AuxPoW requires an explicit BITCOIN_MINER_ADDRESS")
+
+    validate_node_readiness(
+        qbit_rpc,
+        label="qbit",
+        configured_chain=QBIT_CHAIN,
+        rpc_chain_names=QBIT_RPC_CHAIN_NAMES,
+        expected_genesis_hash=QBIT_EXPECTED_GENESIS_HASH or None,
+    )
+    validate_node_readiness(
+        bitcoin_rpc,
+        label="Bitcoin",
+        configured_chain=BITCOIN_CHAIN,
+        rpc_chain_names=BITCOIN_RPC_CHAIN_NAMES,
+        expected_genesis_hash=BITCOIN_EXPECTED_GENESIS_HASH or None,
+    )
+
+
 @dataclass
 class AuxPowStratumJob:
     job_id: str
@@ -656,6 +811,8 @@ class AuxPowStratumServer:
         self.worker_stats: dict[str, WorkerStats] = {}
         self.recent_share_keys: set[tuple[str, ...]] = set()
         self.last_stats_monotonic = time.monotonic()
+        self.last_successful_refresh_monotonic: float | None = None
+        self.refresh_fatal_error: str | None = None
 
     def next_connection_id(self) -> int:
         with self.lock:
@@ -946,12 +1103,22 @@ class AuxPowStratumServer:
         )
 
     def serve(self) -> int:
+        initial_refresh_started = time.monotonic()
         while True:
             try:
                 self.refresh_job(force=True)
+                self.last_successful_refresh_monotonic = time.monotonic()
                 break
             except Exception as exc:
                 print(f"auxpow stratum: initial job refresh failed: {exc}", flush=True)
+                if (
+                    AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS > 0
+                    and time.monotonic() - initial_refresh_started
+                    >= AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS
+                ):
+                    raise RuntimeError(
+                        "auxpow stratum: initial job refresh failure budget exhausted"
+                    ) from exc
                 self.stop_event.wait(AUXPOW_STRATUM_POLL_SECONDS)
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1001,16 +1168,34 @@ class AuxPowStratumServer:
                 self.clients.clear()
             for client in clients:
                 client.close()
-        return 0
+        return 1 if self.refresh_fatal_error is not None else 0
 
     def refresh_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
                 refreshed = self.refresh_job(force=self.refresh_now.is_set())
+                self.last_successful_refresh_monotonic = time.monotonic()
                 if refreshed:
                     self.refresh_now.clear()
             except Exception as exc:
                 print(f"auxpow stratum: refresh failed: {exc}", flush=True)
+                last_success = self.last_successful_refresh_monotonic
+                if last_success is None:
+                    last_success = time.monotonic()
+                    self.last_successful_refresh_monotonic = last_success
+                failure_age = time.monotonic() - last_success
+                if (
+                    AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS > 0
+                    and failure_age >= AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS
+                ):
+                    self.refresh_fatal_error = (
+                        "job refresh failed for "
+                        f"{failure_age:.1f}s (budget="
+                        f"{AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS}s)"
+                    )
+                    print(f"auxpow stratum: fatal: {self.refresh_fatal_error}", flush=True)
+                    self.stop_event.set()
+                    return
             self.maybe_log_worker_stats()
             self.maybe_retarget_idle_clients()
             self.stop_event.wait(AUXPOW_STRATUM_POLL_SECONDS)
@@ -1752,8 +1937,15 @@ def main() -> int:
     )
     for rpc in (qbit_rpc, bitcoin_rpc):
         wait_for_rpc(rpc)
+    validate_auxpow_startup(qbit_rpc, bitcoin_rpc)
     qbit_miner_address = resolve_qbit_miner_address(qbit_rpc)
     bitcoin_miner_address = resolve_bitcoin_miner_address(bitcoin_rpc)
+    validate_auxpow_templates(
+        qbit_rpc,
+        bitcoin_rpc,
+        qbit_miner_address=qbit_miner_address,
+        max_age_seconds=AUXPOW_TEMPLATE_MAX_AGE_SECONDS,
+    )
     print(f"auxpow: using qbit payout address {qbit_miner_address}", flush=True)
     print(f"auxpow: using Bitcoin payout address {bitcoin_miner_address.address}", flush=True)
     if AUXPOW_MODE == "bridge":
@@ -1774,10 +1966,15 @@ def main() -> int:
 
 
 DIFF1_TARGET = compact_target(0x1D00FFFF)
+QBIT_CHAIN = env("QBIT_CHAIN", "regtest")
+QBIT_EXPECTED_GENESIS_HASH = os.environ.get("QBIT_EXPECTED_GENESIS_HASH", "").strip()
 QBIT_MINER_ADDRESS = env("QBIT_MINER_ADDRESS", "auto")
 QBIT_MINER_WALLET_NAME = env("QBIT_MINER_WALLET_NAME", "auxpow")
+BITCOIN_CHAIN = env("BITCOIN_CHAIN", "regtest")
+BITCOIN_EXPECTED_GENESIS_HASH = os.environ.get("BITCOIN_EXPECTED_GENESIS_HASH", "").strip()
 BITCOIN_MINER_ADDRESS = env("BITCOIN_MINER_ADDRESS", "auto")
 BITCOIN_MINER_WALLET_NAME = env("BITCOIN_MINER_WALLET_NAME", "auxpow-parent")
+AUXPOW_TEMPLATE_MAX_AGE_SECONDS = env_nonnegative_int("AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120)
 AUXPOW_MODE = env("AUXPOW_MODE", "once")
 AUXPOW_BRIDGE_INTERVAL_SECONDS = env_int("AUXPOW_BRIDGE_INTERVAL_SECONDS", 15)
 AUXPOW_STRATUM_BIND = env("AUXPOW_STRATUM_BIND", "0.0.0.0")
@@ -1791,6 +1988,10 @@ AUXPOW_STRATUM_MIN_ADVERTISED_DIFF = env_nonnegative_decimal("AUXPOW_STRATUM_MIN
 AUXPOW_STRATUM_EXTRANONCE2_SIZE = env_int("AUXPOW_STRATUM_EXTRANONCE2_SIZE", 8)
 AUXPOW_STRATUM_POLL_SECONDS = env_int("AUXPOW_STRATUM_POLL_SECONDS", 5)
 AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS = env_nonnegative_int("AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 2700)
+AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS = env_nonnegative_int(
+    "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS",
+    120,
+)
 AUXPOW_STRATUM_VERSION_MASK = env_mask("AUXPOW_STRATUM_VERSION_MASK", "1fffe000")
 AUXPOW_STRATUM_HEADER_VARIANT = env("AUXPOW_STRATUM_HEADER_VARIANT", "canonical")
 AUXPOW_STRATUM_DIAG_JSONL = env_bool("AUXPOW_STRATUM_DIAG_JSONL")

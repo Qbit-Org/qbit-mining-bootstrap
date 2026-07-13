@@ -501,9 +501,11 @@ Static-only checks, before the stack is live:
 python3 scripts/prism-self-check.py --skip-live
 ```
 
-Stop services with normal Docker Compose controls or `make down`. The Makefile
-intentionally keeps PRISM Postgres volume cleanup out of broad all-profile
-cleanup because the ledger is operator state.
+Stop services with normal Docker Compose controls or `make down`. The normal
+target stops PRISM but preserves its Postgres and audit volumes because the
+ledger is operator state. The explicitly destructive
+`make purge-local-volumes` target is restricted to confirmed, non-production,
+non-main-chain cleanup.
 
 ## Run On Signet
 
@@ -544,10 +546,9 @@ PRISM_CTV_FANOUT_FEE_PREMIUM_BPS=12000
 
 Fee-rate selection:
 
-- Leave `PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT` empty to use
-  the node fee estimate path.
-- Set it explicitly when you want a fixed market-fee input for deterministic
-  policy.
+- Mainnet requires an explicit, reviewed, positive
+  `PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT`.
+- On non-mainnet networks, leaving it empty uses the node fee estimate path.
 
 Broadcaster:
 

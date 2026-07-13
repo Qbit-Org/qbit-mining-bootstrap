@@ -44,6 +44,12 @@ jobs:
       - name: Run Python unit tests
         run: python -m unittest discover -s tests -p 'test_*.py'
 
+      - name: Run Postgres ledger integration tests
+        run: make test-prism-postgres-ledger
+
+      - name: Validate mainnet Compose contract
+        run: python -m unittest tests.test_mainnet_compose_contract
+
       - name: Run Rust tests
         run: cargo test --locked --workspace --all-targets
 
