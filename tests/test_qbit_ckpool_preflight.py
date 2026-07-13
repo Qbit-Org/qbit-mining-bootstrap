@@ -273,9 +273,21 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
         self.assertNotIn("qbit ckpool preflight: PASS\n", stderr.getvalue())
 
     def test_mainnet_implies_production_gate(self) -> None:
-        with self.assertRaisesRegex(preflight.PreflightError, "non-default QBIT_RPC_PASSWORD"):
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "production mode requires a non-default QBIT_RPC_PASSWORD",
+        ):
             preflight.run_preflight(
                 mainnet_env(QBIT_RPC_PASSWORD="change-this"),
+                FakeRpc(rpc_chain="main"),
+            )
+
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive",
+        ):
+            preflight.run_preflight(
+                mainnet_env(CKPOOL_PUBLIC_DIFF_POLICY="permissive"),
                 FakeRpc(rpc_chain="main"),
             )
 
