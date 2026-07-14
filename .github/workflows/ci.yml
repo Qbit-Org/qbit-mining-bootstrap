@@ -99,3 +99,49 @@ jobs:
             --load \
             -f lab/prism/Dockerfile \
             .
+
+  qbit-runtime-image:
+    name: Build and smoke real qbitd image
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      QBIT_CI_COMMIT: 5b08afe4257dabd82591f9f19283a516b34171ca
+      QBIT_CI_IMAGE: qbit-lab-qbitd:ci
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@v1
+
+      - name: Stage pinned qbit source
+        run: |
+          set -euo pipefail
+          qbit_git="${RUNNER_TEMP}/qbit-git"
+          qbit_src="${RUNNER_TEMP}/qbit-src"
+          mkdir -p "${qbit_git}" "${qbit_src}"
+          git -C "${qbit_git}" init --quiet
+          git -C "${qbit_git}" remote add origin https://github.com/Qbit-Org/qbit.git
+          git -C "${qbit_git}" fetch --depth=1 origin "${QBIT_CI_COMMIT}"
+          resolved_commit="$(git -C "${qbit_git}" rev-parse FETCH_HEAD)"
+          if [[ "${resolved_commit}" != "${QBIT_CI_COMMIT}" ]]; then
+            printf 'qbit source resolved %s, expected %s\n' \
+              "${resolved_commit}" "${QBIT_CI_COMMIT}" >&2
+            exit 1
+          fi
+          git -C "${qbit_git}" archive "${resolved_commit}" | tar -x -C "${qbit_src}"
+          printf 'qbit CI source: %s\n' "${resolved_commit}"
+
+      - name: Build real qbitd image
+        run: |
+          docker buildx build \
+            --build-context qbit-src="${RUNNER_TEMP}/qbit-src" \
+            --load \
+            --tag "${QBIT_CI_IMAGE}" \
+            -f docker/qbit/Dockerfile \
+            .
+
+      - name: Smoke real qbitd runtime
+        run: bash .github/scripts/test-qbit-image-runtime.sh
