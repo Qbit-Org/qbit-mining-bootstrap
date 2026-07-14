@@ -66,7 +66,8 @@ The only relaxed mode requires mainnet, both production flags set to `1`, and
 both launch/readiness flags set to `0`. It continuously checks static policy,
 chain/genesis identity, and the payout address, while deferring only IBD, peer,
 GBT, freshness, and active-tip requirements. Switching both readiness flags to
-`1` restores strict checks.
+`1` and restarting or redeploying CKPool restores strict checks. A running
+supervisor intentionally uses the environment captured at process startup.
 
 ### Fee and size accounting
 

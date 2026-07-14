@@ -196,8 +196,10 @@ Preflight still checks the RPC chain, configured genesis hash, static qbit
 assumptions, difficulty policy, and P2MR payout address, but defers launch-only
 IBD, peer, live-template, freshness, and active-tip checks. CKPool remains
 running with its Stratum listener bound and retries GBT until qbitd can serve
-work. At launch, set both readiness flags to `1`; the supervisor then checks IBD,
-peer count, live-template freshness, and active-tip agreement continuously.
+work. At launch, set both readiness flags to `1` and restart or redeploy CKPool;
+the new supervisor then checks IBD, peer count, live-template freshness, and
+active-tip agreement continuously. Runtime environment changes are not
+hot-reloaded by an already-running supervisor.
 `CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` controls the interval and persistent
 failures terminate CKPool after `CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS`.
 

@@ -247,7 +247,11 @@ class CkpoolStartupTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("dynamic getblocktemplate validation deferred", result.stderr)
+            self.assertEqual(
+                result.stderr.count("dynamic getblocktemplate validation deferred"),
+                1,
+            )
+            self.assertIn("initial supervisor checks: PASS", result.stderr)
             with config_file.open(encoding="utf-8") as handle:
                 config = json.load(handle)
             self.assertEqual(config["btcaddress"], "qb1staticqbitaddress")

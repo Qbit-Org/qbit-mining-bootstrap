@@ -252,7 +252,7 @@ if [[ "${QBIT_MINER_ADDRESS_FILE_WAIT}" == "1" ]]; then
 fi
 QBIT_MINER_ADDRESS="$(resolve_miner_address)"
 export QBIT_MINER_ADDRESS
-qbit-ckpool-preflight
+qbit-ckpool-preflight --production-gate-only
 mkdir -p "$(dirname "${QBIT_MINER_ADDRESS_FILE}")"
 printf '%s\n' "${QBIT_MINER_ADDRESS}" > "${QBIT_MINER_ADDRESS_FILE}"
 
