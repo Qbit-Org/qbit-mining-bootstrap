@@ -390,6 +390,10 @@ fail() {
   exit 1
 }
 
+ascii_lower() {
+  printf '%s' "${1:-}" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
 canonical_dir() {
   (
     cd "$1" >/dev/null 2>&1
@@ -446,7 +450,7 @@ parse_bool_env() {
   local value="${2:-}"
   local normalized
 
-  normalized="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
+  normalized="$(ascii_lower "${value}")"
 
   case "${normalized}" in
     1|true|yes|on) PARSED_BOOL_ENV=1 ;;
@@ -574,7 +578,7 @@ check_private_rpc_binding() {
     fail "production mode requires ${name} with a port between 1 and 65535"
   fi
 
-  lower_host="${host,,}"
+  lower_host="$(ascii_lower "${host}")"
   if [[ "${lower_host}" == *:* ]]; then
     if [[ "${lower_host}" == "::1" || "${lower_host}" =~ ^f[cd][0-9a-f]{2}: || "${lower_host}" =~ ^fe[89ab][0-9a-f]: ]]; then
       return 0
@@ -609,7 +613,7 @@ check_node_extra_arg_selectors() {
   for name in QBIT_NODE_EXTRA_ARG BITCOIN_NODE_EXTRA_ARGS; do
     value="${!name:-}"
     for token in ${value}; do
-      normalized="${token,,}"
+      normalized="$(ascii_lower "${token}")"
       [[ "${normalized}" == -* ]] || continue
       option="${normalized#-}"
       option="${option#-}"
@@ -626,7 +630,7 @@ check_production_bitcoin_extra_args() {
   local token normalized option
 
   for token in ${BITCOIN_NODE_EXTRA_ARGS:-}; do
-    normalized="${token,,}"
+    normalized="$(ascii_lower "${token}")"
     [[ "${normalized}" == -* ]] || continue
     option="${normalized#-}"
     option="${option#-}"
@@ -782,7 +786,7 @@ check_production_gate() {
     if is_public_qbit_chain "${QBIT_CHAIN:-regtest}"; then
       [[ "${CKPOOL_REQUIRE_P2MR_PAYOUT:-1}" != "0" ]] || fail "production mode rejects public-chain CKPOOL_REQUIRE_P2MR_PAYOUT=0"
     fi
-    [[ -n "${QBIT_MINER_ADDRESS:-}" && "${QBIT_MINER_ADDRESS,,}" != "auto" ]] || fail "production CKPool requires an explicit QBIT_MINER_ADDRESS"
+    [[ -n "${QBIT_MINER_ADDRESS:-}" && "$(ascii_lower "${QBIT_MINER_ADDRESS:-}")" != "auto" ]] || fail "production CKPool requires an explicit QBIT_MINER_ADDRESS"
   fi
 
   if mining_lane_enabled auxpow; then
@@ -830,28 +834,30 @@ check_release_provenance_gate() {
 
 verify_git_checkout_commit() {
   local checkout="$1"
-  local expected_commit="${2,,}"
+  local expected_commit
   local label="$3"
   local actual_commit
 
+  expected_commit="$(ascii_lower "$2")"
   if ! actual_commit="$(git -C "${checkout}" rev-parse --verify HEAD 2>/dev/null)"; then
     fail "cannot resolve ${label} HEAD: ${checkout}"
   fi
-  actual_commit="${actual_commit,,}"
+  actual_commit="$(ascii_lower "${actual_commit}")"
   [[ "${actual_commit}" == "${expected_commit}" ]] || fail "${label} HEAD ${actual_commit} does not match QBIT_GIT_COMMIT ${expected_commit}"
   printf 'doctor: %s verified at %s\n' "${label}" "${actual_commit}"
 }
 
 verify_staged_source_commit() {
   local checkout="$1"
-  local expected_commit="${2,,}"
+  local expected_commit
   local label="$3"
   local marker="${checkout}/.qbit-source-commit"
   local actual_commit
 
+  expected_commit="$(ascii_lower "$2")"
   if [[ -f "${marker}" ]]; then
     actual_commit="$(tr -d '[:space:]' < "${marker}")"
-    actual_commit="${actual_commit,,}"
+    actual_commit="$(ascii_lower "${actual_commit}")"
     [[ "${actual_commit}" =~ ^[[:xdigit:]]{40}$ ]] || fail "${label} has an invalid source commit marker"
     [[ "${actual_commit}" == "${expected_commit}" ]] || fail "${label} commit ${actual_commit} does not match QBIT_GIT_COMMIT ${expected_commit}"
     printf 'doctor: %s verified at %s\n' "${label}" "${actual_commit}"
@@ -904,7 +910,7 @@ check_bitcoin_chain_selection() {
     mainnet)
       [[ "${BITCOIN_CHAIN_FLAG:-}" == "-chain=main" ]] || fail "BITCOIN_CHAIN=mainnet requires explicit BITCOIN_CHAIN_FLAG=-chain=main"
       [[ "${BITCOIN_EXPECTED_GENESIS_HASH:-}" =~ ^[[:xdigit:]]{64}$ ]] || fail "BITCOIN_CHAIN=mainnet requires BITCOIN_EXPECTED_GENESIS_HASH as 64 hex characters"
-      [[ "${BITCOIN_EXPECTED_GENESIS_HASH,,}" == "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" ]] || fail "BITCOIN_EXPECTED_GENESIS_HASH must equal the canonical Bitcoin mainnet genesis"
+      [[ "$(ascii_lower "${BITCOIN_EXPECTED_GENESIS_HASH:-}")" == "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" ]] || fail "BITCOIN_EXPECTED_GENESIS_HASH must equal the canonical Bitcoin mainnet genesis"
       ;;
     *)
       fail "BITCOIN_CHAIN must be mainnet, testnet, testnet3, testnet4, signet, or regtest; got '${BITCOIN_CHAIN}'"

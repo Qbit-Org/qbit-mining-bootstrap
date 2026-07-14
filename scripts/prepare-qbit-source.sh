@@ -57,6 +57,10 @@ fail() {
   exit 1
 }
 
+ascii_lower() {
+  printf '%s' "${1:-}" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
 }
@@ -109,7 +113,7 @@ stage_tree() {
     --exclude='.DS_Store' \
     "${staged_source}/" "${dest_dir}/"
   if [[ -n "${source_commit}" ]]; then
-    printf '%s\n' "${source_commit,,}" > "${dest_dir}/.qbit-source-commit"
+    printf '%s\n' "$(ascii_lower "${source_commit}")" > "${dest_dir}/.qbit-source-commit"
   fi
   printf '%s\n' "${dest_dir}"
 }
@@ -127,15 +131,17 @@ requires_pinned_source() {
 resolve_commit() {
   local source_dir="$1"
   local requested_commit="$2"
+  local requested_commit_normalized
   local resolved_commit
 
   [[ -d "${source_dir}/.git" ]] || fail "pinned qbit source must be a Git checkout: ${source_dir}"
   if ! resolved_commit="$(git -C "${source_dir}" rev-parse --verify "${requested_commit}^{commit}" 2>/dev/null)"; then
     fail "QBIT_GIT_COMMIT is not present in qbit source: ${requested_commit}"
   fi
-  resolved_commit="${resolved_commit,,}"
-  [[ "${resolved_commit}" == "${requested_commit,,}" ]] || fail \
-    "qbit source resolved ${resolved_commit}, expected QBIT_GIT_COMMIT ${requested_commit,,}"
+  resolved_commit="$(ascii_lower "${resolved_commit}")"
+  requested_commit_normalized="$(ascii_lower "${requested_commit}")"
+  [[ "${resolved_commit}" == "${requested_commit_normalized}" ]] || fail \
+    "qbit source resolved ${resolved_commit}, expected QBIT_GIT_COMMIT ${requested_commit_normalized}"
   printf '%s\n' "${resolved_commit}"
 }
 

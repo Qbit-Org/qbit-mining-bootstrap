@@ -180,7 +180,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         env = os.environ.copy()
         env.update(overrides)
         return subprocess.run(
-            ["bash", str(script), *arguments],
+            ["/bin/bash", str(script), *arguments],
             cwd=cwd,
             env=env,
             text=True,
@@ -546,7 +546,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         }
         cases = (
             ("QBIT_NODE_EXTRA_ARG", "-testnet4", "network selector"),
-            ("QBIT_NODE_EXTRA_ARG", "-testnet4=1", "network selector"),
+            ("QBIT_NODE_EXTRA_ARG", "--TESTNET4=1", "network selector"),
             ("QBIT_NODE_EXTRA_ARG", "--signet=1", "network selector"),
             ("QBIT_NODE_EXTRA_ARG", "-server=1 -chain=main", "network selector"),
             ("BITCOIN_NODE_EXTRA_ARGS", "-regtest", "network selector"),
@@ -571,7 +571,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "BITCOIN_CHAIN_FLAG": "-signet",
         }
         for value, expected in (
-            ("-dnsseed=0", "BITCOIN_DNSSEED"),
+            ("-DNSSEED=0", "BITCOIN_DNSSEED"),
             ("--dnsseed=0", "BITCOIN_DNSSEED"),
             ("-discover=0", "BITCOIN_DISCOVER"),
         ):
@@ -603,7 +603,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "172.16.0.2:19552",
             "192.168.1.2:19552",
             "[::1]:19552",
-            "[fd00::2]:19552",
+            "[FD00::2]:19552",
         ):
             with self.subTest(value=value):
                 result = self.run_check_env(**common, QBIT_RPC_PORT_HOST=value)
@@ -845,7 +845,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "BITCOIN_CHAIN_FLAG": "-chain=main",
             "BITCOIN_EXPECTED_GENESIS_HASH": (
                 "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-            ),
+            ).upper(),
             "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
         }
         for qbit_address, bitcoin_address, expected_name in (
@@ -977,7 +977,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 "QBIT_SRC_DIR_OVERRIDE": str(checkout),
             })
 
-            matching = self.run_check_env(**{**common, "QBIT_GIT_COMMIT": actual_commit})
+            matching = self.run_check_env(**{**common, "QBIT_GIT_COMMIT": actual_commit.upper()})
             self.assertEqual(matching.returncode, 0, matching.stderr)
             self.assertIn(f"qbit source checkout verified at {actual_commit}", matching.stdout)
 

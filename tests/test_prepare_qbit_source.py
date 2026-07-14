@@ -66,7 +66,7 @@ class PrepareQbitSourceTests(unittest.TestCase):
             }
         )
         return subprocess.run(
-            ["bash", str(script)],
+            ["/bin/bash", str(script)],
             cwd=script.parents[1],
             env=env,
             text=True,
@@ -91,7 +91,7 @@ class PrepareQbitSourceTests(unittest.TestCase):
             (checkout / "CMakeLists.txt").write_text("dirty\n", encoding="utf-8")
             (checkout / "untracked-secret.txt").write_text("do not stage\n", encoding="utf-8")
 
-            result = self.run_script(checkout, QBIT_GIT_COMMIT=commit)
+            result = self.run_script(checkout, QBIT_GIT_COMMIT=commit.upper())
 
             self.assertEqual(result.returncode, 0, result.stderr)
             staged = Path(result.stdout.strip())

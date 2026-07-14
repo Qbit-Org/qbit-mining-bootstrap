@@ -181,6 +181,15 @@ class MakefileLifecycleTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_host_entrypoint_scripts_avoid_bash_4_case_expansion(self) -> None:
+        for relative_path in (
+            "scripts/check-env.sh",
+            "scripts/prepare-qbit-source.sh",
+        ):
+            with self.subTest(relative_path=relative_path):
+                script = (ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertNotRegex(script, r"\$\{[^}\n]*(?:,,|\^\^)[^}\n]*\}")
+
     def test_auxpow_real_miner_smoke_uses_deterministic_lab_difficulty(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         recipe = makefile.split("test-auxpow-stratum:\n", 1)[1].split("\ntest-auxpow-stratum-bip310:", 1)[0]
