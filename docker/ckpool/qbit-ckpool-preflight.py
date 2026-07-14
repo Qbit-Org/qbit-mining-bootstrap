@@ -94,6 +94,18 @@ def bool_env(env: dict[str, str], name: str, default: bool) -> bool:
     raise PreflightError(f"{name} must be true/false style value, got {value!r}")
 
 
+def optional_bool_env(env: dict[str, str], name: str) -> bool | None:
+    value = env.get(name, "")
+    if value == "":
+        return None
+    normalized = value.strip().lower()
+    if normalized in BOOL_TRUE:
+        return True
+    if normalized in BOOL_FALSE:
+        return False
+    raise PreflightError(f"{name} must be true/false style value, got {value!r}")
+
+
 def int_env(env: dict[str, str], name: str, default: int) -> int:
     value = env.get(name, "")
     if value == "":
@@ -127,7 +139,20 @@ def is_public_chain(chain: str) -> bool:
 
 
 def production_mode(env: dict[str, str]) -> bool:
-    return bool_env(env, "QBIT_PRODUCTION", False) or bool_env(env, "QBIT_TOOLS_PRODUCTION", False)
+    qbit_production = bool_env(env, "QBIT_PRODUCTION", False)
+    qbit_tools_production = bool_env(env, "QBIT_TOOLS_PRODUCTION", False)
+    return qbit_production or qbit_tools_production
+
+
+def mainnet_launch_readiness_checks(env: dict[str, str]) -> bool | None:
+    enabled = optional_bool_env(env, "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED")
+    chain = chain_name(env)
+    if enabled is not None and chain != "mainnet":
+        raise PreflightError(
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED is valid only for "
+            "QBIT_CHAIN=mainnet"
+        )
+    return enabled
 
 
 def gbt_rules(chain: str) -> list[str]:
@@ -210,11 +235,17 @@ def validate_production_gate(env: dict[str, str]) -> list[str]:
     if chain == "regtest":
         raise PreflightError("QBIT_PRODUCTION=1 rejects regtest QBIT_CHAIN")
 
+    launch_readiness_checks = mainnet_launch_readiness_checks(env)
+    readiness_gate = bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True)
     policy = env.get("CKPOOL_PUBLIC_DIFF_POLICY", "explicit").strip().lower() or "explicit"
     if policy in DIFF_POLICY_PERMISSIVE:
         raise PreflightError("QBIT_PRODUCTION=1 rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive")
-    if not bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True):
-        raise PreflightError("QBIT_PRODUCTION=1 rejects CKPOOL_NON_TEST_READINESS_GATE=0")
+    if not readiness_gate and not (chain == "mainnet" and launch_readiness_checks is False):
+        raise PreflightError(
+            "QBIT_PRODUCTION=1 permits CKPOOL_NON_TEST_READINESS_GATE=0 only when "
+            "QBIT_CHAIN=mainnet and "
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
+        )
     if not bool_env(env, "CKPOOL_VALIDATE_QBIT_ASSUMPTIONS", True):
         raise PreflightError("QBIT_PRODUCTION=1 rejects CKPOOL_VALIDATE_QBIT_ASSUMPTIONS=0")
     if is_public_chain(chain) and not bool_env(env, "CKPOOL_REQUIRE_P2MR_PAYOUT", True):
@@ -224,7 +255,8 @@ def validate_production_gate(env: dict[str, str]) -> list[str]:
     if not env.get("CKPOOL_STRATUM_PORT", ""):
         raise PreflightError("QBIT_PRODUCTION=1 requires explicit CKPOOL_STRATUM_PORT")
 
-    return [f"production gate: chain={chain} ckpool=strict"]
+    readiness_mode = "mainnet-prelaunch" if not readiness_gate else "strict"
+    return [f"production gate: chain={chain} ckpool={readiness_mode}"]
 
 
 def validate_ckpool_knobs(env: dict[str, str]) -> list[str]:
@@ -259,9 +291,9 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
     chain = chain_name(env)
     if not is_public_chain(chain):
         return [f"readiness gate: skipped for QBIT_CHAIN={chain}"]
-    if not bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True):
-        return [f"readiness gate: disabled for QBIT_CHAIN={chain}"]
 
+    readiness_gate = bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True)
+    launch_readiness_checks = mainnet_launch_readiness_checks(env)
     info = rpc.call("getblockchaininfo")
     if not isinstance(info, dict):
         raise PreflightError("getblockchaininfo result was not an object")
@@ -271,7 +303,19 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
         raise PreflightError(
             f"QBIT_CHAIN={chain} does not match getblockchaininfo.chain={rpc_chain}"
         )
-    if bool(info.get("initialblockdownload")):
+    if not readiness_gate:
+        mode = (
+            "explicitly relaxed for mainnet prelaunch"
+            if chain == "mainnet" and launch_readiness_checks is False
+            else "disabled"
+        )
+        return [f"readiness gate: {mode} for QBIT_CHAIN={chain} rpc_chain={rpc_chain}"]
+    initial_block_download = info.get("initialblockdownload")
+    if not isinstance(initial_block_download, bool):
+        raise PreflightError(
+            "getblockchaininfo.initialblockdownload was missing or not a boolean"
+        )
+    if initial_block_download:
         raise PreflightError(f"QBIT_CHAIN={chain} is still in initial block download")
 
     min_peers = int_env(env, "CKPOOL_MIN_PEERS", 1)
@@ -290,7 +334,7 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
         if not isinstance(network_info, dict):
             raise PreflightError("getnetworkinfo result was not an object")
         connections = network_info.get("connections")
-        if not isinstance(connections, int):
+        if not isinstance(connections, int) or isinstance(connections, bool):
             raise PreflightError("getnetworkinfo.connections was missing or not an integer")
         if connections >= min_peers:
             break

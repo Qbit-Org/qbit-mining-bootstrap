@@ -33,6 +33,68 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertIn("QBIT_PRODUCTION=1 rejects regtest QBIT_CHAIN", result.stderr)
         self.assertNotIn("docker is required", result.stderr)
 
+    def test_production_mainnet_prelaunch_requires_explicit_authorization(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0", result.stderr)
+        self.assertNotIn("docker is required", result.stderr)
+
+    def test_production_mainnet_prelaunch_accepts_explicit_authorization(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("permits CKPOOL_NON_TEST_READINESS_GATE=0", result.stderr)
+        self.assertIn("requires a non-default PRISM_POSTGRES_PASSWORD", result.stderr)
+
+    def test_production_mainnet_launch_rejects_disabled_readiness(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0", result.stderr)
+
+    def test_production_gate_rejects_malformed_boolean_flags(self) -> None:
+        cases = {
+            "CKPOOL_NON_TEST_READINESS_GATE": "sometimes",
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "prelaunch",
+            "QBIT_TOOLS_PRODUCTION": "maybe",
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name):
+                result = self.run_check_env(
+                    QBIT_PRODUCTION="1",
+                    QBIT_CHAIN="mainnet",
+                    **{name: value},
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{name} must be a true/false style value", result.stderr)
+
+    def test_non_mainnet_production_rejects_mainnet_launch_flag(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="testnet4",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("valid only for QBIT_CHAIN=mainnet", result.stderr)
+
     def test_production_mode_rejects_prism_test_bypass_before_docker_check(self) -> None:
         result = self.run_check_env(
             QBIT_PRODUCTION="1",
