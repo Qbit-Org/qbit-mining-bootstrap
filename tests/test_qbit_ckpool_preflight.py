@@ -25,7 +25,7 @@ class FakeRpc:
     def __init__(
         self,
         *,
-        ibd: bool = False,
+        ibd: Any = False,
         rpc_chain: str = "regtest",
         connections: int | list[int] = 1,
         weightlimit: int = 2_000_000,
@@ -106,6 +106,15 @@ def production_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def mainnet_production_env(**overrides: str) -> dict[str, str]:
+    env = production_env(
+        QBIT_CHAIN="mainnet",
+        QBIT_MINER_ADDRESS="qb1miner",
+    )
+    env.update(overrides)
+    return env
+
+
 class QbitCkpoolPreflightTests(unittest.TestCase):
     def test_regtest_allows_implicit_regtest_difficulty_floor(self) -> None:
         messages = preflight.run_preflight(base_env(), FakeRpc())
@@ -157,6 +166,113 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
         messages = preflight.run_preflight(production_env(), FakeRpc(rpc_chain="testnet4"))
 
         self.assertTrue(any("production gate" in message for message in messages))
+
+    def test_production_mainnet_prelaunch_requires_explicit_authorization(self) -> None:
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0",
+        ):
+            preflight.run_preflight(
+                mainnet_production_env(CKPOOL_NON_TEST_READINESS_GATE="0"),
+                FakeRpc(ibd=True, rpc_chain="main"),
+            )
+
+    def test_production_mainnet_prelaunch_allows_disabled_readiness(self) -> None:
+        messages = preflight.run_preflight(
+            mainnet_production_env(
+                CKPOOL_NON_TEST_READINESS_GATE="0",
+                QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+            ),
+            FakeRpc(ibd=True, connections=0, rpc_chain="main"),
+        )
+
+        self.assertTrue(any("ckpool=mainnet-prelaunch" in message for message in messages))
+        self.assertTrue(any("explicitly relaxed" in message for message in messages))
+
+    def test_launch_enabled_rejects_disabled_readiness(self) -> None:
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0",
+        ):
+            preflight.run_preflight(
+                mainnet_production_env(
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="1",
+                ),
+                FakeRpc(rpc_chain="main"),
+            )
+
+    def test_launch_enabled_rejects_initial_block_download(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "initial block download"):
+            preflight.run_preflight(
+                mainnet_production_env(
+                    CKPOOL_NON_TEST_READINESS_GATE="1",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="1",
+                ),
+                FakeRpc(ibd=True, rpc_chain="main"),
+            )
+
+    def test_launch_enabled_requires_boolean_initial_block_download(self) -> None:
+        for value in (None, "false", 0):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                preflight.PreflightError,
+                "initialblockdownload was missing or not a boolean",
+            ):
+                preflight.run_preflight(
+                    mainnet_production_env(
+                        CKPOOL_NON_TEST_READINESS_GATE="1",
+                        QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="1",
+                    ),
+                    FakeRpc(ibd=value, rpc_chain="main"),
+                )
+
+    def test_launch_enabled_accepts_sufficient_readiness(self) -> None:
+        messages = preflight.run_preflight(
+            mainnet_production_env(
+                CKPOOL_NON_TEST_READINESS_GATE="1",
+                QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="1",
+            ),
+            FakeRpc(ibd=False, connections=1, rpc_chain="main"),
+        )
+
+        self.assertTrue(any("ckpool=strict" in message for message in messages))
+        self.assertTrue(any("ibd=false peers=1" in message for message in messages))
+
+    def test_mainnet_prelaunch_still_rejects_rpc_chain_mismatch(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "does not match"):
+            preflight.run_preflight(
+                mainnet_production_env(
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                ),
+                FakeRpc(ibd=True, rpc_chain="testnet4"),
+            )
+
+    def test_non_mainnet_production_cannot_use_mainnet_prelaunch_authorization(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "valid only"):
+            preflight.run_preflight(
+                production_env(
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                ),
+                FakeRpc(rpc_chain="testnet4"),
+            )
+
+    def test_malformed_readiness_and_production_flags_fail(self) -> None:
+        cases = {
+            "CKPOOL_NON_TEST_READINESS_GATE": "sometimes",
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "prelaunch",
+            "QBIT_TOOLS_PRODUCTION": "maybe",
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                preflight.PreflightError,
+                name,
+            ):
+                preflight.run_preflight(
+                    mainnet_production_env(**{name: value}),
+                    FakeRpc(rpc_chain="main"),
+                )
 
     def test_public_readiness_rejects_initial_block_download(self) -> None:
         env = base_env(
