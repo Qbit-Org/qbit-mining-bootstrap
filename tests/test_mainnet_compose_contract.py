@@ -109,6 +109,15 @@ class MainnetComposeContractTests(unittest.TestCase):
             ["-discover=1"],
         )
 
+    def test_qbit_runtime_receives_complete_launch_authorization_tuple(self) -> None:
+        env = self._environment("qbitd")
+
+        self.assertEqual(env["QBIT_PRODUCTION"], "1")
+        self.assertEqual(env["QBIT_TOOLS_PRODUCTION"], "1")
+        self.assertEqual(env["QBIT_CHAIN"], "mainnet")
+        self.assertEqual(env["CKPOOL_NON_TEST_READINESS_GATE"], "1")
+        self.assertEqual(env["QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"], "1")
+
     def test_expected_genesis_reaches_public_pool_runtimes(self) -> None:
         expected = "1" * 64
 

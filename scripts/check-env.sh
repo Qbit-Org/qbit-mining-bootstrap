@@ -9,6 +9,8 @@ ENV_MINING_LANES="${MINING_LANES:-}"
 ENV_QBIT_PRODUCTION="${QBIT_PRODUCTION:-}"
 ENV_QBIT_TOOLS_PRODUCTION="${QBIT_TOOLS_PRODUCTION:-}"
 ENV_QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}"
+ENV_QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS_IS_SET="${QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS+x}"
+ENV_QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="${QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS-}"
 ENV_QBIT_REQUIRE_RELEASE_PROVENANCE="${QBIT_REQUIRE_RELEASE_PROVENANCE:-}"
 ENV_QBIT_SRC_DIR="${QBIT_SRC_DIR:-}"
 ENV_QBIT_BIN_DIR="${QBIT_BIN_DIR:-}"
@@ -138,6 +140,9 @@ if [[ -n "${ENV_QBIT_TOOLS_PRODUCTION}" ]]; then
 fi
 if [[ -n "${ENV_QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED}" ]]; then
   QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="${ENV_QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED}"
+fi
+if [[ "${ENV_QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS_IS_SET}" == "x" ]]; then
+  QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="${ENV_QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS}"
 fi
 if [[ -n "${ENV_QBIT_REQUIRE_RELEASE_PROVENANCE}" ]]; then
   QBIT_REQUIRE_RELEASE_PROVENANCE="${ENV_QBIT_REQUIRE_RELEASE_PROVENANCE}"
@@ -450,7 +455,7 @@ parse_bool_env() {
   local value="${2:-}"
   local normalized
 
-  normalized="$(ascii_lower "${value}")"
+  normalized="$(ascii_lower "${value}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 
   case "${normalized}" in
     1|true|yes|on) PARSED_BOOL_ENV=1 ;;
@@ -731,6 +736,27 @@ check_production_gate() {
   fi
   [[ "${QBIT_CHAIN:-regtest}" == "mainnet" || "${production_enabled}" == "1" ]] || return 0
 
+  parse_bool_env QBIT_PRODUCTION "${QBIT_PRODUCTION:-0}"
+  qbit_production="${PARSED_BOOL_ENV}"
+  parse_bool_env QBIT_TOOLS_PRODUCTION "${QBIT_TOOLS_PRODUCTION:-0}"
+  qbit_tools_production="${PARSED_BOOL_ENV}"
+  parse_bool_env CKPOOL_NON_TEST_READINESS_GATE "${CKPOOL_NON_TEST_READINESS_GATE:-1}"
+  readiness_gate="${PARSED_BOOL_ENV}"
+  if [[ -n "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}" ]]; then
+    parse_bool_env QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED}"
+    launch_readiness_checks="${PARSED_BOOL_ENV}"
+    [[ "${QBIT_CHAIN:-regtest}" == "mainnet" ]] || fail "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED is valid only for QBIT_CHAIN=mainnet"
+  fi
+  if [[ "${readiness_gate}" == "0" || "${launch_readiness_checks}" == "0" ]]; then
+    [[ \
+      "${QBIT_CHAIN:-regtest}" == "mainnet" && \
+      "${qbit_production}" == "1" && \
+      "${qbit_tools_production}" == "1" && \
+      "${readiness_gate}" == "0" && \
+      "${launch_readiness_checks}" == "0" \
+    ]] || fail "mainnet prelaunch requires the explicitly authorized mainnet prelaunch combination: QBIT_PRODUCTION=1, QBIT_TOOLS_PRODUCTION=1, CKPOOL_NON_TEST_READINESS_GATE=0, and QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
+  fi
+
   [[ "${QBIT_CHAIN:-regtest}" != "regtest" ]] || fail "production mode rejects regtest QBIT_CHAIN"
 
   if mining_lane_enabled prism; then
@@ -760,28 +786,9 @@ check_production_gate() {
   fi
 
   if mining_lane_enabled ckpool; then
-    parse_bool_env QBIT_PRODUCTION "${QBIT_PRODUCTION:-0}"
-    qbit_production="${PARSED_BOOL_ENV}"
-    parse_bool_env QBIT_TOOLS_PRODUCTION "${QBIT_TOOLS_PRODUCTION:-0}"
-    qbit_tools_production="${PARSED_BOOL_ENV}"
-    parse_bool_env CKPOOL_NON_TEST_READINESS_GATE "${CKPOOL_NON_TEST_READINESS_GATE:-1}"
-    readiness_gate="${PARSED_BOOL_ENV}"
-    if [[ -n "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}" ]]; then
-      parse_bool_env QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED}"
-      launch_readiness_checks="${PARSED_BOOL_ENV}"
-      [[ "${QBIT_CHAIN:-regtest}" == "mainnet" ]] || fail "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED is valid only for QBIT_CHAIN=mainnet"
-    fi
     [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "permissive" ]] || fail "production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive"
     [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "allow-defaults" ]] || fail "production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=allow-defaults"
     [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "defaults" ]] || fail "production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=defaults"
-    if [[ "${readiness_gate}" == "0" ]]; then
-      [[ \
-        "${QBIT_CHAIN:-regtest}" == "mainnet" && \
-        "${qbit_production}" == "1" && \
-        "${qbit_tools_production}" == "1" && \
-        "${launch_readiness_checks}" == "0" \
-      ]] || fail "CKPOOL_NON_TEST_READINESS_GATE=0 requires the explicitly authorized mainnet prelaunch combination: QBIT_PRODUCTION=1, QBIT_TOOLS_PRODUCTION=1, and QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
-    fi
     [[ "${CKPOOL_VALIDATE_QBIT_ASSUMPTIONS:-1}" != "0" ]] || fail "production mode rejects CKPOOL_VALIDATE_QBIT_ASSUMPTIONS=0"
     if is_public_qbit_chain "${QBIT_CHAIN:-regtest}"; then
       [[ "${CKPOOL_REQUIRE_P2MR_PAYOUT:-1}" != "0" ]] || fail "production mode rejects public-chain CKPOOL_REQUIRE_P2MR_PAYOUT=0"
@@ -964,6 +971,17 @@ case "${1:-}" in
   *) fail "unknown argument: ${1}" ;;
 esac
 
+export QBIT_PRODUCTION QBIT_TOOLS_PRODUCTION QBIT_CHAIN CKPOOL_NON_TEST_READINESS_GATE
+export QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED
+export QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS
+qbit_validation_args=(
+  --validate-only
+  "${QBIT_CHAIN_FLAG:--regtest}"
+  "${QBIT_NODE_EXTRA_ARG:--asert}"
+  "${QBIT_P2MR_ONLY_ARG:--p2mronly=0}"
+)
+bash "${ROOT_DIR}/docker/qbit/qbit-entrypoint.sh" "${qbit_validation_args[@]}"
+
 validate_mining_lanes
 check_node_extra_arg_selectors
 check_qbit_chain_selection
@@ -973,6 +991,7 @@ if mining_lane_enabled auxpow; then
   check_bool_env BITCOIN_DISCOVER
 fi
 check_ctv_fee_config
+
 check_production_gate
 check_release_provenance_gate
 if mining_lane_enabled auxpow; then

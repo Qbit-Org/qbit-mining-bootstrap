@@ -335,6 +335,21 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0", result.stderr)
         self.assertNotIn("docker is required", result.stderr)
 
+    def test_nonproduction_skips_production_only_policy_checks(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="0",
+            QBIT_TOOLS_PRODUCTION="0",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            CKPOOL_PUBLIC_DIFF_POLICY="permissive",
+            PRISM_ALLOW_MEMORY_LEDGER="1",
+            PRISM_ALLOW_TEST_SIGNING_SEEDS="1",
+        )
+
+        self.assertNotIn("mainnet prelaunch requires", result.stderr)
+        self.assertNotIn("rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive", result.stderr)
+        self.assertNotIn("rejects PRISM_ALLOW_MEMORY_LEDGER=1", result.stderr)
+        self.assertNotIn("rejects PRISM_ALLOW_TEST_SIGNING_SEEDS=1", result.stderr)
+
     def test_production_mainnet_prelaunch_accepts_explicit_authorization(self) -> None:
         result = self.run_check_env(
             MINING_LANES="ckpool",
@@ -348,10 +363,28 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("mainnet prelaunch requires", result.stderr)
         self.assertNotIn(
             "requires the explicitly authorized mainnet prelaunch combination",
             result.stderr,
         )
+        self.assertIn("production CKPool requires an explicit QBIT_MINER_ADDRESS", result.stderr)
+
+    def test_production_mainnet_prelaunch_accepts_whitespace_around_launch_flag(self) -> None:
+        result = self.run_check_env(
+            MINING_LANES="ckpool",
+            QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            QBIT_CHAIN_FLAG="-chain=main",
+            QBIT_EXPECTED_GENESIS_HASH="11" * 32,
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=" 0\t",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("true/false style value", result.stderr)
+        self.assertNotIn("mainnet prelaunch requires", result.stderr)
         self.assertIn("production CKPool requires an explicit QBIT_MINER_ADDRESS", result.stderr)
 
     def test_production_mainnet_prelaunch_requires_both_production_flags(self) -> None:
@@ -421,6 +454,93 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"{name} must be a true/false style value", result.stderr)
 
+    def test_mainnet_prelaunch_accepts_valid_reviewed_tip_age(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            QBIT_CHAIN_FLAG="-chain=main",
+            QBIT_EXPECTED_GENESIS_HASH="11" * 32,
+            QBIT_NODE_EXTRA_ARG="-listen=1",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+            QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="456789",
+            PRISM_STRATUM_STALE_GRACE_SECONDS="0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS", result.stderr)
+        self.assertIn("requires a non-default PRISM_POSTGRES_PASSWORD", result.stderr)
+
+    def test_launch_rejects_caller_supplied_qbitd_tip_age_before_docker_check(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            QBIT_CHAIN_FLAG="-chain=main",
+            QBIT_EXPECTED_GENESIS_HASH="11" * 32,
+            QBIT_NODE_EXTRA_ARG="-maxtipage=9223372036854775807",
+            CKPOOL_NON_TEST_READINESS_GATE="1",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("caller-provided -maxtipage", result.stderr)
+        self.assertNotIn("docker is required", result.stderr)
+
+    def test_mainnet_prelaunch_rejects_test_chain_in_qbitd_argv(self) -> None:
+        cases = (
+            {"QBIT_CHAIN_FLAG": "-regtest", "QBIT_NODE_EXTRA_ARG": "-listen=1"},
+            {"QBIT_CHAIN_FLAG": "-chain=main", "QBIT_NODE_EXTRA_ARG": "-signet"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                result = self.run_check_env(
+                    QBIT_PRODUCTION="1",
+                    QBIT_TOOLS_PRODUCTION="1",
+                    QBIT_CHAIN="mainnet",
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                    QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="456789",
+                    **overrides,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("selects a test chain", result.stderr)
+                self.assertNotIn("docker is required", result.stderr)
+
+    def test_mainnet_prelaunch_rejects_invalid_tip_age_before_docker_check(self) -> None:
+        for value in ("", "0", "-1", "1;echo injected", "9223372036854775808"):
+            with self.subTest(value=value):
+                result = self.run_check_env(
+                    QBIT_PRODUCTION="1",
+                    QBIT_TOOLS_PRODUCTION="1",
+                    QBIT_CHAIN="mainnet",
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                    QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS=value,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS", result.stderr)
+                self.assertNotIn("docker is required", result.stderr)
+
+    def test_tip_age_rejects_incompatible_chain_or_production_mode(self) -> None:
+        cases = (
+            {"QBIT_PRODUCTION": "0", "QBIT_CHAIN": "mainnet"},
+            {"QBIT_PRODUCTION": "1", "QBIT_CHAIN": "signet", "QBIT_CHAIN_FLAG": "-signet"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                result = self.run_check_env(
+                    QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="456789",
+                    **overrides,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS", result.stderr)
+                self.assertNotIn("docker is required", result.stderr)
+
     def test_non_mainnet_production_rejects_mainnet_launch_flag(self) -> None:
         result = self.run_check_env(
             MINING_LANES="ckpool",
@@ -434,7 +554,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("valid only for QBIT_CHAIN=mainnet", result.stderr)
 
-    def test_prism_lane_ignores_ckpool_launch_settings(self) -> None:
+    def test_prism_lane_validates_shared_launch_flag(self) -> None:
         result = self.run_check_env(
             MINING_LANES="prism",
             QBIT_PRODUCTION="1",
@@ -445,9 +565,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("CKPOOL_NON_TEST_READINESS_GATE", result.stderr)
-        self.assertNotIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED", result.stderr)
-        self.assertIn("production mode requires a non-default PRISM_POSTGRES_PASSWORD", result.stderr)
+        self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED", result.stderr)
+        self.assertNotIn("docker is required", result.stderr)
 
     def test_lane_selection_rejects_unknown_lane(self) -> None:
         result = self.run_check_env(MINING_LANES="ckpool,unknown")

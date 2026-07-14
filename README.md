@@ -197,11 +197,12 @@ shape, and receives explicit `CKPOOL_MINDIFF` and `CKPOOL_STARTDIFF` values.
 Regtest keeps the lab-only `1/256` difficulty floor.
 
 The one launch-only exception is explicitly authorized mainnet prelaunch. It
-requires all five values below; missing, invalid, or mismatched values fail
-closed:
+requires the five authorization values below plus the explicit mainnet daemon
+selector; missing, invalid, or mismatched values fail closed:
 
 ```bash
 QBIT_CHAIN=mainnet
+QBIT_CHAIN_FLAG=-chain=main
 QBIT_PRODUCTION=1
 QBIT_TOOLS_PRODUCTION=1
 CKPOOL_NON_TEST_READINESS_GATE=0
@@ -218,6 +219,23 @@ active-tip agreement continuously. Runtime environment changes are not
 hot-reloaded by an already-running supervisor.
 `CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` controls the interval and persistent
 failures terminate CKPool after `CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS`.
+
+If mainnet still contains only a genesis block older than qbitd's normal tip-age
+window, qbitd remains in IBD and `getblocktemplate` cannot provide the first
+mining job. For that bootstrap case only, set
+`QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS` to a positive number of seconds
+explicitly reviewed against the genesis age and planned launch window. The
+qbitd startup wrapper adds `-maxtipage=<seconds>` only when
+`QBIT_PRODUCTION=1`, `QBIT_TOOLS_PRODUCTION=1`, `QBIT_CHAIN=mainnet`,
+`CKPOOL_NON_TEST_READINESS_GATE=0`, and
+`QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0`; existing arguments such as
+`QBIT_NODE_EXTRA_ARG=-listen=1` remain separate and unchanged. Flipping only
+the launch flag to `1` and restarting removes the generated argument even if
+the duration remains configured, returning qbitd to its normal tip-age policy.
+Caller-provided `-maxtipage` and `--maxtipage` daemon arguments are rejected in
+every mode so this managed control cannot be retained or duplicated at launch.
+This is a temporary first-block bootstrap control, not a permanent production
+setting; leave it unset when no reviewed override is required.
 
 `qbit-ckpool-preflight` supports three interfaces: no arguments runs the full
 one-shot preflight; `--production-gate-only` runs only stateless production,

@@ -246,6 +246,13 @@ The command is safe to run repeatedly. It exits non-zero when any FAIL row is
 present. Use `python3 scripts/prism-self-check.py --skip-live` to validate only
 static configuration before the profile is running.
 
+On mainnet, an explicit
+`QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0` keeps the probe useful before
+launch: `qbit.ibd`, a missing initial `stratum.highdiff_floor` difficulty
+notification, and a below-threshold `coordinator.ready_miners` result are WARN
+rows, while all other checks remain active and fatal. Set the flag to `1` for
+launch; an omitted flag is also strict, and a malformed value fails closed.
+
 For operator runs, `make up-prism-pool` requires Postgres plus
 `PRISM_MANIFEST_SIGNING_SEED_HEX`,
 `PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX`, and the trusted

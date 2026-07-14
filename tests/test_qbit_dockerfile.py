@@ -31,6 +31,18 @@ class QbitDockerfileTests(unittest.TestCase):
         self.assertIn("/opt/qbit/bin/qbitd", copy_sources)
         self.assertIn("/opt/qbit/bin/qbit-cli", copy_sources)
 
+    def test_qbit_runtime_keeps_tini_and_uses_exec_entrypoint(self) -> None:
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "COPY --chmod=0755 docker/qbit/qbit-entrypoint.sh /usr/local/bin/qbit-entrypoint.sh",
+            dockerfile,
+        )
+        self.assertIn(
+            'ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/qbit-entrypoint.sh"]',
+            dockerfile,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,12 @@ QBIT_CHAIN_FLAGS = {
     "testnet4": "-testnet4",
     "signet": "-signet",
 }
+QBIT_RPC_CHAIN_ALIASES = {"main": "mainnet"}
+BOOL_TRUE = {"1", "true", "yes", "on"}
+BOOL_FALSE = {"0", "false", "no", "off"}
+LAUNCH_READINESS_FLAG = "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"
+PRELAUNCH_TIP_AGE_NAME = "QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"
+MAX_SIGNED_INT64 = 9223372036854775807
 BITCOIN_CHAIN_FLAGS = {
     "mainnet": "-chain=main",
     "regtest": "-regtest",
@@ -48,6 +54,10 @@ BITCOIN_CHAIN_FLAGS = {
     "testnet4": "-testnet4",
     "signet": "-signet",
 }
+
+
+class MissingHighdiffNotificationError(RuntimeError):
+    """Raised when Stratum never advertises an initial difficulty."""
 
 
 @dataclass
@@ -161,11 +171,103 @@ def env_value(env: dict[str, str], name: str, default: str = "") -> str:
 
 
 def is_true(value: str) -> bool:
-    return value.lower() in {"1", "true", "yes", "on"}
+    return value.strip().lower() in BOOL_TRUE
+
+
+def optional_bool_env(env: dict[str, str], name: str) -> bool | None:
+    value = env.get(name, "")
+    if value == "":
+        return None
+    normalized = value.strip().lower()
+    if normalized in BOOL_TRUE:
+        return True
+    if normalized in BOOL_FALSE:
+        return False
+    raise ValueError(f"{name} must be a true/false style value, got {value!r}")
+
+
+def launch_readiness_checks_enabled(env: dict[str, str]) -> bool:
+    enabled = optional_bool_env(env, LAUNCH_READINESS_FLAG)
+    if enabled is None:
+        return True
+    chain = env_value(env, "QBIT_CHAIN", "regtest").strip().lower() or "regtest"
+    if chain != "mainnet":
+        raise ValueError(f"{LAUNCH_READINESS_FLAG} is valid only for QBIT_CHAIN=mainnet")
+    return enabled
+
+
+def authorized_mainnet_prelaunch(env: dict[str, str]) -> bool:
+    try:
+        return (
+            env_value(env, "QBIT_CHAIN", "regtest").strip().lower() == "mainnet"
+            and optional_bool_env(env, "QBIT_PRODUCTION") is True
+            and optional_bool_env(env, "QBIT_TOOLS_PRODUCTION") is True
+            and optional_bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE") is False
+            and launch_readiness_checks_enabled(env) is False
+        )
+    except ValueError:
+        return False
+
+
+def launch_readiness_checks_disabled(env: dict[str, str]) -> bool:
+    # static_checks reports malformed or incomplete authorization. Live checks
+    # must remain strict instead of treating it as prelaunch authorization.
+    return authorized_mainnet_prelaunch(env)
+
+
+def report_launch_dependent_failure(
+    env: dict[str, str],
+    reporter: Reporter,
+    name: str,
+    detail: str,
+    *,
+    hint: str | None = None,
+) -> None:
+    if launch_readiness_checks_disabled(env):
+        reporter.warn(
+            name,
+            f"{detail}; tolerated only because {LAUNCH_READINESS_FLAG}=0 (prelaunch)",
+            hint=f"Set {LAUNCH_READINESS_FLAG}=1 at launch; this condition will then fail the self-check.",
+        )
+    else:
+        reporter.fail(name, detail, hint=hint)
+
+
+def normalize_qbit_chain_name(value: object) -> str:
+    normalized = str(value).strip().lower()
+    return QBIT_RPC_CHAIN_ALIASES.get(normalized, normalized)
 
 
 def production_mode(env: dict[str, str]) -> bool:
     return is_true(env_value(env, "QBIT_PRODUCTION", "0")) or is_true(env_value(env, "QBIT_TOOLS_PRODUCTION", "0"))
+
+
+def prelaunch_tip_age_seconds(env: dict[str, str]) -> int | None:
+    if PRELAUNCH_TIP_AGE_NAME not in env:
+        return None
+
+    value = env[PRELAUNCH_TIP_AGE_NAME]
+    if value == "":
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} must not be empty")
+    if not value.isascii() or not value.isdigit():
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} must be a positive integer")
+    normalized = value.lstrip("0") or "0"
+    if normalized == "0":
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} must be greater than zero")
+    maximum = str(MAX_SIGNED_INT64)
+    if len(normalized) > len(maximum) or (
+        len(normalized) == len(maximum) and normalized > maximum
+    ):
+        raise ValueError(
+            f"{PRELAUNCH_TIP_AGE_NAME} exceeds qbitd's signed 64-bit integer range"
+        )
+    seconds = int(normalized)
+    production_enabled = optional_bool_env(env, "QBIT_PRODUCTION")
+    if production_enabled is not True:
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} is valid only with QBIT_PRODUCTION=1")
+    if env_value(env, "QBIT_CHAIN", "regtest") != "mainnet":
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} is valid only with QBIT_CHAIN=mainnet")
+    return seconds
 
 
 def release_provenance_required(env: dict[str, str]) -> bool:
@@ -221,6 +323,32 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
     qbit_chain = env_value(env, "QBIT_CHAIN", "regtest")
     prod = qbit_chain == "mainnet" or production_mode(env)
     qbit_chain_flag = env_value(env, "QBIT_CHAIN_FLAG", "-regtest")
+    try:
+        launch_checks_enabled = launch_readiness_checks_enabled(env)
+    except ValueError as exc:
+        reporter.fail(f"env.{LAUNCH_READINESS_FLAG}", str(exc))
+    else:
+        configured_launch_flag = env_value(env, LAUNCH_READINESS_FLAG)
+        if not configured_launch_flag:
+            reporter.pass_(
+                "launch.readiness",
+                f"{LAUNCH_READINESS_FLAG} is unset; launch-dependent checks remain strict",
+            )
+        elif launch_checks_enabled:
+            reporter.pass_("launch.readiness", f"{LAUNCH_READINESS_FLAG}=1; launch checks are strict")
+        elif not authorized_mainnet_prelaunch(env):
+            reporter.fail(
+                "launch.readiness",
+                f"{LAUNCH_READINESS_FLAG}=0 requires QBIT_CHAIN=mainnet, "
+                "QBIT_PRODUCTION=1, QBIT_TOOLS_PRODUCTION=1, and "
+                "CKPOOL_NON_TEST_READINESS_GATE=0",
+            )
+        else:
+            reporter.warn(
+                "launch.readiness",
+                f"{LAUNCH_READINESS_FLAG}=0; only explicit launch-dependent conditions are relaxed",
+                hint=f"Set {LAUNCH_READINESS_FLAG}=1 at launch.",
+            )
     if prod and qbit_chain == "regtest":
         reporter.fail("qbit.chain", "production mode cannot use regtest", hint="Set QBIT_CHAIN and QBIT_CHAIN_FLAG for the live network.")
     else:
@@ -232,6 +360,22 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.fail("qbit.chain_flag", f"unknown QBIT_CHAIN={qbit_chain}")
     else:
         reporter.pass_("qbit.chain_flag", "chain flag matches the configured qbit chain")
+
+    try:
+        tip_age_seconds = prelaunch_tip_age_seconds(env)
+    except ValueError as exc:
+        reporter.fail(f"env.{PRELAUNCH_TIP_AGE_NAME}", str(exc))
+    else:
+        if tip_age_seconds is None:
+            reporter.pass_(
+                f"env.{PRELAUNCH_TIP_AGE_NAME}",
+                "not configured; qbitd uses its normal tip-age policy",
+            )
+        else:
+            reporter.pass_(
+                f"env.{PRELAUNCH_TIP_AGE_NAME}",
+                f"validated reviewed duration of {tip_age_seconds} seconds",
+            )
 
     bitcoin_chain = env_value(env, "BITCOIN_CHAIN", "regtest")
     bitcoin_chain_flag = env_value(env, "BITCOIN_CHAIN_FLAG", "-regtest")
@@ -677,9 +821,13 @@ def stratum_first_advertised_difficulty(
             try:
                 chunk = sock.recv(4096)
             except socket.timeout as exc:
-                raise RuntimeError("timed out waiting for mining.set_difficulty") from exc
+                raise MissingHighdiffNotificationError(
+                    "timed out waiting for mining.set_difficulty"
+                ) from exc
             if not chunk:
-                raise RuntimeError("connection closed before mining.set_difficulty")
+                raise MissingHighdiffNotificationError(
+                    "connection closed before mining.set_difficulty"
+                )
             buffer += chunk
             while b"\n" in buffer:
                 line, _, buffer = buffer.partition(b"\n")
@@ -698,7 +846,7 @@ def stratum_first_advertised_difficulty(
                     if not isinstance(params, list) or not params:
                         raise RuntimeError("mining.set_difficulty carried no difficulty")
                     return parse_decimal(str(params[0]))
-        raise RuntimeError("timed out waiting for mining.set_difficulty")
+        raise MissingHighdiffNotificationError("timed out waiting for mining.set_difficulty")
 
 
 def check_highdiff_advertised_floor(env: dict[str, str], host: str, port: int, reporter: Reporter) -> None:
@@ -711,6 +859,15 @@ def check_highdiff_advertised_floor(env: dict[str, str], host: str, port: int, r
     username = env_value(env, "PRISM_USERNAME_FALLBACK_ADDRESS", "").strip() or "prism-self-check"
     try:
         advertised = stratum_first_advertised_difficulty(host, port, username=username)
+    except MissingHighdiffNotificationError as exc:
+        report_launch_dependent_failure(
+            env,
+            reporter,
+            "stratum.highdiff_floor",
+            f"stratum handshake with {host}:{port} did not advertise a difficulty: {exc}",
+            hint="Wait for a usable block template/job and check coordinator logs.",
+        )
+        return
     except (OSError, RuntimeError, ValueError) as exc:
         reporter.fail(
             "stratum.highdiff_floor",
@@ -765,10 +922,9 @@ def qbit_live_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.fail("qbit.rpc", "getblockchaininfo returned a non-object response")
         return
     expected_chain = env_value(env, "QBIT_CHAIN", "regtest")
-    expected_rpc_chain = "main" if expected_chain == "mainnet" else expected_chain
     actual_chain = str(blockchain_info.get("chain", ""))
-    if actual_chain != expected_rpc_chain:
-        reporter.fail("qbit.rpc_chain", f"qbitd reports chain={actual_chain}, expected {expected_rpc_chain}")
+    if normalize_qbit_chain_name(actual_chain) != normalize_qbit_chain_name(expected_chain):
+        reporter.fail("qbit.rpc_chain", f"qbitd reports chain={actual_chain}, expected {expected_chain}")
     else:
         reporter.pass_("qbit.rpc_chain", f"qbitd reports {actual_chain}")
     public_chain = expected_chain in PUBLIC_QBIT_CHAINS
@@ -777,7 +933,12 @@ def qbit_live_checks(env: dict[str, str], reporter: Reporter) -> None:
         if public_chain
         else bool(blockchain_info.get("initialblockdownload"))
     ):
-        reporter.fail("qbit.ibd", "qbitd is still in initial block download or did not report readiness")
+        report_launch_dependent_failure(
+            env,
+            reporter,
+            "qbit.ibd",
+            "qbitd is still in initial block download or did not report readiness",
+        )
     else:
         reporter.pass_("qbit.ibd", "qbitd is not in initial block download")
     if public_chain:
@@ -921,7 +1082,9 @@ def check_ready_miner_threshold(payload: dict[str, object], env: dict[str, str],
         reporter.fail("coordinator.ready_miners", "PRISM_MIN_READY_MINERS must be an integer")
         return
     if ready_miner_count < min_ready_miners:
-        reporter.fail(
+        report_launch_dependent_failure(
+            env,
+            reporter,
             "coordinator.ready_miners",
             f"{ready_miner_count}/{min_ready_miners} miners ready",
             hint="Connect miners and wait for accepted PRISM shares before treating the pool as block-ready.",
