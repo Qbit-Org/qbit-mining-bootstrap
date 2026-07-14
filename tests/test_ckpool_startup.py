@@ -196,7 +196,7 @@ class CkpoolStartupTests(unittest.TestCase):
             compose,
         )
 
-    def test_compose_passes_mainnet_launch_readiness_flag_to_ckpool_services(self) -> None:
+    def test_compose_passes_mainnet_launch_readiness_flag_to_qbit_services(self) -> None:
         compose = (ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
 
         self.assertEqual(
@@ -204,7 +204,7 @@ class CkpoolStartupTests(unittest.TestCase):
                 "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED: "
                 "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}"
             ),
-            2,
+            3,
         )
 
     def test_compose_passes_supervisor_settings_to_ckpool_services(self) -> None:
