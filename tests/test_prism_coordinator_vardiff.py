@@ -2688,11 +2688,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {**base, "PRISM_STRATUM_STALE_GRACE_SECONDS": "3"},
+            {**base, "QBIT_CHAIN": "mainnet", "PRISM_STRATUM_STALE_GRACE_SECONDS": "3"},
             clear=True,
         ):
-            with self.assertRaisesRegex(SystemExit, "STALE_GRACE_SECONDS=0"):
+            with self.assertRaisesRegex(SystemExit, "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"):
                 validate_prism_production_gate()
+
+        # Off mainnet, production mode accepts a bounded grace window.
+        with patch.dict(
+            os.environ,
+            {**base, "PRISM_STRATUM_STALE_GRACE_SECONDS": "2"},
+            clear=True,
+        ):
+            validate_prism_production_gate()
 
         with patch.dict(os.environ, {**base, "PRISM_POSTGRES_PASSWORD": "change-this"}, clear=True):
             with self.assertRaisesRegex(SystemExit, "PRISM_POSTGRES_PASSWORD"):

@@ -415,11 +415,13 @@ class PrismSelfCheckTests(unittest.TestCase):
             {(row.status, row.name) for row in reporter.rows},
         )
 
-    def test_static_checks_require_zero_production_stale_grace(self) -> None:
+    def test_static_checks_require_zero_mainnet_stale_grace(self) -> None:
         env = self.valid_env()
         env.update(
             {
-                "QBIT_PRODUCTION": "1",
+                "QBIT_CHAIN": "mainnet",
+                "QBIT_CHAIN_FLAG": "-chain=main",
+                "QBIT_EXPECTED_GENESIS_HASH": "AB" * 32,
                 "QBIT_GIT_COMMIT": "41" * 20,
                 "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             }
@@ -432,6 +434,23 @@ class PrismSelfCheckTests(unittest.TestCase):
             ("FAIL", "mining.stale_grace"),
             {(row.status, row.name) for row in reporter.rows},
         )
+
+    def test_static_checks_accept_bounded_stale_grace_off_mainnet(self) -> None:
+        env = self.valid_env()
+        env.update(
+            {
+                "QBIT_PRODUCTION": "1",
+                "QBIT_GIT_COMMIT": "41" * 20,
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "2",
+            }
+        )
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        rows = {(row.status, row.name) for row in reporter.rows}
+        self.assertIn(("PASS", "mining.stale_grace"), rows)
+        self.assertNotIn(("FAIL", "mining.stale_grace"), rows)
 
     def test_static_checks_require_explicit_production_auxpow_payouts(self) -> None:
         env = self.valid_env()

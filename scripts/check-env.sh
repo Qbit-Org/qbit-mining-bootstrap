@@ -705,7 +705,9 @@ check_production_gate() {
         fail "production mode rejects ${name}=1"
       fi
     done
-    [[ "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" == "0" ]] || fail "production mode requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
+    if [[ "${QBIT_CHAIN:-regtest}" == "mainnet" ]]; then
+      [[ "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" == "0" ]] || fail "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
+    fi
     [[ -n "${PRISM_DATABASE_URL:-}" || -n "${PRISM_POSTGRES_PSQL_COMMAND:-}" ]] || fail "production mode requires PRISM_DATABASE_URL or PRISM_POSTGRES_PSQL_COMMAND"
     [[ "${PRISM_POSTGRES_PASSWORD:-}" != "change-this" ]] || fail "production mode requires a non-default PRISM_POSTGRES_PASSWORD"
     [[ "${PRISM_DATABASE_URL:-}" != *"change-this"* ]] || fail "production mode requires a non-default PRISM_DATABASE_URL"

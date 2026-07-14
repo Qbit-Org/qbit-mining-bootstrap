@@ -398,12 +398,12 @@ def validate_prism_production_gate() -> None:
         if env_bool(name, "0"):
             raise SystemExit(f"production mode rejects {name}=1")
 
-    if env_nonnegative_float(
+    if env("QBIT_CHAIN", "regtest").lower() in {"main", "mainnet"} and env_nonnegative_float(
         "PRISM_STRATUM_STALE_GRACE_SECONDS",
         DEFAULT_PRISM_STALE_GRACE_SECONDS,
     ) != 0:
         raise SystemExit(
-            "production mode requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
+            "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
         )
 
     prism_database_url = env_optional("PRISM_DATABASE_URL")

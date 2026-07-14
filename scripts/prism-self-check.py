@@ -386,10 +386,10 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.fail("mining.share_diff", str(exc))
 
     stale_grace = env_value(env, "PRISM_STRATUM_STALE_GRACE_SECONDS", "3").strip()
-    if prod and stale_grace != "0":
+    if qbit_chain == "mainnet" and stale_grace != "0":
         reporter.fail(
             "mining.stale_grace",
-            "production requires PRISM_STRATUM_STALE_GRACE_SECONDS=0",
+            "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0",
             hint="Enable stale-credit grace only after proving verifier compatibility for the deployed release.",
         )
     else:

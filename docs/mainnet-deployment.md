@@ -39,8 +39,11 @@ parent-node release pins.
 
 Validation runs in two tiers. The behavioral production checks (non-default
 credentials, explicit payout addresses, strict difficulty and readiness
-policies, zero stale grace, commit-pinned sources) apply whenever
-`QBIT_PRODUCTION=1`, `QBIT_TOOLS_PRODUCTION=1`, or `QBIT_CHAIN=mainnet`. The
+policies, commit-pinned sources) apply whenever `QBIT_PRODUCTION=1`,
+`QBIT_TOOLS_PRODUCTION=1`, or `QBIT_CHAIN=mainnet`; zero stale grace
+(`PRISM_STRATUM_STALE_GRACE_SECONDS=0`) is pinned only on mainnet, so a public
+test-chain pool may credit shares that raced a block within a bounded grace
+window. The
 release-provenance checks (digest-qualified `*_IMAGE` references, absolute
 `*_DATA_SOURCE` host paths, and fresh PRISM capacity evidence) are enforced
 unconditionally on mainnet — no environment variable can disable them there —

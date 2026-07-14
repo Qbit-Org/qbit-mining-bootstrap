@@ -765,19 +765,34 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 )
                 self.assertNotIn("docker is required", result.stderr)
 
-    def test_production_requires_zero_stale_grace(self) -> None:
+    def test_mainnet_requires_zero_stale_grace(self) -> None:
+        result = self.run_check_env(
+            MINING_LANES="prism",
+            QBIT_CHAIN="mainnet",
+            QBIT_CHAIN_FLAG="-chain=main",
+            QBIT_EXPECTED_GENESIS_HASH="11" * 32,
+            QBIT_GIT_COMMIT="41" * 20,
+            PRISM_STRATUM_STALE_GRACE_SECONDS="3",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0", result.stderr)
+        self.assertNotIn("docker is required", result.stderr)
+
+    def test_non_mainnet_production_accepts_bounded_stale_grace(self) -> None:
+        # A public-chain production pool may credit shares that raced a block
+        # within a bounded grace window; only mainnet pins the strict zero.
         result = self.run_check_env(
             MINING_LANES="prism",
             QBIT_PRODUCTION="1",
             QBIT_CHAIN="signet",
             QBIT_CHAIN_FLAG="-signet",
             QBIT_GIT_COMMIT="41" * 20,
-            PRISM_STRATUM_STALE_GRACE_SECONDS="3",
+            PRISM_STRATUM_STALE_GRACE_SECONDS="2",
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("production mode requires PRISM_STRATUM_STALE_GRACE_SECONDS=0", result.stderr)
-        self.assertNotIn("docker is required", result.stderr)
+        self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
 
     def test_production_verifies_resolved_git_checkout_matches_pin(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
