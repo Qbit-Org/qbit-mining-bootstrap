@@ -119,6 +119,18 @@ def bool_env(env: dict[str, str], name: str, default: bool) -> bool:
     raise PreflightError(f"{name} must be true/false style value, got {value!r}")
 
 
+def optional_bool_env(env: dict[str, str], name: str) -> bool | None:
+    value = env.get(name, "")
+    if value == "":
+        return None
+    normalized = value.strip().lower()
+    if normalized in BOOL_TRUE:
+        return True
+    if normalized in BOOL_FALSE:
+        return False
+    raise PreflightError(f"{name} must be true/false style value, got {value!r}")
+
+
 def int_env(env: dict[str, str], name: str, default: int) -> int:
     value = env.get(name, "")
     if value == "":
@@ -152,9 +164,20 @@ def is_public_chain(chain: str) -> bool:
 
 
 def production_mode(env: dict[str, str]) -> bool:
-    if chain_name(env) == "mainnet":
-        return True
-    return bool_env(env, "QBIT_PRODUCTION", False) or bool_env(env, "QBIT_TOOLS_PRODUCTION", False)
+    qbit_production = bool_env(env, "QBIT_PRODUCTION", False)
+    qbit_tools_production = bool_env(env, "QBIT_TOOLS_PRODUCTION", False)
+    return chain_name(env) == "mainnet" or qbit_production or qbit_tools_production
+
+
+def mainnet_launch_readiness_checks(env: dict[str, str]) -> bool | None:
+    enabled = optional_bool_env(env, "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED")
+    chain = chain_name(env)
+    if enabled is not None and chain != "mainnet":
+        raise PreflightError(
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED is valid only for "
+            "QBIT_CHAIN=mainnet"
+        )
+    return enabled
 
 
 def gbt_rules(chain: str) -> list[str]:
@@ -247,11 +270,17 @@ def validate_production_gate(env: dict[str, str]) -> list[str]:
         raise PreflightError("production mode rejects regtest QBIT_CHAIN")
     validated_expected_genesis_hash(env, chain)
 
+    launch_readiness_checks = mainnet_launch_readiness_checks(env)
+    readiness_gate = bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True)
     policy = env.get("CKPOOL_PUBLIC_DIFF_POLICY", "explicit").strip().lower() or "explicit"
     if policy in DIFF_POLICY_PERMISSIVE:
         raise PreflightError("production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive")
-    if not bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True):
-        raise PreflightError("production mode rejects CKPOOL_NON_TEST_READINESS_GATE=0")
+    if not readiness_gate and not (chain == "mainnet" and launch_readiness_checks is False):
+        raise PreflightError(
+            "QBIT_PRODUCTION=1 permits CKPOOL_NON_TEST_READINESS_GATE=0 only when "
+            "QBIT_CHAIN=mainnet and "
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
+        )
     if not bool_env(env, "CKPOOL_VALIDATE_QBIT_ASSUMPTIONS", True):
         raise PreflightError("production mode rejects CKPOOL_VALIDATE_QBIT_ASSUMPTIONS=0")
     if is_public_chain(chain) and not bool_env(env, "CKPOOL_REQUIRE_P2MR_PAYOUT", True):
@@ -266,7 +295,8 @@ def validate_production_gate(env: dict[str, str]) -> list[str]:
     if not env.get("CKPOOL_STRATUM_PORT", ""):
         raise PreflightError("production mode requires explicit CKPOOL_STRATUM_PORT")
 
-    return [f"production gate: chain={chain} ckpool=strict"]
+    readiness_mode = "mainnet-prelaunch" if not readiness_gate else "strict"
+    return [f"production gate: chain={chain} ckpool={readiness_mode}"]
 
 
 def validate_ckpool_knobs(env: dict[str, str]) -> list[str]:
@@ -412,18 +442,10 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
     chain = chain_name(env)
     if not is_public_chain(chain):
         return [f"readiness gate: skipped for QBIT_CHAIN={chain}"]
-    if not bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True):
-        return [f"readiness gate: disabled for QBIT_CHAIN={chain}"]
 
     expected_genesis = validated_expected_genesis_hash(env, chain)
-
-    min_peers = int_env(env, "CKPOOL_MIN_PEERS", 1)
-    if min_peers < 1:
-        raise PreflightError("CKPOOL_MIN_PEERS must be at least 1 for public-chain readiness")
-
-    readiness_timeout = float_env(env, "CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS", 120.0)
-    if readiness_timeout < 0:
-        raise PreflightError("CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS must be non-negative")
+    readiness_gate = bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True)
+    launch_readiness_checks = mainnet_launch_readiness_checks(env)
 
     info = rpc.call("getblockchaininfo")
     rpc_chain, initial_block_download, blocks, headers = parse_blockchain_readiness(
@@ -435,6 +457,24 @@ def validate_readiness(env: dict[str, str], rpc: RpcClient) -> list[str]:
             raise PreflightError(
                 f"qbit genesis hash is {actual_genesis!r}, expected {expected_genesis}"
             )
+
+    if not readiness_gate:
+        # Chain identity and the genesis pin are validated above even when the
+        # gate is relaxed; only the IBD/height/peer waits are skipped.
+        mode = (
+            "explicitly relaxed for mainnet prelaunch"
+            if chain == "mainnet" and launch_readiness_checks is False
+            else "disabled"
+        )
+        return [f"readiness gate: {mode} for QBIT_CHAIN={chain} rpc_chain={rpc_chain}"]
+
+    min_peers = int_env(env, "CKPOOL_MIN_PEERS", 1)
+    if min_peers < 1:
+        raise PreflightError("CKPOOL_MIN_PEERS must be at least 1 for public-chain readiness")
+
+    readiness_timeout = float_env(env, "CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS", 120.0)
+    if readiness_timeout < 0:
+        raise PreflightError("CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS must be non-negative")
 
     deadline = time.monotonic() + readiness_timeout
     connections = 0
@@ -702,6 +742,7 @@ def supervise_ckpool(
 
     if not command:
         raise PreflightError("--supervise requires a CKPool command")
+    validate_production_gate(env)
     poll_seconds, failure_exit_seconds = watchdog_settings(env)
 
     # The startup wrapper has just run the full preflight. Recheck readiness and
@@ -845,6 +886,7 @@ def main(argv: list[str] | None = None) -> int:
                 command = command[1:]
             if not command:
                 raise PreflightError("--supervise requires a CKPool command")
+            validate_production_gate(env)
             if not watchdog_required(env):
                 os.execvp(command[0], command)
             return supervise_ckpool(env, build_rpc_client(env), command)

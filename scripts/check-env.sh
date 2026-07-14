@@ -8,6 +8,7 @@ ENV_QBIT_PROVIDER="${QBIT_PROVIDER:-}"
 ENV_MINING_LANES="${MINING_LANES:-}"
 ENV_QBIT_PRODUCTION="${QBIT_PRODUCTION:-}"
 ENV_QBIT_TOOLS_PRODUCTION="${QBIT_TOOLS_PRODUCTION:-}"
+ENV_QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}"
 ENV_QBIT_REQUIRE_RELEASE_PROVENANCE="${QBIT_REQUIRE_RELEASE_PROVENANCE:-}"
 ENV_QBIT_SRC_DIR="${QBIT_SRC_DIR:-}"
 ENV_QBIT_BIN_DIR="${QBIT_BIN_DIR:-}"
@@ -134,6 +135,9 @@ if [[ -n "${ENV_QBIT_PRODUCTION}" ]]; then
 fi
 if [[ -n "${ENV_QBIT_TOOLS_PRODUCTION}" ]]; then
   QBIT_TOOLS_PRODUCTION="${ENV_QBIT_TOOLS_PRODUCTION}"
+fi
+if [[ -n "${ENV_QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED}" ]]; then
+  QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="${ENV_QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED}"
 fi
 if [[ -n "${ENV_QBIT_REQUIRE_RELEASE_PROVENANCE}" ]]; then
   QBIT_REQUIRE_RELEASE_PROVENANCE="${ENV_QBIT_REQUIRE_RELEASE_PROVENANCE}"
@@ -437,8 +441,29 @@ is_true_env() {
   esac
 }
 
+parse_bool_env() {
+  local name="$1"
+  local value="${2:-}"
+  local normalized
+
+  normalized="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
+
+  case "${normalized}" in
+    1|true|yes|on) PARSED_BOOL_ENV=1 ;;
+    0|false|no|off) PARSED_BOOL_ENV=0 ;;
+    *) fail "${name} must be a true/false style value, got '${value}'" ;;
+  esac
+}
+
 production_mode_enabled() {
-  is_true_env "${QBIT_PRODUCTION:-0}" || is_true_env "${QBIT_TOOLS_PRODUCTION:-0}"
+  local qbit_production
+  local qbit_tools_production
+
+  parse_bool_env QBIT_PRODUCTION "${QBIT_PRODUCTION:-0}"
+  qbit_production="${PARSED_BOOL_ENV}"
+  parse_bool_env QBIT_TOOLS_PRODUCTION "${QBIT_TOOLS_PRODUCTION:-0}"
+  qbit_tools_production="${PARSED_BOOL_ENV}"
+  [[ "${qbit_production}" == "1" || "${qbit_tools_production}" == "1" ]]
 }
 
 # Release provenance (digest-qualified images, absolute host state paths, and
@@ -691,7 +716,14 @@ require_lab_mode() {
 }
 
 check_production_gate() {
-  [[ "${QBIT_CHAIN:-regtest}" == "mainnet" ]] || production_mode_enabled || return 0
+  local production_enabled=0
+  local readiness_gate
+  local launch_readiness_checks="unset"
+
+  if production_mode_enabled; then
+    production_enabled=1
+  fi
+  [[ "${QBIT_CHAIN:-regtest}" == "mainnet" || "${production_enabled}" == "1" ]] || return 0
 
   [[ "${QBIT_CHAIN:-regtest}" != "regtest" ]] || fail "production mode rejects regtest QBIT_CHAIN"
 
@@ -722,10 +754,20 @@ check_production_gate() {
   fi
 
   if mining_lane_enabled ckpool; then
+    parse_bool_env CKPOOL_NON_TEST_READINESS_GATE "${CKPOOL_NON_TEST_READINESS_GATE:-1}"
+    readiness_gate="${PARSED_BOOL_ENV}"
+    if [[ -n "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}" ]]; then
+      parse_bool_env QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED}"
+      launch_readiness_checks="${PARSED_BOOL_ENV}"
+      [[ "${QBIT_CHAIN:-regtest}" == "mainnet" ]] || fail "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED is valid only for QBIT_CHAIN=mainnet"
+    fi
     [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "permissive" ]] || fail "production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive"
     [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "allow-defaults" ]] || fail "production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=allow-defaults"
     [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "defaults" ]] || fail "production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=defaults"
-    [[ "${CKPOOL_NON_TEST_READINESS_GATE:-1}" != "0" ]] || fail "production mode rejects CKPOOL_NON_TEST_READINESS_GATE=0"
+    if [[ "${readiness_gate}" == "0" ]]; then
+      [[ "${QBIT_CHAIN:-regtest}" == "mainnet" && "${launch_readiness_checks}" == "0" ]] || \
+        fail "QBIT_PRODUCTION=1 permits CKPOOL_NON_TEST_READINESS_GATE=0 only when QBIT_CHAIN=mainnet and QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
+    fi
     [[ "${CKPOOL_VALIDATE_QBIT_ASSUMPTIONS:-1}" != "0" ]] || fail "production mode rejects CKPOOL_VALIDATE_QBIT_ASSUMPTIONS=0"
     if is_public_qbit_chain "${QBIT_CHAIN:-regtest}"; then
       [[ "${CKPOOL_REQUIRE_P2MR_PAYOUT:-1}" != "0" ]] || fail "production mode rejects public-chain CKPOOL_REQUIRE_P2MR_PAYOUT=0"

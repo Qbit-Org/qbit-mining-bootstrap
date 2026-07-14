@@ -317,6 +317,107 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertIn("production mode rejects regtest QBIT_CHAIN", result.stderr)
         self.assertNotIn("docker is required", result.stderr)
 
+    def test_production_mainnet_prelaunch_requires_explicit_authorization(self) -> None:
+        # PR #21 tests, adapted: this branch also requires the explicit mainnet
+        # chain flag and genesis pin, runs the PRISM behavioral block before
+        # the ckpool lane, so the ckpool lane is selected directly.
+        result = self.run_check_env(
+            MINING_LANES="ckpool",
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            QBIT_CHAIN_FLAG="-chain=main",
+            QBIT_EXPECTED_GENESIS_HASH="11" * 32,
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0", result.stderr)
+        self.assertNotIn("docker is required", result.stderr)
+
+    def test_production_mainnet_prelaunch_accepts_explicit_authorization(self) -> None:
+        result = self.run_check_env(
+            MINING_LANES="ckpool",
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            QBIT_CHAIN_FLAG="-chain=main",
+            QBIT_EXPECTED_GENESIS_HASH="11" * 32,
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("permits CKPOOL_NON_TEST_READINESS_GATE=0", result.stderr)
+        self.assertIn("production CKPool requires an explicit QBIT_MINER_ADDRESS", result.stderr)
+
+    def test_production_mainnet_launch_rejects_disabled_readiness(self) -> None:
+        result = self.run_check_env(
+            MINING_LANES="ckpool",
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            QBIT_CHAIN_FLAG="-chain=main",
+            QBIT_EXPECTED_GENESIS_HASH="11" * 32,
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0", result.stderr)
+
+    def test_production_gate_rejects_malformed_boolean_flags(self) -> None:
+        cases = (
+            ("CKPOOL_NON_TEST_READINESS_GATE", "sometimes", "mainnet"),
+            ("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED", "prelaunch", "mainnet"),
+            ("QBIT_TOOLS_PRODUCTION", "maybe", "mainnet"),
+        )
+        for name, value, chain in cases:
+            with self.subTest(name=name):
+                chain_env = (
+                    {
+                        "QBIT_CHAIN": "mainnet",
+                        "QBIT_CHAIN_FLAG": "-chain=main",
+                        "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+                    }
+                    if chain == "mainnet"
+                    else {"QBIT_CHAIN": "signet", "QBIT_CHAIN_FLAG": "-signet"}
+                )
+                result = self.run_check_env(
+                    MINING_LANES="ckpool",
+                    QBIT_PRODUCTION="1",
+                    **chain_env,
+                    **{name: value},
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{name} must be a true/false style value", result.stderr)
+
+    def test_non_mainnet_production_rejects_mainnet_launch_flag(self) -> None:
+        result = self.run_check_env(
+            MINING_LANES="ckpool",
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="testnet4",
+            QBIT_CHAIN_FLAG="-testnet4",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("valid only for QBIT_CHAIN=mainnet", result.stderr)
+
+    def test_prism_lane_ignores_ckpool_launch_settings(self) -> None:
+        result = self.run_check_env(
+            MINING_LANES="prism",
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="signet",
+            QBIT_CHAIN_FLAG="-signet",
+            CKPOOL_NON_TEST_READINESS_GATE="sometimes",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="prelaunch",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("CKPOOL_NON_TEST_READINESS_GATE", result.stderr)
+        self.assertNotIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED", result.stderr)
+        self.assertIn("production mode requires a non-default PRISM_POSTGRES_PASSWORD", result.stderr)
+
     def test_lane_selection_rejects_unknown_lane(self) -> None:
         result = self.run_check_env(MINING_LANES="ckpool,unknown")
 
