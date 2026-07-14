@@ -327,6 +327,10 @@ check_production_gate() {
   qbit_production="${PARSED_BOOL_ENV}"
   parse_bool_env QBIT_TOOLS_PRODUCTION "${QBIT_TOOLS_PRODUCTION:-0}"
   qbit_tools_production="${PARSED_BOOL_ENV}"
+  if [[ "${qbit_production}" != "1" && "${qbit_tools_production}" != "1" ]]; then
+    return 0
+  fi
+
   parse_bool_env CKPOOL_NON_TEST_READINESS_GATE "${CKPOOL_NON_TEST_READINESS_GATE:-1}"
   readiness_gate="${PARSED_BOOL_ENV}"
   if [[ -n "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}" ]]; then
@@ -355,10 +359,6 @@ check_production_gate() {
       "${readiness_gate}" == "0" && \
       "${launch_readiness_checks}" == "0" ]] || \
       fail "mainnet prelaunch requires QBIT_PRODUCTION=1, QBIT_TOOLS_PRODUCTION=1, CKPOOL_NON_TEST_READINESS_GATE=0, and QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
-  fi
-
-  if [[ "${qbit_production}" != "1" && "${qbit_tools_production}" != "1" ]]; then
-    return 0
   fi
 
   [[ "${QBIT_CHAIN:-regtest}" != "regtest" ]] || fail "QBIT_PRODUCTION=1 rejects regtest QBIT_CHAIN"

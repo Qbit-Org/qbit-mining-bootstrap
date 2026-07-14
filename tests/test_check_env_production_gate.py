@@ -44,18 +44,20 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0", result.stderr)
         self.assertNotIn("docker is required", result.stderr)
 
-    def test_nonproduction_mainnet_cannot_enable_prelaunch(self) -> None:
+    def test_nonproduction_skips_production_only_policy_checks(self) -> None:
         result = self.run_check_env(
             QBIT_PRODUCTION="0",
             QBIT_TOOLS_PRODUCTION="0",
-            QBIT_CHAIN="mainnet",
             CKPOOL_NON_TEST_READINESS_GATE="0",
-            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+            CKPOOL_PUBLIC_DIFF_POLICY="permissive",
+            PRISM_ALLOW_MEMORY_LEDGER="1",
+            PRISM_ALLOW_TEST_SIGNING_SEEDS="1",
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("mainnet prelaunch requires QBIT_PRODUCTION=1", result.stderr)
-        self.assertNotIn("docker is required", result.stderr)
+        self.assertNotIn("mainnet prelaunch requires", result.stderr)
+        self.assertNotIn("rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive", result.stderr)
+        self.assertNotIn("rejects PRISM_ALLOW_MEMORY_LEDGER=1", result.stderr)
+        self.assertNotIn("rejects PRISM_ALLOW_TEST_SIGNING_SEEDS=1", result.stderr)
 
     def test_production_mainnet_prelaunch_accepts_explicit_authorization(self) -> None:
         result = self.run_check_env(
