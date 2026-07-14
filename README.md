@@ -181,11 +181,12 @@ shape, and receives explicit `CKPOOL_MINDIFF` and `CKPOOL_STARTDIFF` values.
 Regtest keeps the lab-only `1/256` difficulty floor.
 
 The one launch-only exception is explicitly authorized mainnet prelaunch. It
-requires all five values below; missing, invalid, or mismatched values fail
-closed:
+requires the five authorization values below plus the explicit mainnet daemon
+selector; missing, invalid, or mismatched values fail closed:
 
 ```bash
 QBIT_CHAIN=mainnet
+QBIT_CHAIN_FLAG=-chain=main
 QBIT_PRODUCTION=1
 QBIT_TOOLS_PRODUCTION=1
 CKPOOL_NON_TEST_READINESS_GATE=0

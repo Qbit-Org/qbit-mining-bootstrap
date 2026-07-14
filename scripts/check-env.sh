@@ -393,7 +393,13 @@ check_production_gate() {
 
 export QBIT_PRODUCTION QBIT_CHAIN QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED
 export QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS
-bash "${ROOT_DIR}/docker/qbit/qbit-entrypoint.sh" --validate-only
+qbit_validation_args=(
+  --validate-only
+  "${QBIT_CHAIN_FLAG:--regtest}"
+  "${QBIT_NODE_EXTRA_ARG:--asert}"
+  "${QBIT_P2MR_ONLY_ARG:--p2mronly=0}"
+)
+bash "${ROOT_DIR}/docker/qbit/qbit-entrypoint.sh" "${qbit_validation_args[@]}"
 
 check_production_gate
 

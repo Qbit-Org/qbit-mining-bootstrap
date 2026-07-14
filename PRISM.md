@@ -501,8 +501,10 @@ Static-only checks, before the stack is live:
 python3 scripts/prism-self-check.py --skip-live
 ```
 
-For an explicitly authorized mainnet prelaunch, set the five-value combination
-shown in the mainnet prelaunch section above. Only then does
+For an explicitly authorized mainnet prelaunch, set `QBIT_CHAIN=mainnet`,
+`QBIT_CHAIN_FLAG=-chain=main`, both production flags to `1`,
+`CKPOOL_NON_TEST_READINESS_GATE=0`, and the launch-readiness flag to `0`. Only
+then does
 `QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0` change three expected
 launch-dependent conditions from FAIL to WARN: qbitd still being in IBD, the
 high-diff listener not yet advertising its first `mining.set_difficulty`, and

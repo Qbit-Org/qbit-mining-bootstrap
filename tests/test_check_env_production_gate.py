@@ -119,6 +119,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             QBIT_PRODUCTION="1",
             QBIT_TOOLS_PRODUCTION="1",
             QBIT_CHAIN="mainnet",
+            QBIT_CHAIN_FLAG="-chain=main",
+            QBIT_NODE_EXTRA_ARG="-listen=1",
             CKPOOL_NON_TEST_READINESS_GATE="0",
             QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
             QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="456789",
@@ -127,6 +129,27 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS", result.stderr)
         self.assertIn("requires a non-default PRISM_POSTGRES_PASSWORD", result.stderr)
+
+    def test_mainnet_prelaunch_rejects_test_chain_in_qbitd_argv(self) -> None:
+        cases = (
+            {"QBIT_CHAIN_FLAG": "-regtest", "QBIT_NODE_EXTRA_ARG": "-listen=1"},
+            {"QBIT_CHAIN_FLAG": "-chain=main", "QBIT_NODE_EXTRA_ARG": "-signet"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                result = self.run_check_env(
+                    QBIT_PRODUCTION="1",
+                    QBIT_TOOLS_PRODUCTION="1",
+                    QBIT_CHAIN="mainnet",
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                    QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="456789",
+                    **overrides,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("selects a test chain", result.stderr)
+                self.assertNotIn("docker is required", result.stderr)
 
     def test_mainnet_prelaunch_rejects_invalid_tip_age_before_docker_check(self) -> None:
         for value in ("", "0", "-1", "1;echo injected", "9223372036854775808"):
