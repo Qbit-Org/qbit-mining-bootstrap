@@ -50,9 +50,10 @@ compose_env_value() { \
 	}; \
 	operator_build_mode() { \
 		production="$$(compose_env_value QBIT_PRODUCTION 0)"; \
+		tools_production="$$(compose_env_value QBIT_TOOLS_PRODUCTION 0)"; \
 		chain="$$(compose_env_value QBIT_CHAIN regtest)"; \
-		case "$$(printf '%s' "$$production" | tr '[:upper:]' '[:lower:]'):$$chain" in \
-			1:*|true:*|yes:*|on:*|*:main|*:mainnet) printf '%s\n' no-build ;; \
+		case "$$(printf '%s:%s:%s' "$$production" "$$tools_production" "$$chain" | tr '[:upper:]' '[:lower:]')" in \
+			1:*:*|true:*:*|yes:*:*|on:*:*|*:1:*|*:true:*|*:yes:*|*:on:*|*:*:main|*:*:mainnet) printf '%s\n' no-build ;; \
 			*) printf '%s\n' build ;; \
 		esac; \
 	};

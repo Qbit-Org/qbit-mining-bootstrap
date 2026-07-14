@@ -17,6 +17,66 @@ README = ROOT / "README.md"
 
 
 class MakefileLifecycleTests(unittest.TestCase):
+    def resolve_operator_build_mode(
+        self,
+        *,
+        qbit_production: str,
+        qbit_tools_production: str,
+        qbit_chain: str,
+    ) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_compose = root / "fake-compose"
+            fake_compose.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/bin/sh
+                    if [ "${1:-}" = config ] && [ "${2:-}" = --environment ]; then
+                      printf 'QBIT_PRODUCTION=%s\\n' "$FAKE_QBIT_PRODUCTION"
+                      printf 'QBIT_TOOLS_PRODUCTION=%s\\n' "$FAKE_QBIT_TOOLS_PRODUCTION"
+                      printf 'QBIT_CHAIN=%s\\n' "$FAKE_QBIT_CHAIN"
+                      exit 0
+                    fi
+                    exit 9
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_compose.chmod(0o755)
+            wrapper = root / "Makefile"
+            wrapper.write_text(
+                f"include {ROOT / 'Makefile'}\n\n"
+                "print-operator-build-mode:\n"
+                "\t@$(COMPOSE_ENV_HELPERS) operator_build_mode\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "FAKE_QBIT_PRODUCTION": qbit_production,
+                    "FAKE_QBIT_TOOLS_PRODUCTION": qbit_tools_production,
+                    "FAKE_QBIT_CHAIN": qbit_chain,
+                }
+            )
+            result = subprocess.run(
+                [
+                    "make",
+                    "--no-print-directory",
+                    "-s",
+                    "-f",
+                    str(wrapper),
+                    "print-operator-build-mode",
+                    f"COMPOSE={fake_compose}",
+                ],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
     def resolve_compose_env_files(self, *, deploy_env_file: str = "") -> list[str]:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -97,6 +157,29 @@ class MakefileLifecycleTests(unittest.TestCase):
                 re.MULTILINE,
             ),
         )
+
+    def test_operator_build_mode_normalizes_production_and_main_chain_case(self) -> None:
+        cases = (
+            ("0", "0", "Mainnet", "no-build"),
+            ("0", "0", "MAIN", "no-build"),
+            ("TrUe", "0", "regtest", "no-build"),
+            ("0", "YeS", "testnet4", "no-build"),
+            ("0", "0", "signet", "build"),
+        )
+        for qbit_production, qbit_tools_production, qbit_chain, expected in cases:
+            with self.subTest(
+                qbit_production=qbit_production,
+                qbit_tools_production=qbit_tools_production,
+                qbit_chain=qbit_chain,
+            ):
+                self.assertEqual(
+                    self.resolve_operator_build_mode(
+                        qbit_production=qbit_production,
+                        qbit_tools_production=qbit_tools_production,
+                        qbit_chain=qbit_chain,
+                    ),
+                    expected,
+                )
 
     def test_auxpow_real_miner_smoke_uses_deterministic_lab_difficulty(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
