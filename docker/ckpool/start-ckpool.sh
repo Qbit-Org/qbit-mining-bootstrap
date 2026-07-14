@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SUPERVISED_CHILD=0
+if [[ "${1:-}" == "--supervised-child" ]]; then
+  SUPERVISED_CHILD=1
+  shift
+fi
+if (( $# != 0 )); then
+  printf 'unexpected start-ckpool argument: %s\n' "$1" >&2
+  exit 2
+fi
+
 : "${QBIT_RPC_USER:?QBIT_RPC_USER is required}"
 : "${QBIT_RPC_PASSWORD:?QBIT_RPC_PASSWORD is required}"
 : "${QBIT_RPC_HOST:=qbitd}"
@@ -37,16 +47,16 @@ set -euo pipefail
 : "${CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS:=5}"
 : "${CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS:=120}"
 : "${CKPOOL_TEMPLATE_MAX_AGE_SECONDS:=120}"
-: "${CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS:=7200}"
-: "${CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS:=15}"
+: "${CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS:=30}"
+: "${CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS:=5}"
 : "${CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS:=120}"
 : "${CKPOOL_VALIDATE_QBIT_ASSUMPTIONS:=1}"
 : "${CKPOOL_REQUIRE_P2MR_PAYOUT:=}"
 : "${QBIT_EXPECTED_ADDRESS_HRP:=}"
+: "${QBIT_EXPECTED_GENESIS_HASH:=}"
 : "${QBIT_EXPECTED_MAX_BLOCK_WEIGHT:=2000000}"
 : "${QBIT_EXPECTED_WITNESS_SCALE_FACTOR:=1}"
 : "${QBIT_EXPECTED_COINBASE_MATURITY:=1000}"
-: "${QBIT_EXPECTED_GENESIS_HASH:=}"
 
 export QBIT_RPC_USER QBIT_RPC_PASSWORD QBIT_RPC_HOST QBIT_RPC_PORT QBIT_CHAIN QBIT_MINER_WALLET_NAME
 export QBIT_PRODUCTION QBIT_TOOLS_PRODUCTION CKPOOL_STRATUM_PORT
@@ -56,15 +66,12 @@ export CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS CKPOOL_PREFLIGHT_READINESS_TIMEOUT_S
 export CKPOOL_TEMPLATE_MAX_AGE_SECONDS CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS
 export CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS
 export CKPOOL_VALIDATE_QBIT_ASSUMPTIONS CKPOOL_REQUIRE_P2MR_PAYOUT
-export QBIT_EXPECTED_ADDRESS_HRP QBIT_EXPECTED_MAX_BLOCK_WEIGHT
+export QBIT_EXPECTED_ADDRESS_HRP QBIT_EXPECTED_GENESIS_HASH QBIT_EXPECTED_MAX_BLOCK_WEIGHT
 export QBIT_EXPECTED_WITNESS_SCALE_FACTOR QBIT_EXPECTED_COINBASE_MATURITY
-export QBIT_EXPECTED_GENESIS_HASH
-
-# Reject implicit production payouts before file or wallet resolution can hide
-# how the address was supplied.
-qbit-ckpool-preflight --production-gate-only
-
-mkdir -p "$(dirname "${CKPOOL_CONFIG_FILE}")" "${CKPOOL_LOG_DIR}" "${CKPOOL_SOCK_DIR}" "${CKPOOL_STATE_DIR}"
+export CKPOOL_BIN CKPOOL_CONFIG_FILE CKPOOL_LOG_DIR CKPOOL_SOCK_DIR CKPOOL_STATE_DIR
+export QBIT_MINER_ADDRESS_FILE QBIT_MINER_ADDRESS_FILE_WAIT
+export CKPOOL_NOTIFY CKPOOL_BTCSIG CKPOOL_BLOCKPOLL CKPOOL_DONATION
+export CKPOOL_NONCE1LENGTH CKPOOL_NONCE2LENGTH CKPOOL_UPDATE_INTERVAL
 
 json_string() {
   python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"
@@ -243,21 +250,30 @@ if [[ -n "${CKPOOL_MAXDIFF:-}" ]]; then
   printf -v DIFF_FIELDS '%s"maxdiff" : %s,\n' "${DIFF_FIELDS}" "${CKPOOL_MAXDIFF}"
 fi
 
-CKPOOL_VERSION_MASK="$(ckpool-version-mask)"
-export CKPOOL_VERSION_MASK
+if [[ "${SUPERVISED_CHILD}" == "0" ]]; then
+  # Reject implicit production payouts and invalid static policy before wallet,
+  # state, or configuration creation can hide how values were supplied.
+  qbit-ckpool-preflight --production-gate-only
 
-if [[ "${QBIT_MINER_ADDRESS_FILE_WAIT}" == "1" ]]; then
-  for _ in $(seq 1 30); do
-    if [[ -s "${QBIT_MINER_ADDRESS_FILE}" ]]; then
-      QBIT_MINER_ADDRESS="$(<"${QBIT_MINER_ADDRESS_FILE}")"
-      break
-    fi
-    sleep 1
-  done
+  CKPOOL_VERSION_MASK="$(ckpool-version-mask)"
+  export CKPOOL_VERSION_MASK
+
+  if [[ "${QBIT_MINER_ADDRESS_FILE_WAIT}" == "1" ]]; then
+    for _ in $(seq 1 30); do
+      if [[ -s "${QBIT_MINER_ADDRESS_FILE}" ]]; then
+        QBIT_MINER_ADDRESS="$(<"${QBIT_MINER_ADDRESS_FILE}")"
+        break
+      fi
+      sleep 1
+    done
+  fi
+  QBIT_MINER_ADDRESS="$(resolve_miner_address)"
+  export QBIT_MINER_ADDRESS
+  exec qbit-ckpool-preflight --supervise /bin/bash "$0" --supervised-child
 fi
-QBIT_MINER_ADDRESS="$(resolve_miner_address)"
-export QBIT_MINER_ADDRESS
-qbit-ckpool-preflight
+
+: "${QBIT_MINER_ADDRESS:?QBIT_MINER_ADDRESS is required in supervised child}"
+mkdir -p "$(dirname "${CKPOOL_CONFIG_FILE}")" "${CKPOOL_LOG_DIR}" "${CKPOOL_SOCK_DIR}" "${CKPOOL_STATE_DIR}"
 mkdir -p "$(dirname "${QBIT_MINER_ADDRESS_FILE}")"
 printf '%s\n' "${QBIT_MINER_ADDRESS}" > "${QBIT_MINER_ADDRESS_FILE}"
 
@@ -291,5 +307,4 @@ ${DIFF_FIELDS}"logdir" : ${CKPOOL_LOG_DIR_JSON}
 }
 EOF
 
-exec qbit-ckpool-preflight --supervise \
-  "${CKPOOL_BIN}" -B -c "${CKPOOL_CONFIG_FILE}" -k -n qbitlab --sockdir "${CKPOOL_SOCK_DIR}"
+exec "${CKPOOL_BIN}" -B -c "${CKPOOL_CONFIG_FILE}" -k -n qbitlab --sockdir "${CKPOOL_SOCK_DIR}"

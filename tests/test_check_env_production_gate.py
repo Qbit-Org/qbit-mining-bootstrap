@@ -324,6 +324,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         result = self.run_check_env(
             MINING_LANES="ckpool",
             QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
             QBIT_CHAIN="mainnet",
             QBIT_CHAIN_FLAG="-chain=main",
             QBIT_EXPECTED_GENESIS_HASH="11" * 32,
@@ -338,6 +339,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         result = self.run_check_env(
             MINING_LANES="ckpool",
             QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
             QBIT_CHAIN="mainnet",
             QBIT_CHAIN_FLAG="-chain=main",
             QBIT_EXPECTED_GENESIS_HASH="11" * 32,
@@ -346,13 +348,42 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("permits CKPOOL_NON_TEST_READINESS_GATE=0", result.stderr)
+        self.assertNotIn(
+            "requires the explicitly authorized mainnet prelaunch combination",
+            result.stderr,
+        )
         self.assertIn("production CKPool requires an explicit QBIT_MINER_ADDRESS", result.stderr)
+
+    def test_production_mainnet_prelaunch_requires_both_production_flags(self) -> None:
+        for name in ("QBIT_PRODUCTION", "QBIT_TOOLS_PRODUCTION"):
+            flags = {
+                "QBIT_PRODUCTION": "1",
+                "QBIT_TOOLS_PRODUCTION": "1",
+            }
+            flags[name] = "0"
+            with self.subTest(name=name):
+                result = self.run_check_env(
+                    MINING_LANES="ckpool",
+                    QBIT_CHAIN="mainnet",
+                    QBIT_CHAIN_FLAG="-chain=main",
+                    QBIT_EXPECTED_GENESIS_HASH="11" * 32,
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                    **flags,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "requires the explicitly authorized mainnet prelaunch combination",
+                    result.stderr,
+                )
+                self.assertNotIn("docker is required", result.stderr)
 
     def test_production_mainnet_launch_rejects_disabled_readiness(self) -> None:
         result = self.run_check_env(
             MINING_LANES="ckpool",
             QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
             QBIT_CHAIN="mainnet",
             QBIT_CHAIN_FLAG="-chain=main",
             QBIT_EXPECTED_GENESIS_HASH="11" * 32,

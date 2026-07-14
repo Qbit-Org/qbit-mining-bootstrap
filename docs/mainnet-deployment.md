@@ -246,36 +246,41 @@ restartable without interrupting the others.
 ## CKPool Gate
 
 CKPool fetches and publishes its own qbit jobs on its configured update cycle.
-The container wrapper does not compete with that refresh path. It independently
-validates the complete local mining state while supervising the CKPool child
-process: qbit must remain out of IBD, caught up to headers, connected to the
-minimum peer count, on the pinned genesis, and able to return a fresh template
-whose `previousblockhash` matches its active tip. The wrapper retries one
-inconsistent tip/template pair immediately to tolerate an ordinary tip rollover.
-A confirmed unsafe state terminates CKPool and exits nonzero so the service
-supervisor can restart the complete runtime. The local tip comparison detects
-stale or internally inconsistent work; it does not by itself identify a
-coherent network partition.
+The container wrapper independently validates qbit before launching CKPool and
+then supervises the child process. In strict mode, qbit must remain out of IBD,
+connected to the minimum peer count, on the pinned genesis, and able to return a
+fresh template whose `previousblockhash` matches its active tip. A persistent
+failure terminates and reaps CKPool, then exits nonzero so Docker can restart the
+complete runtime. A recovered validation resets the failure timer.
 
 Both qbitd and CKPool use `restart: unless-stopped`, covering unexpected clean
 exits and Docker daemon restarts. `docker compose stop` and `make down` remain
 explicit operator shutdowns and do not delete named volumes.
 
-`CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` sets the validation cadence.
-`CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS` bounds a transient RPC outage and is
-capped by the last fully validated template's remaining lifetime. A template
-and local-tip mismatch gets one immediate retry. IBD, header lag, or insufficient
-peers may recover within the same bounded failure window as an RPC outage,
-which avoids flapping on a momentary header-processing race. Only a fully
-healthy chain, peer, and template observation resets that deadline. Malformed,
-stale, or future-dated templates fail immediately. Each sequential RPC in a
-validation cycle may take up to `CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS` before
-shutdown.
+`CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` sets the validation cadence, and
+`CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS` sets how long a failed validation may
+persist before shutdown. Each RPC may take up to
+`CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS`. The default watchdog poll interval is 5
+seconds, and the default maximum future template time is 30 seconds.
 `CKPOOL_UPDATE_INTERVAL` must be lower than `CKPOOL_TEMPLATE_MAX_AGE_SECONDS`
-so CKPool cannot publish one job beyond that freshness bound. The default
-`CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS=7200` matches qbit's consensus
-maximum-future block window, allowing valid MTP-driven timestamps without
-letting an arbitrary future timestamp bypass the freshness check.
+so CKPool cannot publish one job beyond that freshness bound.
+
+The only relaxed mode is explicitly authorized mainnet prelaunch. It requires
+all five values below; any missing, invalid, or mismatched value fails closed:
+
+```bash
+QBIT_CHAIN=mainnet
+QBIT_PRODUCTION=1
+QBIT_TOOLS_PRODUCTION=1
+CKPOOL_NON_TEST_READINESS_GATE=0
+QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0
+```
+
+Prelaunch still checks static policy, chain and mandatory genesis identity, and
+the explicit payout address. It defers IBD, peer, GBT, freshness, and active-tip
+checks so CKPool can bind its listener and retry GBT while qbitd starts. At
+launch, set both readiness flags to `1` and restart or redeploy CKPool. A running
+supervisor does not hot-reload environment changes.
 
 ## AuxPoW Gate
 

@@ -717,6 +717,8 @@ require_lab_mode() {
 
 check_production_gate() {
   local production_enabled=0
+  local qbit_production=0
+  local qbit_tools_production=0
   local readiness_gate
   local launch_readiness_checks="unset"
 
@@ -754,6 +756,10 @@ check_production_gate() {
   fi
 
   if mining_lane_enabled ckpool; then
+    parse_bool_env QBIT_PRODUCTION "${QBIT_PRODUCTION:-0}"
+    qbit_production="${PARSED_BOOL_ENV}"
+    parse_bool_env QBIT_TOOLS_PRODUCTION "${QBIT_TOOLS_PRODUCTION:-0}"
+    qbit_tools_production="${PARSED_BOOL_ENV}"
     parse_bool_env CKPOOL_NON_TEST_READINESS_GATE "${CKPOOL_NON_TEST_READINESS_GATE:-1}"
     readiness_gate="${PARSED_BOOL_ENV}"
     if [[ -n "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}" ]]; then
@@ -765,8 +771,12 @@ check_production_gate() {
     [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "allow-defaults" ]] || fail "production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=allow-defaults"
     [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "defaults" ]] || fail "production mode rejects CKPOOL_PUBLIC_DIFF_POLICY=defaults"
     if [[ "${readiness_gate}" == "0" ]]; then
-      [[ "${QBIT_CHAIN:-regtest}" == "mainnet" && "${launch_readiness_checks}" == "0" ]] || \
-        fail "QBIT_PRODUCTION=1 permits CKPOOL_NON_TEST_READINESS_GATE=0 only when QBIT_CHAIN=mainnet and QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
+      [[ \
+        "${QBIT_CHAIN:-regtest}" == "mainnet" && \
+        "${qbit_production}" == "1" && \
+        "${qbit_tools_production}" == "1" && \
+        "${launch_readiness_checks}" == "0" \
+      ]] || fail "CKPOOL_NON_TEST_READINESS_GATE=0 requires the explicitly authorized mainnet prelaunch combination: QBIT_PRODUCTION=1, QBIT_TOOLS_PRODUCTION=1, and QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
     fi
     [[ "${CKPOOL_VALIDATE_QBIT_ASSUMPTIONS:-1}" != "0" ]] || fail "production mode rejects CKPOOL_VALIDATE_QBIT_ASSUMPTIONS=0"
     if is_public_qbit_chain "${QBIT_CHAIN:-regtest}"; then

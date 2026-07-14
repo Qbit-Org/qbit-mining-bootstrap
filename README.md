@@ -196,21 +196,37 @@ has at least `CKPOOL_MIN_PEERS` peer connection, exposes the expected qbit GBT
 shape, and receives explicit `CKPOOL_MINDIFF` and `CKPOOL_STARTDIFF` values.
 Regtest keeps the lab-only `1/256` difficulty floor.
 
-On public chains, the CKPool wrapper continues checking qbit's mining state
-while CKPool runs. CKPool remains responsible for its normal job refreshes; the
-wrapper independently confirms that qbit remains synced and peered, the pinned
-genesis still matches, and each fresh template builds on the node's active tip.
-One immediate retry tolerates a normal tip change between RPC calls. A sync or
-peer-readiness loss may recover within the same bounded failure window as an
-RPC transport error, avoiding restarts for a momentary header-processing race.
-`CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS` caps that window, and the last fully
-validated template's remaining lifetime can end it earlier. Template-only
-success does not extend the deadline. Each sequential RPC in a validation cycle
-can consume up to `CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS` before shutdown.
-`CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` controls the check cadence, and
-`CKPOOL_UPDATE_INTERVAL` must remain below the template age limit. The default
-7200-second future bound matches the node's consensus maximum-future block
-window and is separate from the 120-second freshness limit.
+The one launch-only exception is explicitly authorized mainnet prelaunch. It
+requires all five values below; missing, invalid, or mismatched values fail
+closed:
+
+```bash
+QBIT_CHAIN=mainnet
+QBIT_PRODUCTION=1
+QBIT_TOOLS_PRODUCTION=1
+CKPOOL_NON_TEST_READINESS_GATE=0
+QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0
+```
+
+Preflight still checks the RPC chain, the mandatory mainnet genesis hash, static qbit
+assumptions, difficulty policy, and P2MR payout address, but defers launch-only
+IBD, peer, live-template, freshness, and active-tip checks. CKPool remains
+running with its Stratum listener bound and retries GBT until qbitd can serve
+work. At launch, set both readiness flags to `1` and restart or redeploy CKPool;
+the new supervisor then checks IBD, peer count, live-template freshness, and
+active-tip agreement continuously. Runtime environment changes are not
+hot-reloaded by an already-running supervisor.
+`CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` controls the interval and persistent
+failures terminate CKPool after `CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS`.
+
+`qbit-ckpool-preflight` supports three interfaces: no arguments runs the full
+one-shot preflight; `--production-gate-only` runs only stateless production,
+CKPool-knob, and explicit public-difficulty checks without RPC; and
+`--supervise <command> [args...]` runs full initial checks, launches the command
+without a shell, forwards termination signals, and applies the continuous
+watchdog. Mainnet requires `QBIT_EXPECTED_GENESIS_HASH`; other chains may set it
+to pin the connected node's genesis. Template time bounds are
+`CKPOOL_TEMPLATE_MAX_AGE_SECONDS` and `CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS`.
 
 If you want both public mining paths on one host, use:
 

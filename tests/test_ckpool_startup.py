@@ -182,6 +182,8 @@ class CkpoolStartupTests(unittest.TestCase):
                     QBIT_RPC_PASSWORD="not-default",
                     QBIT_MINER_ADDRESS="qb1staticqbitaddress",
                     QBIT_EXPECTED_GENESIS_HASH=value,
+                    CKPOOL_MINDIFF="1024",
+                    CKPOOL_STARTDIFF="65536",
                 )
 
                 self.assertNotEqual(result.returncode, 0)
@@ -261,15 +263,39 @@ class CkpoolStartupTests(unittest.TestCase):
             1,
         )
 
+    def test_compose_passes_supervisor_settings_to_ckpool_service(self) -> None:
+        compose = (ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
+        ckpool_service = compose.split("\n  ckpool:\n", 1)[1].split(
+            "\n  permissionless-miner:\n", 1
+        )[0]
+        settings = {
+            "CKPOOL_TEMPLATE_MAX_AGE_SECONDS": "120",
+            "CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS": "30",
+            "CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS": "5",
+            "CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS": "120",
+            "QBIT_EXPECTED_GENESIS_HASH": "",
+        }
+
+        for name, default in settings.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    ckpool_service.count(f"{name}: ${{{name}:-{default}}}"),
+                    1,
+                )
+
     def test_production_mainnet_prelaunch_starts_with_explicit_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
-            "--chain", "main", "--initialblockdownload"
+            "--chain",
+            "main",
+            "--initialblockdownload",
+            "--reject-gbt-during-ibd",
         ) as rpc:
-            config = self.run_start_ckpool(
+            result, config_file = self.run_start_ckpool_raw(
                 Path(tmp),
                 rpc,
                 QBIT_CHAIN="mainnet",
                 QBIT_PRODUCTION="1",
+                QBIT_TOOLS_PRODUCTION="1",
                 QBIT_RPC_PASSWORD="not-default",
                 QBIT_MINER_ADDRESS="qb1staticqbitaddress",
                 QBIT_EXPECTED_GENESIS_HASH="00" * 32,
@@ -280,7 +306,15 @@ class CkpoolStartupTests(unittest.TestCase):
                 CKPOOL_REQUIRE_P2MR_PAYOUT="1",
             )
 
-        self.assertEqual(config["btcaddress"], "qb1staticqbitaddress")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stderr.count("dynamic getblocktemplate validation deferred"),
+                1,
+            )
+            self.assertIn("initial supervisor checks: PASS", result.stderr)
+            with config_file.open(encoding="utf-8") as handle:
+                config = json.load(handle)
+            self.assertEqual(config["btcaddress"], "qb1staticqbitaddress")
 
     def test_production_mainnet_launch_rejects_disabled_readiness_before_config_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer("--chain", "main") as rpc:
@@ -302,6 +336,19 @@ class CkpoolStartupTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0", result.stderr)
         self.assertFalse(config_file.exists())
+
+    def test_rpc_preflight_failure_happens_before_state_or_config_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+            "--initialblockdownload",
+            "--reject-gbt-during-ibd",
+        ) as rpc:
+            tmpdir = Path(tmp)
+            result, config_file = self.run_start_ckpool_raw(tmpdir, rpc)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("getblocktemplate failed: RPC -10", result.stderr)
+            self.assertFalse(config_file.exists())
+            self.assertFalse((tmpdir / "state" / "miner-address.txt").exists())
 
     def test_public_chain_missing_explicit_diff_fails_before_config_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer() as rpc:

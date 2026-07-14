@@ -35,6 +35,7 @@ class FakeQbitState:
         connections: int = 1,
         weightlimit: int = 2_000_000,
         versionrollingmask: str | None = DEFAULT_VERSION_ROLLING_MASK,
+        reject_gbt_during_ibd: bool = False,
     ) -> None:
         self.bits = bits
         self.target = target
@@ -44,6 +45,7 @@ class FakeQbitState:
         self.connections = connections
         self.weightlimit = weightlimit
         self.versionrollingmask = versionrollingmask
+        self.reject_gbt_during_ibd = reject_gbt_during_ibd
         self.height = 1
         self.requests = 0
         self.submits = 0
@@ -81,6 +83,11 @@ class FakeQbitState:
             }, None
 
         if method == "getblocktemplate":
+            if self.initialblockdownload and self.reject_gbt_during_ibd:
+                return None, {
+                    "code": -10,
+                    "message": "qbit is in initial sync and waiting for blocks",
+                }
             now = int(time.time())
             height = self.height
             template = {
@@ -152,7 +159,7 @@ def build_handler(state: FakeQbitState) -> type[BaseHTTPRequestHandler]:
                 + "\n"
             ).encode("utf-8")
 
-            self.send_response(200)
+            self.send_response(500 if error and error.get("code") == -10 else 200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
@@ -172,6 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-requests", type=int, default=20, help="number of initial RPC methods to print")
     parser.add_argument("--chain", default="regtest")
     parser.add_argument("--initialblockdownload", action="store_true")
+    parser.add_argument("--reject-gbt-during-ibd", action="store_true")
     parser.add_argument("--connections", type=int, default=1)
     parser.add_argument("--weightlimit", type=int, default=2_000_000)
     parser.add_argument(
@@ -193,6 +201,7 @@ def main() -> int:
         connections=args.connections,
         weightlimit=args.weightlimit,
         versionrollingmask=args.versionrollingmask or None,
+        reject_gbt_during_ibd=args.reject_gbt_during_ibd,
     )
     server = ThreadingHTTPServer((args.host, args.port), build_handler(state))
     print(f"fake qbit RPC listening on {args.host}:{args.port}", flush=True)
