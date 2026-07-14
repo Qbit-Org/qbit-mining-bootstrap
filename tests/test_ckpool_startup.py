@@ -207,15 +207,36 @@ class CkpoolStartupTests(unittest.TestCase):
             2,
         )
 
+    def test_compose_passes_supervisor_settings_to_ckpool_services(self) -> None:
+        compose = (ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
+        settings = {
+            "CKPOOL_TEMPLATE_MAX_AGE_SECONDS": "120",
+            "CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS": "30",
+            "CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS": "5",
+            "CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS": "120",
+            "QBIT_EXPECTED_GENESIS_HASH": "",
+        }
+
+        for name, default in settings.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    compose.count(f"{name}: ${{{name}:-{default}}}"),
+                    2,
+                )
+
     def test_production_mainnet_prelaunch_starts_with_explicit_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
-            "--chain", "main", "--initialblockdownload"
+            "--chain",
+            "main",
+            "--initialblockdownload",
+            "--reject-gbt-during-ibd",
         ) as rpc:
-            config = self.run_start_ckpool(
+            result, config_file = self.run_start_ckpool_raw(
                 Path(tmp),
                 rpc,
                 QBIT_CHAIN="mainnet",
                 QBIT_PRODUCTION="1",
+                QBIT_TOOLS_PRODUCTION="1",
                 QBIT_RPC_PASSWORD="not-default",
                 QBIT_MINER_ADDRESS="qb1staticqbitaddress",
                 CKPOOL_MINDIFF="1024",
@@ -225,7 +246,11 @@ class CkpoolStartupTests(unittest.TestCase):
                 CKPOOL_REQUIRE_P2MR_PAYOUT="1",
             )
 
-        self.assertEqual(config["btcaddress"], "qb1staticqbitaddress")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("dynamic getblocktemplate validation deferred", result.stderr)
+            with config_file.open(encoding="utf-8") as handle:
+                config = json.load(handle)
+            self.assertEqual(config["btcaddress"], "qb1staticqbitaddress")
 
     def test_production_mainnet_launch_rejects_disabled_readiness_before_config_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer("--chain", "main") as rpc:

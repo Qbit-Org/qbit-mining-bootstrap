@@ -180,6 +180,36 @@ has at least `CKPOOL_MIN_PEERS` peer connection, exposes the expected qbit GBT
 shape, and receives explicit `CKPOOL_MINDIFF` and `CKPOOL_STARTDIFF` values.
 Regtest keeps the lab-only `1/256` difficulty floor.
 
+The one launch-only exception is explicitly authorized mainnet prelaunch. It
+requires all five values below; missing, invalid, or mismatched values fail
+closed:
+
+```bash
+QBIT_CHAIN=mainnet
+QBIT_PRODUCTION=1
+QBIT_TOOLS_PRODUCTION=1
+CKPOOL_NON_TEST_READINESS_GATE=0
+QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0
+```
+
+Preflight still checks the RPC chain, configured genesis hash, static qbit
+assumptions, difficulty policy, and P2MR payout address, but defers launch-only
+IBD, peer, live-template, freshness, and active-tip checks. CKPool remains
+running with its Stratum listener bound and retries GBT until qbitd can serve
+work. At launch, set both readiness flags to `1`; the supervisor then checks IBD,
+peer count, live-template freshness, and active-tip agreement continuously.
+`CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` controls the interval and persistent
+failures terminate CKPool after `CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS`.
+
+`qbit-ckpool-preflight` supports three interfaces: no arguments runs the full
+one-shot preflight; `--production-gate-only` runs only stateless production,
+CKPool-knob, and explicit public-difficulty checks without RPC; and
+`--supervise <command> [args...]` runs full initial checks, launches the command
+without a shell, forwards termination signals, and applies the continuous
+watchdog. Set `QBIT_EXPECTED_GENESIS_HASH` to pin the connected node's genesis;
+template time bounds are `CKPOOL_TEMPLATE_MAX_AGE_SECONDS` and
+`CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS`.
+
 If you want both public mining paths on one host, use:
 
 ```bash

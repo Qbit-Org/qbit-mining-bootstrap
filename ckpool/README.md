@@ -38,6 +38,35 @@ container defaults `CKPOOL_VERSION_MASK_MODE=dynamic`, so ckpool probes
 `versionrollingmask` fall back to `CKPOOL_VERSION_MASK=1fffe000`. If qbitd
 returns `versionrollingmask=00000000`, ckpool disables BIP310 version rolling.
 For normal production qbit, the node-advertised mask is the source of truth.
+During explicitly authorized mainnet prelaunch, the mask probe uses the
+configured fallback and preflight defers only its live GBT shape check. CKPool's
+generator then keeps retrying GBT every five seconds rather than exiting. Its
+Stratum listener remains bound, but it does not serve mining work until qbitd
+returns a valid template.
+
+### Preflight interfaces
+
+`qbit-ckpool-preflight` with no arguments performs the existing full one-shot
+check. `--production-gate-only` performs stateless production, CKPool-knob, and
+public difficulty-policy checks without constructing an RPC client. Private
+wrappers can run it before creating wallets or files. `--supervise <command>
+[args...]` performs full initial checks, starts the child without shell
+interpolation, forwards SIGTERM/SIGINT, and continuously checks qbit while the
+child lives.
+
+Strict public-chain supervision requires the expected RPC chain, optional
+`QBIT_EXPECTED_GENESIS_HASH`, completed IBD, `CKPOOL_MIN_PEERS`, a fresh live
+template, and a template parent matching the active tip. The watchdog interval,
+failure grace, maximum template age, and maximum future time are configured by
+`CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS`,
+`CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS`, `CKPOOL_TEMPLATE_MAX_AGE_SECONDS`, and
+`CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS`.
+
+The only relaxed mode requires mainnet, both production flags set to `1`, and
+both launch/readiness flags set to `0`. It continuously checks static policy,
+chain/genesis identity, and the payout address, while deferring only IBD, peer,
+GBT, freshness, and active-tip requirements. Switching both readiness flags to
+`1` restores strict checks.
 
 ### Fee and size accounting
 

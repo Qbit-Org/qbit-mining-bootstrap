@@ -5,7 +5,13 @@ from __future__ import annotations
 import contextlib
 import io
 import importlib.util
+import json
+import os
+import signal
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -33,6 +39,11 @@ class FakeRpc:
         address_valid: bool = True,
         iswitness: bool = True,
         witness_version: int | None = 2,
+        template_error: Exception | None = None,
+        genesis_hash: str = "0" * 64,
+        best_block_hash: str = "1" * 64,
+        previous_block_hash: str | None = None,
+        template_time: int | None = None,
     ) -> None:
         self.ibd = ibd
         self.rpc_chain = rpc_chain
@@ -43,6 +54,11 @@ class FakeRpc:
         self.address_valid = address_valid
         self.iswitness = iswitness
         self.witness_version = witness_version
+        self.template_error = template_error
+        self.genesis_hash = genesis_hash
+        self.best_block_hash = best_block_hash
+        self.previous_block_hash = previous_block_hash or best_block_hash
+        self.template_time = int(time.time()) if template_time is None else template_time
         self.calls: list[tuple[str, list[Any]]] = []
 
     def call(self, method: str, params: list[Any] | None = None) -> Any:
@@ -55,7 +71,18 @@ class FakeRpc:
             self.network_info_calls += 1
             return {"connections": self.connections[index]}
         if method == "getblocktemplate":
-            return {"rules": self.template_rules, "weightlimit": self.weightlimit}
+            if self.template_error is not None:
+                raise self.template_error
+            return {
+                "rules": self.template_rules,
+                "weightlimit": self.weightlimit,
+                "previousblockhash": self.previous_block_hash,
+                "curtime": self.template_time,
+            }
+        if method == "getblockhash":
+            return self.genesis_hash
+        if method == "getbestblockhash":
+            return self.best_block_hash
         if method == "validateaddress":
             return {
                 "isvalid": self.address_valid,
@@ -109,6 +136,7 @@ def production_env(**overrides: str) -> dict[str, str]:
 def mainnet_production_env(**overrides: str) -> dict[str, str]:
     env = production_env(
         QBIT_CHAIN="mainnet",
+        QBIT_TOOLS_PRODUCTION="1",
         QBIT_MINER_ADDRESS="qb1miner",
     )
     env.update(overrides)
@@ -116,6 +144,55 @@ def mainnet_production_env(**overrides: str) -> dict[str, str]:
 
 
 class QbitCkpoolPreflightTests(unittest.TestCase):
+    def test_no_argument_cli_preserves_full_preflight(self) -> None:
+        rpc = FakeRpc()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.dict(preflight.os.environ, base_env(), clear=True),
+            mock.patch.object(preflight, "build_rpc_client", return_value=rpc),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = preflight.main([])
+
+        self.assertEqual(returncode, 0)
+        self.assertIn("getblocktemplate", [method for method, _params in rpc.calls])
+        self.assertIn("validateaddress", [method for method, _params in rpc.calls])
+        self.assertIn("PASS", stderr.getvalue())
+
+    def test_production_gate_only_makes_zero_rpc_calls(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(preflight.os.environ, production_env(), clear=True),
+            mock.patch.object(
+                preflight,
+                "build_rpc_client",
+                side_effect=AssertionError("RPC client must not be instantiated"),
+            ) as build_rpc,
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = preflight.main(["--production-gate-only"])
+
+        self.assertEqual(returncode, 0)
+        build_rpc.assert_not_called()
+        self.assertIn("production gate", stderr.getvalue())
+
+    def test_production_gate_only_rejects_implicit_public_difficulty(self) -> None:
+        env = production_env(CKPOOL_MINDIFF_EXPLICIT="0")
+
+        with self.assertRaisesRegex(preflight.PreflightError, "explicit CKPOOL_MINDIFF"):
+            preflight.run_static_preflight(env)
+
+    def test_prelaunch_requires_both_production_flags(self) -> None:
+        env = mainnet_production_env(
+            QBIT_TOOLS_PRODUCTION="0",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+        )
+
+        with self.assertRaisesRegex(preflight.PreflightError, "QBIT_TOOLS_PRODUCTION=1"):
+            preflight.run_static_preflight(env)
+
     def test_regtest_allows_implicit_regtest_difficulty_floor(self) -> None:
         messages = preflight.run_preflight(base_env(), FakeRpc())
 
@@ -177,17 +254,56 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 FakeRpc(ibd=True, rpc_chain="main"),
             )
 
-    def test_production_mainnet_prelaunch_allows_disabled_readiness(self) -> None:
+    def test_production_mainnet_prelaunch_defers_live_template_validation(self) -> None:
+        rpc = FakeRpc(
+            ibd=True,
+            connections=0,
+            rpc_chain="main",
+            template_error=preflight.PreflightError(
+                "getblocktemplate failed: RPC -10: qbit is in initial sync and waiting for blocks"
+            ),
+        )
         messages = preflight.run_preflight(
             mainnet_production_env(
                 CKPOOL_NON_TEST_READINESS_GATE="0",
                 QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
             ),
-            FakeRpc(ibd=True, connections=0, rpc_chain="main"),
+            rpc,
         )
 
         self.assertTrue(any("ckpool=mainnet-prelaunch" in message for message in messages))
         self.assertTrue(any("explicitly relaxed" in message for message in messages))
+        self.assertTrue(any("dynamic getblocktemplate validation deferred" in message for message in messages))
+        self.assertNotIn("getblocktemplate", [method for method, _params in rpc.calls])
+        self.assertIn("validateaddress", [method for method, _params in rpc.calls])
+
+    def test_production_mainnet_prelaunch_still_validates_static_assumptions(self) -> None:
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "QBIT_EXPECTED_MAX_BLOCK_WEIGHT must be 2000000",
+        ):
+            preflight.run_preflight(
+                mainnet_production_env(
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                    QBIT_EXPECTED_MAX_BLOCK_WEIGHT="4000000",
+                ),
+                FakeRpc(ibd=True, rpc_chain="main"),
+            )
+
+    def test_production_mainnet_prelaunch_still_validates_payout_address(self) -> None:
+        rpc = FakeRpc(ibd=True, rpc_chain="main", address_valid=False)
+
+        with self.assertRaisesRegex(preflight.PreflightError, "is not valid"):
+            preflight.run_preflight(
+                mainnet_production_env(
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                ),
+                rpc,
+            )
+
+        self.assertIn("validateaddress", [method for method, _params in rpc.calls])
 
     def test_launch_enabled_rejects_disabled_readiness(self) -> None:
         with self.assertRaisesRegex(
@@ -237,6 +353,26 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
 
         self.assertTrue(any("ckpool=strict" in message for message in messages))
         self.assertTrue(any("ibd=false peers=1" in message for message in messages))
+
+    def test_launch_enabled_requires_live_template_validation(self) -> None:
+        with self.assertRaisesRegex(
+            preflight.PreflightError,
+            "RPC -10: qbit is in initial sync and waiting for blocks",
+        ):
+            preflight.run_preflight(
+                mainnet_production_env(
+                    CKPOOL_NON_TEST_READINESS_GATE="1",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="1",
+                ),
+                FakeRpc(
+                    ibd=False,
+                    rpc_chain="main",
+                    template_error=preflight.PreflightError(
+                        "getblocktemplate failed: RPC -10: "
+                        "qbit is in initial sync and waiting for blocks"
+                    ),
+                ),
+            )
 
     def test_mainnet_prelaunch_still_rejects_rpc_chain_mismatch(self) -> None:
         with self.assertRaisesRegex(preflight.PreflightError, "does not match"):
@@ -390,6 +526,48 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
 
         self.assertTrue(any("qbit assumptions" in message for message in messages))
 
+    def test_other_chains_do_not_defer_live_template_validation(self) -> None:
+        cases = {
+            "regtest": (base_env(), "regtest"),
+            "testnet4": (production_env(), "testnet4"),
+            "signet": (
+                production_env(QBIT_CHAIN="signet", QBIT_MINER_ADDRESS="tq1miner"),
+                "signet",
+            ),
+        }
+        for name, (env, rpc_chain) in cases.items():
+            with self.subTest(chain=name), self.assertRaisesRegex(
+                preflight.PreflightError,
+                "template unavailable",
+            ):
+                preflight.run_preflight(
+                    env,
+                    FakeRpc(
+                        rpc_chain=rpc_chain,
+                        template_error=preflight.PreflightError("template unavailable"),
+                    ),
+                )
+
+    def test_http_500_preserves_json_rpc_error_diagnostics(self) -> None:
+        body = io.BytesIO(
+            b'{"result":null,"error":{"code":-10,"message":'
+            b'"qbit is in initial sync and waiting for blocks"},"id":"preflight"}'
+        )
+        http_error = preflight.error.HTTPError(
+            "http://qbitd:8352",
+            500,
+            "Internal Server Error",
+            {},
+            body,
+        )
+        rpc = preflight.HttpRpcClient("qbitd", "8352", "user", "password", 5.0)
+
+        with mock.patch.object(preflight.request, "urlopen", side_effect=http_error), self.assertRaisesRegex(
+            preflight.PreflightError,
+            "getblocktemplate failed: RPC -10: qbit is in initial sync and waiting for blocks.*HTTP 500",
+        ):
+            rpc.call("getblocktemplate", [{"rules": ["segwit"]}])
+
     def test_rejects_wrong_address_hrp(self) -> None:
         env = base_env(
             QBIT_CHAIN="testnet4",
@@ -441,6 +619,248 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 with self.assertRaises(preflight.PreflightError):
                     preflight.run_preflight(base_env(**overrides), FakeRpc())
+
+
+class QbitCkpoolSupervisorTests(unittest.TestCase):
+    def supervisor_env(self, **overrides: str) -> dict[str, str]:
+        env = base_env(
+            CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="0.01",
+            CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS="0.05",
+        )
+        env.update(overrides)
+        return env
+
+    def test_supervisor_launches_child_and_preserves_arguments_without_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "argv.json"
+            marker = Path(tmp) / "must-not-exist"
+            arguments = ["plain value", f"$(touch {marker})", "; exit 99"]
+            code = "import json,sys; open(sys.argv[1],'w').write(json.dumps(sys.argv[2:]))"
+            command = [sys.executable, "-c", code, str(output), *arguments]
+
+            returncode = preflight.run_supervisor(
+                self.supervisor_env(), FakeRpc(), command
+            )
+
+            self.assertEqual(returncode, 0)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), arguments)
+            self.assertFalse(marker.exists())
+
+    def test_supervisor_propagates_child_exit_code(self) -> None:
+        returncode = preflight.run_supervisor(
+            self.supervisor_env(),
+            FakeRpc(),
+            [sys.executable, "-c", "raise SystemExit(23)"],
+        )
+
+        self.assertEqual(returncode, 23)
+
+    def test_supervisor_requires_a_child_command(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            preflight.main(["--supervise"])
+
+        self.assertEqual(error.exception.code, 2)
+
+    def test_initial_preflight_failure_does_not_launch_child(self) -> None:
+        with mock.patch.object(preflight.subprocess, "Popen") as popen:
+            with self.assertRaises(preflight.PreflightError):
+                preflight.run_supervisor(
+                    self.supervisor_env(CKPOOL_MINDIFF="0"),
+                    FakeRpc(),
+                    ["must-not-run"],
+                )
+
+        popen.assert_not_called()
+
+    def test_strict_watchdog_enforces_ibd_peers_genesis_and_live_template(self) -> None:
+        strict_env = mainnet_production_env(
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="1",
+            CKPOOL_NON_TEST_READINESS_GATE="1",
+            QBIT_EXPECTED_GENESIS_HASH="a" * 64,
+        )
+        cases = {
+            "ibd": (FakeRpc(rpc_chain="main", ibd=True, genesis_hash="a" * 64), "initial block download"),
+            "peers": (
+                FakeRpc(rpc_chain="main", connections=0, genesis_hash="a" * 64),
+                "requires at least 1",
+            ),
+            "genesis": (FakeRpc(rpc_chain="main", genesis_hash="b" * 64), "does not match"),
+            "template": (
+                FakeRpc(
+                    rpc_chain="main",
+                    genesis_hash="a" * 64,
+                    template_error=preflight.PreflightError("getblocktemplate unavailable"),
+                ),
+                "getblocktemplate unavailable",
+            ),
+        }
+
+        for name, (rpc, error_pattern) in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                preflight.PreflightError, error_pattern
+            ):
+                preflight.run_watchdog_check(strict_env, rpc)
+
+    def test_strict_watchdog_enforces_template_time_and_active_tip(self) -> None:
+        env = self.supervisor_env(
+            CKPOOL_TEMPLATE_MAX_AGE_SECONDS="10",
+            CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS="5",
+        )
+        cases = {
+            "stale": (FakeRpc(template_time=int(time.time()) - 11), "is .* old"),
+            "future": (FakeRpc(template_time=int(time.time()) + 6), "in the future"),
+            "wrong-tip": (
+                FakeRpc(previous_block_hash="2" * 64),
+                "does not build on the active tip",
+            ),
+        }
+
+        for name, (rpc, error_pattern) in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                preflight.PreflightError, error_pattern
+            ):
+                preflight.run_watchdog_check(env, rpc)
+
+    def test_prelaunch_watchdog_tolerates_rpc_minus_10_indefinitely(self) -> None:
+        rpc = FakeRpc(
+            rpc_chain="main",
+            ibd=True,
+            template_error=preflight.PreflightError(
+                "getblocktemplate failed: RPC -10: qbit is in initial sync"
+            ),
+        )
+        env = mainnet_production_env(
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+            CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="0.01",
+            CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS="0",
+        )
+
+        returncode = preflight.run_supervisor(
+            env,
+            rpc,
+            [sys.executable, "-c", "import time; time.sleep(0.08); raise SystemExit(7)"],
+        )
+
+        self.assertEqual(returncode, 7)
+        self.assertNotIn("getblocktemplate", [method for method, _params in rpc.calls])
+        self.assertGreaterEqual(
+            [method for method, _params in rpc.calls].count("validateaddress"), 2
+        )
+
+    def test_watchdog_recovers_when_rpc_minus_10_transitions_to_valid_template(self) -> None:
+        class RecoveringRpc(FakeRpc):
+            def __init__(self) -> None:
+                super().__init__()
+                self.template_calls = 0
+
+            def call(self, method: str, params: list[Any] | None = None) -> Any:
+                if method == "getblocktemplate":
+                    self.template_calls += 1
+                    if self.template_calls == 3:
+                        self.calls.append((method, params or []))
+                        raise preflight.PreflightError(
+                            "getblocktemplate failed: RPC -10: temporary initial sync"
+                        )
+                return super().call(method, params)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            returncode = preflight.run_supervisor(
+                self.supervisor_env(CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS="1"),
+                RecoveringRpc(),
+                [sys.executable, "-c", "import time; time.sleep(0.08); raise SystemExit(9)"],
+            )
+
+        self.assertEqual(returncode, 9)
+        self.assertIn("watchdog failure", stderr.getvalue())
+        self.assertIn("watchdog recovered", stderr.getvalue())
+
+    def test_launched_watchdog_exits_after_failure_grace(self) -> None:
+        class FailingRpc(FakeRpc):
+            def __init__(self) -> None:
+                super().__init__()
+                self.template_calls = 0
+
+            def call(self, method: str, params: list[Any] | None = None) -> Any:
+                if method == "getblocktemplate":
+                    self.template_calls += 1
+                    if self.template_calls > 2:
+                        self.calls.append((method, params or []))
+                        raise preflight.PreflightError("template service unavailable")
+                return super().call(method, params)
+
+        started = time.monotonic()
+        returncode = preflight.run_supervisor(
+            self.supervisor_env(CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS="0.03"),
+            FailingRpc(),
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+
+        self.assertEqual(returncode, 1)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_supervisor_forwards_term_and_int_and_reaps_child(self) -> None:
+        from tests.test_ckpool_startup import FakeRpcServer
+
+        child_code = (
+            "import os,signal,sys,time; ready,out=sys.argv[1:]; "
+            "stop=lambda sig,frame:(open(out,'w').write(str(sig)),sys.exit(0)); "
+            "signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop); "
+            "open(ready,'w').write(str(os.getpid())); "
+            "exec('while True:\\n time.sleep(0.02)')"
+        )
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signum=signum), tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+                "--chain",
+                "main",
+                "--initialblockdownload",
+                "--reject-gbt-during-ibd",
+            ) as rpc:
+                ready = Path(tmp) / "ready"
+                received = Path(tmp) / "received"
+                env = mainnet_production_env(
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                    QBIT_RPC_HOST="127.0.0.1",
+                    QBIT_RPC_PORT=str(rpc.port),
+                    CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS="0.02",
+                    CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS="0",
+                )
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(SCRIPT_PATH),
+                        "--supervise",
+                        sys.executable,
+                        "-c",
+                        child_code,
+                        str(ready),
+                        str(received),
+                    ],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    deadline = time.monotonic() + 5
+                    while not ready.exists() and process.poll() is None:
+                        if time.monotonic() >= deadline:
+                            self.fail("supervised child did not start")
+                        time.sleep(0.01)
+                    child_pid = int(ready.read_text(encoding="utf-8"))
+                    process.send_signal(signum)
+                    _stdout, stderr = process.communicate(timeout=5)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+
+                self.assertEqual(process.returncode, 128 + signum, stderr)
+                self.assertEqual(received.read_text(encoding="utf-8"), str(signum))
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
 
 
 if __name__ == "__main__":
