@@ -313,6 +313,23 @@ def require_production_env(name: str) -> str:
     return value
 
 
+def release_provenance_required() -> bool:
+    """Release provenance is unconditional on mainnet; no environment variable
+    may waive it there. Other chains can run production mode while building
+    images from the pinned source, so they enforce provenance only when
+    QBIT_REQUIRE_RELEASE_PROVENANCE opts in."""
+    return env("QBIT_CHAIN", "regtest").lower() in {"main", "mainnet"} or env_bool(
+        "QBIT_REQUIRE_RELEASE_PROVENANCE", "0"
+    )
+
+
+def require_release_provenance_env(name: str) -> str:
+    value = env_optional(name)
+    if value is None:
+        raise SystemExit(f"release provenance requires {name}")
+    return value
+
+
 def prism_capacity_configuration() -> dict[str, str]:
     defaults = {
         "PRISM_STRATUM_SHARE_DIFF": "0.000000001",
@@ -336,21 +353,23 @@ def prism_capacity_configuration() -> dict[str, str]:
 
 
 def validate_prism_capacity_gate() -> None:
-    evidence_path = Path(require_production_env("PRISM_CAPACITY_EVIDENCE_FILE"))
+    evidence_path = Path(require_release_provenance_env("PRISM_CAPACITY_EVIDENCE_FILE"))
     subject = {
-        "coordinator_revision": require_production_env("PRISM_CAPACITY_COORDINATOR_REVISION"),
-        "coordinator_image_digest": require_production_env(
+        "coordinator_revision": require_release_provenance_env(
+            "PRISM_CAPACITY_COORDINATOR_REVISION"
+        ),
+        "coordinator_image_digest": require_release_provenance_env(
             "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST"
         ),
-        "postgres_server_version": require_production_env(
+        "postgres_server_version": require_release_provenance_env(
             "PRISM_CAPACITY_POSTGRES_SERVER_VERSION"
         ),
-        "database_profile_sha256": require_production_env(
+        "database_profile_sha256": require_release_provenance_env(
             "PRISM_CAPACITY_DATABASE_PROFILE_SHA256"
         ),
     }
-    forecast = require_production_env("PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND")
-    p99_limit = require_production_env("PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS")
+    forecast = require_release_provenance_env("PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND")
+    p99_limit = require_release_provenance_env("PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS")
     max_age = env_positive_int("PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS", 86_400)
     try:
         load_capacity_evidence(
@@ -363,7 +382,7 @@ def validate_prism_capacity_gate() -> None:
             enforce_freshness=False,
         )
     except CapacityEvidenceError as exc:
-        raise SystemExit(f"production capacity evidence is invalid: {exc}") from exc
+        raise SystemExit(f"release provenance capacity evidence is invalid: {exc}") from exc
 
 
 def validate_prism_production_gate() -> None:
@@ -417,7 +436,10 @@ def validate_prism_production_gate() -> None:
         require_production_env("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")
         env_positive_int("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT", 0)
 
-    validate_prism_capacity_gate()
+
+def validate_prism_release_provenance_gate() -> None:
+    if release_provenance_required():
+        validate_prism_capacity_gate()
 
 
 def validate_hex(value: str, *, name: str, expected_bytes: int | None = None) -> str:
@@ -959,6 +981,7 @@ def split_worker_username(username: str) -> tuple[str, str | None]:
 class PrismCoordinator:
     def __init__(self) -> None:
         validate_prism_production_gate()
+        validate_prism_release_provenance_gate()
         self.rpc = JsonRpc(
             host=env("QBIT_RPC_HOST"),
             port=env_int("QBIT_RPC_PORT", 18452),

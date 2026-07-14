@@ -8,6 +8,7 @@ ENV_QBIT_PROVIDER="${QBIT_PROVIDER:-}"
 ENV_MINING_LANES="${MINING_LANES:-}"
 ENV_QBIT_PRODUCTION="${QBIT_PRODUCTION:-}"
 ENV_QBIT_TOOLS_PRODUCTION="${QBIT_TOOLS_PRODUCTION:-}"
+ENV_QBIT_REQUIRE_RELEASE_PROVENANCE="${QBIT_REQUIRE_RELEASE_PROVENANCE:-}"
 ENV_QBIT_SRC_DIR="${QBIT_SRC_DIR:-}"
 ENV_QBIT_BIN_DIR="${QBIT_BIN_DIR:-}"
 ENV_QBIT_GIT_URL="${QBIT_GIT_URL:-}"
@@ -133,6 +134,9 @@ if [[ -n "${ENV_QBIT_PRODUCTION}" ]]; then
 fi
 if [[ -n "${ENV_QBIT_TOOLS_PRODUCTION}" ]]; then
   QBIT_TOOLS_PRODUCTION="${ENV_QBIT_TOOLS_PRODUCTION}"
+fi
+if [[ -n "${ENV_QBIT_REQUIRE_RELEASE_PROVENANCE}" ]]; then
+  QBIT_REQUIRE_RELEASE_PROVENANCE="${ENV_QBIT_REQUIRE_RELEASE_PROVENANCE}"
 fi
 if [[ -n "${ENV_QBIT_SRC_DIR}" ]]; then
   QBIT_SRC_DIR="${ENV_QBIT_SRC_DIR}"
@@ -437,6 +441,18 @@ production_mode_enabled() {
   is_true_env "${QBIT_PRODUCTION:-0}" || is_true_env "${QBIT_TOOLS_PRODUCTION:-0}"
 }
 
+# Release provenance (digest-qualified images, absolute host state paths, and
+# fresh PRISM capacity evidence) is unconditional on mainnet: no environment
+# variable may waive it there. Other chains can run production mode while
+# building images from the pinned source, so they enforce provenance only when
+# QBIT_REQUIRE_RELEASE_PROVENANCE opts in.
+release_provenance_required() {
+  if [[ "${QBIT_CHAIN:-regtest}" == "mainnet" ]]; then
+    return 0
+  fi
+  is_true_env "${QBIT_REQUIRE_RELEASE_PROVENANCE:-0}"
+}
+
 is_public_qbit_chain() {
   case "${1}" in
     mainnet|testnet|testnet3|testnet4|signet) return 0 ;;
@@ -466,11 +482,11 @@ check_prism_capacity_evidence() {
   local evidence_file="${PRISM_CAPACITY_EVIDENCE_FILE:-}"
   local output
 
-  [[ -n "${PRISM_STRATUM_SHARE_DIFF:-}" ]] || fail "production mode requires an explicit PRISM_STRATUM_SHARE_DIFF"
-  [[ -n "${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" ]] || fail "production mode requires an explicit PRISM_STRATUM_VARDIFF_MIN_DIFF"
-  [[ -n "${PRISM_STRATUM_VARDIFF_START_DIFF:-}" ]] || fail "production mode requires an explicit PRISM_STRATUM_VARDIFF_START_DIFF"
-  [[ -n "${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" ]] || fail "production mode requires an explicit PRISM_STRATUM_VARDIFF_MAX_DIFF"
-  [[ -n "${evidence_file}" ]] || fail "production mode requires PRISM_CAPACITY_EVIDENCE_FILE"
+  [[ -n "${PRISM_STRATUM_SHARE_DIFF:-}" ]] || fail "release provenance requires an explicit PRISM_STRATUM_SHARE_DIFF"
+  [[ -n "${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" ]] || fail "release provenance requires an explicit PRISM_STRATUM_VARDIFF_MIN_DIFF"
+  [[ -n "${PRISM_STRATUM_VARDIFF_START_DIFF:-}" ]] || fail "release provenance requires an explicit PRISM_STRATUM_VARDIFF_START_DIFF"
+  [[ -n "${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" ]] || fail "release provenance requires an explicit PRISM_STRATUM_VARDIFF_MAX_DIFF"
+  [[ -n "${evidence_file}" ]] || fail "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE"
   if [[ "${evidence_file}" != /* ]]; then
     evidence_file="${ROOT_DIR}/${evidence_file}"
   fi
@@ -510,7 +526,7 @@ check_digest_image() {
   local value="${!name:-}"
 
   [[ "${value}" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || \
-    fail "production mode requires ${name} as a digest-qualified image reference"
+    fail "release provenance requires ${name} as a digest-qualified image reference"
 }
 
 check_private_rpc_binding() {
@@ -602,7 +618,7 @@ check_absolute_storage_source() {
   local value="${!name:-}"
 
   [[ -n "${value}" && "${value}" == /* ]] || \
-    fail "production mode requires ${name} as an absolute host path"
+    fail "release provenance requires ${name} as an absolute host path"
 }
 
 check_distinct_storage_sources() {
@@ -620,7 +636,7 @@ check_distinct_storage_sources() {
       right_value="${!right_name}"
       right_value="${right_value%/}"
       [[ "${left_value}" != "${right_value}" ]] || \
-        fail "production storage sources ${left_name} and ${right_name} must be distinct"
+        fail "release provenance storage sources ${left_name} and ${right_name} must be distinct"
     done
   done
 }
@@ -646,7 +662,7 @@ check_production_deployment_inputs() {
     check_absolute_storage_source PRISM_POSTGRES_WAL_SOURCE
     check_absolute_storage_source PRISM_AUDIT_DATA_SOURCE
     [[ "${PRISM_CAPACITY_EVIDENCE_FILE:-}" == /* ]] || \
-      fail "production mode requires PRISM_CAPACITY_EVIDENCE_FILE as an absolute host path"
+      fail "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE as an absolute host path"
     [[ "${PRISM_COORDINATOR_IMAGE##*@}" == "${PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST:-}" ]] || \
       fail "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST must match PRISM_COORDINATOR_IMAGE"
     storage_names+=(
@@ -741,6 +757,16 @@ check_production_gate() {
   [[ "${QBIT_GIT_COMMIT:-}" =~ ^[[:xdigit:]]{40}$ ]] || fail "production mode requires QBIT_GIT_COMMIT as exactly 40 hex characters"
   if mining_lane_enabled ckpool; then
     [[ "${CKPOOL_GIT_REF:-}" =~ ^[[:xdigit:]]{40}$ ]] || fail "production mode requires CKPOOL_GIT_REF as exactly 40 hex characters"
+  fi
+}
+
+check_release_provenance_gate() {
+  if ! release_provenance_required; then
+    if production_mode_enabled; then
+      printf 'doctor: release provenance not enforced for QBIT_CHAIN=%s; set QBIT_REQUIRE_RELEASE_PROVENANCE=1 to require digest-pinned deployment inputs\n' \
+        "${QBIT_CHAIN:-regtest}"
+    fi
+    return 0
   fi
   if mining_lane_enabled prism; then
     check_prism_capacity_evidence
@@ -888,6 +914,7 @@ if mining_lane_enabled auxpow; then
 fi
 check_ctv_fee_config
 check_production_gate
+check_release_provenance_gate
 if mining_lane_enabled auxpow; then
   check_bitcoin_peer_bootstrap
 fi

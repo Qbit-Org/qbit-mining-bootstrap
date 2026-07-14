@@ -37,6 +37,18 @@ source provider and checks that the staged source is exactly that commit. Follow
 [`bitcoin-release-integrity.md`](bitcoin-release-integrity.md) when changing the
 parent-node release pins.
 
+Validation runs in two tiers. The behavioral production checks (non-default
+credentials, explicit payout addresses, strict difficulty and readiness
+policies, zero stale grace, commit-pinned sources) apply whenever
+`QBIT_PRODUCTION=1`, `QBIT_TOOLS_PRODUCTION=1`, or `QBIT_CHAIN=mainnet`. The
+release-provenance checks (digest-qualified `*_IMAGE` references, absolute
+`*_DATA_SOURCE` host paths, and fresh PRISM capacity evidence) are enforced
+unconditionally on mainnet — no environment variable can disable them there —
+and on other chains only with `QBIT_REQUIRE_RELEASE_PROVENANCE=1`. A
+production pool that builds images from the pinned source in place (for
+example a public testnet4 deployment) runs with that flag unset and keeps
+every behavioral check active.
+
 ## Host And Storage
 
 Size qbit chain data, Bitcoin chain data, Postgres, Postgres WAL, audit

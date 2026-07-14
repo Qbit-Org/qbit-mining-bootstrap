@@ -54,6 +54,7 @@ from lab.prism.prism_coordinator import (
     scaled_target_difficulty,
     target_from_compact,
     validate_prism_production_gate,
+    validate_prism_release_provenance_gate,
 )
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"
@@ -2707,6 +2708,63 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(SystemExit, "PRISM_DATABASE_URL"):
                 validate_prism_production_gate()
+
+    def test_release_provenance_gate_tiers_capacity_validation(self) -> None:
+        capacity = {
+            "PRISM_CAPACITY_EVIDENCE_FILE": "/run/qbit-prism/capacity-evidence.json",
+            "PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND": "100",
+            "PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS": "50",
+            "PRISM_CAPACITY_COORDINATOR_REVISION": "aa" * 20,
+            "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST": "sha256:" + "bb" * 32,
+            "PRISM_CAPACITY_POSTGRES_SERVER_VERSION": "16.4",
+            "PRISM_CAPACITY_DATABASE_PROFILE_SHA256": "cc" * 32,
+        }
+
+        with patch.dict(
+            os.environ,
+            {"QBIT_PRODUCTION": "1", "QBIT_CHAIN": "testnet4"},
+            clear=True,
+        ):
+            validate_prism_release_provenance_gate()
+
+        with patch.dict(
+            os.environ,
+            {"QBIT_CHAIN": "testnet4", "QBIT_REQUIRE_RELEASE_PROVENANCE": "1"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
+            ):
+                validate_prism_release_provenance_gate()
+
+        with patch.dict(
+            os.environ,
+            {"QBIT_CHAIN": "mainnet", "QBIT_REQUIRE_RELEASE_PROVENANCE": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
+            ):
+                validate_prism_release_provenance_gate()
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    **capacity,
+                    "QBIT_CHAIN": "testnet4",
+                    "QBIT_REQUIRE_RELEASE_PROVENANCE": "1",
+                },
+                clear=True,
+            ),
+            patch(
+                "lab.prism.prism_coordinator.load_capacity_evidence"
+            ) as load_evidence,
+        ):
+            validate_prism_release_provenance_gate()
+        load_evidence.assert_called_once()
 
     def test_mainnet_implies_production_gate(self) -> None:
         with patch.dict(

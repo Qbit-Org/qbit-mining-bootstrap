@@ -168,6 +168,15 @@ def production_mode(env: dict[str, str]) -> bool:
     return is_true(env_value(env, "QBIT_PRODUCTION", "0")) or is_true(env_value(env, "QBIT_TOOLS_PRODUCTION", "0"))
 
 
+def release_provenance_required(env: dict[str, str]) -> bool:
+    """Release provenance is unconditional on mainnet; no environment variable
+    may waive it there. Other chains enforce it only when
+    QBIT_REQUIRE_RELEASE_PROVENANCE opts in."""
+    return env_value(env, "QBIT_CHAIN", "regtest") == "mainnet" or is_true(
+        env_value(env, "QBIT_REQUIRE_RELEASE_PROVENANCE", "0")
+    )
+
+
 def parse_decimal(value: str) -> Decimal:
     try:
         return Decimal(value)
@@ -462,11 +471,12 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
                 "reviewed share and bounded vardiff values configured",
             )
 
+    if release_provenance_required(env):
         capacity_path = env_value(env, "PRISM_CAPACITY_EVIDENCE_FILE").strip()
         if not capacity_path:
             reporter.fail(
                 "capacity.evidence",
-                "production requires PRISM_CAPACITY_EVIDENCE_FILE",
+                "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
                 hint="Qualify the deployed Stratum-to-Postgres path before accepting miners.",
             )
         else:
@@ -511,7 +521,10 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
                     f"committed={summary.acknowledged_shares}",
                 )
     else:
-        reporter.pass_("capacity.evidence", "not required outside production")
+        reporter.pass_(
+            "capacity.evidence",
+            "not required without QBIT_CHAIN=mainnet or QBIT_REQUIRE_RELEASE_PROVENANCE=1",
+        )
 
     if env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"):
         try:

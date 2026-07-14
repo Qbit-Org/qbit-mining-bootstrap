@@ -39,6 +39,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         return {
             "MINING_LANES": "prism",
             "QBIT_PRODUCTION": "1",
+            "QBIT_REQUIRE_RELEASE_PROVENANCE": "1",
             "QBIT_CHAIN": "signet",
             "QBIT_CHAIN_FLAG": "-signet",
             "QBIT_GIT_COMMIT": "41" * 20,
@@ -86,6 +87,87 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST": "sha256:" + "b" * 64,
             "PRISM_CAPACITY_POSTGRES_SERVER_VERSION": "16.4",
             "PRISM_CAPACITY_DATABASE_PROFILE_SHA256": "c" * 64,
+        }
+
+    def write_pinned_qbit_checkout(self, root: Path) -> tuple[Path, str]:
+        checkout = root / "qbit"
+        checkout.mkdir()
+        for relative_path in (
+            "CMakeLists.txt",
+            "src/CMakeLists.txt",
+            "test/functional/test_framework/auxpow.py",
+        ):
+            path = checkout / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# test\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+            check=True,
+        )
+        commit = subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        return checkout, commit
+
+    def write_fake_docker(self, root: Path) -> Path:
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        docker.chmod(0o755)
+        return fake_bin
+
+    def production_testnet4_env(self, root: Path) -> dict[str, str]:
+        checkout, commit = self.write_pinned_qbit_checkout(root)
+        fake_bin = self.write_fake_docker(root)
+        return {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "MINING_LANES": "all",
+            "QBIT_PRODUCTION": "1",
+            "QBIT_CHAIN": "testnet4",
+            "QBIT_CHAIN_FLAG": "-testnet4",
+            "BITCOIN_CHAIN": "testnet4",
+            "BITCOIN_CHAIN_FLAG": "-testnet4",
+            "BITCOIN_DNSSEED": "1",
+            "QBIT_GIT_COMMIT": commit,
+            "QBIT_SRC_DIR": str(checkout),
+            "QBIT_SRC_DIR_OVERRIDE": str(checkout),
+            "QBIT_RPC_USER": "qbitrpc",
+            "QBIT_RPC_PASSWORD": "not-default",
+            "QBIT_RPC_PORT_HOST": "127.0.0.1:19552",
+            "BITCOIN_RPC_USER": "bitcoinrpc",
+            "BITCOIN_RPC_PASSWORD": "not-default",
+            "BITCOIN_RPC_PORT_HOST": "127.0.0.1:18443",
+            "QBIT_MINER_ADDRESS": "tq1explicitminer",
+            "BITCOIN_MINER_ADDRESS": "tb1explicitminer",
+            "CKPOOL_GIT_REF": "42" * 20,
+            "CKPOOL_STRATUM_PORT_HOST": "0.0.0.0:3333",
+            "CKPOOL_MINDIFF": "1024",
+            "CKPOOL_STARTDIFF": "65536",
+            "PRISM_DATABASE_URL": "postgresql://example.invalid/qbit",
+            "PRISM_POSTGRES_PASSWORD": "not-default",
+            "PRISM_MANIFEST_SIGNING_SEED_HEX": "42" * 32,
+            "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32,
+            "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX": "44" * 32,
+            "PRISM_LEDGER_WRITER_ID": "managed-writer",
+            "PRISM_LEDGER_WRITER_EPOCH": "7",
+            "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
+            "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
         }
 
     def run_check_env(
@@ -245,6 +327,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         result = self.run_check_env(
             MINING_LANES="ckpool",
             QBIT_PRODUCTION="1",
+            QBIT_REQUIRE_RELEASE_PROVENANCE="1",
             QBIT_CHAIN="signet",
             QBIT_CHAIN_FLAG="-signet",
             QBIT_GIT_COMMIT="41" * 20,
@@ -372,6 +455,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         common = {
             "MINING_LANES": "ckpool",
             "QBIT_PRODUCTION": "1",
+            "QBIT_REQUIRE_RELEASE_PROVENANCE": "1",
             "QBIT_CHAIN": "signet",
             "QBIT_CHAIN_FLAG": "-signet",
             "QBIT_GIT_COMMIT": "41" * 20,
@@ -753,6 +837,77 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             mismatched = self.run_check_env(**{**common, "QBIT_GIT_COMMIT": "ff" * 20})
             self.assertNotEqual(mismatched.returncode, 0)
             self.assertIn("does not match QBIT_GIT_COMMIT", mismatched.stderr)
+
+    def test_production_testnet4_passes_without_release_provenance_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self.production_testnet4_env(Path(temp_dir))
+
+            result = self.run_check_env(**env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "release provenance not enforced for QBIT_CHAIN=testnet4",
+            result.stdout,
+        )
+        self.assertIn("qbit source checkout verified at", result.stdout)
+
+    def test_release_provenance_opt_in_enforces_on_testnet4(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self.production_testnet4_env(Path(temp_dir))
+
+            result = self.run_check_env(**env, QBIT_REQUIRE_RELEASE_PROVENANCE="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
+            result.stderr,
+        )
+        self.assertNotIn("release provenance not enforced", result.stdout)
+
+    def test_mainnet_release_provenance_cannot_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self.production_testnet4_env(Path(temp_dir))
+            env.update(
+                {
+                    "QBIT_CHAIN": "mainnet",
+                    "QBIT_CHAIN_FLAG": "-chain=main",
+                    "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+                    "BITCOIN_CHAIN": "mainnet",
+                    "BITCOIN_CHAIN_FLAG": "-chain=main",
+                    "BITCOIN_EXPECTED_GENESIS_HASH": (
+                        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+                    ),
+                }
+            )
+            for opt_out in ("", "0", "false"):
+                with self.subTest(opt_out=opt_out):
+                    result = self.run_check_env(
+                        **env,
+                        QBIT_REQUIRE_RELEASE_PROVENANCE=opt_out,
+                    )
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
+                        result.stderr,
+                    )
+                    self.assertNotIn("release provenance not enforced", result.stdout)
+
+    def test_release_provenance_opt_in_applies_without_production_mode(self) -> None:
+        result = self.run_check_env(
+            MINING_LANES="ckpool",
+            QBIT_PRODUCTION="0",
+            QBIT_CHAIN="testnet4",
+            QBIT_CHAIN_FLAG="-testnet4",
+            QBIT_REQUIRE_RELEASE_PROVENANCE="1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "release provenance requires QBITD_IMAGE as a digest-qualified image reference",
+            result.stderr,
+        )
+        self.assertNotIn("docker is required", result.stderr)
 
     def test_production_rejects_lab_prism_difficulty_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

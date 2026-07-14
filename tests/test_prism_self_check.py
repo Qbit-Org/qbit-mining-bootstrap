@@ -319,6 +319,7 @@ class PrismSelfCheckTests(unittest.TestCase):
             env.update(
                 {
                     "QBIT_PRODUCTION": "1",
+                    "QBIT_REQUIRE_RELEASE_PROVENANCE": "1",
                     "QBIT_GIT_COMMIT": "41" * 20,
                     "CKPOOL_GIT_REF": "42" * 20,
                     "CPUMINER_GIT_REF": "43" * 20,
@@ -346,6 +347,54 @@ class PrismSelfCheckTests(unittest.TestCase):
         rows = {(row.status, row.name) for row in reporter.rows}
         self.assertIn(("PASS", "mining.production_difficulty"), rows)
         self.assertIn(("PASS", "capacity.evidence"), rows)
+
+    def test_static_checks_skip_capacity_evidence_without_provenance_opt_in(self) -> None:
+        env = self.valid_env()
+        env.update(
+            {
+                "QBIT_PRODUCTION": "1",
+                "QBIT_GIT_COMMIT": "41" * 20,
+                "PRISM_POSTGRES_PASSWORD": "not-default",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_SHARE_DIFF": "1024",
+                "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
+                "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
+                "PRISM_STRATUM_VARDIFF_MAX_DIFF": "65536",
+            }
+        )
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        rows = {(row.status, row.name) for row in reporter.rows}
+        self.assertIn(("PASS", "mining.production_difficulty"), rows)
+        self.assertIn(("PASS", "capacity.evidence"), rows)
+        self.assertNotIn(("FAIL", "capacity.evidence"), rows)
+
+    def test_static_checks_mainnet_requires_capacity_evidence_despite_opt_out(self) -> None:
+        env = self.valid_env()
+        env.update(
+            {
+                "QBIT_CHAIN": "mainnet",
+                "QBIT_CHAIN_FLAG": "-chain=main",
+                "QBIT_EXPECTED_GENESIS_HASH": "AB" * 32,
+                "QBIT_GIT_COMMIT": "41" * 20,
+                "QBIT_REQUIRE_RELEASE_PROVENANCE": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_SHARE_DIFF": "1024",
+                "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
+                "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
+                "PRISM_STRATUM_VARDIFF_MAX_DIFF": "65536",
+            }
+        )
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        self.assertIn(
+            ("FAIL", "capacity.evidence"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
 
     def test_static_checks_reject_lab_production_difficulty(self) -> None:
         env = self.valid_env()
