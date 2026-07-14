@@ -19,6 +19,8 @@ from urllib import request
 
 
 READINESS_POLL_SECONDS = 2.0
+MINING_STATE_SNAPSHOT_ATTEMPTS = 3
+MINING_STATE_SNAPSHOT_RETRY_SECONDS = 1.0
 PUBLIC_CHAINS = {"mainnet", "testnet", "testnet3", "testnet4", "signet"}
 CHAIN_HRPS = {
     "mainnet": "qb",
@@ -519,10 +521,15 @@ def validate_template_response(
         raise TemplateValidationError("getblocktemplate.curtime must be an integer") from exc
     max_age = int_env(env, "CKPOOL_TEMPLATE_MAX_AGE_SECONDS", 120)
     max_future = int_env(env, "CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS", 7200)
+    # Template-policy misconfiguration must fail closed immediately in the
+    # watchdog (TemplateValidationError); a plain PreflightError would ride
+    # the transient-RPC grace window while CKPool keeps mining.
     if max_age <= 0:
-        raise PreflightError("CKPOOL_TEMPLATE_MAX_AGE_SECONDS must be positive on public chains")
+        raise TemplateValidationError(
+            "CKPOOL_TEMPLATE_MAX_AGE_SECONDS must be positive on public chains"
+        )
     if max_future < 0:
-        raise PreflightError("CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS must be non-negative")
+        raise TemplateValidationError("CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS must be non-negative")
     template_age = (int(time.time()) if now is None else now) - template_time
     if template_age > max_age:
         raise TemplateValidationError(
@@ -540,13 +547,21 @@ def validate_template_response(
     )
 
 
-def fetch_and_validate_template(env: dict[str, str], rpc: RpcClient) -> TemplateStatus:
+def fetch_and_validate_template(
+    env: dict[str, str],
+    rpc: RpcClient,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> TemplateStatus:
     chain = chain_name(env)
     if not is_public_chain(chain):
         template = rpc.call("getblocktemplate", [{"rules": gbt_rules(chain)}])
         return validate_template_response(env, template)
 
-    for attempt in range(2):
+    # A block arriving between getblocktemplate and getbestblockhash makes an
+    # innocent snapshot look forked; only a mismatch that persists across
+    # time-separated snapshots is a wedged or forked template builder.
+    for attempt in range(MINING_STATE_SNAPSHOT_ATTEMPTS):
         try:
             template = rpc.call("getblocktemplate", [{"rules": gbt_rules(chain)}])
             status = validate_template_response(env, template)
@@ -558,7 +573,8 @@ def fetch_and_validate_template(env: dict[str, str], rpc: RpcClient) -> Template
                     f"template={previous_block_hash} tip={best_block_hash}"
                 )
         except MiningStateValidationError:
-            if attempt == 0:
+            if attempt + 1 < MINING_STATE_SNAPSHOT_ATTEMPTS:
+                sleep(MINING_STATE_SNAPSHOT_RETRY_SECONDS)
                 continue
             raise
         return status

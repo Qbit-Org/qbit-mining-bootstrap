@@ -440,27 +440,59 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
             best_block_hash=["22" * 32, "22" * 32],
             template_previous_hash=["11" * 32, "22" * 32],
         )
+        delays: list[float] = []
 
-        preflight.fetch_and_validate_template(mainnet_env(), rpc)
+        preflight.fetch_and_validate_template(mainnet_env(), rpc, sleep=delays.append)
 
         self.assertEqual(rpc.template_calls, 2)
         self.assertEqual(rpc.best_block_hash_calls, 2)
+        self.assertEqual(delays, [preflight.MINING_STATE_SNAPSHOT_RETRY_SECONDS])
 
-    def test_template_tip_mismatch_fails_after_one_retry(self) -> None:
+    def test_template_tip_race_tolerates_consecutive_tip_advancements(self) -> None:
+        rpc = FakeRpc(
+            rpc_chain="main",
+            best_block_hash=["22" * 32, "33" * 32, "33" * 32],
+            template_previous_hash=["11" * 32, "22" * 32, "33" * 32],
+        )
+        delays: list[float] = []
+
+        preflight.fetch_and_validate_template(mainnet_env(), rpc, sleep=delays.append)
+
+        self.assertEqual(rpc.template_calls, 3)
+        self.assertEqual(rpc.best_block_hash_calls, 3)
+        self.assertEqual(len(delays), 2)
+
+    def test_template_tip_mismatch_fails_after_persistent_snapshots(self) -> None:
         rpc = FakeRpc(
             rpc_chain="main",
             best_block_hash="22" * 32,
             template_previous_hash="11" * 32,
         )
+        delays: list[float] = []
 
         with self.assertRaisesRegex(
             preflight.MiningStateValidationError,
             "does not match the current qbit tip",
         ):
-            preflight.fetch_and_validate_template(mainnet_env(), rpc)
+            preflight.fetch_and_validate_template(mainnet_env(), rpc, sleep=delays.append)
 
-        self.assertEqual(rpc.template_calls, 2)
-        self.assertEqual(rpc.best_block_hash_calls, 2)
+        self.assertEqual(rpc.template_calls, preflight.MINING_STATE_SNAPSHOT_ATTEMPTS)
+        self.assertEqual(rpc.best_block_hash_calls, preflight.MINING_STATE_SNAPSHOT_ATTEMPTS)
+        self.assertEqual(len(delays), preflight.MINING_STATE_SNAPSHOT_ATTEMPTS - 1)
+
+    def test_template_policy_config_errors_are_template_validation_failures(self) -> None:
+        # Watchdog routing contract: TemplateValidationError fails closed
+        # immediately, while plain PreflightError rides the transient-RPC
+        # grace window with CKPool still mining.
+        for overrides in (
+            {"CKPOOL_TEMPLATE_MAX_AGE_SECONDS": "0"},
+            {"CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS": "-1"},
+        ):
+            with self.assertRaises(preflight.TemplateValidationError):
+                preflight.fetch_and_validate_template(
+                    mainnet_env(**overrides),
+                    FakeRpc(rpc_chain="main"),
+                )
 
     def test_watchdog_rejects_initially_unready_node_before_spawning_child(self) -> None:
         def reject_popen(_command: list[str]) -> FakeChild:
