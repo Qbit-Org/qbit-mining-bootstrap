@@ -545,6 +545,8 @@ def coordinator() -> PrismCoordinator:
     server.stale_share_count = 0
     server.duplicate_share_count = 0
     server.low_difficulty_share_count = 0
+    server.collection_block_submission_count = 0
+    server._pool_ready_latched = False
     server.grace_credited_share_count = 0
     server.idle_retarget_count = 0
     server.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
@@ -5805,9 +5807,12 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 1)
         self.assertEqual(len(ledger.pending), 0)
 
-    def test_collection_only_block_worthy_low_difficulty_submission_is_rejected(self) -> None:
-        # Collection bundles cannot submit blocks, so block-worthiness does
-        # not rescue a below-target share there.
+    def test_collection_only_below_target_block_solve_submits_solver_pays_all(self) -> None:
+        # A collection job's signed bootstrap manifest already commits the
+        # whole coinbase to the submitting worker, so a solved block on a
+        # collection job is submitted (synchronously here, since the share
+        # missed its target) instead of being withheld -- the first block on a
+        # fresh ledger must never be silently ledgered away.
         server, state, ledger = submit_coordinator()
         server.jobs["job-1"].collection_only = True
         submission = SimpleNamespace(
@@ -5816,19 +5821,130 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             share_pass=False,
             block_pass=True,
         )
+        submitted: list[object] = []
+
+        def fake_submit(candidate: object) -> bool:
+            submitted.append(candidate)
+            server.append_accepted_share(
+                candidate.client, candidate.context, candidate.submission, candidate.pending_share
+            )
+            return True
+
+        server.submit_block_candidate = fake_submit  # type: ignore[method-assign]
         with patch(
             "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
             return_value=submission,
         ):
-            with self.assertRaises(StratumError) as raised:
-                server.handle_submit(
-                    state,
-                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
-                )
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
 
-        self.assertEqual(raised.exception.code, 23)
-        self.assertEqual(raised.exception.reason, PRISM_REJECTION_LOW_DIFFICULTY)
-        self.assertEqual(len(ledger.pending), 0)
+        self.assertFalse(should_close)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 0)
+        self.assertEqual(len(submitted), 1)
+        self.assertTrue(submitted[0].credit_share_on_accept)
+        self.assertTrue(submitted[0].context.collection_only)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(server.collection_block_submission_count, 1)
+
+    def test_collection_job_block_solve_is_credited_and_enqueued_not_withheld(self) -> None:
+        # A solved block that also met its share target on a collection job is
+        # credited immediately and queued for the submitter thread, exactly
+        # like a ready-window candidate.
+        server, state, ledger = submit_coordinator()
+        server.jobs["job-1"].collection_only = True
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="cc" * 32,
+            share_pass=True,
+            block_pass=True,
+        )
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(server.block_candidate_queue.qsize(), 1)
+        queued = server.block_candidate_queue.get_nowait()
+        self.assertTrue(queued.context.collection_only)
+        self.assertFalse(queued.credit_share_on_accept)
+        self.assertEqual(server.collection_block_submission_count, 1)
+
+    def test_block_candidate_intent_round_trips_collection_flag(self) -> None:
+        server, state, _ledger = submit_coordinator()
+        server.jobs["job-1"].collection_only = True
+        pending = PendingShare(
+            share_id="miner-a:" + "dd" * 32,
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=9,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=2,
+            ntime=1,
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="00",
+            block_hash_hex="dd" * 32,
+            block_hex="00",
+            share_pass=True,
+            block_pass=True,
+        )
+        candidate = block_candidate(server, state, submission, pending_share=pending)
+
+        intent = server.block_candidate_intent(candidate)
+        self.assertIs(intent["collection_only"], True)
+        self.assertTrue(server.block_candidate_from_intent(intent).context.collection_only)
+
+        # Intents persisted before the flag existed replay as ready-window
+        # candidates, which is all the outbox could ever have contained then.
+        intent.pop("collection_only")
+        self.assertFalse(server.block_candidate_from_intent(intent).context.collection_only)
+
+    def test_ready_pool_refreshes_clients_left_on_collection_jobs(self) -> None:
+        # Once the pool crosses min_ready_miners, the poller must replace
+        # collection jobs with windowed work even when the template snapshot
+        # is otherwise unchanged -- readiness itself is invisible to the
+        # template fingerprint.
+        server, state, _ledger = submit_coordinator()
+        tip = "00" * 32
+        snapshot = SimpleNamespace(
+            bestblockhash=tip,
+            previousblockhash=tip,
+            template_fingerprint="fp",
+        )
+        context = SimpleNamespace(
+            template={"previousblockhash": tip},
+            template_fingerprint="fp",
+            collection_only=True,
+        )
+        state.active_job = context
+
+        server.min_ready_miners = 1
+        server.accepted_share_stats = lambda: (0, 0)  # type: ignore[method-assign]
+        self.assertFalse(server.pool_readiness_latched())
+        self.assertFalse(server.client_needs_tip_template_refresh(state, snapshot))
+
+        server.accepted_share_stats = lambda: (1, 1)  # type: ignore[method-assign]
+        self.assertTrue(server.pool_readiness_latched())
+        self.assertTrue(server.client_needs_tip_template_refresh(state, snapshot))
+
+        # Readiness is monotonic: once latched the ledger is never consulted
+        # again, and ready (non-collection) jobs still need no refresh.
+        server.accepted_share_stats = None  # type: ignore[assignment]
+        self.assertTrue(server.pool_readiness_latched())
+        context.collection_only = False
+        self.assertFalse(server.client_needs_tip_template_refresh(state, snapshot))
 
 
 if __name__ == "__main__":

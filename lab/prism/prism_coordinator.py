@@ -1161,6 +1161,8 @@ class PrismCoordinator:
         self.stale_share_count = 0
         self.duplicate_share_count = 0
         self.low_difficulty_share_count = 0
+        self.collection_block_submission_count = 0
+        self._pool_ready_latched = False
         self.grace_credited_share_count = 0
         self.idle_retarget_count = 0
         self.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
@@ -2437,6 +2439,7 @@ class PrismCoordinator:
         try:
             snapshot = self.fetch_qbit_tip_template_snapshot()
             self.observe_tip_first_seen(snapshot.bestblockhash)
+            self.pool_readiness_latched()
             if not self.ensure_reorg_reconciled_for_tip(snapshot.bestblockhash):
                 raise TemplateRefreshBlocked(
                     "qbit chain view remained untrusted after reorg reconciliation"
@@ -2960,6 +2963,24 @@ class PrismCoordinator:
     def client_can_receive_jobs(self, client: ClientState) -> bool:
         return client.subscribed and client.authorized and client.worker is not None
 
+    def pool_readiness_latched(self) -> bool:
+        """Latch, once, the transition past min_ready_miners.
+
+        Readiness is monotonic (a lifetime distinct-accepted-miner count), so
+        a single observation is permanent and later checks stay ledger-free.
+        The poll loop refreshes the latch outside the coordinator lock.
+        """
+        if getattr(self, "_pool_ready_latched", False):
+            return True
+        try:
+            _, ready_miner_count = self.accepted_share_stats()
+        except Exception:
+            return False
+        if ready_miner_count >= getattr(self, "min_ready_miners", 3):
+            self._pool_ready_latched = True
+            return True
+        return False
+
     def client_needs_tip_template_refresh(
         self,
         client: ClientState,
@@ -2967,6 +2988,13 @@ class PrismCoordinator:
     ) -> bool:
         context = client.active_job
         if context is None:
+            return True
+        if getattr(context, "collection_only", False) and getattr(
+            self, "_pool_ready_latched", False
+        ):
+            # The pool crossed min_ready_miners after this job was issued.
+            # A collection job keeps settling solved blocks solver-pays-all,
+            # so replace it with windowed work on the next poller pass.
             return True
         template = context.template
         previousblockhash = str(template.get("previousblockhash", ""))
@@ -3693,12 +3721,27 @@ class PrismCoordinator:
         # qbit network target while network difficulty sits below the floor,
         # so a submission can solve a block yet miss the share target. Never
         # discard a block over share bookkeeping: reject as low-difficulty
-        # only when the hash is not block-worthy.
+        # only when the hash is not block-worthy. Collection-mode jobs are
+        # block-worthy too: their signed bootstrap manifest already commits
+        # the whole coinbase to the submitting worker, so the solve settles
+        # solver-pays-all instead of being silently ledgered as a share -- a
+        # fresh ledger would otherwise withhold every solved block until some
+        # later job delivery, stalling a bootstrapping chain.
         block_worthy = (
             submission.block_pass
-            and not context.collection_only
             and credit_policy != PRISM_CREDIT_POLICY_STALE_GRACE
         )
+        if block_worthy and context.collection_only:
+            with self.lock:
+                self.collection_block_submission_count = (
+                    getattr(self, "collection_block_submission_count", 0) + 1
+                )
+            print(
+                f"prism coordinator: collection-mode block candidate settles "
+                f"solver-pays-all miner={context.worker.payout_address} "
+                f"hash={submission.block_hash_hex}",
+                flush=True,
+            )
         if not submission.share_pass and not block_worthy:
             self.reject_stratum(
                 23,
@@ -3842,6 +3885,7 @@ class PrismCoordinator:
             "username": candidate.client.username,
             "pending_share": dataclasses.asdict(candidate.pending_share),
             "credit_share_on_accept": candidate.credit_share_on_accept,
+            "collection_only": bool(context.collection_only),
         }
         # Fail on the client thread before committing a share if a future field
         # introduces a value that cannot survive the durable JSON boundary.
@@ -3882,7 +3926,7 @@ class PrismCoordinator:
             prior_balances=list(intent["prior_balances"]),
             found_block=dict(intent["found_block"]),
             share_weight=0,
-            collection_only=False,
+            collection_only=bool(intent.get("collection_only", False)),
             worker=WorkerIdentity(
                 username=str(intent["username"]),
                 payout_address="",
@@ -5335,6 +5379,9 @@ class PrismCoordinator:
             "# HELP qbit_prism_low_difficulty_shares_total Low-difficulty Stratum shares rejected.",
             "# TYPE qbit_prism_low_difficulty_shares_total counter",
             f"qbit_prism_low_difficulty_shares_total {self.low_difficulty_share_count}",
+            "# HELP qbit_prism_collection_block_submissions_total Solver-pays-all block candidates submitted from collection-mode jobs.",
+            "# TYPE qbit_prism_collection_block_submissions_total counter",
+            f"qbit_prism_collection_block_submissions_total {getattr(self, 'collection_block_submission_count', 0)}",
             "# HELP qbit_prism_grace_credited_shares_total Accepted shares credited by the stale-grace policy.",
             "# TYPE qbit_prism_grace_credited_shares_total counter",
             f"qbit_prism_grace_credited_shares_total {grace_credited_share_count}",

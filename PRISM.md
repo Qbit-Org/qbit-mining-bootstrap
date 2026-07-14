@@ -236,6 +236,16 @@ only when both `job_issued_at <= anchor_job_issued_at` and
 `accepted_at <= anchor_job_issued_at`. That prevents a delayed old-job share
 from appearing after the found-block anchor and changing the published split.
 
+Before the ledger has accepted shares from `PRISM_MIN_READY_MINERS` distinct
+miners, jobs run in collection mode: the audit bundle's window is a single
+synthetic bootstrap share for the connecting worker, so its signed coinbase
+manifest pays that worker the whole reward. A block solved on a collection job
+is submitted like any other and settles solver-pays-all (counted by
+`qbit_prism_collection_block_submissions_total`); the shares collected
+meanwhile stay ledgered and enter the window of the next ready block. Once the
+pool crosses the readiness threshold, the template poller replaces outstanding
+collection jobs with windowed work on its next pass.
+
 ## Payout Policy
 
 PRISM separates three concepts that are easy to conflate:
