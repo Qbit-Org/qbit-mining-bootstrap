@@ -203,6 +203,20 @@ hot-reloaded by an already-running supervisor.
 `CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS` controls the interval and persistent
 failures terminate CKPool after `CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS`.
 
+If mainnet still contains only a genesis block older than qbitd's normal tip-age
+window, qbitd remains in IBD and `getblocktemplate` cannot provide the first
+mining job. For that bootstrap case only, set
+`QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS` to a positive number of seconds
+explicitly reviewed against the genesis age and planned launch window. The
+qbitd startup wrapper adds `-maxtipage=<seconds>` only when
+`QBIT_PRODUCTION=1`, `QBIT_CHAIN=mainnet`, and
+`QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0`; existing arguments such as
+`QBIT_NODE_EXTRA_ARG=-listen=1` remain separate and unchanged. Flipping only
+the launch flag to `1` and restarting removes the generated argument even if
+the duration remains configured, returning qbitd to its normal tip-age policy.
+This is a temporary first-block bootstrap control, not a permanent production
+setting; leave it unset when no reviewed override is required.
+
 `qbit-ckpool-preflight` supports three interfaces: no arguments runs the full
 one-shot preflight; `--production-gate-only` runs only stateless production,
 CKPool-knob, and explicit public-difficulty checks without RPC; and

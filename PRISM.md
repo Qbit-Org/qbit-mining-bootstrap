@@ -501,6 +501,26 @@ Static-only checks, before the stack is live:
 python3 scripts/prism-self-check.py --skip-live
 ```
 
+For an explicitly authorized mainnet prelaunch,
+`QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0` changes only three expected
+launch-dependent conditions from FAIL to WARN: qbitd still being in IBD, the
+high-diff listener not yet advertising its first `mining.set_difficulty`, and
+the coordinator having fewer than `PRISM_MIN_READY_MINERS` ready miners. Chain
+identity (including the normal `QBIT_CHAIN=mainnet` / RPC `chain=main` naming),
+secrets, Postgres, fee policy, listener reachability, and every other check
+remain active and fatal. Set the flag to `1` at launch to make all three strict
+again. An unset flag keeps the legacy strict behavior; malformed values fail
+the self-check rather than authorizing prelaunch.
+
+When a stale genesis is itself keeping qbitd in IBD and preventing the first
+template, an operator may also set the reviewed, positive
+`QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS` duration. The qbitd wrapper turns
+that value into one `-maxtipage=<seconds>` argument only for production mainnet
+with launch readiness explicitly disabled. Review it against genesis age and
+the planned launch window. After the first-block bootstrap, set the launch flag
+to `1` and restart; the wrapper then omits the argument and restores qbitd's
+normal tip-age policy even if the duration remains in the environment.
+
 Stop services with normal Docker Compose controls or `make down`. The Makefile
 intentionally keeps PRISM Postgres volume cleanup out of broad all-profile
 cleanup because the ledger is operator state.

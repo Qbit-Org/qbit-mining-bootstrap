@@ -66,6 +66,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build-from-source /opt/qbit/bin/qbitd /usr/local/bin/qbitd
 COPY --from=build-from-source /opt/qbit/bin/qbit-cli /usr/local/bin/qbit-cli
+COPY --chmod=0755 docker/qbit/qbit-entrypoint.sh /usr/local/bin/qbit-entrypoint.sh
 
-ENTRYPOINT ["/usr/bin/tini", "--", "qbitd"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/qbit-entrypoint.sh"]
 CMD ["-printtoconsole"]

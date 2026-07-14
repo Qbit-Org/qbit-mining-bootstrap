@@ -36,6 +36,7 @@ class PrismComposeProfileTests(unittest.TestCase):
         env.update(
             {
                 "QBIT_SRC_DIR": str(ROOT),
+                "QBIT_NODE_EXTRA_ARG": "-listen=1",
                 "PRISM_STRATUM_PORT": "43340",
                 "PRISM_STRATUM_PORT_HOST": "127.0.0.1:43340",
                 "PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://public-pool.example:3335",
@@ -102,6 +103,20 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertIn("qbitd", services)
         self.assertIn("prism-postgres", services)
         self.assertIn("prism-coordinator", services)
+
+    def test_qbit_prelaunch_tip_age_is_absent_by_default(self) -> None:
+        env = self.config["services"]["qbitd"]["environment"]
+
+        self.assertEqual(env["QBIT_PRODUCTION"], "0")
+        self.assertEqual(env["QBIT_CHAIN"], "regtest")
+        self.assertEqual(env["QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"], "")
+        self.assertIsNone(env["QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"])
+
+    def test_qbit_extra_argument_remains_one_independent_argv_entry(self) -> None:
+        command = self.config["services"]["qbitd"]["command"]
+
+        self.assertIn("-listen=1", command)
+        self.assertEqual(command.count("-listen=1"), 1)
 
     def test_prism_coordinator_gets_required_environment(self) -> None:
         env = self._service_environment("prism-coordinator")

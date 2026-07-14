@@ -89,6 +89,23 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "regtest",
             )
 
+    def test_missing_launch_readiness_flag_defaults_to_strict(self) -> None:
+        self.assertTrue(self.self_check.launch_readiness_checks_enabled({"QBIT_CHAIN": "mainnet"}))
+
+    def test_static_checks_fail_malformed_launch_readiness_flag(self) -> None:
+        env = self.valid_env()
+        env["QBIT_CHAIN"] = "mainnet"
+        env["QBIT_CHAIN_FLAG"] = ""
+        env["QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"] = "prelaunch"
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        self.assertIn(
+            ("FAIL", "env.QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
     def test_static_checks_accept_valid_prism_operator_env(self) -> None:
         reporter = self.self_check.Reporter()
 
@@ -194,6 +211,43 @@ class PrismSelfCheckTests(unittest.TestCase):
             {(row.status, row.name) for row in reporter.rows},
         )
 
+    def test_ready_miner_threshold_is_nonfatal_during_mainnet_prelaunch(self) -> None:
+        env = self.valid_env()
+        env.update(
+            {
+                "QBIT_CHAIN": "mainnet",
+                "PRISM_MIN_READY_MINERS": "1",
+                "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
+            }
+        )
+        reporter = self.self_check.Reporter()
+
+        self.self_check.check_ready_miner_threshold({"ready_miner_count": 0}, env, reporter)
+
+        self.assertFalse(reporter.failed)
+        rows = [row for row in reporter.rows if row.name == "coordinator.ready_miners"]
+        self.assertEqual([row.status for row in rows], ["WARN"])
+        self.assertIn("tolerated only", rows[0].detail)
+
+    def test_ready_miner_threshold_is_fatal_after_mainnet_launch(self) -> None:
+        env = self.valid_env()
+        env.update(
+            {
+                "QBIT_CHAIN": "mainnet",
+                "PRISM_MIN_READY_MINERS": "1",
+                "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "1",
+            }
+        )
+        reporter = self.self_check.Reporter()
+
+        self.self_check.check_ready_miner_threshold({"ready_miner_count": 0}, env, reporter)
+
+        self.assertTrue(reporter.failed)
+        self.assertIn(
+            ("FAIL", "coordinator.ready_miners"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
     def test_ready_miner_threshold_passes_when_minimum_met(self) -> None:
         env = self.valid_env()
         env["PRISM_MIN_READY_MINERS"] = "3"
@@ -225,6 +279,135 @@ class PrismSelfCheckTests(unittest.TestCase):
             ("FAIL", "qbit.peers"),
             {(row.status, row.name) for row in reporter.rows},
         )
+
+    def test_mainnet_rpc_chain_name_main_matches_configured_mainnet(self) -> None:
+        reporter = self.self_check.Reporter()
+
+        def fake_qbit_rpc_call(env: dict[str, str], method: str) -> object:
+            if method == "getblockchaininfo":
+                return {"chain": "main", "initialblockdownload": False}
+            if method == "getnetworkinfo":
+                return {"connections": 1}
+            raise AssertionError(method)
+
+        with patch.object(self.self_check, "qbit_rpc_call", fake_qbit_rpc_call):
+            self.self_check.qbit_live_checks({"QBIT_CHAIN": "mainnet"}, reporter)
+
+        self.assertFalse(reporter.failed)
+        self.assertIn(
+            ("PASS", "qbit.rpc_chain"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
+    def test_mainnet_rpc_chain_mismatch_remains_fatal(self) -> None:
+        reporter = self.self_check.Reporter()
+
+        def fake_qbit_rpc_call(env: dict[str, str], method: str) -> object:
+            if method == "getblockchaininfo":
+                return {"chain": "testnet4", "initialblockdownload": False}
+            if method == "getnetworkinfo":
+                return {"connections": 1}
+            raise AssertionError(method)
+
+        env = {
+            "QBIT_CHAIN": "mainnet",
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
+        }
+        with patch.object(self.self_check, "qbit_rpc_call", fake_qbit_rpc_call):
+            self.self_check.qbit_live_checks(env, reporter)
+
+        self.assertTrue(reporter.failed)
+        self.assertIn(
+            ("FAIL", "qbit.rpc_chain"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
+    def test_ibd_is_nonfatal_during_mainnet_prelaunch(self) -> None:
+        reporter = self.self_check.Reporter()
+
+        def fake_qbit_rpc_call(env: dict[str, str], method: str) -> object:
+            if method == "getblockchaininfo":
+                return {"chain": "main", "initialblockdownload": True}
+            if method == "getnetworkinfo":
+                return {"connections": 1}
+            raise AssertionError(method)
+
+        env = {
+            "QBIT_CHAIN": "mainnet",
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
+        }
+        with patch.object(self.self_check, "qbit_rpc_call", fake_qbit_rpc_call):
+            self.self_check.qbit_live_checks(env, reporter)
+
+        self.assertFalse(reporter.failed)
+        self.assertIn(
+            ("WARN", "qbit.ibd"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
+    def test_ibd_is_fatal_after_mainnet_launch(self) -> None:
+        reporter = self.self_check.Reporter()
+
+        def fake_qbit_rpc_call(env: dict[str, str], method: str) -> object:
+            if method == "getblockchaininfo":
+                return {"chain": "main", "initialblockdownload": True}
+            if method == "getnetworkinfo":
+                return {"connections": 1}
+            raise AssertionError(method)
+
+        env = {
+            "QBIT_CHAIN": "mainnet",
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "1",
+        }
+        with patch.object(self.self_check, "qbit_rpc_call", fake_qbit_rpc_call):
+            self.self_check.qbit_live_checks(env, reporter)
+
+        self.assertTrue(reporter.failed)
+        self.assertIn(
+            ("FAIL", "qbit.ibd"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
+    def test_missing_launch_flag_keeps_ibd_fatal(self) -> None:
+        reporter = self.self_check.Reporter()
+
+        def fake_qbit_rpc_call(env: dict[str, str], method: str) -> object:
+            if method == "getblockchaininfo":
+                return {"chain": "main", "initialblockdownload": True}
+            if method == "getnetworkinfo":
+                return {"connections": 1}
+            raise AssertionError(method)
+
+        with patch.object(self.self_check, "qbit_rpc_call", fake_qbit_rpc_call):
+            self.self_check.qbit_live_checks({"QBIT_CHAIN": "mainnet"}, reporter)
+
+        self.assertTrue(reporter.failed)
+        self.assertIn(
+            ("FAIL", "qbit.ibd"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
+    def test_unrelated_peer_failure_remains_fatal_during_mainnet_prelaunch(self) -> None:
+        reporter = self.self_check.Reporter()
+
+        def fake_qbit_rpc_call(env: dict[str, str], method: str) -> object:
+            if method == "getblockchaininfo":
+                return {"chain": "main", "initialblockdownload": True}
+            if method == "getnetworkinfo":
+                return {"connections": 0}
+            raise AssertionError(method)
+
+        env = {
+            "QBIT_CHAIN": "mainnet",
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
+        }
+        with patch.object(self.self_check, "qbit_rpc_call", fake_qbit_rpc_call):
+            self.self_check.qbit_live_checks(env, reporter)
+
+        self.assertTrue(reporter.failed)
+        statuses = {(row.status, row.name) for row in reporter.rows}
+        self.assertIn(("WARN", "qbit.ibd"), statuses)
+        self.assertIn(("FAIL", "qbit.peers"), statuses)
 
 
 class HighdiffFloorProbeTests(unittest.TestCase):
@@ -330,6 +513,41 @@ class HighdiffFloorProbeTests(unittest.TestCase):
         rows = self.floor_rows(reporter)
         self.assertEqual([row.status for row in rows], ["FAIL"])
         self.assertIn("mining.set_difficulty", rows[0].detail)
+
+    def test_missing_difficulty_is_nonfatal_during_mainnet_prelaunch(self) -> None:
+        port = self.fake_stratum_server([{"id": None, "method": "mining.notify", "params": []}])
+        env = self.probe_env()
+        env.update(
+            {
+                "QBIT_CHAIN": "mainnet",
+                "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
+            }
+        )
+        reporter = self.self_check.Reporter()
+
+        self.self_check.check_highdiff_advertised_floor(env, "127.0.0.1", port, reporter)
+
+        rows = self.floor_rows(reporter)
+        self.assertFalse(reporter.failed)
+        self.assertEqual([row.status for row in rows], ["WARN"])
+        self.assertIn("tolerated only", rows[0].detail)
+
+    def test_missing_difficulty_is_fatal_after_mainnet_launch(self) -> None:
+        port = self.fake_stratum_server([{"id": None, "method": "mining.notify", "params": []}])
+        env = self.probe_env()
+        env.update(
+            {
+                "QBIT_CHAIN": "mainnet",
+                "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "1",
+            }
+        )
+        reporter = self.self_check.Reporter()
+
+        self.self_check.check_highdiff_advertised_floor(env, "127.0.0.1", port, reporter)
+
+        rows = self.floor_rows(reporter)
+        self.assertTrue(reporter.failed)
+        self.assertEqual([row.status for row in rows], ["FAIL"])
 
 
 if __name__ == "__main__":

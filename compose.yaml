@@ -9,6 +9,11 @@ services:
         qbit-src: ${QBIT_SRC_DIR:?Set an absolute QBIT_SRC_DIR}
       args:
         UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
+    environment:
+      QBIT_PRODUCTION: ${QBIT_PRODUCTION:-0}
+      QBIT_CHAIN: ${QBIT_CHAIN:-regtest}
+      QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED: ${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}
+      QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS:
     command:
       - -printtoconsole
       - -conf=/etc/qbit/qbit.conf

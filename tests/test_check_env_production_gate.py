@@ -84,6 +84,48 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"{name} must be a true/false style value", result.stderr)
 
+    def test_mainnet_prelaunch_accepts_valid_reviewed_tip_age(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+            QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="456789",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS", result.stderr)
+        self.assertIn("requires a non-default PRISM_POSTGRES_PASSWORD", result.stderr)
+
+    def test_mainnet_prelaunch_rejects_invalid_tip_age_before_docker_check(self) -> None:
+        for value in ("", "0", "-1", "1;echo injected", "9223372036854775808"):
+            with self.subTest(value=value):
+                result = self.run_check_env(
+                    QBIT_PRODUCTION="1",
+                    QBIT_CHAIN="mainnet",
+                    QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+                    QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS=value,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS", result.stderr)
+                self.assertNotIn("docker is required", result.stderr)
+
+    def test_tip_age_rejects_incompatible_chain_or_production_mode(self) -> None:
+        cases = (
+            {"QBIT_PRODUCTION": "0", "QBIT_CHAIN": "mainnet"},
+            {"QBIT_PRODUCTION": "1", "QBIT_CHAIN": "signet", "QBIT_CHAIN_FLAG": "-signet"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                result = self.run_check_env(
+                    QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="456789",
+                    **overrides,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS", result.stderr)
+                self.assertNotIn("docker is required", result.stderr)
+
     def test_non_mainnet_production_rejects_mainnet_launch_flag(self) -> None:
         result = self.run_check_env(
             QBIT_PRODUCTION="1",
