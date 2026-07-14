@@ -348,6 +348,39 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="cd" * 32))
         self.assertEqual(ledger.pending_block_candidates(), [])
 
+    def test_candidate_retry_with_new_acknowledgment_stamp_is_idempotent(self) -> None:
+        # A miner can resubmit the same solved block after a transient submit
+        # outcome, and the rebuilt intent differs from the persisted one only
+        # in pending_share.accepted_at_ms. The outbox must treat that as the
+        # same work and keep the first payload authoritative, while any other
+        # divergence stays a hard payload mismatch.
+        ledger = SingleWriterShareLedger()
+        share = pending_share(1, accepted_at_ms=2_000)
+        intent = {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": "ef" * 32,
+            "block_hex": "00",
+            "pending_share": dict(share.__dict__),
+            "credit_share_on_accept": True,
+        }
+        retry_share = pending_share(1, accepted_at_ms=2_042)
+        retry_intent = {**intent, "pending_share": dict(retry_share.__dict__)}
+
+        self.assertTrue(ledger.persist_block_candidate_intent(intent))
+        self.assertFalse(ledger.persist_block_candidate_intent(retry_intent))
+        self.assertEqual(ledger.pending_block_candidates(), [intent])
+        with self.assertRaisesRegex(ValueError, "candidate payload mismatch"):
+            ledger.persist_block_candidate_intent({**retry_intent, "block_hex": "01"})
+
+        # A retry that lands links its share to the first persisted payload.
+        self.assertEqual(
+            ledger.append_batch([(retry_share, retry_intent)])[0].share_seq, 1
+        )
+        self.assertEqual(
+            ledger.pending_block_candidate_rows(),
+            [{"block_hash": "ef" * 32, "candidate": intent}],
+        )
+
     def test_concurrent_append_still_has_one_canonical_sequence(self) -> None:
         ledger = SingleWriterShareLedger()
 

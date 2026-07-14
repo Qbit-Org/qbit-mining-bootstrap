@@ -220,14 +220,15 @@ class SingleWriterShareLedger:
                         raise ValueError("duplicate block candidate in append batch")
                     seen_blocks.add(block_hash)
                     outbox = self._block_candidate_outbox.get(block_hash)
-                    candidate_sha256 = sha256_json_hex(candidate)
+                    candidate_sha256 = block_candidate_identity_sha256(candidate)
                     if outbox is not None and (
                         outbox["share_id"] not in {None, pending.share_id}
                         or
                         outbox["candidate_sha256"] != candidate_sha256
                         or (
                             outbox["candidate"] is not None
-                            and outbox["candidate"] != candidate
+                            and block_candidate_identity(outbox["candidate"])
+                            != block_candidate_identity(candidate)
                         )
                     ):
                         raise ValueError("block candidate payload mismatch")
@@ -264,7 +265,7 @@ class SingleWriterShareLedger:
                             "block_hash": block_hash,
                             "share_id": pending.share_id,
                             "candidate": candidate,
-                            "candidate_sha256": sha256_json_hex(candidate),
+                            "candidate_sha256": block_candidate_identity_sha256(candidate),
                             "state": "pending",
                             "attempt_count": 0,
                             "last_error": None,
@@ -278,7 +279,7 @@ class SingleWriterShareLedger:
         block_hash = str(candidate.get("block_hash_hex", "")).lower()
         if not block_hash:
             raise ValueError("block candidate is missing block_hash_hex")
-        candidate_sha256 = sha256_json_hex(candidate)
+        candidate_sha256 = block_candidate_identity_sha256(candidate)
         with self._lock:
             existing = self._block_candidate_outbox.get(block_hash)
             if existing is not None:
@@ -1177,7 +1178,7 @@ END;
                     },
                     "candidate": candidate_payload,
                     "candidate_sha256": (
-                        sha256_json_hex(candidate_payload)
+                        block_candidate_identity_sha256(candidate_payload)
                         if candidate_payload is not None
                         else None
                     ),
@@ -1239,7 +1240,9 @@ candidate_mismatch AS (
     WHERE payload.candidate IS NOT NULL
       AND ((outbox.share_id IS NOT NULL AND outbox.share_id IS DISTINCT FROM payload.data->>'share_id')
            OR outbox.candidate_sha256 IS DISTINCT FROM payload.candidate_sha256
-           OR (outbox.candidate IS NOT NULL AND outbox.candidate IS DISTINCT FROM payload.candidate))
+           OR (outbox.candidate IS NOT NULL
+               AND (outbox.candidate #- '{{pending_share,accepted_at_ms}}')
+                   IS DISTINCT FROM (payload.candidate #- '{{pending_share,accepted_at_ms}}')))
 ),
 batch_ok AS (
     SELECT 1 AS ok
@@ -1348,7 +1351,7 @@ END;
         if not block_hash:
             raise ValueError("block candidate is missing block_hash_hex")
         candidate = {**candidate, "block_hash_hex": block_hash}
-        candidate_sha256 = sha256_json_hex(candidate)
+        candidate_sha256 = block_candidate_identity_sha256(candidate)
         sql = f"""
 WITH durability AS (
     SELECT set_config('synchronous_commit', 'on', true)
@@ -5352,6 +5355,29 @@ def require_mapping(value: object, name: str) -> dict[str, Any]:
 
 def sha256_json_hex(payload: object) -> str:
     return hashlib.sha256(canonical_json_text(payload).encode()).hexdigest()
+
+
+def block_candidate_identity(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Candidate payload with its volatile acknowledgment stamp removed.
+
+    A miner can resubmit the same solved block after a transient submit
+    outcome, and the rebuilt intent differs from the persisted one only in
+    pending_share.accepted_at_ms. That drift must stay idempotent against the
+    durable outbox while any other divergence remains a hard payload
+    mismatch. The stored payload keeps its original stamp; only comparisons
+    use this identity form.
+    """
+    pending_share = candidate.get("pending_share")
+    if isinstance(pending_share, dict) and "accepted_at_ms" in pending_share:
+        candidate = {
+            **candidate,
+            "pending_share": {**pending_share, "accepted_at_ms": None},
+        }
+    return candidate
+
+
+def block_candidate_identity_sha256(candidate: dict[str, Any]) -> str:
+    return sha256_json_hex(block_candidate_identity(candidate))
 
 
 def sha256_bytes_hex(payload: bytes) -> str:

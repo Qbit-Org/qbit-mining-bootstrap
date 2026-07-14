@@ -5738,9 +5738,17 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         server.submit_block_candidate = lambda _candidate: False  # type: ignore[method-assign]
 
         submit_params = ["miner-a", "job-1", "00" * 8, "00000001", "00000002"]
+        # Each retry rebuilds its candidate intent with a fresh acknowledgment
+        # stamp. Force every call onto a new millisecond so the durable-outbox
+        # idempotency is exercised across acknowledgment-stamp drift instead of
+        # depending on both attempts landing within the same millisecond.
+        clock_ms = iter(range(1_700_000_000_000, 1_700_000_070_000, 7))
         with patch(
             "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
             return_value=submission,
+        ), patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=clock_ms.__next__,
         ):
             for _attempt in range(2):
                 with self.assertRaisesRegex(RuntimeError, "pending durable retry"):
