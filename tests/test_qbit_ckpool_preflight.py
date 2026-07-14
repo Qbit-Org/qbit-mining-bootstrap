@@ -138,6 +138,7 @@ def mainnet_production_env(**overrides: str) -> dict[str, str]:
         QBIT_CHAIN="mainnet",
         QBIT_TOOLS_PRODUCTION="1",
         QBIT_MINER_ADDRESS="qb1miner",
+        QBIT_EXPECTED_GENESIS_HASH="0" * 64,
     )
     env.update(overrides)
     return env
@@ -424,14 +425,7 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 )
 
     def test_public_readiness_rejects_initial_block_download(self) -> None:
-        env = base_env(
-            QBIT_CHAIN="mainnet",
-            QBIT_MINER_ADDRESS="qb1miner",
-            CKPOOL_MINDIFF="1024",
-            CKPOOL_STARTDIFF="65536",
-            CKPOOL_MINDIFF_EXPLICIT="1",
-            CKPOOL_STARTDIFF_EXPLICIT="1",
-        )
+        env = mainnet_production_env()
 
         with self.assertRaisesRegex(preflight.PreflightError, "initial block download"):
             preflight.run_preflight(env, FakeRpc(ibd=True, rpc_chain="main"))
@@ -595,14 +589,7 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
             preflight.run_preflight(env, FakeRpc(rpc_chain="testnet4"))
 
     def test_public_payout_requires_p2mr_witness_version(self) -> None:
-        env = base_env(
-            QBIT_CHAIN="mainnet",
-            QBIT_MINER_ADDRESS="qb1miner",
-            CKPOOL_MINDIFF="1024",
-            CKPOOL_STARTDIFF="65536",
-            CKPOOL_MINDIFF_EXPLICIT="1",
-            CKPOOL_STARTDIFF_EXPLICIT="1",
-        )
+        env = mainnet_production_env()
 
         with self.assertRaisesRegex(preflight.PreflightError, "witness_version"):
             preflight.run_preflight(env, FakeRpc(rpc_chain="main", witness_version=1))

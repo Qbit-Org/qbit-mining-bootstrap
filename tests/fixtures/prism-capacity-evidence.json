@@ -1,0 +1,103 @@
+{
+  "schema": "qbit-prism-capacity-evidence/v2",
+  "artifact_kind": "example",
+  "test_path": "stratum-to-postgres",
+  "generated_at": "2026-07-13T12:00:00Z",
+  "run_id": "00000000-0000-0000-0000-000000000000",
+  "subject": {
+    "coordinator_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "coordinator_image_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "postgres_server_version": "16.4",
+    "database_profile_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "durability": {
+    "fsync": "on",
+    "full_page_writes": "on",
+    "synchronous_commit": "on"
+  },
+  "configuration": {
+    "PRISM_STRATUM_SHARE_DIFF": "1024",
+    "PRISM_STRATUM_VARDIFF": 1,
+    "PRISM_STRATUM_VARDIFF_TARGET_SECONDS": "15",
+    "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
+    "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
+    "PRISM_STRATUM_VARDIFF_MAX_DIFF": "65536",
+    "PRISM_STRATUM_VARDIFF_RETARGET_SECONDS": "90",
+    "PRISM_STRATUM_VARDIFF_MAX_STEP_UP": "4",
+    "PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN": "4",
+    "PRISM_STRATUM_VARDIFF_EWMA_ALPHA": "0.4",
+    "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE": "0.25",
+    "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "15",
+    "PRISM_SHARE_COMMIT_BATCH_SIZE": 64,
+    "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS": 5,
+    "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS": "15",
+    "PRISM_STRATUM_SEND_TIMEOUT_SECONDS": "20"
+  },
+  "forecast_peak_shares_per_second": 100,
+  "test_duration_seconds": 600,
+  "offered_valid_shares": 120000,
+  "acknowledged_shares": 120000,
+  "postgres_unique_committed_shares": 120000,
+  "rejected_valid_shares": 0,
+  "missing_acknowledged_share_ids": 0,
+  "unexpected_committed_share_ids": 0,
+  "acknowledged_share_ids_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "postgres_share_ids_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "ack_latency_milliseconds": {
+    "p50": 6,
+    "p99": 40
+  },
+  "ack_p99_limit_milliseconds": 50,
+  "phases": {
+    "steady_state": {
+      "completed": true,
+      "duration_seconds": 400,
+      "offered_valid_shares": 80000,
+      "acknowledged_shares": 80000,
+      "postgres_unique_committed_shares": 80000,
+      "rejected_valid_shares": 0,
+      "missing_acknowledged_share_ids": 0,
+      "unexpected_committed_share_ids": 0,
+      "acknowledged_share_ids_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "postgres_share_ids_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ack_latency_milliseconds": {
+        "p50": 5,
+        "p99": 20
+      }
+    },
+    "reconnect": {
+      "completed": true,
+      "duration_seconds": 100,
+      "reconnect_events": 10,
+      "offered_valid_shares": 20000,
+      "acknowledged_shares": 20000,
+      "postgres_unique_committed_shares": 20000,
+      "rejected_valid_shares": 0,
+      "missing_acknowledged_share_ids": 0,
+      "unexpected_committed_share_ids": 0,
+      "acknowledged_share_ids_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "postgres_share_ids_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "ack_latency_milliseconds": {
+        "p50": 8,
+        "p99": 30
+      }
+    },
+    "slow_database": {
+      "completed": true,
+      "duration_seconds": 100,
+      "database_delay_milliseconds": 20,
+      "offered_valid_shares": 20000,
+      "acknowledged_shares": 20000,
+      "postgres_unique_committed_shares": 20000,
+      "rejected_valid_shares": 0,
+      "missing_acknowledged_share_ids": 0,
+      "unexpected_committed_share_ids": 0,
+      "acknowledged_share_ids_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "postgres_share_ids_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ack_latency_milliseconds": {
+        "p50": 10,
+        "p99": 40
+      }
+    }
+  }
+}

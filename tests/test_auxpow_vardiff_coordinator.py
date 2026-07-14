@@ -86,7 +86,501 @@ install_test_framework_stubs()
 from lab.auxpow import auxpow_coordinator as coordinator  # noqa: E402
 
 
+class ReadinessRpc:
+    def __init__(
+        self,
+        *,
+        chain: str,
+        blocks: int = 10,
+        headers: int = 10,
+        initial_block_download: bool = False,
+        connections: int = 2,
+        genesis_hash: str = "11" * 32,
+    ) -> None:
+        self.chain = chain
+        self.blocks = blocks
+        self.headers = headers
+        self.initial_block_download = initial_block_download
+        self.connections = connections
+        self.genesis_hash = genesis_hash
+
+    def call(self, method: str, params: list[object] | None = None) -> object:
+        if method == "getblockchaininfo":
+            return {
+                "chain": self.chain,
+                "blocks": self.blocks,
+                "headers": self.headers,
+                "initialblockdownload": self.initial_block_download,
+            }
+        if method == "getnetworkinfo":
+            return {"connections": self.connections}
+        if method == "getblockhash":
+            return self.genesis_hash
+        if method == "createauxblock":
+            return {"hash": "22" * 32}
+        if method == "getblocktemplate":
+            return {"previousblockhash": "33" * 32, "curtime": int(time.time())}
+        raise AssertionError(f"unexpected RPC method {method}")
+
+
+class AutomaticWalletRpc:
+    def __init__(self, *, successful_address_attempt: int | None) -> None:
+        self.successful_address_attempt = successful_address_attempt
+        self.address_attempts = 0
+        self.calls: list[tuple[str, tuple[object, ...], str | None]] = []
+
+    def call(
+        self,
+        method: str,
+        params: list[object] | None = None,
+        *,
+        wallet: str | None = None,
+    ) -> object:
+        self.calls.append((method, tuple(params or []), wallet))
+        if method in {"createwallet", "loadwallet"}:
+            raise TimeoutError(f"{method} timed out")
+        if method == "getnewaddress":
+            self.address_attempts += 1
+            if self.address_attempts == self.successful_address_attempt:
+                return "qbrt1automatic"
+            raise RuntimeError("getnewaddress unavailable")
+        raise AssertionError(f"unexpected RPC method {method}")
+
+
 class AuxPowVardiffCoordinatorTests(unittest.TestCase):
+    def test_automatic_wallet_address_retries_transient_rpc_failures(self) -> None:
+        rpc = AutomaticWalletRpc(successful_address_attempt=4)
+
+        with patch.object(coordinator.time, "sleep") as sleep:
+            address = coordinator.get_new_address(
+                rpc,
+                "auxpow",
+                timeout_seconds=5,
+                retry_seconds=0.1,
+            )
+
+        self.assertEqual(address, "qbrt1automatic")
+        self.assertEqual(rpc.address_attempts, 4)
+        self.assertEqual(rpc.calls[-1], ("getnewaddress", (), "auxpow"))
+        sleep.assert_called_once_with(0.1)
+
+    def test_automatic_wallet_address_timeout_reports_final_rpc_error(self) -> None:
+        rpc = AutomaticWalletRpc(successful_address_attempt=None)
+        now = [100.0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        with (
+            patch.object(coordinator.time, "monotonic", side_effect=lambda: now[0]),
+            patch.object(coordinator.time, "sleep", side_effect=advance),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"auxpow wallet did not return an address within 0\.5s after 2 attempts; "
+                r"last RPC error: getnewaddress unavailable",
+            ),
+        ):
+            coordinator.get_new_address(
+                rpc,
+                "auxpow",
+                timeout_seconds=0.5,
+                retry_seconds=0.25,
+            )
+
+        self.assertEqual(rpc.address_attempts, 6)
+
+    def test_public_node_readiness_requires_expected_chain_sync_and_peers(self) -> None:
+        coordinator.validate_node_readiness(
+            ReadinessRpc(chain="main"),
+            label="qbit",
+            configured_chain="mainnet",
+            rpc_chain_names=coordinator.QBIT_RPC_CHAIN_NAMES,
+            expected_genesis_hash="11" * 32,
+        )
+
+        cases = (
+            (ReadinessRpc(chain="regtest"), "chain mismatch"),
+            (ReadinessRpc(chain="main", initial_block_download=True), "initial block download"),
+            (ReadinessRpc(chain="main", blocks=9, headers=10), "not caught up"),
+            (ReadinessRpc(chain="main", connections=0), "no peer connections"),
+            (ReadinessRpc(chain="main", genesis_hash="ff" * 32), "genesis mismatch"),
+        )
+        for rpc, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, message):
+                coordinator.validate_node_readiness(
+                    rpc,
+                    label="qbit",
+                    configured_chain="mainnet",
+                    rpc_chain_names=coordinator.QBIT_RPC_CHAIN_NAMES,
+                    expected_genesis_hash="11" * 32,
+                )
+
+    def test_regtest_readiness_does_not_require_public_sync_state(self) -> None:
+        coordinator.validate_node_readiness(
+            ReadinessRpc(
+                chain="regtest",
+                blocks=0,
+                headers=3,
+                initial_block_download=True,
+                connections=0,
+            ),
+            label="qbit",
+            configured_chain="regtest",
+            rpc_chain_names=coordinator.QBIT_RPC_CHAIN_NAMES,
+        )
+
+    def test_mainnet_auxpow_requires_explicit_payouts_and_frozen_genesis(self) -> None:
+        qbit_rpc = ReadinessRpc(chain="main")
+        bitcoin_genesis = coordinator.KNOWN_BITCOIN_GENESIS_HASHES["mainnet"]
+        bitcoin_rpc = ReadinessRpc(chain="main", genesis_hash=bitcoin_genesis)
+        base = {
+            "QBIT_CHAIN": "mainnet",
+            "BITCOIN_CHAIN": "mainnet",
+            "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+            "BITCOIN_EXPECTED_GENESIS_HASH": bitcoin_genesis,
+            "QBIT_MINER_ADDRESS": "qb1explicit",
+            "BITCOIN_MINER_ADDRESS": "bc1explicit",
+            "AUXPOW_MODE": "stratum",
+            "AUXPOW_STRATUM_HEADER_VARIANT": "canonical",
+            "AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT": False,
+        }
+        with (
+            patch.multiple(coordinator, **base),
+        ):
+            coordinator.validate_auxpow_startup(qbit_rpc, bitcoin_rpc)
+
+        for override, message in (
+            ({"QBIT_EXPECTED_GENESIS_HASH": ""}, "GENESIS"),
+            ({"BITCOIN_EXPECTED_GENESIS_HASH": ""}, "BITCOIN_EXPECTED_GENESIS_HASH"),
+            ({"BITCOIN_EXPECTED_GENESIS_HASH": "11" * 32}, "canonical Bitcoin"),
+            ({"QBIT_MINER_ADDRESS": "auto"}, "QBIT_MINER_ADDRESS"),
+            ({"BITCOIN_MINER_ADDRESS": "auto"}, "BITCOIN_MINER_ADDRESS"),
+        ):
+            with (
+                self.subTest(override=override),
+                patch.multiple(coordinator, **{**base, **override}),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                coordinator.validate_auxpow_startup(qbit_rpc, bitcoin_rpc)
+
+    def test_mainnet_auxpow_rejects_lab_only_modes_and_wrong_parent_genesis(self) -> None:
+        bitcoin_genesis = coordinator.KNOWN_BITCOIN_GENESIS_HASHES["mainnet"]
+        base = {
+            "QBIT_CHAIN": "mainnet",
+            "BITCOIN_CHAIN": "mainnet",
+            "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+            "BITCOIN_EXPECTED_GENESIS_HASH": bitcoin_genesis,
+            "QBIT_MINER_ADDRESS": "qb1explicit",
+            "BITCOIN_MINER_ADDRESS": "bc1explicit",
+            "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS": 120,
+            "AUXPOW_STRATUM_HEADER_VARIANT": "canonical",
+            "AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT": False,
+        }
+        for mode in ("once", "bridge"):
+            with (
+                self.subTest(mode=mode),
+                patch.multiple(coordinator, **base, AUXPOW_MODE=mode),
+                self.assertRaisesRegex(RuntimeError, "lab-only"),
+            ):
+                coordinator.validate_auxpow_startup(
+                    ReadinessRpc(chain="main"),
+                    ReadinessRpc(chain="main"),
+                )
+
+        with (
+            patch.multiple(coordinator, **base, AUXPOW_MODE="stratum"),
+            self.assertRaisesRegex(RuntimeError, "Bitcoin genesis mismatch"),
+        ):
+            coordinator.validate_auxpow_startup(
+                ReadinessRpc(chain="main"),
+                ReadinessRpc(chain="main", genesis_hash="22" * 32),
+            )
+
+        with (
+            patch.multiple(
+                coordinator,
+                **{**base, "BITCOIN_CHAIN": "regtest"},
+                AUXPOW_MODE="stratum",
+            ),
+            self.assertRaisesRegex(RuntimeError, "requires BITCOIN_CHAIN=mainnet"),
+        ):
+            coordinator.validate_auxpow_startup(
+                ReadinessRpc(chain="main"),
+                ReadinessRpc(chain="regtest"),
+            )
+
+    def test_mainnet_auxpow_rejects_diagnostic_header_modes(self) -> None:
+        bitcoin_genesis = coordinator.KNOWN_BITCOIN_GENESIS_HASHES["mainnet"]
+        base = {
+            "QBIT_CHAIN": "mainnet",
+            "BITCOIN_CHAIN": "mainnet",
+            "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+            "BITCOIN_EXPECTED_GENESIS_HASH": bitcoin_genesis,
+            "QBIT_MINER_ADDRESS": "qb1explicit",
+            "BITCOIN_MINER_ADDRESS": "bc1explicit",
+            "AUXPOW_MODE": "stratum",
+            "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS": 120,
+            "AUXPOW_STRATUM_HEADER_VARIANT": "canonical",
+            "AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT": False,
+        }
+        for override, message in (
+            ({"AUXPOW_STRATUM_HEADER_VARIANT": "diagnostic"}, "HEADER_VARIANT"),
+            ({"AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT": True}, "ACCEPT_DIAGNOSTIC"),
+        ):
+            with (
+                self.subTest(override=override),
+                patch.multiple(coordinator, **{**base, **override}),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                coordinator.validate_auxpow_startup(
+                    ReadinessRpc(chain="main"),
+                    ReadinessRpc(chain="main", genesis_hash=bitcoin_genesis),
+                )
+
+    def test_refresh_loop_exits_after_sustained_rpc_failure(self) -> None:
+        server = self.server()
+        server.stop_event = threading.Event()
+        server.refresh_now = threading.Event()
+        server.last_successful_refresh_monotonic = 0.0
+        server.refresh_fatal_error = None
+        server.refresh_job = Mock(side_effect=RuntimeError("RPC unavailable"))
+        server.maybe_log_worker_stats = lambda: None
+        server.maybe_retarget_idle_clients = lambda: None
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS", 1),
+            patch.object(coordinator.time, "monotonic", return_value=2.0),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            server.refresh_loop()
+
+        self.assertTrue(server.stop_event.is_set())
+        self.assertIn("budget=1s", server.refresh_fatal_error or "")
+
+    def test_refresh_loop_recovers_from_transient_rpc_failure(self) -> None:
+        server = self.server()
+        server.stop_event = threading.Event()
+        server.refresh_now = threading.Event()
+        server.last_successful_refresh_monotonic = 100.0
+        server.refresh_fatal_error = None
+        server.refresh_job = Mock(side_effect=[RuntimeError("transient"), False])
+        server.maybe_retarget_idle_clients = lambda: None
+        iterations = 0
+
+        def stop_after_second_iteration() -> None:
+            nonlocal iterations
+            iterations += 1
+            if iterations == 2:
+                server.stop_event.set()
+
+        server.maybe_log_worker_stats = stop_after_second_iteration
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS", 10),
+            patch.object(coordinator, "AUXPOW_STRATUM_POLL_SECONDS", 0),
+            patch.object(coordinator.time, "monotonic", side_effect=[105.0, 106.0]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            server.refresh_loop()
+
+        self.assertIsNone(server.refresh_fatal_error)
+        self.assertTrue(server.stop_event.is_set())
+        self.assertEqual(server.last_successful_refresh_monotonic, 106.0)
+
+    def test_auxpow_template_preflight_rejects_stale_parent_work(self) -> None:
+        qbit_rpc = ReadinessRpc(chain="main")
+        bitcoin_rpc = ReadinessRpc(chain="main")
+        bitcoin_rpc.call = Mock(
+            return_value={
+                "previousblockhash": "33" * 32,
+                "curtime": int(time.time()) - 121,
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "template is stale"):
+            coordinator.validate_auxpow_templates(
+                qbit_rpc,
+                bitcoin_rpc,
+                qbit_miner_address="qb1explicit",
+                max_age_seconds=120,
+            )
+
+    def test_auxpow_template_preflight_rejects_grossly_future_parent_work(self) -> None:
+        qbit_rpc = ReadinessRpc(chain="main")
+        bitcoin_rpc = ReadinessRpc(chain="main")
+        bitcoin_rpc.call = Mock(
+            return_value={
+                "previousblockhash": "33" * 32,
+                "curtime": 8201,
+            }
+        )
+        with (
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaisesRegex(RuntimeError, "future-dated"),
+        ):
+            coordinator.validate_auxpow_templates(
+                qbit_rpc,
+                bitcoin_rpc,
+                qbit_miner_address="qb1explicit",
+                max_age_seconds=120,
+                max_future_seconds=7200,
+            )
+
+    def test_auxpow_template_preflight_allows_consensus_future_time_boundary(self) -> None:
+        with patch.object(coordinator.time, "time", return_value=1000):
+            age = coordinator.validate_bitcoin_parent_template(
+                {
+                    "previousblockhash": "33" * 32,
+                    "curtime": 8200,
+                },
+                max_age_seconds=120,
+                max_future_seconds=7200,
+            )
+
+        self.assertEqual(age, -7200)
+
+    def test_same_tip_refreshes_when_parent_template_age_expires(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 0),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            refreshed = server.refresh_job(force=False)
+
+        self.assertTrue(refreshed)
+        self.assertIn("reason=parent-template-age", stdout.getvalue())
+        server.make_job.assert_called_once()
+        server.broadcast_job.assert_called_once()
+
+    def test_parent_template_age_boundary_remains_a_noop(self) -> None:
+        server, current_job = self.refresh_server(parent_curtime=880, replacement_curtime=1000)
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 0),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+        ):
+            refreshed = server.refresh_job(force=False)
+
+        self.assertFalse(refreshed)
+        self.assertIs(server.current_job, current_job)
+        server.make_job.assert_not_called()
+        server.broadcast_job.assert_not_called()
+
+    def test_parent_template_expiring_during_tip_poll_forces_refresh(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=880, replacement_curtime=1001)
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 0),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", side_effect=[1000, 1001, 1001]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            refreshed = server.refresh_job(force=False)
+
+        self.assertTrue(refreshed)
+        server.make_job.assert_called_once()
+        server.broadcast_job.assert_called_once()
+
+    def test_refresh_rejects_stale_parent_template_before_publication(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=879)
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 0),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaisesRegex(RuntimeError, "template is stale"),
+        ):
+            server.refresh_job(force=False)
+
+        self.assertIsNone(server.current_job)
+        self.assertEqual(server.jobs, {})
+        server.make_job.assert_not_called()
+        server.broadcast_job.assert_not_called()
+
+    def test_expired_parent_work_is_invalidated_before_refresh_rpc(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+        server.qbit_rpc.call = Mock(side_effect=RuntimeError("qbit RPC unavailable"))
+        server.bitcoin_rpc.call = Mock()
+
+        with (
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaisesRegex(RuntimeError, "qbit RPC unavailable"),
+        ):
+            server.refresh_job(force=False)
+
+        self.assertIsNone(server.current_job)
+        self.assertEqual(server.jobs, {})
+        server.qbit_rpc.call.assert_called_once_with("getbestblockhash")
+        server.bitcoin_rpc.call.assert_not_called()
+
+    def test_submit_rejects_parent_work_that_expires_between_refresh_polls(self) -> None:
+        server, current_job = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+        client = self.client()
+
+        with (
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaises(coordinator.StratumError) as raised,
+        ):
+            server.handle_submit(
+                client,
+                ["worker", current_job.job_id, "00" * 8, "00000000", "00000000"],
+            )
+
+        self.assertEqual(raised.exception.code, 21)
+        self.assertIsNone(server.current_job)
+        self.assertEqual(server.jobs, {})
+
+    def test_stale_submit_does_not_invalidate_newer_fresh_work(self) -> None:
+        server, stale_job = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+        fresh_job = self.job(job_id="fresh")
+        fresh_job.btc_template = {
+            "previousblockhash": "11" * 32,
+            "curtime": 1000,
+        }
+        server.current_job = fresh_job
+        server.jobs = {stale_job.job_id: stale_job}
+        client = self.client()
+
+        with (
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            self.assertRaises(coordinator.StratumError) as raised,
+        ):
+            server.handle_submit(
+                client,
+                ["worker", stale_job.job_id, "00" * 8, "00000000", "00000000"],
+            )
+
+        self.assertEqual(raised.exception.code, 21)
+        self.assertIs(server.current_job, fresh_job)
+        self.assertEqual(server.jobs, {})
+
+    def test_subscribe_and_authorize_do_not_publish_expired_current_work(self) -> None:
+        for method in ("mining.subscribe", "mining.authorize"):
+            with self.subTest(method=method):
+                server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+                client = self.client()
+                server.send_result = Mock()
+                server.send_job_to_client = Mock()
+
+                with (
+                    patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+                    patch.object(coordinator.time, "time", return_value=1000),
+                ):
+                    server.handle_request(
+                        client,
+                        {"id": 1, "method": method, "params": ["worker"]},
+                    )
+
+                server.send_result.assert_called_once()
+                server.send_job_to_client.assert_not_called()
+                self.assertIsNone(server.current_job)
+                self.assertEqual(server.jobs, {})
+
     def test_build_chain_commitment_uses_display_order_root_bytes(self) -> None:
         root_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         aux_template = {"hash": root_hex, "chainid": 31430, "commitmentorder": "display"}
@@ -212,6 +706,54 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
         server.worker_stats = {}
         server.log_event = lambda *args, **kwargs: None
         return server
+
+    def refresh_server(
+        self,
+        *,
+        parent_curtime: int,
+        replacement_curtime: int,
+    ) -> tuple[coordinator.AuxPowStratumServer, coordinator.AuxPowStratumJob]:
+        server = self.server()
+        current_job = self.job(job_id="current")
+        current_job.btc_template = {
+            "previousblockhash": "00" * 32,
+            "curtime": parent_curtime,
+        }
+        server.current_job = current_job
+        server.jobs = {current_job.job_id: current_job}
+        server.tip_snapshot = ("qbit-tip", "bitcoin-tip")
+
+        server.qbit_rpc = types.SimpleNamespace(
+            call=lambda method, params=None, **kwargs: {
+                "getbestblockhash": "qbit-tip",
+                "createauxblock": {
+                    "height": 1,
+                    "hash": "aux-hash",
+                    "bits": "1d00ffff",
+                },
+            }[method]
+        )
+        server.bitcoin_rpc = types.SimpleNamespace(
+            call=lambda method, params=None, **kwargs: {
+                "getbestblockhash": "bitcoin-tip",
+                "getblocktemplate": {
+                    "height": 1,
+                    "previousblockhash": "00" * 32,
+                    "version": 0x20000000,
+                    "bits": "1d00ffff",
+                    "curtime": replacement_curtime,
+                },
+            }[method]
+        )
+
+        def make_job(**kwargs: object) -> coordinator.AuxPowStratumJob:
+            job = self.job(job_id=str(kwargs["job_id"]))
+            job.btc_template = dict(kwargs["btc_template"])
+            return job
+
+        server.make_job = Mock(side_effect=make_job)
+        server.broadcast_job = Mock()
+        return server, current_job
 
     def client(self) -> coordinator.StratumClientState:
         client = coordinator.StratumClientState(
@@ -355,6 +897,35 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
         self.assertIsNone(client.vardiff_difficulty_estimate)
         self.assertEqual(client.pending_share_difficulty, Decimal("4"))
 
+    def test_clean_job_retarget_does_not_publish_expired_current_work(self) -> None:
+        server, _ = self.refresh_server(parent_curtime=879, replacement_curtime=1000)
+        client = self.client()
+        client.share_difficulty = Decimal("16")
+        server.send_difficulty_value = Mock()
+        server.send_job_to_client = Mock()
+
+        with (
+            patch.object(coordinator, "AUXPOW_STRATUM_VARDIFF_APPLY_MODE", "clean_job"),
+            patch.object(coordinator, "AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120),
+            patch.object(coordinator.time, "time", return_value=1000),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            server.retarget_client(
+                client,
+                current_difficulty=Decimal("16"),
+                accepted_shares=0,
+                submitted_shares=0,
+                accepted_difficulty=Decimal("0"),
+                elapsed_seconds=Decimal("90"),
+                worker="worker",
+                reason="test",
+            )
+
+        server.send_job_to_client.assert_not_called()
+        server.send_difficulty_value.assert_called_once_with(client, Decimal("4"))
+        self.assertIsNone(server.current_job)
+        self.assertEqual(server.jobs, {})
+
     def test_retarget_does_not_overwrite_newer_client_difficulty(self) -> None:
         server = self.server()
         client = self.client()
@@ -398,7 +969,7 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
                     "previousblockhash": "00" * 32,
                     "version": 0x20000000,
                     "bits": "1d00ffff",
-                    "curtime": 1,
+                    "curtime": int(time.time()),
                 },
             }[method]
         )

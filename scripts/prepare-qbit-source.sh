@@ -1,23 +1,40 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1090
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_DEPLOY_ENV_FILE="${DEPLOY_ENV_FILE:-}"
 ENV_QBIT_PROVIDER="${QBIT_PROVIDER:-}"
+ENV_QBIT_PRODUCTION="${QBIT_PRODUCTION:-}"
 ENV_QBIT_SRC_DIR="${QBIT_SRC_DIR:-}"
 ENV_QBIT_GIT_URL="${QBIT_GIT_URL:-}"
 ENV_QBIT_GIT_REF="${QBIT_GIT_REF:-}"
 ENV_QBIT_GIT_COMMIT="${QBIT_GIT_COMMIT:-}"
+ENV_QBIT_CHAIN="${QBIT_CHAIN:-}"
 source "${ROOT_DIR}/.env.example"
 if [[ -f "${ROOT_DIR}/config/upstream.env" ]]; then
   source "${ROOT_DIR}/config/upstream.env"
 else
   source "${ROOT_DIR}/config/upstream.env.example"
 fi
-if [[ -f "${ROOT_DIR}/.env" ]]; then
+DEPLOY_ENV_FILE="${ENV_DEPLOY_ENV_FILE}"
+if [[ -n "${DEPLOY_ENV_FILE:-}" ]]; then
+  if [[ "${DEPLOY_ENV_FILE}" != /* ]]; then
+    DEPLOY_ENV_FILE="${ROOT_DIR}/${DEPLOY_ENV_FILE}"
+  fi
+  if [[ ! -f "${DEPLOY_ENV_FILE}" ]]; then
+    printf 'prepare-qbit-source: DEPLOY_ENV_FILE does not exist: %s\n' "${DEPLOY_ENV_FILE}" >&2
+    exit 1
+  fi
+  source "${DEPLOY_ENV_FILE}"
+elif [[ -f "${ROOT_DIR}/.env" ]]; then
   source "${ROOT_DIR}/.env"
 fi
 if [[ -n "${ENV_QBIT_PROVIDER}" ]]; then
   QBIT_PROVIDER="${ENV_QBIT_PROVIDER}"
+fi
+if [[ -n "${ENV_QBIT_PRODUCTION}" ]]; then
+  QBIT_PRODUCTION="${ENV_QBIT_PRODUCTION}"
 fi
 if [[ -n "${ENV_QBIT_SRC_DIR}" ]]; then
   QBIT_SRC_DIR="${ENV_QBIT_SRC_DIR}"
@@ -31,10 +48,17 @@ fi
 if [[ -n "${ENV_QBIT_GIT_COMMIT}" ]]; then
   QBIT_GIT_COMMIT="${ENV_QBIT_GIT_COMMIT}"
 fi
+if [[ -n "${ENV_QBIT_CHAIN}" ]]; then
+  QBIT_CHAIN="${ENV_QBIT_CHAIN}"
+fi
 
 fail() {
   printf 'prepare-qbit-source: %s\n' "$1" >&2
   exit 1
+}
+
+ascii_lower() {
+  printf '%s' "${1:-}" | LC_ALL=C tr '[:upper:]' '[:lower:]'
 }
 
 require_cmd() {
@@ -60,9 +84,22 @@ check_qbit_tree() {
 
 stage_tree() {
   local source_dir="$1"
+  local source_commit="${2:-}"
   local dest_dir="${ROOT_DIR}/generated/qbit-src"
+  local staged_source="${source_dir}"
+  local archive_dir=""
 
   require_cmd rsync
+  mkdir -p "${ROOT_DIR}/generated"
+  if [[ -n "${source_commit}" ]]; then
+    require_cmd git
+    require_cmd tar
+    archive_dir="$(mktemp -d "${ROOT_DIR}/generated/qbit-archive.XXXXXX")"
+    trap 'rm -rf "${archive_dir}"' RETURN
+    git -C "${source_dir}" archive --format=tar "${source_commit}" | tar -xf - -C "${archive_dir}"
+    staged_source="${archive_dir}"
+    check_qbit_tree "${staged_source}"
+  fi
   mkdir -p "${dest_dir}"
   rsync -a --delete --delete-excluded \
     --exclude='.git/' \
@@ -74,8 +111,38 @@ stage_tree() {
     --exclude='__pycache__/' \
     --exclude='*.pyc' \
     --exclude='.DS_Store' \
-    "${source_dir}/" "${dest_dir}/"
+    "${staged_source}/" "${dest_dir}/"
+  if [[ -n "${source_commit}" ]]; then
+    printf '%s\n' "$(ascii_lower "${source_commit}")" > "${dest_dir}/.qbit-source-commit"
+  fi
   printf '%s\n' "${dest_dir}"
+}
+
+requires_pinned_source() {
+  case "${QBIT_CHAIN:-regtest}" in
+    main|mainnet) return 0 ;;
+  esac
+  case "${QBIT_PRODUCTION:-0}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_commit() {
+  local source_dir="$1"
+  local requested_commit="$2"
+  local requested_commit_normalized
+  local resolved_commit
+
+  [[ -d "${source_dir}/.git" ]] || fail "pinned qbit source must be a Git checkout: ${source_dir}"
+  if ! resolved_commit="$(git -C "${source_dir}" rev-parse --verify "${requested_commit}^{commit}" 2>/dev/null)"; then
+    fail "QBIT_GIT_COMMIT is not present in qbit source: ${requested_commit}"
+  fi
+  resolved_commit="$(ascii_lower "${resolved_commit}")"
+  requested_commit_normalized="$(ascii_lower "${requested_commit}")"
+  [[ "${resolved_commit}" == "${requested_commit_normalized}" ]] || fail \
+    "qbit source resolved ${resolved_commit}, expected QBIT_GIT_COMMIT ${requested_commit_normalized}"
+  printf '%s\n' "${resolved_commit}"
 }
 
 resolve_git_source() {
@@ -117,4 +184,14 @@ case "${QBIT_PROVIDER}" in
 esac
 
 check_qbit_tree "${source_dir}"
-stage_tree "${source_dir}"
+if requires_pinned_source && [[ ! "${QBIT_GIT_COMMIT:-}" =~ ^[[:xdigit:]]{40}$ ]]; then
+  fail "production source staging requires QBIT_GIT_COMMIT as exactly 40 hex characters"
+fi
+
+resolved_commit=""
+if [[ -n "${QBIT_GIT_COMMIT:-}" ]]; then
+  resolved_commit="$(resolve_commit "${source_dir}" "${QBIT_GIT_COMMIT}")"
+elif [[ "${QBIT_PROVIDER}" == "git" ]]; then
+  resolved_commit="$(git -C "${source_dir}" rev-parse --verify HEAD)"
+fi
+stage_tree "${source_dir}" "${resolved_commit}"

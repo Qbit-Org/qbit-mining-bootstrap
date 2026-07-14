@@ -281,16 +281,105 @@ class PrismShareLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "network_difficulty"):
             ledger.append(share.__class__(**{**share.__dict__, "network_difficulty": 0}))
 
-    def test_rejects_duplicate_share_id_without_consuming_sequence(self) -> None:
+    def test_exact_duplicate_share_is_idempotent_but_mutation_is_rejected(self) -> None:
         ledger = SingleWriterShareLedger()
         first = pending_share(1)
         duplicate = pending_share(2).__class__(**{**pending_share(2).__dict__, "share_id": first.share_id})
 
         self.assertEqual(ledger.append(first).share_seq, 1)
-        with self.assertRaisesRegex(ValueError, "duplicate share_id"):
+        self.assertEqual(ledger.append(first).share_seq, 1)
+        with self.assertRaisesRegex(ValueError, "payload mismatch"):
             ledger.append(duplicate)
 
         self.assertEqual(ledger.append(pending_share(3)).share_seq, 2)
+
+    def test_share_and_block_candidate_intent_commit_atomically(self) -> None:
+        ledger = SingleWriterShareLedger()
+        share = pending_share(1)
+        intent = {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": "ab" * 32,
+            "block_hex": "00",
+        }
+
+        records = ledger.append_batch([(share, intent)])
+
+        self.assertEqual(records[0].share_seq, 1)
+        self.assertEqual(ledger.pending_block_candidates(), [intent])
+        self.assertEqual(
+            ledger.pending_block_candidate_rows(),
+            [{"block_hash": "ab" * 32, "candidate": intent}],
+        )
+        # Exact replay returns the original row and does not duplicate outbox
+        # work. A changed intent with the same hash is rejected as corruption.
+        self.assertEqual(ledger.append_batch([(share, intent)])[0].share_seq, 1)
+        with self.assertRaisesRegex(ValueError, "candidate payload mismatch"):
+            ledger.append_batch([(share, {**intent, "block_hex": "01"})])
+        self.assertEqual(len(ledger), 1)
+        self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="ab" * 32))
+        self.assertEqual(ledger.pending_block_candidates(), [])
+
+    def test_batch_validation_is_all_or_nothing(self) -> None:
+        ledger = SingleWriterShareLedger()
+        first = pending_share(1)
+        bad_duplicate = pending_share(2).__class__(
+            **{**pending_share(2).__dict__, "share_id": first.share_id}
+        )
+        ledger.append(first)
+
+        with self.assertRaisesRegex(ValueError, "payload mismatch"):
+            ledger.append_batch([(pending_share(3), None), (bad_duplicate, None)])
+
+        self.assertEqual(len(ledger), 1)
+
+    def test_candidate_only_intent_links_to_share_after_block_lands(self) -> None:
+        ledger = SingleWriterShareLedger()
+        share = pending_share(1)
+        intent = {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": "cd" * 32,
+            "block_hex": "00",
+            "credit_share_on_accept": True,
+        }
+
+        self.assertTrue(ledger.persist_block_candidate_intent(intent))
+        self.assertEqual(ledger.pending_block_candidates(), [intent])
+        self.assertEqual(ledger.append_batch([(share, intent)])[0].share_seq, 1)
+        self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="cd" * 32))
+        self.assertEqual(ledger.pending_block_candidates(), [])
+
+    def test_candidate_retry_with_new_acknowledgment_stamp_is_idempotent(self) -> None:
+        # A miner can resubmit the same solved block after a transient submit
+        # outcome, and the rebuilt intent differs from the persisted one only
+        # in pending_share.accepted_at_ms. The outbox must treat that as the
+        # same work and keep the first payload authoritative, while any other
+        # divergence stays a hard payload mismatch.
+        ledger = SingleWriterShareLedger()
+        share = pending_share(1, accepted_at_ms=2_000)
+        intent = {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": "ef" * 32,
+            "block_hex": "00",
+            "pending_share": dict(share.__dict__),
+            "credit_share_on_accept": True,
+        }
+        retry_share = pending_share(1, accepted_at_ms=2_042)
+        retry_intent = {**intent, "pending_share": dict(retry_share.__dict__)}
+
+        self.assertTrue(ledger.persist_block_candidate_intent(intent))
+        self.assertFalse(ledger.persist_block_candidate_intent(retry_intent))
+        self.assertEqual(ledger.pending_block_candidates(), [intent])
+        with self.assertRaisesRegex(ValueError, "candidate payload mismatch"):
+            ledger.persist_block_candidate_intent({**retry_intent, "block_hex": "01"})
+
+        # A retry that lands links its share to the first persisted payload.
+        self.assertEqual(
+            ledger.append_batch([(retry_share, retry_intent)])[0].share_seq, 1
+        )
+        self.assertEqual(
+            ledger.pending_block_candidate_rows(),
+            [{"block_hash": "ef" * 32, "candidate": intent}],
+        )
 
     def test_concurrent_append_still_has_one_canonical_sequence(self) -> None:
         ledger = SingleWriterShareLedger()
@@ -635,6 +724,77 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(ledger._lease_interval_sql, "make_interval(secs => 42.0)")
         self.assertIn("make_interval(secs => 42.0)", ledger.lease_queries[0])
         self.assertNotIn("interval '5 minutes'", ledger.lease_queries[0])
+
+    def test_postgres_batch_sql_fences_share_and_candidate_in_one_statement(self) -> None:
+        share = pending_share(1)
+        record = {
+            "share_seq": 7,
+            "share_id": share.share_id,
+            "miner_id": share.miner_id,
+            "order_key": share.order_key,
+            "p2mr_program_hex": share.p2mr_program_hex,
+            "share_difficulty": str(share.share_difficulty),
+            "network_difficulty": str(share.network_difficulty),
+            "template_height": share.template_height,
+            "job_id": share.job_id,
+            "job_issued_at_ms": share.job_issued_at_ms,
+            "accepted_at_ms": share.accepted_at_ms,
+            "ntime": share.ntime,
+            "credit_policy": share.credit_policy,
+        }
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease(), {"records": [record]}]
+        )
+        intent = {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": "ab" * 32,
+            "block_hex": "00",
+        }
+
+        self.assertEqual(ledger.append_batch([(share, intent)])[0].share_seq, 7)
+        query = ledger.lease_queries[-1]
+        self.assertIn("inserted_shares AS", query)
+        self.assertIn("inserted_candidates AS", query)
+        self.assertIn("qbit_block_candidate_outbox", query)
+        self.assertIn("duplicate share_id payload mismatch", query)
+        self.assertEqual(query.count("SELECT CASE"), 1)
+
+    def test_postgres_candidate_only_intent_forces_durable_fenced_commit(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease(), {"inserted": 1}]
+        )
+        intent = {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": "cd" * 32,
+            "block_hex": "00",
+            "credit_share_on_accept": True,
+        }
+
+        self.assertTrue(ledger.persist_block_candidate_intent(intent))
+        query = ledger.lease_queries[-1]
+        self.assertIn("set_config('synchronous_commit', 'on', true)", query)
+        self.assertIn("qbit_ledger_writer_lease", query)
+        self.assertIn("qbit_block_candidate_outbox", query)
+
+    def test_postgres_pending_candidate_rows_keep_authoritative_outbox_key(self) -> None:
+        intent = {
+            "schema": "unsupported",
+            "block_hex": "00",
+        }
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                [{"block_hash": "ef" * 32, "candidate": intent}],
+            ]
+        )
+
+        self.assertEqual(
+            ledger.pending_block_candidate_rows(),
+            [{"block_hash": "ef" * 32, "candidate": intent}],
+        )
+        query = ledger.lease_queries[-1]
+        self.assertIn("json_build_object('block_hash', block_hash, 'candidate', candidate)", query)
+        self.assertIn("ORDER BY created_at, block_hash", query)
 
     def test_writer_lease_ttl_defaults_to_sixty_seconds(self) -> None:
         ledger = FakeLeasePsqlShareLedger([acquired_lease()])

@@ -44,28 +44,28 @@ jobs:
       - name: Run Python unit tests
         run: python -m unittest discover -s tests -p 'test_*.py'
 
+      - name: Run Postgres ledger integration tests
+        run: make test-prism-postgres-ledger
+
+      - name: Validate mainnet Compose contract
+        run: python -m unittest tests.test_mainnet_compose_contract
+
       - name: Run Rust tests
         run: cargo test --locked --workspace --all-targets
 
       - name: Validate Docker Compose files
         run: |
-          docker compose \
-            --env-file config/upstream.env.example \
-            --env-file .env.example \
-            -f compose.yaml \
-            --profile permissionless \
-            --profile permissionless-real \
-            --profile auxpow \
-            config --quiet
-          QBIT_SRC_DIR="$PWD" \
-          PRISM_STRATUM_PORT_HOST=127.0.0.1:43340 \
-          PRISM_STRATUM_PORT=43340 \
-          docker compose \
-            --env-file config/upstream.env.example \
-            --env-file .env.example \
-            -f compose.yaml \
-            --profile prism \
-            config --quiet
+          export QBIT_SRC_DIR="$PWD"
+          export PRISM_STRATUM_PORT_HOST=127.0.0.1:43340
+          export PRISM_STRATUM_PORT=43340
+          for profile in permissionless real-miner-smoke auxpow prism; do
+            docker compose \
+              --env-file config/upstream.env.example \
+              --env-file .env.example \
+              -f compose.yaml \
+              --profile "$profile" \
+              config --quiet
+          done
 
   docker-builds:
     name: Build lightweight Docker images

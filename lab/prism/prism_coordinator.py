@@ -24,6 +24,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import uuid
+from types import SimpleNamespace
 from dataclasses import dataclass, field, replace as dataclass_replace
 from decimal import Decimal, ROUND_CEILING
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +38,11 @@ if not __package__:
 
 from lab.auxpow import stratum_codec, vardiff
 from lab.prism import direct_stratum, public_api
+from lab.prism.capacity_evidence import (
+    CONFIGURATION_KEYS as CAPACITY_CONFIGURATION_KEYS,
+    EvidenceError as CapacityEvidenceError,
+    load_capacity_evidence,
+)
 from lab.prism.prism_tools import prism_tool_command
 from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
 from lab.prism.ctv_broadcaster_daemon import CtvFanoutBroadcastDaemon, CtvFanoutDaemonResult
@@ -75,14 +81,18 @@ DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
 # Block candidates queue to a dedicated submitter thread so the miner's share
-# ack never waits on audit/persist/submitblock. The bound only guards runaway
-# growth: when it overflows, the OLDEST candidate drops (it was built on the
-# oldest tip and has already lost its race).
+# ack never waits on audit/submitblock after the share and intent commit. The
+# bound limits RAM; overflow only coalesces a wakeup because Postgres retains
+# the authoritative pending candidate.
 MAX_PENDING_BLOCK_CANDIDATES = 32
-# Accepted-share ledger writes queue to a dedicated writer thread so the
-# miner's ack never waits on a psql round trip. The bound is a multi-hour
-# ledger-outage backstop, not a working depth.
-MAX_PENDING_SHARE_APPENDS = 100_000
+# Accepted shares use a small, bounded group-commit queue.  Every submitter
+# waits for its batch's Postgres commit before receiving Stratum success, so
+# this is a latency-smoothing bound rather than a durable backlog.
+MAX_PENDING_SHARE_APPENDS = 4_096
+DEFAULT_SHARE_COMMIT_BATCH_SIZE = 64
+DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS = 5.0
+DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS = 15.0
+DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS = 120
 # The reward window is 8x network difficulty (must match PRISM_WINDOW_MULTIPLIER
 # in crates/qbit-prism/src/lib.rs and the SQL). The job-build snapshot only needs
 # the shares that window can cover; requesting a margin above it returns a
@@ -130,6 +140,16 @@ PRISM_REJECTION_INTERNAL_ERROR = "internal-error"
 PRISM_REJECTION_POOL_CLOSED = "pool-closed"
 PRISM_REJECTION_BLOCK_STALE = "block-stale"
 PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED = "ledger-confirmation-failed"
+PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
+    {
+        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+        PRISM_REJECTION_INTERNAL_ERROR,
+        PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+        PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
+    }
+)
+DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS = 0.25
+DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 # Credit policies recorded on accepted ledger rows. Normal shares carry no
 # policy; a policy marks a share that was credited by an explicit pool rule
 # (documented in docs/prism-rejections.md) so audits can distinguish them.
@@ -279,14 +299,90 @@ def env_optional(name: str) -> str | None:
 
 
 def production_mode() -> bool:
-    return env_bool("QBIT_PRODUCTION", "0") or env_bool("QBIT_TOOLS_PRODUCTION", "0")
+    return (
+        env_bool("QBIT_PRODUCTION", "0")
+        or env_bool("QBIT_TOOLS_PRODUCTION", "0")
+        or env("QBIT_CHAIN", "regtest").lower() in {"main", "mainnet"}
+    )
 
 
 def require_production_env(name: str) -> str:
     value = env_optional(name)
     if value is None:
-        raise SystemExit(f"QBIT_PRODUCTION=1 requires {name}")
+        raise SystemExit(f"production mode requires {name}")
     return value
+
+
+def release_provenance_required() -> bool:
+    """Release provenance is unconditional on mainnet; no environment variable
+    may waive it there. Other chains can run production mode while building
+    images from the pinned source, so they enforce provenance only when
+    QBIT_REQUIRE_RELEASE_PROVENANCE opts in."""
+    return env("QBIT_CHAIN", "regtest").lower() in {"main", "mainnet"} or env_bool(
+        "QBIT_REQUIRE_RELEASE_PROVENANCE", "0"
+    )
+
+
+def require_release_provenance_env(name: str) -> str:
+    value = env_optional(name)
+    if value is None:
+        raise SystemExit(f"release provenance requires {name}")
+    return value
+
+
+def prism_capacity_configuration() -> dict[str, str]:
+    defaults = {
+        "PRISM_STRATUM_SHARE_DIFF": "0.000000001",
+        "PRISM_STRATUM_VARDIFF": "1",
+        "PRISM_STRATUM_VARDIFF_TARGET_SECONDS": "15",
+        "PRISM_STRATUM_VARDIFF_MIN_DIFF": "0.000000001",
+        "PRISM_STRATUM_VARDIFF_START_DIFF": "0.000000001",
+        "PRISM_STRATUM_VARDIFF_MAX_DIFF": "1024",
+        "PRISM_STRATUM_VARDIFF_RETARGET_SECONDS": "90",
+        "PRISM_STRATUM_VARDIFF_MAX_STEP_UP": "4",
+        "PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN": "4",
+        "PRISM_STRATUM_VARDIFF_EWMA_ALPHA": "0.4",
+        "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE": "0.25",
+        "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "15",
+        "PRISM_SHARE_COMMIT_BATCH_SIZE": "64",
+        "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS": "5",
+        "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS": "15",
+        "PRISM_STRATUM_SEND_TIMEOUT_SECONDS": "20",
+    }
+    return {name: env(name, defaults[name]) for name in CAPACITY_CONFIGURATION_KEYS}
+
+
+def validate_prism_capacity_gate() -> None:
+    evidence_path = Path(require_release_provenance_env("PRISM_CAPACITY_EVIDENCE_FILE"))
+    subject = {
+        "coordinator_revision": require_release_provenance_env(
+            "PRISM_CAPACITY_COORDINATOR_REVISION"
+        ),
+        "coordinator_image_digest": require_release_provenance_env(
+            "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST"
+        ),
+        "postgres_server_version": require_release_provenance_env(
+            "PRISM_CAPACITY_POSTGRES_SERVER_VERSION"
+        ),
+        "database_profile_sha256": require_release_provenance_env(
+            "PRISM_CAPACITY_DATABASE_PROFILE_SHA256"
+        ),
+    }
+    forecast = require_release_provenance_env("PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND")
+    p99_limit = require_release_provenance_env("PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS")
+    max_age = env_positive_int("PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS", 86_400)
+    try:
+        load_capacity_evidence(
+            evidence_path,
+            expected_configuration=prism_capacity_configuration(),
+            expected_subject=subject,
+            expected_forecast_peak_shares_per_second=forecast,
+            expected_ack_p99_limit_milliseconds=p99_limit,
+            max_age_seconds=max_age,
+            enforce_freshness=False,
+        )
+    except CapacityEvidenceError as exc:
+        raise SystemExit(f"release provenance capacity evidence is invalid: {exc}") from exc
 
 
 def validate_prism_production_gate() -> None:
@@ -300,15 +396,23 @@ def validate_prism_production_gate() -> None:
         "PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN",
     ):
         if env_bool(name, "0"):
-            raise SystemExit(f"QBIT_PRODUCTION=1 rejects {name}=1")
+            raise SystemExit(f"production mode rejects {name}=1")
+
+    if env("QBIT_CHAIN", "regtest").lower() in {"main", "mainnet"} and env_nonnegative_float(
+        "PRISM_STRATUM_STALE_GRACE_SECONDS",
+        DEFAULT_PRISM_STALE_GRACE_SECONDS,
+    ) != 0:
+        raise SystemExit(
+            "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
+        )
 
     prism_database_url = env_optional("PRISM_DATABASE_URL")
     if prism_database_url is None and env_optional("PRISM_POSTGRES_PSQL_COMMAND") is None:
-        raise SystemExit("QBIT_PRODUCTION=1 requires PRISM_DATABASE_URL or PRISM_POSTGRES_PSQL_COMMAND")
+        raise SystemExit("production mode requires PRISM_DATABASE_URL or PRISM_POSTGRES_PSQL_COMMAND")
     if env_optional("PRISM_POSTGRES_PASSWORD") == "change-this":
-        raise SystemExit("QBIT_PRODUCTION=1 requires a non-default PRISM_POSTGRES_PASSWORD")
+        raise SystemExit("production mode requires a non-default PRISM_POSTGRES_PASSWORD")
     if prism_database_url is not None and "change-this" in prism_database_url:
-        raise SystemExit("QBIT_PRODUCTION=1 requires a non-default PRISM_DATABASE_URL")
+        raise SystemExit("production mode requires a non-default PRISM_DATABASE_URL")
 
     require_production_env("PRISM_MANIFEST_SIGNING_SEED_HEX")
     require_production_env("PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX")
@@ -319,12 +423,23 @@ def validate_prism_production_gate() -> None:
     require_production_env("PRISM_EVIDENCE_PATH")
 
     if env_optional("PRISM_LEDGER_WRITER_SESSION_TOKEN") is not None:
-        raise SystemExit("QBIT_PRODUCTION=1 requires managed ledger session tokens; unset PRISM_LEDGER_WRITER_SESSION_TOKEN")
+        raise SystemExit("production mode requires managed ledger session tokens; unset PRISM_LEDGER_WRITER_SESSION_TOKEN")
 
     require_production_env("QBIT_RPC_USER")
     qbit_rpc_password = require_production_env("QBIT_RPC_PASSWORD")
     if qbit_rpc_password == "change-this":
-        raise SystemExit("QBIT_PRODUCTION=1 requires a non-default QBIT_RPC_PASSWORD")
+        raise SystemExit("production mode requires a non-default QBIT_RPC_PASSWORD")
+
+    if env("QBIT_CHAIN", "regtest").lower() in {"main", "mainnet"} and env_bool(
+        "PRISM_CTV_SETTLEMENT_ENABLED", "0"
+    ):
+        require_production_env("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")
+        env_positive_int("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT", 0)
+
+
+def validate_prism_release_provenance_gate() -> None:
+    if release_provenance_required():
+        validate_prism_capacity_gate()
 
 
 def validate_hex(value: str, *, name: str, expected_bytes: int | None = None) -> str:
@@ -686,13 +801,13 @@ class PrismJobContext:
     template_fingerprint: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class PendingShareAppend:
-    """An accepted share queued for the share-writer thread.
+    """A share waiting for the ledger group-commit writer.
 
-    The share was acknowledged and counted in-memory on the client thread;
-    this record carries what the writer needs to persist it and emit the
-    canonical accepted-share log line.
+    The client thread does not count or acknowledge this share until
+    ``committed`` is set successfully.  A block candidate intent, when
+    present, is inserted in the same transaction as the share.
     """
 
     pending_share: PendingShare
@@ -701,6 +816,10 @@ class PendingShareAppend:
     block_hash_hex: str
     collection_only: bool
     credit_policy: str | None
+    candidate_intent: dict[str, Any] | None = None
+    committed: threading.Event = field(default_factory=threading.Event)
+    record: Any | None = None
+    error: BaseException | None = None
 
 
 @dataclass(frozen=True)
@@ -839,6 +958,14 @@ class StratumError(RuntimeError):
         self.reason = reason
 
 
+class TemplateRefreshBlocked(RuntimeError):
+    """A live template was fetched, but safe work could not be issued."""
+
+
+class _JobBuildFailed(RuntimeError):
+    """Internal signal used to distinguish a skipped build from a no-op."""
+
+
 def parse_worker_username(username: str) -> tuple[str, str | None]:
     payout_address, worker_name = split_worker_username(username)
     if not payout_address:
@@ -854,6 +981,7 @@ def split_worker_username(username: str) -> tuple[str, str | None]:
 class PrismCoordinator:
     def __init__(self) -> None:
         validate_prism_production_gate()
+        validate_prism_release_provenance_gate()
         self.rpc = JsonRpc(
             host=env("QBIT_RPC_HOST"),
             port=env_int("QBIT_RPC_PORT", 18452),
@@ -902,6 +1030,16 @@ class PrismCoordinator:
             "PRISM_TEMPLATE_CACHE_SECONDS",
             self.blockpoll_seconds,
         )
+        self.template_refresh_failure_exit_seconds = env_nonnegative_float(
+            "PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS",
+            DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
+        )
+        if production_mode() and self.template_refresh_failure_exit_seconds <= 0:
+            raise SystemExit(
+                "production mode requires a positive "
+                "PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS"
+            )
+        self.last_successful_template_refresh_monotonic: float | None = None
         self.reorg_reconcile_cache_seconds = env_nonnegative_float(
             "PRISM_REORG_RECONCILE_CACHE_SECONDS",
             DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
@@ -1023,6 +1161,8 @@ class PrismCoordinator:
         self.stale_share_count = 0
         self.duplicate_share_count = 0
         self.low_difficulty_share_count = 0
+        self.collection_block_submission_count = 0
+        self._pool_ready_latched = False
         self.grace_credited_share_count = 0
         self.idle_retarget_count = 0
         self.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
@@ -1046,31 +1186,46 @@ class PrismCoordinator:
             maxsize=MAX_PENDING_BLOCK_CANDIDATES
         )
         self.block_candidates_dropped = 0
+        self.block_candidate_wakeups_coalesced = 0
+        self.block_candidate_retry_count = 0
+        self.block_candidate_poisoned_count = 0
+        self.block_candidate_retry_initial_seconds = (
+            DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS
+        )
+        self.block_candidate_retry_max_seconds = DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS
+        self.block_candidate_retry_delays: dict[str, float] = {}
         # A block candidate that loses its tip race (or fails to submit) is a
         # BLOCK-path event, not a share rejection: under the async model the
         # share was already accepted and credited, so it must not touch the
         # share-reject counters (that would inflate stale_share_percent with
         # block-race losses). Tracked here by reason instead.
         self.block_candidate_abandoned_counts: dict[str, int] = {}
-        # Accepted-share ledger writes drain on a dedicated writer thread; the
-        # flag flips on in run() so tooling/tests that never start the writer
-        # keep the synchronous append. See append_accepted_share.
+        # Accepted shares drain through a bounded group-commit writer.  A
+        # submitting client waits on its entry's completion event, making the
+        # database commit the acknowledgement boundary without paying one
+        # process/transaction round trip per share during bursts.
         self.share_append_queue: queue.Queue[PendingShareAppend] = queue.Queue(
             maxsize=MAX_PENDING_SHARE_APPENDS
         )
+        self.share_commit_batch_size = env_positive_int(
+            "PRISM_SHARE_COMMIT_BATCH_SIZE", DEFAULT_SHARE_COMMIT_BATCH_SIZE
+        )
+        self.share_commit_linger_seconds = (
+            env_nonnegative_float(
+                "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS",
+                DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS,
+            )
+            / 1000.0
+        )
+        self.share_commit_timeout_seconds = env_positive_float(
+            "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS", DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS
+        )
         self.share_writer_active = False
         self.share_append_failure_count = 0
-        # An accepted share that the writer cannot persist (a ledger outage that
-        # outlasts shutdown, or a backlog overflow) is written to this recovery
-        # file instead of being silently lost, and replayed into the ledger on
-        # the next start -- an acked share is a payout. Replay skips already-
-        # committed share_ids, so it is idempotent across a partial replay.
-        # Durability boundary: acked shares survive a ledger outage, a graceful
-        # shutdown, a backlog overflow, and a watchdog-triggered exit (the queue
-        # is flushed to this file first). A SIGKILL / OOM / host failure can
-        # still lose shares sitting in the in-memory queue -- a bounded window
-        # matching async pool designs (e.g. Miningcore's buffer). A pre-ack
-        # local WAL would close it at the cost of ack latency; not done here.
+        # Retain the historical recovery-file reader for clean upgrades from a
+        # release that could acknowledge before Postgres commit.  New shares
+        # are never written here: an unavailable ledger produces no success
+        # acknowledgement and an exact retry is idempotent.
         self.share_recovery_path = Path(
             env("PRISM_SHARE_RECOVERY_PATH", str(self.audit_dir / "prism-unpersisted-shares.jsonl"))
         )
@@ -1887,17 +2042,9 @@ class PrismCoordinator:
                     "Exiting non-zero so the restart policy recovers the process.",
                     flush=True,
                 )
-                # Flush queued acked shares to the recovery file before the hard
-                # exit so a self-inflicted kill does not lose payouts. Bounded by
-                # a join timeout in a side thread: a wedged disk must not stop the
-                # watchdog from actually killing the hung process.
-                drainer = threading.Thread(
-                    target=self._drain_share_queue_to_recovery,
-                    args=("liveness watchdog exit",),
-                    daemon=True,
-                )
-                drainer.start()
-                drainer.join(timeout=5.0)
+                # Queued shares have not been acknowledged. Miners reconnect
+                # and retry them after restart; exact-payload replay is
+                # idempotent if Postgres committed just before this exit.
                 os._exit(1)
 
     def release_ledger_lease(self) -> None:
@@ -1924,6 +2071,8 @@ class PrismCoordinator:
                 break
             except Exception:
                 time.sleep(1)
+        self.validate_live_chain_identity()
+        self.validate_live_template_and_fee_policy()
         self.prism_payout_policy()
         print(
             f"prism coordinator: listening on {self.bind}:{self.port} "
@@ -1947,6 +2096,10 @@ class PrismCoordinator:
             )
         if self.audit_bind and self.audit_port:
             self.start_audit_server()
+        # Recover block work before opening Stratum listeners.  New miners can
+        # only add wakeups after every previously committed candidate has had a
+        # chance to re-enter the submit queue.
+        self.replay_pending_block_candidates()
         with ExitStack() as listener_stack:
             listeners: list[tuple[socket.socket, StratumListenerProfile]] = []
             for profile in self.listener_profiles:
@@ -2129,6 +2282,26 @@ class PrismCoordinator:
             except Exception:
                 print("prism coordinator: qbit tip/template poll failed", flush=True)
                 traceback.print_exc()
+                if self.template_refresh_failure_expired(time.monotonic()):
+                    print(
+                        "prism coordinator: template refresh failure budget exhausted; "
+                        "exiting non-zero so the restart policy recovers the process",
+                        flush=True,
+                    )
+                    os._exit(1)
+
+    def template_refresh_failure_expired(self, now: float) -> bool:
+        budget = float(
+            getattr(
+                self,
+                "template_refresh_failure_exit_seconds",
+                DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
+            )
+        )
+        if budget <= 0:
+            return False
+        last_success = getattr(self, "last_successful_template_refresh_monotonic", None)
+        return last_success is not None and now - last_success >= budget
 
     def blockwait_once(self, known_tip: str) -> str:
         """One waitfornewblock round: returns the tip after the wait.
@@ -2266,8 +2439,11 @@ class PrismCoordinator:
         try:
             snapshot = self.fetch_qbit_tip_template_snapshot()
             self.observe_tip_first_seen(snapshot.bestblockhash)
+            self.pool_readiness_latched()
             if not self.ensure_reorg_reconciled_for_tip(snapshot.bestblockhash):
-                return 0
+                raise TemplateRefreshBlocked(
+                    "qbit chain view remained untrusted after reorg reconciliation"
+                )
             with self.lock:
                 previous_snapshot = self.tip_template_snapshot
                 snapshot_changed = previous_snapshot is not None and previous_snapshot != snapshot
@@ -2287,6 +2463,7 @@ class PrismCoordinator:
                     ]
 
             refreshed = 0
+            build_failures = 0
             for client in clients:
                 if self.stop_event.is_set():
                     break
@@ -2299,14 +2476,23 @@ class PrismCoordinator:
                     if self.maybe_send_job(
                         client,
                         clean_jobs=self.client_tip_changed_for_snapshot(client, snapshot),
+                        raise_on_reorg_failure=True,
+                        raise_on_build_failure=True,
                     ):
                         refreshed += 1
+                except _JobBuildFailed:
+                    build_failures += 1
                 except OSError:
                     self.disconnect_client(client)
 
+            if refreshed == 0 and build_failures:
+                raise TemplateRefreshBlocked(
+                    f"job builds failed for {build_failures} client(s); no refreshed work was issued"
+                )
             if refreshed:
                 with self.lock:
                     self.tip_refresh_job_count += refreshed
+            self.last_successful_template_refresh_monotonic = time.monotonic()
             return refreshed
         finally:
             self._tip_refresh_lock.release()
@@ -2552,17 +2738,146 @@ class PrismCoordinator:
         blockchain_info = self.rpc.call("getblockchaininfo")
         if not isinstance(blockchain_info, dict):
             raise RuntimeError("getblockchaininfo returned non-object")
-        if blockchain_info.get("initialblockdownload"):
+        public_chain = str(getattr(self, "qbit_chain", "regtest")).lower() in {
+            "main",
+            "mainnet",
+            *TESTNET_QBIT_CHAINS,
+        }
+        if (
+            blockchain_info.get("initialblockdownload") is not False
+            if public_chain
+            else bool(blockchain_info.get("initialblockdownload"))
+        ):
             return True
         blocks_raw = blockchain_info.get("blocks")
         headers_raw = blockchain_info.get("headers")
+        if public_chain and (blocks_raw is None or headers_raw is None):
+            return True
         if blocks_raw is not None and headers_raw is not None:
             try:
-                if int(headers_raw) > int(blocks_raw):
+                blocks = int(blocks_raw)
+                headers = int(headers_raw)
+                if blocks < 0 or headers < 0 or headers != blocks:
                     return True
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("getblockchaininfo blocks/headers are not integers") from exc
         return False
+
+    def validate_live_chain_identity(self) -> None:
+        """Fail closed when a public-chain node is wrong, isolated, or behind."""
+        configured = str(getattr(self, "qbit_chain", "regtest")).strip().lower()
+        info = self.rpc.call("getblockchaininfo")
+        if not isinstance(info, dict):
+            raise RuntimeError("getblockchaininfo returned non-object")
+        reported = str(info.get("chain", "")).strip().lower()
+        aliases = {
+            "main": {"main", "mainnet"},
+            "mainnet": {"main", "mainnet"},
+        }
+        allowed = aliases.get(configured, {configured})
+        if reported not in allowed:
+            raise RuntimeError(
+                f"configured qbit chain {configured!r} does not match RPC chain {reported!r}"
+            )
+
+        expected_genesis = env_optional("QBIT_EXPECTED_GENESIS_HASH")
+        if configured in {"main", "mainnet"} and expected_genesis is None:
+            raise RuntimeError("QBIT_EXPECTED_GENESIS_HASH is required on mainnet")
+        if expected_genesis is not None:
+            expected_genesis = validate_hex(
+                expected_genesis,
+                name="QBIT_EXPECTED_GENESIS_HASH",
+                expected_bytes=32,
+            )
+            live_genesis = str(self.rpc.call("getblockhash", [0])).lower()
+            if live_genesis != expected_genesis:
+                raise RuntimeError(
+                    "QBIT_EXPECTED_GENESIS_HASH does not match the connected qbit node"
+                )
+
+        if configured not in {"main", "mainnet", *TESTNET_QBIT_CHAINS}:
+            return
+        if info.get("initialblockdownload") is not False:
+            raise RuntimeError("public-chain qbitd is still in initial block download")
+        try:
+            blocks = int(info["blocks"])
+            headers = int(info["headers"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("public-chain qbitd did not report numeric blocks and headers") from exc
+        if blocks < 0 or headers < 0:
+            raise RuntimeError("public-chain qbitd reported negative blocks or headers")
+        if blocks != headers:
+            raise RuntimeError(f"public-chain qbitd is not caught up: blocks={blocks}, headers={headers}")
+        network_info = self.rpc.call("getnetworkinfo")
+        if not isinstance(network_info, dict):
+            raise RuntimeError("getnetworkinfo returned non-object")
+        try:
+            connections = int(network_info["connections"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("public-chain qbitd did not report a numeric peer count") from exc
+        minimum_peers = env_positive_int("PRISM_MIN_PEERS", 1)
+        if connections < minimum_peers:
+            raise RuntimeError(
+                f"public-chain qbitd has {connections} peers, requires at least {minimum_peers}"
+            )
+
+    @staticmethod
+    def rpc_fee_rate_bits_per_1000_weight(value: object, *, field: str) -> int:
+        try:
+            fee_rate = Decimal(str(value))
+        except Exception as exc:
+            raise RuntimeError(f"{field} is not a decimal fee rate") from exc
+        if not fee_rate.is_finite() or fee_rate <= 0:
+            raise RuntimeError(f"{field} is not a positive fee rate")
+        return int(
+            (fee_rate * Decimal(100_000_000)).to_integral_value(rounding=ROUND_CEILING)
+        )
+
+    def validate_live_template_and_fee_policy(self) -> None:
+        artifacts = self.current_template_artifacts()
+        template = artifacts.template
+        if not artifacts.previousblockhash:
+            raise RuntimeError("getblocktemplate.previousblockhash was missing")
+        try:
+            template_time = int(template["curtime"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("getblocktemplate.curtime was missing or not numeric") from exc
+        max_age = env_nonnegative_int(
+            "PRISM_TEMPLATE_MAX_AGE_SECONDS",
+            DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
+        )
+        template_age = int(time.time()) - template_time
+        if template_age > max_age:
+            raise RuntimeError(
+                f"qbit block template is stale: age={template_age}s exceeds {max_age}s"
+            )
+        self.last_successful_template_refresh_monotonic = time.monotonic()
+
+        settlement = self.prism_ctv_settlement_config(
+            block_height=int(template["height"]) if "height" in template else None,
+            parent_hash=artifacts.previousblockhash,
+        )
+        if settlement is None:
+            return
+        policy = settlement["fanout_fee_rate_policy"]
+        assert isinstance(policy, dict)
+        configured_rate = int(policy["market_fee_rate_sats_per_1000_weight"])
+        mempool_info = self.rpc.call("getmempoolinfo")
+        if not isinstance(mempool_info, dict):
+            raise RuntimeError("getmempoolinfo returned non-object")
+        relay_floors = [
+            self.rpc_fee_rate_bits_per_1000_weight(mempool_info[name], field=name)
+            for name in ("minrelaytxfee", "mempoolminfee")
+            if mempool_info.get(name) is not None
+        ]
+        if not relay_floors:
+            raise RuntimeError("getmempoolinfo did not report a relay fee floor")
+        required_rate = max(relay_floors)
+        if configured_rate < required_rate:
+            raise RuntimeError(
+                "PRISM CTV fanout fee rate is below the connected node relay floor: "
+                f"configured={configured_rate} required={required_rate} bits/1000 weight"
+            )
 
     def reconcile_prism_pool_blocks_once(self, *, tip_hash: str | None = None) -> dict[str, object]:
         summary: dict[str, object] = {
@@ -2648,6 +2963,24 @@ class PrismCoordinator:
     def client_can_receive_jobs(self, client: ClientState) -> bool:
         return client.subscribed and client.authorized and client.worker is not None
 
+    def pool_readiness_latched(self) -> bool:
+        """Latch, once, the transition past min_ready_miners.
+
+        Readiness is monotonic (a lifetime distinct-accepted-miner count), so
+        a single observation is permanent and later checks stay ledger-free.
+        The poll loop refreshes the latch outside the coordinator lock.
+        """
+        if getattr(self, "_pool_ready_latched", False):
+            return True
+        try:
+            _, ready_miner_count = self.accepted_share_stats()
+        except Exception:
+            return False
+        if ready_miner_count >= getattr(self, "min_ready_miners", 3):
+            self._pool_ready_latched = True
+            return True
+        return False
+
     def client_needs_tip_template_refresh(
         self,
         client: ClientState,
@@ -2655,6 +2988,13 @@ class PrismCoordinator:
     ) -> bool:
         context = client.active_job
         if context is None:
+            return True
+        if getattr(context, "collection_only", False) and getattr(
+            self, "_pool_ready_latched", False
+        ):
+            # The pool crossed min_ready_miners after this job was issued.
+            # A collection job keeps settling solved blocks solver-pays-all,
+            # so replace it with windowed work on the next poller pass.
             return True
         template = context.template
         previousblockhash = str(template.get("previousblockhash", ""))
@@ -2856,7 +3196,14 @@ class PrismCoordinator:
             raise StratumError(20, f"{label} does not resolve to a P2MR script: {address}")
         return script, script[4:]
 
-    def maybe_send_job(self, client: ClientState, *, clean_jobs: bool) -> bool:
+    def maybe_send_job(
+        self,
+        client: ClientState,
+        *,
+        clean_jobs: bool,
+        raise_on_reorg_failure: bool = False,
+        raise_on_build_failure: bool = False,
+    ) -> bool:
         if not client.subscribed or not client.authorized or client.worker is None:
             return False
         self._ensure_job_cache_state()
@@ -2870,19 +3217,29 @@ class PrismCoordinator:
         phase_started = time.monotonic()
         try:
             if not self.ensure_reorg_reconciled_for_current_tip():
+                if raise_on_reorg_failure:
+                    raise TemplateRefreshBlocked(
+                        "qbit chain view became untrusted before client job build"
+                    )
                 return False
-        except Exception:
+        except TemplateRefreshBlocked:
+            raise
+        except Exception as exc:
             print(
                 f"prism coordinator: reorg reconciliation failed before job build "
                 f"connection={client.connection_id} username={client.username}; skipping this job",
                 flush=True,
             )
             traceback.print_exc()
+            if raise_on_reorg_failure:
+                raise TemplateRefreshBlocked(
+                    "reorg reconciliation failed before client job build"
+                ) from exc
             return False
         phases["reorg"] = time.monotonic() - phase_started
         try:
             context = self.build_job_for_client(client, clean_jobs=clean_jobs)
-        except Exception:
+        except Exception as exc:
             # A single bad template (e.g. a coinbase whose bytes collide with the
             # extranonce placeholder, or a transient getblocktemplate failure) must
             # never tear down the miner's connection. Log it, count it, and skip
@@ -2898,6 +3255,10 @@ class PrismCoordinator:
                 flush=True,
             )
             traceback.print_exc()
+            if raise_on_build_failure:
+                raise _JobBuildFailed(
+                    f"job build failed for connection {client.connection_id}"
+                ) from exc
             return False
         client.active_job = context
         with self.lock:
@@ -3360,12 +3721,27 @@ class PrismCoordinator:
         # qbit network target while network difficulty sits below the floor,
         # so a submission can solve a block yet miss the share target. Never
         # discard a block over share bookkeeping: reject as low-difficulty
-        # only when the hash is not block-worthy.
+        # only when the hash is not block-worthy. Collection-mode jobs are
+        # block-worthy too: their signed bootstrap manifest already commits
+        # the whole coinbase to the submitting worker, so the solve settles
+        # solver-pays-all instead of being silently ledgered as a share -- a
+        # fresh ledger would otherwise withhold every solved block until some
+        # later job delivery, stalling a bootstrapping chain.
         block_worthy = (
             submission.block_pass
-            and not context.collection_only
             and credit_policy != PRISM_CREDIT_POLICY_STALE_GRACE
         )
+        if block_worthy and context.collection_only:
+            with self.lock:
+                self.collection_block_submission_count = (
+                    getattr(self, "collection_block_submission_count", 0) + 1
+                )
+            print(
+                f"prism coordinator: collection-mode block candidate settles "
+                f"solver-pays-all miner={context.worker.payout_address} "
+                f"hash={submission.block_hash_hex}",
+                flush=True,
+            )
         if not submission.share_pass and not block_worthy:
             self.reject_stratum(
                 23,
@@ -3382,13 +3758,18 @@ class PrismCoordinator:
             credit_policy=credit_policy,
         )
         if not block_worthy:
-            self.append_accepted_share(
-                client,
-                context,
-                submission,
-                pending_share,
-                credit_policy=credit_policy,
-            )
+            try:
+                self.append_accepted_share(
+                    client,
+                    context,
+                    submission,
+                    pending_share,
+                    credit_policy=credit_policy,
+                )
+            except BaseException:
+                with self.lock:
+                    self.recent_share_keys.discard(share_key)
+                raise
             return False
         candidate = PrismBlockCandidate(
             context=context,
@@ -3414,28 +3795,156 @@ class PrismCoordinator:
             # block_candidate_abandoned_counts; reject_stratum additionally counts
             # the miner-facing rejection (globally and per worker) so this rare
             # synchronous path is not missing from the rejection metrics.
-            if not self.submit_block_candidate(candidate):
+            candidate_intent = self.block_candidate_intent(candidate)
+            persist_intent = getattr(self.ledger, "persist_block_candidate_intent", None)
+            try:
+                if callable(persist_intent):
+                    persist_intent(candidate_intent)
+                block_landed = self.submit_block_candidate(candidate)
+            except BaseException:
+                with self.lock:
+                    self.recent_share_keys.discard(share_key)
+                raise
+            if not block_landed:
+                outcome = getattr(self, "_block_candidate_outcome", None)
+                reason = getattr(outcome, "reason", None) if outcome is not None else None
+                retryable_reasons = {None, *PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS}
+                if reason in retryable_reasons:
+                    # The durable outbox may still land and credit this block.
+                    # Close without a Stratum result instead of issuing a false
+                    # definitive rejection for an uncertain outcome.
+                    with self.lock:
+                        self.recent_share_keys.discard(share_key)
+                    raise RuntimeError(
+                        "block candidate outcome is pending durable retry"
+                    )
+                if reason not in retryable_reasons:
+                    finish = getattr(self.ledger, "mark_block_candidate_abandoned", None)
+                    if callable(finish):
+                        finish(block_hash=submission.block_hash_hex, error=reason)
+                with self.lock:
+                    self.recent_share_keys.discard(share_key)
                 self.reject_stratum(
                     23,
                     PRISM_REJECTION_LOW_DIFFICULTY,
                     "low difficulty share",
                     worker=worker_name,
                 )
+            else:
+                finish = getattr(self.ledger, "mark_block_candidate_submitted", None)
+                if callable(finish):
+                    finish(block_hash=submission.block_hash_hex)
             return False
         # A block-worthy submission that met the share target is a valid share
         # regardless of the block's fate: credit it now, acknowledge the miner
         # immediately, and land the block from the dedicated submitter thread
         # (ckpool/btcpool/StratumV2 semantics). An orphaned candidate keeps its
         # share credit.
-        self.append_accepted_share(
-            client,
-            context,
-            submission,
-            pending_share,
-            credit_policy=credit_policy,
-        )
+        try:
+            candidate_intent = self.block_candidate_intent(candidate)
+            self.append_accepted_share(
+                client,
+                context,
+                submission,
+                pending_share,
+                credit_policy=credit_policy,
+                candidate_intent=candidate_intent,
+            )
+        except BaseException:
+            with self.lock:
+                self.recent_share_keys.discard(share_key)
+            raise
         self.enqueue_block_candidate(candidate)
         return False
+
+    @staticmethod
+    def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
+        """Return the immutable JSON needed to resume a candidate after restart."""
+        context = candidate.context
+        submission = candidate.submission
+        intent = {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": str(submission.block_hash_hex).lower(),
+            "block_hex": str(getattr(submission, "block_hex", "")),
+            "coinbase_tx_hex": str(getattr(submission, "coinbase_tx_hex", "")),
+            "parent_hash": str(context.template["previousblockhash"]).lower(),
+            "expected_height": int(context.template["height"]),
+            "template": {
+                "previousblockhash": context.template["previousblockhash"],
+                "height": int(context.template["height"]),
+                "coinbasevalue": int(context.template["coinbasevalue"]),
+            },
+            "shares_json": context.shares_json,
+            "prior_balances": context.prior_balances,
+            "found_block": context.found_block,
+            "witness_merkle_leaves_hex": direct_stratum.witness_merkle_leaves_hex(
+                getattr(context.job, "transaction_hexes", ())
+            ),
+            "extranonce1_hex": candidate.extranonce1_hex,
+            "extranonce2_hex": candidate.extranonce2_hex,
+            "username": candidate.client.username,
+            "pending_share": dataclasses.asdict(candidate.pending_share),
+            "credit_share_on_accept": candidate.credit_share_on_accept,
+            "collection_only": bool(context.collection_only),
+        }
+        # Fail on the client thread before committing a share if a future field
+        # introduces a value that cannot survive the durable JSON boundary.
+        json.dumps(intent, separators=(",", ":"), sort_keys=True)
+        return intent
+
+    @staticmethod
+    def block_candidate_from_intent(intent: dict[str, Any]) -> PrismBlockCandidate:
+        if intent.get("schema") != "qbit.prism.block-candidate-intent.v1":
+            raise ValueError("unsupported block candidate intent schema")
+        block_hash = str(intent["block_hash_hex"]).lower()
+        template = dict(intent["template"])
+        if str(template.get("previousblockhash", "")).lower() != str(intent["parent_hash"]).lower():
+            raise ValueError("block candidate parent hash does not match template")
+        if int(template.get("height", -1)) != int(intent["expected_height"]):
+            raise ValueError("block candidate height does not match template")
+        submission = direct_stratum.DirectQbitSubmission(
+            coinbase_tx_hex=str(intent["coinbase_tx_hex"]),
+            coinbase_txid_preimage_hex="",
+            header_hex="",
+            block_hex=str(intent["block_hex"]),
+            block_hash_hex=block_hash,
+            block_hash_int=int(block_hash, 16),
+            share_pass=True,
+            block_pass=True,
+            applied_version_hex="",
+        )
+        context = PrismJobContext(
+            job=SimpleNamespace(
+                transaction_hexes=(),
+                witness_merkle_leaves_hex=tuple(
+                    intent.get("witness_merkle_leaves_hex", [])
+                ),
+            ),
+            template=template,
+            bundle={},
+            shares_json=list(intent["shares_json"]),
+            prior_balances=list(intent["prior_balances"]),
+            found_block=dict(intent["found_block"]),
+            share_weight=0,
+            collection_only=bool(intent.get("collection_only", False)),
+            worker=WorkerIdentity(
+                username=str(intent["username"]),
+                payout_address="",
+                worker_name=None,
+                script_pubkey_hex="",
+                p2mr_program_hex="",
+            ),
+            issued_at_ms=0,
+        )
+        return PrismBlockCandidate(
+            context=context,
+            submission=submission,
+            extranonce1_hex=str(intent["extranonce1_hex"]),
+            extranonce2_hex=str(intent["extranonce2_hex"]),
+            pending_share=PendingShare(**dict(intent["pending_share"])),
+            client=SimpleNamespace(username=str(intent["username"])),
+            credit_share_on_accept=bool(intent.get("credit_share_on_accept", False)),
+        )
 
     def pending_share_from_submission(
         self,
@@ -3469,23 +3978,8 @@ class PrismCoordinator:
         pending_share: PendingShare,
         *,
         credit_policy: str | None = None,
+        candidate_intent: dict[str, Any] | None = None,
     ) -> None:
-        # In-memory accounting (worker counters, vardiff window) happens on the
-        # calling thread so retargets and metrics see the share immediately;
-        # the ledger write is handed to the share-writer thread when it is
-        # running so the miner's ack never waits on a psql round trip. Without
-        # a writer (tests, tools that never call run()) the append is
-        # synchronous, exactly as before.
-        #
-        # Reward-window boundary: a job snapshot reads committed ledger rows, so
-        # a share acked just before a job is issued but still in the writer queue
-        # may miss that job's window and land in a later block's window instead.
-        # It is never dropped or double-paid, the effect is bounded by the writer
-        # lag (sub-ms normally) and averages across miners, so we accept it rather
-        # than fence job-build on the writer -- fencing would delay new jobs and
-        # cause stale shares during the very ledger slowness where it would bite.
-        self.note_worker_accepted_share(client.username, credit_policy)
-        self.note_vardiff_accepted_share(client, context.job)
         entry = PendingShareAppend(
             pending_share=pending_share,
             username=client.username,
@@ -3493,29 +3987,50 @@ class PrismCoordinator:
             block_hash_hex=submission.block_hash_hex,
             collection_only=bool(context.collection_only),
             credit_policy=credit_policy,
+            candidate_intent=candidate_intent,
         )
         if getattr(self, "share_writer_active", False):
-            self.enqueue_share_append(entry)
-            return
-        self._append_share_entry(entry)
+            self.enqueue_share_append(entry, wait=True)
+        else:
+            self._append_share_entry(entry)
+        # Only committed shares affect public accounting, vardiff, and the
+        # response that handle_request sends immediately after this returns.
+        self.note_worker_accepted_share(client.username, credit_policy)
+        self.note_vardiff_accepted_share(client, context.job)
 
-    def enqueue_share_append(self, entry: PendingShareAppend) -> None:
+    def enqueue_share_append(self, entry: PendingShareAppend, *, wait: bool = False) -> None:
         queue_obj = getattr(self, "share_append_queue", None)
         if queue_obj is None:
             queue_obj = queue.Queue(maxsize=MAX_PENDING_SHARE_APPENDS)
             self.share_append_queue = queue_obj
         try:
-            queue_obj.put_nowait(entry)
+            if wait:
+                queue_obj.put(
+                    entry,
+                    timeout=getattr(self, "share_commit_timeout_seconds", 15.0),
+                )
+            else:
+                queue_obj.put_nowait(entry)
         except queue.Full:
-            # A full backlog means the ledger has been unreachable for a very
-            # long time. Recover the INCOMING (newest) share rather than
-            # displacing an older queued one: that keeps the queue in acceptance
-            # order so it persists with correct share_seq when the ledger
-            # returns, and never loses an acked share (a payout).
-            self._recover_share_to_disk(entry, "writer backlog full")
+            raise StratumError(
+                20,
+                "share ledger commit queue is full",
+                reason=PRISM_REJECTION_INTERNAL_ERROR,
+            )
+        if not wait:
+            return
+        # Once admitted, wait for a definite transaction outcome. A local
+        # timeout is ambiguous because Postgres may commit immediately after
+        # it; the liveness watchdog owns recovery from a wedged writer.
+        entry.committed.wait()
+        if entry.error is not None:
+            raise StratumError(
+                20,
+                f"share ledger commit failed: {entry.error}",
+                reason=PRISM_REJECTION_INTERNAL_ERROR,
+            )
 
     def share_append_loop(self) -> None:
-        drain_to_recovery = False
         while True:
             self._record_heartbeat("share_writer")
             queue_obj = getattr(self, "share_append_queue", None)
@@ -3529,15 +4044,66 @@ class PrismCoordinator:
                 if stopping:
                     return
                 continue
-            if drain_to_recovery:
-                # A ledger outage was still unresolved at shutdown. Once we start
-                # recovering, recover the rest in FIFO order rather than persist a
-                # newer share ahead of an already-recovered older one (which
-                # would misorder the reward window on replay).
-                self._recover_share_to_disk(entry, "ledger unavailable at shutdown")
-                continue
-            if not self._append_share_entry(entry, retry_until_stopped=True):
-                drain_to_recovery = True
+            batch = [entry]
+            batch_size = max(1, int(getattr(self, "share_commit_batch_size", 64)))
+            deadline = time.monotonic() + max(
+                0.0, float(getattr(self, "share_commit_linger_seconds", 0.005))
+            )
+            if entry.candidate_intent is not None:
+                deadline = time.monotonic()
+            while len(batch) < batch_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    next_entry = queue_obj.get(timeout=remaining)
+                    batch.append(next_entry)
+                    if next_entry.candidate_intent is not None:
+                        break
+                except queue.Empty:
+                    break
+            self._append_share_batch(batch)
+
+    def _append_share_batch(self, batch: list[PendingShareAppend]) -> bool:
+        """Commit a writer batch, then release every waiting submitter."""
+        try:
+            append_batch = getattr(self.ledger, "append_batch", None)
+            if callable(append_batch):
+                records = append_batch(
+                    [(entry.pending_share, entry.candidate_intent) for entry in batch]
+                )
+            else:
+                # Compatibility for lightweight test/tool ledgers. Production's
+                # Postgres ledger always supplies the atomic batch method.
+                records = [self.ledger.append(entry.pending_share) for entry in batch]
+            if len(records) != len(batch):
+                raise RuntimeError("share ledger returned an incomplete commit batch")
+            for entry, record in zip(batch, records, strict=True):
+                entry.record = record
+                print(
+                    "prism coordinator: accepted share "
+                    f"seq={record.share_seq} miner={entry.username} job={entry.job_id} "
+                    f"hash={entry.block_hash_hex} collection={entry.collection_only} "
+                    f"credit_policy={entry.credit_policy or 'normal'}",
+                    flush=True,
+                )
+            return True
+        except Exception as exc:
+            with self.lock:
+                self.share_append_failure_count = (
+                    int(getattr(self, "share_append_failure_count", 0)) + len(batch)
+                )
+            for entry in batch:
+                entry.error = exc
+            print(
+                f"prism coordinator: share ledger group commit failed count={len(batch)}",
+                flush=True,
+            )
+            traceback.print_exc()
+            return False
+        finally:
+            for entry in batch:
+                entry.committed.set()
 
     def _recover_share_to_disk(self, entry: PendingShareAppend, reason: str) -> None:
         """Durably capture an acked share the writer could not persist.
@@ -3583,33 +4149,6 @@ class PrismCoordinator:
                     flush=True,
                 )
                 traceback.print_exc()
-
-    def _drain_share_queue_to_recovery(self, reason: str) -> int:
-        """Flush queued-but-unpersisted acked shares to the recovery file.
-
-        Best-effort, used before a self-inflicted hard exit (the liveness
-        watchdog) so acked shares still in the in-memory writer queue survive.
-        A duplicate written here -- the writer may have already persisted the
-        same entry -- is harmless: replay skips already-committed share_ids.
-        """
-        queue_obj = getattr(self, "share_append_queue", None)
-        if queue_obj is None:
-            return 0
-        drained = 0
-        while True:
-            try:
-                entry = queue_obj.get_nowait()
-            except queue.Empty:
-                break
-            self._recover_share_to_disk(entry, reason)
-            drained += 1
-        if drained:
-            print(
-                f"prism coordinator: flushed {drained} queued acked share(s) to the "
-                f"recovery file before exit reason={reason}",
-                flush=True,
-            )
-        return drained
 
     def replay_recovered_shares(self) -> int:
         """Replay any recovery-file shares into the ledger at startup.
@@ -3689,7 +4228,7 @@ class PrismCoordinator:
         return replayed
 
     def _append_share_entry(self, entry: PendingShareAppend, *, retry_until_stopped: bool = False) -> bool:
-        """Append one accepted share to the ledger, with retry on the writer.
+        """Synchronously append one accepted share.
 
         On the writer thread a transient ledger failure retries with capped
         backoff so ordering is preserved and nothing is silently lost; the
@@ -3703,7 +4242,14 @@ class PrismCoordinator:
         backoff_seconds = 0.5
         while True:
             try:
-                record = self.ledger.append(entry.pending_share)
+                append_batch = getattr(self.ledger, "append_batch", None)
+                if callable(append_batch):
+                    record = append_batch(
+                        [(entry.pending_share, entry.candidate_intent)]
+                    )[0]
+                else:
+                    record = self.ledger.append(entry.pending_share)
+                entry.record = record
                 break
             except Exception:
                 if not retry_until_stopped:
@@ -3733,6 +4279,7 @@ class PrismCoordinator:
             f"credit_policy={entry.credit_policy or 'normal'}",
             flush=True,
         )
+        entry.committed.set()
         return True
 
     def accepted_share_difficulty(self, context: PrismJobContext) -> int:
@@ -3956,36 +4503,96 @@ class PrismCoordinator:
         if client.vardiff_window_started_monotonic == idle_window_reset_at:
             client.vardiff_window_started_monotonic = idle_window_started
 
-    def enqueue_block_candidate(self, candidate: PrismBlockCandidate) -> None:
+    def enqueue_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
         queue_obj = getattr(self, "block_candidate_queue", None)
         if queue_obj is None:
             queue_obj = queue.Queue(maxsize=MAX_PENDING_BLOCK_CANDIDATES)
             self.block_candidate_queue = queue_obj
-        while True:
+        try:
+            queue_obj.put_nowait(candidate)
+            return True
+        except queue.Full:
+            # The candidate is already durable. A full queue merely coalesces
+            # this wakeup; the submitter re-reads pending outbox rows whenever
+            # it drains the queue, so no candidate is discarded.
+            with self.lock:
+                self.block_candidate_wakeups_coalesced = int(
+                    getattr(self, "block_candidate_wakeups_coalesced", 0)
+                ) + 1
+            print(
+                "prism coordinator: block candidate wakeup coalesced "
+                f"hash={candidate.submission.block_hash_hex} (submitter queue full)",
+                flush=True,
+            )
+            return False
+
+    def replay_pending_block_candidates(self) -> int:
+        """Queue durable candidate intents not completed by an earlier process."""
+        pending_rows = getattr(self.ledger, "pending_block_candidate_rows", None)
+        if callable(pending_rows):
+            durable_rows = pending_rows(limit=MAX_PENDING_BLOCK_CANDIDATES)
+        else:
+            pending = getattr(self.ledger, "pending_block_candidates", None)
+            if not callable(pending):
+                return 0
+            durable_rows = [
+                {
+                    "block_hash": (
+                        intent.get("block_hash_hex", "")
+                        if isinstance(intent, dict)
+                        else ""
+                    ),
+                    "candidate": intent,
+                }
+                for intent in pending(limit=MAX_PENDING_BLOCK_CANDIDATES)
+            ]
+        queue_obj = getattr(self, "block_candidate_queue", None)
+        if queue_obj is not None and not queue_obj.empty():
+            return 0
+        queued = 0
+        for durable_row in durable_rows:
+            durable_block_hash = ""
             try:
-                queue_obj.put_nowait(candidate)
-                return
-            except queue.Full:
-                # Never block the client thread. Drop the OLDEST queued
-                # candidate: it was built on the oldest tip and has already
-                # lost its race; the incoming candidate is the freshest.
-                try:
-                    dropped = queue_obj.get_nowait()
-                except queue.Empty:
-                    continue
-                with self.lock:
-                    self.block_candidates_dropped = (
-                        int(getattr(self, "block_candidates_dropped", 0)) + 1
-                    )
-                print(
-                    "prism coordinator: dropped oldest queued block candidate "
-                    f"hash={dropped.submission.block_hash_hex} (submitter queue full)",
-                    flush=True,
-                )
+                if not isinstance(durable_row, dict):
+                    raise ValueError("durable block candidate row is not an object")
+                durable_block_hash = str(durable_row["block_hash"]).lower()
+                intent = durable_row["candidate"]
+                if not isinstance(intent, dict):
+                    raise ValueError("durable block candidate intent is not an object")
+                intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
+                if not durable_block_hash or intent_block_hash != durable_block_hash:
+                    raise ValueError("durable block candidate row key does not match intent")
+                if self.enqueue_block_candidate(self.block_candidate_from_intent(intent)):
+                    queued += 1
+            except Exception:
+                print("prism coordinator: invalid durable block candidate intent", flush=True)
+                traceback.print_exc()
+                quarantine = getattr(self.ledger, "mark_block_candidate_abandoned", None)
+                if durable_block_hash and callable(quarantine):
+                    try:
+                        quarantined = quarantine(
+                            block_hash=durable_block_hash,
+                            error="invalid durable candidate intent",
+                        )
+                        if quarantined:
+                            self._clear_block_candidate_retry_state(durable_block_hash)
+                            with self.lock:
+                                self.block_candidate_poisoned_count = int(
+                                    getattr(self, "block_candidate_poisoned_count", 0)
+                                ) + 1
+                    except Exception:
+                        traceback.print_exc()
+        if queued:
+            print(
+                f"prism coordinator: replayed {queued} pending block candidate(s)",
+                flush=True,
+            )
+        return queued
 
     def block_submit_loop(self) -> None:
         while not self.stop_event.is_set():
             self._record_heartbeat("block_submitter")
+            self.replay_pending_block_candidates()
             self.submit_next_block_candidate(timeout=1.0)
 
     def submit_next_block_candidate(self, timeout: float | None = None) -> bool:
@@ -4004,16 +4611,115 @@ class PrismCoordinator:
                 candidate = queue_obj.get(timeout=timeout)
         except queue.Empty:
             return False
+        accepted = False
+        error = "candidate became stale or submission failed"
+        outcome = getattr(self, "_block_candidate_outcome", None)
+        if outcome is None:
+            outcome = threading.local()
+            self._block_candidate_outcome = outcome
+        outcome.reason = None
         try:
-            self.submit_block_candidate(candidate)
+            accepted = self.submit_block_candidate(candidate)
         except Exception:
+            error = "candidate submission raised an exception"
             print(
                 "prism coordinator: block candidate submission failed "
                 f"hash={candidate.submission.block_hash_hex}",
                 flush=True,
             )
             traceback.print_exc()
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        abandon_reason = getattr(outcome, "reason", None) if outcome is not None else None
+        retryable = not accepted and (
+            abandon_reason is None
+            or abandon_reason in PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS
+        )
+        if retryable:
+            # Leave the outbox row pending. It will replay after a short pause
+            # or on process restart; turning an infrastructure outage into a
+            # terminal abandonment would recreate the loss this outbox avoids.
+            print(
+                "prism coordinator: retained block candidate for retry "
+                f"hash={block_hash} reason={abandon_reason or 'exception'}",
+                flush=True,
+            )
+            with self.lock:
+                self.block_candidate_retry_count = int(
+                    getattr(self, "block_candidate_retry_count", 0)
+                ) + 1
+            self.stop_event.wait(self._next_block_candidate_retry_delay(block_hash))
+            return True
+        self._clear_block_candidate_retry_state(block_hash)
+        finish_name = (
+            "mark_block_candidate_submitted"
+            if accepted
+            else "mark_block_candidate_abandoned"
+        )
+        finish = getattr(self.ledger, finish_name, None)
+        if callable(finish):
+            try:
+                if accepted:
+                    finish(block_hash=block_hash)
+                else:
+                    finish(block_hash=block_hash, error=error)
+            except Exception:
+                # Keep the coordinator alive. If the terminal-state update
+                # failed, restart replay is exact-idempotent and will retry.
+                print(
+                    "prism coordinator: could not finalize durable block candidate "
+                    f"hash={block_hash}",
+                    flush=True,
+                )
+                traceback.print_exc()
         return True
+
+    def _next_block_candidate_retry_delay(self, block_hash: str) -> float:
+        initial = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "block_candidate_retry_initial_seconds",
+                    DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS,
+                )
+            ),
+        )
+        maximum = max(
+            initial,
+            float(
+                getattr(
+                    self,
+                    "block_candidate_retry_max_seconds",
+                    DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS,
+                )
+            ),
+        )
+        with self.lock:
+            delays = getattr(self, "block_candidate_retry_delays", None)
+            if delays is None:
+                delays = {}
+                self.block_candidate_retry_delays = delays
+            delay = float(delays.get(block_hash, initial))
+            delays[block_hash] = min(maximum, max(initial, delay * 2))
+        return min(delay, maximum)
+
+    def _clear_block_candidate_retry_state(self, block_hash: str) -> None:
+        with self.lock:
+            delays = getattr(self, "block_candidate_retry_delays", None)
+            if delays is not None:
+                delays.pop(block_hash, None)
+
+    def _defer_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
+        """Record a retryable outcome without counting a terminal abandonment."""
+        outcome = getattr(self, "_block_candidate_outcome", None)
+        if outcome is None:
+            outcome = threading.local()
+            self._block_candidate_outcome = outcome
+        outcome.reason = reason
+        print(
+            f"prism coordinator: block candidate deferred reason={reason}: {message}",
+            flush=True,
+        )
 
     def _abandon_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
         """Record a lost/failed block candidate as a BLOCK-path event.
@@ -4026,6 +4732,14 @@ class PrismCoordinator:
         submitblock-rejected/ledger failure) rather than the share-reject
         counters, which stay a true measure of shares refused to miners.
         """
+        if reason in PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS:
+            self._defer_block_candidate(reason, message, worker=worker)
+            return
+        outcome = getattr(self, "_block_candidate_outcome", None)
+        if outcome is None:
+            outcome = threading.local()
+            self._block_candidate_outcome = outcome
+        outcome.reason = reason
         with self.lock:
             counts = getattr(self, "block_candidate_abandoned_counts", None)
             if counts is None:
@@ -4037,16 +4751,41 @@ class PrismCoordinator:
             flush=True,
         )
 
+    def active_block_candidate_height(self, block_hash: str) -> int | None:
+        """Return the active-chain height for a previously submitted candidate."""
+        try:
+            header = self.rpc.call("getblockheader", [block_hash])
+        except Exception as exc:
+            detail = str(exc).lower()
+            if "block not found" in detail or "not found" in detail or "-5" in detail:
+                return None
+            raise
+        if not isinstance(header, dict):
+            return None
+        try:
+            confirmations = int(header.get("confirmations", 0))
+            height = int(header["height"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return height if confirmations > 0 else None
+
     def submit_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
-        """Land one block candidate: audit, persist, submitblock, confirm.
+        """Land one block candidate, then finalize its audit and payout state.
 
         Runs on the block-submitter thread (tests call it synchronously). It
         never raises for a lost race and holds self.lock only for short
         in-memory state mutation -- never across RPC, psql, subprocess, or
         file I/O -- so share acks and job pushes stay fast while a block
-        lands. The persist -> submitblock -> confirm crash-safety ordering is
-        unchanged. Returns True when qbitd accepts the block.
+        lands. The durable candidate outbox is the pre-submit recovery boundary;
+        full audit and payout persistence happens after the latency-sensitive
+        ``submitblock`` call and is replayable after a crash. Returns True only
+        after that finalization completes.
         """
+        outcome = getattr(self, "_block_candidate_outcome", None)
+        if outcome is None:
+            outcome = threading.local()
+            self._block_candidate_outcome = outcome
+        outcome.reason = None
         context = candidate.context
         submission = candidate.submission
         worker = candidate.client.username or None
@@ -4059,8 +4798,39 @@ class PrismCoordinator:
                 worker=worker,
             )
             return False
+        expected_height = int(context.template["height"])
+        block_hash = str(submission.block_hash_hex).lower()
+        parent_hash = str(context.template["previousblockhash"])
         current_tip = str(self.rpc.call("getbestblockhash"))
-        if str(context.template["previousblockhash"]) != current_tip:
+        landed_height: int | None = None
+        if current_tip.lower() == block_hash:
+            landed_height = expected_height
+        elif current_tip != parent_hash:
+            try:
+                landed_height = self.active_block_candidate_height(block_hash)
+            except Exception:
+                traceback.print_exc()
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                    "could not determine whether a prior candidate is active",
+                    worker=worker,
+                )
+                return False
+        already_active = landed_height == expected_height
+        if landed_height is not None and not already_active:
+            self._abandon_block_candidate(
+                PRISM_REJECTION_BLOCK_STALE,
+                f"candidate active at unexpected height {landed_height}",
+                worker=worker,
+            )
+            return False
+        if already_active:
+            print(
+                "prism coordinator: resuming finalization for active block candidate "
+                f"height={landed_height} hash={submission.block_hash_hex}",
+                flush=True,
+            )
+        elif parent_hash != current_tip:
             self._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
                 f"tip moved before submit: {current_tip}",
@@ -4077,20 +4847,51 @@ class PrismCoordinator:
                 worker=worker,
             )
             return False
-        if not reorg_reconciled:
+        if not reorg_reconciled and not already_active:
             self._abandon_block_candidate(
-                PRISM_REJECTION_STALE_JOB,
+                PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                 "reorg reconciliation reported an untrusted chain view",
                 worker=worker,
             )
             return False
-        if not self.prior_balances_match_current(context.prior_balances):
+        if not already_active and not self.prior_balances_match_current(context.prior_balances):
             self._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
                 "prior balances changed since the job was issued",
                 worker=worker,
             )
             return False
+        if not already_active:
+            before_height = int(self.rpc.call("getblockcount"))
+            if before_height + 1 != expected_height:
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_BLOCK_STALE,
+                    f"stale block height: template={expected_height} tip={before_height}",
+                    worker=worker,
+                )
+                return False
+            # The accepted share and complete candidate are already durable.
+            # Submit before rebuilding/verifying the final audit bundle so disk,
+            # subprocess, and large-ledger latency cannot lose the tip race.
+            self._record_heartbeat("block_submitter")
+            result = self.rpc.call("submitblock", [submission.block_hex])
+            self._record_heartbeat("block_submitter")
+            if result not in (None, "duplicate"):
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                    f"submitblock rejected candidate: {result}",
+                    worker=worker,
+                )
+                return False
+            active_hash = str(self.rpc.call("getblockhash", [expected_height])).lower()
+            if active_hash != block_hash:
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                    f"submitted block is not active at height {expected_height}",
+                    worker=worker,
+                )
+                return False
+        active_tip_height = int(self.rpc.call("getblockcount"))
         self._record_heartbeat("block_submitter")
         final_bundle = self.build_audit_bundle(
             shares=context.shares_json,
@@ -4100,13 +4901,17 @@ class PrismCoordinator:
                 candidate.extranonce1_hex,
                 candidate.extranonce2_hex,
             ),
-            witness_merkle_leaves_hex=direct_stratum.witness_merkle_leaves_hex(
+            witness_merkle_leaves_hex=list(
+                getattr(context.job, "witness_merkle_leaves_hex", ())
+            )
+            or direct_stratum.witness_merkle_leaves_hex(
                 getattr(context.job, "transaction_hexes", ())
             ),
             ctv_fee_parent_hash=str(context.template["previousblockhash"]),
         )
         final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
         if final_manifest["coinbase_tx_hex"].lower() != submission.coinbase_tx_hex.lower():
+            self.stop_event.set()
             self._abandon_block_candidate(
                 PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
                 "final audit bundle coinbase does not match submitted coinbase",
@@ -4125,26 +4930,8 @@ class PrismCoordinator:
                 expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
             )
             self._record_heartbeat("block_submitter")
-            current_tip = str(self.rpc.call("getbestblockhash"))
-            if str(context.template["previousblockhash"]) != current_tip:
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_STALE_JOB,
-                    f"tip moved during audit verification: {current_tip}",
-                    worker=worker,
-                )
-                return False
-            before_height = int(self.rpc.call("getblockcount"))
-            expected_height = int(context.template["height"])
-            if before_height + 1 != expected_height:
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_BLOCK_STALE,
-                    f"stale block height: template={expected_height} tip={before_height}",
-                    worker=worker,
-                )
-                return False
-            # Heartbeat around each blocking step of the persist -> submitblock
-            # -> confirm stretch so a healthy-but-slow submit never trips the
-            # liveness watchdog, while a genuinely wedged call still does.
+            # Finalization is exact-idempotent so an active-tip/active-ancestor
+            # replay can safely repeat any step after a crash.
             self._record_heartbeat("block_submitter")
             persistence = self.ledger.persist_accepted_block(
                 block_hash=submission.block_hash_hex,
@@ -4154,50 +4941,11 @@ class PrismCoordinator:
                 audit_report=report,
             )
             self._record_heartbeat("block_submitter")
-            result = self.rpc.call("submitblock", [submission.block_hex])
-            after_height = int(self.rpc.call("getblockcount"))
-            self._record_heartbeat("block_submitter")
-            if result not in (None, "duplicate"):
-                self.reject_prepared_block(
-                    block_hash=submission.block_hash_hex,
-                    active_tip_height=after_height,
-                )
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                    f"submitblock rejected candidate: {result}",
-                    worker=worker,
-                )
-                return False
-            if after_height != before_height + 1:
-                self.reject_prepared_block(
-                    block_hash=submission.block_hash_hex,
-                    active_tip_height=after_height,
-                )
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                    f"submitblock did not advance height: {before_height}->{after_height}",
-                    worker=worker,
-                )
-                return False
-            block_hash = str(self.rpc.call("getblockhash", [after_height]))
-            if block_hash.lower() != submission.block_hash_hex.lower():
-                self.stop_event.set()
-                self.reject_prepared_block(
-                    block_hash=submission.block_hash_hex,
-                    active_tip_height=after_height,
-                )
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                    f"submitted block hash mismatch: expected {submission.block_hash_hex} got {block_hash}",
-                    worker=worker,
-                )
-                return False
-            self._record_heartbeat("block_submitter")
             confirmation = self.ledger.confirm_accepted_block(
                 block_hash=block_hash,
-                active_tip_height=after_height,
+                active_tip_height=active_tip_height,
             )
-            if int(confirmation.get("confirmed_count", 0)) != 1:
+            if int(confirmation.get("confirmed_count", 0)) not in {0, 1}:
                 self.stop_event.set()
                 self._abandon_block_candidate(
                     PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
@@ -4213,11 +4961,11 @@ class PrismCoordinator:
                     manifest_set=ctv_manifest_set,
                     manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
                 )
-            final_bundle_path = self.audit_dir / f"prism-live-audit-bundle-{after_height}-{block_hash}.json"
+            final_bundle_path = self.audit_dir / f"prism-live-audit-bundle-{expected_height}-{block_hash}.json"
             self.write_audit_bundle_envelope(
                 final_bundle_path,
                 block_hash=block_hash,
-                block_height=after_height,
+                block_height=expected_height,
                 report=report,
                 persistence=persistence,
             )
@@ -4229,6 +4977,7 @@ class PrismCoordinator:
                     context,
                     submission,
                     candidate.pending_share,
+                    candidate_intent=self.block_candidate_intent(candidate),
                 )
             # Aggregate counts only: materializing the whole share history
             # (all_shares) here would scan the full ledger twice per block,
@@ -4237,7 +4986,7 @@ class PrismCoordinator:
             evidence = {
                 "schema": "qbit.prism.live-stratum-evidence.v1",
                 "block_hash": block_hash,
-                "block_height": after_height,
+                "block_height": expected_height,
                 "coinbase_tx_hex": submission.coinbase_tx_hex,
                 "audit_bundle_path": str(bundle_path),
                 "audit_report": report,
@@ -4257,7 +5006,7 @@ class PrismCoordinator:
                 should_stop = self.stop_after_block or self.accepted_block_count >= self.max_blocks
             print(
                 "prism coordinator: qbit accepted direct PRISM block "
-                f"height={after_height} hash={block_hash}",
+                f"height={expected_height} hash={block_hash}",
                 flush=True,
             )
             if should_stop:
@@ -4270,7 +5019,7 @@ class PrismCoordinator:
                 # multi-client push on this thread is not mistaken for a hang
                 # and does not trip a false liveness-watchdog exit.
                 self.refresh_jobs_after_accepted_block(
-                    block_height=after_height,
+                    block_height=expected_height,
                     block_hash=block_hash,
                     heartbeat_name="block_submitter",
                 )
@@ -4630,6 +5379,9 @@ class PrismCoordinator:
             "# HELP qbit_prism_low_difficulty_shares_total Low-difficulty Stratum shares rejected.",
             "# TYPE qbit_prism_low_difficulty_shares_total counter",
             f"qbit_prism_low_difficulty_shares_total {self.low_difficulty_share_count}",
+            "# HELP qbit_prism_collection_block_submissions_total Solver-pays-all block candidates submitted from collection-mode jobs.",
+            "# TYPE qbit_prism_collection_block_submissions_total counter",
+            f"qbit_prism_collection_block_submissions_total {getattr(self, 'collection_block_submission_count', 0)}",
             "# HELP qbit_prism_grace_credited_shares_total Accepted shares credited by the stale-grace policy.",
             "# TYPE qbit_prism_grace_credited_shares_total counter",
             f"qbit_prism_grace_credited_shares_total {grace_credited_share_count}",
@@ -4666,9 +5418,18 @@ class PrismCoordinator:
             "# HELP qbit_prism_job_build_failures_total Job builds skipped after a template/coinbase error without dropping the client.",
             "# TYPE qbit_prism_job_build_failures_total counter",
             f"qbit_prism_job_build_failures_total {self.job_build_failure_count}",
-            "# HELP qbit_prism_block_candidates_dropped_total Queued block candidates dropped because the submitter queue overflowed.",
+            "# HELP qbit_prism_block_candidates_dropped_total Legacy counter; durable candidate outbox rows are never dropped on queue overflow.",
             "# TYPE qbit_prism_block_candidates_dropped_total counter",
             f"qbit_prism_block_candidates_dropped_total {int(getattr(self, 'block_candidates_dropped', 0))}",
+            "# HELP qbit_prism_block_candidate_wakeups_coalesced_total Candidate queue wakeups coalesced while the durable outbox retained the work.",
+            "# TYPE qbit_prism_block_candidate_wakeups_coalesced_total counter",
+            f"qbit_prism_block_candidate_wakeups_coalesced_total {int(getattr(self, 'block_candidate_wakeups_coalesced', 0))}",
+            "# HELP qbit_prism_block_candidate_retries_total Transient candidate outcomes retained for durable retry.",
+            "# TYPE qbit_prism_block_candidate_retries_total counter",
+            f"qbit_prism_block_candidate_retries_total {int(getattr(self, 'block_candidate_retry_count', 0))}",
+            "# HELP qbit_prism_block_candidate_poisoned_total Invalid durable candidate intents quarantined from replay.",
+            "# TYPE qbit_prism_block_candidate_poisoned_total counter",
+            f"qbit_prism_block_candidate_poisoned_total {int(getattr(self, 'block_candidate_poisoned_count', 0))}",
             "# HELP qbit_prism_block_candidates_abandoned_total Block candidates that did not land (lost tip race or failed submit), by reason. Not share rejections: the underlying share was accepted.",
             "# TYPE qbit_prism_block_candidates_abandoned_total counter",
             *[
@@ -4678,10 +5439,10 @@ class PrismCoordinator:
             "# HELP qbit_prism_share_append_queue_depth Accepted shares waiting on the ledger writer thread.",
             "# TYPE qbit_prism_share_append_queue_depth gauge",
             f"qbit_prism_share_append_queue_depth {self.share_append_queue.qsize() if getattr(self, 'share_append_queue', None) is not None else 0}",
-            "# HELP qbit_prism_share_append_failures_total Ledger share appends that failed and were retried by the writer thread.",
+            "# HELP qbit_prism_share_append_failures_total Shares in group commits that failed before acknowledgement.",
             "# TYPE qbit_prism_share_append_failures_total counter",
             f"qbit_prism_share_append_failures_total {int(getattr(self, 'share_append_failure_count', 0))}",
-            "# HELP qbit_prism_shares_recovered_to_disk_total Acked shares written to the recovery file after a ledger outage instead of being lost.",
+            "# HELP qbit_prism_shares_recovered_to_disk_total Legacy pre-commit-ACK shares written to the upgrade recovery file.",
             "# TYPE qbit_prism_shares_recovered_to_disk_total counter",
             f"qbit_prism_shares_recovered_to_disk_total {int(getattr(self, 'shares_recovered_to_disk', 0))}",
             "# HELP qbit_prism_shares_replayed_total Recovery-file shares replayed into the ledger at startup.",

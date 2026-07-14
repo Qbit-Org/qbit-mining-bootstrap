@@ -173,7 +173,7 @@ def is_public_chain(chain: str) -> bool:
 def production_mode(env: dict[str, str]) -> bool:
     qbit_production = bool_env(env, "QBIT_PRODUCTION", False)
     qbit_tools_production = bool_env(env, "QBIT_TOOLS_PRODUCTION", False)
-    return qbit_production or qbit_tools_production
+    return chain_name(env) == "mainnet" or qbit_production or qbit_tools_production
 
 
 def both_production_flags_enabled(env: dict[str, str]) -> bool:
@@ -317,8 +317,13 @@ def validate_production_gate(env: dict[str, str]) -> list[str]:
         raise PreflightError("QBIT_PRODUCTION=1 rejects CKPOOL_VALIDATE_QBIT_ASSUMPTIONS=0")
     if is_public_chain(chain) and not bool_env(env, "CKPOOL_REQUIRE_P2MR_PAYOUT", True):
         raise PreflightError("QBIT_PRODUCTION=1 rejects public-chain CKPOOL_REQUIRE_P2MR_PAYOUT=0")
+    payout_address = env.get("QBIT_MINER_ADDRESS", "").strip()
+    if not payout_address or payout_address.lower() == "auto":
+        raise PreflightError(
+            "production mode requires an explicit QBIT_MINER_ADDRESS for CKPool"
+        )
     if env.get("QBIT_RPC_PASSWORD", "") in {"", "change-this"}:
-        raise PreflightError("QBIT_PRODUCTION=1 requires a non-default QBIT_RPC_PASSWORD")
+        raise PreflightError("production mode requires a non-default QBIT_RPC_PASSWORD")
     if not env.get("CKPOOL_STRATUM_PORT", ""):
         raise PreflightError("QBIT_PRODUCTION=1 requires explicit CKPOOL_STRATUM_PORT")
 
@@ -344,6 +349,17 @@ def validate_ckpool_knobs(env: dict[str, str]) -> list[str]:
         raise PreflightError("CKPOOL_NONCE2LENGTH must be between 2 and 8")
     if update_interval <= 0:
         raise PreflightError("CKPOOL_UPDATE_INTERVAL must be positive")
+    if is_public_chain(chain_name(env)):
+        template_max_age = int_env(env, "CKPOOL_TEMPLATE_MAX_AGE_SECONDS", 120)
+        if template_max_age <= 0:
+            raise PreflightError(
+                "CKPOOL_TEMPLATE_MAX_AGE_SECONDS must be positive on public chains"
+            )
+        if update_interval >= template_max_age:
+            raise PreflightError(
+                "CKPOOL_UPDATE_INTERVAL must be less than "
+                "CKPOOL_TEMPLATE_MAX_AGE_SECONDS on public chains"
+            )
     if donation < 0:
         raise PreflightError("CKPOOL_DONATION must be non-negative")
 
@@ -357,9 +373,11 @@ def validate_ckpool_knobs(env: dict[str, str]) -> list[str]:
 def expected_genesis_hash(env: dict[str, str]) -> str | None:
     value = env.get("QBIT_EXPECTED_GENESIS_HASH", "").strip().lower()
     if not value:
+        if chain_name(env) == "mainnet":
+            raise PreflightError("QBIT_CHAIN=mainnet requires QBIT_EXPECTED_GENESIS_HASH")
         return None
     if HASH_RE.fullmatch(value) is None:
-        raise PreflightError("QBIT_EXPECTED_GENESIS_HASH must be a 64-character hex hash")
+        raise PreflightError("QBIT_EXPECTED_GENESIS_HASH must be 64 lowercase hex characters")
     return value
 
 

@@ -125,6 +125,8 @@ class SingleWriterShareLedger:
         self._next_share_seq = first_share_seq
         self._shares: list[AcceptedShareRecord] = []
         self._share_ids: set[str] = set()
+        self._shares_by_id: dict[str, AcceptedShareRecord] = {}
+        self._block_candidate_outbox: dict[str, dict[str, Any]] = {}
         self._ctv_fanout_sets: dict[str, dict[str, Any]] = {}
         self._ctv_fanout_statuses: dict[str, dict[str, Any]] = {}
         self._ctv_fanout_attempts: dict[str, list[dict[str, Any]]] = {}
@@ -138,7 +140,10 @@ class SingleWriterShareLedger:
         credit_policy = validate_credit_policy(pending.credit_policy)
         with self._lock:
             if pending.share_id in self._share_ids:
-                raise ValueError("duplicate share_id")
+                existing = self._shares_by_id[pending.share_id]
+                if self._pending_matches_record(pending, existing, credit_policy=credit_policy):
+                    return replace(existing)
+                raise ValueError("duplicate share_id payload mismatch")
             record = AcceptedShareRecord(
                 share_seq=self._next_share_seq,
                 share_id=pending.share_id,
@@ -156,8 +161,180 @@ class SingleWriterShareLedger:
             )
             self._shares.append(record)
             self._share_ids.add(pending.share_id)
+            self._shares_by_id[pending.share_id] = record
             self._next_share_seq += 1
             return record
+
+    @staticmethod
+    def _pending_matches_record(
+        pending: PendingShare,
+        record: AcceptedShareRecord,
+        *,
+        credit_policy: str | None,
+    ) -> bool:
+        return (
+            pending.share_id == record.share_id
+            and pending.miner_id == record.miner_id
+            and pending.order_key == record.order_key
+            and pending.p2mr_program_hex.lower() == record.p2mr_program_hex.lower()
+            and int(pending.share_difficulty) == int(record.share_difficulty)
+            and int(pending.network_difficulty) == int(record.network_difficulty)
+            and int(pending.template_height) == int(record.template_height)
+            and pending.job_id == record.job_id
+            and int(pending.job_issued_at_ms) == int(record.job_issued_at_ms)
+            and int(pending.accepted_at_ms) == int(record.accepted_at_ms)
+            and int(pending.ntime) == int(record.ntime)
+            and credit_policy == record.credit_policy
+        )
+
+    def append_batch(
+        self,
+        entries: list[tuple[PendingShare, dict[str, Any] | None]],
+    ) -> list[AcceptedShareRecord]:
+        """Atomically append a small coordinator group-commit batch.
+
+        The in-memory backend is used by tests and local demonstrations.  Its
+        lock provides the same all-at-once visibility expected from the
+        Postgres implementation.
+        """
+        records: list[AcceptedShareRecord] = []
+        with self._lock:
+            # Validate the complete batch before mutating either collection.
+            seen_ids: set[str] = set()
+            seen_blocks: set[str] = set()
+            for pending, candidate in entries:
+                if pending.share_id in seen_ids:
+                    raise ValueError("duplicate share_id in append batch")
+                seen_ids.add(pending.share_id)
+                credit_policy = validate_credit_policy(pending.credit_policy)
+                existing = self._shares_by_id.get(pending.share_id)
+                if existing is not None and not self._pending_matches_record(
+                    pending, existing, credit_policy=credit_policy
+                ):
+                    raise ValueError("duplicate share_id payload mismatch")
+                if candidate is not None:
+                    block_hash = str(candidate.get("block_hash_hex", "")).lower()
+                    if not block_hash:
+                        raise ValueError("block candidate is missing block_hash_hex")
+                    if block_hash in seen_blocks:
+                        raise ValueError("duplicate block candidate in append batch")
+                    seen_blocks.add(block_hash)
+                    outbox = self._block_candidate_outbox.get(block_hash)
+                    candidate_sha256 = block_candidate_identity_sha256(candidate)
+                    if outbox is not None and (
+                        outbox["share_id"] not in {None, pending.share_id}
+                        or
+                        outbox["candidate_sha256"] != candidate_sha256
+                        or (
+                            outbox["candidate"] is not None
+                            and block_candidate_identity(outbox["candidate"])
+                            != block_candidate_identity(candidate)
+                        )
+                    ):
+                        raise ValueError("block candidate payload mismatch")
+
+            for pending, candidate in entries:
+                existing = self._shares_by_id.get(pending.share_id)
+                if existing is None:
+                    credit_policy = validate_credit_policy(pending.credit_policy)
+                    existing = AcceptedShareRecord(
+                        share_seq=self._next_share_seq,
+                        share_id=pending.share_id,
+                        miner_id=pending.miner_id,
+                        order_key=pending.order_key,
+                        p2mr_program_hex=pending.p2mr_program_hex,
+                        share_difficulty=pending.share_difficulty,
+                        network_difficulty=pending.network_difficulty,
+                        template_height=pending.template_height,
+                        job_id=pending.job_id,
+                        job_issued_at_ms=pending.job_issued_at_ms,
+                        accepted_at_ms=pending.accepted_at_ms,
+                        ntime=pending.ntime,
+                        credit_policy=credit_policy,
+                    )
+                    self._shares.append(existing)
+                    self._share_ids.add(pending.share_id)
+                    self._shares_by_id[pending.share_id] = existing
+                    self._next_share_seq += 1
+                records.append(replace(existing))
+                if candidate is not None:
+                    block_hash = str(candidate["block_hash_hex"]).lower()
+                    self._block_candidate_outbox.setdefault(
+                        block_hash,
+                        {
+                            "block_hash": block_hash,
+                            "share_id": pending.share_id,
+                            "candidate": candidate,
+                            "candidate_sha256": block_candidate_identity_sha256(candidate),
+                            "state": "pending",
+                            "attempt_count": 0,
+                            "last_error": None,
+                        },
+                    )
+                    self._block_candidate_outbox[block_hash]["share_id"] = pending.share_id
+        return records
+
+    def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
+        """Persist candidate work before a below-share-target synchronous submit."""
+        block_hash = str(candidate.get("block_hash_hex", "")).lower()
+        if not block_hash:
+            raise ValueError("block candidate is missing block_hash_hex")
+        candidate_sha256 = block_candidate_identity_sha256(candidate)
+        with self._lock:
+            existing = self._block_candidate_outbox.get(block_hash)
+            if existing is not None:
+                if existing["candidate_sha256"] != candidate_sha256:
+                    raise ValueError("block candidate payload mismatch")
+                return False
+            self._block_candidate_outbox[block_hash] = {
+                "block_hash": block_hash,
+                "share_id": None,
+                "candidate": candidate,
+                "candidate_sha256": candidate_sha256,
+                "state": "pending",
+                "attempt_count": 0,
+                "last_error": None,
+            }
+            return True
+
+    def pending_block_candidates(self, *, limit: int = 32) -> list[dict[str, Any]]:
+        return [
+            row["candidate"]
+            for row in self.pending_block_candidate_rows(limit=limit)
+        ]
+
+    def pending_block_candidate_rows(self, *, limit: int = 32) -> list[dict[str, Any]]:
+        """Return pending payloads together with their authoritative row keys."""
+        with self._lock:
+            return [
+                {
+                    "block_hash": str(row["block_hash"]),
+                    "candidate": (
+                        dict(row["candidate"])
+                        if isinstance(row["candidate"], dict)
+                        else row["candidate"]
+                    ),
+                }
+                for row in self._block_candidate_outbox.values()
+                if row["state"] == "pending"
+            ][:limit]
+
+    def mark_block_candidate_submitted(self, *, block_hash: str) -> bool:
+        return self._finish_block_candidate(block_hash=block_hash, state="submitted", error=None)
+
+    def mark_block_candidate_abandoned(self, *, block_hash: str, error: str) -> bool:
+        return self._finish_block_candidate(block_hash=block_hash, state="abandoned", error=error)
+
+    def _finish_block_candidate(self, *, block_hash: str, state: str, error: str | None) -> bool:
+        with self._lock:
+            row = self._block_candidate_outbox.get(block_hash.lower())
+            if row is None:
+                return False
+            row["state"] = state
+            row["last_error"] = error
+            row["attempt_count"] = int(row["attempt_count"]) + 1
+            row["candidate"] = None
+            return True
 
     def snapshot_at_job_issue(
         self,
@@ -959,6 +1136,344 @@ END;
         if "error" in result:
             raise RuntimeError(str(result["error"]))
         return self._record_from_json(result)
+
+    def append_batch(
+        self,
+        entries: list[tuple[PendingShare, dict[str, Any] | None]],
+    ) -> list[AcceptedShareRecord]:
+        """Commit accepted shares and optional block intents in one transaction.
+
+        Replaying the exact same payload is idempotent.  Reusing a share ID or
+        block hash with different content fails the whole batch.  Postgres
+        assigns the share sequence and makes every row visible before this
+        method returns, which is the coordinator's Stratum ACK boundary.
+        """
+        if not entries:
+            return []
+        payloads: list[dict[str, Any]] = []
+        share_ids: set[str] = set()
+        block_hashes: set[str] = set()
+        for pending, candidate in entries:
+            if pending.share_difficulty <= 0:
+                raise ValueError("share_difficulty must be positive")
+            if pending.network_difficulty <= 0:
+                raise ValueError("network_difficulty must be positive")
+            if pending.share_id in share_ids:
+                raise ValueError("duplicate share_id in append batch")
+            share_ids.add(pending.share_id)
+            candidate_payload = candidate
+            if candidate_payload is not None:
+                block_hash = str(candidate_payload.get("block_hash_hex", "")).lower()
+                if not block_hash:
+                    raise ValueError("block candidate is missing block_hash_hex")
+                if block_hash in block_hashes:
+                    raise ValueError("duplicate block candidate in append batch")
+                block_hashes.add(block_hash)
+                candidate_payload = {**candidate_payload, "block_hash_hex": block_hash}
+            payloads.append(
+                {
+                    "share": {
+                        **pending.__dict__,
+                        "credit_policy": validate_credit_policy(pending.credit_policy),
+                    },
+                    "candidate": candidate_payload,
+                    "candidate_sha256": (
+                        block_candidate_identity_sha256(candidate_payload)
+                        if candidate_payload is not None
+                        else None
+                    ),
+                }
+            )
+        payload = {
+            "entries": payloads,
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        sql = f"""
+WITH input AS (
+    SELECT
+        {self._jsonb_literal(payload)} AS root,
+        set_config('synchronous_commit', 'on', true) AS durability
+),
+payload AS (
+    SELECT
+        item->'share' AS data,
+        NULLIF(item->'candidate', 'null'::jsonb) AS candidate,
+        item->>'candidate_sha256' AS candidate_sha256,
+        ordinality
+    FROM input,
+         jsonb_array_elements(root->'entries') WITH ORDINALITY AS rows(item, ordinality)
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM input
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = root->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (root->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = root->>'writer_session_token'
+    RETURNING qbit_ledger_writer_lease.writer_id
+),
+share_mismatch AS (
+    SELECT data->>'share_id' AS share_id
+    FROM payload
+    JOIN qbit_share_ledger ledger ON ledger.share_id = data->>'share_id'
+    WHERE ledger.miner_id IS DISTINCT FROM data->>'miner_id'
+       OR ledger.payout_order_key IS DISTINCT FROM data->>'order_key'
+       OR ledger.p2mr_program IS DISTINCT FROM decode(data->>'p2mr_program_hex', 'hex')
+       OR ledger.share_difficulty IS DISTINCT FROM (data->>'share_difficulty')::numeric
+       OR ledger.network_difficulty IS DISTINCT FROM (data->>'network_difficulty')::numeric
+       OR ledger.template_height IS DISTINCT FROM (data->>'template_height')::bigint
+       OR ledger.job_id IS DISTINCT FROM data->>'job_id'
+       OR ledger.job_issued_at IS DISTINCT FROM to_timestamp((data->>'job_issued_at_ms')::double precision / 1000.0)
+       OR ledger.accepted_at IS DISTINCT FROM to_timestamp((data->>'accepted_at_ms')::double precision / 1000.0)
+       OR ledger.ntime IS DISTINCT FROM (data->>'ntime')::bigint
+       OR ledger.credit_policy IS DISTINCT FROM data->>'credit_policy'
+),
+candidate_mismatch AS (
+    SELECT payload.candidate->>'block_hash_hex' AS block_hash
+    FROM payload
+    JOIN qbit_block_candidate_outbox outbox
+      ON outbox.block_hash = payload.candidate->>'block_hash_hex'
+    WHERE payload.candidate IS NOT NULL
+      AND ((outbox.share_id IS NOT NULL AND outbox.share_id IS DISTINCT FROM payload.data->>'share_id')
+           OR outbox.candidate_sha256 IS DISTINCT FROM payload.candidate_sha256
+           OR (outbox.candidate IS NOT NULL
+               AND (outbox.candidate #- '{{pending_share,accepted_at_ms}}')
+                   IS DISTINCT FROM (payload.candidate #- '{{pending_share,accepted_at_ms}}')))
+),
+batch_ok AS (
+    SELECT 1 AS ok
+    WHERE EXISTS (SELECT 1 FROM lease)
+      AND NOT EXISTS (SELECT 1 FROM share_mismatch)
+      AND NOT EXISTS (SELECT 1 FROM candidate_mismatch)
+),
+inserted_shares AS (
+    INSERT INTO qbit_share_ledger (
+        share_id, miner_id, payout_order_key, p2mr_program,
+        share_difficulty, network_difficulty, template_height, job_id,
+        job_issued_at, ntime, accepted_at, credit_policy, accepted,
+        writer_id, writer_epoch
+    )
+    SELECT
+        data->>'share_id', data->>'miner_id', data->>'order_key',
+        decode(data->>'p2mr_program_hex', 'hex'),
+        (data->>'share_difficulty')::numeric,
+        (data->>'network_difficulty')::numeric,
+        (data->>'template_height')::bigint, data->>'job_id',
+        to_timestamp((data->>'job_issued_at_ms')::double precision / 1000.0),
+        (data->>'ntime')::bigint,
+        to_timestamp((data->>'accepted_at_ms')::double precision / 1000.0),
+        data->>'credit_policy', true, root->>'writer_id',
+        (root->>'writer_epoch')::bigint
+    FROM payload, input, batch_ok
+    WHERE NOT EXISTS (
+        SELECT 1 FROM qbit_share_ledger existing
+        WHERE existing.share_id = payload.data->>'share_id'
+    )
+    ORDER BY payload.ordinality
+    ON CONFLICT (share_id) DO NOTHING
+    RETURNING qbit_share_ledger.*
+),
+inserted_candidates AS (
+    INSERT INTO qbit_block_candidate_outbox (
+        block_hash, share_id, candidate, candidate_sha256
+    )
+    SELECT
+        payload.candidate->>'block_hash_hex', payload.data->>'share_id',
+        payload.candidate, payload.candidate_sha256
+    FROM payload, batch_ok
+    WHERE payload.candidate IS NOT NULL
+    ON CONFLICT (block_hash) DO UPDATE
+    SET share_id = EXCLUDED.share_id,
+        updated_at = clock_timestamp()
+    WHERE qbit_block_candidate_outbox.share_id IS NULL
+      AND qbit_block_candidate_outbox.candidate_sha256 = EXCLUDED.candidate_sha256
+    RETURNING block_hash
+),
+records AS (
+    SELECT ledger.*, payload.ordinality
+    FROM payload
+    JOIN qbit_share_ledger ledger ON ledger.share_id = payload.data->>'share_id'
+    UNION ALL
+    SELECT inserted_shares.*, payload.ordinality
+    FROM inserted_shares
+    JOIN payload ON payload.data->>'share_id' = inserted_shares.share_id
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    WHEN EXISTS (SELECT 1 FROM share_mismatch) THEN
+        json_build_object(
+            'error', 'duplicate share_id payload mismatch',
+            'share_ids', (SELECT json_agg(share_id ORDER BY share_id) FROM share_mismatch)
+        )
+    WHEN EXISTS (SELECT 1 FROM candidate_mismatch) THEN
+        json_build_object(
+            'error', 'block candidate payload mismatch',
+            'block_hashes', (SELECT json_agg(block_hash ORDER BY block_hash) FROM candidate_mismatch)
+        )
+    ELSE json_build_object(
+        'records', (
+            SELECT json_agg(json_build_object(
+                'share_seq', records.share_seq,
+                'share_id', records.share_id,
+                'miner_id', records.miner_id,
+                'order_key', records.payout_order_key,
+                'p2mr_program_hex', encode(records.p2mr_program, 'hex'),
+                'share_difficulty', records.share_difficulty::text,
+                'network_difficulty', records.network_difficulty::text,
+                'template_height', records.template_height,
+                'job_id', records.job_id,
+                'job_issued_at_ms', round(extract(epoch FROM records.job_issued_at) * 1000)::bigint,
+                'accepted_at_ms', round(extract(epoch FROM records.accepted_at) * 1000)::bigint,
+                'ntime', records.ntime,
+                'credit_policy', records.credit_policy
+            ) ORDER BY records.ordinality)
+            FROM records
+        )
+    )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        records = result.get("records")
+        if not isinstance(records, list) or len(records) != len(entries):
+            raise RuntimeError("Postgres share batch returned an incomplete result")
+        return [self._record_from_json(record) for record in records]
+
+    def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
+        """Persist candidate work that is not yet eligible for share credit."""
+        block_hash = str(candidate.get("block_hash_hex", "")).lower()
+        if not block_hash:
+            raise ValueError("block candidate is missing block_hash_hex")
+        candidate = {**candidate, "block_hash_hex": block_hash}
+        candidate_sha256 = block_candidate_identity_sha256(candidate)
+        sql = f"""
+WITH durability AS (
+    SELECT set_config('synchronous_commit', 'on', true)
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM durability
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+existing AS (
+    SELECT candidate_sha256
+    FROM qbit_block_candidate_outbox
+    WHERE block_hash = {self._text_literal(block_hash)}
+),
+inserted AS (
+    INSERT INTO qbit_block_candidate_outbox (
+        block_hash, share_id, candidate, candidate_sha256
+    )
+    SELECT
+        {self._text_literal(block_hash)}, NULL,
+        {self._jsonb_literal(candidate)}, {self._text_literal(candidate_sha256)}
+    FROM lease
+    WHERE NOT EXISTS (SELECT 1 FROM existing)
+    ON CONFLICT (block_hash) DO NOTHING
+    RETURNING block_hash
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    WHEN EXISTS (
+        SELECT 1 FROM existing
+        WHERE candidate_sha256 <> {self._text_literal(candidate_sha256)}
+    ) THEN
+        json_build_object('error', 'block candidate payload mismatch')
+    ELSE
+        json_build_object('inserted', (SELECT count(*) FROM inserted))
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return int(result.get("inserted", 0)) > 0
+
+    def pending_block_candidates(self, *, limit: int = 32) -> list[dict[str, Any]]:
+        return [
+            row["candidate"]
+            for row in self.pending_block_candidate_rows(limit=limit)
+        ]
+
+    def pending_block_candidate_rows(self, *, limit: int = 32) -> list[dict[str, Any]]:
+        """Return pending payloads together with their authoritative row keys."""
+        if limit <= 0:
+            return []
+        sql = f"""
+SELECT COALESCE(
+    json_agg(
+        json_build_object('block_hash', block_hash, 'candidate', candidate)
+        ORDER BY created_at, block_hash
+    ),
+    '[]'::json
+)
+FROM (
+    SELECT candidate, created_at, block_hash
+    FROM qbit_block_candidate_outbox
+    WHERE state = 'pending'
+    ORDER BY created_at, block_hash
+    LIMIT {int(limit)}
+) pending;
+"""
+        with self._lock:
+            return list(self._run_json(sql))
+
+    def mark_block_candidate_submitted(self, *, block_hash: str) -> bool:
+        return self._finish_block_candidate(block_hash=block_hash, state="submitted", error=None)
+
+    def mark_block_candidate_abandoned(self, *, block_hash: str, error: str) -> bool:
+        return self._finish_block_candidate(block_hash=block_hash, state="abandoned", error=error)
+
+    def _finish_block_candidate(self, *, block_hash: str, state: str, error: str | None) -> bool:
+        if state not in {"submitted", "abandoned"}:
+            raise ValueError("invalid block candidate terminal state")
+        sql = f"""
+WITH lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+updated AS (
+    UPDATE qbit_block_candidate_outbox
+    SET state = {self._text_literal(state)},
+        attempt_count = attempt_count + 1,
+        last_error = {self._text_literal(error) if error is not None else 'NULL'},
+        updated_at = clock_timestamp(),
+        completed_at = clock_timestamp(),
+        candidate = NULL
+    FROM lease
+    WHERE block_hash = {self._text_literal(block_hash.lower())}
+      AND state = 'pending'
+    RETURNING block_hash
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object('updated', (SELECT count(*) FROM updated))
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return int(result.get("updated", 0)) > 0
 
     def snapshot_at_job_issue(
         self,
@@ -4840,6 +5355,29 @@ def require_mapping(value: object, name: str) -> dict[str, Any]:
 
 def sha256_json_hex(payload: object) -> str:
     return hashlib.sha256(canonical_json_text(payload).encode()).hexdigest()
+
+
+def block_candidate_identity(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Candidate payload with its volatile acknowledgment stamp removed.
+
+    A miner can resubmit the same solved block after a transient submit
+    outcome, and the rebuilt intent differs from the persisted one only in
+    pending_share.accepted_at_ms. That drift must stay idempotent against the
+    durable outbox while any other divergence remains a hard payload
+    mismatch. The stored payload keeps its original stamp; only comparisons
+    use this identity form.
+    """
+    pending_share = candidate.get("pending_share")
+    if isinstance(pending_share, dict) and "accepted_at_ms" in pending_share:
+        candidate = {
+            **candidate,
+            "pending_share": {**pending_share, "accepted_at_ms": None},
+        }
+    return candidate
+
+
+def block_candidate_identity_sha256(candidate: dict[str, Any]) -> str:
+    return sha256_json_hex(block_candidate_identity(candidate))
 
 
 def sha256_bytes_hex(payload: bytes) -> str:

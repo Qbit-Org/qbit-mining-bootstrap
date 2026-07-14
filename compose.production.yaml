@@ -1,0 +1,82 @@
+services:
+  qbitd:
+    image: ${QBITD_IMAGE:-invalid.invalid/qbit-mining-bootstrap/qbitd:production-image-not-configured}
+    pull_policy: always
+    volumes:
+      - type: bind
+        source: ${QBIT_DATA_SOURCE:-/production-source-not-configured/qbit}
+        target: /var/lib/qbit
+        bind:
+          create_host_path: false
+
+  ckpool:
+    image: ${CKPOOL_IMAGE:-invalid.invalid/qbit-mining-bootstrap/ckpool:production-image-not-configured}
+    pull_policy: always
+    restart: unless-stopped
+    volumes: !override []
+
+  bitcoind:
+    image: ${BITCOIND_IMAGE:-invalid.invalid/qbit-mining-bootstrap/bitcoind:production-image-not-configured}
+    pull_policy: always
+    volumes:
+      - type: bind
+        source: ${BITCOIN_DATA_SOURCE:-/production-source-not-configured/bitcoin}
+        target: /var/lib/bitcoin
+        bind:
+          create_host_path: false
+
+  auxpow-coordinator:
+    image: ${AUXPOW_COORDINATOR_IMAGE:-invalid.invalid/qbit-mining-bootstrap/auxpow:production-image-not-configured}
+    pull_policy: always
+    profiles: !override ["production-disabled"]
+
+  auxpow-bridge:
+    image: ${AUXPOW_COORDINATOR_IMAGE:-invalid.invalid/qbit-mining-bootstrap/auxpow:production-image-not-configured}
+    pull_policy: always
+    profiles: !override ["production-disabled"]
+
+  auxpow-stratum:
+    image: ${AUXPOW_COORDINATOR_IMAGE:-invalid.invalid/qbit-mining-bootstrap/auxpow:production-image-not-configured}
+    pull_policy: always
+    restart: unless-stopped
+
+  prism-postgres:
+    image: ${PRISM_POSTGRES_IMAGE:-invalid.invalid/qbit-mining-bootstrap/postgres:production-image-not-configured}
+    pull_policy: always
+    volumes:
+      - type: bind
+        source: ${PRISM_POSTGRES_DATA_SOURCE:-/production-source-not-configured/postgres/data}
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PRISM_POSTGRES_WAL_SOURCE:-/production-source-not-configured/postgres/wal}
+        target: /var/lib/postgresql/wal
+        bind:
+          create_host_path: false
+
+  prism-coordinator:
+    image: ${PRISM_COORDINATOR_IMAGE:-invalid.invalid/qbit-mining-bootstrap/prism:production-image-not-configured}
+    pull_policy: always
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ${PRISM_AUDIT_DATA_SOURCE:-/production-source-not-configured/prism/audit}
+        target: ${PRISM_AUDIT_DIR:-/var/lib/qbit-prism/audit}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PRISM_CAPACITY_EVIDENCE_FILE:-/production-source-not-configured/prism/capacity-evidence.json}
+        target: /run/qbit-prism/capacity-evidence.json
+        read_only: true
+        bind:
+          create_host_path: false
+
+  permissionless-miner:
+    profiles: !override ["production-disabled"]
+
+  real-miner:
+    profiles: !override ["production-disabled"]
+
+  auxpow-real-miner:
+    profiles: !override ["production-disabled"]

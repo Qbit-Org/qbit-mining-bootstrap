@@ -176,8 +176,8 @@ make up-permissionless-pool
 make test-real-miner
 ```
 
-- `make up-permissionless-pool` starts `qbitd + ckpool` and waits for a real external miner
-- `make test-real-miner` uses the bundled `cpuminer-opt` client as an operator-facing smoke test
+- `make up-permissionless-pool` starts `qbitd + ckpool` on port 3333 and waits for a real external miner
+- `make test-real-miner` points the bundled `cpuminer-opt` client at that same ordinary `ckpool:3333` endpoint
 - `make test-permissionless-p2mr` runs the same permissionless stack with `-p2mronly=1` and forces
   `QBIT_MINER_ADDRESS=auto` so local non-P2MR payout overrides do not mask the restricted-output smoke
 
@@ -268,7 +268,13 @@ make test-auxpow-stratum-bip310
 - `make test-auxpow` runs the deterministic one-shot positive and negative-path checks
 - `make test-auxpow-stratum-bip310` checks the Python bridge's BIP310 mask negotiation
 
-The bundled Stratum bridge refreshes miner jobs when either chain tip changes and also age-refreshes jobs before qbit's default template expiry. The default `AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS=2700` is 45 minutes, leaving a 15 minute buffer before qbit's default 60 minute `-auxpowtemplateexpiry` window. Set it lower for faster job rotation or `0` to disable age-based bridge refresh.
+The bundled Stratum bridge refreshes miner jobs when either chain tip changes,
+when the Bitcoin parent template exceeds `AUXPOW_TEMPLATE_MAX_AGE_SECONDS`,
+and before qbit's default template expiry. The default
+`AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS=2700` is 45 minutes, leaving a 15 minute
+buffer before qbit's default 60 minute `-auxpowtemplateexpiry` window. Set the
+job limit lower for faster qbit candidate rotation or `0` to disable that
+separate limit; the parent-template freshness bound still applies.
 
 AuxPoW Stratum vardiff is enabled by default in compose so mixed miner hardware does not require one fixed share-difficulty setting. Each miner connection starts at `AUXPOW_STRATUM_VARDIFF_STARTUP_DIFF` (or `AUXPOW_STRATUM_SHARE_DIFF` when unset), retargets every `AUXPOW_STRATUM_VARDIFF_RETARGET_SECONDS` toward `AUXPOW_STRATUM_VARDIFF_TARGET_SHARE_SECONDS` or `AUXPOW_STRATUM_VARDIFF_TARGET_SHARES_PER_SECOND`, and clamps movement with `AUXPOW_STRATUM_VARDIFF_MIN_DIFF`, `AUXPOW_STRATUM_VARDIFF_MAX_DIFF`, and `AUXPOW_STRATUM_VARDIFF_MAX_STEP_FACTOR`. Set `AUXPOW_STRATUM_VARDIFF_ENABLED=0` to keep the fixed advertised `AUXPOW_STRATUM_SHARE_DIFF` behavior.
 

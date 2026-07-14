@@ -135,12 +135,19 @@ fi
 
 wait_for_qbit_rpc_state ready 60
 qbit_rpc createwallet "${WALLET_NAME}" >/dev/null
-before_height="$(qbit_rpc getblockcount)"
 
 miner_usernames=()
 for miner_index in $(seq 1 "${MINER_COUNT}"); do
   miner_usernames+=("$(qbit_rpc -rpcwallet="${WALLET_NAME}" getnewaddress "" p2mr)")
 done
+
+# A virgin regtest chain reports initialblockdownload=true until its first
+# block, and the coordinator's chain-trust gate blocks job issuance during
+# IBD, so a fresh chain could never mine its own first block through the
+# pool. Pre-mine one block to exit IBD; the PRISM ledger stays empty, so the
+# fresh-ledger (collection-mode) path is still exercised by the miners.
+qbit_rpc generatetoaddress 1 "${miner_usernames[0]}" >/dev/null
+before_height="$(qbit_rpc getblockcount)"
 
 (
   cd "${ROOT_DIR}"
@@ -267,9 +274,18 @@ print(f"difficulty probe PASS port={port} password={password!r} difficulty={diff
 PY
 }
 
-probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[0]}" "x" "0.000000001"
+# The stamped job floor clamps the advertised share difficulty to the network
+# difficulty (a share is never required to be harder than a block), while an
+# explicit md= minimum and the high-diff wire floor still hold above it. On a
+# fresh regtest chain the network difficulty sits below every configured
+# value, so the first probe expects the network clamp.
+network_difficulty="$(qbit_rpc getdifficulty)"
+probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[0]}" "x" "${network_difficulty}"
 probe_first_difficulty "${HIGHDIFF_PORT}" "${miner_usernames[0]}" "x" "${HIGHDIFF_START_DIFF}"
-probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[0]}" "d=0.5,md=0.25" "0.5"
+# Password d=/md= bound vardiff but do not lift the first advertised job
+# above the network clamp; only the high-diff listener floor is a wire
+# guarantee that holds above it.
+probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[0]}" "d=0.5,md=0.25" "${network_difficulty}"
 
 if [[ "${AUDIT_API_ENABLED}" == "1" ]]; then
   AUDIT_PORT="${AUDIT_PORT}" python3 <<'PY'
@@ -619,8 +635,12 @@ else
 fi
 
 after_height="$(qbit_rpc getblockcount)"
-if [[ "${after_height}" -ne $((before_height + 1)) ]]; then
-  echo "expected live PRISM blockcount ${before_height}+1, got ${after_height}" >&2
+# With the advertised difficulty clamped to the network difficulty, every
+# accepted share is also a block, so a share already in flight when the
+# coordinator begins its stop-after-block shutdown can land one extra block.
+# Require at least the target; never fewer.
+if [[ "${after_height}" -lt $((before_height + 1)) ]]; then
+  echo "expected live PRISM blockcount >= ${before_height}+1, got ${after_height}" >&2
   exit 1
 fi
 

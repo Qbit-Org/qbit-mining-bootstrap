@@ -54,10 +54,11 @@ wrappers can run it before creating wallets or files. `--supervise <command>
 interpolation, forwards SIGTERM/SIGINT, and continuously checks qbit while the
 child lives.
 
-Strict public-chain supervision requires the expected RPC chain, optional
-`QBIT_EXPECTED_GENESIS_HASH`, completed IBD, `CKPOOL_MIN_PEERS`, a fresh live
-template, and a template parent matching the active tip. The watchdog interval,
-failure grace, maximum template age, and maximum future time are configured by
+Strict public-chain supervision requires the expected RPC chain, completed IBD,
+`CKPOOL_MIN_PEERS`, a fresh live template, and a template parent matching the
+active tip. `QBIT_EXPECTED_GENESIS_HASH` is mandatory on mainnet and optional on
+other chains. The watchdog interval, failure grace, maximum template age, and
+maximum future time are configured by
 `CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS`,
 `CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS`, `CKPOOL_TEMPLATE_MAX_AGE_SECONDS`, and
 `CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS`.

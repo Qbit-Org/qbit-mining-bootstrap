@@ -145,6 +145,22 @@ Useful entrypoints:
 - `make smoke-all`
 - `make down`
 
+`make down` stops every Compose profile and preserves all named volumes. Local
+chain data, the share ledger, and audit artifacts therefore survive an ordinary
+stop/restart cycle. The separate `make purge-local-volumes` target is only for
+disposable development stacks: it refuses production and main-chain
+configurations and requires the exact confirmation token printed by the
+command before it will delete volumes.
+
+When upgrading an existing project from the former two-pool smoke topology,
+run `make down` from the new checkout before starting the selected services.
+Its `--remove-orphans` cleanup removes containers that no longer exist in
+Compose without deleting their named volumes. Retired volumes stay detached and
+can be archived or removed separately.
+
+For a fresh public-network deployment, use the fail-closed sequence and explicit
+operator service sets in [`docs/mainnet-deployment.md`](docs/mainnet-deployment.md).
+
 ## Signet Mode
 
 The compose stack stays regtest by default so the built-in smokes remain deterministic. To point qbit at a signet instead, set:
@@ -193,7 +209,7 @@ CKPOOL_NON_TEST_READINESS_GATE=0
 QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0
 ```
 
-Preflight still checks the RPC chain, configured genesis hash, static qbit
+Preflight still checks the RPC chain, the mandatory mainnet genesis hash, static qbit
 assumptions, difficulty policy, and P2MR payout address, but defers launch-only
 IBD, peer, live-template, freshness, and active-tip checks. CKPool remains
 running with its Stratum listener bound and retries GBT until qbitd can serve
@@ -223,9 +239,9 @@ one-shot preflight; `--production-gate-only` runs only stateless production,
 CKPool-knob, and explicit public-difficulty checks without RPC; and
 `--supervise <command> [args...]` runs full initial checks, launches the command
 without a shell, forwards termination signals, and applies the continuous
-watchdog. Set `QBIT_EXPECTED_GENESIS_HASH` to pin the connected node's genesis;
-template time bounds are `CKPOOL_TEMPLATE_MAX_AGE_SECONDS` and
-`CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS`.
+watchdog. Mainnet requires `QBIT_EXPECTED_GENESIS_HASH`; other chains may set it
+to pin the connected node's genesis. Template time bounds are
+`CKPOOL_TEMPLATE_MAX_AGE_SECONDS` and `CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS`.
 
 If you want both public mining paths on one host, use:
 
@@ -240,7 +256,12 @@ That starts:
 - `bitcoind`
 - `auxpow-stratum` on `stratum+tcp://127.0.0.1:3335` for parent-chain merged mining
 
-The `auxpow-stratum` service (also reachable via `make up-auxpow-pool`) refreshes miner jobs whenever either chain tip changes and additionally age-refreshes them after `AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS` (default 2700, i.e. 45 minutes). That sits below qbit's default 60 minute `-auxpowtemplateexpiry`, so miners receive replacement work before qbit ages out the cached aux candidate.
+The `auxpow-stratum` service (also reachable via `make up-auxpow-pool`) refreshes
+miner jobs whenever either chain tip changes, when the Bitcoin parent template
+exceeds `AUXPOW_TEMPLATE_MAX_AGE_SECONDS` (default 120), or after
+`AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS` (default 2700, i.e. 45 minutes). The latter
+sits below qbit's default 60 minute `-auxpowtemplateexpiry`, so both parent work
+and the cached qbit candidate receive bounded replacement.
 
 The AuxPoW Stratum bridge advertises parent-chain work, enables per-miner vardiff by default, and uses `AUXPOW_STRATUM_VERSION_MASK=1fffe000` for BIP310 version rolling. qbit child candidates still come from `createauxblock`; permissionless qbit, ckpool, and direct PRISM Stratum prefer the connected qbit node's `getblocktemplate.versionrollingmask` when present. Older or unavailable GBT probes fall back to each service's configured mask: `CKPOOL_VERSION_MASK` for ckpool and `PRISM_VERSION_ROLLING_MASK` for direct PRISM. For byte-order investigations, set `AUXPOW_STRATUM_DIAG_VARIANTS=1` and optionally `AUXPOW_STRATUM_DIAG_JSONL=1`; normal operation uses `AUXPOW_STRATUM_HEADER_VARIANT=canonical`.
 
@@ -249,6 +270,12 @@ Vardiff defaults target one accepted share every 5 seconds, start miners at diff
 On a VM, expose or relay both Stratum ports if you want both URLs reachable from outside the host.
 
 For a live AuxPoW endpoint, also set the `BITCOIN_RPC_*` and `BITCOIN_MINER_ADDRESS` envs to the parent-chain node you want to mine against. If you leave the defaults alone, the local `bitcoind` container stays in regtest mode and the AuxPoW URL is only a lab smoke.
+
+The bundled Bitcoin Core image verifies its downloaded archive against the
+architecture-specific SHA256 pinned in `config/upstream.env` before extracting
+it. See [`docs/bitcoin-release-integrity.md`](docs/bitcoin-release-integrity.md)
+before changing the Bitcoin Core version, download location, or release
+digests.
 
 ### Bitcoin Testnet4 Parent Node
 
@@ -309,10 +336,9 @@ logged and rendered into `/etc/ckpool/ckpool.conf`. If qbitd advertises
 node.
 
 CKPool also exposes its private command socket below `CKPOOL_SOCK_DIR`
-(`/tmp/qbitlab` by default for `ckpool`, `/tmp/qbitlab-real` for the optional
-`ckpool-real` service). Override those paths only to share the Unix socket with
-a local private stats exporter or same-host operator tooling. Do not publish the
-socket directory or `/var/log/ckpool` outside the mining-pool host.
+(`/tmp/qbitlab` by default). Override that path only to share the Unix socket
+with a local private stats exporter or same-host operator tooling. Do not
+publish the socket directory or `/var/log/ckpool` outside the mining-pool host.
 
 To prove the repo against a real external miner client instead of the built-in simulator:
 
@@ -320,7 +346,10 @@ To prove the repo against a real external miner client instead of the built-in s
 make test-real-miner
 ```
 
-That uses the bundled `cpuminer-opt`-based path as an operator-facing smoke test.
+That starts the `real-miner-smoke` profile and points the bundled
+`cpuminer-opt` client at the ordinary `ckpool` service on port 3333. The
+`make up-permissionless-real` target remains as a deprecated compatibility
+alias for `make up-real-miner` for one release.
 
 `make test-auxpow` brings up:
 

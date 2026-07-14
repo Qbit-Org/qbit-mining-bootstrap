@@ -1,12 +1,13 @@
 services:
   qbitd:
-    profiles: ["permissionless", "permissionless-real", "auxpow", "prism"]
-    image: qbit-lab-qbitd:local
+    profiles: ["permissionless", "real-miner-smoke", "auxpow", "prism"]
+    image: ${QBITD_IMAGE:-qbit-lab-qbitd:local}
+    restart: unless-stopped
     build:
       context: .
       dockerfile: docker/qbit/Dockerfile
       additional_contexts:
-        qbit-src: ${QBIT_SRC_DIR:?Set an absolute QBIT_SRC_DIR}
+        qbit-src: ${QBIT_SRC_DIR:-./generated/qbit-src}
       args:
         UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
     environment:
@@ -40,7 +41,7 @@ services:
       - "${QBIT_ZMQ_TX_PORT_HOST:-127.0.0.1:28333}:28333"
     volumes:
       - ./config/qbit/qbit.conf:/etc/qbit/qbit.conf:ro
-      - qbit-data:/var/lib/qbit
+      - ${QBIT_DATA_SOURCE:-qbit-data}:/var/lib/qbit
     healthcheck:
       test:
         - CMD-SHELL
@@ -56,8 +57,9 @@ services:
       retries: 30
 
   ckpool:
-    profiles: ["permissionless"]
-    image: qbit-lab-ckpool:local
+    profiles: ["permissionless", "real-miner-smoke"]
+    image: ${CKPOOL_IMAGE:-qbit-lab-ckpool:local}
+    restart: unless-stopped
     build:
       context: .
       dockerfile: docker/ckpool/Dockerfile
@@ -68,6 +70,8 @@ services:
     depends_on:
       qbitd:
         condition: service_healthy
+    volumes:
+      - real-miner-smoke-address:/run/qbit-real-miner-smoke
     environment:
       QBIT_PRODUCTION: ${QBIT_PRODUCTION:-0}
       QBIT_TOOLS_PRODUCTION: ${QBIT_TOOLS_PRODUCTION:-0}
@@ -78,6 +82,7 @@ services:
       QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
       QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
       QBIT_MINER_ADDRESS: ${QBIT_MINER_ADDRESS:-auto}
+      QBIT_MINER_ADDRESS_FILE: /run/qbit-real-miner-smoke/miner-address.txt
       QBIT_MINER_ADDRESS_FILE_WAIT: 0
       CKPOOL_MINDIFF: ${CKPOOL_MINDIFF:-}
       CKPOOL_STARTDIFF: ${CKPOOL_STARTDIFF:-}
@@ -103,10 +108,10 @@ services:
       CKPOOL_VALIDATE_QBIT_ASSUMPTIONS: ${CKPOOL_VALIDATE_QBIT_ASSUMPTIONS:-1}
       CKPOOL_REQUIRE_P2MR_PAYOUT: ${CKPOOL_REQUIRE_P2MR_PAYOUT:-}
       QBIT_EXPECTED_ADDRESS_HRP: ${QBIT_EXPECTED_ADDRESS_HRP:-}
-      QBIT_EXPECTED_GENESIS_HASH: ${QBIT_EXPECTED_GENESIS_HASH:-}
       QBIT_EXPECTED_MAX_BLOCK_WEIGHT: ${QBIT_EXPECTED_MAX_BLOCK_WEIGHT:-2000000}
       QBIT_EXPECTED_WITNESS_SCALE_FACTOR: ${QBIT_EXPECTED_WITNESS_SCALE_FACTOR:-1}
       QBIT_EXPECTED_COINBASE_MATURITY: ${QBIT_EXPECTED_COINBASE_MATURITY:-1000}
+      QBIT_EXPECTED_GENESIS_HASH: ${QBIT_EXPECTED_GENESIS_HASH:-}
       CKPOOL_VERSION_MASK: ${CKPOOL_VERSION_MASK:-1fffe000}
       CKPOOL_VERSION_MASK_MODE: ${CKPOOL_VERSION_MASK_MODE:-dynamic}
       CKPOOL_VERSION_MASK_RPC_TIMEOUT_SECONDS: ${CKPOOL_VERSION_MASK_RPC_TIMEOUT_SECONDS:-5}
@@ -118,78 +123,6 @@ services:
         - CMD-SHELL
         - >-
           bash -lc 'exec 3<>/dev/tcp/127.0.0.1/3333'
-      interval: 5s
-      timeout: 5s
-      retries: 30
-
-  ckpool-real:
-    profiles: ["permissionless-real"]
-    image: qbit-lab-ckpool:local
-    build:
-      context: .
-      dockerfile: docker/ckpool/Dockerfile
-      args:
-        UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
-        CKPOOL_GIT_URL: ${CKPOOL_GIT_URL}
-        CKPOOL_GIT_REF: ${CKPOOL_GIT_REF}
-    depends_on:
-      qbitd:
-        condition: service_healthy
-      miner-address:
-        condition: service_healthy
-    volumes:
-      - real-miner-state:/var/lib/qbit-lab
-    environment:
-      QBIT_PRODUCTION: ${QBIT_PRODUCTION:-0}
-      QBIT_TOOLS_PRODUCTION: ${QBIT_TOOLS_PRODUCTION:-0}
-      QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED: ${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}
-      QBIT_CHAIN: ${QBIT_CHAIN:-regtest}
-      QBIT_RPC_HOST: qbitd
-      QBIT_RPC_PORT: ${QBIT_RPC_PORT:-18452}
-      QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
-      QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
-      QBIT_MINER_ADDRESS: ${REAL_MINER_PAYOUT_ADDRESS:-auto}
-      QBIT_MINER_ADDRESS_FILE: /var/lib/qbit-lab/miner-address.txt
-      QBIT_MINER_ADDRESS_FILE_WAIT: 1
-      CKPOOL_MINDIFF: ${CKPOOL_MINDIFF:-}
-      CKPOOL_STARTDIFF: ${CKPOOL_STARTDIFF:-}
-      CKPOOL_MAXDIFF: ${CKPOOL_MAXDIFF:-}
-      CKPOOL_LOG_DIR: ${CKPOOL_REAL_LOG_DIR:-/var/log/ckpool}
-      CKPOOL_SOCK_DIR: ${CKPOOL_REAL_SOCK_DIR:-/tmp/qbitlab-real}
-      CKPOOL_NOTIFY: ${CKPOOL_NOTIFY:-false}
-      CKPOOL_BTCSIG: "${CKPOOL_BTCSIG-/qbit-mining-bootstrap/}"
-      CKPOOL_BLOCKPOLL: ${CKPOOL_BLOCKPOLL:-2}
-      CKPOOL_DONATION: ${CKPOOL_DONATION:-0.0}
-      CKPOOL_NONCE1LENGTH: ${CKPOOL_NONCE1LENGTH:-4}
-      CKPOOL_NONCE2LENGTH: ${CKPOOL_NONCE2LENGTH:-8}
-      CKPOOL_UPDATE_INTERVAL: ${CKPOOL_UPDATE_INTERVAL:-30}
-      CKPOOL_PUBLIC_DIFF_POLICY: ${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}
-      CKPOOL_NON_TEST_READINESS_GATE: ${CKPOOL_NON_TEST_READINESS_GATE:-1}
-      CKPOOL_MIN_PEERS: ${CKPOOL_MIN_PEERS:-1}
-      CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS: ${CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS:-5}
-      CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS: ${CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS:-120}
-      CKPOOL_TEMPLATE_MAX_AGE_SECONDS: ${CKPOOL_TEMPLATE_MAX_AGE_SECONDS:-120}
-      CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS: ${CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS:-30}
-      CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS: ${CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS:-5}
-      CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS: ${CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS:-120}
-      CKPOOL_VALIDATE_QBIT_ASSUMPTIONS: ${CKPOOL_VALIDATE_QBIT_ASSUMPTIONS:-1}
-      CKPOOL_REQUIRE_P2MR_PAYOUT: ${CKPOOL_REQUIRE_P2MR_PAYOUT:-}
-      QBIT_EXPECTED_ADDRESS_HRP: ${QBIT_EXPECTED_ADDRESS_HRP:-}
-      QBIT_EXPECTED_GENESIS_HASH: ${QBIT_EXPECTED_GENESIS_HASH:-}
-      QBIT_EXPECTED_MAX_BLOCK_WEIGHT: ${QBIT_EXPECTED_MAX_BLOCK_WEIGHT:-2000000}
-      QBIT_EXPECTED_WITNESS_SCALE_FACTOR: ${QBIT_EXPECTED_WITNESS_SCALE_FACTOR:-1}
-      QBIT_EXPECTED_COINBASE_MATURITY: ${QBIT_EXPECTED_COINBASE_MATURITY:-1000}
-      CKPOOL_VERSION_MASK: ${CKPOOL_VERSION_MASK:-1fffe000}
-      CKPOOL_VERSION_MASK_MODE: ${CKPOOL_VERSION_MASK_MODE:-dynamic}
-      CKPOOL_VERSION_MASK_RPC_TIMEOUT_SECONDS: ${CKPOOL_VERSION_MASK_RPC_TIMEOUT_SECONDS:-5}
-      CKPOOL_STRATUM_PORT: 3334
-    ports:
-      - "${CKPOOL_STRATUM_PORT_REAL_HOST:-3334}:3334"
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - >-
-          bash -lc 'exec 3<>/dev/tcp/127.0.0.1/3334'
       interval: 5s
       timeout: 5s
       retries: 30
@@ -219,7 +152,7 @@ services:
       QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
 
   real-miner:
-    profiles: ["permissionless-real"]
+    profiles: ["real-miner-smoke"]
     image: qbit-lab-real-miner:local
     build:
       context: .
@@ -231,17 +164,15 @@ services:
     depends_on:
       qbitd:
         condition: service_healthy
-      ckpool-real:
-        condition: service_healthy
-      miner-address:
+      ckpool:
         condition: service_healthy
     volumes:
-      - real-miner-state:/var/lib/qbit-lab
+      - real-miner-smoke-address:/run/qbit-real-miner-smoke:ro
     environment:
-      STRATUM_HOST: ckpool-real
-      STRATUM_PORT: 3334
+      STRATUM_HOST: ckpool
+      STRATUM_PORT: 3333
       MINER_USERNAME: ${REAL_MINER_USERNAME:-auto}
-      MINER_USERNAME_FILE: /var/lib/qbit-lab/miner-address.txt
+      MINER_USERNAME_FILE: /run/qbit-real-miner-smoke/miner-address.txt
       MINER_PASSWORD: x
       MINER_TIMEOUT_SECONDS: ${REAL_MINER_TIMEOUT_SECONDS:-120}
       MINER_USERNAME_TIMEOUT_SECONDS: 60
@@ -253,35 +184,10 @@ services:
       QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
       QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
 
-  miner-address:
-    profiles: ["permissionless-real"]
-    image: qbit-lab-qbitd:local
-    depends_on:
-      qbitd:
-        condition: service_healthy
-    volumes:
-      - real-miner-state:/var/lib/qbit-lab
-      - ./lab/real-miner/bootstrap_miner_address.sh:/usr/local/bin/bootstrap_miner_address.sh:ro
-    environment:
-      QBIT_RPC_HOST: qbitd
-      QBIT_RPC_PORT: ${QBIT_RPC_PORT:-18452}
-      QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
-      QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
-      QBIT_MINER_WALLET_NAME: ckpool-real
-      QBIT_MINER_ADDRESS_FILE: /var/lib/qbit-lab/miner-address.txt
-    entrypoint: ["/usr/bin/tini", "--"]
-    command: ["/bin/bash", "/usr/local/bin/bootstrap_miner_address.sh"]
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - test -s /var/lib/qbit-lab/miner-address.txt
-      interval: 5s
-      timeout: 5s
-      retries: 30
-
   bitcoind:
     profiles: ["auxpow"]
-    image: qbit-lab-bitcoind:local
+    image: ${BITCOIND_IMAGE:-qbit-lab-bitcoind:local}
+    restart: unless-stopped
     build:
       context: .
       dockerfile: docker/bitcoin/Dockerfile
@@ -290,6 +196,8 @@ services:
         BITCOIN_RELEASE_VERSION: ${BITCOIN_RELEASE_VERSION}
         BITCOIN_RELEASE_BASE_URL: ${BITCOIN_RELEASE_BASE_URL}
         BITCOIN_RELEASE_URL: ${BITCOIN_RELEASE_URL}
+        BITCOIN_RELEASE_SHA256_AMD64: ${BITCOIN_RELEASE_SHA256_AMD64}
+        BITCOIN_RELEASE_SHA256_ARM64: ${BITCOIN_RELEASE_SHA256_ARM64}
     command:
       - -printtoconsole
       - -conf=/etc/bitcoin/bitcoin.conf
@@ -315,7 +223,7 @@ services:
       - "${BITCOIN_P2P_PORT_HOST:-127.0.0.1:18446}:${BITCOIN_P2P_PORT:-18444}"
     volumes:
       - ./config/bitcoin/bitcoin.conf:/etc/bitcoin/bitcoin.conf:ro
-      - bitcoin-data:/var/lib/bitcoin
+      - ${BITCOIN_DATA_SOURCE:-bitcoin-data}:/var/lib/bitcoin
     healthcheck:
       test:
         - CMD-SHELL
@@ -332,39 +240,48 @@ services:
 
   auxpow-coordinator:
     profiles: ["auxpow"]
-    image: qbit-lab-auxpow-coordinator:local
+    image: ${AUXPOW_COORDINATOR_IMAGE:-qbit-lab-auxpow-coordinator:local}
+    restart: on-failure
     build:
       context: .
       dockerfile: lab/auxpow/Dockerfile
       additional_contexts:
-        qbit-src: ${QBIT_SRC_DIR:?Set an absolute QBIT_SRC_DIR}
+        qbit-src: ${QBIT_SRC_DIR:-./generated/qbit-src}
     depends_on:
       qbitd:
         condition: service_healthy
       bitcoind:
         condition: service_healthy
     environment:
+      QBIT_CHAIN: ${QBIT_CHAIN:-regtest}
+      QBIT_EXPECTED_GENESIS_HASH: ${QBIT_EXPECTED_GENESIS_HASH:-}
       QBIT_RPC_HOST: qbitd
       QBIT_RPC_PORT: ${QBIT_RPC_PORT:-18452}
       QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
       QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
       QBIT_MINER_ADDRESS: ${QBIT_MINER_ADDRESS:-auto}
       QBIT_MINER_WALLET_NAME: auxpow
+      BITCOIN_CHAIN: ${BITCOIN_CHAIN:-regtest}
+      BITCOIN_EXPECTED_GENESIS_HASH: ${BITCOIN_EXPECTED_GENESIS_HASH:-}
       BITCOIN_RPC_HOST: ${BITCOIN_RPC_HOST:-bitcoind}
       BITCOIN_RPC_PORT: ${BITCOIN_RPC_PORT:-18443}
       BITCOIN_RPC_USER: ${BITCOIN_RPC_USER:-bitcoinrpc}
       BITCOIN_RPC_PASSWORD: ${BITCOIN_RPC_PASSWORD:-change-this}
       BITCOIN_MINER_ADDRESS: ${BITCOIN_MINER_ADDRESS:-auto}
       BITCOIN_MINER_WALLET_NAME: ${BITCOIN_MINER_WALLET_NAME:-auxpow-parent}
+      AUXPOW_TEMPLATE_MAX_AGE_SECONDS: ${AUXPOW_TEMPLATE_MAX_AGE_SECONDS:-120}
+      AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS: ${AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS:-7200}
+      AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS: ${AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS:-120}
 
   auxpow-bridge:
     profiles: ["auxpow"]
-    image: qbit-lab-auxpow-coordinator:local
+    image: ${AUXPOW_COORDINATOR_IMAGE:-qbit-lab-auxpow-coordinator:local}
+    restart: on-failure
     build:
       context: .
       dockerfile: lab/auxpow/Dockerfile
       additional_contexts:
-        qbit-src: ${QBIT_SRC_DIR:?Set an absolute QBIT_SRC_DIR}
+        qbit-src: ${QBIT_SRC_DIR:-./generated/qbit-src}
     depends_on:
       qbitd:
         condition: service_healthy
@@ -373,12 +290,19 @@ services:
     environment:
       AUXPOW_MODE: bridge
       AUXPOW_BRIDGE_INTERVAL_SECONDS: ${AUXPOW_BRIDGE_INTERVAL_SECONDS:-15}
+      AUXPOW_TEMPLATE_MAX_AGE_SECONDS: ${AUXPOW_TEMPLATE_MAX_AGE_SECONDS:-120}
+      AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS: ${AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS:-7200}
+      AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS: ${AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS:-120}
+      QBIT_CHAIN: ${QBIT_CHAIN:-regtest}
+      QBIT_EXPECTED_GENESIS_HASH: ${QBIT_EXPECTED_GENESIS_HASH:-}
       QBIT_RPC_HOST: qbitd
       QBIT_RPC_PORT: ${QBIT_RPC_PORT:-18452}
       QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
       QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
       QBIT_MINER_ADDRESS: ${QBIT_MINER_ADDRESS:-auto}
       QBIT_MINER_WALLET_NAME: auxpow
+      BITCOIN_CHAIN: ${BITCOIN_CHAIN:-regtest}
+      BITCOIN_EXPECTED_GENESIS_HASH: ${BITCOIN_EXPECTED_GENESIS_HASH:-}
       BITCOIN_RPC_HOST: ${BITCOIN_RPC_HOST:-bitcoind}
       BITCOIN_RPC_PORT: ${BITCOIN_RPC_PORT:-18443}
       BITCOIN_RPC_USER: ${BITCOIN_RPC_USER:-bitcoinrpc}
@@ -388,12 +312,13 @@ services:
 
   auxpow-stratum:
     profiles: ["auxpow"]
-    image: qbit-lab-auxpow-coordinator:local
+    image: ${AUXPOW_COORDINATOR_IMAGE:-qbit-lab-auxpow-coordinator:local}
+    restart: on-failure
     build:
       context: .
       dockerfile: lab/auxpow/Dockerfile
       additional_contexts:
-        qbit-src: ${QBIT_SRC_DIR:?Set an absolute QBIT_SRC_DIR}
+        qbit-src: ${QBIT_SRC_DIR:-./generated/qbit-src}
     depends_on:
       qbitd:
         condition: service_healthy
@@ -401,6 +326,9 @@ services:
         condition: service_healthy
     environment:
       AUXPOW_MODE: stratum
+      AUXPOW_TEMPLATE_MAX_AGE_SECONDS: ${AUXPOW_TEMPLATE_MAX_AGE_SECONDS:-120}
+      AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS: ${AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS:-7200}
+      AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS: ${AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS:-120}
       AUXPOW_STRATUM_PORT: ${AUXPOW_STRATUM_PORT:-3335}
       AUXPOW_STRATUM_SHARE_DIFF: ${AUXPOW_STRATUM_SHARE_DIFF:-1}
       AUXPOW_STRATUM_VARDIFF_ENABLED: ${AUXPOW_STRATUM_VARDIFF_ENABLED:-1}
@@ -426,12 +354,16 @@ services:
       AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT: ${AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT:-0}
       AUXPOW_STRATUM_STATS_INTERVAL_SECONDS: ${AUXPOW_STRATUM_STATS_INTERVAL_SECONDS:-60}
       AUXPOW_STRATUM_EXPECTED_HASHRATES: ${AUXPOW_STRATUM_EXPECTED_HASHRATES:-}
+      QBIT_CHAIN: ${QBIT_CHAIN:-regtest}
+      QBIT_EXPECTED_GENESIS_HASH: ${QBIT_EXPECTED_GENESIS_HASH:-}
       QBIT_RPC_HOST: qbitd
       QBIT_RPC_PORT: ${QBIT_RPC_PORT:-18452}
       QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
       QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
       QBIT_MINER_ADDRESS: ${QBIT_MINER_ADDRESS:-auto}
       QBIT_MINER_WALLET_NAME: auxpow
+      BITCOIN_CHAIN: ${BITCOIN_CHAIN:-regtest}
+      BITCOIN_EXPECTED_GENESIS_HASH: ${BITCOIN_EXPECTED_GENESIS_HASH:-}
       BITCOIN_RPC_HOST: ${BITCOIN_RPC_HOST:-bitcoind}
       BITCOIN_RPC_PORT: ${BITCOIN_RPC_PORT:-18443}
       BITCOIN_RPC_USER: ${BITCOIN_RPC_USER:-bitcoinrpc}
@@ -486,8 +418,10 @@ services:
       POSTGRES_DB: ${PRISM_POSTGRES_DB:-qbit}
       POSTGRES_USER: ${PRISM_POSTGRES_USER:-qbit}
       POSTGRES_PASSWORD: ${PRISM_POSTGRES_PASSWORD:-change-this}
+      POSTGRES_INITDB_WALDIR: /var/lib/postgresql/wal
     volumes:
-      - prism-postgres-data:/var/lib/postgresql/data
+      - ${PRISM_POSTGRES_DATA_SOURCE:-prism-postgres-data}:/var/lib/postgresql/data
+      - ${PRISM_POSTGRES_WAL_SOURCE:-prism-postgres-wal}:/var/lib/postgresql/wal
     healthcheck:
       test:
         - CMD-SHELL
@@ -498,7 +432,7 @@ services:
 
   prism-coordinator:
     profiles: ["prism"]
-    image: qbit-lab-prism-coordinator:local
+    image: ${PRISM_COORDINATOR_IMAGE:-qbit-lab-prism-coordinator:local}
     restart: on-failure
     build:
       context: .
@@ -509,11 +443,19 @@ services:
       prism-postgres:
         condition: service_healthy
     volumes:
-      - prism-audit-data:${PRISM_AUDIT_DIR:-/var/lib/qbit-prism/audit}
+      - ${PRISM_AUDIT_DATA_SOURCE:-prism-audit-data}:${PRISM_AUDIT_DIR:-/var/lib/qbit-prism/audit}
+      - type: bind
+        source: ${PRISM_CAPACITY_EVIDENCE_FILE:-./tests/fixtures/prism-capacity-evidence.json}
+        target: /run/qbit-prism/capacity-evidence.json
+        read_only: true
+        bind:
+          create_host_path: false
     environment:
       QBIT_PRODUCTION: ${QBIT_PRODUCTION:-0}
       QBIT_TOOLS_PRODUCTION: ${QBIT_TOOLS_PRODUCTION:-0}
+      QBIT_REQUIRE_RELEASE_PROVENANCE: ${QBIT_REQUIRE_RELEASE_PROVENANCE:-0}
       QBIT_CHAIN: ${QBIT_CHAIN:-regtest}
+      QBIT_EXPECTED_GENESIS_HASH: ${QBIT_EXPECTED_GENESIS_HASH:-}
       QBIT_RPC_HOST: qbitd
       QBIT_RPC_PORT: ${QBIT_RPC_PORT:-18452}
       QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
@@ -527,6 +469,9 @@ services:
       PRISM_POSTGRES_PSQL_COMMAND: ${PRISM_POSTGRES_PSQL_COMMAND:-}
       PRISM_POSTGRES_INIT_SCHEMA: ${PRISM_POSTGRES_INIT_SCHEMA:-1}
       PRISM_POSTGRES_READ_CONCURRENCY: ${PRISM_POSTGRES_READ_CONCURRENCY:-4}
+      PRISM_SHARE_COMMIT_BATCH_SIZE: ${PRISM_SHARE_COMMIT_BATCH_SIZE:-64}
+      PRISM_SHARE_COMMIT_LINGER_MILLISECONDS: ${PRISM_SHARE_COMMIT_LINGER_MILLISECONDS:-5}
+      PRISM_SHARE_COMMIT_TIMEOUT_SECONDS: ${PRISM_SHARE_COMMIT_TIMEOUT_SECONDS:-15}
       PRISM_LEDGER_WRITER_ID: ${PRISM_LEDGER_WRITER_ID:-prism-coordinator}
       PRISM_LEDGER_WRITER_EPOCH: ${PRISM_LEDGER_WRITER_EPOCH:-1}
       PRISM_LEDGER_WRITER_SESSION_TOKEN: ${PRISM_LEDGER_WRITER_SESSION_TOKEN:-}
@@ -549,6 +494,7 @@ services:
       PRISM_BLOCKWAIT_TIMEOUT_SECONDS: ${PRISM_BLOCKWAIT_TIMEOUT_SECONDS:-5}
       PRISM_JOB_BUNDLE_CACHE_SECONDS: ${PRISM_JOB_BUNDLE_CACHE_SECONDS:-10}
       PRISM_TEMPLATE_CACHE_SECONDS: ${PRISM_TEMPLATE_CACHE_SECONDS:-2}
+      PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS: ${PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS:-120}
       PRISM_REORG_RECONCILE_CACHE_SECONDS: ${PRISM_REORG_RECONCILE_CACHE_SECONDS:-5}
       PRISM_HEALTH_REFRESH_SECONDS: ${PRISM_HEALTH_REFRESH_SECONDS:-5}
       PRISM_STRATUM_SEND_TIMEOUT_SECONDS: ${PRISM_STRATUM_SEND_TIMEOUT_SECONDS:-20}
@@ -579,6 +525,14 @@ services:
       PRISM_PUBLIC_CACHE_DEBUG_HEADERS: ${PRISM_PUBLIC_CACHE_DEBUG_HEADERS:-0}
       PRISM_STRATUM_EXTRANONCE2_SIZE: ${PRISM_STRATUM_EXTRANONCE2_SIZE:-8}
       PRISM_COINBASE_TAG: ${PRISM_COINBASE_TAG-/PRISM/}
+      PRISM_CAPACITY_EVIDENCE_FILE: /run/qbit-prism/capacity-evidence.json
+      PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND: ${PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND:-}
+      PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS: ${PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS:-}
+      PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS: ${PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS:-86400}
+      PRISM_CAPACITY_COORDINATOR_REVISION: ${PRISM_CAPACITY_COORDINATOR_REVISION:-}
+      PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST: ${PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST:-}
+      PRISM_CAPACITY_POSTGRES_SERVER_VERSION: ${PRISM_CAPACITY_POSTGRES_SERVER_VERSION:-}
+      PRISM_CAPACITY_DATABASE_PROFILE_SHA256: ${PRISM_CAPACITY_DATABASE_PROFILE_SHA256:-}
       PRISM_STRATUM_SHARE_DIFF: ${PRISM_STRATUM_SHARE_DIFF:-0.000000001}
       PRISM_STRATUM_SHARE_WEIGHT: ${PRISM_STRATUM_SHARE_WEIGHT:-1}
       PRISM_STRATUM_SHARE_WEIGHTS_JSON: ${PRISM_STRATUM_SHARE_WEIGHTS_JSON:-}
@@ -597,6 +551,7 @@ services:
       PRISM_RESERVED_COINBASE_OUTPUTS: ${PRISM_RESERVED_COINBASE_OUTPUTS:-0}
       PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT: ${PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT:-}
       PRISM_CTV_FANOUT_FEE_PREMIUM_BPS: ${PRISM_CTV_FANOUT_FEE_PREMIUM_BPS:-12000}
+      PRISM_CTV_FANOUT_FEE_ESTIMATE_TARGET_BLOCKS: ${PRISM_CTV_FANOUT_FEE_ESTIMATE_TARGET_BLOCKS:-2}
       PRISM_CTV_BROADCASTER_ENABLED: ${PRISM_CTV_BROADCASTER_ENABLED:-}
       PRISM_CTV_BROADCASTER_WALLET: ${PRISM_CTV_BROADCASTER_WALLET:-}
       PRISM_CTV_BROADCASTER_FEE_BITS: ${PRISM_CTV_BROADCASTER_FEE_BITS:-0}
@@ -657,6 +612,7 @@ services:
 volumes:
   bitcoin-data:
   qbit-data:
-  real-miner-state:
+  real-miner-smoke-address:
   prism-audit-data:
   prism-postgres-data:
+  prism-postgres-wal:

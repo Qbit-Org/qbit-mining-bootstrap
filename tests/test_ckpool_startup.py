@@ -135,6 +135,62 @@ class CkpoolStartupTests(unittest.TestCase):
         self.assertEqual(config["version_mask"], "1fffe000")
         self.assertEqual(config["btcsig"], "/qbit-mining-bootstrap/")
 
+    def test_startup_writes_resolved_address_for_real_miner_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer() as rpc:
+            root = Path(tmp)
+            self.run_start_ckpool(root, rpc)
+            address = (root / "state" / "miner-address.txt").read_text(encoding="utf-8").strip()
+
+        self.assertEqual(address, REGTEST_ADDRESS)
+
+    def test_mainnet_rejects_implicit_address_before_wallet_resolution(self) -> None:
+        for address in ("", "auto", " AUTO "):
+            with self.subTest(address=address), tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+                "--chain", "main"
+            ) as rpc:
+                root = Path(tmp)
+                result, config_file = self.run_start_ckpool_raw(
+                    root,
+                    rpc,
+                    QBIT_CHAIN="mainnet",
+                    QBIT_PRODUCTION="0",
+                    QBIT_RPC_PASSWORD="not-default",
+                    QBIT_MINER_ADDRESS=address,
+                    QBIT_EXPECTED_GENESIS_HASH="11" * 32,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires an explicit QBIT_MINER_ADDRESS", result.stderr)
+                self.assertFalse(config_file.exists())
+                self.assertFalse((root / "state" / "miner-address.txt").exists())
+
+    def test_mainnet_rejects_invalid_genesis_before_state_creation(self) -> None:
+        cases = {
+            "": "QBIT_CHAIN=mainnet requires QBIT_EXPECTED_GENESIS_HASH",
+            "not-a-hash": "QBIT_EXPECTED_GENESIS_HASH must be 64 lowercase hex characters",
+        }
+        for value, expected_error in cases.items():
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+                "--chain", "main"
+            ) as rpc:
+                root = Path(tmp)
+                result, config_file = self.run_start_ckpool_raw(
+                    root,
+                    rpc,
+                    QBIT_CHAIN="mainnet",
+                    QBIT_PRODUCTION="0",
+                    QBIT_RPC_PASSWORD="not-default",
+                    QBIT_MINER_ADDRESS="qb1staticqbitaddress",
+                    QBIT_EXPECTED_GENESIS_HASH=value,
+                    CKPOOL_MINDIFF="1024",
+                    CKPOOL_STARTDIFF="65536",
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(config_file.exists())
+                self.assertFalse((root / "state").exists())
+
     def test_explicit_public_difficulty_and_knobs_render(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer("--chain", "testnet4") as rpc:
             config = self.run_start_ckpool(
@@ -189,7 +245,7 @@ class CkpoolStartupTests(unittest.TestCase):
             compose.count(
                 'CKPOOL_BTCSIG: "${CKPOOL_BTCSIG-/qbit-mining-bootstrap/}"'
             ),
-            2,
+            1,
         )
         self.assertNotIn(
             "CKPOOL_BTCSIG: ${CKPOOL_BTCSIG:-/qbit-mining-bootstrap/}",
@@ -204,11 +260,14 @@ class CkpoolStartupTests(unittest.TestCase):
                 "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED: "
                 "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}"
             ),
-            3,
+            2,
         )
 
-    def test_compose_passes_supervisor_settings_to_ckpool_services(self) -> None:
+    def test_compose_passes_supervisor_settings_to_ckpool_service(self) -> None:
         compose = (ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
+        ckpool_service = compose.split("\n  ckpool:\n", 1)[1].split(
+            "\n  permissionless-miner:\n", 1
+        )[0]
         settings = {
             "CKPOOL_TEMPLATE_MAX_AGE_SECONDS": "120",
             "CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS": "30",
@@ -220,8 +279,8 @@ class CkpoolStartupTests(unittest.TestCase):
         for name, default in settings.items():
             with self.subTest(name=name):
                 self.assertEqual(
-                    compose.count(f"{name}: ${{{name}:-{default}}}"),
-                    2,
+                    ckpool_service.count(f"{name}: ${{{name}:-{default}}}"),
+                    1,
                 )
 
     def test_production_mainnet_prelaunch_starts_with_explicit_authorization(self) -> None:
@@ -239,6 +298,7 @@ class CkpoolStartupTests(unittest.TestCase):
                 QBIT_TOOLS_PRODUCTION="1",
                 QBIT_RPC_PASSWORD="not-default",
                 QBIT_MINER_ADDRESS="qb1staticqbitaddress",
+                QBIT_EXPECTED_GENESIS_HASH="00" * 32,
                 CKPOOL_MINDIFF="1024",
                 CKPOOL_STARTDIFF="65536",
                 CKPOOL_NON_TEST_READINESS_GATE="0",
@@ -265,6 +325,7 @@ class CkpoolStartupTests(unittest.TestCase):
                 QBIT_PRODUCTION="1",
                 QBIT_RPC_PASSWORD="not-default",
                 QBIT_MINER_ADDRESS="qb1staticqbitaddress",
+                QBIT_EXPECTED_GENESIS_HASH="00" * 32,
                 CKPOOL_MINDIFF="1024",
                 CKPOOL_STARTDIFF="65536",
                 CKPOOL_NON_TEST_READINESS_GATE="0",

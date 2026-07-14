@@ -34,6 +34,30 @@ from test_framework.script import CScript
 getcontext().prec = 40
 
 
+PUBLIC_CHAINS = {"mainnet", "testnet", "testnet3", "testnet4", "signet"}
+QBIT_RPC_CHAIN_NAMES = {
+    "mainnet": {"main", "mainnet"},
+    "testnet": {"test", "testnet"},
+    "testnet3": {"test", "testnet3"},
+    "testnet4": {"testnet4"},
+    "signet": {"signet"},
+    "regtest": {"regtest"},
+}
+BITCOIN_RPC_CHAIN_NAMES = {
+    "mainnet": {"main"},
+    "testnet": {"test"},
+    "testnet3": {"test"},
+    "testnet4": {"testnet4"},
+    "signet": {"signet"},
+    "regtest": {"regtest"},
+}
+KNOWN_BITCOIN_GENESIS_HASHES = {
+    "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+}
+AUTOMATIC_WALLET_READY_TIMEOUT_SECONDS = 180.0
+AUTOMATIC_WALLET_RETRY_SECONDS = 1.0
+
+
 def env(name: str, default: str | None = None) -> str:
     value = os.environ.get(name, default)
     if value is None or value == "":
@@ -237,27 +261,69 @@ class ResolvedAddress:
     script_pubkey_hex: str
 
 
-def ensure_wallet_loaded(rpc: JsonRpc, wallet_name: str) -> None:
-    try:
-        rpc.call("createwallet", [wallet_name])
-    except Exception:
-        pass
-    try:
-        rpc.call("loadwallet", [wallet_name])
-    except Exception:
-        pass
-
-
-def get_new_address(rpc: JsonRpc, wallet_name: str) -> str:
-    ensure_wallet_loaded(rpc, wallet_name)
-    for params in ([], ["", "p2mr"], ["", "bech32"]):
+def ensure_wallet_loaded(
+    rpc: JsonRpc,
+    wallet_name: str,
+    *,
+    deadline: float | None = None,
+) -> Exception | None:
+    last_error: Exception | None = None
+    for method in ("createwallet", "loadwallet"):
+        if deadline is not None and time.monotonic() >= deadline:
+            return last_error or TimeoutError("wallet readiness deadline elapsed")
         try:
-            address = rpc.call("getnewaddress", params, wallet=wallet_name)
-        except Exception:
-            continue
-        if address:
-            return str(address)
-    raise RuntimeError(f"{wallet_name} wallet did not return an address")
+            rpc.call(method, [wallet_name])
+            return None
+        except Exception as exc:
+            last_error = exc
+    return last_error
+
+
+def get_new_address(
+    rpc: JsonRpc,
+    wallet_name: str,
+    *,
+    timeout_seconds: float = AUTOMATIC_WALLET_READY_TIMEOUT_SECONDS,
+    retry_seconds: float = AUTOMATIC_WALLET_RETRY_SECONDS,
+) -> str:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be > 0")
+    if retry_seconds <= 0:
+        raise ValueError("retry_seconds must be > 0")
+
+    deadline = time.monotonic() + timeout_seconds
+    attempts = 0
+    last_error: Exception | None = None
+    while True:
+        if attempts > 0 and time.monotonic() >= deadline:
+            break
+        attempts += 1
+        wallet_error = ensure_wallet_loaded(rpc, wallet_name, deadline=deadline)
+        if wallet_error is not None:
+            last_error = wallet_error
+
+        for params in ([], ["", "p2mr"], ["", "bech32"]):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                address = rpc.call("getnewaddress", params, wallet=wallet_name)
+            except Exception as exc:
+                last_error = exc
+                continue
+            if address:
+                return str(address)
+            last_error = RuntimeError("RPC getnewaddress returned an empty result")
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            break
+        time.sleep(min(retry_seconds, remaining_seconds))
+
+    detail = f"; last RPC error: {last_error}" if last_error is not None else ""
+    raise RuntimeError(
+        f"{wallet_name} wallet did not return an address within "
+        f"{timeout_seconds:g}s after {attempts} attempts{detail}"
+    ) from last_error
 
 
 def resolve_validated_address(rpc: JsonRpc, address: str, *, field_name: str) -> ResolvedAddress:
@@ -541,6 +607,159 @@ def wait_for_rpc(rpc: JsonRpc) -> None:
     raise RuntimeError("RPC service never became ready")
 
 
+def validate_node_readiness(
+    rpc: JsonRpc,
+    *,
+    label: str,
+    configured_chain: str,
+    rpc_chain_names: dict[str, set[str]],
+    expected_genesis_hash: str | None = None,
+) -> None:
+    expected_rpc_names = rpc_chain_names.get(configured_chain)
+    if expected_rpc_names is None:
+        raise RuntimeError(f"unsupported {label} chain {configured_chain!r}")
+
+    blockchain_info = rpc.call("getblockchaininfo")
+    if not isinstance(blockchain_info, dict):
+        raise RuntimeError(f"{label} getblockchaininfo returned a non-object response")
+    actual_chain = str(blockchain_info.get("chain", "")).lower()
+    if actual_chain not in expected_rpc_names:
+        expected = ", ".join(sorted(expected_rpc_names))
+        raise RuntimeError(f"{label} RPC chain mismatch: expected {expected}, got {actual_chain or '<unset>'}")
+
+    if configured_chain not in PUBLIC_CHAINS:
+        return
+    if blockchain_info.get("initialblockdownload") is not False:
+        raise RuntimeError(f"{label} is still in initial block download")
+    try:
+        blocks = int(blockchain_info["blocks"])
+        headers = int(blockchain_info["headers"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} did not report numeric blocks and headers") from exc
+    if blocks != headers:
+        raise RuntimeError(f"{label} is not caught up: blocks={blocks}, headers={headers}")
+
+    network_info = rpc.call("getnetworkinfo")
+    if not isinstance(network_info, dict):
+        raise RuntimeError(f"{label} getnetworkinfo returned a non-object response")
+    try:
+        connections = int(network_info["connections"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} did not report a numeric connection count") from exc
+    if connections < 1:
+        raise RuntimeError(f"{label} has no peer connections")
+
+    if expected_genesis_hash:
+        actual_genesis = str(rpc.call("getblockhash", [0])).lower()
+        if actual_genesis != expected_genesis_hash.lower():
+            raise RuntimeError(
+                f"{label} genesis mismatch: expected {expected_genesis_hash.lower()}, got {actual_genesis}"
+            )
+
+
+def validate_bitcoin_parent_template(
+    parent_template: object,
+    *,
+    max_age_seconds: int,
+    max_future_seconds: int = 7200,
+) -> int:
+    if not isinstance(parent_template, dict) or not parent_template.get("previousblockhash"):
+        raise RuntimeError("Bitcoin getblocktemplate did not return a usable template")
+    try:
+        template_time = int(parent_template["curtime"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Bitcoin template did not report a numeric curtime") from exc
+    template_age = int(time.time()) - template_time
+    if template_age > max_age_seconds:
+        raise RuntimeError(
+            f"Bitcoin template is stale: age={template_age}s exceeds {max_age_seconds}s"
+        )
+    if template_age < -max_future_seconds:
+        raise RuntimeError(
+            "Bitcoin template is future-dated: "
+            f"ahead={-template_age}s exceeds {max_future_seconds}s"
+        )
+    return template_age
+
+
+def validate_auxpow_templates(
+    qbit_rpc: JsonRpc,
+    bitcoin_rpc: JsonRpc,
+    *,
+    qbit_miner_address: str,
+    max_age_seconds: int,
+    max_future_seconds: int = 7200,
+) -> None:
+    aux_template = qbit_rpc.call("createauxblock", [qbit_miner_address])
+    if not isinstance(aux_template, dict) or not aux_template.get("hash"):
+        raise RuntimeError("qbit createauxblock did not return a usable template")
+
+    parent_template = bitcoin_rpc.call("getblocktemplate", [{"rules": ["segwit"]}])
+    validate_bitcoin_parent_template(
+        parent_template,
+        max_age_seconds=max_age_seconds,
+        max_future_seconds=max_future_seconds,
+    )
+
+
+def validate_auxpow_startup(qbit_rpc: JsonRpc, bitcoin_rpc: JsonRpc) -> None:
+    if QBIT_CHAIN == "mainnet" and BITCOIN_CHAIN != "mainnet":
+        raise RuntimeError("qbit mainnet AuxPoW requires BITCOIN_CHAIN=mainnet")
+    if BITCOIN_CHAIN == "mainnet" and AUXPOW_MODE != "stratum":
+        raise RuntimeError(
+            "Bitcoin mainnet AuxPoW requires AUXPOW_MODE=stratum; bridge and once are lab-only"
+        )
+    if BITCOIN_CHAIN == "mainnet" and AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS <= 0:
+        raise RuntimeError(
+            "Bitcoin mainnet AuxPoW requires a positive "
+            "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS"
+        )
+    if BITCOIN_CHAIN == "mainnet":
+        expected_bitcoin_genesis = KNOWN_BITCOIN_GENESIS_HASHES["mainnet"]
+        if not BITCOIN_EXPECTED_GENESIS_HASH:
+            raise RuntimeError(
+                "BITCOIN_EXPECTED_GENESIS_HASH is required for Bitcoin mainnet AuxPoW"
+            )
+        if BITCOIN_EXPECTED_GENESIS_HASH.lower() != expected_bitcoin_genesis:
+            raise RuntimeError(
+                "BITCOIN_EXPECTED_GENESIS_HASH must equal the canonical Bitcoin mainnet genesis"
+            )
+        if AUXPOW_STRATUM_HEADER_VARIANT != "canonical":
+            raise RuntimeError(
+                "Bitcoin mainnet AuxPoW requires AUXPOW_STRATUM_HEADER_VARIANT=canonical"
+            )
+        if AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT:
+            raise RuntimeError(
+                "Bitcoin mainnet AuxPoW rejects AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT=1"
+            )
+    if QBIT_CHAIN == "mainnet":
+        if not QBIT_EXPECTED_GENESIS_HASH:
+            raise RuntimeError("QBIT_EXPECTED_GENESIS_HASH is required for mainnet AuxPoW")
+        if len(QBIT_EXPECTED_GENESIS_HASH) != 64 or any(
+            character not in "0123456789abcdefABCDEF" for character in QBIT_EXPECTED_GENESIS_HASH
+        ):
+            raise RuntimeError("QBIT_EXPECTED_GENESIS_HASH must be 64 hex characters")
+        if QBIT_MINER_ADDRESS == "auto":
+            raise RuntimeError("mainnet AuxPoW requires an explicit QBIT_MINER_ADDRESS")
+    if BITCOIN_CHAIN == "mainnet" and BITCOIN_MINER_ADDRESS == "auto":
+        raise RuntimeError("Bitcoin mainnet AuxPoW requires an explicit BITCOIN_MINER_ADDRESS")
+
+    validate_node_readiness(
+        qbit_rpc,
+        label="qbit",
+        configured_chain=QBIT_CHAIN,
+        rpc_chain_names=QBIT_RPC_CHAIN_NAMES,
+        expected_genesis_hash=QBIT_EXPECTED_GENESIS_HASH or None,
+    )
+    validate_node_readiness(
+        bitcoin_rpc,
+        label="Bitcoin",
+        configured_chain=BITCOIN_CHAIN,
+        rpc_chain_names=BITCOIN_RPC_CHAIN_NAMES,
+        expected_genesis_hash=BITCOIN_EXPECTED_GENESIS_HASH or None,
+    )
+
+
 @dataclass
 class AuxPowStratumJob:
     job_id: str
@@ -656,6 +875,8 @@ class AuxPowStratumServer:
         self.worker_stats: dict[str, WorkerStats] = {}
         self.recent_share_keys: set[tuple[str, ...]] = set()
         self.last_stats_monotonic = time.monotonic()
+        self.last_successful_refresh_monotonic: float | None = None
+        self.refresh_fatal_error: str | None = None
 
     def next_connection_id(self) -> int:
         with self.lock:
@@ -673,6 +894,36 @@ class AuxPowStratumServer:
             and AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS > 0
             and now - job.created_at_monotonic >= AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS
         )
+
+    def parent_template_age_expired(self, job: AuxPowStratumJob | None) -> bool:
+        if job is None:
+            return False
+        try:
+            validate_bitcoin_parent_template(
+                job.btc_template,
+                max_age_seconds=AUXPOW_TEMPLATE_MAX_AGE_SECONDS,
+                max_future_seconds=AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS,
+            )
+        except RuntimeError:
+            return True
+        return False
+
+    def fresh_current_job(self) -> AuxPowStratumJob | None:
+        with self.lock:
+            current_job = self.current_job
+            if not self.parent_template_age_expired(current_job):
+                return current_job
+            self.current_job = None
+            self.jobs = {}
+        return None
+
+    def invalidate_expired_parent_work(self) -> bool:
+        with self.lock:
+            if not self.parent_template_age_expired(self.current_job):
+                return False
+            self.current_job = None
+            self.jobs = {}
+        return True
 
     def next_extranonce1_hex(self) -> str:
         with self.lock:
@@ -831,9 +1082,9 @@ class AuxPowStratumServer:
             if previous_difficulty != current_difficulty:
                 return
             client.pending_share_difficulty = next_difficulty
-            current_job = self.current_job
         if next_difficulty == previous_difficulty:
             return
+        current_job = self.fresh_current_job()
         try:
             if AUXPOW_STRATUM_VARDIFF_APPLY_MODE == "clean_job" and current_job is not None:
                 job = self.send_job_to_client(client, current_job, clean_jobs=True)
@@ -946,12 +1197,22 @@ class AuxPowStratumServer:
         )
 
     def serve(self) -> int:
+        initial_refresh_started = time.monotonic()
         while True:
             try:
                 self.refresh_job(force=True)
+                self.last_successful_refresh_monotonic = time.monotonic()
                 break
             except Exception as exc:
                 print(f"auxpow stratum: initial job refresh failed: {exc}", flush=True)
+                if (
+                    AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS > 0
+                    and time.monotonic() - initial_refresh_started
+                    >= AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS
+                ):
+                    raise RuntimeError(
+                        "auxpow stratum: initial job refresh failure budget exhausted"
+                    ) from exc
                 self.stop_event.wait(AUXPOW_STRATUM_POLL_SECONDS)
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1001,21 +1262,40 @@ class AuxPowStratumServer:
                 self.clients.clear()
             for client in clients:
                 client.close()
-        return 0
+        return 1 if self.refresh_fatal_error is not None else 0
 
     def refresh_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
                 refreshed = self.refresh_job(force=self.refresh_now.is_set())
+                self.last_successful_refresh_monotonic = time.monotonic()
                 if refreshed:
                     self.refresh_now.clear()
             except Exception as exc:
                 print(f"auxpow stratum: refresh failed: {exc}", flush=True)
+                last_success = self.last_successful_refresh_monotonic
+                if last_success is None:
+                    last_success = time.monotonic()
+                    self.last_successful_refresh_monotonic = last_success
+                failure_age = time.monotonic() - last_success
+                if (
+                    AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS > 0
+                    and failure_age >= AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS
+                ):
+                    self.refresh_fatal_error = (
+                        "job refresh failed for "
+                        f"{failure_age:.1f}s (budget="
+                        f"{AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS}s)"
+                    )
+                    print(f"auxpow stratum: fatal: {self.refresh_fatal_error}", flush=True)
+                    self.stop_event.set()
+                    return
             self.maybe_log_worker_stats()
             self.maybe_retarget_idle_clients()
             self.stop_event.wait(AUXPOW_STRATUM_POLL_SECONDS)
 
     def refresh_job(self, *, force: bool) -> bool:
+        parent_template_age_expired = self.invalidate_expired_parent_work()
         qbit_best = str(self.qbit_rpc.call("getbestblockhash"))
         bitcoin_best = str(self.bitcoin_rpc.call("getbestblockhash"))
         snapshot = (qbit_best, bitcoin_best)
@@ -1024,11 +1304,27 @@ class AuxPowStratumServer:
             current_job = self.current_job
             tip_snapshot = self.tip_snapshot
             job_age_expired = self.job_age_expired(current_job, now)
-        if not force and current_job is not None and snapshot == tip_snapshot and not job_age_expired:
+            if self.parent_template_age_expired(current_job):
+                self.current_job = None
+                self.jobs = {}
+                current_job = None
+                parent_template_age_expired = True
+        if (
+            not force
+            and current_job is not None
+            and snapshot == tip_snapshot
+            and not job_age_expired
+            and not parent_template_age_expired
+        ):
             return False
         aux_template = self.qbit_rpc.call("createauxblock", [self.qbit_miner_address])
         commitment_order = auxpow_commitment_order(aux_template)
         btc_template = self.bitcoin_rpc.call("getblocktemplate", [{"rules": ["segwit"]}])
+        validate_bitcoin_parent_template(
+            btc_template,
+            max_age_seconds=AUXPOW_TEMPLATE_MAX_AGE_SECONDS,
+            max_future_seconds=AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS,
+        )
         job = self.make_job(
             job_id=self.next_job_id(),
             aux_template=aux_template,
@@ -1042,13 +1338,20 @@ class AuxPowStratumServer:
                 self.jobs = {}
             else:
                 self.jobs = {job.job_id: job}
+        refresh_reason = self.refresh_reason(
+            force,
+            snapshot,
+            tip_snapshot,
+            job_age_expired,
+            parent_template_age_expired,
+        )
         print(
             "auxpow stratum: new job "
             f"{job.job_id} qbit_height={aux_template['height']} bitcoin_height={btc_template['height']} "
             f"share_diff={job.share_difficulty.normalize()} "
             f"commitment_order={commitment_order} "
             f"prevhash={job.prevhash} parent_prevhash={btc_template['previousblockhash']} "
-            f"reason={self.refresh_reason(force, snapshot, tip_snapshot, job_age_expired)}",
+            f"reason={refresh_reason}",
             flush=True,
         )
         self.log_event(
@@ -1083,6 +1386,7 @@ class AuxPowStratumServer:
         snapshot: tuple[str, str],
         tip_snapshot: tuple[str, str] | None,
         job_age_expired: bool,
+        parent_template_age_expired: bool,
     ) -> str:
         if force:
             return "forced"
@@ -1090,6 +1394,8 @@ class AuxPowStratumServer:
             return "initial"
         if snapshot != tip_snapshot:
             return "tip"
+        if parent_template_age_expired:
+            return "parent-template-age"
         if job_age_expired:
             return "age"
         return "unknown"
@@ -1346,16 +1652,18 @@ class AuxPowStratumServer:
             client.subscribed = True
             client.agent = str(params[0]) if params else ""
             self.send_result(client, request_id, [[], client.extranonce1_hex, AUXPOW_STRATUM_EXTRANONCE2_SIZE])
-            if client.authorized and self.current_job is not None:
-                self.send_job_to_client(client, self.current_job, clean_jobs=self.current_job.clean_jobs)
+            current_job = self.fresh_current_job()
+            if client.authorized and current_job is not None:
+                self.send_job_to_client(client, current_job, clean_jobs=current_job.clean_jobs)
             return
 
         if method == "mining.authorize":
             client.authorized = True
             client.username = str(params[0]) if params else ""
             self.send_result(client, request_id, True)
-            if client.subscribed and self.current_job is not None:
-                self.send_job_to_client(client, self.current_job, clean_jobs=self.current_job.clean_jobs)
+            current_job = self.fresh_current_job()
+            if client.subscribed and current_job is not None:
+                self.send_job_to_client(client, current_job, clean_jobs=current_job.clean_jobs)
             return
 
         if method == "mining.extranonce.subscribe":
@@ -1394,6 +1702,12 @@ class AuxPowStratumServer:
             raise StratumError(20, "version_bits required after version-rolling negotiation")
         with self.lock:
             job = self.jobs.get(job_id)
+            if job is not None and self.parent_template_age_expired(job):
+                self.jobs.pop(job_id, None)
+                if self.parent_template_age_expired(self.current_job):
+                    self.current_job = None
+                    self.jobs = {}
+                job = None
             if self.vardiff_config.enabled and job is not None and job_id not in client.active_job_ids:
                 job = None
         if job is None:
@@ -1752,8 +2066,16 @@ def main() -> int:
     )
     for rpc in (qbit_rpc, bitcoin_rpc):
         wait_for_rpc(rpc)
+    validate_auxpow_startup(qbit_rpc, bitcoin_rpc)
     qbit_miner_address = resolve_qbit_miner_address(qbit_rpc)
     bitcoin_miner_address = resolve_bitcoin_miner_address(bitcoin_rpc)
+    validate_auxpow_templates(
+        qbit_rpc,
+        bitcoin_rpc,
+        qbit_miner_address=qbit_miner_address,
+        max_age_seconds=AUXPOW_TEMPLATE_MAX_AGE_SECONDS,
+        max_future_seconds=AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS,
+    )
     print(f"auxpow: using qbit payout address {qbit_miner_address}", flush=True)
     print(f"auxpow: using Bitcoin payout address {bitcoin_miner_address.address}", flush=True)
     if AUXPOW_MODE == "bridge":
@@ -1774,10 +2096,16 @@ def main() -> int:
 
 
 DIFF1_TARGET = compact_target(0x1D00FFFF)
+QBIT_CHAIN = env("QBIT_CHAIN", "regtest")
+QBIT_EXPECTED_GENESIS_HASH = os.environ.get("QBIT_EXPECTED_GENESIS_HASH", "").strip()
 QBIT_MINER_ADDRESS = env("QBIT_MINER_ADDRESS", "auto")
 QBIT_MINER_WALLET_NAME = env("QBIT_MINER_WALLET_NAME", "auxpow")
+BITCOIN_CHAIN = env("BITCOIN_CHAIN", "regtest")
+BITCOIN_EXPECTED_GENESIS_HASH = os.environ.get("BITCOIN_EXPECTED_GENESIS_HASH", "").strip()
 BITCOIN_MINER_ADDRESS = env("BITCOIN_MINER_ADDRESS", "auto")
 BITCOIN_MINER_WALLET_NAME = env("BITCOIN_MINER_WALLET_NAME", "auxpow-parent")
+AUXPOW_TEMPLATE_MAX_AGE_SECONDS = env_nonnegative_int("AUXPOW_TEMPLATE_MAX_AGE_SECONDS", 120)
+AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS = env_nonnegative_int("AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS", 7200)
 AUXPOW_MODE = env("AUXPOW_MODE", "once")
 AUXPOW_BRIDGE_INTERVAL_SECONDS = env_int("AUXPOW_BRIDGE_INTERVAL_SECONDS", 15)
 AUXPOW_STRATUM_BIND = env("AUXPOW_STRATUM_BIND", "0.0.0.0")
@@ -1791,6 +2119,10 @@ AUXPOW_STRATUM_MIN_ADVERTISED_DIFF = env_nonnegative_decimal("AUXPOW_STRATUM_MIN
 AUXPOW_STRATUM_EXTRANONCE2_SIZE = env_int("AUXPOW_STRATUM_EXTRANONCE2_SIZE", 8)
 AUXPOW_STRATUM_POLL_SECONDS = env_int("AUXPOW_STRATUM_POLL_SECONDS", 5)
 AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS = env_nonnegative_int("AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS", 2700)
+AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS = env_nonnegative_int(
+    "AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS",
+    120,
+)
 AUXPOW_STRATUM_VERSION_MASK = env_mask("AUXPOW_STRATUM_VERSION_MASK", "1fffe000")
 AUXPOW_STRATUM_HEADER_VARIANT = env("AUXPOW_STRATUM_HEADER_VARIANT", "canonical")
 AUXPOW_STRATUM_DIAG_JSONL = env_bool("AUXPOW_STRATUM_DIAG_JSONL")

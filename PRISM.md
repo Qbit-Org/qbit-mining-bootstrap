@@ -236,6 +236,16 @@ only when both `job_issued_at <= anchor_job_issued_at` and
 `accepted_at <= anchor_job_issued_at`. That prevents a delayed old-job share
 from appearing after the found-block anchor and changing the published split.
 
+Before the ledger has accepted shares from `PRISM_MIN_READY_MINERS` distinct
+miners, jobs run in collection mode: the audit bundle's window is a single
+synthetic bootstrap share for the connecting worker, so its signed coinbase
+manifest pays that worker the whole reward. A block solved on a collection job
+is submitted like any other and settles solver-pays-all (counted by
+`qbit_prism_collection_block_submissions_total`); the shares collected
+meanwhile stay ledgered and enter the window of the next ready block. Once the
+pool crosses the readiness threshold, the template poller replaces outstanding
+collection jobs with windowed work on its next pass.
+
 ## Payout Policy
 
 PRISM separates three concepts that are easy to conflate:
@@ -528,9 +538,11 @@ Static self-checks validate a configured duration before attempting live
 checks, using the same positive signed-64-bit range and production-mainnet
 requirements as the qbitd wrapper.
 
-Stop services with normal Docker Compose controls or `make down`. The Makefile
-intentionally keeps PRISM Postgres volume cleanup out of broad all-profile
-cleanup because the ledger is operator state.
+Stop services with normal Docker Compose controls or `make down`. The normal
+target stops PRISM but preserves its Postgres and audit volumes because the
+ledger is operator state. The explicitly destructive
+`make purge-local-volumes` target is restricted to confirmed, non-production,
+non-main-chain cleanup.
 
 ## Run On Signet
 
@@ -571,10 +583,9 @@ PRISM_CTV_FANOUT_FEE_PREMIUM_BPS=12000
 
 Fee-rate selection:
 
-- Leave `PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT` empty to use
-  the node fee estimate path.
-- Set it explicitly when you want a fixed market-fee input for deterministic
-  policy.
+- Mainnet requires an explicit, reviewed, positive
+  `PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT`.
+- On non-mainnet networks, leaving it empty uses the node fee estimate path.
 
 Broadcaster:
 

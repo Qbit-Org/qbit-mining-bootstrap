@@ -73,8 +73,6 @@ export QBIT_MINER_ADDRESS_FILE QBIT_MINER_ADDRESS_FILE_WAIT
 export CKPOOL_NOTIFY CKPOOL_BTCSIG CKPOOL_BLOCKPOLL CKPOOL_DONATION
 export CKPOOL_NONCE1LENGTH CKPOOL_NONCE2LENGTH CKPOOL_UPDATE_INTERVAL
 
-mkdir -p "$(dirname "${CKPOOL_CONFIG_FILE}")" "${CKPOOL_LOG_DIR}" "${CKPOOL_SOCK_DIR}" "${CKPOOL_STATE_DIR}"
-
 json_string() {
   python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"
 }
@@ -253,6 +251,10 @@ if [[ -n "${CKPOOL_MAXDIFF:-}" ]]; then
 fi
 
 if [[ "${SUPERVISED_CHILD}" == "0" ]]; then
+  # Reject implicit production payouts and invalid static policy before wallet,
+  # state, or configuration creation can hide how values were supplied.
+  qbit-ckpool-preflight --production-gate-only
+
   CKPOOL_VERSION_MASK="$(ckpool-version-mask)"
   export CKPOOL_VERSION_MASK
 
@@ -267,11 +269,11 @@ if [[ "${SUPERVISED_CHILD}" == "0" ]]; then
   fi
   QBIT_MINER_ADDRESS="$(resolve_miner_address)"
   export QBIT_MINER_ADDRESS
-  qbit-ckpool-preflight --production-gate-only
   exec qbit-ckpool-preflight --supervise /bin/bash "$0" --supervised-child
 fi
 
 : "${QBIT_MINER_ADDRESS:?QBIT_MINER_ADDRESS is required in supervised child}"
+mkdir -p "$(dirname "${CKPOOL_CONFIG_FILE}")" "${CKPOOL_LOG_DIR}" "${CKPOOL_SOCK_DIR}" "${CKPOOL_STATE_DIR}"
 mkdir -p "$(dirname "${QBIT_MINER_ADDRESS_FILE}")"
 printf '%s\n' "${QBIT_MINER_ADDRESS}" > "${QBIT_MINER_ADDRESS_FILE}"
 
