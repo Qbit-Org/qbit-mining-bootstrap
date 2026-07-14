@@ -394,6 +394,19 @@ class QbitCkpoolPreflightTests(unittest.TestCase):
                 FakeRpc(rpc_chain="testnet4"),
             )
 
+    def test_non_mainnet_chains_cannot_disable_readiness_gate(self) -> None:
+        for chain in ("regtest", "testnet4", "signet"):
+            with self.subTest(chain=chain), self.assertRaisesRegex(
+                preflight.PreflightError,
+                "explicitly authorized mainnet prelaunch",
+            ):
+                preflight.run_static_preflight(
+                    base_env(
+                        QBIT_CHAIN=chain,
+                        CKPOOL_NON_TEST_READINESS_GATE="0",
+                    )
+                )
+
     def test_malformed_readiness_and_production_flags_fail(self) -> None:
         cases = {
             "CKPOOL_NON_TEST_READINESS_GATE": "sometimes",
@@ -671,6 +684,48 @@ class QbitCkpoolSupervisorTests(unittest.TestCase):
                 )
 
         popen.assert_not_called()
+
+    def test_unexpected_supervisor_error_terminates_and_reaps_child(self) -> None:
+        class WaitCrashChild:
+            pid = 123
+
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.signals: list[int] = []
+                self.wait_calls = 0
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def send_signal(self, signum: int) -> None:
+                self.signals.append(signum)
+                self.returncode = -signum
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise RuntimeError("unexpected wait failure")
+                assert self.returncode is not None
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -signal.SIGKILL
+
+        child = WaitCrashChild()
+        with (
+            mock.patch.object(preflight.subprocess, "Popen", return_value=child),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(RuntimeError, "unexpected wait failure"),
+        ):
+            preflight.run_supervisor(
+                self.supervisor_env(),
+                FakeRpc(),
+                ["ckpool"],
+            )
+
+        self.assertEqual(child.signals, [signal.SIGTERM])
+        self.assertEqual(child.returncode, -signal.SIGTERM)
+        self.assertEqual(child.wait_calls, 2)
 
     def test_strict_watchdog_enforces_ibd_peers_genesis_and_live_template(self) -> None:
         strict_env = mainnet_production_env(

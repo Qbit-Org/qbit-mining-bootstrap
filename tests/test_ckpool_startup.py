@@ -276,6 +276,19 @@ class CkpoolStartupTests(unittest.TestCase):
         self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0", result.stderr)
         self.assertFalse(config_file.exists())
 
+    def test_rpc_preflight_failure_happens_before_state_or_config_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+            "--initialblockdownload",
+            "--reject-gbt-during-ibd",
+        ) as rpc:
+            tmpdir = Path(tmp)
+            result, config_file = self.run_start_ckpool_raw(tmpdir, rpc)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("getblocktemplate failed: RPC -10", result.stderr)
+            self.assertFalse(config_file.exists())
+            self.assertFalse((tmpdir / "state" / "miner-address.txt").exists())
+
     def test_public_chain_missing_explicit_diff_fails_before_config_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FakeRpcServer() as rpc:
             result, config_file = self.run_start_ckpool_raw(

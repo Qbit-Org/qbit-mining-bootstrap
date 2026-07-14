@@ -207,8 +207,6 @@ def validate_mainnet_readiness_flags(env: dict[str, str]) -> None:
     launch_checks = mainnet_launch_readiness_checks(env)
     readiness_gate = bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE", True)
 
-    if chain != "mainnet":
-        return
     if not readiness_gate and not authorized_mainnet_prelaunch(env):
         raise PreflightError(
             "CKPOOL_NON_TEST_READINESS_GATE=0 requires the explicitly authorized "
@@ -216,6 +214,8 @@ def validate_mainnet_readiness_flags(env: dict[str, str]) -> None:
             "QBIT_TOOLS_PRODUCTION=1, and "
             "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
         )
+    if chain != "mainnet":
+        return
     if launch_checks is False and readiness_gate:
         raise PreflightError(
             "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0 requires "
@@ -803,8 +803,12 @@ def run_supervisor(env: dict[str, str], rpc: RpcClient, command: list[str]) -> i
             except subprocess.TimeoutExpired:
                 pass
     finally:
-        for signum, handler in old_handlers.items():
-            signal.signal(signum, handler)
+        try:
+            if child.poll() is None:
+                terminate_and_reap(child, signal.SIGTERM)
+        finally:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
 
 
 def build_parser() -> argparse.ArgumentParser:
