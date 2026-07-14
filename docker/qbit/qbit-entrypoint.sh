@@ -57,10 +57,28 @@ validate_mainnet_qbitd_args() {
   done
 }
 
+reject_caller_tip_age_args() {
+  local arg
+  local normalized
+
+  for arg in "$@"; do
+    normalized="$(printf '%s' "${arg}" | tr '[:upper:]' '[:lower:]')"
+    case "${normalized}" in
+      -maxtipage|-maxtipage=*|--maxtipage|--maxtipage=*)
+        fail "caller-provided ${arg} is not allowed; use QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS for an explicitly authorized mainnet prelaunch"
+        ;;
+    esac
+  done
+}
+
 configure_prelaunch_tip_age() {
   local production_value="${QBIT_PRODUCTION:-0}"
+  local tools_production_value="${QBIT_TOOLS_PRODUCTION:-0}"
+  local readiness_gate_value="${CKPOOL_NON_TEST_READINESS_GATE:-1}"
   local launch_value="${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}"
   local production_enabled
+  local tools_production_enabled
+  local readiness_gate_enabled
   local launch_checks_enabled=1
   local duration_name="QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"
   local duration
@@ -71,6 +89,10 @@ configure_prelaunch_tip_age() {
     parse_bool QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED "${launch_value}"
     launch_checks_enabled="${PARSED_BOOL}"
   fi
+  parse_bool QBIT_TOOLS_PRODUCTION "${tools_production_value}"
+  tools_production_enabled="${PARSED_BOOL}"
+  parse_bool CKPOOL_NON_TEST_READINESS_GATE "${readiness_gate_value}"
+  readiness_gate_enabled="${PARSED_BOOL}"
 
   if [[ "${QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS+x}" != "x" ]]; then
     return
@@ -84,11 +106,16 @@ configure_prelaunch_tip_age() {
     fail "${duration_name} is valid only with QBIT_CHAIN=mainnet"
 
   if [[ "${launch_checks_enabled}" == "0" ]]; then
+    [[ "${tools_production_enabled}" == "1" ]] ||
+      fail "${duration_name} requires QBIT_TOOLS_PRODUCTION=1"
+    [[ "${readiness_gate_enabled}" == "0" ]] ||
+      fail "${duration_name} requires CKPOOL_NON_TEST_READINESS_GATE=0"
     validate_mainnet_qbitd_args "$@"
     PRELAUNCH_TIP_AGE_ARG="-maxtipage=${duration}"
   fi
 }
 
+reject_caller_tip_age_args "$@"
 configure_prelaunch_tip_age "$@"
 
 if [[ "${1:-}" == "--validate-only" ]]; then

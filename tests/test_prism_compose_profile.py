@@ -108,7 +108,9 @@ class PrismComposeProfileTests(unittest.TestCase):
         env = self.config["services"]["qbitd"]["environment"]
 
         self.assertEqual(env["QBIT_PRODUCTION"], "0")
+        self.assertEqual(env["QBIT_TOOLS_PRODUCTION"], "0")
         self.assertEqual(env["QBIT_CHAIN"], "regtest")
+        self.assertEqual(env["CKPOOL_NON_TEST_READINESS_GATE"], "1")
         self.assertEqual(env["QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"], "")
         self.assertIsNone(env["QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"])
 

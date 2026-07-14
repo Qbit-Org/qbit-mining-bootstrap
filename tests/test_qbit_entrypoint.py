@@ -16,7 +16,9 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT_DIR / "docker" / "qbit" / "qbit-entrypoint.sh"
 RELEVANT_ENV = (
     "QBIT_PRODUCTION",
+    "QBIT_TOOLS_PRODUCTION",
     "QBIT_CHAIN",
+    "CKPOOL_NON_TEST_READINESS_GATE",
     "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED",
     "QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS",
 )
@@ -91,7 +93,9 @@ sys.exit(int(os.environ.get("FAKE_QBITD_EXIT_CODE", "0")))
     def prelaunch_environment(self, duration: str = "456789") -> dict[str, str]:
         return self.environment(
             QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
             QBIT_CHAIN="mainnet",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
             QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
             QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS=duration,
         )
@@ -129,6 +133,45 @@ sys.exit(int(os.environ.get("FAKE_QBITD_EXIT_CODE", "0")))
                 self.assertFalse(self.argv_path.exists(), "qbitd started on a test chain")
                 self.assertIn("selects a test chain", result.stderr)
 
+    def test_strict_launch_rejects_caller_tip_age_argument(self) -> None:
+        env = self.prelaunch_environment()
+        env["CKPOOL_NON_TEST_READINESS_GATE"] = "1"
+        env["QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"] = "1"
+
+        result = self.run_entrypoint(
+            "-chain=main",
+            "-maxtipage=9223372036854775807",
+            env=env,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.argv_path.exists())
+        self.assertIn("caller-provided -maxtipage", result.stderr)
+
+    def test_absent_duration_rejects_caller_tip_age_argument(self) -> None:
+        result = self.run_entrypoint("-maxtipage", "123")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.argv_path.exists())
+        self.assertIn("caller-provided -maxtipage", result.stderr)
+
+    def test_rejects_double_dash_caller_tip_age_argument(self) -> None:
+        result = self.run_entrypoint("--maxtipage=123")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.argv_path.exists())
+        self.assertIn("caller-provided --maxtipage=123", result.stderr)
+
+    def test_prelaunch_rejects_caller_tip_age_before_managed_duplicate(self) -> None:
+        result = self.run_entrypoint(
+            "-maxtipage=123",
+            env=self.prelaunch_environment("456"),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.argv_path.exists())
+        self.assertIn("caller-provided -maxtipage=123", result.stderr)
+
     def test_existing_arguments_remain_separate_and_byte_exact(self) -> None:
         original_args = ["-printtoconsole", "-listen=1", "-server=1", "-uacomment=two words"]
 
@@ -139,6 +182,7 @@ sys.exit(int(os.environ.get("FAKE_QBITD_EXIT_CODE", "0")))
 
     def test_launched_mode_does_not_append_tip_age_argument(self) -> None:
         env = self.prelaunch_environment()
+        env["CKPOOL_NON_TEST_READINESS_GATE"] = "1"
         env["QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"] = "1"
 
         result = self.run_entrypoint("-listen=1", env=env)
@@ -153,16 +197,28 @@ sys.exit(int(os.environ.get("FAKE_QBITD_EXIT_CODE", "0")))
         self.assertEqual(self.captured_argv(), ["-listen=1", "-maxtipage=987654"])
 
         self.argv_path.unlink()
+        env["CKPOOL_NON_TEST_READINESS_GATE"] = "1"
         env["QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"] = "1"
         launched = self.run_entrypoint("-listen=1", env=env)
 
         self.assertEqual(launched.returncode, 0, launched.stderr)
         self.assertEqual(self.captured_argv(), ["-listen=1"])
 
+    def test_missing_launch_flag_does_not_append_tip_age_argument(self) -> None:
+        env = self.prelaunch_environment()
+        env.pop("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED")
+
+        result = self.run_entrypoint("-listen=1", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.captured_argv(), ["-listen=1"])
+
     def test_absent_duration_preserves_legacy_arguments(self) -> None:
         env = self.environment(
             QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
             QBIT_CHAIN="mainnet",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
             QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
         )
 
@@ -191,22 +247,32 @@ sys.exit(int(os.environ.get("FAKE_QBITD_EXIT_CODE", "0")))
                 self.assertFalse(self.argv_path.exists(), "qbitd started with invalid configuration")
                 self.assertIn("QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS", result.stderr)
 
-    def test_incompatible_chain_or_production_mode_fails(self) -> None:
+    def test_prelaunch_tip_age_requires_complete_authorization_tuple(self) -> None:
         cases = (
-            {"QBIT_PRODUCTION": "0", "QBIT_CHAIN": "mainnet"},
-            {"QBIT_PRODUCTION": "1", "QBIT_CHAIN": "signet"},
+            ("QBIT_PRODUCTION missing", "QBIT_PRODUCTION", None),
+            ("QBIT_PRODUCTION disabled", "QBIT_PRODUCTION", "0"),
+            ("QBIT_TOOLS_PRODUCTION missing", "QBIT_TOOLS_PRODUCTION", None),
+            ("QBIT_TOOLS_PRODUCTION disabled", "QBIT_TOOLS_PRODUCTION", "0"),
+            ("QBIT_CHAIN missing", "QBIT_CHAIN", None),
+            ("QBIT_CHAIN incorrect", "QBIT_CHAIN", "signet"),
+            ("CKPOOL_NON_TEST_READINESS_GATE missing", "CKPOOL_NON_TEST_READINESS_GATE", None),
+            ("CKPOOL_NON_TEST_READINESS_GATE enabled", "CKPOOL_NON_TEST_READINESS_GATE", "1"),
         )
-        for overrides in cases:
-            with self.subTest(overrides=overrides):
+        for label, name, value in cases:
+            with self.subTest(case=label):
                 if self.argv_path.exists():
                     self.argv_path.unlink()
                 env = self.prelaunch_environment()
-                env.update(overrides)
+                if value is None:
+                    env.pop(name)
+                else:
+                    env[name] = value
 
                 result = self.run_entrypoint("-listen=1", env=env)
 
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.argv_path.exists(), "qbitd started with incompatible configuration")
+                self.assertIn(name, result.stderr)
 
     def test_malformed_launch_flag_fails_before_qbitd_starts(self) -> None:
         env = self.prelaunch_environment()

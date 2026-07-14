@@ -226,11 +226,14 @@ mining job. For that bootstrap case only, set
 `QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS` to a positive number of seconds
 explicitly reviewed against the genesis age and planned launch window. The
 qbitd startup wrapper adds `-maxtipage=<seconds>` only when
-`QBIT_PRODUCTION=1`, `QBIT_CHAIN=mainnet`, and
+`QBIT_PRODUCTION=1`, `QBIT_TOOLS_PRODUCTION=1`, `QBIT_CHAIN=mainnet`,
+`CKPOOL_NON_TEST_READINESS_GATE=0`, and
 `QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0`; existing arguments such as
 `QBIT_NODE_EXTRA_ARG=-listen=1` remain separate and unchanged. Flipping only
 the launch flag to `1` and restarting removes the generated argument even if
 the duration remains configured, returning qbitd to its normal tip-age policy.
+Caller-provided `-maxtipage` and `--maxtipage` daemon arguments are rejected in
+every mode so this managed control cannot be retained or duplicated at launch.
 This is a temporary first-block bootstrap control, not a permanent production
 setting; leave it unset when no reviewed override is required.
 

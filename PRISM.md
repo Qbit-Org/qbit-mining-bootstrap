@@ -529,11 +529,13 @@ malformed values fail the self-check rather than authorizing prelaunch.
 When a stale genesis is itself keeping qbitd in IBD and preventing the first
 template, an operator may also set the reviewed, positive
 `QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS` duration. The qbitd wrapper turns
-that value into one `-maxtipage=<seconds>` argument only for production mainnet
-with launch readiness explicitly disabled. Review it against genesis age and
-the planned launch window. After the first-block bootstrap, set the launch flag
-to `1` and restart; the wrapper then omits the argument and restores qbitd's
-normal tip-age policy even if the duration remains in the environment.
+that value into one `-maxtipage=<seconds>` argument only when the complete
+five-value mainnet prelaunch authorization above is present. Review it against
+genesis age and the planned launch window. After the first-block bootstrap, set
+the launch flag to `1` and restart; the wrapper then omits the argument and
+restores qbitd's normal tip-age policy even if the duration remains in the
+environment. Caller-provided `-maxtipage` and `--maxtipage` daemon arguments
+are rejected in every mode.
 Static self-checks validate a configured duration before attempting live
 checks, using the same positive signed-64-bit range and production-mainnet
 requirements as the qbitd wrapper.
