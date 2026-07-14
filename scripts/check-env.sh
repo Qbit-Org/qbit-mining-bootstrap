@@ -301,24 +301,13 @@ parse_bool_env() {
   local value="${2:-}"
   local normalized
 
-  normalized="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
+  normalized="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 
   case "${normalized}" in
     1|true|yes|on) PARSED_BOOL_ENV=1 ;;
     0|false|no|off) PARSED_BOOL_ENV=0 ;;
     *) fail "${name} must be a true/false style value, got '${value}'" ;;
   esac
-}
-
-production_mode_enabled() {
-  local qbit_production
-  local qbit_tools_production
-
-  parse_bool_env QBIT_PRODUCTION "${QBIT_PRODUCTION:-0}"
-  qbit_production="${PARSED_BOOL_ENV}"
-  parse_bool_env QBIT_TOOLS_PRODUCTION "${QBIT_TOOLS_PRODUCTION:-0}"
-  qbit_tools_production="${PARSED_BOOL_ENV}"
-  [[ "${qbit_production}" == "1" || "${qbit_tools_production}" == "1" ]]
 }
 
 is_public_qbit_chain() {
@@ -331,11 +320,13 @@ is_public_qbit_chain() {
 check_production_gate() {
   local readiness_gate
   local launch_readiness_checks="unset"
+  local qbit_production
+  local qbit_tools_production
 
-  production_mode_enabled || return 0
-
-  [[ "${QBIT_CHAIN:-regtest}" != "regtest" ]] || fail "QBIT_PRODUCTION=1 rejects regtest QBIT_CHAIN"
-
+  parse_bool_env QBIT_PRODUCTION "${QBIT_PRODUCTION:-0}"
+  qbit_production="${PARSED_BOOL_ENV}"
+  parse_bool_env QBIT_TOOLS_PRODUCTION "${QBIT_TOOLS_PRODUCTION:-0}"
+  qbit_tools_production="${PARSED_BOOL_ENV}"
   parse_bool_env CKPOOL_NON_TEST_READINESS_GATE "${CKPOOL_NON_TEST_READINESS_GATE:-1}"
   readiness_gate="${PARSED_BOOL_ENV}"
   if [[ -n "${QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED:-}" ]]; then
@@ -357,10 +348,20 @@ check_production_gate() {
   [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "permissive" ]] || fail "QBIT_PRODUCTION=1 rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive"
   [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "allow-defaults" ]] || fail "QBIT_PRODUCTION=1 rejects CKPOOL_PUBLIC_DIFF_POLICY=allow-defaults"
   [[ "${CKPOOL_PUBLIC_DIFF_POLICY:-explicit}" != "defaults" ]] || fail "QBIT_PRODUCTION=1 rejects CKPOOL_PUBLIC_DIFF_POLICY=defaults"
-  if [[ "${readiness_gate}" == "0" ]]; then
-    [[ "${QBIT_CHAIN:-regtest}" == "mainnet" && "${launch_readiness_checks}" == "0" ]] || \
-      fail "QBIT_PRODUCTION=1 permits CKPOOL_NON_TEST_READINESS_GATE=0 only when QBIT_CHAIN=mainnet and QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
+  if [[ "${readiness_gate}" == "0" || "${launch_readiness_checks}" == "0" ]]; then
+    [[ "${QBIT_CHAIN:-regtest}" == "mainnet" && \
+      "${qbit_production}" == "1" && \
+      "${qbit_tools_production}" == "1" && \
+      "${readiness_gate}" == "0" && \
+      "${launch_readiness_checks}" == "0" ]] || \
+      fail "mainnet prelaunch requires QBIT_PRODUCTION=1, QBIT_TOOLS_PRODUCTION=1, CKPOOL_NON_TEST_READINESS_GATE=0, and QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0"
   fi
+
+  if [[ "${qbit_production}" != "1" && "${qbit_tools_production}" != "1" ]]; then
+    return 0
+  fi
+
+  [[ "${QBIT_CHAIN:-regtest}" != "regtest" ]] || fail "QBIT_PRODUCTION=1 rejects regtest QBIT_CHAIN"
   [[ "${CKPOOL_VALIDATE_QBIT_ASSUMPTIONS:-1}" != "0" ]] || fail "QBIT_PRODUCTION=1 rejects CKPOOL_VALIDATE_QBIT_ASSUMPTIONS=0"
   if is_public_qbit_chain "${QBIT_CHAIN:-regtest}"; then
     [[ "${CKPOOL_REQUIRE_P2MR_PAYOUT:-1}" != "0" ]] || fail "QBIT_PRODUCTION=1 rejects public-chain CKPOOL_REQUIRE_P2MR_PAYOUT=0"

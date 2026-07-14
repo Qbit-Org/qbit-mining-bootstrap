@@ -14,7 +14,7 @@ parse_bool() {
   local value="$2"
   local normalized
 
-  normalized="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
+  normalized="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   case "${normalized}" in
     1|true|yes|on) PARSED_BOOL=1 ;;
     0|false|no|off) PARSED_BOOL=0 ;;
@@ -39,6 +39,22 @@ validate_positive_int64() {
     { [[ "${#normalized}" -eq "${#MAX_SIGNED_INT64}" ]] && [[ "${normalized}" > "${MAX_SIGNED_INT64}" ]]; }; then
     fail "${name} exceeds qbitd's signed 64-bit integer range"
   fi
+}
+
+validate_mainnet_qbitd_args() {
+  local arg
+  local normalized
+
+  for arg in "$@"; do
+    normalized="$(printf '%s' "${arg}" | tr '[:upper:]' '[:lower:]')"
+    case "${normalized}" in
+      -regtest=0|-regtest=false|-signet=0|-signet=false|-testnet=0|-testnet=false|-testnet3=0|-testnet3=false|-testnet4=0|-testnet4=false)
+        ;;
+      -regtest|-regtest=*|-signet|-signet=*|-testnet|-testnet=*|-testnet3|-testnet3=*|-testnet4|-testnet4=*|-chain=regtest|-chain=signet|-chain=testnet|-chain=testnet3|-chain=testnet4)
+        fail "QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS cannot be used when qbitd selects a test chain with ${arg}"
+        ;;
+    esac
+  done
 }
 
 configure_prelaunch_tip_age() {
@@ -68,11 +84,12 @@ configure_prelaunch_tip_age() {
     fail "${duration_name} is valid only with QBIT_CHAIN=mainnet"
 
   if [[ "${launch_checks_enabled}" == "0" ]]; then
+    validate_mainnet_qbitd_args "$@"
     PRELAUNCH_TIP_AGE_ARG="-maxtipage=${duration}"
   fi
 }
 
-configure_prelaunch_tip_age
+configure_prelaunch_tip_age "$@"
 
 if [[ "${1:-}" == "--validate-only" ]]; then
   exit 0

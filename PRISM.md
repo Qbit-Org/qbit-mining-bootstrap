@@ -501,16 +501,18 @@ Static-only checks, before the stack is live:
 python3 scripts/prism-self-check.py --skip-live
 ```
 
-For an explicitly authorized mainnet prelaunch,
-`QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0` changes only three expected
+For an explicitly authorized mainnet prelaunch, set the five-value combination
+shown in the mainnet prelaunch section above. Only then does
+`QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0` change three expected
 launch-dependent conditions from FAIL to WARN: qbitd still being in IBD, the
 high-diff listener not yet advertising its first `mining.set_difficulty`, and
-the coordinator having fewer than `PRISM_MIN_READY_MINERS` ready miners. Chain
-identity (including the normal `QBIT_CHAIN=mainnet` / RPC `chain=main` naming),
-secrets, Postgres, fee policy, listener reachability, and every other check
-remain active and fatal. Set the flag to `1` at launch to make all three strict
-again. An unset flag keeps the legacy strict behavior; malformed values fail
-the self-check rather than authorizing prelaunch.
+the coordinator having fewer than `PRISM_MIN_READY_MINERS` ready miners. An
+incomplete combination fails the static self-check and keeps live checks
+strict. Chain identity (including the normal `QBIT_CHAIN=mainnet` / RPC
+`chain=main` naming), secrets, Postgres, fee policy, listener reachability, and
+every other check remain active and fatal. Set the flag to `1` at launch to make
+all three strict again. An unset flag keeps the legacy strict behavior;
+malformed values fail the self-check rather than authorizing prelaunch.
 
 When a stale genesis is itself keeping qbitd in IBD and preventing the first
 template, an operator may also set the reviewed, positive
@@ -520,6 +522,9 @@ with launch readiness explicitly disabled. Review it against genesis age and
 the planned launch window. After the first-block bootstrap, set the launch flag
 to `1` and restart; the wrapper then omits the argument and restores qbitd's
 normal tip-age policy even if the duration remains in the environment.
+Static self-checks validate a configured duration before attempting live
+checks, using the same positive signed-64-bit range and production-mainnet
+requirements as the qbitd wrapper.
 
 Stop services with normal Docker Compose controls or `make down`. The Makefile
 intentionally keeps PRISM Postgres volume cleanup out of broad all-profile

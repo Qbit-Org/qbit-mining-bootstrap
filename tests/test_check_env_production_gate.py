@@ -44,16 +44,44 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertIn("QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0", result.stderr)
         self.assertNotIn("docker is required", result.stderr)
 
-    def test_production_mainnet_prelaunch_accepts_explicit_authorization(self) -> None:
+    def test_nonproduction_mainnet_cannot_enable_prelaunch(self) -> None:
         result = self.run_check_env(
-            QBIT_PRODUCTION="1",
+            QBIT_PRODUCTION="0",
+            QBIT_TOOLS_PRODUCTION="0",
             QBIT_CHAIN="mainnet",
             CKPOOL_NON_TEST_READINESS_GATE="0",
             QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("permits CKPOOL_NON_TEST_READINESS_GATE=0", result.stderr)
+        self.assertIn("mainnet prelaunch requires QBIT_PRODUCTION=1", result.stderr)
+        self.assertNotIn("docker is required", result.stderr)
+
+    def test_production_mainnet_prelaunch_accepts_explicit_authorization(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("mainnet prelaunch requires", result.stderr)
+        self.assertIn("requires a non-default PRISM_POSTGRES_PASSWORD", result.stderr)
+
+    def test_production_mainnet_prelaunch_accepts_whitespace_around_launch_flag(self) -> None:
+        result = self.run_check_env(
+            QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
+            QBIT_CHAIN="mainnet",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
+            QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=" 0\t",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("true/false style value", result.stderr)
+        self.assertNotIn("mainnet prelaunch requires", result.stderr)
         self.assertIn("requires a non-default PRISM_POSTGRES_PASSWORD", result.stderr)
 
     def test_production_mainnet_launch_rejects_disabled_readiness(self) -> None:
@@ -87,7 +115,9 @@ class CheckEnvProductionGateTests(unittest.TestCase):
     def test_mainnet_prelaunch_accepts_valid_reviewed_tip_age(self) -> None:
         result = self.run_check_env(
             QBIT_PRODUCTION="1",
+            QBIT_TOOLS_PRODUCTION="1",
             QBIT_CHAIN="mainnet",
+            CKPOOL_NON_TEST_READINESS_GATE="0",
             QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
             QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS="456789",
         )
@@ -101,7 +131,9 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             with self.subTest(value=value):
                 result = self.run_check_env(
                     QBIT_PRODUCTION="1",
+                    QBIT_TOOLS_PRODUCTION="1",
                     QBIT_CHAIN="mainnet",
+                    CKPOOL_NON_TEST_READINESS_GATE="0",
                     QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED="0",
                     QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS=value,
                 )

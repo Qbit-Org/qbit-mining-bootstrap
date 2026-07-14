@@ -25,6 +25,21 @@ def load_self_check_module() -> ModuleType:
     return module
 
 
+def authorize_mainnet_prelaunch(env: dict[str, str]) -> dict[str, str]:
+    env.update(
+        {
+            "QBIT_CHAIN": "mainnet",
+            "QBIT_CHAIN_FLAG": "",
+            "QBIT_PRODUCTION": "1",
+            "QBIT_TOOLS_PRODUCTION": "1",
+            "CKPOOL_NON_TEST_READINESS_GATE": "0",
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
+            "PRISM_POSTGRES_PASSWORD": "not-default",
+        }
+    )
+    return env
+
+
 class PrismSelfCheckTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -105,6 +120,92 @@ class PrismSelfCheckTests(unittest.TestCase):
             ("FAIL", "env.QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"),
             {(row.status, row.name) for row in reporter.rows},
         )
+
+    def test_static_checks_require_full_prelaunch_authorization(self) -> None:
+        cases = (
+            ("QBIT_PRODUCTION", "0"),
+            ("QBIT_TOOLS_PRODUCTION", "0"),
+            ("CKPOOL_NON_TEST_READINESS_GATE", "1"),
+        )
+        for name, value in cases:
+            with self.subTest(name=name):
+                env = authorize_mainnet_prelaunch(self.valid_env())
+                env[name] = value
+                reporter = self.self_check.Reporter()
+
+                self.self_check.static_checks(env, reporter)
+
+                self.assertIn(
+                    ("FAIL", "launch.readiness"),
+                    {(row.status, row.name) for row in reporter.rows},
+                )
+                launch_failure = next(
+                    row for row in reporter.rows if row.name == "launch.readiness"
+                )
+                self.assertIn("requires QBIT_CHAIN=mainnet", launch_failure.detail)
+
+    def test_whitespace_around_launch_flag_preserves_prelaunch_authorization(self) -> None:
+        env = authorize_mainnet_prelaunch(self.valid_env())
+        env["QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"] = " 0\t"
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        self.assertFalse(reporter.failed)
+        self.assertIn(
+            ("WARN", "launch.readiness"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
+    def test_static_checks_validate_prelaunch_tip_age(self) -> None:
+        env = authorize_mainnet_prelaunch(self.valid_env())
+        env["QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"] = "000456789"
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        self.assertFalse(reporter.failed)
+        rows = [
+            row
+            for row in reporter.rows
+            if row.name == "env.QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"
+        ]
+        self.assertEqual([row.status for row in rows], ["PASS"])
+        self.assertIn("456789 seconds", rows[0].detail)
+
+    def test_static_checks_reject_invalid_prelaunch_tip_age(self) -> None:
+        invalid_values = ("", "0", "-1", "1;echo injected", "9223372036854775808")
+        for value in invalid_values:
+            with self.subTest(value=value):
+                env = authorize_mainnet_prelaunch(self.valid_env())
+                env["QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"] = value
+                reporter = self.self_check.Reporter()
+
+                self.self_check.static_checks(env, reporter)
+
+                self.assertIn(
+                    ("FAIL", "env.QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"),
+                    {(row.status, row.name) for row in reporter.rows},
+                )
+
+    def test_static_checks_reject_tip_age_for_incompatible_mode(self) -> None:
+        cases = (
+            {"QBIT_PRODUCTION": "0", "QBIT_CHAIN": "mainnet", "QBIT_CHAIN_FLAG": ""},
+            {"QBIT_PRODUCTION": "1", "QBIT_CHAIN": "signet", "QBIT_CHAIN_FLAG": "-signet"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                env = self.valid_env()
+                env.update(overrides)
+                env["QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"] = "456789"
+                reporter = self.self_check.Reporter()
+
+                self.self_check.static_checks(env, reporter)
+
+                self.assertIn(
+                    ("FAIL", "env.QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"),
+                    {(row.status, row.name) for row in reporter.rows},
+                )
 
     def test_static_checks_accept_valid_prism_operator_env(self) -> None:
         reporter = self.self_check.Reporter()
@@ -212,6 +313,18 @@ class PrismSelfCheckTests(unittest.TestCase):
         )
 
     def test_ready_miner_threshold_is_nonfatal_during_mainnet_prelaunch(self) -> None:
+        env = authorize_mainnet_prelaunch(self.valid_env())
+        env["PRISM_MIN_READY_MINERS"] = "1"
+        reporter = self.self_check.Reporter()
+
+        self.self_check.check_ready_miner_threshold({"ready_miner_count": 0}, env, reporter)
+
+        self.assertFalse(reporter.failed)
+        rows = [row for row in reporter.rows if row.name == "coordinator.ready_miners"]
+        self.assertEqual([row.status for row in rows], ["WARN"])
+        self.assertIn("tolerated only", rows[0].detail)
+
+    def test_ready_miner_threshold_stays_fatal_without_full_prelaunch_authorization(self) -> None:
         env = self.valid_env()
         env.update(
             {
@@ -224,10 +337,10 @@ class PrismSelfCheckTests(unittest.TestCase):
 
         self.self_check.check_ready_miner_threshold({"ready_miner_count": 0}, env, reporter)
 
-        self.assertFalse(reporter.failed)
-        rows = [row for row in reporter.rows if row.name == "coordinator.ready_miners"]
-        self.assertEqual([row.status for row in rows], ["WARN"])
-        self.assertIn("tolerated only", rows[0].detail)
+        self.assertIn(
+            ("FAIL", "coordinator.ready_miners"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
 
     def test_ready_miner_threshold_is_fatal_after_mainnet_launch(self) -> None:
         env = self.valid_env()
@@ -309,10 +422,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 return {"connections": 1}
             raise AssertionError(method)
 
-        env = {
-            "QBIT_CHAIN": "mainnet",
-            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
-        }
+        env = authorize_mainnet_prelaunch({})
         with patch.object(self.self_check, "qbit_rpc_call", fake_qbit_rpc_call):
             self.self_check.qbit_live_checks(env, reporter)
 
@@ -332,10 +442,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 return {"connections": 1}
             raise AssertionError(method)
 
-        env = {
-            "QBIT_CHAIN": "mainnet",
-            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
-        }
+        env = authorize_mainnet_prelaunch({})
         with patch.object(self.self_check, "qbit_rpc_call", fake_qbit_rpc_call):
             self.self_check.qbit_live_checks(env, reporter)
 
@@ -397,10 +504,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 return {"connections": 0}
             raise AssertionError(method)
 
-        env = {
-            "QBIT_CHAIN": "mainnet",
-            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
-        }
+        env = authorize_mainnet_prelaunch({})
         with patch.object(self.self_check, "qbit_rpc_call", fake_qbit_rpc_call):
             self.self_check.qbit_live_checks(env, reporter)
 
@@ -516,13 +620,7 @@ class HighdiffFloorProbeTests(unittest.TestCase):
 
     def test_missing_difficulty_is_nonfatal_during_mainnet_prelaunch(self) -> None:
         port = self.fake_stratum_server([{"id": None, "method": "mining.notify", "params": []}])
-        env = self.probe_env()
-        env.update(
-            {
-                "QBIT_CHAIN": "mainnet",
-                "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
-            }
-        )
+        env = authorize_mainnet_prelaunch(self.probe_env())
         reporter = self.self_check.Reporter()
 
         self.self_check.check_highdiff_advertised_floor(env, "127.0.0.1", port, reporter)

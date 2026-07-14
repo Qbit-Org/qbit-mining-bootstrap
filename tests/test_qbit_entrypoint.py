@@ -108,6 +108,27 @@ sys.exit(int(os.environ.get("FAKE_QBITD_EXIT_CODE", "0")))
         self.assertEqual(argv, ["-printtoconsole", "-listen=1", "-maxtipage=456789"])
         self.assertEqual(argv.count("-maxtipage=456789"), 1)
 
+    def test_prelaunch_accepts_whitespace_around_launch_flag(self) -> None:
+        env = self.prelaunch_environment()
+        env["QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"] = " 0\t"
+
+        result = self.run_entrypoint("-listen=1", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.captured_argv(), ["-listen=1", "-maxtipage=456789"])
+
+    def test_prelaunch_rejects_qbitd_test_chain_arguments(self) -> None:
+        for chain_arg in ("-regtest", "-testnet4=1", "-chain=signet"):
+            with self.subTest(chain_arg=chain_arg):
+                if self.argv_path.exists():
+                    self.argv_path.unlink()
+
+                result = self.run_entrypoint(chain_arg, env=self.prelaunch_environment())
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.argv_path.exists(), "qbitd started on a test chain")
+                self.assertIn("selects a test chain", result.stderr)
+
     def test_existing_arguments_remain_separate_and_byte_exact(self) -> None:
         original_args = ["-printtoconsole", "-listen=1", "-server=1", "-uacomment=two words"]
 

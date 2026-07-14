@@ -33,6 +33,8 @@ QBIT_RPC_CHAIN_ALIASES = {"main": "mainnet"}
 BOOL_TRUE = {"1", "true", "yes", "on"}
 BOOL_FALSE = {"0", "false", "no", "off"}
 LAUNCH_READINESS_FLAG = "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED"
+PRELAUNCH_TIP_AGE_NAME = "QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS"
+MAX_SIGNED_INT64 = 9223372036854775807
 
 
 class MissingHighdiffNotificationError(RuntimeError):
@@ -143,7 +145,7 @@ def env_value(env: dict[str, str], name: str, default: str = "") -> str:
 
 
 def is_true(value: str) -> bool:
-    return value.lower() in BOOL_TRUE
+    return value.strip().lower() in BOOL_TRUE
 
 
 def optional_bool_env(env: dict[str, str], name: str) -> bool | None:
@@ -168,13 +170,23 @@ def launch_readiness_checks_enabled(env: dict[str, str]) -> bool:
     return enabled
 
 
-def launch_readiness_checks_disabled(env: dict[str, str]) -> bool:
+def authorized_mainnet_prelaunch(env: dict[str, str]) -> bool:
     try:
-        return not launch_readiness_checks_enabled(env)
+        return (
+            env_value(env, "QBIT_CHAIN", "regtest").strip().lower() == "mainnet"
+            and optional_bool_env(env, "QBIT_PRODUCTION") is True
+            and optional_bool_env(env, "QBIT_TOOLS_PRODUCTION") is True
+            and optional_bool_env(env, "CKPOOL_NON_TEST_READINESS_GATE") is False
+            and launch_readiness_checks_enabled(env) is False
+        )
     except ValueError:
-        # static_checks reports the malformed configuration. Live checks must
-        # remain strict instead of treating it as prelaunch authorization.
         return False
+
+
+def launch_readiness_checks_disabled(env: dict[str, str]) -> bool:
+    # static_checks reports malformed or incomplete authorization. Live checks
+    # must remain strict instead of treating it as prelaunch authorization.
+    return authorized_mainnet_prelaunch(env)
 
 
 def report_launch_dependent_failure(
@@ -202,6 +214,34 @@ def normalize_qbit_chain_name(value: object) -> str:
 
 def production_mode(env: dict[str, str]) -> bool:
     return is_true(env_value(env, "QBIT_PRODUCTION", "0")) or is_true(env_value(env, "QBIT_TOOLS_PRODUCTION", "0"))
+
+
+def prelaunch_tip_age_seconds(env: dict[str, str]) -> int | None:
+    if PRELAUNCH_TIP_AGE_NAME not in env:
+        return None
+
+    value = env[PRELAUNCH_TIP_AGE_NAME]
+    if value == "":
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} must not be empty")
+    if not value.isascii() or not value.isdigit():
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} must be a positive integer")
+    normalized = value.lstrip("0") or "0"
+    if normalized == "0":
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} must be greater than zero")
+    maximum = str(MAX_SIGNED_INT64)
+    if len(normalized) > len(maximum) or (
+        len(normalized) == len(maximum) and normalized > maximum
+    ):
+        raise ValueError(
+            f"{PRELAUNCH_TIP_AGE_NAME} exceeds qbitd's signed 64-bit integer range"
+        )
+    seconds = int(normalized)
+    production_enabled = optional_bool_env(env, "QBIT_PRODUCTION")
+    if production_enabled is not True:
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} is valid only with QBIT_PRODUCTION=1")
+    if env_value(env, "QBIT_CHAIN", "regtest") != "mainnet":
+        raise ValueError(f"{PRELAUNCH_TIP_AGE_NAME} is valid only with QBIT_CHAIN=mainnet")
+    return seconds
 
 
 def parse_decimal(value: str) -> Decimal:
@@ -239,6 +279,13 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
             )
         elif launch_checks_enabled:
             reporter.pass_("launch.readiness", f"{LAUNCH_READINESS_FLAG}=1; launch checks are strict")
+        elif not authorized_mainnet_prelaunch(env):
+            reporter.fail(
+                "launch.readiness",
+                f"{LAUNCH_READINESS_FLAG}=0 requires QBIT_CHAIN=mainnet, "
+                "QBIT_PRODUCTION=1, QBIT_TOOLS_PRODUCTION=1, and "
+                "CKPOOL_NON_TEST_READINESS_GATE=0",
+            )
         else:
             reporter.warn(
                 "launch.readiness",
@@ -258,6 +305,22 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.fail("qbit.chain_flag", f"unknown QBIT_CHAIN={qbit_chain}")
     else:
         reporter.pass_("qbit.chain_flag", "chain flag matches the configured qbit chain")
+
+    try:
+        tip_age_seconds = prelaunch_tip_age_seconds(env)
+    except ValueError as exc:
+        reporter.fail(f"env.{PRELAUNCH_TIP_AGE_NAME}", str(exc))
+    else:
+        if tip_age_seconds is None:
+            reporter.pass_(
+                f"env.{PRELAUNCH_TIP_AGE_NAME}",
+                "not configured; qbitd uses its normal tip-age policy",
+            )
+        else:
+            reporter.pass_(
+                f"env.{PRELAUNCH_TIP_AGE_NAME}",
+                f"validated reviewed duration of {tip_age_seconds} seconds",
+            )
 
     required_keys = (
         "PRISM_MANIFEST_SIGNING_SEED_HEX",
