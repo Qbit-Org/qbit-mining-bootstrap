@@ -31,6 +31,8 @@ class PrepareQbitSourceTests(unittest.TestCase):
                 )
                 self.assertEqual(values["QBIT_GIT_REF"], "v1.0.0")
                 self.assertEqual(values["QBIT_GIT_COMMIT"], QBIT_V1_MAINNET_COMMIT)
+        ci = ROOT / ".github" / "workflows" / "ci.yml"
+        self.assertIn(f"QBIT_CI_COMMIT: {QBIT_V1_MAINNET_COMMIT}", ci.read_text(encoding="utf-8"))
 
     def make_checkout(self, root: Path) -> tuple[Path, str]:
         checkout = root / "qbit"
