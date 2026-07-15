@@ -698,6 +698,9 @@ class SingleWriterShareLedger:
     def dashboard_miner_lifetime_earnings_bits(self, *, recipient_id: str) -> int:
         return 0
 
+    def dashboard_miner_pending_maturity_bits(self, *, recipient_id: str) -> int:
+        return 0
+
     def dashboard_miner_payout_rows(self, *, recipient_id: str, page: int, limit: int) -> dict[str, object]:
         from lab.prism import public_api
 
@@ -1808,6 +1811,26 @@ SELECT json_build_object(
 """
         payload = self._run_read_json(sql)
         return int(payload["lifetime_earnings_bits"])
+
+    def dashboard_miner_pending_maturity_bits(self, *, recipient_id: str) -> int:
+        if not recipient_id:
+            raise ValueError("recipient_id is required")
+        sql = f"""
+SELECT json_build_object(
+    'pending_maturity_bits',
+    COALESCE(sum(GREATEST(carry.onchain_amount_sats - carry.settlement_fee_sats, 0)), 0)
+)
+FROM qbit_payout_carry_forward carry
+JOIN qbit_pool_blocks block
+  ON block.block_hash = carry.block_hash
+WHERE carry.miner_id = {self._text_literal(recipient_id)}
+  AND carry.action = 'onchain'
+  AND carry.maturity_state = 'immature'
+  AND block.chain_state = 'confirmed'
+  AND block.maturity_state = 'immature';
+"""
+        payload = self._run_read_json(sql)
+        return int(payload["pending_maturity_bits"])
 
     def dashboard_miner_share_summary(self, *, recipient_id: str) -> dict[str, object]:
         from lab.prism import public_api

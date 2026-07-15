@@ -5,6 +5,7 @@
   "display_name": null,
   "owed_balance_bits": 1842000,
   "lifetime_earnings_bits": 38654846757,
+  "pending_maturity_bits": 66943800,
   "unpaid_earnings_bits": 1842000,
   "minimum_payout_bits": 10485760,
   "hashrate_ths": {

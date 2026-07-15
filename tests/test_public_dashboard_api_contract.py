@@ -249,6 +249,20 @@ class PublicDashboardApiContractTests(unittest.TestCase):
         self.assertLess(miner["owed_balance_bits"], miner["minimum_payout_bits"])
         self.assertIsNone(miner["estimated_time_to_minimum_payout_seconds"])
 
+    def test_miner_contract_exposes_pending_maturity_total(self) -> None:
+        miner = self.load_fixture("miner.json")
+        earnings = self.load_fixture("miner-earnings.json")["rows"]
+        expected_pending = sum(
+            row["net_earning_bits"]
+            for row in earnings
+            if row["maturity_state"] == "immature"
+        )
+
+        self.assertEqual(miner["pending_maturity_bits"], expected_pending)
+        text = OPENAPI_PATH.read_text(encoding="utf-8")
+        self.assertIn("- pending_maturity_bits", text)
+        self.assertIn('pending_maturity_bits:\n          $ref: "#/components/schemas/Bits"', text)
+
     def test_dashboard_api_is_public_read_model_not_internal_audit_api(self) -> None:
         text = OPENAPI_PATH.read_text(encoding="utf-8")
         self.assertNotIn("/audit/", text)

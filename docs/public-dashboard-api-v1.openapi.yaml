@@ -1437,6 +1437,7 @@ components:
         - display_name
         - owed_balance_bits
         - lifetime_earnings_bits
+        - pending_maturity_bits
         - unpaid_earnings_bits
         - minimum_payout_bits
         - hashrate_ths
@@ -1461,6 +1462,11 @@ components:
           $ref: "#/components/schemas/Bits"
         lifetime_earnings_bits:
           $ref: "#/components/schemas/Bits"
+        pending_maturity_bits:
+          $ref: "#/components/schemas/Bits"
+          description: >
+            Total net settlement value allocated to this miner and not yet spendable because the
+            confirmed parent coinbase remains subject to Qbit's 1,000-block maturity.
         unpaid_earnings_bits:
           $ref: "#/components/schemas/Bits"
         minimum_payout_bits:

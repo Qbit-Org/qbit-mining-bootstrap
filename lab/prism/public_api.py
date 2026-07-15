@@ -622,6 +622,7 @@ def miner(coordinator: Any, *, recipient_id: str) -> dict[str, object]:
     reward_window_percent = reward_window["share_percent"]
     minimum_payout_bits = public_minimum_payout_bits()
     lifetime_earnings_bits = lifetime_earnings_for_recipient(coordinator.ledger, recipient_id)
+    pending_maturity_bits = pending_maturity_bits_for_recipient(coordinator.ledger, recipient_id)
     estimated_reward_bits = estimated_next_block_reward_bits(
         share_percent=reward_window_percent,
         expected_coinbase_bits=latest_block_coinbase_value_bits(coordinator),
@@ -634,6 +635,7 @@ def miner(coordinator: Any, *, recipient_id: str) -> dict[str, object]:
         "display_name": None,
         "owed_balance_bits": owed_balance_bits,
         "lifetime_earnings_bits": lifetime_earnings_bits,
+        "pending_maturity_bits": pending_maturity_bits,
         "unpaid_earnings_bits": owed_balance_bits,
         "minimum_payout_bits": minimum_payout_bits,
         "hashrate_ths": share_summary["hashrate_ths"],
@@ -1390,6 +1392,18 @@ def lifetime_earnings_for_recipient(ledger: Any, recipient_id: str) -> int:
         return int(read_model(recipient_id=recipient_id))
     history = ledger.recipient_payout_history(recipient_id=recipient_id, limit=1_000)
     return sum(gross_earning_bits_from_row(row) for row in history)
+
+
+def pending_maturity_bits_for_recipient(ledger: Any, recipient_id: str) -> int:
+    read_model = getattr(ledger, "dashboard_miner_pending_maturity_bits", None)
+    if callable(read_model):
+        return int(read_model(recipient_id=recipient_id))
+    history = ledger.recipient_payout_history(recipient_id=recipient_id, limit=1_000)
+    return sum(
+        max(0, int(row.get("onchain_amount_sats", 0)) - int(row.get("settlement_fee_sats", 0)))
+        for row in history
+        if row.get("action") == "onchain" and row.get("maturity_state") == "immature"
+    )
 
 
 def miner_earning_row(row: dict[str, object]) -> dict[str, object]:

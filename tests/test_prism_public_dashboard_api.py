@@ -321,6 +321,15 @@ class FakePublicLedger:
             total += int(row.get("gross_amount_sats", fallback_gross))
         return total
 
+    def dashboard_miner_pending_maturity_bits(self, *, recipient_id: str) -> int:
+        if recipient_id != "miner-a":
+            return 0
+        return sum(
+            max(0, int(row.get("onchain_amount_sats", 0)) - int(row.get("settlement_fee_sats", 0)))
+            for row in self._payout_history()
+            if row["action"] == "onchain" and row["maturity_state"] == "immature"
+        )
+
     def dashboard_miner_payout_rows(self, *, recipient_id: str, page: int, limit: int) -> dict[str, object]:
         history = self.recipient_payout_history(recipient_id=recipient_id, limit=1_000)
         rows = [public_api.miner_payout_row(row) for row in history]
@@ -341,6 +350,7 @@ class FakePublicLedger:
                 "coinbase_txid": "1" * 64,
                 "recipient_id": "miner-a",
                 "onchain_amount_sats": 40,
+                "settlement_fee_sats": 3,
                 "carry_forward_balance_sats": 2,
                 "block_gross_amount_sats": 84,
                 "action": "onchain",
@@ -1187,6 +1197,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(miner["schema"], "prism.dashboard.miner.v1")
         self.assertEqual(miner["owed_balance_bits"], 42)
         self.assertEqual(miner["lifetime_earnings_bits"], 49)
+        self.assertEqual(miner["pending_maturity_bits"], 37)
         self.assertEqual(miner["minimum_payout_bits"], 0)
         self.assertEqual(miner["estimated_time_to_minimum_payout_seconds"], 0)
         self.assertEqual(miner["reward_window_percent"], "50")
@@ -1457,6 +1468,41 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
                     "created_at": "2026-06-26 20:45:00+00",
                 }
             )
+
+    def test_pending_maturity_fallback_filters_and_nets_immature_onchain_rows(self) -> None:
+        class HistoryOnlyLedger:
+            def recipient_payout_history(self, *, recipient_id: str, limit: int = 50) -> list[dict[str, object]]:
+                self.request = (recipient_id, limit)
+                return [
+                    {
+                        "action": "onchain",
+                        "maturity_state": "immature",
+                        "onchain_amount_sats": 20,
+                        "settlement_fee_sats": 3,
+                    },
+                    {
+                        "action": "onchain",
+                        "maturity_state": "mature",
+                        "onchain_amount_sats": 50,
+                        "settlement_fee_sats": 2,
+                    },
+                    {
+                        "action": "accrued",
+                        "maturity_state": "immature",
+                        "onchain_amount_sats": 70,
+                    },
+                    {
+                        "action": "onchain",
+                        "maturity_state": "immature",
+                        "onchain_amount_sats": 1,
+                        "settlement_fee_sats": 2,
+                    },
+                ]
+
+        ledger = HistoryOnlyLedger()
+
+        self.assertEqual(public_api.pending_maturity_bits_for_recipient(ledger, "miner-a"), 17)
+        self.assertEqual(ledger.request, ("miner-a", 1_000))
 
 
 class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):

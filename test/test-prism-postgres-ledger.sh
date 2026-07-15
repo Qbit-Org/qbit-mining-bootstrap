@@ -465,6 +465,7 @@ bundle = {
                 "prior_balance_sats": 0,
                 "candidate_balance_sats": 50000,
                 "onchain_amount_sats": 50000,
+                "settlement_fee_sats": 500,
                 "carry_forward_balance_sats": 0,
                 "action": "onchain",
             },
@@ -723,6 +724,16 @@ WHERE miner_id LIKE 'miner-unanchored-%';
 assert_equal(unanchored_balances, [], "unanchored carry rows require a confirmed pool block")
 confirmed = replacement.confirm_accepted_block(block_hash="44" * 32, active_tip_height=7)
 assert_equal(confirmed["confirmed_count"], 1, "confirmed block count")
+assert_equal(
+    replacement.dashboard_miner_pending_maturity_bits(recipient_id="miner-b"),
+    49500,
+    "pending maturity totals net immature onchain outputs",
+)
+assert_equal(
+    replacement.dashboard_miner_pending_maturity_bits(recipient_id="miner-a"),
+    0,
+    "pending maturity excludes accrued balances",
+)
 owed = replacement.current_owed_balances()
 assert_equal([(row["recipient_id"], row["balance_sats"]) for row in owed], [("miner-a", 1000)], "owed balance before reversal")
 
@@ -935,6 +946,11 @@ WHERE block_hash = '""" + "66" * 32 + """';
 """
 )
 assert_equal(carry_states, ["mature"], "mature payout sweep includes carry-forward rows")
+assert_equal(
+    replacement.dashboard_miner_pending_maturity_bits(recipient_id="miner-b"),
+    0,
+    "pending maturity excludes mature outputs",
+)
 try:
     replacement.mark_pool_block_inactive(block_hash="66" * 32, active_tip_height=1008)
 except RuntimeError as exc:

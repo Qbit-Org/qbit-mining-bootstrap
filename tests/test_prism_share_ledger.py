@@ -1146,6 +1146,30 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("WHERE block_hash IN (SELECT block_hash FROM page_base)", block_totals)
         self.assertNotIn("maturity_state <> 'reversed'", block_totals)
 
+    def test_postgres_miner_pending_maturity_sums_net_immature_onchain_outputs(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"pending_maturity_bits": 37},
+            ]
+        )
+
+        self.assertEqual(ledger.dashboard_miner_pending_maturity_bits(recipient_id="miner-a"), 37)
+        query = ledger.lease_queries[-1]
+        self.assertIn("FROM qbit_payout_carry_forward carry", query)
+        self.assertIn(
+            "sum(GREATEST(carry.onchain_amount_sats - carry.settlement_fee_sats, 0))",
+            query,
+        )
+        self.assertIn("carry.miner_id = 'miner-a'", query)
+        self.assertIn("carry.action = 'onchain'", query)
+        self.assertIn("carry.maturity_state = 'immature'", query)
+        self.assertIn("block.chain_state = 'confirmed'", query)
+        self.assertIn("block.maturity_state = 'immature'", query)
+
+        with self.assertRaisesRegex(ValueError, "recipient_id is required"):
+            ledger.dashboard_miner_pending_maturity_bits(recipient_id="")
+
     def test_postgres_pool_snapshot_reward_window_allows_zero_difficulty(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
             [
