@@ -1146,6 +1146,78 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("WHERE block_hash IN (SELECT block_hash FROM page_base)", block_totals)
         self.assertNotIn("maturity_state <> 'reversed'", block_totals)
 
+    def test_postgres_miner_payout_rows_resolve_ctv_fanout_outputs(self) -> None:
+        fanout_txid = "c5" * 32
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "total_count": 2,
+                    "rows": [
+                        {
+                            "block_hash": "a1" * 32,
+                            "block_height": 19,
+                            "coinbase_txid": "b2" * 32,
+                            "payout_manifest_sha256": "d4" * 32,
+                            "recipient_id": "miner-a",
+                            "order_key": "miner-a",
+                            "p2mr_program_hex": "e5" * 32,
+                            "onchain_amount_sats": 7_767_471,
+                            "carry_forward_balance_sats": "0",
+                            "action": "onchain",
+                            "maturity_state": "immature",
+                            "created_at": "2026-07-15 21:50:03+00",
+                            "fanout_txid": fanout_txid,
+                            "fanout_vout": 1,
+                            "fanout_amount_sats": 7_767_319,
+                            "fanout_fee_sats": 152,
+                            "fanout_gross_amount_sats": 7_767_471,
+                            "fanout_status": "awaiting_maturity",
+                        },
+                        {
+                            "block_hash": "a2" * 32,
+                            "block_height": 17,
+                            "coinbase_txid": "b3" * 32,
+                            "payout_manifest_sha256": "d5" * 32,
+                            "recipient_id": "miner-a",
+                            "order_key": "miner-a",
+                            "p2mr_program_hex": "e5" * 32,
+                            "onchain_amount_sats": 11_991_078,
+                            "carry_forward_balance_sats": "0",
+                            "action": "onchain",
+                            "maturity_state": "immature",
+                            "created_at": "2026-07-15 20:50:03+00",
+                            "fanout_txid": None,
+                            "fanout_vout": None,
+                            "fanout_amount_sats": None,
+                            "fanout_fee_sats": None,
+                            "fanout_gross_amount_sats": None,
+                            "fanout_status": None,
+                        },
+                    ],
+                },
+            ]
+        )
+
+        payload = ledger.dashboard_miner_payout_rows(recipient_id="miner-a", page=1, limit=15)
+        query = ledger.lease_queries[-1]
+
+        self.assertIn("LEFT JOIN LATERAL", query)
+        self.assertIn("qbit_ctv_fanout_artifacts", query)
+        self.assertIn("manifest->'precommitment'->'outputs'", query)
+        self.assertIn("output.value->>'recipient_id' = page_rows.miner_id", query)
+        self.assertIn("output.value->>'order_key' = page_rows.payout_order_key", query)
+        self.assertIn("output.value->>'p2mr_program_hex' = encode(page_rows.p2mr_program, 'hex')", query)
+        self.assertIn("page_rows.action = 'onchain'", query)
+
+        ctv_row, direct_row = payload["rows"]
+        self.assertEqual(ctv_row["transaction_kind"], "ctv_fanout")
+        self.assertEqual(ctv_row["transaction_id"], fanout_txid)
+        self.assertEqual(ctv_row["onchain_amount_bits"], 7_767_319)
+        self.assertEqual(direct_row["transaction_kind"], "coinbase")
+        self.assertEqual(direct_row["transaction_id"], "b3" * 32)
+        self.assertEqual(direct_row["onchain_amount_bits"], 11_991_078)
+
     def test_postgres_pool_snapshot_reward_window_allows_zero_difficulty(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
             [

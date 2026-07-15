@@ -1368,15 +1368,37 @@ def miner_worker_rows(
 
 
 def miner_payout_row(row: dict[str, object]) -> dict[str, object]:
-    txid = nullable_str(row.get("coinbase_txid")) if str(row.get("action")) == "onchain" else None
+    onchain = str(row.get("action")) == "onchain"
+    fanout_txid = nullable_str(row.get("fanout_txid")) if onchain else None
+    coinbase_txid = nullable_str(row.get("coinbase_txid")) if onchain else None
+    if fanout_txid:
+        # The recipient's output is committed inside a CTV fanout rather than
+        # paid directly from the coinbase: report the fanout transaction and
+        # the committed output value (gross entitlement minus the fanout fee
+        # share), which is what actually lands on-chain.
+        transaction_kind = "ctv_fanout"
+        txid = fanout_txid
+        onchain_amount_sats = first_int(
+            row.get("fanout_amount_sats"),
+            row.get("onchain_amount_sats"),
+            default=0,
+        )
+    elif coinbase_txid:
+        transaction_kind = "coinbase"
+        txid = coinbase_txid
+        onchain_amount_sats = int(row.get("onchain_amount_sats", 0))
+    else:
+        transaction_kind = "carry_forward"
+        txid = None
+        onchain_amount_sats = int(row.get("onchain_amount_sats", 0))
     explorer_prefix = os.environ.get("PRISM_PUBLIC_EXPLORER_TX_URL_PREFIX")
     return {
         "block_height": int(row.get("block_height", 0)),
         "block_hash": str(row.get("block_hash") or ""),
         "created_at": required_public_timestamp(row.get("created_at")),
         "transaction_id": txid,
-        "transaction_kind": "coinbase" if txid else "carry_forward",
-        "onchain_amount_bits": int(row.get("onchain_amount_sats", 0)),
+        "transaction_kind": transaction_kind,
+        "onchain_amount_bits": onchain_amount_sats,
         "carry_forward_balance_bits": int(row.get("carry_forward_balance_sats", 0)),
         "action": str(row.get("action") or "accrued"),
         "maturity_state": str(row.get("maturity_state") or "immature"),

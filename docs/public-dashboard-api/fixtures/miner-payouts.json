@@ -20,6 +20,18 @@
       "action": "onchain",
       "maturity_state": "immature",
       "explorer_url": "https://explorer.example/tx/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "block_height": 123448,
+      "block_hash": "0000000000000000000abc1230000000000000000000000000000000000000ab",
+      "created_at": "2026-06-26T19:35:00Z",
+      "transaction_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "transaction_kind": "ctv_fanout",
+      "onchain_amount_bits": 5231648,
+      "carry_forward_balance_bits": 0,
+      "action": "onchain",
+      "maturity_state": "immature",
+      "explorer_url": "https://explorer.example/tx/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
     }
   ]
 }

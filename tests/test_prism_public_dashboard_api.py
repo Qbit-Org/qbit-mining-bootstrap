@@ -1208,6 +1208,57 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(workers["rows"][0]["worker_name"], "rig-a")
         self.assertEqual(workers["rows"][0]["status"], "active")
 
+    def test_miner_payout_row_labels_ctv_fanout_outputs(self) -> None:
+        fanout_txid = "c5" * 32
+        base_row = {
+            "block_hash": "a1" * 32,
+            "block_height": 19,
+            "coinbase_txid": "b2" * 32,
+            "recipient_id": "miner-a",
+            "onchain_amount_sats": 7_767_471,
+            "carry_forward_balance_sats": 0,
+            "action": "onchain",
+            "maturity_state": "immature",
+            "created_at": "2026-07-15 21:50:03+00",
+        }
+
+        with patch.dict(os.environ, {"PRISM_PUBLIC_EXPLORER_TX_URL_PREFIX": "https://explorer.example/tx"}, clear=False):
+            ctv_row = public_api.miner_payout_row(
+                {
+                    **base_row,
+                    "fanout_txid": fanout_txid,
+                    "fanout_vout": 1,
+                    "fanout_amount_sats": 7_767_319,
+                    "fanout_fee_sats": 152,
+                    "fanout_gross_amount_sats": 7_767_471,
+                    "fanout_status": "awaiting_maturity",
+                }
+            )
+        self.assertEqual(ctv_row["transaction_kind"], "ctv_fanout")
+        self.assertEqual(ctv_row["transaction_id"], fanout_txid)
+        self.assertEqual(ctv_row["onchain_amount_bits"], 7_767_319)
+        self.assertEqual(ctv_row["explorer_url"], f"https://explorer.example/tx/{fanout_txid}")
+
+        coinbase_row = public_api.miner_payout_row(dict(base_row))
+        self.assertEqual(coinbase_row["transaction_kind"], "coinbase")
+        self.assertEqual(coinbase_row["transaction_id"], "b2" * 32)
+        self.assertEqual(coinbase_row["onchain_amount_bits"], 7_767_471)
+
+        # Accrued rows stay carry_forward even if a fanout/coinbase column
+        # leaks in from a wider read-model row.
+        accrued_row = public_api.miner_payout_row(
+            {
+                **base_row,
+                "action": "accrued",
+                "onchain_amount_sats": 0,
+                "carry_forward_balance_sats": 7,
+                "fanout_txid": fanout_txid,
+            }
+        )
+        self.assertEqual(accrued_row["transaction_kind"], "carry_forward")
+        self.assertIsNone(accrued_row["transaction_id"])
+        self.assertEqual(accrued_row["onchain_amount_bits"], 0)
+
     def test_estimated_next_block_reward_bits_computes_and_handles_edges(self) -> None:
         # 50% of a 600-bit coinbase, no pool fee.
         self.assertEqual(
