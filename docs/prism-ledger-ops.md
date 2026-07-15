@@ -224,8 +224,8 @@ capacity.
 
 ## Operator Readiness
 
-Production capacity qualification and its versioned evidence contract are
-documented in [PRISM production capacity qualification](prism-capacity-readiness.md).
+Optional capacity qualification and its versioned evidence contract are
+documented in [PRISM capacity qualification](prism-capacity-readiness.md).
 
 `make prism-self-check` is the PRISM operator readiness probe. It resolves the
 same Compose environment as `make up-prism-pool`, then emits PASS/WARN/FAIL

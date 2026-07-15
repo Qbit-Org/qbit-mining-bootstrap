@@ -1,34 +1,31 @@
-# PRISM Production Capacity Qualification
+# Optional PRISM Capacity Qualification
 
-PRISM production readiness requires recent evidence from the complete
-miner-facing path: valid Stratum submission, share validation, ACK, and durable
-Postgres commit. Process health and a schema-only database benchmark are not
-capacity evidence.
+This document defines an optional operator load-test record for a future public
+promotion decision. A capacity artifact is not required for PRISM startup,
+restart, mainnet readiness, or CI. Compose, `make doctor`, `prism-self-check`,
+and the coordinator do not consume an artifact or any `PRISM_CAPACITY_*`
+environment variables.
 
-## Deployment Policy
+The bootstrap repository ships the strict
+`qbit-prism-capacity-evidence/v2` validator, but it does not ship a production
+qualification runner. An operator may use the format after capturing the
+complete miner-facing path: valid Stratum submission, share validation, ACK,
+and durable Postgres commit. Process health and a schema-only database benchmark
+are not capacity evidence. Paid rented hash is not required; owned miners or a
+controlled load generator may be used if they exercise the real path.
 
-Set these values independently of the qualification artifact:
+## Qualification Policy
 
-```dotenv
-PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND=<reviewed peak>
-PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS=<reviewed ACK limit>
-PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS=86400
-PRISM_CAPACITY_COORDINATOR_REVISION=<40 lowercase hex characters>
-PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST=sha256:<64 lowercase hex characters>
-PRISM_CAPACITY_POSTGRES_SERVER_VERSION=<exact server version>
-PRISM_CAPACITY_DATABASE_PROFILE_SHA256=<64 lowercase hex characters>
-PRISM_CAPACITY_EVIDENCE_FILE=/absolute/host/path/capacity-evidence.json
-```
+Choose the forecast peak, ACK limit, maximum evidence age, coordinator revision
+and image digest, exact Postgres version, and database-profile digest outside the
+artifact. Pass them to the standalone validator so the artifact cannot choose
+its own passing threshold.
 
-The validator requires the artifact's forecast, ACK limit, runtime identity,
-database identity, and every load-affecting configuration value to match these
-deployment inputs. The artifact cannot choose its own passing threshold.
-
-`PRISM_CAPACITY_DATABASE_PROFILE_SHA256` is the SHA-256 digest of the reviewed
-database profile used for the run. Keep the source profile with deployment
-records. It should identify the storage class, CPU and memory allocation,
-Postgres configuration, connection path, replica policy, and any resource limits
-that can change commit latency. A changed profile digest requires a new run.
+The database-profile SHA-256 is the digest of the reviewed database profile used
+for the run. Keep the source profile with qualification records. It should
+identify the storage class, CPU and memory allocation, Postgres configuration,
+connection path, replica policy, and resource limits that can change commit
+latency. A changed profile digest requires a new run.
 
 The artifact separately records and requires these live Postgres settings:
 
@@ -84,7 +81,7 @@ and database-profile source beside the release record.
 
 `tests/fixtures/prism-capacity-evidence.json` documents the complete JSON shape.
 It is marked `artifact_kind=example`, contains synthetic values, and is rejected
-by production validation. The CLI test-only override exists solely so automated
+by normal standalone validation. The CLI test-only override exists solely so automated
 tests can validate the example's structure:
 
 ```bash
@@ -98,17 +95,18 @@ Never use that override in a deployment command or runtime environment.
 ## Validate Qualification Evidence
 
 Pass the independently configured policy and subject together with every bound
-runtime value. For example:
+runtime value. The shell names below are local validator inputs, not coordinator
+environment variables:
 
 ```bash
 python3 scripts/prism_capacity_evidence.py /path/to/capacity-evidence.json \
-  --forecast-peak-shares-per-second "$PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND" \
-  --ack-p99-limit-milliseconds "$PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS" \
-  --max-age-seconds "$PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS" \
-  --expect-coordinator-revision "$PRISM_CAPACITY_COORDINATOR_REVISION" \
-  --expect-coordinator-image-digest "$PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST" \
-  --expect-postgres-server-version "$PRISM_CAPACITY_POSTGRES_SERVER_VERSION" \
-  --expect-database-profile-sha256 "$PRISM_CAPACITY_DATABASE_PROFILE_SHA256" \
+  --forecast-peak-shares-per-second "$CAPACITY_FORECAST_SHARES_PER_SECOND" \
+  --ack-p99-limit-milliseconds "$CAPACITY_ACK_P99_LIMIT_MILLISECONDS" \
+  --max-age-seconds "$CAPACITY_EVIDENCE_MAX_AGE_SECONDS" \
+  --expect-coordinator-revision "$COORDINATOR_REVISION" \
+  --expect-coordinator-image-digest "$COORDINATOR_IMAGE_DIGEST" \
+  --expect-postgres-server-version "$POSTGRES_SERVER_VERSION" \
+  --expect-database-profile-sha256 "$DATABASE_PROFILE_SHA256" \
   --expect PRISM_STRATUM_SHARE_DIFF="$PRISM_STRATUM_SHARE_DIFF" \
   --expect PRISM_STRATUM_VARDIFF="$PRISM_STRATUM_VARDIFF" \
   --expect PRISM_STRATUM_VARDIFF_TARGET_SECONDS="$PRISM_STRATUM_VARDIFF_TARGET_SECONDS" \
@@ -127,11 +125,9 @@ python3 scripts/prism_capacity_evidence.py /path/to/capacity-evidence.json \
   --expect PRISM_STRATUM_SEND_TIMEOUT_SECONDS="$PRISM_STRATUM_SEND_TIMEOUT_SECONDS"
 ```
 
-Compose mounts the host evidence path read-only at
-`/run/qbit-prism/capacity-evidence.json`; the coordinator validates that fixed
-container path before opening Stratum in production. Runtime validation checks
-the immutable subject, policy, configuration, reconciliation, and durability
-contract with freshness enforcement disabled, so a routine restart does not
-become a time bomb after the deployment window closes. The host pre-deployment
-gate always enforces freshness. A missing bind source is not created
-automatically.
+No startup or deployment path runs this validator automatically. If an operator
+later adopts capacity qualification as public-routing policy, deployment
+orchestration should call it explicitly before opening public routes and archive
+the artifact and raw results. Private canaries and routine restarts do not
+require it. Re-run only when the qualified image, bound load configuration,
+database/hardware profile, forecast, or ACK objective changes.

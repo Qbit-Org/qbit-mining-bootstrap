@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 from types import SimpleNamespace
 from dataclasses import dataclass, field, replace as dataclass_replace
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
@@ -38,11 +38,6 @@ if not __package__:
 
 from lab.auxpow import stratum_codec, vardiff
 from lab.prism import direct_stratum, public_api
-from lab.prism.capacity_evidence import (
-    CONFIGURATION_KEYS as CAPACITY_CONFIGURATION_KEYS,
-    EvidenceError as CapacityEvidenceError,
-    load_capacity_evidence,
-)
 from lab.prism.prism_tools import prism_tool_command
 from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
 from lab.prism.ctv_broadcaster_daemon import CtvFanoutBroadcastDaemon, CtvFanoutDaemonResult
@@ -313,78 +308,6 @@ def require_production_env(name: str) -> str:
     return value
 
 
-def release_provenance_required() -> bool:
-    """Release provenance is unconditional on mainnet; no environment variable
-    may waive it there. Other chains can run production mode while building
-    images from the pinned source, so they enforce provenance only when
-    QBIT_REQUIRE_RELEASE_PROVENANCE opts in."""
-    return env("QBIT_CHAIN", "regtest").lower() in {"main", "mainnet"} or env_bool(
-        "QBIT_REQUIRE_RELEASE_PROVENANCE", "0"
-    )
-
-
-def require_release_provenance_env(name: str) -> str:
-    value = env_optional(name)
-    if value is None:
-        raise SystemExit(f"release provenance requires {name}")
-    return value
-
-
-def prism_capacity_configuration() -> dict[str, str]:
-    defaults = {
-        "PRISM_STRATUM_SHARE_DIFF": "0.000000001",
-        "PRISM_STRATUM_VARDIFF": "1",
-        "PRISM_STRATUM_VARDIFF_TARGET_SECONDS": "15",
-        "PRISM_STRATUM_VARDIFF_MIN_DIFF": "0.000000001",
-        "PRISM_STRATUM_VARDIFF_START_DIFF": "0.000000001",
-        "PRISM_STRATUM_VARDIFF_MAX_DIFF": "1024",
-        "PRISM_STRATUM_VARDIFF_RETARGET_SECONDS": "90",
-        "PRISM_STRATUM_VARDIFF_MAX_STEP_UP": "4",
-        "PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN": "4",
-        "PRISM_STRATUM_VARDIFF_EWMA_ALPHA": "0.4",
-        "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE": "0.25",
-        "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "15",
-        "PRISM_SHARE_COMMIT_BATCH_SIZE": "64",
-        "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS": "5",
-        "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS": "15",
-        "PRISM_STRATUM_SEND_TIMEOUT_SECONDS": "20",
-    }
-    return {name: env(name, defaults[name]) for name in CAPACITY_CONFIGURATION_KEYS}
-
-
-def validate_prism_capacity_gate() -> None:
-    evidence_path = Path(require_release_provenance_env("PRISM_CAPACITY_EVIDENCE_FILE"))
-    subject = {
-        "coordinator_revision": require_release_provenance_env(
-            "PRISM_CAPACITY_COORDINATOR_REVISION"
-        ),
-        "coordinator_image_digest": require_release_provenance_env(
-            "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST"
-        ),
-        "postgres_server_version": require_release_provenance_env(
-            "PRISM_CAPACITY_POSTGRES_SERVER_VERSION"
-        ),
-        "database_profile_sha256": require_release_provenance_env(
-            "PRISM_CAPACITY_DATABASE_PROFILE_SHA256"
-        ),
-    }
-    forecast = require_release_provenance_env("PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND")
-    p99_limit = require_release_provenance_env("PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS")
-    max_age = env_positive_int("PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS", 86_400)
-    try:
-        load_capacity_evidence(
-            evidence_path,
-            expected_configuration=prism_capacity_configuration(),
-            expected_subject=subject,
-            expected_forecast_peak_shares_per_second=forecast,
-            expected_ack_p99_limit_milliseconds=p99_limit,
-            max_age_seconds=max_age,
-            enforce_freshness=False,
-        )
-    except CapacityEvidenceError as exc:
-        raise SystemExit(f"release provenance capacity evidence is invalid: {exc}") from exc
-
-
 def validate_prism_production_gate() -> None:
     if not production_mode():
         return
@@ -405,6 +328,36 @@ def validate_prism_production_gate() -> None:
         raise SystemExit(
             "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
         )
+
+    production_difficulties: dict[str, Decimal] = {}
+    for name in (
+        "PRISM_STRATUM_SHARE_DIFF",
+        "PRISM_STRATUM_VARDIFF_MIN_DIFF",
+        "PRISM_STRATUM_VARDIFF_START_DIFF",
+        "PRISM_STRATUM_VARDIFF_MAX_DIFF",
+    ):
+        raw_value = require_production_env(name)
+        if not raw_value:
+            raise SystemExit(f"production mode requires an explicit {name}")
+        try:
+            value = Decimal(raw_value)
+        except InvalidOperation as exc:
+            raise SystemExit(f"{name} must be a decimal number") from exc
+        if not value.is_finite() or value <= 0:
+            raise SystemExit(f"{name} must be positive")
+        if value == Decimal("0.000000001"):
+            raise SystemExit(f"{name} cannot use the lab-only 1e-9 difficulty")
+        production_difficulties[name] = value
+    if (
+        production_difficulties["PRISM_STRATUM_VARDIFF_MIN_DIFF"]
+        > production_difficulties["PRISM_STRATUM_VARDIFF_START_DIFF"]
+    ):
+        raise SystemExit("production vardiff minimum exceeds its start difficulty")
+    if (
+        production_difficulties["PRISM_STRATUM_VARDIFF_START_DIFF"]
+        > production_difficulties["PRISM_STRATUM_VARDIFF_MAX_DIFF"]
+    ):
+        raise SystemExit("production vardiff start exceeds its maximum difficulty")
 
     prism_database_url = env_optional("PRISM_DATABASE_URL")
     if prism_database_url is None and env_optional("PRISM_POSTGRES_PSQL_COMMAND") is None:
@@ -435,11 +388,6 @@ def validate_prism_production_gate() -> None:
     ):
         require_production_env("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")
         env_positive_int("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT", 0)
-
-
-def validate_prism_release_provenance_gate() -> None:
-    if release_provenance_required():
-        validate_prism_capacity_gate()
 
 
 def validate_hex(value: str, *, name: str, expected_bytes: int | None = None) -> str:
@@ -981,7 +929,6 @@ def split_worker_username(username: str) -> tuple[str, str | None]:
 class PrismCoordinator:
     def __init__(self) -> None:
         validate_prism_production_gate()
-        validate_prism_release_provenance_gate()
         self.rpc = JsonRpc(
             host=env("QBIT_RPC_HOST"),
             port=env_int("QBIT_RPC_PORT", 18452),

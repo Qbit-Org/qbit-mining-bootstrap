@@ -150,42 +150,26 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT"], "1000")
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_PREMIUM_BPS"], "12000")
 
-    def test_prism_uses_qualified_non_lab_difficulty_profile(self) -> None:
+    def test_prism_uses_explicit_non_lab_difficulty_profile(self) -> None:
         env = self._environment("prism-coordinator")
 
         self.assertEqual(env["PRISM_STRATUM_SHARE_DIFF"], "1024")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_MIN_DIFF"], "1024")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_START_DIFF"], "4096")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_MAX_DIFF"], "65536")
-        self.assertEqual(env["PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND"], "100")
-        self.assertEqual(env["PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS"], "50")
-        self.assertEqual(env["PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS"], "86400")
-        self.assertEqual(env["PRISM_CAPACITY_COORDINATOR_REVISION"], "a" * 40)
-        self.assertEqual(env["PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST"], "sha256:" + "5" * 64)
-        self.assertEqual(env["PRISM_CAPACITY_POSTGRES_SERVER_VERSION"], "16.4")
-        self.assertEqual(env["PRISM_CAPACITY_DATABASE_PROFILE_SHA256"], "c" * 64)
         self.assertEqual(env["PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS"], "120")
 
-    def test_prism_capacity_evidence_is_a_fixed_read_only_mount(self) -> None:
+    def test_prism_runtime_has_no_capacity_evidence_dependency(self) -> None:
         env = self._environment("prism-coordinator")
         volumes = self.config["services"]["prism-coordinator"]["volumes"]
-        evidence_mounts = [
-            volume
-            for volume in volumes
-            if isinstance(volume, dict)
-            and volume.get("target") == "/run/qbit-prism/capacity-evidence.json"
-        ]
-
-        self.assertEqual(env["PRISM_CAPACITY_EVIDENCE_FILE"], "/run/qbit-prism/capacity-evidence.json")
-        self.assertEqual(len(evidence_mounts), 1)
-        self.assertEqual(evidence_mounts[0]["type"], "bind")
-        self.assertEqual(
-            evidence_mounts[0]["source"],
-            "/srv/qbit-mining-bootstrap/mainnet/config/prism-capacity-evidence.json",
-        )
-        self.assertTrue(evidence_mounts[0]["read_only"])
+        self.assertFalse(any(name.startswith("PRISM_CAPACITY_") for name in env))
+        self.assertNotIn("QBIT_REQUIRE_RELEASE_PROVENANCE", env)
         self.assertFalse(
-            evidence_mounts[0].get("bind", {}).get("create_host_path", False)
+            any(
+                isinstance(volume, dict)
+                and volume.get("target") == "/run/qbit-prism/capacity-evidence.json"
+                for volume in volumes
+            )
         )
 
     def test_operator_images_are_digest_qualified_release_artifacts(self) -> None:
@@ -199,12 +183,6 @@ class MainnetComposeContractTests(unittest.TestCase):
                 self.assertEqual(len(digest), 64)
                 self.assertTrue(all(character in "0123456789abcdef" for character in digest))
                 self.assertEqual(self.config["services"][service]["pull_policy"], "always")
-
-        prism_image_digest = self.config["services"]["prism-coordinator"]["image"].rpartition("@")[2]
-        self.assertEqual(
-            self._environment("prism-coordinator")["PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST"],
-            prism_image_digest,
-        )
 
     def test_operator_state_uses_explicit_host_bind_mounts(self) -> None:
         expected = {
@@ -445,17 +423,12 @@ class MainnetComposeContractTests(unittest.TestCase):
                     config["services"][service]["image"].startswith("invalid.invalid/"),
                     config["services"][service]["image"],
                 )
-        evidence_mount = next(
-            volume
-            for volume in config["services"]["prism-coordinator"]["volumes"]
-            if volume.get("target") == "/run/qbit-prism/capacity-evidence.json"
-        )
-        self.assertEqual(
-            evidence_mount["source"],
-            "/production-source-not-configured/prism/capacity-evidence.json",
-        )
         self.assertFalse(
-            evidence_mount.get("bind", {}).get("create_host_path", False)
+            any(
+                volume.get("target") == "/run/qbit-prism/capacity-evidence.json"
+                for volume in config["services"]["prism-coordinator"]["volumes"]
+                if isinstance(volume, dict)
+            )
         )
 
     @staticmethod

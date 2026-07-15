@@ -80,14 +80,6 @@ ENV_PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN="${PRISM_ALLOW_FIXED_LEDGER_SESSION_T
 ENV_PRISM_CTV_SETTLEMENT_ENABLED="${PRISM_CTV_SETTLEMENT_ENABLED:-}"
 ENV_PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT="${PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT:-}"
 ENV_PRISM_CTV_FANOUT_FEE_PREMIUM_BPS="${PRISM_CTV_FANOUT_FEE_PREMIUM_BPS:-}"
-ENV_PRISM_CAPACITY_EVIDENCE_FILE="${PRISM_CAPACITY_EVIDENCE_FILE:-}"
-ENV_PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND="${PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND:-}"
-ENV_PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS="${PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS:-}"
-ENV_PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS="${PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS:-}"
-ENV_PRISM_CAPACITY_COORDINATOR_REVISION="${PRISM_CAPACITY_COORDINATOR_REVISION:-}"
-ENV_PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST="${PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST:-}"
-ENV_PRISM_CAPACITY_POSTGRES_SERVER_VERSION="${PRISM_CAPACITY_POSTGRES_SERVER_VERSION:-}"
-ENV_PRISM_CAPACITY_DATABASE_PROFILE_SHA256="${PRISM_CAPACITY_DATABASE_PROFILE_SHA256:-}"
 ENV_PRISM_STRATUM_SHARE_DIFF="${PRISM_STRATUM_SHARE_DIFF:-}"
 ENV_PRISM_STRATUM_VARDIFF="${PRISM_STRATUM_VARDIFF:-}"
 ENV_PRISM_STRATUM_VARDIFF_TARGET_SECONDS="${PRISM_STRATUM_VARDIFF_TARGET_SECONDS:-}"
@@ -335,17 +327,7 @@ fi
 if [[ -n "${ENV_PRISM_CTV_FANOUT_FEE_PREMIUM_BPS}" ]]; then
   PRISM_CTV_FANOUT_FEE_PREMIUM_BPS="${ENV_PRISM_CTV_FANOUT_FEE_PREMIUM_BPS}"
 fi
-if [[ -n "${ENV_PRISM_CAPACITY_EVIDENCE_FILE}" ]]; then
-  PRISM_CAPACITY_EVIDENCE_FILE="${ENV_PRISM_CAPACITY_EVIDENCE_FILE}"
-fi
 for name in \
-  PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND \
-  PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS \
-  PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS \
-  PRISM_CAPACITY_COORDINATOR_REVISION \
-  PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST \
-  PRISM_CAPACITY_POSTGRES_SERVER_VERSION \
-  PRISM_CAPACITY_DATABASE_PROFILE_SHA256 \
   PRISM_STRATUM_VARDIFF \
   PRISM_STRATUM_VARDIFF_TARGET_SECONDS \
   PRISM_STRATUM_VARDIFF_MAX_DIFF \
@@ -475,11 +457,10 @@ production_mode_enabled() {
   [[ "${qbit_production}" == "1" || "${qbit_tools_production}" == "1" ]]
 }
 
-# Release provenance (digest-qualified images, absolute host state paths, and
-# fresh PRISM capacity evidence) is unconditional on mainnet: no environment
-# variable may waive it there. Other chains can run production mode while
-# building images from the pinned source, so they enforce provenance only when
-# QBIT_REQUIRE_RELEASE_PROVENANCE opts in.
+# Release provenance (digest-qualified images and absolute host state paths) is
+# unconditional on mainnet: no environment variable may waive it there. Other
+# chains can run production mode while building images from the pinned source,
+# so they enforce provenance only when QBIT_REQUIRE_RELEASE_PROVENANCE opts in.
 release_provenance_required() {
   if [[ "${QBIT_CHAIN:-regtest}" == "mainnet" ]]; then
     return 0
@@ -510,49 +491,6 @@ validate_mining_lanes() {
       *) fail "MINING_LANES contains unsupported lane '${lane}'" ;;
     esac
   done
-}
-
-check_prism_capacity_evidence() {
-  local evidence_file="${PRISM_CAPACITY_EVIDENCE_FILE:-}"
-  local output
-
-  [[ -n "${PRISM_STRATUM_SHARE_DIFF:-}" ]] || fail "release provenance requires an explicit PRISM_STRATUM_SHARE_DIFF"
-  [[ -n "${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" ]] || fail "release provenance requires an explicit PRISM_STRATUM_VARDIFF_MIN_DIFF"
-  [[ -n "${PRISM_STRATUM_VARDIFF_START_DIFF:-}" ]] || fail "release provenance requires an explicit PRISM_STRATUM_VARDIFF_START_DIFF"
-  [[ -n "${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" ]] || fail "release provenance requires an explicit PRISM_STRATUM_VARDIFF_MAX_DIFF"
-  [[ -n "${evidence_file}" ]] || fail "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE"
-  if [[ "${evidence_file}" != /* ]]; then
-    evidence_file="${ROOT_DIR}/${evidence_file}"
-  fi
-  command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate PRISM capacity evidence"
-  if ! output="$(python3 "${ROOT_DIR}/scripts/prism_capacity_evidence.py" \
-    "${evidence_file}" \
-    --expect "PRISM_STRATUM_SHARE_DIFF=${PRISM_STRATUM_SHARE_DIFF}" \
-    --expect "PRISM_STRATUM_VARDIFF=${PRISM_STRATUM_VARDIFF:-1}" \
-    --expect "PRISM_STRATUM_VARDIFF_TARGET_SECONDS=${PRISM_STRATUM_VARDIFF_TARGET_SECONDS:-15}" \
-    --expect "PRISM_STRATUM_VARDIFF_MIN_DIFF=${PRISM_STRATUM_VARDIFF_MIN_DIFF}" \
-    --expect "PRISM_STRATUM_VARDIFF_START_DIFF=${PRISM_STRATUM_VARDIFF_START_DIFF}" \
-    --expect "PRISM_STRATUM_VARDIFF_MAX_DIFF=${PRISM_STRATUM_VARDIFF_MAX_DIFF}" \
-    --expect "PRISM_STRATUM_VARDIFF_RETARGET_SECONDS=${PRISM_STRATUM_VARDIFF_RETARGET_SECONDS:-90}" \
-    --expect "PRISM_STRATUM_VARDIFF_MAX_STEP_UP=${PRISM_STRATUM_VARDIFF_MAX_STEP_UP:-4}" \
-    --expect "PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN=${PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN:-4}" \
-    --expect "PRISM_STRATUM_VARDIFF_EWMA_ALPHA=${PRISM_STRATUM_VARDIFF_EWMA_ALPHA:-0.4}" \
-    --expect "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE=${PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE:-0.25}" \
-    --expect "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS=${PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS:-15}" \
-    --expect "PRISM_SHARE_COMMIT_BATCH_SIZE=${PRISM_SHARE_COMMIT_BATCH_SIZE:-64}" \
-    --expect "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS=${PRISM_SHARE_COMMIT_LINGER_MILLISECONDS:-5}" \
-    --expect "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS=${PRISM_SHARE_COMMIT_TIMEOUT_SECONDS:-15}" \
-    --expect "PRISM_STRATUM_SEND_TIMEOUT_SECONDS=${PRISM_STRATUM_SEND_TIMEOUT_SECONDS:-20}" \
-    --expect-coordinator-revision "${PRISM_CAPACITY_COORDINATOR_REVISION:-}" \
-    --expect-coordinator-image-digest "${PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST:-}" \
-    --expect-postgres-server-version "${PRISM_CAPACITY_POSTGRES_SERVER_VERSION:-}" \
-    --expect-database-profile-sha256 "${PRISM_CAPACITY_DATABASE_PROFILE_SHA256:-}" \
-    --forecast-peak-shares-per-second "${PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND:-}" \
-    --ack-p99-limit-milliseconds "${PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS:-}" \
-    --max-age-seconds "${PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS:-86400}" 2>&1)"; then
-    fail "${output}"
-  fi
-  printf 'doctor: %s\n' "${output}"
 }
 
 check_digest_image() {
@@ -695,10 +633,6 @@ check_production_deployment_inputs() {
     check_absolute_storage_source PRISM_POSTGRES_DATA_SOURCE
     check_absolute_storage_source PRISM_POSTGRES_WAL_SOURCE
     check_absolute_storage_source PRISM_AUDIT_DATA_SOURCE
-    [[ "${PRISM_CAPACITY_EVIDENCE_FILE:-}" == /* ]] || \
-      fail "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE as an absolute host path"
-    [[ "${PRISM_COORDINATOR_IMAGE##*@}" == "${PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST:-}" ]] || \
-      fail "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST must match PRISM_COORDINATOR_IMAGE"
     storage_names+=(
       PRISM_POSTGRES_DATA_SOURCE
       PRISM_POSTGRES_WAL_SOURCE
@@ -722,6 +656,47 @@ require_lab_mode() {
   check_qbit_chain_selection
   check_bitcoin_chain_selection
   printf 'doctor: lab-only target confirmed non-production chains\n'
+}
+
+check_prism_production_difficulty() {
+  local output
+
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate production PRISM difficulty"
+  if ! output="$(python3 - \
+    "${PRISM_STRATUM_SHARE_DIFF:-}" \
+    "${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" \
+    "${PRISM_STRATUM_VARDIFF_START_DIFF:-}" \
+    "${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" 2>&1 <<'PY'
+from decimal import Decimal, InvalidOperation
+import sys
+
+names = (
+    "PRISM_STRATUM_SHARE_DIFF",
+    "PRISM_STRATUM_VARDIFF_MIN_DIFF",
+    "PRISM_STRATUM_VARDIFF_START_DIFF",
+    "PRISM_STRATUM_VARDIFF_MAX_DIFF",
+)
+values = {}
+for name, raw_value in zip(names, sys.argv[1:]):
+    if not raw_value:
+        raise SystemExit(f"production mode requires an explicit {name}")
+    try:
+        value = Decimal(raw_value)
+    except InvalidOperation:
+        raise SystemExit(f"{name} must be a decimal number")
+    if not value.is_finite() or value <= 0:
+        raise SystemExit(f"{name} must be positive")
+    if value == Decimal("0.000000001"):
+        raise SystemExit(f"{name} cannot use the lab-only 1e-9 difficulty")
+    values[name] = value
+if values["PRISM_STRATUM_VARDIFF_MIN_DIFF"] > values["PRISM_STRATUM_VARDIFF_START_DIFF"]:
+    raise SystemExit("production vardiff minimum exceeds its start difficulty")
+if values["PRISM_STRATUM_VARDIFF_START_DIFF"] > values["PRISM_STRATUM_VARDIFF_MAX_DIFF"]:
+    raise SystemExit("production vardiff start exceeds its maximum difficulty")
+PY
+  )"; then
+    fail "${output}"
+  fi
 }
 
 check_production_gate() {
@@ -823,6 +798,9 @@ check_production_gate() {
   if mining_lane_enabled ckpool; then
     [[ "${CKPOOL_GIT_REF:-}" =~ ^[[:xdigit:]]{40}$ ]] || fail "production mode requires CKPOOL_GIT_REF as exactly 40 hex characters"
   fi
+  if mining_lane_enabled prism; then
+    check_prism_production_difficulty
+  fi
 }
 
 check_release_provenance_gate() {
@@ -832,9 +810,6 @@ check_release_provenance_gate() {
         "${QBIT_CHAIN:-regtest}"
     fi
     return 0
-  fi
-  if mining_lane_enabled prism; then
-    check_prism_capacity_evidence
   fi
   check_production_deployment_inputs
 }

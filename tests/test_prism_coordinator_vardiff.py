@@ -54,7 +54,6 @@ from lab.prism.prism_coordinator import (
     scaled_target_difficulty,
     target_from_compact,
     validate_prism_production_gate,
-    validate_prism_release_provenance_gate,
 )
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"
@@ -2643,7 +2642,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.backend_name, "postgres-psql")
         self.assertEqual(fake_ledger.call_args.kwargs["writer_session_token"], "fixed-session")
 
-    def test_production_gate_rejects_prism_test_bypasses(self) -> None:
+    def test_production_gate_rejects_prism_test_bypasses_without_capacity_evidence(self) -> None:
         base = {
             "QBIT_PRODUCTION": "1",
             "QBIT_RPC_USER": "qbitrpc",
@@ -2662,13 +2661,6 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
             "PRISM_STRATUM_VARDIFF_MAX_DIFF": "65536",
-            "PRISM_CAPACITY_EVIDENCE_FILE": "/run/qbit-prism/capacity-evidence.json",
-            "PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND": "100",
-            "PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS": "50",
-            "PRISM_CAPACITY_COORDINATOR_REVISION": "aa" * 20,
-            "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST": "sha256:" + "bb" * 32,
-            "PRISM_CAPACITY_POSTGRES_SERVER_VERSION": "16.4",
-            "PRISM_CAPACITY_DATABASE_PROFILE_SHA256": "cc" * 32,
         }
         for name in (
             "PRISM_ALLOW_MEMORY_LEDGER",
@@ -2680,10 +2672,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, name):
                     validate_prism_production_gate()
 
-        with (
-            patch.dict(os.environ, base, clear=True),
-            patch("lab.prism.prism_coordinator.load_capacity_evidence"),
-        ):
+        with patch.dict(os.environ, base, clear=True):
             validate_prism_production_gate()
 
         with patch.dict(
@@ -2719,62 +2708,43 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "PRISM_DATABASE_URL"):
                 validate_prism_production_gate()
 
-    def test_release_provenance_gate_tiers_capacity_validation(self) -> None:
-        capacity = {
-            "PRISM_CAPACITY_EVIDENCE_FILE": "/run/qbit-prism/capacity-evidence.json",
-            "PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND": "100",
-            "PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS": "50",
-            "PRISM_CAPACITY_COORDINATOR_REVISION": "aa" * 20,
-            "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST": "sha256:" + "bb" * 32,
-            "PRISM_CAPACITY_POSTGRES_SERVER_VERSION": "16.4",
-            "PRISM_CAPACITY_DATABASE_PROFILE_SHA256": "cc" * 32,
+    def test_production_gate_rejects_unsafe_difficulty_without_capacity_gate(self) -> None:
+        base = {
+            "QBIT_PRODUCTION": "1",
+            "QBIT_RPC_USER": "qbitrpc",
+            "QBIT_RPC_PASSWORD": "not-default",
+            "PRISM_POSTGRES_PSQL_COMMAND": "psql postgresql://example.invalid/qbit",
+            "PRISM_POSTGRES_PASSWORD": "not-default",
+            "PRISM_MANIFEST_SIGNING_SEED_HEX": "42" * 32,
+            "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32,
+            "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX": "44" * 32,
+            "PRISM_LEDGER_WRITER_ID": "managed-writer",
+            "PRISM_LEDGER_WRITER_EPOCH": "7",
+            "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
+            "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_SHARE_DIFF": "1024",
+            "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
+            "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
+            "PRISM_STRATUM_VARDIFF_MAX_DIFF": "65536",
         }
-
-        with patch.dict(
-            os.environ,
-            {"QBIT_PRODUCTION": "1", "QBIT_CHAIN": "testnet4"},
-            clear=True,
-        ):
-            validate_prism_release_provenance_gate()
-
-        with patch.dict(
-            os.environ,
-            {"QBIT_CHAIN": "testnet4", "QBIT_REQUIRE_RELEASE_PROVENANCE": "1"},
-            clear=True,
-        ):
-            with self.assertRaisesRegex(
-                SystemExit,
-                "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
-            ):
-                validate_prism_release_provenance_gate()
-
-        with patch.dict(
-            os.environ,
-            {"QBIT_CHAIN": "mainnet", "QBIT_REQUIRE_RELEASE_PROVENANCE": "0"},
-            clear=True,
-        ):
-            with self.assertRaisesRegex(
-                SystemExit,
-                "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
-            ):
-                validate_prism_release_provenance_gate()
-
-        with (
-            patch.dict(
+        cases = (
+            ({"PRISM_STRATUM_SHARE_DIFF": ""}, "requires PRISM_STRATUM_SHARE_DIFF"),
+            ({"PRISM_STRATUM_SHARE_DIFF": "not-a-decimal"}, "must be a decimal number"),
+            ({"PRISM_STRATUM_SHARE_DIFF": "NaN"}, "PRISM_STRATUM_SHARE_DIFF must be positive"),
+            ({"PRISM_STRATUM_SHARE_DIFF": "0"}, "PRISM_STRATUM_SHARE_DIFF must be positive"),
+            ({"PRISM_STRATUM_SHARE_DIFF": "1e-9"}, "lab-only 1e-9 difficulty"),
+            ({"PRISM_STRATUM_VARDIFF_MIN_DIFF": "8192"}, "minimum exceeds its start"),
+            ({"PRISM_STRATUM_VARDIFF_START_DIFF": "131072"}, "start exceeds its maximum"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides), patch.dict(
                 os.environ,
-                {
-                    **capacity,
-                    "QBIT_CHAIN": "testnet4",
-                    "QBIT_REQUIRE_RELEASE_PROVENANCE": "1",
-                },
+                {**base, **overrides},
                 clear=True,
-            ),
-            patch(
-                "lab.prism.prism_coordinator.load_capacity_evidence"
-            ) as load_evidence,
-        ):
-            validate_prism_release_provenance_gate()
-        load_evidence.assert_called_once()
+            ):
+                with self.assertRaisesRegex(SystemExit, message):
+                    validate_prism_production_gate()
 
     def test_mainnet_implies_production_gate(self) -> None:
         with patch.dict(
@@ -2785,7 +2755,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             },
             clear=True,
         ):
-            with self.assertRaisesRegex(SystemExit, "production mode requires PRISM_DATABASE_URL"):
+            with self.assertRaisesRegex(SystemExit, "requires PRISM_STRATUM_SHARE_DIFF"):
                 validate_prism_production_gate()
 
     def test_compatibility_production_flag_implies_production_gate(self) -> None:
@@ -2798,7 +2768,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             },
             clear=True,
         ):
-            with self.assertRaisesRegex(SystemExit, "production mode requires PRISM_DATABASE_URL"):
+            with self.assertRaisesRegex(SystemExit, "requires PRISM_STRATUM_SHARE_DIFF"):
                 validate_prism_production_gate()
 
     def test_mainnet_ctv_requires_static_fee_rate_before_runtime_startup(self) -> None:
@@ -2816,11 +2786,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
             "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_SHARE_DIFF": "1024",
+            "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
+            "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
+            "PRISM_STRATUM_VARDIFF_MAX_DIFF": "65536",
             "PRISM_CTV_SETTLEMENT_ENABLED": "1",
         }
         with (
             patch.dict(os.environ, env, clear=True),
-            patch("lab.prism.prism_coordinator.validate_prism_capacity_gate"),
             self.assertRaisesRegex(
                 SystemExit,
                 "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",

@@ -11,8 +11,6 @@ import tempfile
 import threading
 import time
 import unittest
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
@@ -83,16 +81,6 @@ class PrismSelfCheckTests(unittest.TestCase):
             "PRISM_POOL_FEE_ENABLED": "0",
         }
 
-    def write_capacity_evidence(self, directory: Path) -> Path:
-        fixture = Path(__file__).parent / "fixtures" / "prism-capacity-evidence.json"
-        payload = json.loads(fixture.read_text(encoding="utf-8"))
-        payload["artifact_kind"] = "qualification"
-        payload["run_id"] = str(uuid.uuid4())
-        payload["generated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        path = directory / "capacity-evidence.json"
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        return path
-
     @staticmethod
     def public_blockchain_info(chain: str) -> dict[str, object]:
         return {
@@ -146,6 +134,12 @@ class PrismSelfCheckTests(unittest.TestCase):
             self.self_check.parse_host_port("0.0.0.0:43340", default_host="127.0.0.1", default_port=3340),
             ("0.0.0.0", 43340),
         )
+
+    def test_parse_decimal_rejects_non_finite_values(self) -> None:
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "finite decimal number"):
+                    self.self_check.parse_decimal(value)
 
     def test_compose_commands_include_prism_profile(self) -> None:
         command = self.self_check.compose_base_command()
@@ -459,43 +453,7 @@ class PrismSelfCheckTests(unittest.TestCase):
             {(row.status, row.name) for row in reporter.rows},
         )
 
-    def test_static_checks_accept_matching_capacity_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            evidence = self.write_capacity_evidence(Path(temp_dir))
-            env = self.valid_env()
-            env.update(
-                {
-                    "QBIT_PRODUCTION": "1",
-                    "QBIT_REQUIRE_RELEASE_PROVENANCE": "1",
-                    "QBIT_GIT_COMMIT": "41" * 20,
-                    "CKPOOL_GIT_REF": "42" * 20,
-                    "CPUMINER_GIT_REF": "43" * 20,
-                    "PRISM_POSTGRES_PASSWORD": "not-default",
-                    "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
-                    "PRISM_STRATUM_SHARE_DIFF": "1024",
-                    "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
-                    "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
-                    "PRISM_STRATUM_VARDIFF_MAX_DIFF": "65536",
-                    "PRISM_SHARE_COMMIT_BATCH_SIZE": "64",
-                    "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS": "5",
-                    "PRISM_CAPACITY_EVIDENCE_FILE": str(evidence),
-                    "PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND": "100",
-                    "PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS": "50",
-                    "PRISM_CAPACITY_COORDINATOR_REVISION": "a" * 40,
-                    "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST": "sha256:" + "b" * 64,
-                    "PRISM_CAPACITY_POSTGRES_SERVER_VERSION": "16.4",
-                    "PRISM_CAPACITY_DATABASE_PROFILE_SHA256": "c" * 64,
-                }
-            )
-            reporter = self.self_check.Reporter()
-
-            self.self_check.static_checks(env, reporter)
-
-        rows = {(row.status, row.name) for row in reporter.rows}
-        self.assertIn(("PASS", "mining.production_difficulty"), rows)
-        self.assertIn(("PASS", "capacity.evidence"), rows)
-
-    def test_static_checks_skip_capacity_evidence_without_provenance_opt_in(self) -> None:
+    def test_static_checks_do_not_include_capacity_evidence(self) -> None:
         env = self.valid_env()
         env.update(
             {
@@ -515,10 +473,9 @@ class PrismSelfCheckTests(unittest.TestCase):
 
         rows = {(row.status, row.name) for row in reporter.rows}
         self.assertIn(("PASS", "mining.production_difficulty"), rows)
-        self.assertIn(("PASS", "capacity.evidence"), rows)
-        self.assertNotIn(("FAIL", "capacity.evidence"), rows)
+        self.assertFalse(any(name == "capacity.evidence" for _status, name in rows))
 
-    def test_static_checks_mainnet_requires_capacity_evidence_despite_opt_out(self) -> None:
+    def test_static_checks_mainnet_does_not_require_capacity_evidence(self) -> None:
         env = self.valid_env()
         env.update(
             {
@@ -538,10 +495,7 @@ class PrismSelfCheckTests(unittest.TestCase):
 
         self.self_check.static_checks(env, reporter)
 
-        self.assertIn(
-            ("FAIL", "capacity.evidence"),
-            {(row.status, row.name) for row in reporter.rows},
-        )
+        self.assertFalse(any(row.name == "capacity.evidence" for row in reporter.rows))
 
     def test_static_checks_reject_lab_production_difficulty(self) -> None:
         env = self.valid_env()
@@ -550,7 +504,6 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "41" * 20,
                 "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
-                "PRISM_CAPACITY_EVIDENCE_FILE": "tests/fixtures/prism-capacity-evidence.json",
             }
         )
         reporter = self.self_check.Reporter()

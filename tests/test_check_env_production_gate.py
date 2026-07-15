@@ -2,40 +2,18 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CHECK_ENV = ROOT_DIR / "scripts" / "check-env.sh"
-CAPACITY_EVIDENCE = ROOT_DIR / "tests" / "fixtures" / "prism-capacity-evidence.json"
-
-
 class CheckEnvProductionGateTests(unittest.TestCase):
-    def write_capacity_evidence(
-        self,
-        directory: Path,
-        *,
-        configuration: dict[str, object] | None = None,
-    ) -> Path:
-        payload = json.loads(CAPACITY_EVIDENCE.read_text(encoding="utf-8"))
-        payload["artifact_kind"] = "qualification"
-        payload["run_id"] = str(uuid.uuid4())
-        payload["generated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        if configuration:
-            payload["configuration"].update(configuration)
-        path = directory / "capacity-evidence.json"
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        return path
-
-    def production_prism_env(self, root: Path, evidence: Path) -> dict[str, str]:
+    def production_prism_env(self, root: Path) -> dict[str, str]:
         return {
             "MINING_LANES": "prism",
             "QBIT_PRODUCTION": "1",
@@ -79,14 +57,6 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS": "5",
             "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS": "15",
             "PRISM_STRATUM_SEND_TIMEOUT_SECONDS": "20",
-            "PRISM_CAPACITY_EVIDENCE_FILE": str(evidence),
-            "PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND": "100",
-            "PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS": "50",
-            "PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS": "86400",
-            "PRISM_CAPACITY_COORDINATOR_REVISION": "a" * 40,
-            "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST": "sha256:" + "b" * 64,
-            "PRISM_CAPACITY_POSTGRES_SERVER_VERSION": "16.4",
-            "PRISM_CAPACITY_DATABASE_PROFILE_SHA256": "c" * 64,
         }
 
     def write_pinned_qbit_checkout(self, root: Path) -> tuple[Path, str]:
@@ -168,6 +138,10 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
             "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_SHARE_DIFF": "1024",
+            "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
+            "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
+            "PRISM_STRATUM_VARDIFF_MAX_DIFF": "65536",
         }
 
     def run_check_env(
@@ -734,8 +708,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
     def test_production_rejects_non_digest_images_before_docker_check(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            evidence = self.write_capacity_evidence(root)
-            env = self.production_prism_env(root, evidence)
+            env = self.production_prism_env(root)
             env["PRISM_COORDINATOR_IMAGE"] = "prism:latest"
 
             result = self.run_check_env(**env)
@@ -747,32 +720,13 @@ class CheckEnvProductionGateTests(unittest.TestCase):
     def test_production_rejects_reused_state_paths_before_docker_check(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            evidence = self.write_capacity_evidence(root)
-            env = self.production_prism_env(root, evidence)
+            env = self.production_prism_env(root)
             env["PRISM_POSTGRES_WAL_SOURCE"] = env["PRISM_POSTGRES_DATA_SOURCE"]
 
             result = self.run_check_env(**env)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PRISM_POSTGRES_DATA_SOURCE and PRISM_POSTGRES_WAL_SOURCE must be distinct", result.stderr)
-        self.assertNotIn("docker is required", result.stderr)
-
-    def test_capacity_subject_digest_must_match_deployed_image(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            evidence = self.write_capacity_evidence(root)
-            env = self.production_prism_env(root, evidence)
-            env["PRISM_COORDINATOR_IMAGE"] = (
-                "registry.example.invalid/prism@sha256:" + "f" * 64
-            )
-
-            result = self.run_check_env(**env)
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST must match PRISM_COORDINATOR_IMAGE",
-            result.stderr,
-        )
         self.assertNotIn("docker is required", result.stderr)
 
     def test_qbit_mainnet_auxpow_requires_mainnet_parent(self) -> None:
@@ -1045,7 +999,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
 
-    def test_production_verifies_resolved_git_checkout_matches_pin(self) -> None:
+    def test_mainnet_provenance_passes_without_capacity_evidence_and_verifies_pin(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             checkout = root / "qbit"
@@ -1084,9 +1038,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             docker = fake_bin / "docker"
             docker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             docker.chmod(0o755)
-            evidence = self.write_capacity_evidence(root)
-
-            common = self.production_prism_env(root, evidence)
+            common = self.production_prism_env(root)
             common.update({
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
                 "QBIT_CHAIN": "mainnet",
@@ -1125,7 +1077,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
-            "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
+            "release provenance requires QBITD_IMAGE as a digest-qualified image reference",
             result.stderr,
         )
         self.assertNotIn("release provenance not enforced", result.stdout)
@@ -1154,7 +1106,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
 
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(
-                        "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
+                        "release provenance requires QBITD_IMAGE as a digest-qualified image reference",
                         result.stderr,
                     )
                     self.assertNotIn("release provenance not enforced", result.stdout)
@@ -1175,30 +1127,61 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         )
         self.assertNotIn("docker is required", result.stderr)
 
-    def test_production_rejects_lab_prism_difficulty_profile(self) -> None:
+    def test_production_rejects_unsafe_prism_difficulty_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            evidence = self.write_capacity_evidence(
-                root,
-                configuration={
-                    "PRISM_STRATUM_SHARE_DIFF": "0.000000001",
-                    "PRISM_STRATUM_VARDIFF_MIN_DIFF": "0.000000001",
-                    "PRISM_STRATUM_VARDIFF_START_DIFF": "0.000000001",
-                },
+            base = self.production_prism_env(root)
+            cases = (
+                ("PRISM_STRATUM_SHARE_DIFF", "", "requires an explicit PRISM_STRATUM_SHARE_DIFF"),
+                (
+                    "PRISM_STRATUM_VARDIFF_MIN_DIFF",
+                    "",
+                    "requires an explicit PRISM_STRATUM_VARDIFF_MIN_DIFF",
+                ),
+                (
+                    "PRISM_STRATUM_VARDIFF_START_DIFF",
+                    "",
+                    "requires an explicit PRISM_STRATUM_VARDIFF_START_DIFF",
+                ),
+                (
+                    "PRISM_STRATUM_VARDIFF_MAX_DIFF",
+                    "",
+                    "requires an explicit PRISM_STRATUM_VARDIFF_MAX_DIFF",
+                ),
+                ("PRISM_STRATUM_SHARE_DIFF", "not-a-decimal", "must be a decimal number"),
+                ("PRISM_STRATUM_SHARE_DIFF", "NaN", "must be positive"),
+                ("PRISM_STRATUM_SHARE_DIFF", "Infinity", "must be positive"),
+                ("PRISM_STRATUM_SHARE_DIFF", "0", "must be positive"),
+                ("PRISM_STRATUM_SHARE_DIFF", "-1", "must be positive"),
+                ("PRISM_STRATUM_SHARE_DIFF", "0.000000001", "lab-only 1e-9 difficulty"),
+                (
+                    "PRISM_STRATUM_VARDIFF_MIN_DIFF",
+                    "8192",
+                    "production vardiff minimum exceeds its start difficulty",
+                ),
+                (
+                    "PRISM_STRATUM_VARDIFF_START_DIFF",
+                    "131072",
+                    "production vardiff start exceeds its maximum difficulty",
+                ),
             )
-            env = self.production_prism_env(root, evidence)
-            env.update(
-                {
-                    "PRISM_STRATUM_SHARE_DIFF": "0.000000001",
-                    "PRISM_STRATUM_VARDIFF_MIN_DIFF": "0.000000001",
-                    "PRISM_STRATUM_VARDIFF_START_DIFF": "0.000000001",
-                }
-            )
-            result = self.run_check_env(**env)
+            for name, value, message in cases:
+                with self.subTest(name=name, value=value):
+                    deploy_env = root / "difficulty.env"
+                    deploy_env.write_text(f"{name}={value}\n", encoding="utf-8")
+                    env = {
+                        **base,
+                        "DEPLOY_ENV_FILE": str(deploy_env),
+                        # An empty shell value does not override DEPLOY_ENV_FILE,
+                        # including when the deployed value itself is empty.
+                        name: "",
+                    }
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("lab-only 1e-9 difficulty", result.stderr)
-        self.assertNotIn("docker is required", result.stderr)
+                    result = self.run_check_env(**env)
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+                    self.assertNotIn("docker is required", result.stderr)
 
     def test_production_requires_commit_pinned_mining_sources(self) -> None:
         common = {

@@ -104,9 +104,13 @@ PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX="$(
 ```
 
 Store those values in `.env`, keep all `PRISM_ALLOW_*` flags at `0`, and set
-`QBIT_PRODUCTION=1` for non-regtest deployments. The public ledger key must be
-distributed to verifiers out of band; do not ask verifiers to trust a key copied
-from the audit bundle they are checking.
+`QBIT_PRODUCTION=1` for non-regtest deployments. Production also requires
+explicit, reviewed, positive values for `PRISM_STRATUM_SHARE_DIFF` and the
+`PRISM_STRATUM_VARDIFF_MIN_DIFF`, `PRISM_STRATUM_VARDIFF_START_DIFF`, and
+`PRISM_STRATUM_VARDIFF_MAX_DIFF` bounds. The local-lab `1e-9` values are
+rejected, and the vardiff bounds must satisfy `minimum <= start <= maximum`.
+The public ledger key must be distributed to verifiers out of band; do not ask
+verifiers to trust a key copied from the audit bundle they are checking.
 
 Then start and validate the pool:
 
