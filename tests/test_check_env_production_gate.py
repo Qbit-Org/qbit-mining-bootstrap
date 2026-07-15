@@ -939,29 +939,39 @@ class CheckEnvProductionGateTests(unittest.TestCase):
     def test_production_git_provider_requires_exact_commit_pin(self) -> None:
         for commit in ("", "main", "11" * 19, "zz" * 20):
             with self.subTest(commit=commit):
-                result = self.run_check_env(
-                    MINING_LANES="prism",
-                    QBIT_PRODUCTION="1",
-                    QBIT_CHAIN="signet",
-                    QBIT_CHAIN_FLAG="-signet",
-                    QBIT_GIT_COMMIT=commit,
-                    QBIT_RPC_PASSWORD="not-default",
-                    BITCOIN_RPC_PASSWORD="not-default",
-                    PRISM_DATABASE_URL="postgresql://example.invalid/qbit",
-                    PRISM_POSTGRES_PASSWORD="not-default",
-                    PRISM_MANIFEST_SIGNING_SEED_HEX="42" * 32,
-                    PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX="43" * 32,
-                    PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX="44" * 32,
-                    PRISM_LEDGER_WRITER_ID="managed-writer",
-                    PRISM_LEDGER_WRITER_EPOCH="7",
-                    PRISM_AUDIT_DIR="/var/lib/qbit/prism/audit",
-                    PRISM_EVIDENCE_PATH="/var/lib/qbit/prism/evidence.json",
-                    PRISM_STRATUM_STALE_GRACE_SECONDS="0",
-                    CKPOOL_MINDIFF="1024",
-                    CKPOOL_STARTDIFF="65536",
-                    CKPOOL_REQUIRE_P2MR_PAYOUT="1",
-                    AUXPOW_STRATUM_HEADER_VARIANT="canonical",
-                )
+                overrides = {
+                    "MINING_LANES": "prism",
+                    "QBIT_PRODUCTION": "1",
+                    "QBIT_CHAIN": "signet",
+                    "QBIT_CHAIN_FLAG": "-signet",
+                    "QBIT_RPC_PASSWORD": "not-default",
+                    "BITCOIN_RPC_PASSWORD": "not-default",
+                    "PRISM_DATABASE_URL": "postgresql://example.invalid/qbit",
+                    "PRISM_POSTGRES_PASSWORD": "not-default",
+                    "PRISM_MANIFEST_SIGNING_SEED_HEX": "42" * 32,
+                    "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32,
+                    "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX": "44" * 32,
+                    "PRISM_LEDGER_WRITER_ID": "managed-writer",
+                    "PRISM_LEDGER_WRITER_EPOCH": "7",
+                    "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
+                    "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
+                    "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                    "CKPOOL_MINDIFF": "1024",
+                    "CKPOOL_STARTDIFF": "65536",
+                    "CKPOOL_REQUIRE_P2MR_PAYOUT": "1",
+                    "AUXPOW_STRATUM_HEADER_VARIANT": "canonical",
+                }
+                if commit:
+                    overrides["QBIT_GIT_COMMIT"] = commit
+                    result = self.run_check_env(**overrides)
+                else:
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        deploy_env = Path(temp_dir) / "mainnet.env"
+                        deploy_env.write_text("QBIT_GIT_COMMIT=\n", encoding="utf-8")
+                        result = self.run_check_env(
+                            DEPLOY_ENV_FILE=str(deploy_env),
+                            **overrides,
+                        )
 
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(

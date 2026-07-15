@@ -12,9 +12,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "prepare-qbit-source.sh"
+QBIT_V1_MAINNET_COMMIT = "7ebcddb622d6e639041f005a189b048ec2a221fe"
 
 
 class PrepareQbitSourceTests(unittest.TestCase):
+    def test_checked_in_upstream_default_pins_qbit_v1_mainnet_release(self) -> None:
+        for path in (
+            ROOT / ".env.example",
+            ROOT / "config" / "upstream.env",
+            ROOT / "config" / "upstream.env.example",
+        ):
+            with self.subTest(path=path):
+                lines = path.read_text(encoding="utf-8").splitlines()
+                values = dict(
+                    line.split("=", 1)
+                    for line in lines
+                    if line and not line.startswith("#") and "=" in line
+                )
+                self.assertEqual(values["QBIT_GIT_REF"], "v1.0.0")
+                self.assertEqual(values["QBIT_GIT_COMMIT"], QBIT_V1_MAINNET_COMMIT)
+
     def make_checkout(self, root: Path) -> tuple[Path, str]:
         checkout = root / "qbit"
         for relative in (
@@ -104,9 +121,12 @@ class PrepareQbitSourceTests(unittest.TestCase):
 
     def test_production_source_requires_full_commit_pin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            checkout, _ = self.make_checkout(Path(tmp))
+            root = Path(tmp)
+            checkout, _ = self.make_checkout(root)
+            deploy_env = root / "mainnet.env"
+            deploy_env.write_text("QBIT_GIT_COMMIT=\n", encoding="utf-8")
 
-            result = self.run_script(checkout, QBIT_GIT_COMMIT="")
+            result = self.run_script(checkout, DEPLOY_ENV_FILE=str(deploy_env))
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("requires QBIT_GIT_COMMIT as exactly 40 hex characters", result.stderr)
@@ -131,7 +151,7 @@ class PrepareQbitSourceTests(unittest.TestCase):
             root, script = self.isolated_script_root(directory)
             (root / ".env").write_text(f"QBIT_GIT_COMMIT={'f' * 40}\n", encoding="utf-8")
             deploy_env = root / "mainnet.env"
-            deploy_env.write_text("", encoding="utf-8")
+            deploy_env.write_text("QBIT_GIT_COMMIT=\n", encoding="utf-8")
 
             result = self.run_script(
                 checkout,
