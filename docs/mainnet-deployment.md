@@ -44,10 +44,10 @@ policies, commit-pinned sources) apply whenever `QBIT_PRODUCTION=1`,
 (`PRISM_STRATUM_STALE_GRACE_SECONDS=0`) is pinned only on mainnet, so a public
 test-chain pool may credit shares that raced a block within a bounded grace
 window. The
-release-provenance checks (digest-qualified `*_IMAGE` references, absolute
-`*_DATA_SOURCE` host paths, and fresh PRISM capacity evidence) are enforced
-unconditionally on mainnet — no environment variable can disable them there —
-and on other chains only with `QBIT_REQUIRE_RELEASE_PROVENANCE=1`. A
+release-provenance checks (digest-qualified `*_IMAGE` references and absolute
+`*_DATA_SOURCE` host paths) are enforced unconditionally on mainnet — no
+environment variable can disable them there — and on other chains only with
+`QBIT_REQUIRE_RELEASE_PROVENANCE=1`. A
 production pool that builds images from the pinned source in place (for
 example a public testnet4 deployment) runs with that flag unset and keeps
 every behavioral check active.
@@ -75,12 +75,11 @@ BITCOIN_DATA_SOURCE=/srv/qbit-mining-bootstrap/mainnet/bitcoin
 PRISM_POSTGRES_DATA_SOURCE=/srv/qbit-mining-bootstrap/mainnet/postgres/data
 PRISM_POSTGRES_WAL_SOURCE=/srv/qbit-mining-bootstrap/mainnet/postgres/wal
 PRISM_AUDIT_DATA_SOURCE=/srv/qbit-mining-bootstrap/mainnet/prism/audit
-PRISM_CAPACITY_EVIDENCE_FILE=/srv/qbit-mining-bootstrap/mainnet/config/prism-capacity-evidence.json
 ```
 
-Create each directory and the capacity-evidence file before rendering Compose,
-then grant only the corresponding runtime the required access. Compose refuses
-to create missing production bind paths. The evidence file is mounted read-only.
+Create each directory before rendering Compose, then grant only the corresponding
+runtime the required access. Compose refuses to create missing production bind
+paths.
 
 `PRISM_POSTGRES_WAL_SOURCE` is the primary's live WAL directory. Separating it
 from `PGDATA` permits an independent capacity and I/O boundary only when the two
@@ -98,11 +97,15 @@ Postgres migration procedure instead.
 ## Production Compose Contract
 
 Always render and start mainnet with both Compose files. The override requires
-immutable images and host-backed state, keeps the capacity evidence read-only,
-prevents Docker from silently creating a missing state directory, and moves
-integration helpers out of the operator profiles. It uses Compose's `!override`
-merge tag for that profile isolation; the installed Docker Compose release must
-support that tag.
+immutable images and host-backed state, prevents Docker from silently creating a
+missing state directory, and moves integration helpers out of the operator
+profiles. It uses Compose's `!override` merge tag for that profile isolation;
+the installed Docker Compose release must support that tag.
+
+Capacity qualification is optional and external to startup. The standalone
+validator and artifact format are documented in
+[`prism-capacity-readiness.md`](prism-capacity-readiness.md); neither the
+coordinator nor this Compose contract requires an artifact.
 
 Export the deployment env path once. Make, source staging, environment
 validation, and the PRISM self-check then use it as the sole local deployment
@@ -311,6 +314,13 @@ the share transaction commits. A block-worthy share commits its complete block
 intent in the same transaction. The in-memory candidate queue is only a wakeup;
 pending work is replayed from Postgres after a restart.
 
+Before startup, set `PRISM_STRATUM_SHARE_DIFF`,
+`PRISM_STRATUM_VARDIFF_MIN_DIFF`, `PRISM_STRATUM_VARDIFF_START_DIFF`, and
+`PRISM_STRATUM_VARDIFF_MAX_DIFF` to explicit, reviewed, positive values.
+Production rejects missing values, the local-lab `1e-9` profile, and bounds that
+do not satisfy `minimum <= start <= maximum`. This direct safety check does not
+require a capacity artifact.
+
 Set the group-commit policy explicitly if the defaults are not appropriate:
 
 ```dotenv
@@ -392,7 +402,8 @@ Do not expose a lane until all applicable checks pass:
   reviewed absolute host paths
 - node IBD, header, peer, and template readiness is healthy
 - production credentials and signing material are nondefault
-- CKPool and PRISM difficulty settings have passed representative load testing
+- CKPool and PRISM difficulty settings have passed a controlled-miner smoke/load
+  check; the optional v2 capacity artifact is not required
 - every successful PRISM share survives a coordinator restart exactly once
 - a pending winning candidate resumes safely after a forced process exit
 - walletless fee-bearing CTV fanout construction and broadcast have passed

@@ -18,6 +18,8 @@ references. For public-facing navigation, prefer the short path below.
   OpenAPI contract for `/public/v1`.
 - [prism-storage-sizing.md](prism-storage-sizing.md): storage, VM sizing,
   artifact retention, and monitoring guidance.
+- [mainnet-deployment.md](mainnet-deployment.md): fail-closed production
+  deployment sequence and go-live checks.
 - [prism-rejections.md](prism-rejections.md): stable PRISM rejection reason IDs
   for Stratum errors, metrics, and dashboards.
 - [router-integration-notes.md](router-integration-notes.md): router/hash
@@ -29,6 +31,8 @@ This is useful for reviewers and operators who need implementation detail:
 
 - [prism-ledger-ops.md](prism-ledger-ops.md): formal ledger invariants,
   writer-lease behavior, compaction contract, and readiness probes.
+- [prism-capacity-readiness.md](prism-capacity-readiness.md): optional
+  Stratum-to-Postgres qualification artifact and standalone validator contract.
 
 ## Public-Site Guidance
 

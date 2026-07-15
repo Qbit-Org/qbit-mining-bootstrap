@@ -20,15 +20,6 @@ from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-from prism_capacity_evidence import (  # noqa: E402
-    CONFIGURATION_KEYS as CAPACITY_CONFIGURATION_KEYS,
-    EvidenceError,
-    load_capacity_evidence,
-)
 
 
 PUBLIC_QBIT_CHAINS = {"mainnet", "testnet", "testnet3", "testnet4", "signet"}
@@ -270,42 +261,14 @@ def prelaunch_tip_age_seconds(env: dict[str, str]) -> int | None:
     return seconds
 
 
-def release_provenance_required(env: dict[str, str]) -> bool:
-    """Release provenance is unconditional on mainnet; no environment variable
-    may waive it there. Other chains enforce it only when
-    QBIT_REQUIRE_RELEASE_PROVENANCE opts in."""
-    return env_value(env, "QBIT_CHAIN", "regtest") == "mainnet" or is_true(
-        env_value(env, "QBIT_REQUIRE_RELEASE_PROVENANCE", "0")
-    )
-
-
 def parse_decimal(value: str) -> Decimal:
     try:
-        return Decimal(value)
+        parsed = Decimal(value)
     except InvalidOperation as exc:
         raise ValueError(f"{value!r} is not a decimal number") from exc
-
-
-def capacity_configuration(env: dict[str, str]) -> dict[str, str]:
-    defaults = {
-        "PRISM_STRATUM_SHARE_DIFF": "0.000000001",
-        "PRISM_STRATUM_VARDIFF": "1",
-        "PRISM_STRATUM_VARDIFF_TARGET_SECONDS": "15",
-        "PRISM_STRATUM_VARDIFF_MIN_DIFF": "0.000000001",
-        "PRISM_STRATUM_VARDIFF_START_DIFF": "0.000000001",
-        "PRISM_STRATUM_VARDIFF_MAX_DIFF": "1024",
-        "PRISM_STRATUM_VARDIFF_RETARGET_SECONDS": "90",
-        "PRISM_STRATUM_VARDIFF_MAX_STEP_UP": "4",
-        "PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN": "4",
-        "PRISM_STRATUM_VARDIFF_EWMA_ALPHA": "0.4",
-        "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE": "0.25",
-        "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "15",
-        "PRISM_SHARE_COMMIT_BATCH_SIZE": "64",
-        "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS": "5",
-        "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS": "15",
-        "PRISM_STRATUM_SEND_TIMEOUT_SECONDS": "20",
-    }
-    return {name: env_value(env, name, defaults[name]) for name in CAPACITY_CONFIGURATION_KEYS}
+    if not parsed.is_finite():
+        raise ValueError(f"{value!r} is not a finite decimal number")
+    return parsed
 
 
 def parse_host_port(value: str, *, default_host: str, default_port: int) -> tuple[str, int]:
@@ -614,61 +577,6 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
                 "mining.production_difficulty",
                 "reviewed share and bounded vardiff values configured",
             )
-
-    if release_provenance_required(env):
-        capacity_path = env_value(env, "PRISM_CAPACITY_EVIDENCE_FILE").strip()
-        if not capacity_path:
-            reporter.fail(
-                "capacity.evidence",
-                "release provenance requires PRISM_CAPACITY_EVIDENCE_FILE",
-                hint="Qualify the deployed Stratum-to-Postgres path before accepting miners.",
-            )
-        else:
-            evidence_path = Path(capacity_path)
-            if not evidence_path.is_absolute():
-                evidence_path = ROOT_DIR / evidence_path
-            expected_subject = {
-                "coordinator_revision": env_value(env, "PRISM_CAPACITY_COORDINATOR_REVISION"),
-                "coordinator_image_digest": env_value(
-                    env, "PRISM_CAPACITY_COORDINATOR_IMAGE_DIGEST"
-                ),
-                "postgres_server_version": env_value(
-                    env, "PRISM_CAPACITY_POSTGRES_SERVER_VERSION"
-                ),
-                "database_profile_sha256": env_value(
-                    env, "PRISM_CAPACITY_DATABASE_PROFILE_SHA256"
-                ),
-            }
-            try:
-                summary = load_capacity_evidence(
-                    evidence_path,
-                    expected_configuration=capacity_configuration(env),
-                    expected_subject=expected_subject,
-                    expected_forecast_peak_shares_per_second=env_value(
-                        env, "PRISM_CAPACITY_FORECAST_PEAK_SHARES_PER_SECOND"
-                    ),
-                    expected_ack_p99_limit_milliseconds=env_value(
-                        env, "PRISM_CAPACITY_ACK_P99_LIMIT_MILLISECONDS"
-                    ),
-                    max_age_seconds=int(
-                        env_value(env, "PRISM_CAPACITY_EVIDENCE_MAX_AGE_SECONDS", "86400")
-                    ),
-                )
-            except (EvidenceError, ValueError) as exc:
-                reporter.fail("capacity.evidence", str(exc))
-            else:
-                reporter.pass_(
-                    "capacity.evidence",
-                    f"{summary.capacity_multiple}x forecast; "
-                    f"ACK p50={summary.ack_p50_milliseconds}ms "
-                    f"p99={summary.ack_p99_milliseconds}ms; "
-                    f"committed={summary.acknowledged_shares}",
-                )
-    else:
-        reporter.pass_(
-            "capacity.evidence",
-            "not required without QBIT_CHAIN=mainnet or QBIT_REQUIRE_RELEASE_PROVENANCE=1",
-        )
 
     if env_value(env, "PRISM_STRATUM_HIGHDIFF_PORT"):
         try:

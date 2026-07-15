@@ -65,12 +65,6 @@ services:
         target: ${PRISM_AUDIT_DIR:-/var/lib/qbit-prism/audit}
         bind:
           create_host_path: false
-      - type: bind
-        source: ${PRISM_CAPACITY_EVIDENCE_FILE:-/production-source-not-configured/prism/capacity-evidence.json}
-        target: /run/qbit-prism/capacity-evidence.json
-        read_only: true
-        bind:
-          create_host_path: false
 
   permissionless-miner:
     profiles: !override ["production-disabled"]

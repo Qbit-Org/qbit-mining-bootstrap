@@ -483,7 +483,13 @@ PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN=0
 ```
 
 For non-regtest deployments, also set `QBIT_PRODUCTION=1`, non-default qbit RPC
-credentials, non-default Postgres credentials, and chain-specific qbit settings.
+credentials, non-default Postgres credentials, chain-specific qbit settings,
+and explicit reviewed production values for `PRISM_STRATUM_SHARE_DIFF`,
+`PRISM_STRATUM_VARDIFF_MIN_DIFF`, `PRISM_STRATUM_VARDIFF_START_DIFF`, and
+`PRISM_STRATUM_VARDIFF_MAX_DIFF`. Production rejects the local-lab `1e-9`
+profile and requires `minimum <= start <= maximum`. Capacity qualification is
+optional and external to startup; see
+[docs/prism-capacity-readiness.md](docs/prism-capacity-readiness.md).
 
 Start the pool:
 
