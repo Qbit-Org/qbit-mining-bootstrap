@@ -75,6 +75,7 @@ class PrepareQbitSourceTests(unittest.TestCase):
         **overrides: str,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
+        env.pop("QBIT_GIT_COMMIT", None)
         env.update(
             {
                 "QBIT_PROVIDER": "source",
@@ -128,7 +129,11 @@ class PrepareQbitSourceTests(unittest.TestCase):
             deploy_env = root / "mainnet.env"
             deploy_env.write_text("QBIT_GIT_COMMIT=\n", encoding="utf-8")
 
-            result = self.run_script(checkout, DEPLOY_ENV_FILE=str(deploy_env))
+            result = self.run_script(
+                checkout,
+                DEPLOY_ENV_FILE=str(deploy_env),
+                QBIT_GIT_COMMIT="",
+            )
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("requires QBIT_GIT_COMMIT as exactly 40 hex characters", result.stderr)

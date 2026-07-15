@@ -152,6 +152,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         **overrides: str,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
+        env.pop("QBIT_GIT_COMMIT", None)
         env.update(overrides)
         return subprocess.run(
             ["/bin/bash", str(script), *arguments],
@@ -970,6 +971,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                         deploy_env.write_text("QBIT_GIT_COMMIT=\n", encoding="utf-8")
                         result = self.run_check_env(
                             DEPLOY_ENV_FILE=str(deploy_env),
+                            QBIT_GIT_COMMIT="",
                             **overrides,
                         )
 
