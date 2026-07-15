@@ -49,7 +49,7 @@ Notes:
 | Difficulty algorithm | ASERT |
 | ASERT half-life | `7200` seconds |
 | Difficulty timespan compatibility value | `1209600` seconds on public nets, `86400` on regtest |
-| AuxPoW chain ID | `31430` |
+| AuxPoW chain ID | `47` mainnet, `31430` testnet4 |
 | Max block serialized size | `2,000,000` bytes |
 | Max block weight | `2,000,000` |
 | Max sigops cost | `80,000` |
@@ -74,7 +74,8 @@ Constants:
 Operational consequences:
 
 - Permissionless blocks use `chain_id=0` and `auxpow=false`
-- AuxPoW blocks use `chain_id=31430` and `auxpow=true`
+- Mainnet AuxPoW blocks use `chain_id=47` and `auxpow=true`
+- Testnet4 AuxPoW blocks use `chain_id=31430` and `auxpow=true`
 - Pools should preserve the returned `version` from `getblocktemplate`
 - Manually setting reserved bits or the wrong chain ID causes header rejection
 

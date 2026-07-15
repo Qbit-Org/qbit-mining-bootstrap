@@ -12,7 +12,7 @@ The node caches the full candidate block after `createauxblock`, so the miner on
 Call `createauxblock` with a qbit payout address. qbit returns:
 
 - `hash`: aux block hash
-- `chainid`: qbit chain ID, currently `31430`
+- `chainid`: qbit chain ID, `47` on mainnet and `31430` on testnet4
 - `previousblockhash`
 - `coinbasevalue`
 - `bits`
@@ -61,7 +61,8 @@ index = rand & ((1 << merkle_height) - 1)
 
 For qbit:
 
-- `chain_id = 31430`
+- mainnet uses `chain_id = 47`
+- testnet4 uses `chain_id = 31430`
 - the chain merkle branch height must be at most `30`
 
 If the submitted `chain_index` does not match qbit's recomputation, the node rejects the block with `bad-auxpow-chain-index`.

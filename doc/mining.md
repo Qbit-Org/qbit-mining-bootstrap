@@ -32,7 +32,7 @@ Each `make` target stages a clean qbit tree before building containers, so host 
 | Max block serialized size / weight | `2,000,000` / `2,000,000` | No witness discount; size and weight track together |
 | Witness scale factor | `1` | Software assuming `4` will overestimate vsize and fee rates |
 | Coinbase maturity | `1000` blocks | Do not hardcode `100` |
-| AuxPoW chain ID | `31430` | Required for merge-mining slot selection and version layout |
+| AuxPoW chain ID | `47` mainnet, `31430` testnet4 | Required for merge-mining slot selection and version layout |
 | ASERT half-life | `2 hours` | Difficulty reacts faster than Bitcoin's epoch retarget |
 
 ## Address formats
