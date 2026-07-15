@@ -1,6 +1,6 @@
 [package]
 name = "qbit-pool-builder"
-version = "0.1.2"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "Deterministic qbit P2MR coinbase and payout manifest builder"

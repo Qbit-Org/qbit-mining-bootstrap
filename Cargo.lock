@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-pool-builder"
-version = "0.1.2"
+version = "1.0.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "hex",
  "qbit-pool-builder",
