@@ -1309,6 +1309,11 @@ components:
         created_at:
           $ref: "#/components/schemas/IsoTimestamp"
         transaction_id:
+          description: >-
+            Transaction carrying the recipient's on-chain output: the block's
+            coinbase txid for `transaction_kind=coinbase`, the CTV fanout txid
+            for `transaction_kind=ctv_fanout`, and null for
+            `transaction_kind=carry_forward`.
           oneOf:
             - $ref: "#/components/schemas/HexHash"
             - type: "null"
@@ -1316,6 +1321,11 @@ components:
           type: string
           enum: [coinbase, ctv_fanout, carry_forward]
         onchain_amount_bits:
+          description: >-
+            Value of the recipient's committed on-chain output. For
+            `ctv_fanout` rows this is the fanout output value (gross
+            entitlement minus the recipient's fanout fee share), so it never
+            exceeds the block's `net_earning_bits`.
           $ref: "#/components/schemas/Bits"
         carry_forward_balance_bits:
           $ref: "#/components/schemas/Bits"
