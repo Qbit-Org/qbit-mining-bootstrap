@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from lab.prism.ctv_broadcaster import (
     AWAITING_MATURITY,
@@ -80,11 +80,21 @@ class CtvFanoutBroadcastDaemon:
         self.broadcaster = broadcaster
         self.fee_sats = fee_sats
 
-    def run_once(self, *, limit: int = 100) -> CtvFanoutDaemonResult:
+    def run_once(
+        self,
+        *,
+        limit: int = 100,
+        progress_callback: Callable[[], None] | None = None,
+    ) -> CtvFanoutDaemonResult:
+        """Process one batch, notifying after each row path has completed."""
         rows = self.ledger.pending_ctv_fanout_statuses(limit=limit)
         submitted_count = 0
         updated_count = 0
         failed_count = 0
+
+        def record_progress() -> None:
+            if progress_callback is not None:
+                progress_callback()
 
         for row in rows:
             if str(row.get("settlement_status") or row.get("status") or "") in {
@@ -92,8 +102,10 @@ class CtvFanoutBroadcastDaemon:
                 "reorged",
                 "failed",
             }:
+                record_progress()
                 continue
             if not broadcast_attempt_due(row.get("next_broadcast_attempt_at")):
+                record_progress()
                 continue
             artifact = artifact_from_status_row(row)
             attempt = self.broadcaster.broadcast(artifact, self.fee_sats)
@@ -102,12 +114,14 @@ class CtvFanoutBroadcastDaemon:
                 self._journal_attempt(attempt, attempt_status="submitted")
                 # record_ctv_fanout_broadcast_attempt moves the durable row to
                 # broadcast_submitted, so do not double-update here.
+                record_progress()
                 continue
 
             if attempt.fee_sats is not None:
                 attempt_status = "planned" if attempt.package_msg == "error" else "rejected"
                 self._journal_attempt(attempt, attempt_status=attempt_status)
                 failed_count += 1
+                record_progress()
                 continue
 
             next_status = LEDGER_STATUS_BY_BROADCASTER_STATUS.get(attempt.status)
@@ -117,10 +131,12 @@ class CtvFanoutBroadcastDaemon:
                     settlement_status=next_status,
                 )
                 updated_count += 1
+                record_progress()
                 continue
 
             self._journal_attempt(attempt, attempt_status="failed")
             failed_count += 1
+            record_progress()
 
         return CtvFanoutDaemonResult(
             scanned_count=len(rows),

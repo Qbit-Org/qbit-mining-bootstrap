@@ -1068,6 +1068,26 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             metrics,
         )
 
+    def test_metrics_include_ctv_broadcaster_progress_and_pass_duration(self) -> None:
+        server = coordinator()
+        server._record_ctv_fanout_broadcaster_progress()
+        server._record_ctv_fanout_broadcaster_progress()
+        server.observe_ctv_fanout_broadcaster_pass(102.0)
+
+        metrics = server.metrics_payload()
+
+        self.assertIn("qbit_prism_ctv_fanout_broadcaster_processed_rows_total 2", metrics)
+        self.assertIn(
+            'qbit_prism_ctv_fanout_broadcaster_pass_seconds_bucket{le="60"} 0',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_ctv_fanout_broadcaster_pass_seconds_bucket{le="120"} 1',
+            metrics,
+        )
+        self.assertIn("qbit_prism_ctv_fanout_broadcaster_pass_seconds_sum 102.000000", metrics)
+        self.assertIn("qbit_prism_ctv_fanout_broadcaster_pass_seconds_count 1", metrics)
+
     def test_zero_worker_metric_limit_uses_overflow_bucket(self) -> None:
         server = coordinator()
         server.worker_metrics_limit = 0
@@ -5461,6 +5481,128 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             server._heartbeats["qbit_blockpoll"] = now - 1_000.0
 
         self.assertEqual(server._overdue_heartbeats(now), ["qbit_blockpoll"])
+
+    def test_progressing_ctv_pass_longer_than_watchdog_timeout_stays_healthy(self) -> None:
+        server = self._bare_coordinator()
+        server.ctv_broadcaster_limit = 200
+        server.ctv_broadcaster_interval_seconds = 30.0
+        clock = {"now": 0.0}
+        overdue_samples: list[list[str]] = []
+        seen_limits: list[int] = []
+
+        class StopAfterOnePass:
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, timeout: float) -> bool:
+                return True
+
+        class ProgressingDaemon:
+            def run_once(self, *, limit: int, progress_callback: object) -> object:
+                seen_limits.append(limit)
+                assert callable(progress_callback)
+                for _ in range(3):
+                    clock["now"] += 80.0
+                    overdue_samples.append(server._overdue_heartbeats(clock["now"]))
+                    progress_callback()
+                return SimpleNamespace(
+                    scanned_count=3,
+                    submitted_count=0,
+                    updated_count=3,
+                    failed_count=0,
+                )
+
+        server.stop_event = StopAfterOnePass()  # type: ignore[assignment]
+        server.ctv_fanout_broadcast_daemon = ProgressingDaemon()
+
+        with patch("lab.prism.prism_coordinator.time.monotonic", side_effect=lambda: clock["now"]), patch(
+            "builtins.print"
+        ):
+            server.ctv_fanout_broadcaster_loop()
+
+        self.assertGreater(clock["now"], server.watchdog_timeout_seconds)
+        self.assertEqual(seen_limits, [200])
+        self.assertEqual(overdue_samples, [[], [], []])
+        self.assertEqual(server.ctv_broadcaster_processed_rows_total, 3)
+        self.assertEqual(server.ctv_broadcaster_pass_count, 1)
+
+    def test_ctv_pass_completion_heartbeat_precedes_interval_wait(self) -> None:
+        server = self._bare_coordinator()
+        server.ctv_broadcaster_limit = 200
+        server.ctv_broadcaster_interval_seconds = 30.0
+        clock = {"now": 0.0}
+        wait_observation: dict[str, object] = {}
+
+        class StopAfterIntervalWait:
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, timeout: float) -> bool:
+                wait_observation["timeout"] = timeout
+                wait_observation["heartbeat"] = server._heartbeats["ctv_fanout_broadcaster"]
+                wait_observation["overdue_after_wait"] = server._overdue_heartbeats(
+                    clock["now"] + timeout
+                )
+                return True
+
+        class IncidentDurationDaemon:
+            def run_once(self, *, limit: int, progress_callback: object) -> object:
+                clock["now"] += 102.0
+                return SimpleNamespace(
+                    scanned_count=200,
+                    submitted_count=0,
+                    updated_count=200,
+                    failed_count=0,
+                )
+
+        server.stop_event = StopAfterIntervalWait()  # type: ignore[assignment]
+        server.ctv_fanout_broadcast_daemon = IncidentDurationDaemon()
+
+        with patch("lab.prism.prism_coordinator.time.monotonic", side_effect=lambda: clock["now"]), patch(
+            "builtins.print"
+        ):
+            server.ctv_fanout_broadcaster_loop()
+
+        self.assertEqual(wait_observation["timeout"], 30.0)
+        self.assertEqual(wait_observation["heartbeat"], 102.0)
+        self.assertEqual(wait_observation["overdue_after_wait"], [])
+
+    def test_ctv_pass_without_progress_remains_watchdog_eligible(self) -> None:
+        server = self._bare_coordinator()
+        server.ctv_broadcaster_limit = 200
+        server.ctv_broadcaster_interval_seconds = 30.0
+        clock = {"now": 0.0}
+        entered_row = threading.Event()
+        release_row = threading.Event()
+
+        class BlockingDaemon:
+            def run_once(self, *, limit: int, progress_callback: object) -> object:
+                entered_row.set()
+                release_row.wait()
+                return SimpleNamespace(
+                    scanned_count=1,
+                    submitted_count=0,
+                    updated_count=1,
+                    failed_count=0,
+                )
+
+        server.ctv_fanout_broadcast_daemon = BlockingDaemon()
+        broadcaster_thread = threading.Thread(target=server.ctv_fanout_broadcaster_loop)
+        with patch("lab.prism.prism_coordinator.time.monotonic", side_effect=lambda: clock["now"]), patch(
+            "builtins.print"
+        ):
+            broadcaster_thread.start()
+            self.assertTrue(entered_row.wait(timeout=1.0))
+            clock["now"] = server.watchdog_timeout_seconds + 1.0
+            self.assertEqual(
+                server._overdue_heartbeats(clock["now"]),
+                ["ctv_fanout_broadcaster"],
+            )
+            server.stop_event.set()
+            release_row.set()
+            broadcaster_thread.join(timeout=1.0)
+
+        self.assertFalse(broadcaster_thread.is_alive())
 
     def test_watchdog_pause_suppresses_known_long_critical_section(self) -> None:
         server = self._bare_coordinator()

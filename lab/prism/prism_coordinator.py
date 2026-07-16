@@ -32,7 +32,7 @@ from dataclasses import dataclass, field, replace as dataclass_replace
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import sys
 
@@ -128,6 +128,16 @@ PRISM_JOB_BUILD_SECONDS_BUCKETS = (
     5.0,
     10.0,
     30.0,
+)
+PRISM_CTV_BROADCASTER_SECONDS_BUCKETS = (
+    1.0,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
 )
 PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_JOB_BUILD_PHASES = ("reorg", "template", "merkle", "ledger", "bundle", "stamp", "send")
@@ -1292,6 +1302,13 @@ class PrismCoordinator:
             "PRISM_CTV_BROADCASTER_INTERVAL_SECONDS",
             30.0,
         )
+        self._ctv_broadcaster_metrics_lock = threading.Lock()
+        self.ctv_broadcaster_pass_seconds_bucket_counts = {
+            bucket: 0 for bucket in PRISM_CTV_BROADCASTER_SECONDS_BUCKETS
+        }
+        self.ctv_broadcaster_pass_seconds_sum = 0.0
+        self.ctv_broadcaster_pass_count = 0
+        self.ctv_broadcaster_processed_rows_total = 0
         self._ctv_fanout_market_fee_rate_cache: dict[tuple[int | None, str | None], int] = {}
         self.ctv_fanout_broadcast_daemon: CtvFanoutBroadcastDaemon | None = None
         self.lock = threading.RLock()
@@ -2192,6 +2209,35 @@ class PrismCoordinator:
         if not hasattr(self, "_watchdog_pauses"):
             self._watchdog_pauses = {}
 
+    def _ensure_ctv_broadcaster_metrics_state(self) -> None:
+        if not hasattr(self, "_ctv_broadcaster_metrics_lock"):
+            self._ctv_broadcaster_metrics_lock = threading.Lock()
+        if not hasattr(self, "ctv_broadcaster_pass_seconds_bucket_counts"):
+            self.ctv_broadcaster_pass_seconds_bucket_counts = {
+                bucket: 0 for bucket in PRISM_CTV_BROADCASTER_SECONDS_BUCKETS
+            }
+        if not hasattr(self, "ctv_broadcaster_pass_seconds_sum"):
+            self.ctv_broadcaster_pass_seconds_sum = 0.0
+        if not hasattr(self, "ctv_broadcaster_pass_count"):
+            self.ctv_broadcaster_pass_count = 0
+        if not hasattr(self, "ctv_broadcaster_processed_rows_total"):
+            self.ctv_broadcaster_processed_rows_total = 0
+
+    def _record_ctv_fanout_broadcaster_progress(self) -> None:
+        self._record_heartbeat("ctv_fanout_broadcaster")
+        self._ensure_ctv_broadcaster_metrics_state()
+        with self._ctv_broadcaster_metrics_lock:
+            self.ctv_broadcaster_processed_rows_total += 1
+
+    def observe_ctv_fanout_broadcaster_pass(self, elapsed_seconds: float) -> None:
+        self._ensure_ctv_broadcaster_metrics_state()
+        with self._ctv_broadcaster_metrics_lock:
+            self.ctv_broadcaster_pass_count += 1
+            self.ctv_broadcaster_pass_seconds_sum += elapsed_seconds
+            for bucket in PRISM_CTV_BROADCASTER_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    self.ctv_broadcaster_pass_seconds_bucket_counts[bucket] += 1
+
     def _ensure_worker_metrics_state(self) -> None:
         if not hasattr(self, "worker_metrics_lock"):
             self.worker_metrics_lock = threading.Lock()
@@ -2871,16 +2917,41 @@ class PrismCoordinator:
             fee_sats=self.ctv_broadcaster_fee_sats,
         )
 
-    def run_ctv_fanout_broadcaster_once(self) -> CtvFanoutDaemonResult:
+    def run_ctv_fanout_broadcaster_once(
+        self,
+        *,
+        progress_callback: Callable[[], None] | None = None,
+    ) -> CtvFanoutDaemonResult:
         if self.ctv_fanout_broadcast_daemon is None:
             self.ctv_fanout_broadcast_daemon = self.make_ctv_fanout_broadcast_daemon()
-        return self.ctv_fanout_broadcast_daemon.run_once(limit=self.ctv_broadcaster_limit)
+        if progress_callback is None:
+            return self.ctv_fanout_broadcast_daemon.run_once(limit=self.ctv_broadcaster_limit)
+        return self.ctv_fanout_broadcast_daemon.run_once(
+            limit=self.ctv_broadcaster_limit,
+            progress_callback=progress_callback,
+        )
 
     def ctv_fanout_broadcaster_loop(self) -> None:
         while not self.stop_event.is_set():
             self._record_heartbeat("ctv_fanout_broadcaster")
+            started = time.monotonic()
             try:
-                result = self.run_ctv_fanout_broadcaster_once()
+                try:
+                    result = self.run_ctv_fanout_broadcaster_once(
+                        progress_callback=self._record_ctv_fanout_broadcaster_progress,
+                    )
+                finally:
+                    # Stamp completion before logging or entering the interval
+                    # wait. A blocked row never reaches this finally clause, so
+                    # the watchdog remains able to recover a wedged operation.
+                    self._record_heartbeat("ctv_fanout_broadcaster")
+                    self.observe_ctv_fanout_broadcaster_pass(
+                        max(0.0, time.monotonic() - started)
+                    )
+            except Exception:
+                print("prism coordinator: CTV fanout broadcaster pass failed", flush=True)
+                traceback.print_exc()
+            else:
                 if result.scanned_count or result.submitted_count or result.failed_count:
                     print(
                         "prism coordinator: CTV fanout broadcaster "
@@ -2890,9 +2961,6 @@ class PrismCoordinator:
                         f"failed={result.failed_count}",
                         flush=True,
                     )
-            except Exception:
-                print("prism coordinator: CTV fanout broadcaster pass failed", flush=True)
-                traceback.print_exc()
             if self.stop_event.wait(self.ctv_broadcaster_interval_seconds):
                 break
 
@@ -6998,6 +7066,7 @@ class PrismCoordinator:
             "# TYPE qbit_prism_audit_artifact_scan_error gauge",
             f"qbit_prism_audit_artifact_scan_error {audit_metrics['scan_error']}",
         ]
+        lines.extend(self.ctv_fanout_broadcaster_metrics_lines())
         lines.extend(self.job_build_metrics_lines())
         lines.extend(self.tip_refresh_metrics_lines())
         return "\n".join(lines) + "\n"
@@ -7045,6 +7114,29 @@ class PrismCoordinator:
         if name.startswith("prism-live-audit-bundle-") and name.endswith(".json"):
             return "live_bundle"
         return "other"
+
+    def ctv_fanout_broadcaster_metrics_lines(self) -> list[str]:
+        self._ensure_ctv_broadcaster_metrics_state()
+        with self._ctv_broadcaster_metrics_lock:
+            bucket_counts = dict(self.ctv_broadcaster_pass_seconds_bucket_counts)
+            pass_sum = self.ctv_broadcaster_pass_seconds_sum
+            pass_count = self.ctv_broadcaster_pass_count
+            processed_rows_total = self.ctv_broadcaster_processed_rows_total
+        metric_name = "qbit_prism_ctv_fanout_broadcaster_pass_seconds"
+        return [
+            "# HELP qbit_prism_ctv_fanout_broadcaster_processed_rows_total CTV fanout rows completed by the broadcaster loop.",
+            "# TYPE qbit_prism_ctv_fanout_broadcaster_processed_rows_total counter",
+            f"qbit_prism_ctv_fanout_broadcaster_processed_rows_total {processed_rows_total}",
+            "# HELP qbit_prism_ctv_fanout_broadcaster_pass_seconds CTV fanout broadcaster pass wall time.",
+            "# TYPE qbit_prism_ctv_fanout_broadcaster_pass_seconds histogram",
+            *[
+                f'{metric_name}_bucket{{le="{bucket:g}"}} {bucket_counts.get(bucket, 0)}'
+                for bucket in PRISM_CTV_BROADCASTER_SECONDS_BUCKETS
+            ],
+            f'{metric_name}_bucket{{le="+Inf"}} {pass_count}',
+            f"{metric_name}_sum {pass_sum:.6f}",
+            f"{metric_name}_count {pass_count}",
+        ]
 
     def tip_refresh_metrics_lines(self) -> list[str]:
         self._ensure_tip_refresh_state()

@@ -15,7 +15,11 @@ from lab.prism.ctv_broadcaster import (
     REORGED,
     BroadcastAttempt,
 )
-from lab.prism.ctv_broadcaster_daemon import CtvFanoutBroadcastDaemon, artifact_from_status_row
+from lab.prism.ctv_broadcaster_daemon import (
+    CtvFanoutBroadcastDaemon,
+    CtvFanoutDaemonResult,
+    artifact_from_status_row,
+)
 from lab.prism.run_ctv_broadcaster_daemon import env_positive_int, make_daemon_from_env
 from lab.prism.prism_coordinator import JsonRpc
 
@@ -201,6 +205,72 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
         self.assertEqual(result.failed_count, 0)
         self.assertEqual(ledger.attempts, [])
         self.assertEqual(broadcaster.fees, [])
+
+    def test_progress_callback_covers_skipped_due_updated_submitted_and_failed_rows(self) -> None:
+        skipped_txid = "10" * 32
+        not_due_txid = "20" * 32
+        updated_txid = "30" * 32
+        submitted_txid = "40" * 32
+        failed_txid = "50" * 32
+        skipped = pending_row(skipped_txid)
+        skipped["settlement_status"] = "failed"
+        not_due = pending_row(not_due_txid)
+        not_due["next_broadcast_attempt_at"] = datetime.now(timezone.utc) + timedelta(minutes=5)
+        ledger = FakeLedger(
+            [
+                skipped,
+                not_due,
+                pending_row(updated_txid),
+                pending_row(submitted_txid),
+                pending_row(failed_txid),
+            ]
+        )
+        broadcaster = FakeBroadcaster(
+            {
+                updated_txid: BroadcastAttempt(updated_txid, CONFIRMED, submitted=False),
+                submitted_txid: BroadcastAttempt(
+                    submitted_txid,
+                    BROADCAST,
+                    submitted=True,
+                    fee_sats=900,
+                    package_msg="success",
+                ),
+                failed_txid: BroadcastAttempt(
+                    failed_txid,
+                    BROADCASTABLE,
+                    submitted=False,
+                    fee_sats=900,
+                    package_msg="rejected",
+                ),
+            }
+        )
+        progress_snapshots: list[tuple[int, int, int]] = []
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=900).run_once(
+            progress_callback=lambda: progress_snapshots.append(
+                (len(broadcaster.fees), len(ledger.updates), len(ledger.attempts))
+            )
+        )
+
+        self.assertEqual(
+            result,
+            CtvFanoutDaemonResult(
+                scanned_count=5,
+                submitted_count=1,
+                updated_count=1,
+                failed_count=1,
+            ),
+        )
+        self.assertEqual(
+            progress_snapshots,
+            [
+                (0, 0, 0),
+                (0, 0, 0),
+                (1, 1, 0),
+                (2, 1, 1),
+                (3, 1, 2),
+            ],
+        )
 
     def test_direct_parent_failure_is_journaled_without_terminal_rejection(self) -> None:
         fanout_txid = "45" * 32
