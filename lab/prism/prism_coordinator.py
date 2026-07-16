@@ -3394,11 +3394,25 @@ class PrismCoordinator:
             cached = getattr(self, "current_tip_parent", None)
             if cached is not None and cached[0] == tip_hash:
                 return cached[1]
+            first_seen = getattr(self, "current_tip_first_seen", None)
+            observed_sequence = (
+                int(getattr(self, "current_tip_observation_sequence", 0))
+                if first_seen is not None and first_seen[0] == tip_hash
+                else None
+            )
         parent = self._fetch_tip_parent_hash(tip_hash)
         if parent is None:
             return None
         with self.lock:
-            self.current_tip_parent = (tip_hash, parent)
+            current = getattr(self, "current_tip_first_seen", None)
+            if (
+                observed_sequence is not None
+                and current is not None
+                and current[0] == tip_hash
+                and int(getattr(self, "current_tip_observation_sequence", 0))
+                == observed_sequence
+            ):
+                self.current_tip_parent = (tip_hash, parent)
         return parent
 
     def stale_grace_deadline_open(

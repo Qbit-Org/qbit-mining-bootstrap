@@ -3689,6 +3689,29 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             (entry.context, PRISM_CREDIT_POLICY_STALE_GRACE),
         )
 
+    def test_slow_parent_lookup_cannot_overwrite_newer_tip_parent_cache(self) -> None:
+        old_tip = "00" * 32
+        old_parent = "ff" * 32
+        new_tip = "11" * 32
+        new_parent = old_tip
+        server = coordinator()
+        server.current_tip_first_seen = (old_tip, None)
+        server.current_tip_observation_sequence = 1
+        server.current_tip_parent = None
+
+        def overtake_parent_lookup(tip_hash: str) -> str:
+            self.assertEqual(tip_hash, old_tip)
+            with server.lock:
+                server.current_tip_first_seen = (new_tip, 100.0)
+                server.current_tip_observation_sequence = 2
+                server.current_tip_parent = (new_tip, new_parent)
+            return old_parent
+
+        server._fetch_tip_parent_hash = overtake_parent_lookup  # type: ignore[method-assign]
+
+        self.assertEqual(server.current_tip_parent_hash(old_tip), old_parent)
+        self.assertEqual(server.current_tip_parent, (new_tip, new_parent))
+
     def test_retained_same_tip_duplicate_remains_duplicate_share(self) -> None:
         tip = "00" * 32
         server, state, ledger = submit_coordinator(tip=tip)
