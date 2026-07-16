@@ -1370,6 +1370,53 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(workers), 8)
         self.assertEqual(rpc.validated, [PAYOUT_ADDRESS])
 
+    def test_concurrent_failed_worker_resolution_shares_singleflight_error(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        entered = threading.Event()
+        release = threading.Event()
+
+        class FailingAddressRpc:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def call(self, method: str, params: list[object] | None = None) -> object:
+                self.calls += 1
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release validateaddress")
+                raise RuntimeError("qbitd unavailable")
+
+        rpc = FailingAddressRpc()
+        server.rpc = rpc
+        server._ensure_p2mr_address_cache_state()
+        errors: list[BaseException] = []
+
+        def resolve() -> None:
+            try:
+                server.resolve_worker(PAYOUT_ADDRESS)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=resolve) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(entered.wait(timeout=5))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with server._p2mr_address_cache_lock:
+                pending = server._p2mr_address_validation_inflight[PAYOUT_ADDRESS]
+                if pending.waiters == 7:
+                    break
+            time.sleep(0.001)
+        self.assertEqual(pending.waiters, 7)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(rpc.calls, 1)
+        self.assertEqual(len(errors), 8)
+        self.assertTrue(all("qbitd unavailable" in str(exc) for exc in errors))
+
     def test_resolve_worker_rejects_invalid_base_address_with_worker_suffix(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
         rpc = AddressValidationRpc()
@@ -5507,6 +5554,25 @@ class PrismListenerProfileTests(unittest.TestCase):
         self.assertTrue(server.reserve_client_username(second, worker))
         self.assertEqual(server.connection_limit_rejection_counts["username"], 0)
 
+    def test_username_limit_does_not_count_idle_clients_for_empty_username(self) -> None:
+        server = coordinator()
+        server.stratum_max_connections_per_username = 1
+        idle = client()
+        first = client()
+        second = client()
+        server.clients.update({idle, first, second})
+        worker = WorkerIdentity(
+            username="",
+            payout_address=PAYOUT_ADDRESS,
+            worker_name=None,
+            script_pubkey_hex="5220" + "11" * 32,
+            p2mr_program_hex="11" * 32,
+        )
+
+        self.assertTrue(server.reserve_client_username(first, worker))
+        self.assertFalse(server.reserve_client_username(second, worker))
+        self.assertEqual(server.connection_limit_rejection_counts["username"], 1)
+
     def test_accept_loop_rejects_above_global_connection_limit(self) -> None:
         server = coordinator()
         server.stratum_max_connections = 1
@@ -5575,6 +5641,15 @@ class PrismListenerProfileTests(unittest.TestCase):
 
         self.assertEqual(listener.calls, 2)
         self.assertEqual(server.accept_resource_exhaustion_count, 1)
+
+    def test_resource_backoff_keeps_accept_watchdog_heartbeat_fresh(self) -> None:
+        server = coordinator()
+        server.stratum_accept_resource_exhaustion_backoff_seconds = 0.03
+        server.watchdog_timeout_seconds = 0.01
+
+        server._wait_after_stratum_resource_failure("stratum_accept")
+
+        self.assertFalse(server._overdue_heartbeats(time.monotonic()))
 
     def test_accept_loop_recovers_when_handler_thread_cannot_start(self) -> None:
         server = coordinator()

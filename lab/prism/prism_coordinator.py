@@ -738,6 +738,14 @@ class WorkerIdentity:
     p2mr_program_hex: str
 
 
+@dataclass
+class _P2mrAddressValidationFlight:
+    event: threading.Event = field(default_factory=threading.Event)
+    result: tuple[str, str] | None = None
+    error: BaseException | None = None
+    waiters: int = 0
+
+
 @dataclass(frozen=True)
 class PrismJobContext:
     job: direct_stratum.DirectQbitStratumJob
@@ -1133,7 +1141,9 @@ class PrismCoordinator:
         self.connection_setup_failure_count = 0
         self._p2mr_address_cache_lock = threading.Lock()
         self._p2mr_address_cache: dict[str, tuple[str, str]] = {}
-        self._p2mr_address_validation_inflight: dict[str, threading.Event] = {}
+        self._p2mr_address_validation_inflight: dict[
+            str, _P2mrAddressValidationFlight
+        ] = {}
         self.jobs: dict[str, PrismJobContext] = {}
         self.recent_share_keys: set[tuple[object, ...]] = set()
         self.connection_counter = 0
@@ -2195,7 +2205,7 @@ class PrismCoordinator:
                         location="accept",
                         error_number=exc.errno,
                     )
-                    self._wait_after_stratum_resource_failure()
+                    self._wait_after_stratum_resource_failure(profile.heartbeat_name)
                     continue
                 raise
 
@@ -2272,7 +2282,7 @@ class PrismCoordinator:
                         f"error={exc!r} count={setup_failure_count}",
                         flush=True,
                     )
-                self._wait_after_stratum_resource_failure()
+                self._wait_after_stratum_resource_failure(profile.heartbeat_name)
                 continue
 
     def _record_stratum_resource_exhaustion(
@@ -2296,13 +2306,29 @@ class PrismCoordinator:
             )
         return exhaustion_count
 
-    def _wait_after_stratum_resource_failure(self) -> None:
+    def _wait_after_stratum_resource_failure(self, heartbeat_name: str) -> None:
         backoff_seconds = getattr(
             self,
             "stratum_accept_resource_exhaustion_backoff_seconds",
             DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS,
         )
-        self.stop_event.wait(max(0.0, float(backoff_seconds)))
+        remaining_seconds = max(0.0, float(backoff_seconds))
+        watchdog_timeout_seconds = max(
+            0.001,
+            float(getattr(self, "watchdog_timeout_seconds", 120.0)),
+        )
+        heartbeat_interval_seconds = max(
+            0.001,
+            min(1.0, watchdog_timeout_seconds / 2.0),
+        )
+        deadline = time.monotonic() + remaining_seconds
+        while not self.stop_event.is_set():
+            self._record_heartbeat(heartbeat_name)
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                return
+            if self.stop_event.wait(min(remaining_seconds, heartbeat_interval_seconds)):
+                return
 
     def _ensure_connection_capacity_state(self) -> None:
         if not hasattr(self, "connection_limit_rejection_counts"):
@@ -2328,7 +2354,11 @@ class PrismCoordinator:
             active_for_username = sum(
                 1
                 for other in self.clients
-                if other is not client and other.username == worker.username
+                if (
+                    other is not client
+                    and other.worker is not None
+                    and other.username == worker.username
+                )
             )
             if limit > 0 and active_for_username >= limit:
                 rejection_count = self._note_connection_limit_rejection_locked("username")
@@ -3332,17 +3362,25 @@ class PrismCoordinator:
 
     def validate_p2mr_address(self, address: str, *, label: str) -> tuple[str, str]:
         self._ensure_p2mr_address_cache_state()
-        while True:
-            with self._p2mr_address_cache_lock:
-                cached = self._p2mr_address_cache.get(address)
-                if cached is not None:
-                    return cached
-                pending = self._p2mr_address_validation_inflight.get(address)
-                if pending is None:
-                    pending = threading.Event()
-                    self._p2mr_address_validation_inflight[address] = pending
-                    break
-            pending.wait()
+        with self._p2mr_address_cache_lock:
+            cached = self._p2mr_address_cache.get(address)
+            if cached is not None:
+                return cached
+            pending = self._p2mr_address_validation_inflight.get(address)
+            is_leader = pending is None
+            if pending is None:
+                pending = _P2mrAddressValidationFlight()
+                self._p2mr_address_validation_inflight[address] = pending
+            else:
+                pending.waiters += 1
+
+        if not is_leader:
+            pending.event.wait()
+            if pending.result is not None:
+                return pending.result
+            if pending.error is not None:
+                self._raise_shared_p2mr_address_validation_error(pending.error)
+            raise RuntimeError("payout address validation completed without a result")
 
         try:
             validation = self.rpc.call("validateaddress", [address])
@@ -3354,12 +3392,28 @@ class PrismCoordinator:
             result = (script, script[4:])
             with self._p2mr_address_cache_lock:
                 self._p2mr_address_cache[address] = result
+                pending.result = result
             return result
+        except BaseException as exc:
+            with self._p2mr_address_cache_lock:
+                pending.error = exc
+            raise
         finally:
             with self._p2mr_address_cache_lock:
-                completed = self._p2mr_address_validation_inflight.pop(address, None)
-                if completed is not None:
-                    completed.set()
+                if self._p2mr_address_validation_inflight.get(address) is pending:
+                    self._p2mr_address_validation_inflight.pop(address, None)
+                pending.event.set()
+
+    @staticmethod
+    def _raise_shared_p2mr_address_validation_error(error: BaseException) -> None:
+        if isinstance(error, StratumError):
+            raise StratumError(
+                error.code,
+                error.message,
+                reason=error.reason,
+                disconnect=error.disconnect,
+            ) from error
+        raise RuntimeError(str(error)) from error
 
     def _ensure_p2mr_address_cache_state(self) -> None:
         if not hasattr(self, "_p2mr_address_cache_lock"):
