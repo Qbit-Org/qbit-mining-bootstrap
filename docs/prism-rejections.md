@@ -43,10 +43,11 @@ coordinator retains their original immutable validation contexts for
 by `PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION` and
 `PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL`. Production requires the global
 cap to be positive but leaves `PRISM_STRATUM_MAX_CONNECTIONS=0` valid, so job
-retention is bounded independently of connection admission. A share submitted
-against one of these contexts uses the job's original worker, extranonce,
-template fingerprint, and share target; a later Vardiff change cannot alter its
-target.
+retention is bounded independently of connection admission. Outside production,
+a zero global retention cap disables global count eviction while the
+per-connection cap and TTL remain active. A share submitted against one of these
+contexts uses the job's original worker, extranonce, template fingerprint, and
+share target; a later Vardiff change cannot alter its target.
 It is accepted normally with no credit policy while its parent remains the
 current tip. When the tip changes, the same context immediately falls back to
 the ordinary stale-grace rules and is never extended by the same-tip window.

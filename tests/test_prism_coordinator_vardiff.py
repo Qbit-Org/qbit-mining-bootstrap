@@ -3611,6 +3611,22 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("same-1", server.evicted_job_graveyard)
         self.assertEqual(server.evicted_job_capacity_eviction_counts["global"], 1)
 
+    def test_zero_global_same_tip_cap_disables_global_eviction(self) -> None:
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.current_tip_first_seen = (tip, None)
+        server.same_tip_job_retention_per_connection = 10
+        server.same_tip_job_retention_global = 0
+
+        for index in range(2):
+            job_id = f"same-{index}"
+            server.jobs[job_id] = prism_context(job_id, tip, worker=state.worker)
+            server.bury_evicted_job(state, job_id)
+
+        self.assertIn("same-0", server.evicted_job_graveyard)
+        self.assertIn("same-1", server.evicted_job_graveyard)
+        self.assertEqual(server.evicted_job_capacity_eviction_counts["global"], 0)
+
     def test_tip_change_and_disconnect_remove_retained_contexts(self) -> None:
         old_tip = "00" * 32
         new_tip = "11" * 32

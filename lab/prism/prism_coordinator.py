@@ -3645,7 +3645,7 @@ class PrismCoordinator:
                 job_ids = self.evicted_same_tip_by_connection.get(candidate_connection_id)
 
         global_cap = int(self.same_tip_job_retention_global)
-        while len(self.evicted_same_tip_job_ids) > global_cap:
+        while global_cap > 0 and len(self.evicted_same_tip_job_ids) > global_cap:
             oldest_job_id = next(iter(self.evicted_same_tip_job_ids))
             self._remove_evicted_job_locked(oldest_job_id)
             self.evicted_job_capacity_eviction_counts["global"] += 1
