@@ -83,6 +83,7 @@ DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS = 30.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_GLOBAL = 4_096
+DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
 DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
@@ -872,6 +873,7 @@ class EvictedJobEntry:
     connection_id: int
     evicted_monotonic: float
     previousblockhash: str
+    client: ClientState | None = None
 
 
 @dataclass(frozen=True)
@@ -1253,7 +1255,11 @@ class PrismCoordinator:
         # the independent TTL and capacity limits. Prior-tip entries never
         # consume the same-tip caps while stale-grace still protects them.
         self.evicted_job_graveyard: OrderedDict[str, EvictedJobEntry] = OrderedDict()
+        self.evicted_jobs_by_connection: dict[int, OrderedDict[str, None]] = {}
         self.evicted_same_tip_by_connection: dict[int, OrderedDict[str, None]] = {}
+        self.evicted_same_tip_job_ids: OrderedDict[str, None] = OrderedDict()
+        self.evicted_job_index_tip_hash: str | None = None
+        self.evicted_job_next_prune_monotonic = 0.0
         self.evicted_job_expiration_counts = {
             job_class: 0 for job_class in PRISM_EVICTED_JOB_CLASSES
         }
@@ -2852,7 +2858,7 @@ class PrismCoordinator:
                         self.bury_evicted_job(client, job_id, prune=False)
                         self.jobs.pop(job_id, None)
                     client.active_job_ids.clear()
-                    self.prune_evicted_job_graveyard()
+                    self.prune_evicted_job_graveyard(force=False)
                 self.jobs[context.job.job_id] = context
                 client.active_job_ids.add(context.job.job_id)
                 self.prune_client_active_jobs(client)
@@ -2993,6 +2999,7 @@ class PrismCoordinator:
         try:
             snapshot = self.fetch_qbit_tip_template_snapshot()
             self.observe_tip_first_seen(snapshot.bestblockhash)
+            self.prune_evicted_job_graveyard(force=False)
             self.pool_readiness_latched()
             if not self.ensure_reorg_reconciled_for_tip(snapshot.bestblockhash):
                 raise TemplateRefreshBlocked(
@@ -3129,7 +3136,7 @@ class PrismCoordinator:
             # Reclassify formerly same-tip entries immediately. On mainnet the
             # zero stale-grace TTL removes them in this pass; on other chains
             # only the independently configured stale-grace lifetime applies.
-            self.prune_evicted_job_graveyard(now=now)
+            self.prune_evicted_job_graveyard(now=now, force=True)
 
     def current_tip_parent_hash(self, tip_hash: str) -> str | None:
         with self.lock:
@@ -3208,6 +3215,7 @@ class PrismCoordinator:
 
     def _ensure_evicted_job_state(self) -> None:
         graveyard = getattr(self, "evicted_job_graveyard", None)
+        rebuild_indexes = False
         if not isinstance(graveyard, OrderedDict):
             converted: OrderedDict[str, EvictedJobEntry] = OrderedDict()
             for job_id, entry in (graveyard or {}).items():
@@ -3215,15 +3223,37 @@ class PrismCoordinator:
                     converted[job_id] = entry
                     continue
                 context, connection_id, evicted_monotonic = entry
+                client = next(
+                    (
+                        candidate
+                        for candidate in getattr(self, "clients", ())
+                        if candidate.connection_id == connection_id
+                    ),
+                    None,
+                )
                 converted[job_id] = EvictedJobEntry(
                     context=context,
                     connection_id=connection_id,
                     evicted_monotonic=evicted_monotonic,
                     previousblockhash=str(context.template["previousblockhash"]),
+                    client=client,
                 )
             self.evicted_job_graveyard = converted
+            rebuild_indexes = True
+        if not hasattr(self, "evicted_jobs_by_connection"):
+            self.evicted_jobs_by_connection = {}
+            rebuild_indexes = True
         if not hasattr(self, "evicted_same_tip_by_connection"):
             self.evicted_same_tip_by_connection = {}
+            rebuild_indexes = True
+        if not hasattr(self, "evicted_same_tip_job_ids"):
+            self.evicted_same_tip_job_ids = OrderedDict()
+            rebuild_indexes = True
+        if not hasattr(self, "evicted_job_index_tip_hash"):
+            self.evicted_job_index_tip_hash = None
+            rebuild_indexes = True
+        if not hasattr(self, "evicted_job_next_prune_monotonic"):
+            self.evicted_job_next_prune_monotonic = 0.0
         if not hasattr(self, "evicted_job_expiration_counts"):
             self.evicted_job_expiration_counts = {
                 job_class: 0 for job_class in PRISM_EVICTED_JOB_CLASSES
@@ -3245,6 +3275,12 @@ class PrismCoordinator:
         if not hasattr(self, "same_tip_job_retention_global"):
             self.same_tip_job_retention_global = DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_GLOBAL
 
+        current_tip = self._current_observed_tip_hash_locked()
+        if self.evicted_job_index_tip_hash != current_tip:
+            rebuild_indexes = True
+        if rebuild_indexes:
+            self._rebuild_evicted_job_indexes_locked()
+
     def _current_observed_tip_hash_locked(self) -> str | None:
         first_seen = getattr(self, "current_tip_first_seen", None)
         if first_seen is not None:
@@ -3264,20 +3300,64 @@ class PrismCoordinator:
         entry = self.evicted_job_graveyard.pop(job_id, None)
         if entry is None:
             return None
+        connection_jobs = self.evicted_jobs_by_connection.get(entry.connection_id)
+        if connection_jobs is not None:
+            connection_jobs.pop(job_id, None)
+            if not connection_jobs:
+                self.evicted_jobs_by_connection.pop(entry.connection_id, None)
         connection_jobs = self.evicted_same_tip_by_connection.get(entry.connection_id)
         if connection_jobs is not None:
             connection_jobs.pop(job_id, None)
             if not connection_jobs:
                 self.evicted_same_tip_by_connection.pop(entry.connection_id, None)
+        self.evicted_same_tip_job_ids.pop(job_id, None)
         return entry
 
-    def _rebuild_evicted_same_tip_index_locked(self) -> None:
-        index: dict[int, OrderedDict[str, None]] = {}
+    def _index_evicted_job_locked(self, job_id: str, entry: EvictedJobEntry) -> None:
+        self.evicted_jobs_by_connection.setdefault(
+            entry.connection_id,
+            OrderedDict(),
+        )[job_id] = None
+        if self._evicted_job_class_locked(entry) != "same_tip":
+            return
+        self.evicted_same_tip_by_connection.setdefault(
+            entry.connection_id,
+            OrderedDict(),
+        )[job_id] = None
+        self.evicted_same_tip_job_ids[job_id] = None
+
+    def _rebuild_evicted_job_indexes_locked(self) -> None:
+        self.evicted_jobs_by_connection = {}
+        self.evicted_same_tip_by_connection = {}
+        self.evicted_same_tip_job_ids = OrderedDict()
         for job_id, entry in self.evicted_job_graveyard.items():
-            if self._evicted_job_class_locked(entry) != "same_tip":
-                continue
-            index.setdefault(entry.connection_id, OrderedDict())[job_id] = None
-        self.evicted_same_tip_by_connection = index
+            self._index_evicted_job_locked(job_id, entry)
+        self.evicted_job_index_tip_hash = self._current_observed_tip_hash_locked()
+        self._enforce_evicted_same_tip_capacity_locked()
+
+    def _enforce_evicted_same_tip_capacity_locked(
+        self,
+        connection_id: int | None = None,
+    ) -> None:
+        connection_ids = (
+            (connection_id,)
+            if connection_id is not None
+            else tuple(self.evicted_same_tip_by_connection)
+        )
+        per_connection_cap = int(self.same_tip_job_retention_per_connection)
+        for candidate_connection_id in connection_ids:
+            job_ids = self.evicted_same_tip_by_connection.get(candidate_connection_id)
+            while job_ids is not None and len(job_ids) > per_connection_cap:
+                oldest_job_id = next(iter(job_ids))
+                self._remove_evicted_job_locked(oldest_job_id)
+                self.evicted_job_capacity_eviction_counts["connection"] += 1
+                job_ids = self.evicted_same_tip_by_connection.get(candidate_connection_id)
+
+        global_cap = int(self.same_tip_job_retention_global)
+        while len(self.evicted_same_tip_job_ids) > global_cap:
+            oldest_job_id = next(iter(self.evicted_same_tip_job_ids))
+            self._remove_evicted_job_locked(oldest_job_id)
+            self.evicted_job_capacity_eviction_counts["global"] += 1
 
     def _stale_grace_entry_expired_locked(
         self,
@@ -3303,14 +3383,7 @@ class PrismCoordinator:
         if previous_tip is not None and entry.previousblockhash != previous_tip:
             return True
 
-        client = next(
-            (
-                candidate
-                for candidate in self.clients
-                if candidate.connection_id == entry.connection_id
-            ),
-            None,
-        )
+        client = entry.client
         if client is not None:
             delivered = client.tip_work_delivered
             if delivered is None or delivered[0] != current_tip:
@@ -3343,58 +3416,56 @@ class PrismCoordinator:
                 connection_id=client.connection_id,
                 evicted_monotonic=time.monotonic() if now is None else now,
                 previousblockhash=str(context.template["previousblockhash"]),
+                client=client,
             )
+            self._index_evicted_job_locked(job_id, self.evicted_job_graveyard[job_id])
+            self._enforce_evicted_same_tip_capacity_locked(client.connection_id)
             if prune:
-                self.prune_evicted_job_graveyard(now=now)
+                self.prune_evicted_job_graveyard(now=now, force=False)
 
-    def prune_evicted_job_graveyard(self, *, now: float | None = None) -> None:
+    def _evicted_job_expired_locked(
+        self,
+        entry: EvictedJobEntry,
+        *,
+        now: float,
+    ) -> tuple[str, bool]:
+        job_class = self._evicted_job_class_locked(entry)
+        if job_class == "same_tip":
+            ttl = float(self.same_tip_job_retention_seconds)
+            return job_class, ttl <= 0 or now - entry.evicted_monotonic > ttl
+        return job_class, self._stale_grace_entry_expired_locked(
+            entry,
+            now=now,
+            ttl=float(
+                getattr(
+                    self,
+                    "stale_grace_seconds",
+                    DEFAULT_PRISM_STALE_GRACE_SECONDS,
+                )
+            ),
+        )
+
+    def prune_evicted_job_graveyard(
+        self,
+        *,
+        now: float | None = None,
+        force: bool = True,
+    ) -> None:
         with self.lock:
             self._ensure_evicted_job_state()
             if not self.evicted_job_graveyard:
-                self.evicted_same_tip_by_connection = {}
                 return
             now = time.monotonic() if now is None else now
-            same_tip_ttl = float(self.same_tip_job_retention_seconds)
-            stale_grace_ttl = float(
-                getattr(self, "stale_grace_seconds", DEFAULT_PRISM_STALE_GRACE_SECONDS)
+            if not force and now < self.evicted_job_next_prune_monotonic:
+                return
+            self.evicted_job_next_prune_monotonic = (
+                now + DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS
             )
             for job_id, entry in tuple(self.evicted_job_graveyard.items()):
-                job_class = self._evicted_job_class_locked(entry)
-                if job_class == "same_tip":
-                    expired = (
-                        same_tip_ttl <= 0
-                        or now - entry.evicted_monotonic > same_tip_ttl
-                    )
-                else:
-                    expired = self._stale_grace_entry_expired_locked(
-                        entry,
-                        now=now,
-                        ttl=stale_grace_ttl,
-                    )
+                job_class, expired = self._evicted_job_expired_locked(entry, now=now)
                 if expired:
                     self._remove_evicted_job_locked(job_id)
                     self.evicted_job_expiration_counts[job_class] += 1
-
-            self._rebuild_evicted_same_tip_index_locked()
-            per_connection_cap = int(self.same_tip_job_retention_per_connection)
-            for connection_id, job_ids in tuple(self.evicted_same_tip_by_connection.items()):
-                while len(job_ids) > per_connection_cap:
-                    oldest_job_id = next(iter(job_ids))
-                    self._remove_evicted_job_locked(oldest_job_id)
-                    self.evicted_job_capacity_eviction_counts["connection"] += 1
-
-            self._rebuild_evicted_same_tip_index_locked()
-            global_cap = int(self.same_tip_job_retention_global)
-            same_tip_job_ids = [
-                job_id
-                for job_id, entry in self.evicted_job_graveyard.items()
-                if self._evicted_job_class_locked(entry) == "same_tip"
-            ]
-            while len(same_tip_job_ids) > global_cap:
-                oldest_job_id = same_tip_job_ids.pop(0)
-                self._remove_evicted_job_locked(oldest_job_id)
-                self.evicted_job_capacity_eviction_counts["global"] += 1
-            self._rebuild_evicted_same_tip_index_locked()
 
     def evicted_job_entry(
         self,
@@ -3402,13 +3473,19 @@ class PrismCoordinator:
         job_id: str,
     ) -> EvictedJobEntry | None:
         with self.lock:
-            self.prune_evicted_job_graveyard()
+            self._ensure_evicted_job_state()
             entry = getattr(self, "evicted_job_graveyard", {}).get(job_id)
-        if entry is None:
-            return None
-        if entry.connection_id != client.connection_id:
-            return None
-        return entry
+            if entry is None or entry.connection_id != client.connection_id:
+                return None
+            job_class, expired = self._evicted_job_expired_locked(
+                entry,
+                now=time.monotonic(),
+            )
+            if expired:
+                self._remove_evicted_job_locked(job_id)
+                self.evicted_job_expiration_counts[job_class] += 1
+                return None
+            return entry
 
     def evicted_submit_context(
         self,
@@ -3875,9 +3952,10 @@ class PrismCoordinator:
                     self.jobs.pop(job_id, None)
                 client.active_job_ids.clear()
                 self._ensure_evicted_job_state()
-                for job_id, entry in tuple(self.evicted_job_graveyard.items()):
-                    if entry.connection_id == client.connection_id:
-                        self._remove_evicted_job_locked(job_id)
+                for job_id in tuple(
+                    self.evicted_jobs_by_connection.get(client.connection_id, ())
+                ):
+                    self._remove_evicted_job_locked(job_id)
             client.close()
 
     def handle_request(self, client: ClientState, request: dict[str, object]) -> None:
@@ -4198,7 +4276,7 @@ class PrismCoordinator:
                     self.bury_evicted_job(client, job_id, prune=False)
                     self.jobs.pop(job_id, None)
                 client.active_job_ids.clear()
-                self.prune_evicted_job_graveyard()
+                self.prune_evicted_job_graveyard(force=False)
             self.jobs[context.job.job_id] = context
             client.active_job_ids.add(context.job.job_id)
             self.prune_client_active_jobs(client)
@@ -6321,14 +6399,11 @@ class PrismCoordinator:
                 getattr(self, "connection_setup_failure_count", 0)
             )
             self._ensure_evicted_job_state()
-            self.prune_evicted_job_graveyard()
+            self.prune_evicted_job_graveyard(force=False)
+            same_tip_context_count = len(self.evicted_same_tip_job_ids)
             evicted_job_context_counts = {
-                job_class: sum(
-                    1
-                    for entry in self.evicted_job_graveyard.values()
-                    if self._evicted_job_class_locked(entry) == job_class
-                )
-                for job_class in PRISM_EVICTED_JOB_CLASSES
+                "same_tip": same_tip_context_count,
+                "stale_grace": len(self.evicted_job_graveyard) - same_tip_context_count,
             }
             evicted_job_submit_counts = dict(self.evicted_job_submit_counts)
             evicted_job_expiration_counts = dict(self.evicted_job_expiration_counts)

@@ -3431,6 +3431,37 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.evicted_job_graveyard, {})
         self.assertEqual(server.evicted_job_expiration_counts["same_tip"], 2)
 
+    def test_evicted_job_hit_is_constant_work_at_global_cap(self) -> None:
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.current_tip_first_seen = (tip, None)
+        server.same_tip_job_retention_seconds = 30
+        server.same_tip_job_retention_per_connection = 4_096
+        server.same_tip_job_retention_global = 4_096
+        for index in range(4_096):
+            job_id = f"retained-{index}"
+            server.jobs[job_id] = prism_context(job_id, tip, worker=state.worker)
+            server.bury_evicted_job(state, job_id, now=100.0, prune=False)
+
+        self.assertEqual(len(server.evicted_job_graveyard), 4_096)
+        self.assertEqual(len(server.evicted_same_tip_job_ids), 4_096)
+        classify_calls = 0
+        original_classify = server._evicted_job_class_locked
+
+        def counted_classify(entry: object) -> str:
+            nonlocal classify_calls
+            classify_calls += 1
+            return original_classify(entry)
+
+        server._evicted_job_class_locked = counted_classify  # type: ignore[method-assign]
+        with patch("lab.prism.prism_coordinator.time.monotonic", return_value=101.0):
+            for _ in range(100):
+                self.assertIsNotNone(
+                    server.evicted_job_entry(state, "retained-2048")
+                )
+
+        self.assertEqual(classify_calls, 100)
+
     def test_global_same_tip_cap_does_not_evict_stale_grace_entry(self) -> None:
         old_tip = "00" * 32
         current_tip = "11" * 32
