@@ -694,6 +694,61 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(result, [2])
 
+    def test_shutdown_drains_inflight_tip_refresh_worker(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 1
+        state = client(1)
+        server.clients = {state}
+        worker_started = threading.Event()
+        worker_send_finished = threading.Event()
+        release_worker = threading.Event()
+        shutdown_complete = threading.Event()
+        poll_errors: list[BaseException] = []
+
+        def blocked_send(payload: dict[str, object]) -> None:
+            if payload["method"] != "mining.notify":
+                return
+            worker_started.set()
+            try:
+                self.assertTrue(release_worker.wait(5))
+            finally:
+                worker_send_finished.set()
+
+        def poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # noqa: BLE001 - surface to the test
+                poll_errors.append(exc)
+
+        def shutdown() -> None:
+            server.shutdown_tip_refresh_executor()
+            shutdown_complete.set()
+
+        state.send = blocked_send  # type: ignore[method-assign]
+        poll_thread = threading.Thread(target=poll)
+        shutdown_thread = threading.Thread(target=shutdown)
+        poll_thread.start()
+        try:
+            self.assertTrue(worker_started.wait(5))
+            server.stop_event.set()
+            shutdown_thread.start()
+            self.assertFalse(shutdown_complete.wait(0.05))
+            self.assertFalse(worker_send_finished.is_set())
+        finally:
+            release_worker.set()
+            shutdown_thread.join(5)
+            poll_thread.join(5)
+
+        self.assertFalse(shutdown_thread.is_alive())
+        self.assertFalse(poll_thread.is_alive())
+        self.assertTrue(shutdown_complete.is_set())
+        self.assertTrue(worker_send_finished.is_set())
+        self.assertEqual(poll_errors, [])
+        self.assertEqual(server.tip_refresh_inflight, 0)
+        with self.assertRaisesRegex(RuntimeError, "executor is shut down"):
+            server.tip_refresh_executor()
+
     def test_queued_fanout_stops_when_chain_view_becomes_untrusted(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)

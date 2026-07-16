@@ -1373,6 +1373,7 @@ class PrismCoordinator:
         self._tip_refresh_lock = threading.Lock()
         self._tip_refresh_executor_lock = threading.Lock()
         self._tip_refresh_executor: ThreadPoolExecutor | None = None
+        self._tip_refresh_executor_shutdown = False
         self.last_reorg_reconciled_tip_hash: str | None = None
         self.last_reorg_reconciled_trusted = False
         self.last_reorg_reconciled_monotonic: float | None = None
@@ -2163,6 +2164,8 @@ class PrismCoordinator:
             self._tip_refresh_executor_lock = threading.Lock()
         if not hasattr(self, "_tip_refresh_executor"):
             self._tip_refresh_executor: ThreadPoolExecutor | None = None
+        if not hasattr(self, "_tip_refresh_executor_shutdown"):
+            self._tip_refresh_executor_shutdown = False
         if not hasattr(self, "tip_refresh_max_workers"):
             self.tip_refresh_max_workers = DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS
         if not hasattr(self, "_tip_refresh_metrics_lock"):
@@ -2215,6 +2218,8 @@ class PrismCoordinator:
     def tip_refresh_executor(self) -> ThreadPoolExecutor:
         self._ensure_tip_refresh_state()
         with self._tip_refresh_executor_lock:
+            if self._tip_refresh_executor_shutdown:
+                raise RuntimeError("tip refresh executor is shut down")
             executor = self._tip_refresh_executor
             if executor is None:
                 executor = ThreadPoolExecutor(
@@ -2229,8 +2234,12 @@ class PrismCoordinator:
         with self._tip_refresh_executor_lock:
             executor = self._tip_refresh_executor
             self._tip_refresh_executor = None
+            self._tip_refresh_executor_shutdown = True
         if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+            # Running workers may already hold client/job state or be inside a
+            # socket send. Drain them before serve returns and the writer lease
+            # is released; queued workers are cancelled without starting.
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _record_heartbeat(self, name: str) -> None:
         self._ensure_watchdog_state()
