@@ -853,7 +853,7 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIsNone(second.active_job)
         self.assertEqual(second_sent, [])
 
-    def test_multiworker_cancel_waits_for_admitted_delivery_and_blocks_queue(self) -> None:
+    def test_multiworker_cancel_releases_client_lock_while_draining_peer(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 2
@@ -919,7 +919,14 @@ class JobBundleCacheTests(unittest.TestCase):
         try:
             self.assertTrue(admitted_send_started.wait(5))
             self.assertTrue(invalidation_started.wait(5))
-            self.assertFalse(invalidation_finished.wait(0.05))
+            self.assertTrue(invalidation_finished.wait(5))
+            lock_acquired = invalidating.job_update_lock.acquire(timeout=0.1)
+            self.assertTrue(lock_acquired)
+            if lock_acquired:
+                invalidating.job_update_lock.release()
+            # The coordinator still waits for the admitted peer delivery, but
+            # queued workers observe cancellation without taking client state.
+            self.assertTrue(thread.is_alive())
             self.assertIsNone(queued.active_job)
         finally:
             release_admitted_send.set()

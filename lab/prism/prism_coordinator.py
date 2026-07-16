@@ -926,10 +926,9 @@ class RefreshResult:
 class _FanoutCancellation:
     """Cancel a fanout without racing already-admitted deliveries.
 
-    Setting cancellation first closes admission to new deliveries, then waits
-    for deliveries that already passed the final gate. The public cancelled
-    state becomes visible immediately through ``is_set``; ``set`` returns only
-    when no peer can still mutate or send client work.
+    ``cancel`` closes admission without waiting, so workers can call it while
+    holding a client lock. The fanout coordinator calls ``set`` outside client
+    locks to wait for deliveries that already passed the final gate.
     """
 
     def __init__(self) -> None:
@@ -956,9 +955,13 @@ class _FanoutCancellation:
             if self._active_deliveries == 0:
                 self._condition.notify_all()
 
-    def set(self) -> None:
+    def cancel(self) -> None:
         with self._condition:
             self._cancelling = True
+
+    def set(self) -> None:
+        self.cancel()
+        with self._condition:
             while self._active_deliveries:
                 self._condition.wait()
 
@@ -2990,11 +2993,11 @@ class PrismCoordinator:
                     )
             except TemplateRefreshBlocked:
                 if cancel_event is not None:
-                    cancel_event.set()
+                    cancel_event.cancel()
                 raise
             except Exception as exc:
                 if cancel_event is not None:
-                    cancel_event.set()
+                    cancel_event.cancel()
                 raise TemplateRefreshBlocked(
                     "reorg reconciliation failed before prepared job delivery"
                 ) from exc
