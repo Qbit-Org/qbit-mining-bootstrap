@@ -60,6 +60,10 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_BLOCKWAIT_ENABLED": "0",
                 "PRISM_BLOCKWAIT_TIMEOUT_SECONDS": "13",
                 "PRISM_STRATUM_STALE_GRACE_SECONDS": "4",
+                "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS": "31",
+                "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION": "65",
+                "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL": "4097",
+                "PRISM_TIP_REFRESH_MAX_WORKERS": "7",
                 "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "19",
                 "PRISM_WORKER_METRICS_LIMIT": "8",
                 "PRISM_STRATUM_MAX_CONNECTIONS": "1900",
@@ -143,6 +147,13 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_BLOCKWAIT_ENABLED"], "0")
         self.assertEqual(env["PRISM_BLOCKWAIT_TIMEOUT_SECONDS"], "13")
         self.assertEqual(env["PRISM_STRATUM_STALE_GRACE_SECONDS"], "4")
+        self.assertEqual(env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS"], "31")
+        self.assertEqual(
+            env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION"],
+            "65",
+        )
+        self.assertEqual(env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL"], "4097")
+        self.assertEqual(env["PRISM_TIP_REFRESH_MAX_WORKERS"], "7")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS"], "19")
         self.assertEqual(env["PRISM_WORKER_METRICS_LIMIT"], "8")
         self.assertEqual(env["PRISM_STRATUM_MAX_CONNECTIONS"], "1900")

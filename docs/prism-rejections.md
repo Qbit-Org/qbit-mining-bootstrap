@@ -37,6 +37,18 @@ The window only opens on an observed tip flip, never at coordinator startup. PRI
 to satisfy the assigned share target and is recorded with
 `credit_policy=stale-grace`.
 
+Clean refreshes on the current tip are separate from stale grace. The
+coordinator retains their original immutable validation contexts for
+`PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS` (30 seconds by default), bounded
+by `PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION` and
+`PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL`. A share submitted against one of
+these contexts uses the job's original worker, extranonce, template
+fingerprint, and share target; a later Vardiff change cannot alter its target.
+It is accepted normally with no credit policy while its parent remains the
+current tip. When the tip changes, the same context immediately falls back to
+the ordinary stale-grace rules and is never extended by the same-tip window.
+Disconnecting a client removes all retained contexts for that connection.
+
 The existing broad counters remain for compatibility:
 
 - `qbit_prism_stale_shares_total`
@@ -51,6 +63,10 @@ Additional private metrics relevant to attribution and grace behavior:
 - `qbit_prism_worker_accepted_shares_total{worker="<bounded-label>"}`
 - `qbit_prism_worker_grace_credited_shares_total{worker="<bounded-label>"}`
 - `qbit_prism_worker_rejections_total{worker="<bounded-label>",reason_id="<id>"}`
+- `qbit_prism_evicted_job_contexts{class="same_tip|stale_grace"}`
+- `qbit_prism_evicted_job_submits_total{outcome="accepted_same_tip|credited_stale_grace"}`
+- `qbit_prism_evicted_job_expirations_total{class="same_tip|stale_grace"}`
+- `qbit_prism_evicted_job_capacity_evictions_total{scope="connection|global"}`
 
 `PRISM_WORKER_METRICS_LIMIT` caps distinct worker labels. New workers beyond
 the cap aggregate into `_other`.

@@ -79,6 +79,10 @@ DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS = 1.0
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES = 4_096
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
 DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
+DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS = 30.0
+DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
+DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_GLOBAL = 4_096
+DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
@@ -102,10 +106,9 @@ DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS = 120
 # digest is unchanged) while keeping the query O(window), not O(ledger history).
 PRISM_REWARD_WINDOW_MULTIPLIER = 8
 PRISM_SNAPSHOT_WINDOW_MARGIN = 2
-# Evicted jobs are retained briefly so shares already in flight when a
-# clean_jobs refresh evicted their job can still be validated instead of
-# bouncing as unknown-job. Retention is age-bounded by the stale-grace window;
-# a global count cap would create false unknown-job rejects on large refreshes.
+# Evicted jobs remain tied to their immutable validation context. Current-tip
+# entries use an independent bounded TTL; once their tip is replaced, only the
+# existing stale-grace lifetime and eligibility rules can retain/credit them.
 # Extranonce1 placeholder used for the shared per-template job build. The
 # stratum coinbase split cuts the whole extranonce window (extranonce1 +
 # zeroed extranonce2) out of coinb1/coinb2, so the placeholder value never
@@ -127,6 +130,10 @@ PRISM_JOB_BUILD_SECONDS_BUCKETS = (
 )
 PRISM_JOB_BUILD_PHASES = ("reorg", "template", "merkle", "ledger", "bundle", "stamp", "send")
 PRISM_JOB_CACHE_KINDS = ("template", "bundle")
+PRISM_TIP_REFRESH_RESULTS = ("sent", "skipped", "disconnected", "failed")
+PRISM_EVICTED_JOB_CLASSES = ("same_tip", "stale_grace")
+PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = ("accepted_same_tip", "credited_stale_grace")
+PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection", "global")
 PRISM_REJECTION_STALE_JOB = "stale-job"
 PRISM_REJECTION_DUPLICATE_SHARE = "duplicate-share"
 PRISM_REJECTION_LOW_DIFFICULTY = "low-difficulty"
@@ -857,6 +864,20 @@ class CachedJobBundle:
     built_monotonic: float
 
 
+@dataclass(frozen=True)
+class EvictedJobEntry:
+    context: PrismJobContext
+    connection_id: int
+    evicted_monotonic: float
+    previousblockhash: str
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    result: str
+    delivered_monotonic: float | None = None
+
+
 @dataclass(eq=False)
 class ClientState:
     sock: socket.socket
@@ -898,6 +919,11 @@ class ClientState:
     # received replacement work, however long the refresh pass took to reach
     # it. See stale_grace_deadline_open.
     tip_work_delivered: tuple[str, float] | None = None
+    # Serializes every job build/register/send transition for this connection.
+    # The coordinator lock may be acquired while this lock is held, never in
+    # the reverse order. RLock permits authorize/retarget helpers to call the
+    # common maybe_send_job path while retaining the same serialization scope.
+    job_update_lock: threading.RLock = field(default_factory=threading.RLock)
     send_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def send(self, payload: dict[str, object]) -> None:
@@ -982,6 +1008,38 @@ class PrismCoordinator:
             "PRISM_STRATUM_STALE_GRACE_SECONDS",
             DEFAULT_PRISM_STALE_GRACE_SECONDS,
         )
+        self.same_tip_job_retention_seconds = env_nonnegative_float(
+            "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS",
+            DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS,
+        )
+        self.same_tip_job_retention_per_connection = env_nonnegative_int(
+            "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION",
+            DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION,
+        )
+        self.same_tip_job_retention_global = env_nonnegative_int(
+            "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL",
+            DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_GLOBAL,
+        )
+        if self.same_tip_job_retention_seconds > 0:
+            if self.same_tip_job_retention_per_connection <= 0:
+                raise SystemExit(
+                    "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION must be positive "
+                    "when same-tip retention is enabled"
+                )
+            if self.same_tip_job_retention_global <= 0:
+                raise SystemExit(
+                    "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL must be positive "
+                    "when same-tip retention is enabled"
+                )
+        self.tip_refresh_max_workers = env_positive_int(
+            "PRISM_TIP_REFRESH_MAX_WORKERS",
+            DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS,
+        )
+        if self.tip_refresh_max_workers > DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS:
+            raise SystemExit(
+                "PRISM_TIP_REFRESH_MAX_WORKERS cannot exceed "
+                f"{DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS}"
+            )
         self.vardiff_idle_sweep_seconds = env_nonnegative_float(
             "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS",
             DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS,
@@ -1177,9 +1235,20 @@ class PrismCoordinator:
         self.worker_metrics_lock = threading.Lock()
         self.worker_share_counts: dict[str, dict[str, int]] = {}
         self.worker_rejection_counts: dict[tuple[str, str], int] = {}
-        # job_id -> (context, connection_id, evicted_monotonic); see
-        # bury_evicted_job.
-        self.evicted_job_graveyard: dict[str, tuple[PrismJobContext, int, float]] = {}
+        # Globally insertion ordered, with a same-tip per-connection index for
+        # the independent TTL and capacity limits. Prior-tip entries never
+        # consume the same-tip caps while stale-grace still protects them.
+        self.evicted_job_graveyard: OrderedDict[str, EvictedJobEntry] = OrderedDict()
+        self.evicted_same_tip_by_connection: dict[int, OrderedDict[str, None]] = {}
+        self.evicted_job_expiration_counts = {
+            job_class: 0 for job_class in PRISM_EVICTED_JOB_CLASSES
+        }
+        self.evicted_job_capacity_eviction_counts = {
+            scope: 0 for scope in PRISM_EVICTED_JOB_CAPACITY_SCOPES
+        }
+        self.evicted_job_submit_counts = {
+            outcome: 0 for outcome in PRISM_EVICTED_JOB_SUBMIT_OUTCOMES
+        }
         # (tip_hash, flip_monotonic_or_None) / (tip_hash, parent_hash) caches.
         # The stamp is when the refresh path saw the tip CHANGE; None marks the
         # startup baseline tip, which never opens the stale-grace window.
@@ -2669,6 +2738,10 @@ class PrismCoordinator:
             # a change away from a previously observed tip records a flip time.
             self.current_tip_first_seen = (tip_hash, now if first_seen is not None else None)
             self.current_tip_parent = None
+            # Reclassify formerly same-tip entries immediately. On mainnet the
+            # zero stale-grace TTL removes them in this pass; on other chains
+            # only the independently configured stale-grace lifetime applies.
+            self.prune_evicted_job_graveyard(now=now)
 
     def current_tip_parent_hash(self, tip_hash: str) -> str | None:
         with self.lock:
@@ -2745,59 +2818,177 @@ class PrismCoordinator:
             if delivered is None or delivered[0] != job_parent_hash:
                 client.tip_work_delivered = (job_parent_hash, now)
 
-    def bury_evicted_job(self, client: ClientState, job_id: str, *, now: float | None = None) -> None:
-        context = self.jobs.get(job_id)
-        if context is None:
-            return
+    def _ensure_evicted_job_state(self) -> None:
         graveyard = getattr(self, "evicted_job_graveyard", None)
-        if graveyard is None:
-            graveyard = {}
-            self.evicted_job_graveyard = graveyard
-        graveyard[job_id] = (context, client.connection_id, time.monotonic() if now is None else now)
-        self.prune_evicted_job_graveyard(now=now)
+        if not isinstance(graveyard, OrderedDict):
+            converted: OrderedDict[str, EvictedJobEntry] = OrderedDict()
+            for job_id, entry in (graveyard or {}).items():
+                if isinstance(entry, EvictedJobEntry):
+                    converted[job_id] = entry
+                    continue
+                context, connection_id, evicted_monotonic = entry
+                converted[job_id] = EvictedJobEntry(
+                    context=context,
+                    connection_id=connection_id,
+                    evicted_monotonic=evicted_monotonic,
+                    previousblockhash=str(context.template["previousblockhash"]),
+                )
+            self.evicted_job_graveyard = converted
+        if not hasattr(self, "evicted_same_tip_by_connection"):
+            self.evicted_same_tip_by_connection = {}
+        if not hasattr(self, "evicted_job_expiration_counts"):
+            self.evicted_job_expiration_counts = {
+                job_class: 0 for job_class in PRISM_EVICTED_JOB_CLASSES
+            }
+        if not hasattr(self, "evicted_job_capacity_eviction_counts"):
+            self.evicted_job_capacity_eviction_counts = {
+                scope: 0 for scope in PRISM_EVICTED_JOB_CAPACITY_SCOPES
+            }
+        if not hasattr(self, "evicted_job_submit_counts"):
+            self.evicted_job_submit_counts = {
+                outcome: 0 for outcome in PRISM_EVICTED_JOB_SUBMIT_OUTCOMES
+            }
+        if not hasattr(self, "same_tip_job_retention_seconds"):
+            self.same_tip_job_retention_seconds = DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS
+        if not hasattr(self, "same_tip_job_retention_per_connection"):
+            self.same_tip_job_retention_per_connection = (
+                DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION
+            )
+        if not hasattr(self, "same_tip_job_retention_global"):
+            self.same_tip_job_retention_global = DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_GLOBAL
+
+    def _current_observed_tip_hash_locked(self) -> str | None:
+        first_seen = getattr(self, "current_tip_first_seen", None)
+        if first_seen is not None:
+            return str(first_seen[0])
+        snapshot = getattr(self, "tip_template_snapshot", None)
+        if snapshot is not None:
+            return str(snapshot.bestblockhash)
+        return None
+
+    def _evicted_job_class_locked(self, entry: EvictedJobEntry) -> str:
+        current_tip = self._current_observed_tip_hash_locked()
+        if current_tip is None or entry.previousblockhash == current_tip:
+            return "same_tip"
+        return "stale_grace"
+
+    def _remove_evicted_job_locked(self, job_id: str) -> EvictedJobEntry | None:
+        entry = self.evicted_job_graveyard.pop(job_id, None)
+        if entry is None:
+            return None
+        connection_jobs = self.evicted_same_tip_by_connection.get(entry.connection_id)
+        if connection_jobs is not None:
+            connection_jobs.pop(job_id, None)
+            if not connection_jobs:
+                self.evicted_same_tip_by_connection.pop(entry.connection_id, None)
+        return entry
+
+    def _rebuild_evicted_same_tip_index_locked(self) -> None:
+        index: dict[int, OrderedDict[str, None]] = {}
+        for job_id, entry in self.evicted_job_graveyard.items():
+            if self._evicted_job_class_locked(entry) != "same_tip":
+                continue
+            index.setdefault(entry.connection_id, OrderedDict())[job_id] = None
+        self.evicted_same_tip_by_connection = index
+
+    def bury_evicted_job(
+        self,
+        client: ClientState,
+        job_id: str,
+        *,
+        now: float | None = None,
+        prune: bool = True,
+    ) -> None:
+        with self.lock:
+            self._ensure_evicted_job_state()
+            context = self.jobs.get(job_id)
+            if context is None:
+                return
+            self._remove_evicted_job_locked(job_id)
+            self.evicted_job_graveyard[job_id] = EvictedJobEntry(
+                context=context,
+                connection_id=client.connection_id,
+                evicted_monotonic=time.monotonic() if now is None else now,
+                previousblockhash=str(context.template["previousblockhash"]),
+            )
+            if prune:
+                self.prune_evicted_job_graveyard(now=now)
 
     def prune_evicted_job_graveyard(self, *, now: float | None = None) -> None:
-        graveyard = getattr(self, "evicted_job_graveyard", None)
-        if not graveyard:
-            return
-        now = time.monotonic() if now is None else now
-        grace_seconds = float(getattr(self, "stale_grace_seconds", DEFAULT_PRISM_STALE_GRACE_SECONDS))
-        max_age = max(1.0, grace_seconds)
-        for job_id, (_context, _connection_id, evicted_at) in tuple(graveyard.items()):
-            if now - evicted_at > max_age:
-                graveyard.pop(job_id, None)
-        # Do not apply a global count cap here. Dropping unexpired entries
-        # creates false unknown-job rejects for shares already in flight during
-        # a clean_jobs refresh burst, exactly the case stale-grace exists to
-        # cover. The grace age bound still limits retention.
+        with self.lock:
+            self._ensure_evicted_job_state()
+            if not self.evicted_job_graveyard:
+                self.evicted_same_tip_by_connection = {}
+                return
+            now = time.monotonic() if now is None else now
+            same_tip_ttl = float(self.same_tip_job_retention_seconds)
+            stale_grace_ttl = float(
+                getattr(self, "stale_grace_seconds", DEFAULT_PRISM_STALE_GRACE_SECONDS)
+            )
+            for job_id, entry in tuple(self.evicted_job_graveyard.items()):
+                job_class = self._evicted_job_class_locked(entry)
+                ttl = same_tip_ttl if job_class == "same_tip" else stale_grace_ttl
+                if ttl <= 0 or now - entry.evicted_monotonic > ttl:
+                    self._remove_evicted_job_locked(job_id)
+                    self.evicted_job_expiration_counts[job_class] += 1
+
+            self._rebuild_evicted_same_tip_index_locked()
+            per_connection_cap = int(self.same_tip_job_retention_per_connection)
+            for connection_id, job_ids in tuple(self.evicted_same_tip_by_connection.items()):
+                while len(job_ids) > per_connection_cap:
+                    oldest_job_id = next(iter(job_ids))
+                    self._remove_evicted_job_locked(oldest_job_id)
+                    self.evicted_job_capacity_eviction_counts["connection"] += 1
+
+            self._rebuild_evicted_same_tip_index_locked()
+            global_cap = int(self.same_tip_job_retention_global)
+            same_tip_job_ids = [
+                job_id
+                for job_id, entry in self.evicted_job_graveyard.items()
+                if self._evicted_job_class_locked(entry) == "same_tip"
+            ]
+            while len(same_tip_job_ids) > global_cap:
+                oldest_job_id = same_tip_job_ids.pop(0)
+                self._remove_evicted_job_locked(oldest_job_id)
+                self.evicted_job_capacity_eviction_counts["global"] += 1
+            self._rebuild_evicted_same_tip_index_locked()
 
     def evicted_job_entry(
         self,
         client: ClientState,
         job_id: str,
-    ) -> tuple[PrismJobContext, int, float] | None:
+    ) -> EvictedJobEntry | None:
         with self.lock:
             self.prune_evicted_job_graveyard()
             entry = getattr(self, "evicted_job_graveyard", {}).get(job_id)
         if entry is None:
             return None
-        _context, connection_id, _evicted_at = entry
-        if connection_id != client.connection_id:
+        if entry.connection_id != client.connection_id:
             return None
         return entry
 
     def evicted_submit_context(
         self,
         client: ClientState,
-        entry: tuple[PrismJobContext, int, float],
+        entry: EvictedJobEntry,
         current_tip: str,
     ) -> tuple[PrismJobContext, str | None] | None:
-        context, _connection_id, _evicted_at = entry
+        context = entry.context
         if str(context.template["previousblockhash"]) == current_tip:
             return context, None
         if not self.context_eligible_for_stale_grace(client, context, current_tip):
             return None
         return context, PRISM_CREDIT_POLICY_STALE_GRACE
+
+    def note_evicted_job_submit(self, credit_policy: str | None) -> None:
+        outcome = (
+            "credited_stale_grace"
+            if credit_policy == PRISM_CREDIT_POLICY_STALE_GRACE
+            else "accepted_same_tip"
+        )
+        with self.lock:
+            self._ensure_evicted_job_state()
+            self.evicted_job_submit_counts[outcome] += 1
 
     def refresh_jobs_after_pending_accepted_block(self, client: ClientState) -> int:
         with self.lock:
@@ -3234,12 +3425,17 @@ class PrismCoordinator:
                 self.disconnect_client(client)
 
     def disconnect_client(self, client: ClientState) -> None:
-        with self.lock:
-            self.clients.discard(client)
-            for job_id in client.active_job_ids:
-                self.jobs.pop(job_id, None)
-            client.active_job_ids.clear()
-        client.close()
+        with client.job_update_lock:
+            with self.lock:
+                self.clients.discard(client)
+                for job_id in client.active_job_ids:
+                    self.jobs.pop(job_id, None)
+                client.active_job_ids.clear()
+                self._ensure_evicted_job_state()
+                for job_id, entry in tuple(self.evicted_job_graveyard.items()):
+                    if entry.connection_id == client.connection_id:
+                        self._remove_evicted_job_locked(job_id)
+            client.close()
 
     def handle_request(self, client: ClientState, request: dict[str, object]) -> None:
         method = request.get("method")
@@ -3533,9 +3729,10 @@ class PrismCoordinator:
         with self.lock:
             if clean_jobs:
                 for job_id in client.active_job_ids:
-                    self.bury_evicted_job(client, job_id)
+                    self.bury_evicted_job(client, job_id, prune=False)
                     self.jobs.pop(job_id, None)
                 client.active_job_ids.clear()
+                self.prune_evicted_job_graveyard()
             self.jobs[context.job.job_id] = context
             client.active_job_ids.add(context.job.job_id)
             self.prune_client_active_jobs(client)
@@ -3889,7 +4086,7 @@ class PrismCoordinator:
             context = self.jobs.get(job_id)
             if context is not None and job_id not in client.active_job_ids:
                 context = None
-        evicted_entry: tuple[PrismJobContext, int, float] | None = None
+        evicted_entry: EvictedJobEntry | None = None
         if context is None:
             evicted_entry = self.evicted_job_entry(client, job_id)
             if evicted_entry is None:
@@ -3931,7 +4128,7 @@ class PrismCoordinator:
             if evicted_context is None:
                 self.reject_stratum(
                     21,
-                    PRISM_REJECTION_UNKNOWN_JOB,
+                    PRISM_REJECTION_STALE_JOB,
                     "stale job",
                     worker=worker_name,
                 )
@@ -4035,6 +4232,8 @@ class PrismCoordinator:
                     pending_share,
                     credit_policy=credit_policy,
                 )
+                if evicted_entry is not None:
+                    self.note_evicted_job_submit(credit_policy)
             except BaseException:
                 with self.lock:
                     self.recent_share_keys.discard(share_key)
@@ -4103,6 +4302,8 @@ class PrismCoordinator:
                 finish = getattr(self.ledger, "mark_block_candidate_submitted", None)
                 if callable(finish):
                     finish(block_hash=submission.block_hash_hex)
+                if evicted_entry is not None:
+                    self.note_evicted_job_submit(credit_policy)
             return False
         # A block-worthy submission that met the share target is a valid share
         # regardless of the block's fate: credit it now, acknowledge the miner
@@ -4119,6 +4320,8 @@ class PrismCoordinator:
                 credit_policy=credit_policy,
                 candidate_intent=candidate_intent,
             )
+            if evicted_entry is not None:
+                self.note_evicted_job_submit(credit_policy)
         except BaseException:
             with self.lock:
                 self.recent_share_keys.discard(share_key)
@@ -5600,6 +5803,21 @@ class PrismCoordinator:
             connection_setup_failure_count = int(
                 getattr(self, "connection_setup_failure_count", 0)
             )
+            self._ensure_evicted_job_state()
+            self.prune_evicted_job_graveyard()
+            evicted_job_context_counts = {
+                job_class: sum(
+                    1
+                    for entry in self.evicted_job_graveyard.values()
+                    if self._evicted_job_class_locked(entry) == job_class
+                )
+                for job_class in PRISM_EVICTED_JOB_CLASSES
+            }
+            evicted_job_submit_counts = dict(self.evicted_job_submit_counts)
+            evicted_job_expiration_counts = dict(self.evicted_job_expiration_counts)
+            evicted_job_capacity_eviction_counts = dict(
+                self.evicted_job_capacity_eviction_counts
+            )
         self._ensure_worker_metrics_state()
         with self.worker_metrics_lock:
             worker_share_counts = {
@@ -5750,6 +5968,30 @@ class PrismCoordinator:
             "# HELP qbit_prism_active_job_contexts Current retained PRISM job contexts.",
             "# TYPE qbit_prism_active_job_contexts gauge",
             f"qbit_prism_active_job_contexts {len(getattr(self, 'jobs', {}))}",
+            "# HELP qbit_prism_evicted_job_contexts Evicted job contexts retained by safety class.",
+            "# TYPE qbit_prism_evicted_job_contexts gauge",
+            *[
+                f'qbit_prism_evicted_job_contexts{{class="{job_class}"}} {evicted_job_context_counts[job_class]}'
+                for job_class in PRISM_EVICTED_JOB_CLASSES
+            ],
+            "# HELP qbit_prism_evicted_job_submits_total Accepted submits validated against an evicted job context.",
+            "# TYPE qbit_prism_evicted_job_submits_total counter",
+            *[
+                f'qbit_prism_evicted_job_submits_total{{outcome="{outcome}"}} {int(evicted_job_submit_counts.get(outcome, 0))}'
+                for outcome in PRISM_EVICTED_JOB_SUBMIT_OUTCOMES
+            ],
+            "# HELP qbit_prism_evicted_job_expirations_total Retained job contexts removed after their class TTL.",
+            "# TYPE qbit_prism_evicted_job_expirations_total counter",
+            *[
+                f'qbit_prism_evicted_job_expirations_total{{class="{job_class}"}} {int(evicted_job_expiration_counts.get(job_class, 0))}'
+                for job_class in PRISM_EVICTED_JOB_CLASSES
+            ],
+            "# HELP qbit_prism_evicted_job_capacity_evictions_total Same-tip retained contexts removed by a configured count limit.",
+            "# TYPE qbit_prism_evicted_job_capacity_evictions_total counter",
+            *[
+                f'qbit_prism_evicted_job_capacity_evictions_total{{scope="{scope}"}} {int(evicted_job_capacity_eviction_counts.get(scope, 0))}'
+                for scope in PRISM_EVICTED_JOB_CAPACITY_SCOPES
+            ],
             "# HELP qbit_prism_post_accept_refresh_failures_total Immediate clean-job refreshes that failed after direct block acceptance.",
             "# TYPE qbit_prism_post_accept_refresh_failures_total counter",
             f"qbit_prism_post_accept_refresh_failures_total {self.post_accept_refresh_failure_count}",

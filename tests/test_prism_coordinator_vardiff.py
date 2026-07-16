@@ -27,6 +27,7 @@ from lab.prism.prism_coordinator import (
     MAX_PENDING_SHARE_APPENDS,
     PRISM_CREDIT_POLICY_STALE_GRACE,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+    PRISM_REJECTION_DUPLICATE_SHARE,
     PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
     PRISM_REJECTION_LOW_DIFFICULTY,
     PendingShareAppend,
@@ -3335,6 +3336,177 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(should_close)
         self.assertEqual(len(ledger.pending), 1)
         self.assertIsNone(ledger.pending[0].credit_policy)
+
+    def test_evicted_same_tip_share_survives_beyond_legacy_one_second_floor(self) -> None:
+        tip = "00" * 32
+        server, state, ledger = submit_coordinator(tip=tip)
+        server.current_tip_first_seen = (tip, None)
+        server.same_tip_job_retention_seconds = 30
+        server.bury_evicted_job(state, "job-1", now=100.0)
+        server.jobs.pop("job-1")
+        state.active_job_ids.clear()
+        submission = SimpleNamespace(
+            header_hex="a1" * 80,
+            block_hash_hex="c1" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            return_value=102.0,
+        ), patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            self.assertFalse(
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+            )
+
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertIsNone(ledger.pending[0].credit_policy)
+        self.assertIn("job-1", server.evicted_job_graveyard)
+        self.assertEqual(server.evicted_job_submit_counts["accepted_same_tip"], 1)
+
+    def test_evicted_same_tip_submit_uses_original_job_difficulty(self) -> None:
+        tip = "00" * 32
+        server, state, ledger = submit_coordinator(tip=tip)
+        server.current_tip_first_seen = (tip, None)
+        original_context = server.jobs["job-1"]
+        original_context.job.share_difficulty = Decimal("2")
+        state.share_difficulty = Decimal("32")
+        server.bury_evicted_job(state, "job-1")
+        server.jobs.pop("job-1")
+        state.active_job_ids.clear()
+        submission = SimpleNamespace(
+            header_hex="a2" * 80,
+            block_hash_hex="c2" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        def assemble(job: object, **_kwargs: object) -> object:
+            self.assertIs(job, original_context.job)
+            self.assertEqual(job.share_difficulty, Decimal("2"))
+            return submission
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            side_effect=assemble,
+        ):
+            self.assertFalse(
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+            )
+
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertIsNone(ledger.pending[0].credit_policy)
+
+    def test_same_tip_retention_ttl_and_capacity_are_bounded(self) -> None:
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.current_tip_first_seen = (tip, None)
+        server.same_tip_job_retention_seconds = 30
+        server.same_tip_job_retention_per_connection = 2
+        server.same_tip_job_retention_global = 10
+        identity = state.worker
+        for index in range(3):
+            job_id = f"job-{index + 1}"
+            server.jobs[job_id] = prism_context(job_id, tip, worker=identity)
+            server.bury_evicted_job(state, job_id, now=100.0 + index)
+
+        self.assertNotIn("job-1", server.evicted_job_graveyard)
+        self.assertEqual(
+            list(server.evicted_job_graveyard),
+            ["job-2", "job-3"],
+        )
+        self.assertEqual(server.evicted_job_capacity_eviction_counts["connection"], 1)
+
+        server.prune_evicted_job_graveyard(now=133.1)
+        self.assertEqual(server.evicted_job_graveyard, {})
+        self.assertEqual(server.evicted_job_expiration_counts["same_tip"], 2)
+
+    def test_global_same_tip_cap_does_not_evict_stale_grace_entry(self) -> None:
+        old_tip = "00" * 32
+        current_tip = "11" * 32
+        server, state, _ledger = submit_coordinator(tip=old_tip)
+        server.current_tip_first_seen = (current_tip, time.monotonic())
+        server.stale_grace_seconds = 30
+        server.same_tip_job_retention_per_connection = 10
+        server.same_tip_job_retention_global = 1
+        server.bury_evicted_job(state, "job-1")
+        stale_entry = server.evicted_job_graveyard["job-1"]
+
+        second = client()
+        second.connection_id = 2
+        second.worker = worker_identity("miner-b")
+        for index in range(2):
+            job_id = f"same-{index}"
+            server.jobs[job_id] = prism_context(job_id, current_tip, worker=second.worker)
+            server.bury_evicted_job(second, job_id)
+
+        self.assertIs(server.evicted_job_graveyard["job-1"], stale_entry)
+        self.assertNotIn("same-0", server.evicted_job_graveyard)
+        self.assertIn("same-1", server.evicted_job_graveyard)
+        self.assertEqual(server.evicted_job_capacity_eviction_counts["global"], 1)
+
+    def test_tip_change_and_disconnect_remove_retained_contexts(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, _ledger = submit_coordinator(tip=old_tip)
+        server.current_tip_first_seen = (old_tip, None)
+        server.stale_grace_seconds = 0
+        server.bury_evicted_job(state, "job-1")
+        self.assertIn("job-1", server.evicted_job_graveyard)
+
+        server.observe_tip_first_seen(new_tip)
+        self.assertNotIn("job-1", server.evicted_job_graveyard)
+
+        server.current_tip_first_seen = (new_tip, None)
+        server.jobs["job-2"] = prism_context("job-2", new_tip, worker=state.worker)
+        server.bury_evicted_job(state, "job-2")
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+        self.assertEqual(server.evicted_job_graveyard, {})
+
+    def test_retained_same_tip_duplicate_remains_duplicate_share(self) -> None:
+        tip = "00" * 32
+        server, state, ledger = submit_coordinator(tip=tip)
+        server.current_tip_first_seen = (tip, None)
+        server.bury_evicted_job(state, "job-1")
+        server.jobs.pop("job-1")
+        state.active_job_ids.clear()
+        submission = SimpleNamespace(
+            header_hex="a3" * 80,
+            block_hash_hex="c3" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+        params = ["miner-a", "job-1", "00" * 8, "00000001", "00000002"]
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            self.assertFalse(server.handle_submit(state, params))
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(state, params)
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_DUPLICATE_SHARE)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertIn("job-1", server.evicted_job_graveyard)
+        metrics = server.metrics_payload()
+        self.assertIn('qbit_prism_evicted_job_contexts{class="same_tip"} 1', metrics)
+        self.assertIn(
+            'qbit_prism_evicted_job_submits_total{outcome="accepted_same_tip"} 1',
+            metrics,
+        )
 
     def test_pool_closed_submit_rejects_before_any_share_accounting(self) -> None:
         # Post-close submits must not inflate submitted totals (the
