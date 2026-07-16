@@ -643,6 +643,63 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(result, [2])
 
+    def test_queued_fanout_stops_when_chain_view_becomes_untrusted(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 1
+        server.reorg_reconciler_enabled = True
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        chain_view_trusted = True
+        trust_checks: list[bool] = []
+
+        def current_tip_trusted() -> bool:
+            trust_checks.append(chain_view_trusted)
+            return chain_view_trusted
+
+        server.ensure_reorg_reconciled_for_current_tip = current_tip_trusted  # type: ignore[method-assign]
+        first = client(1)
+        second = client(2)
+        server.clients = [first, second]  # type: ignore[assignment]
+        first_blocked = threading.Event()
+        release_first = threading.Event()
+        second_sent: list[dict[str, object]] = []
+
+        def first_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                first_blocked.set()
+                self.assertTrue(release_first.wait(5))
+
+        first.send = first_send  # type: ignore[method-assign]
+        second.send = second_sent.append  # type: ignore[method-assign]
+        refreshed: list[int] = []
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                refreshed.append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # noqa: BLE001 - surface to the test
+                errors.append(exc)
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(first_blocked.wait(5))
+            chain_view_trusted = False
+        finally:
+            release_first.set()
+            thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(refreshed, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+        self.assertIn("chain view became untrusted", str(errors[0]))
+        self.assertEqual(trust_checks, [True, False])
+        self.assertIsNotNone(first.active_job)
+        self.assertIsNone(second.active_job)
+        self.assertEqual(second_sent, [])
+
     def test_same_tip_cache_refresh_during_fanout_does_not_abort(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)

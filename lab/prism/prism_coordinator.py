@@ -2875,6 +2875,34 @@ class PrismCoordinator:
         with client.job_update_lock:
             if self.stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
                 return RefreshResult("skipped")
+            with self.lock:
+                if (
+                    client not in self.clients
+                    or client.connection_id != expected_connection_id
+                    or not self.client_can_receive_jobs(client)
+                    or self.intervening_job_supersedes_snapshot(
+                        client.active_job,
+                        expected_active_job,
+                        snapshot,
+                    )
+                    or not self.client_needs_tip_template_refresh(client, snapshot)
+                ):
+                    return RefreshResult("skipped")
+            phase_started = time.monotonic()
+            try:
+                if not self.ensure_reorg_reconciled_for_current_tip():
+                    raise TemplateRefreshBlocked(
+                        "qbit chain view became untrusted before prepared job delivery"
+                    )
+            except TemplateRefreshBlocked:
+                raise
+            except Exception as exc:
+                raise TemplateRefreshBlocked(
+                    "reorg reconciliation failed before prepared job delivery"
+                ) from exc
+            phases["reorg"] = time.monotonic() - phase_started
+            if self.stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                return RefreshResult("skipped")
             # prepare_tip_refresh_bundle validates the exact cache fingerprint
             # before any fanout task is submitted. From that point onward the
             # immutable bundle is the refresh snapshot: consulting the mutable
