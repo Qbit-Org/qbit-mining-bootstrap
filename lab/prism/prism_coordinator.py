@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 import dataclasses
 import errno
@@ -75,6 +76,8 @@ DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS = 20.0
 DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS = 0
 DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME = 0
 DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS = 1.0
+DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES = 4_096
+DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
 DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
@@ -1037,6 +1040,14 @@ class PrismCoordinator:
             "PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS",
             DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS,
         )
+        self.payout_address_cache_max_entries = env_nonnegative_int(
+            "PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES",
+            DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES,
+        )
+        self.payout_address_cache_ttl_seconds = env_nonnegative_float(
+            "PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS",
+            DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS,
+        )
         self.coinbase_tag_hex = default_prism_coinbase_tag_hex()
         self.share_difficulty = env_decimal("PRISM_STRATUM_SHARE_DIFF", "0.000000001")
         self.vardiff_config = load_prism_vardiff_config(self.share_difficulty)
@@ -1140,7 +1151,9 @@ class PrismCoordinator:
         self.accept_resource_exhaustion_count = 0
         self.connection_setup_failure_count = 0
         self._p2mr_address_cache_lock = threading.Lock()
-        self._p2mr_address_cache: dict[str, tuple[str, str]] = {}
+        self._p2mr_address_cache: OrderedDict[
+            str, tuple[float, tuple[str, str]]
+        ] = OrderedDict()
         self._p2mr_address_validation_inflight: dict[
             str, _P2mrAddressValidationFlight
         ] = {}
@@ -3365,7 +3378,11 @@ class PrismCoordinator:
         with self._p2mr_address_cache_lock:
             cached = self._p2mr_address_cache.get(address)
             if cached is not None:
-                return cached
+                expires_monotonic, cached_result = cached
+                if expires_monotonic > time.monotonic():
+                    self._p2mr_address_cache.move_to_end(address)
+                    return cached_result
+                self._p2mr_address_cache.pop(address, None)
             pending = self._p2mr_address_validation_inflight.get(address)
             is_leader = pending is None
             if pending is None:
@@ -3391,7 +3408,28 @@ class PrismCoordinator:
                 raise StratumError(20, f"{label} does not resolve to a P2MR script: {address}")
             result = (script, script[4:])
             with self._p2mr_address_cache_lock:
-                self._p2mr_address_cache[address] = result
+                max_entries = int(
+                    getattr(
+                        self,
+                        "payout_address_cache_max_entries",
+                        DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES,
+                    )
+                )
+                ttl_seconds = float(
+                    getattr(
+                        self,
+                        "payout_address_cache_ttl_seconds",
+                        DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS,
+                    )
+                )
+                if max_entries > 0 and ttl_seconds > 0:
+                    self._p2mr_address_cache[address] = (
+                        time.monotonic() + ttl_seconds,
+                        result,
+                    )
+                    self._p2mr_address_cache.move_to_end(address)
+                    while len(self._p2mr_address_cache) > max_entries:
+                        self._p2mr_address_cache.popitem(last=False)
                 pending.result = result
             return result
         except BaseException as exc:
@@ -3419,7 +3457,7 @@ class PrismCoordinator:
         if not hasattr(self, "_p2mr_address_cache_lock"):
             self._p2mr_address_cache_lock = threading.Lock()
         if not hasattr(self, "_p2mr_address_cache"):
-            self._p2mr_address_cache = {}
+            self._p2mr_address_cache = OrderedDict()
         if not hasattr(self, "_p2mr_address_validation_inflight"):
             self._p2mr_address_validation_inflight = {}
 

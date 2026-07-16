@@ -1333,6 +1333,55 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(rpc.validated, [PAYOUT_ADDRESS])
         self.assertEqual(first.p2mr_program_hex, second.p2mr_program_hex)
 
+    def test_payout_address_cache_evicts_least_recently_used_entry(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server.payout_address_cache_max_entries = 2
+        server.payout_address_cache_ttl_seconds = 60
+
+        class AnyAddressRpc:
+            def __init__(self) -> None:
+                self.validated: list[str] = []
+
+            def call(self, method: str, params: list[object] | None = None) -> object:
+                address = str((params or [""])[0])
+                self.validated.append(address)
+                return {"isvalid": True, "scriptPubKey": "5220" + "33" * 32}
+
+        rpc = AnyAddressRpc()
+        server.rpc = rpc
+
+        server.validate_p2mr_address("address-a", label="test")
+        server.validate_p2mr_address("address-b", label="test")
+        server.validate_p2mr_address("address-a", label="test")
+        server.validate_p2mr_address("address-c", label="test")
+
+        self.assertEqual(rpc.validated, ["address-a", "address-b", "address-c"])
+        self.assertEqual(list(server._p2mr_address_cache), ["address-a", "address-c"])
+
+        server.validate_p2mr_address("address-b", label="test")
+        self.assertEqual(rpc.validated[-1], "address-b")
+        self.assertEqual(len(server._p2mr_address_cache), 2)
+
+    def test_payout_address_cache_revalidates_expired_entry(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server.payout_address_cache_max_entries = 2
+        server.payout_address_cache_ttl_seconds = 5
+        rpc = AddressValidationRpc(script_byte="33")
+        server.rpc = rpc
+        now = 100.0
+
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: now,
+        ):
+            server.validate_p2mr_address(PAYOUT_ADDRESS, label="test")
+            now = 104.0
+            server.validate_p2mr_address(PAYOUT_ADDRESS, label="test")
+            now = 106.0
+            server.validate_p2mr_address(PAYOUT_ADDRESS, label="test")
+
+        self.assertEqual(rpc.validated, [PAYOUT_ADDRESS, PAYOUT_ADDRESS])
+
     def test_concurrent_worker_resolution_singleflights_address_validation(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
         entered = threading.Event()

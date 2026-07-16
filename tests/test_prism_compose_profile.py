@@ -65,6 +65,8 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_STRATUM_MAX_CONNECTIONS": "1900",
                 "PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME": "400",
                 "PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS": "2",
+                "PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES": "2048",
+                "PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS": "1800",
                 "PRISM_COORDINATOR_NOFILE_SOFT": "60000",
                 "PRISM_COORDINATOR_NOFILE_HARD": "65000",
             }
@@ -149,6 +151,8 @@ class PrismComposeProfileTests(unittest.TestCase):
             env["PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS"],
             "2",
         )
+        self.assertEqual(env["PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES"], "2048")
+        self.assertEqual(env["PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS"], "1800")
         self.assertEqual(env["PRISM_STRATUM_BIND"], "0.0.0.0")
         self.assertEqual(env["PRISM_STRATUM_PORT"], "43340")
         self.assertEqual(env["PRISM_PUBLIC_STRATUM_URL"], "stratum+tcp://public-pool.example:3335")
