@@ -3184,14 +3184,6 @@ class PrismCoordinator:
         try:
             observation_sequence = self._reserve_tip_observation_sequence()
             snapshot = self.fetch_qbit_tip_template_snapshot()
-            if not self.observe_tip_first_seen(
-                snapshot.bestblockhash,
-                observation_sequence=observation_sequence,
-            ):
-                raise TemplateRefreshBlocked(
-                    "tip/template poll was superseded by a newer tip observation"
-                )
-            self.prune_evicted_job_graveyard(force=False)
             self.pool_readiness_latched()
             if not self.ensure_reorg_reconciled_for_tip(snapshot.bestblockhash):
                 raise TemplateRefreshBlocked(
@@ -3208,7 +3200,6 @@ class PrismCoordinator:
                     or previous_snapshot.template_fingerprint
                     != snapshot.template_fingerprint
                 )
-                self.tip_template_snapshot = snapshot
                 if snapshot_changed:
                     clients = [
                         client
@@ -3241,6 +3232,7 @@ class PrismCoordinator:
                 clients
                 and getattr(self, "_pool_ready_latched", False)
             )
+            bundle: CachedJobBundle | None = None
             if use_prepared_fanout:
                 try:
                     bundle = self.prepare_tip_refresh_bundle(snapshot, clients)
@@ -3248,6 +3240,35 @@ class PrismCoordinator:
                     for _client in clients:
                         self._record_tip_refresh_client_result("failed")
                     raise
+
+            # A ready-pool pass must validate and build its immutable shared
+            # bundle before committing the observed tip. Otherwise a cache or
+            # derivation failure can prune retained work without any replacement
+            # job ready to fan out. Sequential/collection work has no shared
+            # preparation stage, so it commits here immediately before builds.
+            if not self.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=observation_sequence,
+            ):
+                raise TemplateRefreshBlocked(
+                    "tip/template poll was superseded by a newer tip observation"
+                )
+            self.prune_evicted_job_graveyard(force=False)
+            with self.lock:
+                current_tip = getattr(self, "current_tip_first_seen", None)
+                if (
+                    current_tip is None
+                    or current_tip[0] != snapshot.bestblockhash
+                    or int(getattr(self, "current_tip_observation_sequence", 0))
+                    != observation_sequence
+                ):
+                    raise TemplateRefreshBlocked(
+                        "tip/template poll was superseded before snapshot publication"
+                    )
+                self.tip_template_snapshot = snapshot
+
+            if use_prepared_fanout:
+                assert bundle is not None
                 (
                     refreshed,
                     first_delivery,

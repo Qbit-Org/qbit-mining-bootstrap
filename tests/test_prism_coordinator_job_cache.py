@@ -1254,6 +1254,8 @@ class JobBundleCacheTests(unittest.TestCase):
             server.poll_qbit_tip_template_once()
 
         self.assertEqual(sent, [])
+        self.assertIsNone(getattr(server, "current_tip_first_seen", None))
+        self.assertIsNone(server.tip_template_snapshot)
 
 
 class HealthSnapshotTests(unittest.TestCase):
