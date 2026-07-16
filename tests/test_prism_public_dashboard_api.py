@@ -844,8 +844,8 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
                 os.environ,
                 {
                     "PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS": "600",
-                    "PRISM_PUBLIC_SETTLEMENT_CACHE_TTL_SECONDS": "900",
-                    "PRISM_PUBLIC_SETTLEMENT_CACHE_STALE_WHILE_REVALIDATE_SECONDS": "120",
+                    "PRISM_PUBLIC_SETTLEMENT_CACHE_TTL_SECONDS": "15",
+                    "PRISM_PUBLIC_SETTLEMENT_CACHE_STALE_WHILE_REVALIDATE_SECONDS": "10",
                     "PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS": "7200",
                 },
                 clear=True,
@@ -874,8 +874,17 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             thread.join(timeout=5)
 
         self.assertEqual(config_cache, "public, max-age=600, stale-while-revalidate=3600")
-        self.assertEqual(settlement_cache, "public, max-age=900, stale-while-revalidate=120")
+        self.assertEqual(settlement_cache, "public, max-age=15, stale-while-revalidate=10")
         self.assertEqual(artifact_cache, "public, max-age=7200, stale-while-revalidate=86400, immutable")
+
+    def test_settlement_artifact_cache_default_stays_short_for_live_status(self) -> None:
+        path = f"/public/v1/blocks/{FakePublicLedger.block_hash}/settlement-artifacts"
+
+        with patch.dict(os.environ, {}, clear=True):
+            policy = public_api.public_cache_policy(path)
+
+        self.assertEqual(policy.ttl_seconds, 5)
+        self.assertEqual(policy.stale_while_revalidate_seconds, 30)
 
     def test_public_api_errors_use_public_error_schema(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as raised:

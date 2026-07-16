@@ -39,9 +39,9 @@ emits conservative browser caching (`Cache-Control: public, max-age=0,
 must-revalidate`) plus shared-cache headers for CDNs such as Vercel. Dynamic
 dashboard read models default to a 5-second shared-cache TTL with 30 seconds of
 `stale-while-revalidate`. `GET /public/v1/mining-configuration` defaults to 300
-seconds, settlement-artifact manifests default to 300 seconds, and
-content-addressed artifact routes default to 86400 seconds with an immutable
-shared-cache hint.
+seconds. Settlement-artifact responses also default to 5 seconds because they
+include live fanout status and broadcast attempts. Content-addressed artifact
+routes default to 86400 seconds with an immutable shared-cache hint.
 
 Operators can tune the defaults with:
 

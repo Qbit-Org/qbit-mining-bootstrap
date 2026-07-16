@@ -200,7 +200,7 @@ def public_cache_policy(path: str) -> PublicCachePolicy:
         block_hash = path[len("/public/v1/blocks/"):-len("/settlement-artifacts")].strip()
         if _is_hex64(block_hash):
             return PublicCachePolicy(
-                ttl_seconds=env_nonnegative_int("PRISM_PUBLIC_SETTLEMENT_CACHE_TTL_SECONDS", 300),
+                ttl_seconds=env_nonnegative_int("PRISM_PUBLIC_SETTLEMENT_CACHE_TTL_SECONDS", 5),
                 stale_while_revalidate_seconds=env_nonnegative_int(
                     "PRISM_PUBLIC_SETTLEMENT_CACHE_STALE_WHILE_REVALIDATE_SECONDS",
                     30,
