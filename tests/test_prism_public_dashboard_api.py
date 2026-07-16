@@ -844,6 +844,8 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
                 os.environ,
                 {
                     "PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS": "600",
+                    "PRISM_PUBLIC_SETTLEMENT_CACHE_TTL_SECONDS": "900",
+                    "PRISM_PUBLIC_SETTLEMENT_CACHE_STALE_WHILE_REVALIDATE_SECONDS": "120",
                     "PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS": "7200",
                 },
                 clear=True,
@@ -854,6 +856,12 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
                 ) as config_response:
                     json.loads(config_response.read())
                     config_cache = config_response.headers.get("CDN-Cache-Control")
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/public/v1/blocks/{ledger.block_hash}/settlement-artifacts",
+                    timeout=5,
+                ) as settlement_response:
+                    json.loads(settlement_response.read())
+                    settlement_cache = settlement_response.headers.get("CDN-Cache-Control")
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{server.server_port}/public/v1/artifacts/{ledger.audit_bundle_sha256}",
                     timeout=5,
@@ -866,6 +874,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             thread.join(timeout=5)
 
         self.assertEqual(config_cache, "public, max-age=600, stale-while-revalidate=3600")
+        self.assertEqual(settlement_cache, "public, max-age=900, stale-while-revalidate=120")
         self.assertEqual(artifact_cache, "public, max-age=7200, stale-while-revalidate=86400, immutable")
 
     def test_public_api_errors_use_public_error_schema(self) -> None:
