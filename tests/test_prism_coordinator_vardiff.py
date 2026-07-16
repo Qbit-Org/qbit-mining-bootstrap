@@ -2238,7 +2238,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.pending[0].job_id, "fresh-job")
         self.assertIn(state, server.clients)
 
-    def test_tip_refresh_rpc_race_uses_clean_job_when_template_parent_changed(self) -> None:
+    def test_tip_refresh_rpc_race_blocks_mismatched_tip_template_snapshot(self) -> None:
         old_tip = "00" * 32
         new_tip = "11" * 32
         server = coordinator()
@@ -2262,19 +2262,18 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         server.rpc = TipTemplateRpc(tip=old_tip, template=gbt_template(new_tip, height=11))
 
-        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
-            self.assertTrue(clean_jobs)
-            return prism_context("fresh-job", new_tip, worker=worker, clean_jobs=clean_jobs)
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "tip changed while fetching block template",
+        ):
+            server.poll_qbit_tip_template_once()
 
-        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
-
-        refreshed = server.poll_qbit_tip_template_once()
-
-        self.assertEqual(refreshed, 1)
-        self.assertNotIn("old-job", server.jobs)
-        self.assertEqual(state.active_job_ids, {"fresh-job"})
-        self.assertEqual(sent[1]["params"][0], "fresh-job")
-        self.assertTrue(sent[1]["params"][8])
+        self.assertIs(state.active_job, old_context)
+        self.assertEqual(server.jobs, {"old-job": old_context})
+        self.assertEqual(state.active_job_ids, {"old-job"})
+        self.assertEqual(sent, [])
+        self.assertIsNone(server.current_tip_first_seen)
+        self.assertIsNone(server._template_artifacts)
 
     def test_same_tip_template_refresh_sends_non_clean_job_and_keeps_old_job_submittable(self) -> None:
         tip = "00" * 32

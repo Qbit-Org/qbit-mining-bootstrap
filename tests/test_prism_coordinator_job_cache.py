@@ -259,6 +259,34 @@ def install_fake_bundle_builder(server: PrismCoordinator) -> dict[str, object]:
 
 
 class JobBundleCacheTests(unittest.TestCase):
+    def test_tip_template_snapshot_stays_coherent_across_tip_transition(self) -> None:
+        old_tip = "11" * 32
+        new_tip = "22" * 32
+        server, rpc = coordinator(template=base_template(prevhash=old_tip))
+        new_template = base_template(height=11, prevhash=new_tip)
+        original_call = rpc.call
+
+        def transition_during_template_fetch(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getblocktemplate":
+                rpc.tip = new_tip
+                rpc.template = new_template
+            return original_call(method, params)
+
+        rpc.call = transition_during_template_fetch  # type: ignore[method-assign]
+
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+
+        self.assertEqual(snapshot.bestblockhash, new_tip)
+        self.assertEqual(snapshot.previousblockhash, new_tip)
+        self.assertEqual(
+            snapshot.template_fingerprint,
+            qbit_template_fingerprint(new_template),
+        )
+        self.assertEqual(rpc.calls[:2], ["getblocktemplate", "getbestblockhash"])
+
     def test_one_heavy_build_shared_across_clients_with_per_client_stamping(self) -> None:
         server, rpc = coordinator()
         recorded = install_fake_bundle_builder(server)

@@ -3764,13 +3764,26 @@ class PrismCoordinator:
         # Reserve ordering before either RPC: a fetch that started on an older
         # view must not become "newer" merely because its template arrived last.
         generation = self._reserve_template_artifact_generation()
-        bestblockhash = str(self.rpc.call("getbestblockhash"))
         template = self.rpc.call(
             "getblocktemplate",
             [{"rules": qbit_gbt_rules(getattr(self, "qbit_chain", "regtest"))}],
         )
         if not isinstance(template, dict):
             raise RuntimeError("getblocktemplate returned non-object")
+        previousblockhash = str(template.get("previousblockhash", "") or "")
+        if not previousblockhash:
+            raise RuntimeError("getblocktemplate omitted previousblockhash")
+        # The template parent is the tip this work actually extends. Validate
+        # it after fetching the template so a tip transition between these RPCs
+        # cannot produce an old bestblockhash paired with newer work. Reject a
+        # template that was superseded before it can enter the shared cache or
+        # drive tip observation/graveyard pruning.
+        bestblockhash = str(self.rpc.call("getbestblockhash"))
+        if bestblockhash != previousblockhash:
+            raise TemplateRefreshBlocked(
+                "qbit tip changed while fetching block template "
+                f"template_parent={previousblockhash} current={bestblockhash}"
+            )
         # The poll already paid for this template; seed the job-build cache so
         # client job builds triggered by the refresh below reuse it instead of
         # refetching one template per client.
@@ -3787,7 +3800,7 @@ class PrismCoordinator:
             )
         return QbitTipTemplateSnapshot(
             bestblockhash=bestblockhash,
-            previousblockhash=str(template.get("previousblockhash", "")),
+            previousblockhash=previousblockhash,
             template_fingerprint=qbit_template_fingerprint(template),
             template_generation=generation,
         )
