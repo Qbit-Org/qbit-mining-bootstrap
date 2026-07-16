@@ -3266,7 +3266,11 @@ class PrismCoordinator:
                 raise StratumError(
                     20,
                     "too many connections for username",
-                    disconnect=True,
+                    # A new connection has no useful session to preserve. A
+                    # live miner re-authorizing to a full username does: keep
+                    # its prior worker/session active after returning the
+                    # capacity error.
+                    disconnect=not client.authorized,
                 )
             # The password is authoritative for password-derived options: a
             # re-authorize without d=/md= clears any prior override (a stored

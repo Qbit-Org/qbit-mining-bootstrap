@@ -5586,6 +5586,51 @@ class PrismListenerProfileTests(unittest.TestCase):
         self.assertEqual(server.connection_limit_rejection_counts["username"], 1)
         self.assertFalse(second.authorized)
 
+    def test_reauthorize_limit_error_preserves_live_session(self) -> None:
+        server, live, _ = self.authorize_server_and_client()
+        server.stratum_max_connections_per_username = 1
+        occupant = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=4,
+            extranonce1_hex="00000004",
+        )
+        occupant.send = lambda payload: None  # type: ignore[method-assign]
+        server.clients.update({live, occupant})
+
+        server.handle_request(
+            live,
+            {
+                "id": 5,
+                "method": "mining.authorize",
+                "params": [f"{PAYOUT_ADDRESS}.original", "x"],
+            },
+        )
+        server.handle_request(
+            occupant,
+            {
+                "id": 6,
+                "method": "mining.authorize",
+                "params": [f"{PAYOUT_ADDRESS}.full", "x"],
+            },
+        )
+        original_worker = live.worker
+
+        with self.assertRaises(StratumError) as raised:
+            server.handle_request(
+                live,
+                {
+                    "id": 7,
+                    "method": "mining.authorize",
+                    "params": [f"{PAYOUT_ADDRESS}.full", "x"],
+                },
+            )
+
+        self.assertFalse(raised.exception.disconnect)
+        self.assertTrue(live.authorized)
+        self.assertIs(live.worker, original_worker)
+        self.assertEqual(live.username, f"{PAYOUT_ADDRESS}.original")
+
     def test_username_connection_limit_is_disabled_by_default(self) -> None:
         server = coordinator()
         first = client()
