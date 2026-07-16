@@ -869,7 +869,8 @@ class CachedTemplateArtifacts:
     Derived fields are keyed by the template fingerprint: a refetch whose
     fingerprint matches (only clock fields moved) reuses the previously
     computed transaction hexes and witness merkle leaves instead of re-hashing
-    the full template.
+    the full template. Generation records observation-start order so a slow,
+    older fetch cannot supersede a newer observation merely by finishing last.
     """
 
     template: dict[str, Any]
@@ -1793,7 +1794,19 @@ class PrismCoordinator:
                 if phase in self.job_build_phase_seconds:
                     self.job_build_phase_seconds[phase] += duration
 
-    def _derive_template_artifacts(self, template: dict[str, Any]) -> CachedTemplateArtifacts:
+    def _reserve_template_artifact_generation(self) -> int:
+        """Reserve template ordering when a fetch starts, not when it finishes."""
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            self._template_artifact_generation += 1
+            return self._template_artifact_generation
+
+    def _derive_template_artifacts(
+        self,
+        template: dict[str, Any],
+        *,
+        generation: int,
+    ) -> CachedTemplateArtifacts:
         fingerprint = qbit_template_fingerprint(template)
         with self._job_cache_lock:
             previous = self._template_artifacts
@@ -1806,6 +1819,7 @@ class PrismCoordinator:
                 witness_merkle_leaves_hex=previous.witness_merkle_leaves_hex,
                 network_difficulty=previous.network_difficulty,
                 fetched_monotonic=time.monotonic(),
+                generation=generation,
             )
         phases = self._job_build_phases()
         started = time.monotonic()
@@ -1821,42 +1835,52 @@ class PrismCoordinator:
             witness_merkle_leaves_hex=witness_leaves,
             network_difficulty=network_difficulty,
             fetched_monotonic=time.monotonic(),
+            generation=generation,
         )
 
     def _store_template_artifacts(
         self,
         artifacts: CachedTemplateArtifacts,
-    ) -> CachedTemplateArtifacts:
+    ) -> bool:
         with self._job_cache_lock:
             previous = self._template_artifacts
-            if previous is not None and previous.fingerprint == artifacts.fingerprint:
-                generation = previous.generation
-            else:
-                self._template_artifact_generation += 1
-                generation = self._template_artifact_generation
-            stored = dataclass_replace(artifacts, generation=generation)
-            self._template_artifacts = stored
+            if previous is not None and artifacts.generation < previous.generation:
+                return False
+            self._template_artifacts = artifacts
             if previous is not None and previous.fingerprint != artifacts.fingerprint:
                 self._job_bundle_cache = {
                     key: entry
                     for key, entry in self._job_bundle_cache.items()
                     if entry.template_fingerprint == artifacts.fingerprint
                 }
-            return stored
+            return True
 
-    def store_template_artifacts(self, template: dict[str, Any]) -> CachedTemplateArtifacts | None:
+    def store_template_artifacts(
+        self,
+        template: dict[str, Any],
+        *,
+        generation: int | None = None,
+    ) -> CachedTemplateArtifacts | None:
         """Best-effort cache fill from an already-fetched template (blockpoll).
 
         Returns None instead of raising so a template the derivation cannot
         digest degrades to the legacy per-build fetch path rather than failing
-        the poll.
+        the poll. The returned artifacts describe this exact observation even
+        if a newer observation already won the cache-write race; blockpoll then
+        detects the mismatch before fanout.
         """
         self._ensure_job_cache_state()
+        if generation is None:
+            generation = self._reserve_template_artifact_generation()
         try:
-            artifacts = self._derive_template_artifacts(template)
+            artifacts = self._derive_template_artifacts(
+                template,
+                generation=generation,
+            )
         except Exception:
             return None
-        return self._store_template_artifacts(artifacts)
+        self._store_template_artifacts(artifacts)
+        return artifacts
 
     def current_template_artifacts(self) -> CachedTemplateArtifacts:
         """Return fresh template artifacts, fetching a template on cache miss."""
@@ -1869,6 +1893,7 @@ class PrismCoordinator:
             self._record_job_cache_event("template", hit=True)
             return cached
         self._record_job_cache_event("template", hit=False)
+        generation = self._reserve_template_artifact_generation()
         phases = self._job_build_phases()
         started = time.monotonic()
         template = self.rpc.call(
@@ -1878,8 +1903,19 @@ class PrismCoordinator:
         if not isinstance(template, dict):
             raise RuntimeError("getblocktemplate returned non-object")
         phases["template"] = phases.get("template", 0.0) + (time.monotonic() - started)
-        artifacts = self._derive_template_artifacts(template)
-        return self._store_template_artifacts(artifacts)
+        artifacts = self._derive_template_artifacts(
+            template,
+            generation=generation,
+        )
+        if self._store_template_artifacts(artifacts):
+            return artifacts
+        # A later fetch completed first. Build from that current observation,
+        # never from the stale response that lost the cache-write race.
+        with self._job_cache_lock:
+            current = self._template_artifacts
+        if current is None:
+            raise RuntimeError("newer template artifacts disappeared after cache race")
+        return current
 
     def _lookup_job_bundle(self, fingerprint: str, worker: WorkerIdentity) -> CachedJobBundle | None:
         ttl = getattr(self, "job_bundle_cache_seconds", DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS)
@@ -1931,12 +1967,20 @@ class PrismCoordinator:
         cached = self._lookup_job_bundle(artifacts.fingerprint, worker)
         if self._job_bundle_entry_usable(cached):
             self._record_job_cache_event("bundle", hit=True)
-            return cached
+            assert cached is not None
+            return dataclass_replace(
+                cached,
+                template_generation=artifacts.generation,
+            )
         with self._job_build_lock:
             cached = self._lookup_job_bundle(artifacts.fingerprint, worker)
             if self._job_bundle_entry_usable(cached):
                 self._record_job_cache_event("bundle", hit=True)
-                return cached
+                assert cached is not None
+                return dataclass_replace(
+                    cached,
+                    template_generation=artifacts.generation,
+                )
             self._record_job_cache_event("bundle", hit=False)
             built = self.build_shared_job_bundle(artifacts, worker)
             with self._job_cache_lock:
@@ -3084,7 +3128,15 @@ class PrismCoordinator:
                 )
             with self.lock:
                 previous_snapshot = self.tip_template_snapshot
-                snapshot_changed = previous_snapshot is not None and previous_snapshot != snapshot
+                # Generation orders concurrent observations but is not itself
+                # a template change. Repeated observations of identical work
+                # must not trigger a clean fanout on every poll.
+                snapshot_changed = previous_snapshot is not None and (
+                    previous_snapshot.bestblockhash != snapshot.bestblockhash
+                    or previous_snapshot.previousblockhash != snapshot.previousblockhash
+                    or previous_snapshot.template_fingerprint
+                    != snapshot.template_fingerprint
+                )
                 self.tip_template_snapshot = snapshot
                 if snapshot_changed:
                     clients = [
@@ -3616,6 +3668,9 @@ class PrismCoordinator:
         return refreshed
 
     def fetch_qbit_tip_template_snapshot(self) -> QbitTipTemplateSnapshot:
+        # Reserve ordering before either RPC: a fetch that started on an older
+        # view must not become "newer" merely because its template arrived last.
+        generation = self._reserve_template_artifact_generation()
         bestblockhash = str(self.rpc.call("getbestblockhash"))
         template = self.rpc.call(
             "getblocktemplate",
@@ -3626,7 +3681,10 @@ class PrismCoordinator:
         # The poll already paid for this template; seed the job-build cache so
         # client job builds triggered by the refresh below reuse it instead of
         # refetching one template per client.
-        artifacts = self.store_template_artifacts(template)
+        artifacts = self.store_template_artifacts(
+            template,
+            generation=generation,
+        )
         if artifacts is not None:
             return QbitTipTemplateSnapshot(
                 bestblockhash=bestblockhash,
@@ -3638,6 +3696,7 @@ class PrismCoordinator:
             bestblockhash=bestblockhash,
             previousblockhash=str(template.get("previousblockhash", "")),
             template_fingerprint=qbit_template_fingerprint(template),
+            template_generation=generation,
         )
 
     def ensure_reorg_reconciled_for_current_tip(self) -> bool:

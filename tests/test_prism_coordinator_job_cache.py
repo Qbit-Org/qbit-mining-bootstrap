@@ -365,6 +365,57 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(rpc.count("getblocktemplate"), 2)
 
+    def test_late_stale_template_fetch_cannot_replace_newer_artifacts(self) -> None:
+        server, rpc = coordinator()
+        server.template_cache_seconds = 0.0
+        stale_template = dict(rpc.template)
+        current_template = base_template(height=11, prevhash="22" * 32)
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+        results: list[object] = []
+        errors: list[BaseException] = []
+        original_call = rpc.call
+        thread: threading.Thread
+
+        def blocking_call(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getblocktemplate" and threading.current_thread() is thread:
+                fetch_started.set()
+                if not release_fetch.wait(5):
+                    raise AssertionError("stale template fetch was not released")
+                return dict(stale_template)
+            return original_call(method, params)
+
+        def fetch_stale_artifacts() -> None:
+            try:
+                results.append(server.current_template_artifacts())
+            except BaseException as exc:  # noqa: BLE001 - surface to the test
+                errors.append(exc)
+
+        rpc.call = blocking_call  # type: ignore[method-assign]
+        thread = threading.Thread(target=fetch_stale_artifacts)
+        thread.start()
+        try:
+            self.assertTrue(fetch_started.wait(5))
+            current_artifacts = server.store_template_artifacts(current_template)
+            self.assertIsNotNone(current_artifacts)
+            assert current_artifacts is not None
+            self.assertGreater(current_artifacts.generation, 1)
+        finally:
+            release_fetch.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [current_artifacts])
+        self.assertIs(server._template_artifacts, current_artifacts)
+        self.assertEqual(
+            current_artifacts.fingerprint,
+            qbit_template_fingerprint(current_template),
+        )
+
     def test_collection_mode_bundles_are_keyed_per_worker(self) -> None:
         server, _ = coordinator(ledger=FakeLedger(miners=["solo"]))
         recorded = install_fake_bundle_builder(server)
