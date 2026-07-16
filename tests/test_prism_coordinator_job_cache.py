@@ -806,6 +806,88 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIsNone(second.active_job)
         self.assertEqual(second_sent, [])
 
+    def test_multiworker_cancel_waits_for_admitted_delivery_and_blocks_queue(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 2
+        server.reorg_reconciler_enabled = True
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        admitted = client(1)
+        invalidating = client(2)
+        queued = client(3)
+        server.clients = [admitted, invalidating, queued]  # type: ignore[assignment]
+        admitted_send_started = threading.Event()
+        release_admitted_send = threading.Event()
+        invalidation_started = threading.Event()
+        invalidation_finished = threading.Event()
+        queued_sent: list[dict[str, object]] = []
+        worker_local = threading.local()
+        original_send_prepared_job = server.send_prepared_job
+
+        def controlled_send_prepared_job(
+            state: ClientState,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            worker_local.client = state
+            try:
+                return original_send_prepared_job(state, *args, **kwargs)
+            except TemplateRefreshBlocked:
+                if state is invalidating:
+                    invalidation_finished.set()
+                raise
+
+        def current_tip_trusted() -> bool:
+            state = worker_local.client
+            if state is admitted:
+                return True
+            if state is invalidating:
+                self.assertTrue(admitted_send_started.wait(5))
+                invalidation_started.set()
+                return False
+            return True
+
+        def admitted_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                admitted_send_started.set()
+                self.assertTrue(release_admitted_send.wait(5))
+
+        server.send_prepared_job = controlled_send_prepared_job  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = current_tip_trusted  # type: ignore[method-assign]
+        admitted.send = admitted_send  # type: ignore[method-assign]
+        invalidating.send = lambda _payload: self.fail("invalidating client received work")  # type: ignore[method-assign]
+        queued.send = queued_sent.append  # type: ignore[method-assign]
+        refreshed: list[int] = []
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                refreshed.append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # noqa: BLE001 - surface to the test
+                errors.append(exc)
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(admitted_send_started.wait(5))
+            self.assertTrue(invalidation_started.wait(5))
+            self.assertFalse(invalidation_finished.wait(0.05))
+            self.assertIsNone(queued.active_job)
+        finally:
+            release_admitted_send.set()
+            thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(invalidation_finished.is_set())
+        self.assertEqual(refreshed, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+        self.assertIsNotNone(admitted.active_job)
+        self.assertIsNone(invalidating.active_job)
+        self.assertIsNone(queued.active_job)
+        self.assertEqual(queued_sent, [])
+
     def test_same_tip_cache_refresh_during_fanout_does_not_abort(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)

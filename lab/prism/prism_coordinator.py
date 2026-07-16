@@ -923,6 +923,46 @@ class RefreshResult:
     delivered_monotonic: float | None = None
 
 
+class _FanoutCancellation:
+    """Cancel a fanout without racing already-admitted deliveries.
+
+    Setting cancellation first closes admission to new deliveries, then waits
+    for deliveries that already passed the final gate. The public cancelled
+    state becomes visible immediately through ``is_set``; ``set`` returns only
+    when no peer can still mutate or send client work.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._cancelling = False
+        self._active_deliveries = 0
+
+    def is_set(self) -> bool:
+        with self._condition:
+            return self._cancelling
+
+    def begin_delivery(self) -> bool:
+        with self._condition:
+            if self._cancelling:
+                return False
+            self._active_deliveries += 1
+            return True
+
+    def end_delivery(self) -> None:
+        with self._condition:
+            if self._active_deliveries <= 0:
+                raise RuntimeError("fanout delivery gate released without admission")
+            self._active_deliveries -= 1
+            if self._active_deliveries == 0:
+                self._condition.notify_all()
+
+    def set(self) -> None:
+        with self._condition:
+            self._cancelling = True
+            while self._active_deliveries:
+                self._condition.wait()
+
+
 @dataclass(eq=False)
 class ClientState:
     sock: socket.socket
@@ -2919,7 +2959,7 @@ class PrismCoordinator:
         snapshot: QbitTipTemplateSnapshot,
         expected_connection_id: int,
         expected_active_job: PrismJobContext | None,
-        cancel_event: threading.Event | None = None,
+        cancel_event: _FanoutCancellation | None = None,
     ) -> RefreshResult:
         started = time.monotonic()
         phases = self._job_build_phases()
@@ -2947,69 +2987,80 @@ class PrismCoordinator:
                         "qbit chain view became untrusted before prepared job delivery"
                     )
             except TemplateRefreshBlocked:
+                if cancel_event is not None:
+                    cancel_event.set()
                 raise
             except Exception as exc:
+                if cancel_event is not None:
+                    cancel_event.set()
                 raise TemplateRefreshBlocked(
                     "reorg reconciliation failed before prepared job delivery"
                 ) from exc
             phases["reorg"] = time.monotonic() - phase_started
             if self.stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
                 return RefreshResult("skipped")
-            # prepare_tip_refresh_bundle validates the exact cache fingerprint
-            # before any fanout task is submitted. From that point onward the
-            # immutable bundle is the refresh snapshot: consulting the mutable
-            # global cache here would let an unrelated same-tip job build abort
-            # a partially delivered pass after replacing _template_artifacts.
-            with self.lock:
-                if (
-                    client not in self.clients
-                    or client.connection_id != expected_connection_id
-                    or not self.client_can_receive_jobs(client)
-                    or self.intervening_job_supersedes_snapshot(
-                        client.active_job,
-                        expected_active_job,
-                        snapshot,
+            delivery_admitted = cancel_event is None or cancel_event.begin_delivery()
+            if not delivery_admitted:
+                return RefreshResult("skipped")
+            try:
+                # prepare_tip_refresh_bundle validates the exact cache fingerprint
+                # before any fanout task is submitted. From that point onward the
+                # immutable bundle is the refresh snapshot: consulting the mutable
+                # global cache here would let an unrelated same-tip job build abort
+                # a partially delivered pass after replacing _template_artifacts.
+                with self.lock:
+                    if (
+                        client not in self.clients
+                        or client.connection_id != expected_connection_id
+                        or not self.client_can_receive_jobs(client)
+                        or self.intervening_job_supersedes_snapshot(
+                            client.active_job,
+                            expected_active_job,
+                            snapshot,
+                        )
+                        or not self.client_needs_tip_template_refresh(client, snapshot)
+                    ):
+                        return RefreshResult("skipped")
+                    clean_jobs = self.client_tip_changed_for_snapshot(client, snapshot)
+                    stamp_started = time.monotonic()
+                    context = self.stamp_job_for_client(
+                        client,
+                        bundle,
+                        clean_jobs=clean_jobs,
                     )
-                    or not self.client_needs_tip_template_refresh(client, snapshot)
-                ):
-                    return RefreshResult("skipped")
-                clean_jobs = self.client_tip_changed_for_snapshot(client, snapshot)
-                stamp_started = time.monotonic()
-                context = self.stamp_job_for_client(
-                    client,
-                    bundle,
-                    clean_jobs=clean_jobs,
-                )
-                phases["stamp"] = time.monotonic() - stamp_started
-                client.active_job = context
-                if clean_jobs:
-                    for job_id in tuple(client.active_job_ids):
-                        self.bury_evicted_job(client, job_id, prune=False)
-                        self.jobs.pop(job_id, None)
-                    client.active_job_ids.clear()
-                    self.prune_evicted_job_graveyard(force=False)
-                self.jobs[context.job.job_id] = context
-                client.active_job_ids.add(context.job.job_id)
-                self.prune_client_active_jobs(client)
+                    phases["stamp"] = time.monotonic() - stamp_started
+                    client.active_job = context
+                    if clean_jobs:
+                        for job_id in tuple(client.active_job_ids):
+                            self.bury_evicted_job(client, job_id, prune=False)
+                            self.jobs.pop(job_id, None)
+                        client.active_job_ids.clear()
+                        self.prune_evicted_job_graveyard(force=False)
+                    self.jobs[context.job.job_id] = context
+                    client.active_job_ids.add(context.job.job_id)
+                    self.prune_client_active_jobs(client)
 
-            phase_started = time.monotonic()
-            self.send_job_update(client, context.job)
-            self.apply_job_difficulty(client, context.job)
-            self.note_tip_work_delivered(
-                client,
-                str(context.template["previousblockhash"]),
-            )
-            delivered_monotonic = time.monotonic()
-            phases["send"] = delivered_monotonic - phase_started
-            elapsed = delivered_monotonic - started
-            self.observe_job_build_elapsed(elapsed, phases)
-            print(
-                "prism coordinator: sent prepared job "
-                f"connection={client.connection_id} username={client.username} "
-                f"job={context.job.job_id} elapsed={elapsed:.3f}s",
-                flush=True,
-            )
-            return RefreshResult("sent", delivered_monotonic)
+                phase_started = time.monotonic()
+                self.send_job_update(client, context.job)
+                self.apply_job_difficulty(client, context.job)
+                self.note_tip_work_delivered(
+                    client,
+                    str(context.template["previousblockhash"]),
+                )
+                delivered_monotonic = time.monotonic()
+                phases["send"] = delivered_monotonic - phase_started
+                elapsed = delivered_monotonic - started
+                self.observe_job_build_elapsed(elapsed, phases)
+                print(
+                    "prism coordinator: sent prepared job "
+                    f"connection={client.connection_id} username={client.username} "
+                    f"job={context.job.job_id} elapsed={elapsed:.3f}s",
+                    flush=True,
+                )
+                return RefreshResult("sent", delivered_monotonic)
+            finally:
+                if cancel_event is not None:
+                    cancel_event.end_delivery()
 
     def _fanout_prepared_tip_refresh(
         self,
@@ -3021,7 +3072,7 @@ class PrismCoordinator:
         heartbeat_name: str,
     ) -> tuple[int, float | None, float | None, int]:
         executor = self.tip_refresh_executor()
-        cancel_event = threading.Event()
+        cancel_event = _FanoutCancellation()
         futures: dict[Future[RefreshResult], ClientState] = {}
         if expected_active_jobs is None:
             with self.lock:
