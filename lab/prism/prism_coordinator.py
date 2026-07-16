@@ -899,7 +899,10 @@ class ClientState:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
-        self.sock.close()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 class StratumError(RuntimeError):
@@ -1127,6 +1130,7 @@ class PrismCoordinator:
         self.clients: set[ClientState] = set()
         self.connection_limit_rejection_counts = {"global": 0, "username": 0}
         self.accept_resource_exhaustion_count = 0
+        self.connection_setup_failure_count = 0
         self._p2mr_address_cache_lock = threading.Lock()
         self._p2mr_address_cache: dict[str, tuple[str, str]] = {}
         self._p2mr_address_validation_inflight: dict[str, threading.Event] = {}
@@ -2186,24 +2190,12 @@ class PrismCoordinator:
                 if self.stop_event.is_set():
                     return
                 if exc.errno in {errno.EMFILE, errno.ENFILE}:
-                    with self.lock:
-                        self.accept_resource_exhaustion_count = int(
-                            getattr(self, "accept_resource_exhaustion_count", 0)
-                        ) + 1
-                        exhaustion_count = self.accept_resource_exhaustion_count
-                    if exhaustion_count == 1 or exhaustion_count % 100 == 0:
-                        print(
-                            "prism coordinator: stratum accept resource exhaustion "
-                            f"listener={profile.name} errno={exc.errno} "
-                            f"count={exhaustion_count}; backing off",
-                            flush=True,
-                        )
-                    backoff_seconds = getattr(
-                        self,
-                        "stratum_accept_resource_exhaustion_backoff_seconds",
-                        DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS,
+                    self._record_stratum_resource_exhaustion(
+                        listener_name=profile.name,
+                        location="accept",
+                        error_number=exc.errno,
                     )
-                    self.stop_event.wait(max(0.0, float(backoff_seconds)))
+                    self._wait_after_stratum_resource_failure()
                     continue
                 raise
 
@@ -2249,11 +2241,68 @@ class PrismCoordinator:
                 self.apply_stratum_send_timeout(sock)
                 thread = threading.Thread(target=self.handle_client, args=(client,), daemon=True)
                 thread.start()
-            except Exception:
-                # Admission is atomic with the global count; undo it if socket
-                # setup or thread creation fails before a handler owns cleanup.
-                self.disconnect_client(client)
-                raise
+            except (OSError, RuntimeError) as exc:
+                # Admission is atomic with the global count. Undo it if socket
+                # setup or thread creation fails before a handler owns cleanup,
+                # then keep this listener alive for the next connection.
+                try:
+                    self.disconnect_client(client)
+                except Exception:
+                    print(
+                        "prism coordinator: failed to fully close rejected stratum client "
+                        f"address={address}",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+                with self.lock:
+                    self.connection_setup_failure_count = int(
+                        getattr(self, "connection_setup_failure_count", 0)
+                    ) + 1
+                    setup_failure_count = self.connection_setup_failure_count
+                if isinstance(exc, OSError) and exc.errno in {errno.EMFILE, errno.ENFILE}:
+                    self._record_stratum_resource_exhaustion(
+                        listener_name=profile.name,
+                        location="connection-setup",
+                        error_number=exc.errno,
+                    )
+                if setup_failure_count == 1 or setup_failure_count % 100 == 0:
+                    print(
+                        "prism coordinator: stratum connection setup failed; backing off "
+                        f"listener={profile.name} address={address} "
+                        f"error={exc!r} count={setup_failure_count}",
+                        flush=True,
+                    )
+                self._wait_after_stratum_resource_failure()
+                continue
+
+    def _record_stratum_resource_exhaustion(
+        self,
+        *,
+        listener_name: str,
+        location: str,
+        error_number: int | None,
+    ) -> int:
+        with self.lock:
+            self.accept_resource_exhaustion_count = int(
+                getattr(self, "accept_resource_exhaustion_count", 0)
+            ) + 1
+            exhaustion_count = self.accept_resource_exhaustion_count
+        if exhaustion_count == 1 or exhaustion_count % 100 == 0:
+            print(
+                "prism coordinator: stratum resource exhaustion "
+                f"listener={listener_name} location={location} errno={error_number} "
+                f"count={exhaustion_count}",
+                flush=True,
+            )
+        return exhaustion_count
+
+    def _wait_after_stratum_resource_failure(self) -> None:
+        backoff_seconds = getattr(
+            self,
+            "stratum_accept_resource_exhaustion_backoff_seconds",
+            DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS,
+        )
+        self.stop_event.wait(max(0.0, float(backoff_seconds)))
 
     def _ensure_connection_capacity_state(self) -> None:
         if not hasattr(self, "connection_limit_rejection_counts"):
@@ -3091,8 +3140,9 @@ class PrismCoordinator:
         )
 
     def handle_client(self, client: ClientState) -> None:
-        reader = client.sock.makefile("r", encoding="utf-8", newline="\n")
+        reader = None
         try:
+            reader = client.sock.makefile("r", encoding="utf-8", newline="\n")
             for line in reader:
                 if self.stop_event.is_set():
                     break
@@ -3119,9 +3169,26 @@ class PrismCoordinator:
                     )
                     traceback.print_exc()
                     break
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, OSError) and exc.errno in {errno.EMFILE, errno.ENFILE}:
+                self._record_stratum_resource_exhaustion(
+                    listener_name=client.listener_name,
+                    location="client-reader",
+                    error_number=exc.errno,
+                )
+            print(
+                "prism coordinator: stratum client socket failed "
+                f"address={client.address} error={exc!r}",
+                flush=True,
+            )
         finally:
-            reader.close()
-            self.disconnect_client(client)
+            try:
+                if reader is not None:
+                    reader.close()
+            except (OSError, ValueError):
+                pass
+            finally:
+                self.disconnect_client(client)
 
     def disconnect_client(self, client: ClientState) -> None:
         with self.lock:
@@ -5434,6 +5501,9 @@ class PrismCoordinator:
             accept_resource_exhaustion_count = int(
                 getattr(self, "accept_resource_exhaustion_count", 0)
             )
+            connection_setup_failure_count = int(
+                getattr(self, "connection_setup_failure_count", 0)
+            )
         self._ensure_worker_metrics_state()
         with self.worker_metrics_lock:
             worker_share_counts = {
@@ -5494,9 +5564,12 @@ class PrismCoordinator:
                 f'qbit_prism_stratum_connection_limit_rejections_total{{scope="{scope}"}} {int(connection_limit_rejection_counts.get(scope, 0))}'
                 for scope in ("global", "username")
             ],
-            "# HELP qbit_prism_stratum_accept_resource_exhaustions_total Recoverable listener accept failures caused by process or system descriptor exhaustion.",
+            "# HELP qbit_prism_stratum_accept_resource_exhaustions_total Recoverable Stratum accept or client-setup failures caused by process or system descriptor exhaustion.",
             "# TYPE qbit_prism_stratum_accept_resource_exhaustions_total counter",
             f"qbit_prism_stratum_accept_resource_exhaustions_total {accept_resource_exhaustion_count}",
+            "# HELP qbit_prism_stratum_connection_setup_failures_total Admitted Stratum connections cleaned up after socket or handler-thread setup failure.",
+            "# TYPE qbit_prism_stratum_connection_setup_failures_total counter",
+            f"qbit_prism_stratum_connection_setup_failures_total {connection_setup_failure_count}",
             "# HELP qbit_prism_stale_shares_total Stratum shares rejected or ignored as stale.",
             "# TYPE qbit_prism_stale_shares_total counter",
             f"qbit_prism_stale_shares_total {self.stale_share_count}",

@@ -1014,6 +1014,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.post_accept_refresh_failure_count = 5
         server.connection_limit_rejection_counts = {"global": 2, "username": 3}
         server.accept_resource_exhaustion_count = 4
+        server.connection_setup_failure_count = 5
 
         metrics = server.metrics_payload()
 
@@ -1032,6 +1033,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             metrics,
         )
         self.assertIn("qbit_prism_stratum_accept_resource_exhaustions_total 4", metrics)
+        self.assertIn("qbit_prism_stratum_connection_setup_failures_total 5", metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="stale-job"} 2', metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="duplicate-share"} 1', metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="low-difficulty"} 3', metrics)
@@ -5572,6 +5574,87 @@ class PrismListenerProfileTests(unittest.TestCase):
         server.accept_loop(listener, profile)  # type: ignore[arg-type]
 
         self.assertEqual(listener.calls, 2)
+        self.assertEqual(server.accept_resource_exhaustion_count, 1)
+
+    def test_accept_loop_recovers_when_handler_thread_cannot_start(self) -> None:
+        server = coordinator()
+        server.connection_counter = 0
+        server.stratum_send_timeout_seconds = 0
+        server.stratum_accept_resource_exhaustion_backoff_seconds = 0
+
+        class AcceptedSocket:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def settimeout(self, timeout: object) -> None:
+                pass
+
+            def shutdown(self, how: int) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        accepted = AcceptedSocket()
+
+        class OneConnectionListener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def accept(self) -> tuple[object, tuple[str, int]]:
+                self.calls += 1
+                if self.calls == 1:
+                    return accepted, ("127.0.0.1", 1000)
+                server.stop_event.set()
+                raise socket.timeout()
+
+        listener = OneConnectionListener()
+        profile = StratumListenerProfile(
+            name="default",
+            bind="127.0.0.1",
+            port=3340,
+            share_difficulty=server.share_difficulty,
+            vardiff_config=server.vardiff_config,
+            heartbeat_name="stratum_accept",
+        )
+
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+            server.accept_loop(listener, profile)  # type: ignore[arg-type]
+
+        self.assertEqual(listener.calls, 2)
+        self.assertTrue(accepted.closed)
+        self.assertFalse(server.clients)
+        self.assertEqual(server.connection_setup_failure_count, 1)
+
+    def test_handle_client_cleans_up_when_makefile_hits_descriptor_limit(self) -> None:
+        server = coordinator()
+
+        class MakefileFailureSocket:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def makefile(self, *args: object, **kwargs: object) -> object:
+                raise OSError(errno.EMFILE, "too many open files")
+
+            def shutdown(self, how: int) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        sock = MakefileFailureSocket()
+        state = ClientState(
+            sock=sock,  # type: ignore[arg-type]
+            address=("127.0.0.1", 1000),
+            connection_id=1,
+            extranonce1_hex="00000001",
+        )
+        server.clients.add(state)
+
+        server.handle_client(state)
+
+        self.assertTrue(sock.closed)
+        self.assertNotIn(state, server.clients)
         self.assertEqual(server.accept_resource_exhaustion_count, 1)
 
     def test_accept_loop_assigns_listener_profiles_and_unique_extranonce(self) -> None:
