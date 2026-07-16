@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
@@ -43,7 +44,12 @@ from lab.auxpow import stratum_codec, vardiff
 from lab.prism import direct_stratum, public_api
 from lab.prism.prism_tools import prism_tool_command
 from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
-from lab.prism.ctv_broadcaster_daemon import CtvFanoutBroadcastDaemon, CtvFanoutDaemonResult
+from lab.prism.ctv_broadcaster_daemon import (
+    CtvFanoutBroadcastDaemon,
+    CtvFanoutChunkResult,
+    CtvFanoutDaemonResult,
+    MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE,
+)
 from lab.prism.share_ledger import (
     DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
     DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
@@ -71,6 +77,8 @@ TESTNET_QBIT_CHAINS = {"testnet", "testnet3", "testnet4", "signet"}
 DEFAULT_PRISM_BLOCKPOLL_SECONDS = 2.0
 DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS = 5.0
 DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS = 10.0
+MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
+DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS = 20.0
@@ -139,6 +147,8 @@ PRISM_CTV_BROADCASTER_SECONDS_BUCKETS = (
     300.0,
     600.0,
 )
+PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
+PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS = (1, 2, 5, 10, 25, 50, 100)
 PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_JOB_BUILD_PHASES = ("reorg", "template", "merkle", "ledger", "bundle", "stamp", "send")
 PRISM_JOB_CACHE_KINDS = ("template", "bundle")
@@ -865,14 +875,6 @@ class PrismBlockCandidate:
 
 
 @dataclass(frozen=True)
-class QbitTipTemplateSnapshot:
-    bestblockhash: str
-    previousblockhash: str
-    template_fingerprint: str
-    template_generation: int = 0
-
-
-@dataclass(frozen=True)
 class CachedTemplateArtifacts:
     """Template plus everything derivable from it alone, shared by all clients.
 
@@ -891,6 +893,24 @@ class CachedTemplateArtifacts:
     network_difficulty: int
     fetched_monotonic: float
     generation: int = 0
+
+
+@dataclass(frozen=True)
+class QbitTipTemplateSnapshot:
+    bestblockhash: str
+    previousblockhash: str
+    template_fingerprint: str
+    template_generation: int = 0
+    # The observation owns this exact artifact object.  It deliberately does
+    # not participate in snapshot equality: callers compare the stable
+    # identity fields above, while refresh preparation consumes the exact
+    # template and derivations that were observed even if the mutable cache's
+    # current pointer is replaced concurrently.
+    template_artifacts: CachedTemplateArtifacts | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -931,6 +951,17 @@ class EvictedJobEntry:
 class RefreshResult:
     result: str
     delivered_monotonic: float | None = None
+
+
+@dataclass(frozen=True, eq=False)
+class TipRefreshValidationToken:
+    """Immutable proof that one prepared refresh passed its expensive guard."""
+
+    tip_hash: str
+    template_fingerprint: str
+    template_generation: int
+    observation_sequence: int
+    snapshot: QbitTipTemplateSnapshot = field(repr=False)
 
 
 class _FanoutCancellation:
@@ -1298,6 +1329,15 @@ class PrismCoordinator:
                 "PRISM_CTV_BROADCASTER_FEE_BITS is positive"
             )
         self.ctv_broadcaster_limit = env_positive_int("PRISM_CTV_BROADCASTER_LIMIT", 100)
+        self.ctv_broadcaster_chunk_size = env_positive_int(
+            "PRISM_CTV_BROADCASTER_CHUNK_SIZE",
+            DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE,
+        )
+        if self.ctv_broadcaster_chunk_size > MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE:
+            raise SystemExit(
+                "PRISM_CTV_BROADCASTER_CHUNK_SIZE must be at most "
+                f"{MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE}"
+            )
         self.ctv_broadcaster_interval_seconds = env_positive_float(
             "PRISM_CTV_BROADCASTER_INTERVAL_SECONDS",
             30.0,
@@ -1434,6 +1474,14 @@ class PrismCoordinator:
         self._tip_refresh_executor_lock = threading.Lock()
         self._tip_refresh_executor: ThreadPoolExecutor | None = None
         self._tip_refresh_executor_shutdown = False
+        self._tip_refresh_pending_event = threading.Event()
+        self._tip_refresh_pending_counter = 0
+        self._tip_refresh_pending_token: int | None = None
+        self._tip_refresh_retry = threading.Event()
+        self._active_tip_refresh: tuple[
+            TipRefreshValidationToken,
+            _FanoutCancellation,
+        ] | None = None
         self.last_reorg_reconciled_tip_hash: str | None = None
         self.last_reorg_reconciled_trusted = False
         self.last_reorg_reconciled_monotonic: float | None = None
@@ -1801,7 +1849,9 @@ class PrismCoordinator:
                 getattr(self._template_artifacts, "generation", 0)
             )
         if not hasattr(self, "_job_bundle_cache"):
-            self._job_bundle_cache: dict[tuple[object, ...], CachedJobBundle] = {}
+            self._job_bundle_cache: OrderedDict[
+                tuple[object, ...], CachedJobBundle
+            ] = OrderedDict()
         if not hasattr(self, "_job_build_phase_local"):
             self._job_build_phase_local = threading.local()
         if not hasattr(self, "job_cache_hit_counts"):
@@ -1867,6 +1917,9 @@ class PrismCoordinator:
         *,
         generation: int,
     ) -> CachedTemplateArtifacts:
+        # Detach the observation from mutable RPC/test caller state. The
+        # dataclass then owns this exact tree for the lifetime of its snapshot.
+        template = copy.deepcopy(template)
         fingerprint = qbit_template_fingerprint(template)
         with self._job_cache_lock:
             previous = self._template_artifacts
@@ -1908,11 +1961,11 @@ class PrismCoordinator:
                 return False
             self._template_artifacts = artifacts
             if previous is not None and previous.fingerprint != artifacts.fingerprint:
-                self._job_bundle_cache = {
-                    key: entry
+                self._job_bundle_cache = OrderedDict(
+                    (key, entry)
                     for key, entry in self._job_bundle_cache.items()
                     if entry.template_fingerprint == artifacts.fingerprint
-                }
+                )
             return True
 
     def store_template_artifacts(
@@ -1993,7 +2046,11 @@ class PrismCoordinator:
                 return collection
         return None
 
-    def _job_bundle_entry_usable(self, cached: CachedJobBundle | None) -> bool:
+    def _job_bundle_entry_usable(
+        self,
+        cached: CachedJobBundle | None,
+        artifacts: CachedTemplateArtifacts,
+    ) -> bool:
         """Re-validate readiness for cached collection bundles.
 
         Readiness is monotonic in practice (the distinct accepted-miner count
@@ -2007,6 +2064,15 @@ class PrismCoordinator:
             return False
         if not cached.collection_only:
             return True
+        # Collection bundles sign a synthetic bootstrap share containing the
+        # exact template ntime. A clock-only observation keeps the stable work
+        # fingerprint, but it must rebuild this signed bundle instead of
+        # rebinding the old manifest to a new template generation.
+        if (
+            cached.template is not artifacts.template
+            or cached.template_generation != artifacts.generation
+        ):
+            return False
         try:
             _, ready_miner_count = self.accepted_share_stats()
         except Exception:
@@ -2015,6 +2081,61 @@ class PrismCoordinator:
             # failure instead of continuing to issue no-submit collection jobs.
             return False
         return ready_miner_count < self.min_ready_miners
+
+    def _bind_cached_bundle_to_artifacts(
+        self,
+        cached: CachedJobBundle,
+        artifacts: CachedTemplateArtifacts,
+    ) -> CachedJobBundle:
+        """Return the cached heavy bundle bound to this exact observation.
+
+        Clock-only template changes intentionally keep the stable fingerprint.
+        Ready bundles may reuse their ledger snapshot and signed manifest, but
+        the Stratum base job must still carry the observing template's exact
+        ntime and generation. Collection bundles are filtered before this point
+        because their signed synthetic share contains the template ntime.
+        """
+        if (
+            cached.template is artifacts.template
+            and cached.template_generation == artifacts.generation
+        ):
+            return cached
+        manifest = cached.bundle["signed_coinbase_manifest"]["manifest"]
+        base_job = direct_stratum.make_job_from_builder_manifest(
+            job_id="prism-template-base",
+            template=artifacts.template,
+            manifest=manifest,
+            extranonce1_hex=PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
+            extranonce2_size=self.extranonce2_size,
+            desired_share_difficulty=self.share_difficulty,
+            clean_jobs=True,
+            transaction_hexes=artifacts.transaction_hexes,
+        )
+        return dataclass_replace(
+            cached,
+            template=artifacts.template,
+            base_job=base_job,
+            template_generation=artifacts.generation,
+        )
+
+    def _cache_job_bundle_if_current(
+        self,
+        built: CachedJobBundle,
+        artifacts: CachedTemplateArtifacts,
+    ) -> None:
+        """Bound bundle retention and do not resurrect a raced-out template."""
+        with self._job_cache_lock:
+            current = self._template_artifacts
+            if (
+                current is None
+                or current.fingerprint != artifacts.fingerprint
+                or current.generation != artifacts.generation
+            ):
+                return
+            self._job_bundle_cache[built.key] = built
+            while len(self._job_bundle_cache) > MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES:
+                oldest_key = next(iter(self._job_bundle_cache))
+                self._job_bundle_cache.pop(oldest_key, None)
 
     def shared_job_bundle(self, artifacts: CachedTemplateArtifacts, worker: WorkerIdentity) -> CachedJobBundle:
         """Return the cached heavy build for this template, building at most once.
@@ -2025,26 +2146,19 @@ class PrismCoordinator:
         """
         self._ensure_job_cache_state()
         cached = self._lookup_job_bundle(artifacts.fingerprint, worker)
-        if self._job_bundle_entry_usable(cached):
+        if self._job_bundle_entry_usable(cached, artifacts):
             self._record_job_cache_event("bundle", hit=True)
             assert cached is not None
-            return dataclass_replace(
-                cached,
-                template_generation=artifacts.generation,
-            )
+            return self._bind_cached_bundle_to_artifacts(cached, artifacts)
         with self._job_build_lock:
             cached = self._lookup_job_bundle(artifacts.fingerprint, worker)
-            if self._job_bundle_entry_usable(cached):
+            if self._job_bundle_entry_usable(cached, artifacts):
                 self._record_job_cache_event("bundle", hit=True)
                 assert cached is not None
-                return dataclass_replace(
-                    cached,
-                    template_generation=artifacts.generation,
-                )
+                return self._bind_cached_bundle_to_artifacts(cached, artifacts)
             self._record_job_cache_event("bundle", hit=False)
             built = self.build_shared_job_bundle(artifacts, worker)
-            with self._job_cache_lock:
-                self._job_bundle_cache[built.key] = built
+            self._cache_job_bundle_if_current(built, artifacts)
             return built
 
     def build_shared_job_bundle(
@@ -2222,6 +2336,22 @@ class PrismCoordinator:
             self.ctv_broadcaster_pass_count = 0
         if not hasattr(self, "ctv_broadcaster_processed_rows_total"):
             self.ctv_broadcaster_processed_rows_total = 0
+        if not hasattr(self, "ctv_broadcaster_yielded_total"):
+            self.ctv_broadcaster_yielded_total = 0
+        if not hasattr(self, "ctv_broadcaster_chunk_seconds_bucket_counts"):
+            self.ctv_broadcaster_chunk_seconds_bucket_counts = {
+                bucket: 0 for bucket in PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS
+            }
+        if not hasattr(self, "ctv_broadcaster_chunk_rows_bucket_counts"):
+            self.ctv_broadcaster_chunk_rows_bucket_counts = {
+                bucket: 0 for bucket in PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS
+            }
+        if not hasattr(self, "ctv_broadcaster_chunk_seconds_sum"):
+            self.ctv_broadcaster_chunk_seconds_sum = 0.0
+        if not hasattr(self, "ctv_broadcaster_chunk_rows_sum"):
+            self.ctv_broadcaster_chunk_rows_sum = 0
+        if not hasattr(self, "ctv_broadcaster_chunk_count"):
+            self.ctv_broadcaster_chunk_count = 0
 
     def _record_ctv_fanout_broadcaster_progress(self) -> None:
         self._record_heartbeat("ctv_fanout_broadcaster")
@@ -2237,6 +2367,28 @@ class PrismCoordinator:
             for bucket in PRISM_CTV_BROADCASTER_SECONDS_BUCKETS:
                 if elapsed_seconds <= bucket:
                     self.ctv_broadcaster_pass_seconds_bucket_counts[bucket] += 1
+
+    def observe_ctv_fanout_broadcaster_chunk(
+        self,
+        result: CtvFanoutChunkResult,
+    ) -> None:
+        self._record_heartbeat("ctv_fanout_broadcaster")
+        self._ensure_ctv_broadcaster_metrics_state()
+        with self._ctv_broadcaster_metrics_lock:
+            self.ctv_broadcaster_chunk_count += 1
+            self.ctv_broadcaster_chunk_seconds_sum += result.elapsed_seconds
+            self.ctv_broadcaster_chunk_rows_sum += result.processed_count
+            for bucket in PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS:
+                if result.elapsed_seconds <= bucket:
+                    self.ctv_broadcaster_chunk_seconds_bucket_counts[bucket] += 1
+            for bucket in PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS:
+                if result.processed_count <= bucket:
+                    self.ctv_broadcaster_chunk_rows_bucket_counts[bucket] += 1
+
+    def _record_ctv_fanout_broadcaster_yield(self) -> None:
+        self._ensure_ctv_broadcaster_metrics_state()
+        with self._ctv_broadcaster_metrics_lock:
+            self.ctv_broadcaster_yielded_total += 1
 
     def _ensure_worker_metrics_state(self) -> None:
         if not hasattr(self, "worker_metrics_lock"):
@@ -2274,6 +2426,46 @@ class PrismCoordinator:
             }
         if not hasattr(self, "tip_refresh_inflight"):
             self.tip_refresh_inflight = 0
+        if not hasattr(self, "_tip_refresh_pending_event"):
+            self._tip_refresh_pending_event = threading.Event()
+        if not hasattr(self, "_tip_refresh_pending_counter"):
+            self._tip_refresh_pending_counter = 0
+        if not hasattr(self, "_tip_refresh_pending_token"):
+            self._tip_refresh_pending_token: int | None = None
+        if not hasattr(self, "_tip_refresh_retry"):
+            self._tip_refresh_retry = threading.Event()
+        if not hasattr(self, "_active_tip_refresh"):
+            self._active_tip_refresh: tuple[
+                TipRefreshValidationToken,
+                _FanoutCancellation,
+            ] | None = None
+
+    def tip_refresh_is_pending(self) -> bool:
+        return self._tip_refresh_pending()
+
+    def _tip_refresh_pending(self) -> bool:
+        self._ensure_tip_refresh_state()
+        return self._tip_refresh_pending_event.is_set()
+
+    def _mark_tip_refresh_pending(self, _observation: object) -> int:
+        self._ensure_tip_refresh_state()
+        with self.lock:
+            self._tip_refresh_pending_counter += 1
+            token = self._tip_refresh_pending_counter
+            self._tip_refresh_pending_token = token
+            self._tip_refresh_pending_event.set()
+            return token
+
+    def _clear_tip_refresh_pending(self, token: int) -> None:
+        self._ensure_tip_refresh_state()
+        with self.lock:
+            if self._tip_refresh_pending_token == token:
+                self._tip_refresh_pending_token = None
+                self._tip_refresh_pending_event.clear()
+
+    def _schedule_tip_refresh_retry(self) -> None:
+        self._ensure_tip_refresh_state()
+        self._tip_refresh_retry.set()
 
     def _observe_tip_refresh_seconds(self, name: str, elapsed_seconds: float) -> None:
         self._ensure_tip_refresh_state()
@@ -2517,7 +2709,8 @@ class PrismCoordinator:
                     f"fee_bits={self.ctv_broadcaster_fee_sats} "
                     f"wallet={'configured' if self.ctv_broadcaster_wallet else 'none'} "
                     f"interval={self.ctv_broadcaster_interval_seconds:g}s "
-                    f"limit={self.ctv_broadcaster_limit}",
+                    f"limit={self.ctv_broadcaster_limit} "
+                    f"chunk_size={self.ctv_broadcaster_chunk_size}",
                     flush=True,
                 )
             if self.watchdog_enabled:
@@ -2777,8 +2970,25 @@ class PrismCoordinator:
             # Platform without SO_SNDTIMEO support: keep legacy blocking sends.
             return
 
+    def _wait_for_blockpoll_trigger(self) -> bool:
+        """Wait for the normal interval or an immediate coalesced retry."""
+        remaining = float(self.blockpoll_seconds)
+        while remaining > 0:
+            if self.stop_event.is_set():
+                return False
+            wait_seconds = min(remaining, 0.25)
+            if self._tip_refresh_retry.wait(wait_seconds):
+                self._tip_refresh_retry.clear()
+                return not self.stop_event.is_set()
+            remaining -= wait_seconds
+        return not self.stop_event.is_set()
+
     def blockpoll_loop(self) -> None:
-        while not self.stop_event.wait(self.blockpoll_seconds):
+        self._ensure_tip_refresh_state()
+        while self._wait_for_blockpoll_trigger():
+            # A superseding observation or post-fanout tip change wakes this
+            # fallback loop immediately. The event coalesces repeated signals;
+            # ordinary same-tip polling retains its configured interval.
             # Heartbeat at the top of each iteration: reaching here proves the
             # loop is alive. A transient qbit RPC error still loops and beats; a
             # hung RPC call never returns, so the beat goes stale and the
@@ -2924,11 +3134,18 @@ class PrismCoordinator:
     ) -> CtvFanoutDaemonResult:
         if self.ctv_fanout_broadcast_daemon is None:
             self.ctv_fanout_broadcast_daemon = self.make_ctv_fanout_broadcast_daemon()
-        if progress_callback is None:
-            return self.ctv_fanout_broadcast_daemon.run_once(limit=self.ctv_broadcaster_limit)
         return self.ctv_fanout_broadcast_daemon.run_once(
             limit=self.ctv_broadcaster_limit,
             progress_callback=progress_callback,
+            chunk_size=int(
+                getattr(
+                    self,
+                    "ctv_broadcaster_chunk_size",
+                    DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE,
+                )
+            ),
+            tip_refresh_pending=self.tip_refresh_is_pending,
+            chunk_callback=self.observe_ctv_fanout_broadcaster_chunk,
         )
 
     def ctv_fanout_broadcaster_loop(self) -> None:
@@ -2952,6 +3169,8 @@ class PrismCoordinator:
                 print("prism coordinator: CTV fanout broadcaster pass failed", flush=True)
                 traceback.print_exc()
             else:
+                if result.yielded_to_tip_refresh:
+                    self._record_ctv_fanout_broadcaster_yield()
                 if result.scanned_count or result.submitted_count or result.failed_count:
                     print(
                         "prism coordinator: CTV fanout broadcaster "
@@ -2968,16 +3187,19 @@ class PrismCoordinator:
         self,
         snapshot: QbitTipTemplateSnapshot,
     ) -> CachedTemplateArtifacts:
-        self._ensure_job_cache_state()
-        with self._job_cache_lock:
-            artifacts = self._template_artifacts
+        artifacts = snapshot.template_artifacts
         if (
             artifacts is None
             or artifacts.fingerprint != snapshot.template_fingerprint
             or artifacts.previousblockhash != snapshot.previousblockhash
+            or artifacts.generation != snapshot.template_generation
+            or snapshot.bestblockhash != snapshot.previousblockhash
+            or qbit_template_fingerprint(artifacts.template) != artifacts.fingerprint
+            or str(artifacts.template.get("previousblockhash", ""))
+            != artifacts.previousblockhash
         ):
             raise TemplateRefreshBlocked(
-                "tip/template cache changed while preparing refreshed work"
+                "tip/template snapshot does not own matching exact artifacts"
             )
         return artifacts
 
@@ -3013,21 +3235,163 @@ class PrismCoordinator:
                 "bundle_build",
                 time.monotonic() - build_started,
             )
-        # Another path may have refreshed the shared artifact cache while the
-        # heavy ledger/bundle build was in flight. Fail before submitting any
-        # fanout task rather than issuing work from the superseded snapshot.
-        self._tip_refresh_artifacts(snapshot)
+        # Revalidate only the snapshot-owned object. A concurrent cache fill is
+        # unrelated to this refresh and cannot replace its exact artifacts.
+        artifacts = self._tip_refresh_artifacts(snapshot)
+        if (
+            bundle.template is not artifacts.template
+            or bundle.template_fingerprint != artifacts.fingerprint
+            or bundle.template_generation != artifacts.generation
+            or str(bundle.template.get("previousblockhash", ""))
+            != artifacts.previousblockhash
+        ):
+            raise TemplateRefreshBlocked(
+                "prepared refresh bundle does not match exact template artifacts"
+            )
         if bundle.collection_only:
             raise TemplateRefreshBlocked(
                 "ready-pool prepared refresh unexpectedly produced a collection bundle"
             )
         return bundle
 
+    def _tip_refresh_token_current_locked(
+        self,
+        token: TipRefreshValidationToken,
+        bundle: CachedJobBundle,
+        snapshot: QbitTipTemplateSnapshot,
+    ) -> bool:
+        return bool(
+            token.snapshot is snapshot
+            and token.tip_hash == snapshot.bestblockhash
+            and token.template_fingerprint == snapshot.template_fingerprint
+            and token.template_generation == snapshot.template_generation
+            and bundle.template_fingerprint == token.template_fingerprint
+            and bundle.template_generation == token.template_generation
+            and snapshot.template_artifacts is not None
+            and bundle.template is snapshot.template_artifacts.template
+            and self._tip_refresh_snapshot_current_locked(
+                snapshot,
+                token.observation_sequence,
+            )
+        )
+
+    def _tip_refresh_snapshot_current_locked(
+        self,
+        snapshot: QbitTipTemplateSnapshot,
+        observation_sequence: int,
+    ) -> bool:
+        current_tip = getattr(self, "current_tip_first_seen", None)
+        return bool(
+            self.tip_template_snapshot is snapshot
+            and current_tip is not None
+            and current_tip[0] == snapshot.bestblockhash
+            and int(getattr(self, "current_tip_observation_sequence", 0))
+            == observation_sequence
+        )
+
+    def _validate_prepared_tip_refresh(
+        self,
+        bundle: CachedJobBundle,
+        snapshot: QbitTipTemplateSnapshot,
+        observation_sequence: int,
+    ) -> TipRefreshValidationToken:
+        """Perform the O(1) final chain/trust guard and mint its token."""
+        artifacts = self._tip_refresh_artifacts(snapshot)
+        if (
+            bundle.template is not artifacts.template
+            or bundle.template_fingerprint != artifacts.fingerprint
+            or bundle.template_generation != artifacts.generation
+        ):
+            raise TemplateRefreshBlocked(
+                "prepared refresh bundle changed before final validation"
+            )
+        try:
+            current_tip = str(self.rpc.call("getbestblockhash"))
+        except Exception as exc:
+            raise TemplateRefreshBlocked(
+                "qbit tip validation failed before prepared fanout"
+            ) from exc
+        if current_tip != snapshot.bestblockhash:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "qbit tip changed before prepared fanout "
+                f"expected={snapshot.bestblockhash} current={current_tip}"
+            )
+        try:
+            reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                snapshot.bestblockhash
+            )
+        except Exception as exc:
+            raise TemplateRefreshBlocked(
+                "qbit reorg reconciliation failed before prepared fanout"
+            ) from exc
+        if not reorg_reconciled:
+            raise TemplateRefreshBlocked(
+                "qbit chain view remained untrusted after reorg reconciliation"
+            )
+        try:
+            if (
+                getattr(self, "reorg_reconciler_enabled", True)
+                and self.qbit_chain_view_untrusted()
+            ):
+                raise TemplateRefreshBlocked(
+                    "qbit chain view became untrusted before prepared fanout"
+                )
+        except TemplateRefreshBlocked:
+            raise
+        except Exception as exc:
+            raise TemplateRefreshBlocked(
+                "qbit chain trust check failed before prepared fanout"
+            ) from exc
+        token = TipRefreshValidationToken(
+            tip_hash=snapshot.bestblockhash,
+            template_fingerprint=artifacts.fingerprint,
+            template_generation=artifacts.generation,
+            observation_sequence=observation_sequence,
+            snapshot=snapshot,
+        )
+        with self.lock:
+            if not self._tip_refresh_token_current_locked(token, bundle, snapshot):
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "prepared refresh was superseded before fanout submission"
+                )
+        return token
+
+    def _activate_tip_refresh(
+        self,
+        token: TipRefreshValidationToken,
+        bundle: CachedJobBundle,
+        snapshot: QbitTipTemplateSnapshot,
+        cancel_event: _FanoutCancellation,
+    ) -> None:
+        with self.lock:
+            if not self._tip_refresh_token_current_locked(token, bundle, snapshot):
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "prepared refresh was superseded before cancellation registration"
+                )
+            active = self._active_tip_refresh
+            if active is not None:
+                active[1].cancel()
+            self._active_tip_refresh = (token, cancel_event)
+
+    def _clear_active_tip_refresh(
+        self,
+        token: TipRefreshValidationToken,
+        cancel_event: _FanoutCancellation,
+    ) -> None:
+        with self.lock:
+            active = self._active_tip_refresh
+            if active is not None and active[0] is token and active[1] is cancel_event:
+                self._active_tip_refresh = None
+
     def send_prepared_job(
         self,
         client: ClientState,
         bundle: CachedJobBundle,
         snapshot: QbitTipTemplateSnapshot,
+        validation_token: TipRefreshValidationToken,
         expected_connection_id: int,
         expected_active_job: PrismJobContext | None,
         cancel_event: _FanoutCancellation | None = None,
@@ -3039,6 +3403,17 @@ class PrismCoordinator:
             if self.stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
                 return RefreshResult("skipped")
             with self.lock:
+                token_current = self._tip_refresh_token_current_locked(
+                    validation_token,
+                    bundle,
+                    snapshot,
+                )
+                if not token_current:
+                    if cancel_event is not None:
+                        cancel_event.cancel()
+                    raise TemplateRefreshBlocked(
+                        "prepared refresh token was superseded before delivery"
+                    )
                 if (
                     client not in self.clients
                     or client.connection_id != expected_connection_id
@@ -3051,37 +3426,27 @@ class PrismCoordinator:
                     or not self.client_needs_tip_template_refresh(client, snapshot)
                 ):
                     return RefreshResult("skipped")
-            phase_started = time.monotonic()
-            try:
-                if not self.ensure_reorg_reconciled_for_current_tip(
-                    expected_tip_hash=snapshot.bestblockhash,
-                ):
-                    raise TemplateRefreshBlocked(
-                        "qbit chain view became untrusted before prepared job delivery"
-                    )
-            except TemplateRefreshBlocked:
-                if cancel_event is not None:
-                    cancel_event.cancel()
-                raise
-            except Exception as exc:
-                if cancel_event is not None:
-                    cancel_event.cancel()
-                raise TemplateRefreshBlocked(
-                    "reorg reconciliation failed before prepared job delivery"
-                ) from exc
-            phases["reorg"] = time.monotonic() - phase_started
             if self.stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
                 return RefreshResult("skipped")
             delivery_admitted = cancel_event is None or cancel_event.begin_delivery()
             if not delivery_admitted:
                 return RefreshResult("skipped")
             try:
-                # prepare_tip_refresh_bundle validates the exact cache fingerprint
-                # before any fanout task is submitted. From that point onward the
-                # immutable bundle is the refresh snapshot: consulting the mutable
-                # global cache here would let an unrelated same-tip job build abort
-                # a partially delivered pass after replacing _template_artifacts.
+                # The validation token binds this immutable bundle to the exact
+                # observed artifact object. Fanout tasks consult only in-memory
+                # publication/cancellation state, never RPC or the mutable cache.
                 with self.lock:
+                    token_current = self._tip_refresh_token_current_locked(
+                        validation_token,
+                        bundle,
+                        snapshot,
+                    )
+                    if not token_current:
+                        if cancel_event is not None:
+                            cancel_event.cancel()
+                        raise TemplateRefreshBlocked(
+                            "prepared refresh token was superseded at delivery gate"
+                        )
                     if (
                         client not in self.clients
                         or client.connection_id != expected_connection_id
@@ -3141,11 +3506,28 @@ class PrismCoordinator:
         bundle: CachedJobBundle,
         snapshot: QbitTipTemplateSnapshot,
         *,
+        observation_sequence: int | None = None,
         expected_active_jobs: dict[ClientState, PrismJobContext | None] | None = None,
         heartbeat_name: str,
     ) -> tuple[int, float | None, float | None, int]:
         executor = self.tip_refresh_executor()
         cancel_event = _FanoutCancellation()
+        if observation_sequence is None:
+            with self.lock:
+                observation_sequence = int(
+                    getattr(self, "current_tip_observation_sequence", 0)
+                )
+        validation_token = self._validate_prepared_tip_refresh(
+            bundle,
+            snapshot,
+            observation_sequence,
+        )
+        self._activate_tip_refresh(
+            validation_token,
+            bundle,
+            snapshot,
+            cancel_event,
+        )
         futures: dict[Future[RefreshResult], ClientState] = {}
         if expected_active_jobs is None:
             with self.lock:
@@ -3162,6 +3544,7 @@ class PrismCoordinator:
                     client,
                     bundle,
                     snapshot,
+                    validation_token,
                     client.connection_id,
                     expected_active_jobs.get(client),
                     cancel_event,
@@ -3169,78 +3552,115 @@ class PrismCoordinator:
             except RuntimeError:
                 if self.stop_event.is_set():
                     break
+                cancel_event.set()
+                for submitted_future in futures:
+                    submitted_future.cancel()
+                if futures:
+                    wait(set(futures))
+                self._schedule_tip_refresh_retry()
+                self._clear_active_tip_refresh(validation_token, cancel_event)
                 raise
             self._tip_refresh_future_started()
             future.add_done_callback(self._tip_refresh_future_finished)
             futures[future] = client
 
-        pending = set(futures)
-        sent = 0
-        failed = 0
-        first_delivery: float | None = None
-        last_delivery: float | None = None
-        invalidation: TemplateRefreshBlocked | None = None
-        while pending:
-            self._record_heartbeat(heartbeat_name)
-            if self.stop_event.is_set():
-                cancel_event.set()
-                for future in pending:
-                    future.cancel()
-                break
-            done, pending = wait(
-                pending,
-                timeout=1.0,
-                return_when=FIRST_COMPLETED,
-            )
-            for future in done:
-                client = futures[future]
-                if future.cancelled():
-                    self._record_tip_refresh_client_result("skipped")
-                    continue
-                try:
-                    result = future.result()
-                except OSError:
-                    self._record_tip_refresh_client_result("disconnected")
-                    self.disconnect_client(client)
-                    continue
-                except TemplateRefreshBlocked as exc:
-                    failed += 1
-                    self._record_tip_refresh_client_result("failed")
-                    invalidation = exc
+        try:
+            pending = set(futures)
+            sent = 0
+            failed = 0
+            first_delivery: float | None = None
+            last_delivery: float | None = None
+            invalidation: TemplateRefreshBlocked | None = None
+            while pending:
+                self._record_heartbeat(heartbeat_name)
+                if self.stop_event.is_set():
                     cancel_event.set()
-                    for pending_future in pending:
-                        pending_future.cancel()
-                    continue
-                except Exception:
-                    failed += 1
-                    self._record_tip_refresh_client_result("failed")
-                    with self.lock:
-                        self.job_build_failure_count += 1
-                    print(
-                        "prism coordinator: prepared job fanout failed "
-                        f"connection={client.connection_id} username={client.username}",
-                        flush=True,
-                    )
-                    traceback.print_exc()
-                    continue
-                self._record_tip_refresh_client_result(result.result)
-                if result.result == "sent":
-                    sent += 1
-                    delivered = result.delivered_monotonic
-                    if delivered is not None:
-                        first_delivery = (
-                            delivered
-                            if first_delivery is None
-                            else min(first_delivery, delivered)
+                    for future in pending:
+                        future.cancel()
+                    break
+                done, pending = wait(
+                    pending,
+                    timeout=1.0,
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in done:
+                    client = futures[future]
+                    if future.cancelled():
+                        self._record_tip_refresh_client_result("skipped")
+                        continue
+                    try:
+                        result = future.result()
+                    except OSError:
+                        self._record_tip_refresh_client_result("disconnected")
+                        self.disconnect_client(client)
+                        continue
+                    except TemplateRefreshBlocked as exc:
+                        failed += 1
+                        self._record_tip_refresh_client_result("failed")
+                        invalidation = exc
+                        cancel_event.set()
+                        for pending_future in pending:
+                            pending_future.cancel()
+                        continue
+                    except Exception:
+                        failed += 1
+                        self._record_tip_refresh_client_result("failed")
+                        with self.lock:
+                            self.job_build_failure_count += 1
+                        print(
+                            "prism coordinator: prepared job fanout failed "
+                            f"connection={client.connection_id} username={client.username}",
+                            flush=True,
                         )
-                        last_delivery = (
-                            delivered
-                            if last_delivery is None
-                            else max(last_delivery, delivered)
-                        )
-        if invalidation is not None:
-            raise invalidation
-        return sent, first_delivery, last_delivery, failed
+                        traceback.print_exc()
+                        continue
+                    self._record_tip_refresh_client_result(result.result)
+                    if result.result == "sent":
+                        sent += 1
+                        delivered = result.delivered_monotonic
+                        if delivered is not None:
+                            first_delivery = (
+                                delivered
+                                if first_delivery is None
+                                else min(first_delivery, delivered)
+                            )
+                            last_delivery = (
+                                delivered
+                                if last_delivery is None
+                                else max(last_delivery, delivered)
+                            )
+            if invalidation is not None:
+                self._schedule_tip_refresh_retry()
+                raise invalidation
+            with self.lock:
+                token_current = self._tip_refresh_token_current_locked(
+                    validation_token,
+                    bundle,
+                    snapshot,
+                )
+            if not token_current:
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "prepared refresh was superseded during fanout; immediate retry scheduled"
+                )
+            try:
+                post_fanout_tip = str(self.rpc.call("getbestblockhash"))
+            except Exception as exc:
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "qbit tip validation failed after prepared fanout; "
+                    "immediate retry scheduled"
+                ) from exc
+            if post_fanout_tip != snapshot.bestblockhash:
+                cancel_event.set()
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "qbit tip changed during prepared fanout; immediate retry scheduled "
+                    f"expected={snapshot.bestblockhash} current={post_fanout_tip}"
+                )
+            return sent, first_delivery, last_delivery, failed
+        finally:
+            self._clear_active_tip_refresh(validation_token, cancel_event)
 
     def poll_qbit_tip_template_once(self, *, heartbeat_name: str = "qbit_blockpoll") -> int:
         self._ensure_tip_refresh_state()
@@ -3249,14 +3669,27 @@ class PrismCoordinator:
             self._record_heartbeat(heartbeat_name)
             if self.stop_event.is_set():
                 return 0
+        observation_sequence = 0
+        pending_signal_token: int | None = None
         try:
             observation_sequence = self._reserve_tip_observation_sequence()
+            if self.tip_refresh_is_pending():
+                pending_signal_token = self._mark_tip_refresh_pending(
+                    observation_sequence
+                )
+            # The interval poller has no push notification to mark priority for
+            # it. Probe the cheap best-tip RPC before fetching and deriving the
+            # template so CTV maintenance can yield as soon as a changed tip is
+            # observed, rather than after reconciliation or bundle preparation.
+            observed_best_tip = str(self.rpc.call("getbestblockhash"))
+            with self.lock:
+                current_tip = getattr(self, "current_tip_first_seen", None)
+            if current_tip is not None and current_tip[0] != observed_best_tip:
+                pending_signal_token = self._mark_tip_refresh_pending(
+                    observation_sequence
+                )
             snapshot = self.fetch_qbit_tip_template_snapshot()
             self.pool_readiness_latched()
-            if not self.ensure_reorg_reconciled_for_tip(snapshot.bestblockhash):
-                raise TemplateRefreshBlocked(
-                    "qbit chain view remained untrusted after reorg reconciliation"
-                )
             with self.lock:
                 previous_snapshot = self.tip_template_snapshot
                 # Generation orders concurrent observations but is not itself
@@ -3292,6 +3725,11 @@ class PrismCoordinator:
                     for client in clients
                 }
 
+            if clients and snapshot_changed:
+                pending_signal_token = self._mark_tip_refresh_pending(
+                    observation_sequence
+                )
+
             refreshed = 0
             build_failures = 0
             first_delivery: float | None = None
@@ -3300,6 +3738,19 @@ class PrismCoordinator:
                 clients
                 and getattr(self, "_pool_ready_latched", False)
             )
+            if not use_prepared_fanout:
+                try:
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                        snapshot.bestblockhash
+                    )
+                except Exception as exc:
+                    raise TemplateRefreshBlocked(
+                        "qbit reorg reconciliation failed before refresh preparation"
+                    ) from exc
+                if not reorg_reconciled:
+                    raise TemplateRefreshBlocked(
+                        "qbit chain view remained untrusted after reorg reconciliation"
+                    )
             bundle: CachedJobBundle | None = None
             if use_prepared_fanout:
                 try:
@@ -3317,6 +3768,7 @@ class PrismCoordinator:
             if not self.observe_tip_first_seen(
                 snapshot.bestblockhash,
                 observation_sequence=observation_sequence,
+                publish_refresh_observation=True,
             ):
                 raise TemplateRefreshBlocked(
                     "tip/template poll was superseded by a newer tip observation"
@@ -3346,6 +3798,7 @@ class PrismCoordinator:
                     clients,
                     bundle,
                     snapshot,
+                    observation_sequence=observation_sequence,
                     expected_active_jobs=expected_active_jobs,
                     heartbeat_name=heartbeat_name,
                 )
@@ -3362,6 +3815,8 @@ class PrismCoordinator:
                             clean_jobs=self.client_tip_changed_for_snapshot(client, snapshot),
                             raise_on_reorg_failure=True,
                             raise_on_build_failure=True,
+                            tip_refresh_snapshot=snapshot,
+                            tip_refresh_observation_sequence=observation_sequence,
                         ):
                             delivered = time.monotonic()
                             refreshed += 1
@@ -3385,6 +3840,23 @@ class PrismCoordinator:
                         self._record_tip_refresh_client_result("disconnected")
                         self.disconnect_client(client)
 
+                if clients:
+                    try:
+                        post_fanout_tip = str(self.rpc.call("getbestblockhash"))
+                    except Exception as exc:
+                        self._schedule_tip_refresh_retry()
+                        raise TemplateRefreshBlocked(
+                            "qbit tip validation failed after sequential refresh; "
+                            "immediate retry scheduled"
+                        ) from exc
+                    if post_fanout_tip != snapshot.bestblockhash:
+                        self._schedule_tip_refresh_retry()
+                        raise TemplateRefreshBlocked(
+                            "qbit tip changed during sequential refresh; "
+                            "immediate retry scheduled "
+                            f"expected={snapshot.bestblockhash} current={post_fanout_tip}"
+                        )
+
             if refreshed == 0 and build_failures:
                 raise TemplateRefreshBlocked(
                     f"job builds failed for {build_failures} client(s); no refreshed work was issued"
@@ -3404,6 +3876,8 @@ class PrismCoordinator:
             self.last_successful_template_refresh_monotonic = time.monotonic()
             return refreshed
         finally:
+            if pending_signal_token is not None:
+                self._clear_tip_refresh_pending(pending_signal_token)
             self._tip_refresh_lock.release()
             self._observe_tip_refresh_seconds(
                 "refresh",
@@ -3421,10 +3895,13 @@ class PrismCoordinator:
         tip_hash: str,
         *,
         observation_sequence: int | None = None,
+        publish_refresh_observation: bool = False,
     ) -> bool:
         if observation_sequence is None:
             observation_sequence = self._reserve_tip_observation_sequence()
         now = time.monotonic()
+        active_to_cancel: _FanoutCancellation | None = None
+        tip_changed = False
         with self.lock:
             current_sequence = int(
                 getattr(self, "current_tip_observation_sequence", 0)
@@ -3433,14 +3910,45 @@ class PrismCoordinator:
                 return False
             first_seen = getattr(self, "current_tip_first_seen", None)
             if first_seen is not None and first_seen[0] == tip_hash:
+                same_tip = True
+                active = getattr(self, "_active_tip_refresh", None)
+                # A routine blockwait/poll observation of the same hash carries
+                # no newer template. While that hash is actively fanning out,
+                # do not invalidate its token merely by advancing the global
+                # observation sequence. The next real refresh observation can
+                # advance it after the active fanout clears.
+                if publish_refresh_observation and (
+                    active is None or active[0].tip_hash != tip_hash
+                ):
+                    self.current_tip_observation_sequence = observation_sequence
+            else:
+                same_tip = False
+                tip_changed = first_seen is not None
+                active = getattr(self, "_active_tip_refresh", None)
+                if (
+                    active is not None
+                    and active[0].tip_hash != tip_hash
+                    and active[0].observation_sequence < observation_sequence
+                ):
+                    active_to_cancel = active[1]
+                # The first tip this process observes is a startup baseline,
+                # not a tip flip: a None stamp keeps stale grace closed.
+                self.current_tip_first_seen = (
+                    tip_hash,
+                    now if first_seen is not None else None,
+                )
                 self.current_tip_observation_sequence = observation_sequence
-                return True
-            # The first tip this process observes is a startup baseline, not a
-            # tip flip: a None stamp keeps the stale-grace window closed. Only
-            # a change away from a previously observed tip records a flip time.
-            self.current_tip_first_seen = (tip_hash, now if first_seen is not None else None)
-            self.current_tip_observation_sequence = observation_sequence
-            self.current_tip_parent = None
+                self.current_tip_parent = None
+
+        if active_to_cancel is not None:
+            active_to_cancel.cancel()
+            self._mark_tip_refresh_pending(observation_sequence)
+            self._schedule_tip_refresh_retry()
+        if same_tip:
+            return True
+        if tip_changed:
+            self._mark_tip_refresh_pending(observation_sequence)
+            self._schedule_tip_refresh_retry()
 
         # Parent lookup is best-effort cleanup metadata, so never hold the
         # coordinator lock across RPC or fail tip observation when it is
@@ -3916,6 +4424,7 @@ class PrismCoordinator:
         # drive tip observation/graveyard pruning.
         bestblockhash = str(self.rpc.call("getbestblockhash"))
         if bestblockhash != previousblockhash:
+            self._schedule_tip_refresh_retry()
             raise TemplateRefreshBlocked(
                 "qbit tip changed while fetching block template "
                 f"template_parent={previousblockhash} current={bestblockhash}"
@@ -3933,12 +4442,10 @@ class PrismCoordinator:
                 previousblockhash=artifacts.previousblockhash,
                 template_fingerprint=artifacts.fingerprint,
                 template_generation=artifacts.generation,
+                template_artifacts=artifacts,
             )
-        return QbitTipTemplateSnapshot(
-            bestblockhash=bestblockhash,
-            previousblockhash=previousblockhash,
-            template_fingerprint=qbit_template_fingerprint(template),
-            template_generation=generation,
+        raise TemplateRefreshBlocked(
+            "unable to derive exact artifacts for observed qbit template"
         )
 
     def ensure_reorg_reconciled_for_current_tip(
@@ -4595,6 +5102,8 @@ class PrismCoordinator:
         clean_jobs: bool,
         raise_on_reorg_failure: bool = False,
         raise_on_build_failure: bool = False,
+        tip_refresh_snapshot: QbitTipTemplateSnapshot | None = None,
+        tip_refresh_observation_sequence: int | None = None,
     ) -> bool:
         with client.job_update_lock:
             return self._maybe_send_job_locked(
@@ -4602,6 +5111,8 @@ class PrismCoordinator:
                 clean_jobs=clean_jobs,
                 raise_on_reorg_failure=raise_on_reorg_failure,
                 raise_on_build_failure=raise_on_build_failure,
+                tip_refresh_snapshot=tip_refresh_snapshot,
+                tip_refresh_observation_sequence=tip_refresh_observation_sequence,
             )
 
     def _maybe_send_job_locked(
@@ -4611,6 +5122,8 @@ class PrismCoordinator:
         clean_jobs: bool,
         raise_on_reorg_failure: bool = False,
         raise_on_build_failure: bool = False,
+        tip_refresh_snapshot: QbitTipTemplateSnapshot | None = None,
+        tip_refresh_observation_sequence: int | None = None,
     ) -> bool:
         if not client.subscribed or not client.authorized or client.worker is None:
             return False
@@ -4623,30 +5136,61 @@ class PrismCoordinator:
             flush=True,
         )
         phase_started = time.monotonic()
-        try:
-            if not self.ensure_reorg_reconciled_for_current_tip():
+        guarded_refresh = tip_refresh_snapshot is not None
+        if guarded_refresh != (tip_refresh_observation_sequence is not None):
+            raise ValueError("tip refresh snapshot and observation sequence must be paired")
+        if guarded_refresh:
+            assert tip_refresh_snapshot is not None
+            assert tip_refresh_observation_sequence is not None
+            with self.lock:
+                refresh_current = self._tip_refresh_snapshot_current_locked(
+                    tip_refresh_snapshot,
+                    tip_refresh_observation_sequence,
+                )
+            if not refresh_current:
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "tip refresh snapshot was superseded before client job build"
+                )
+        else:
+            try:
+                if not self.ensure_reorg_reconciled_for_current_tip():
+                    if raise_on_reorg_failure:
+                        raise TemplateRefreshBlocked(
+                            "qbit chain view became untrusted before client job build"
+                        )
+                    return False
+            except TemplateRefreshBlocked:
+                raise
+            except Exception as exc:
+                print(
+                    f"prism coordinator: reorg reconciliation failed before job build "
+                    f"connection={client.connection_id} username={client.username}; skipping this job",
+                    flush=True,
+                )
+                traceback.print_exc()
                 if raise_on_reorg_failure:
                     raise TemplateRefreshBlocked(
-                        "qbit chain view became untrusted before client job build"
-                    )
+                        "reorg reconciliation failed before client job build"
+                    ) from exc
                 return False
-        except TemplateRefreshBlocked:
-            raise
-        except Exception as exc:
-            print(
-                f"prism coordinator: reorg reconciliation failed before job build "
-                f"connection={client.connection_id} username={client.username}; skipping this job",
-                flush=True,
-            )
-            traceback.print_exc()
-            if raise_on_reorg_failure:
-                raise TemplateRefreshBlocked(
-                    "reorg reconciliation failed before client job build"
-                ) from exc
-            return False
         phases["reorg"] = time.monotonic() - phase_started
+        built_from_guarded_artifacts = bool(
+            guarded_refresh
+            and tip_refresh_snapshot.template_artifacts is not None
+            and "build_job_for_client" not in self.__dict__
+        )
         try:
-            context = self.build_job_for_client(client, clean_jobs=clean_jobs)
+            if built_from_guarded_artifacts:
+                assert tip_refresh_snapshot is not None
+                assert tip_refresh_snapshot.template_artifacts is not None
+                context = self.build_job_for_client_from_artifacts(
+                    client,
+                    tip_refresh_snapshot.template_artifacts,
+                    clean_jobs=clean_jobs,
+                )
+            else:
+                context = self.build_job_for_client(client, clean_jobs=clean_jobs)
         except Exception as exc:
             # A single bad template (e.g. a coinbase whose bytes collide with the
             # extranonce placeholder, or a transient getblocktemplate failure) must
@@ -4668,8 +5212,28 @@ class PrismCoordinator:
                     f"job build failed for connection {client.connection_id}"
                 ) from exc
             return False
-        client.active_job = context
         with self.lock:
+            if guarded_refresh:
+                assert tip_refresh_snapshot is not None
+                assert tip_refresh_observation_sequence is not None
+                if not self._tip_refresh_snapshot_current_locked(
+                    tip_refresh_snapshot,
+                    tip_refresh_observation_sequence,
+                ):
+                    self._schedule_tip_refresh_retry()
+                    raise TemplateRefreshBlocked(
+                        "tip refresh snapshot was superseded during client job build"
+                    )
+                artifacts = tip_refresh_snapshot.template_artifacts
+                if built_from_guarded_artifacts and artifacts is not None and (
+                    context.template is not artifacts.template
+                    or context.template_fingerprint != artifacts.fingerprint
+                    or context.template_generation != artifacts.generation
+                ):
+                    raise TemplateRefreshBlocked(
+                        "client job build did not use the guarded refresh artifacts"
+                    )
+            client.active_job = context
             if clean_jobs:
                 for job_id in client.active_job_ids:
                     self.bury_evicted_job(client, job_id, prune=False)
@@ -4910,8 +5474,24 @@ class PrismCoordinator:
         if client.worker is None:
             raise StratumError(20, "client is not authorized")
         self._ensure_job_cache_state()
-        phases = self._job_build_phases()
         artifacts = self.current_template_artifacts()
+        return self.build_job_for_client_from_artifacts(
+            client,
+            artifacts,
+            clean_jobs=clean_jobs,
+        )
+
+    def build_job_for_client_from_artifacts(
+        self,
+        client: ClientState,
+        artifacts: CachedTemplateArtifacts,
+        *,
+        clean_jobs: bool,
+    ) -> PrismJobContext:
+        if client.worker is None:
+            raise StratumError(20, "client is not authorized")
+        self._ensure_job_cache_state()
+        phases = self._job_build_phases()
         cached_bundle = self.shared_job_bundle(artifacts, client.worker)
         stamp_started = time.monotonic()
         context = self.stamp_job_for_client(client, cached_bundle, clean_jobs=clean_jobs)
@@ -7122,7 +7702,17 @@ class PrismCoordinator:
             pass_sum = self.ctv_broadcaster_pass_seconds_sum
             pass_count = self.ctv_broadcaster_pass_count
             processed_rows_total = self.ctv_broadcaster_processed_rows_total
+            yielded_total = self.ctv_broadcaster_yielded_total
+            chunk_seconds_buckets = dict(
+                self.ctv_broadcaster_chunk_seconds_bucket_counts
+            )
+            chunk_rows_buckets = dict(self.ctv_broadcaster_chunk_rows_bucket_counts)
+            chunk_seconds_sum = self.ctv_broadcaster_chunk_seconds_sum
+            chunk_rows_sum = self.ctv_broadcaster_chunk_rows_sum
+            chunk_count = self.ctv_broadcaster_chunk_count
         metric_name = "qbit_prism_ctv_fanout_broadcaster_pass_seconds"
+        chunk_seconds_name = "qbit_prism_ctv_fanout_broadcaster_chunk_seconds"
+        chunk_rows_name = "qbit_prism_ctv_fanout_broadcaster_chunk_rows"
         return [
             "# HELP qbit_prism_ctv_fanout_broadcaster_processed_rows_total CTV fanout rows completed by the broadcaster loop.",
             "# TYPE qbit_prism_ctv_fanout_broadcaster_processed_rows_total counter",
@@ -7136,6 +7726,27 @@ class PrismCoordinator:
             f'{metric_name}_bucket{{le="+Inf"}} {pass_count}',
             f"{metric_name}_sum {pass_sum:.6f}",
             f"{metric_name}_count {pass_count}",
+            "# HELP qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total CTV broadcaster passes yielding between committed chunks for a pending tip refresh.",
+            "# TYPE qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total counter",
+            f"qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total {yielded_total}",
+            "# HELP qbit_prism_ctv_fanout_broadcaster_chunk_seconds CTV broadcaster committed chunk wall time.",
+            "# TYPE qbit_prism_ctv_fanout_broadcaster_chunk_seconds histogram",
+            *[
+                f'{chunk_seconds_name}_bucket{{le="{bucket:g}"}} {chunk_seconds_buckets.get(bucket, 0)}'
+                for bucket in PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS
+            ],
+            f'{chunk_seconds_name}_bucket{{le="+Inf"}} {chunk_count}',
+            f"{chunk_seconds_name}_sum {chunk_seconds_sum:.6f}",
+            f"{chunk_seconds_name}_count {chunk_count}",
+            "# HELP qbit_prism_ctv_fanout_broadcaster_chunk_rows Rows processed per committed CTV broadcaster chunk.",
+            "# TYPE qbit_prism_ctv_fanout_broadcaster_chunk_rows histogram",
+            *[
+                f'{chunk_rows_name}_bucket{{le="{bucket}"}} {chunk_rows_buckets.get(bucket, 0)}'
+                for bucket in PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS
+            ],
+            f'{chunk_rows_name}_bucket{{le="+Inf"}} {chunk_count}',
+            f"{chunk_rows_name}_sum {chunk_rows_sum}",
+            f"{chunk_rows_name}_count {chunk_count}",
         ]
 
     def tip_refresh_metrics_lines(self) -> list[str]:

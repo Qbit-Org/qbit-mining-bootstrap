@@ -1073,6 +1073,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server._record_ctv_fanout_broadcaster_progress()
         server._record_ctv_fanout_broadcaster_progress()
         server.observe_ctv_fanout_broadcaster_pass(102.0)
+        server.observe_ctv_fanout_broadcaster_chunk(
+            SimpleNamespace(processed_count=1, elapsed_seconds=0.25)
+        )
+        server._record_ctv_fanout_broadcaster_yield()
 
         metrics = server.metrics_payload()
 
@@ -1087,6 +1091,18 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         self.assertIn("qbit_prism_ctv_fanout_broadcaster_pass_seconds_sum 102.000000", metrics)
         self.assertIn("qbit_prism_ctv_fanout_broadcaster_pass_seconds_count 1", metrics)
+        self.assertIn(
+            "qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total 1",
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_ctv_fanout_broadcaster_chunk_seconds_bucket{le="0.25"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_ctv_fanout_broadcaster_chunk_rows_bucket{le="1"} 1',
+            metrics,
+        )
 
     def test_zero_worker_metric_limit_uses_overflow_bucket(self) -> None:
         server = coordinator()
@@ -2065,13 +2081,25 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 captured["broadcaster"] = broadcaster
                 captured["fee_sats"] = fee_sats
 
-            def run_once(self, *, limit: int) -> object:
+            def run_once(
+                self,
+                *,
+                limit: int,
+                progress_callback: object,
+                chunk_size: int,
+                tip_refresh_pending: object,
+                chunk_callback: object,
+            ) -> object:
                 captured["limit"] = limit
+                captured["chunk_size"] = chunk_size
+                captured["tip_refresh_pending"] = tip_refresh_pending
+                captured["chunk_callback"] = chunk_callback
                 return SimpleNamespace(
                     scanned_count=1,
                     submitted_count=0,
                     updated_count=1,
                     failed_count=0,
+                    yielded_to_tip_refresh=False,
                 )
 
         with patch("lab.prism.prism_coordinator.CtvFanoutBroadcastDaemon", FakeDaemon):
@@ -2080,6 +2108,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIs(captured["ledger"], server.ledger)
         self.assertEqual(captured["fee_sats"], 0)
         self.assertEqual(captured["limit"], 7)
+        self.assertEqual(captured["chunk_size"], 5)
+        self.assertTrue(callable(captured["tip_refresh_pending"]))
+        self.assertTrue(callable(captured["chunk_callback"]))
         self.assertEqual(result.updated_count, 1)
         self.assertIsNotNone(captured["broadcaster"])
 
@@ -2304,6 +2335,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             previousblockhash=old_tip,
             template_fingerprint="22" * 32,
         )
+        server.rpc = TipRpc(old_tip)
 
         def overtake_poll() -> QbitTipTemplateSnapshot:
             self.assertTrue(server.observe_tip_first_seen(new_tip))
@@ -3176,6 +3208,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             previousblockhash="11" * 32,
             template_fingerprint="22" * 32,
         )
+        server.rpc = TipRpc(snapshot.bestblockhash)
         server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
 
         def trusted_chain_view(_tip: str) -> bool:
@@ -3196,6 +3229,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             previousblockhash="11" * 32,
             template_fingerprint="22" * 32,
         )
+        server.rpc = TipRpc(snapshot.bestblockhash)
         server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
         server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
 
@@ -3216,6 +3250,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             previousblockhash="11" * 32,
             template_fingerprint="22" * 32,
         )
+        server.rpc = TipRpc(snapshot.bestblockhash)
         server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
         server.ensure_reorg_reconciled_for_tip = lambda _tip: False  # type: ignore[method-assign]
 
@@ -3255,6 +3290,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             previousblockhash=new_tip,
             template_fingerprint="44" * 32,
         )
+        server.rpc = TipRpc(new_tip)
         server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
         server.build_job_for_client = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
             RuntimeError("template build unavailable")
@@ -5498,7 +5534,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                 return True
 
         class ProgressingDaemon:
-            def run_once(self, *, limit: int, progress_callback: object) -> object:
+            def run_once(self, *, limit: int, progress_callback: object, **_kwargs: object) -> object:
                 seen_limits.append(limit)
                 assert callable(progress_callback)
                 for _ in range(3):
@@ -5510,6 +5546,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                     submitted_count=0,
                     updated_count=3,
                     failed_count=0,
+                    yielded_to_tip_refresh=False,
                 )
 
         server.stop_event = StopAfterOnePass()  # type: ignore[assignment]
@@ -5546,13 +5583,14 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                 return True
 
         class IncidentDurationDaemon:
-            def run_once(self, *, limit: int, progress_callback: object) -> object:
+            def run_once(self, *, limit: int, progress_callback: object, **_kwargs: object) -> object:
                 clock["now"] += 102.0
                 return SimpleNamespace(
                     scanned_count=200,
                     submitted_count=0,
                     updated_count=200,
                     failed_count=0,
+                    yielded_to_tip_refresh=False,
                 )
 
         server.stop_event = StopAfterIntervalWait()  # type: ignore[assignment]
@@ -5576,7 +5614,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         release_row = threading.Event()
 
         class BlockingDaemon:
-            def run_once(self, *, limit: int, progress_callback: object) -> object:
+            def run_once(self, *, limit: int, progress_callback: object, **_kwargs: object) -> object:
                 entered_row.set()
                 release_row.wait()
                 return SimpleNamespace(
@@ -5584,6 +5622,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                     submitted_count=0,
                     updated_count=1,
                     failed_count=0,
+                    yielded_to_tip_refresh=False,
                 )
 
         server.ctv_fanout_broadcast_daemon = BlockingDaemon()

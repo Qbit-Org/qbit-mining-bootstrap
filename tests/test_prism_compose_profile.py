@@ -54,6 +54,7 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_CTV_BROADCASTER_WALLET": "fanout-broadcaster",
                 "PRISM_CTV_BROADCASTER_FEE_BITS": "0",
                 "PRISM_CTV_BROADCASTER_LIMIT": "7",
+                "PRISM_CTV_BROADCASTER_CHUNK_SIZE": "3",
                 "PRISM_CTV_BROADCASTER_INTERVAL_SECONDS": "11",
                 "PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT": "9",
                 "PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS": "17",
@@ -195,6 +196,7 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_CTV_BROADCASTER_WALLET"], "fanout-broadcaster")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_FEE_BITS"], "0")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_LIMIT"], "7")
+        self.assertEqual(env["PRISM_CTV_BROADCASTER_CHUNK_SIZE"], "3")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_INTERVAL_SECONDS"], "11")
         self.assertEqual(env["PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT"], "9")
         self.assertEqual(env["PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS"], "17")

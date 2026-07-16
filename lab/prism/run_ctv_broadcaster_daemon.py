@@ -14,7 +14,11 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
-from lab.prism.ctv_broadcaster_daemon import CtvFanoutBroadcastDaemon, CtvFanoutDaemonResult
+from lab.prism.ctv_broadcaster_daemon import (
+    CtvFanoutBroadcastDaemon,
+    CtvFanoutDaemonResult,
+    MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE,
+)
 from lab.prism.share_ledger import PsqlShareLedger, SingleWriterShareLedger
 from lab.prism.prism_coordinator import JsonRpc, env, env_bool, env_int, env_positive_float
 
@@ -115,10 +119,16 @@ def print_result(result: CtvFanoutDaemonResult) -> None:
 def main() -> int:
     daemon = make_daemon_from_env()
     limit = env_positive_int("PRISM_CTV_BROADCASTER_LIMIT", 100)
+    chunk_size = env_positive_int("PRISM_CTV_BROADCASTER_CHUNK_SIZE", 5)
+    if chunk_size > MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE:
+        raise SystemExit(
+            "PRISM_CTV_BROADCASTER_CHUNK_SIZE must be at most "
+            f"{MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE}"
+        )
     once = env_bool("PRISM_CTV_BROADCASTER_ONCE", "0")
     interval_seconds = env_positive_int("PRISM_CTV_BROADCASTER_INTERVAL_SECONDS", 30)
     while True:
-        print_result(daemon.run_once(limit=limit))
+        print_result(daemon.run_once(limit=limit, chunk_size=chunk_size))
         if once:
             return 0
         time.sleep(interval_seconds)
