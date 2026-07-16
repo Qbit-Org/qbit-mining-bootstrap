@@ -1017,6 +1017,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.connection_limit_rejection_counts = {"global": 2, "username": 3}
         server.accept_resource_exhaustion_count = 4
         server.connection_setup_failure_count = 5
+        server.evicted_job_capacity_eviction_counts = {"connection": 6, "global": 7}
 
         metrics = server.metrics_payload()
 
@@ -1036,6 +1037,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         self.assertIn("qbit_prism_stratum_accept_resource_exhaustions_total 4", metrics)
         self.assertIn("qbit_prism_stratum_connection_setup_failures_total 5", metrics)
+        self.assertIn(
+            'qbit_prism_evicted_job_capacity_evictions_total{scope="connection"} 6',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_evicted_job_capacity_evictions_total{scope="global"} 7',
+            metrics,
+        )
         self.assertIn('qbit_prism_rejections_total{reason_id="stale-job"} 2', metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="duplicate-share"} 1', metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="low-difficulty"} 3', metrics)
@@ -2827,7 +2836,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.backend_name, "postgres-psql")
         self.assertEqual(fake_ledger.call_args.kwargs["writer_session_token"], "fixed-session")
 
-    def test_same_tip_retention_requires_connection_derived_production_bound(self) -> None:
+    def test_same_tip_retention_requires_independent_production_bounds(self) -> None:
         with self.assertRaisesRegex(
             SystemExit,
             "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION",
@@ -2835,33 +2844,36 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             validate_same_tip_job_retention_limits(
                 retention_seconds=30,
                 per_connection=0,
-                max_connections=0,
+                global_cap=0,
                 production=False,
             )
-        with self.assertRaisesRegex(SystemExit, "PRISM_STRATUM_MAX_CONNECTIONS"):
+        with self.assertRaisesRegex(
+            SystemExit,
+            "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL",
+        ):
             validate_same_tip_job_retention_limits(
                 retention_seconds=30,
                 per_connection=64,
-                max_connections=0,
+                global_cap=0,
                 production=True,
             )
 
         validate_same_tip_job_retention_limits(
             retention_seconds=30,
             per_connection=64,
-            max_connections=1_900,
+            global_cap=4_096,
             production=True,
         )
         validate_same_tip_job_retention_limits(
             retention_seconds=30,
             per_connection=64,
-            max_connections=0,
+            global_cap=0,
             production=False,
         )
         validate_same_tip_job_retention_limits(
             retention_seconds=0,
             per_connection=0,
-            max_connections=0,
+            global_cap=0,
             production=True,
         )
 
@@ -2884,7 +2896,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
             "PRISM_STRATUM_VARDIFF_MAX_DIFF": "65536",
-            "PRISM_STRATUM_MAX_CONNECTIONS": "1900",
+            "PRISM_STRATUM_MAX_CONNECTIONS": "0",
+            "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL": "4096",
         }
         for name in (
             "PRISM_ALLOW_MEMORY_LEDGER",
@@ -2901,10 +2914,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {**base, "PRISM_STRATUM_MAX_CONNECTIONS": "0"},
+            {**base, "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL": "0"},
             clear=True,
         ):
-            with self.assertRaisesRegex(SystemExit, "PRISM_STRATUM_MAX_CONNECTIONS"):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL",
+            ):
                 validate_prism_production_gate()
 
         with patch.dict(
@@ -3522,6 +3538,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.current_tip_first_seen = (tip, None)
         server.same_tip_job_retention_seconds = 30
         server.same_tip_job_retention_per_connection = 2
+        server.same_tip_job_retention_global = 4_096
         identity = state.worker
         for index in range(3):
             job_id = f"job-{index + 1}"
@@ -3545,6 +3562,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.current_tip_first_seen = (tip, None)
         server.same_tip_job_retention_seconds = 30
         server.same_tip_job_retention_per_connection = 4_096
+        server.same_tip_job_retention_global = 4_096
         for index in range(4_096):
             job_id = f"retained-{index}"
             server.jobs[job_id] = prism_context(job_id, tip, worker=state.worker)
@@ -3569,44 +3587,29 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(classify_calls, 100)
 
-    def test_pool_width_does_not_evict_other_connections_retained_jobs(self) -> None:
-        tip = "00" * 32
-        server, _state, _ledger = submit_coordinator(tip=tip)
-        server.current_tip_first_seen = (tip, None)
-        server.same_tip_job_retention_seconds = 30
-        server.same_tip_job_retention_per_connection = 1
-        clients: list[ClientState] = []
-        for index in range(4_097):
-            state = client()
-            state.connection_id = index + 1
-            state.worker = worker_identity(f"miner-{index}")
-            clients.append(state)
-            job_id = f"wide-{index}"
-            server.jobs[job_id] = prism_context(job_id, tip, worker=state.worker)
-            server.bury_evicted_job(state, job_id, now=100.0, prune=False)
+    def test_global_same_tip_cap_does_not_evict_stale_grace_entry(self) -> None:
+        old_tip = "00" * 32
+        current_tip = "11" * 32
+        server, state, _ledger = submit_coordinator(tip=old_tip)
+        server.current_tip_first_seen = (current_tip, time.monotonic())
+        server.stale_grace_seconds = 30
+        server.same_tip_job_retention_per_connection = 10
+        server.same_tip_job_retention_global = 1
+        server.bury_evicted_job(state, "job-1")
+        stale_entry = server.evicted_job_graveyard["job-1"]
 
-        self.assertEqual(len(server.evicted_job_graveyard), 4_097)
-        self.assertIn("wide-0", server.evicted_job_graveyard)
-        self.assertIn("wide-4096", server.evicted_job_graveyard)
+        second = client()
+        second.connection_id = 2
+        second.worker = worker_identity("miner-b")
+        for index in range(2):
+            job_id = f"same-{index}"
+            server.jobs[job_id] = prism_context(job_id, current_tip, worker=second.worker)
+            server.bury_evicted_job(second, job_id)
 
-        replacement_id = "wide-0-replacement"
-        server.jobs[replacement_id] = prism_context(
-            replacement_id,
-            tip,
-            worker=clients[0].worker,
-        )
-        server.bury_evicted_job(
-            clients[0],
-            replacement_id,
-            now=101.0,
-            prune=False,
-        )
-
-        self.assertNotIn("wide-0", server.evicted_job_graveyard)
-        self.assertIn("wide-1", server.evicted_job_graveyard)
-        self.assertIn(replacement_id, server.evicted_job_graveyard)
-        self.assertEqual(len(server.evicted_job_graveyard), 4_097)
-        self.assertEqual(server.evicted_job_capacity_eviction_counts["connection"], 1)
+        self.assertIs(server.evicted_job_graveyard["job-1"], stale_entry)
+        self.assertNotIn("same-0", server.evicted_job_graveyard)
+        self.assertIn("same-1", server.evicted_job_graveyard)
+        self.assertEqual(server.evicted_job_capacity_eviction_counts["global"], 1)
 
     def test_tip_change_and_disconnect_remove_retained_contexts(self) -> None:
         old_tip = "00" * 32
