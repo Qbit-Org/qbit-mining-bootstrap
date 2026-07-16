@@ -739,6 +739,10 @@ class JobBundleCacheTests(unittest.TestCase):
                 intervening_job.template_fingerprint,
                 replacement_artifacts.fingerprint,
             )
+            self.assertGreater(
+                intervening_job.template_generation,
+                first.active_job.template_generation,
+            )
         finally:
             release_first.set()
             thread.join(5)
@@ -748,6 +752,78 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(refreshed, [1])
         self.assertIs(second.active_job, intervening_job)
+        self.assertEqual(
+            [payload["method"] for payload in second_sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+
+    def test_queued_fanout_replaces_stale_intervening_job(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 1
+        first = client(1)
+        second = client(2)
+        server.clients = [first, second]  # type: ignore[assignment]
+        old_artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(old_artifacts)
+        assert old_artifacts is not None
+        assert second.worker is not None
+        old_bundle = server.shared_job_bundle(old_artifacts, second.worker)
+        refreshed_template = dict(rpc.template)
+        refreshed_template["coinbasevalue"] = int(
+            refreshed_template["coinbasevalue"]
+        ) + 1
+        rpc.template = refreshed_template
+        first_blocked = threading.Event()
+        release_first = threading.Event()
+        second_sent: list[dict[str, object]] = []
+
+        def first_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                first_blocked.set()
+                self.assertTrue(release_first.wait(5))
+
+        first.send = first_send  # type: ignore[method-assign]
+        second.send = second_sent.append  # type: ignore[method-assign]
+        refreshed: list[int] = []
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                refreshed.append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # noqa: BLE001 - surface to the test
+                errors.append(exc)
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(first_blocked.wait(5))
+            with second.job_update_lock, server.lock:
+                stale_intervening_job = server.stamp_job_for_client(
+                    second,
+                    old_bundle,
+                    clean_jobs=False,
+                )
+                second.active_job = stale_intervening_job
+                second.active_job_ids.add(stale_intervening_job.job.job_id)
+                server.jobs[stale_intervening_job.job.job_id] = stale_intervening_job
+        finally:
+            release_first.set()
+            thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(refreshed, [2])
+        self.assertIsNot(second.active_job, stale_intervening_job)
+        self.assertEqual(
+            second.active_job.template_fingerprint,
+            qbit_template_fingerprint(refreshed_template),
+        )
+        self.assertGreater(
+            second.active_job.template_generation,
+            stale_intervening_job.template_generation,
+        )
         self.assertEqual(
             [payload["method"] for payload in second_sent],
             ["mining.set_difficulty", "mining.notify"],

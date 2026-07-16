@@ -808,6 +808,7 @@ class PrismJobContext:
     worker: WorkerIdentity
     issued_at_ms: int
     template_fingerprint: str | None = None
+    template_generation: int = 0
 
 
 @dataclass
@@ -858,6 +859,7 @@ class QbitTipTemplateSnapshot:
     bestblockhash: str
     previousblockhash: str
     template_fingerprint: str
+    template_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -877,6 +879,7 @@ class CachedTemplateArtifacts:
     witness_merkle_leaves_hex: tuple[str, ...]
     network_difficulty: int
     fetched_monotonic: float
+    generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -901,6 +904,7 @@ class CachedJobBundle:
     issued_at_ms: int
     base_job: direct_stratum.DirectQbitStratumJob
     built_monotonic: float
+    template_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -1731,6 +1735,10 @@ class PrismCoordinator:
             self._job_build_lock = threading.Lock()
         if not hasattr(self, "_template_artifacts"):
             self._template_artifacts: CachedTemplateArtifacts | None = None
+        if not hasattr(self, "_template_artifact_generation"):
+            self._template_artifact_generation = int(
+                getattr(self._template_artifacts, "generation", 0)
+            )
         if not hasattr(self, "_job_bundle_cache"):
             self._job_bundle_cache: dict[tuple[object, ...], CachedJobBundle] = {}
         if not hasattr(self, "_job_build_phase_local"):
@@ -1815,16 +1823,26 @@ class PrismCoordinator:
             fetched_monotonic=time.monotonic(),
         )
 
-    def _store_template_artifacts(self, artifacts: CachedTemplateArtifacts) -> None:
+    def _store_template_artifacts(
+        self,
+        artifacts: CachedTemplateArtifacts,
+    ) -> CachedTemplateArtifacts:
         with self._job_cache_lock:
             previous = self._template_artifacts
-            self._template_artifacts = artifacts
+            if previous is not None and previous.fingerprint == artifacts.fingerprint:
+                generation = previous.generation
+            else:
+                self._template_artifact_generation += 1
+                generation = self._template_artifact_generation
+            stored = dataclass_replace(artifacts, generation=generation)
+            self._template_artifacts = stored
             if previous is not None and previous.fingerprint != artifacts.fingerprint:
                 self._job_bundle_cache = {
                     key: entry
                     for key, entry in self._job_bundle_cache.items()
                     if entry.template_fingerprint == artifacts.fingerprint
                 }
+            return stored
 
     def store_template_artifacts(self, template: dict[str, Any]) -> CachedTemplateArtifacts | None:
         """Best-effort cache fill from an already-fetched template (blockpoll).
@@ -1838,8 +1856,7 @@ class PrismCoordinator:
             artifacts = self._derive_template_artifacts(template)
         except Exception:
             return None
-        self._store_template_artifacts(artifacts)
-        return artifacts
+        return self._store_template_artifacts(artifacts)
 
     def current_template_artifacts(self) -> CachedTemplateArtifacts:
         """Return fresh template artifacts, fetching a template on cache miss."""
@@ -1862,8 +1879,7 @@ class PrismCoordinator:
             raise RuntimeError("getblocktemplate returned non-object")
         phases["template"] = phases.get("template", 0.0) + (time.monotonic() - started)
         artifacts = self._derive_template_artifacts(template)
-        self._store_template_artifacts(artifacts)
-        return artifacts
+        return self._store_template_artifacts(artifacts)
 
     def _lookup_job_bundle(self, fingerprint: str, worker: WorkerIdentity) -> CachedJobBundle | None:
         ttl = getattr(self, "job_bundle_cache_seconds", DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS)
@@ -2020,6 +2036,7 @@ class PrismCoordinator:
             issued_at_ms=issued_at_ms,
             base_job=base_job,
             built_monotonic=time.monotonic(),
+            template_generation=artifacts.generation,
         )
 
     def stamp_job_for_client(
@@ -2059,6 +2076,7 @@ class PrismCoordinator:
             worker=client.worker,
             issued_at_ms=cached.issued_at_ms,
             template_fingerprint=cached.template_fingerprint,
+            template_generation=cached.template_generation,
         )
 
     def accepted_share_stats(self) -> tuple[int, int]:
@@ -2866,8 +2884,12 @@ class PrismCoordinator:
                 if (
                     client not in self.clients
                     or client.connection_id != expected_connection_id
-                    or client.active_job is not expected_active_job
                     or not self.client_can_receive_jobs(client)
+                    or self.intervening_job_supersedes_snapshot(
+                        client.active_job,
+                        expected_active_job,
+                        snapshot,
+                    )
                     or not self.client_needs_tip_template_refresh(client, snapshot)
                 ):
                     return RefreshResult("skipped")
@@ -3050,10 +3072,11 @@ class PrismCoordinator:
                         and self.client_needs_tip_template_refresh(client, snapshot)
                     ]
                 # Capture the exact job each client had when this refresh pass
-                # selected it. A Vardiff/authorize path may install fresher
+                # selected it. A Vardiff/authorize path may install intervening
                 # work while the shared bundle is prepared or while its task
-                # waits in the executor queue; that task must then skip rather
-                # than overwrite the intervening job with this older snapshot.
+                # waits in the executor queue. Artifact generations let the
+                # task replace stale intervening work while preserving work
+                # produced from a template stored after this snapshot.
                 expected_active_jobs = {
                     client: client.active_job
                     for client in clients
@@ -3581,6 +3604,7 @@ class PrismCoordinator:
                 bestblockhash=bestblockhash,
                 previousblockhash=artifacts.previousblockhash,
                 template_fingerprint=artifacts.fingerprint,
+                template_generation=artifacts.generation,
             )
         return QbitTipTemplateSnapshot(
             bestblockhash=bestblockhash,
@@ -3896,6 +3920,22 @@ class PrismCoordinator:
             or previousblockhash != snapshot.previousblockhash
             or context_fingerprint != snapshot.template_fingerprint
         )
+
+    @staticmethod
+    def intervening_job_supersedes_snapshot(
+        active_job: PrismJobContext | None,
+        expected_active_job: PrismJobContext | None,
+        snapshot: QbitTipTemplateSnapshot,
+    ) -> bool:
+        if active_job is expected_active_job or active_job is None:
+            return False
+        active_generation = int(getattr(active_job, "template_generation", 0))
+        snapshot_generation = int(getattr(snapshot, "template_generation", 0))
+        if active_generation <= 0 or snapshot_generation <= 0:
+            # Legacy/test contexts without ordering metadata retain the safe
+            # behavior: never overwrite an unclassified intervening job.
+            return True
+        return active_generation >= snapshot_generation
 
     def client_tip_changed_for_snapshot(
         self,
