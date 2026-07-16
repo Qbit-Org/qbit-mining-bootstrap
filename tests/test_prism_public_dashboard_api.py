@@ -99,7 +99,9 @@ class FakePublicLedger:
         self.now_ms = int(time.time() * 1000)
         self.current_network_difficulty: object | None = None
         self.reward_window_network_difficulty: object | None = None
+        self.reward_leaderboard_network_difficulty: object | None = None
         self.leaderboard_calls = 0
+        self.reward_leaderboard_calls: list[dict[str, object]] = []
         self.pool_snapshot_calls = 0
 
     def dashboard_pool_snapshot(self, *, current_network_difficulty: object, generated_at: str) -> dict[str, object]:
@@ -175,6 +177,77 @@ class FakePublicLedger:
             },
             "pagination": {"page": page, "limit": limit, "total_count": 1, "total_pages": 1},
             "rows": rows,
+        }
+
+    def dashboard_reward_leaderboard(
+        self,
+        *,
+        page: int,
+        limit: int,
+        current_network_difficulty: object,
+        search: str | None = None,
+        recipient_id: str | None = None,
+    ) -> dict[str, object]:
+        self.reward_leaderboard_network_difficulty = current_network_difficulty
+        self.reward_leaderboard_calls.append(
+            {
+                "page": page,
+                "limit": limit,
+                "search": search,
+                "recipient_id": recipient_id,
+            }
+        )
+        requested_window_weight = Decimal(str(current_network_difficulty)) * Decimal(8)
+        rows = [
+            {
+                "rank": 1,
+                "recipient_id": "miner-a",
+                "display_name": None,
+                "hashrate_ths": "1.5",
+                "included_share_count": 3,
+                "counted_share_difficulty": public_api.decimal_string(requested_window_weight * Decimal("0.6")),
+                "share_percent": "60",
+                "blocks_found_total": 1,
+                "last_share_at": "2026-06-26T20:44:53Z",
+            },
+            {
+                "rank": 2,
+                "recipient_id": "miner-b",
+                "display_name": None,
+                "hashrate_ths": "1",
+                "included_share_count": 2,
+                "counted_share_difficulty": public_api.decimal_string(requested_window_weight * Decimal("0.4")),
+                "share_percent": "40",
+                "blocks_found_total": 0,
+                "last_share_at": "2026-06-26T20:44:00Z",
+            },
+        ]
+        if recipient_id is not None:
+            rows = [row for row in rows if row["recipient_id"] == recipient_id]
+        elif search:
+            rows = [row for row in rows if search.lower() in str(row["recipient_id"]).lower()]
+        offset = (page - 1) * limit
+        return {
+            "window": {
+                "id": "reward",
+                "window_multiplier": 8,
+                "network_difficulty": public_api.decimal_string(current_network_difficulty),
+                "requested_window_weight": public_api.decimal_string(requested_window_weight),
+                "counted_window_weight": public_api.decimal_string(requested_window_weight),
+                "is_complete": True,
+                "started_at": "2026-06-26T20:35:00Z",
+                "ended_at": "2026-06-26T20:45:00Z",
+                "observed_span_seconds": 600,
+                "included_share_count": 5,
+            },
+            "totals": {
+                "pool_hashrate_ths": "2.5",
+                "pool_counted_share_difficulty": public_api.decimal_string(requested_window_weight),
+                "participant_count": 2,
+                "expected_time_to_block_seconds": 75,
+            },
+            "pagination": public_api.pagination(page, limit, len(rows)),
+            "rows": rows[offset : offset + limit],
         }
 
     def dashboard_miner_reward_window(self, *, recipient_id: str, current_network_difficulty: object) -> dict[str, object]:
@@ -585,10 +658,64 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertGreater(payload["pool"]["expected_time_to_block_seconds"], 0)
         self.assertEqual(payload["pool"]["expected_time_to_block_seconds"], expected_eta)
 
-    def test_network_summary_falls_back_to_difficulty_one_without_bits(self) -> None:
-        payload = public_api.network_summary(FakeCoordinator(rpc=FakeRpc(template_bits=None)))
+    def test_network_summary_returns_503_without_authoritative_compact_bits(self) -> None:
+        with self.assertRaises(public_api.PublicApiError) as raised:
+            public_api.network_summary(FakeCoordinator(rpc=FakeRpc(template_bits=None)))
 
-        self.assertEqual(payload["network_difficulty"], "1")
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(raised.exception.code, "qbit_rpc_unavailable")
+        self.assertEqual(raised.exception.message, "qbit RPC did not provide valid compact bits")
+
+    def test_network_summary_uses_valid_blockchain_bits_when_template_bits_are_missing_or_invalid(self) -> None:
+        for template_bits in (None, "not-bits"):
+            with self.subTest(template_bits=template_bits):
+                payload = public_api.network_summary(
+                    FakeCoordinator(
+                        rpc=FakeRpc(
+                            template_bits=template_bits,
+                            blockchain_info={"bits": "1b0404cb"},
+                        )
+                    )
+                )
+
+                self.assertEqual(payload["bits"], "1b0404cb")
+                self.assertEqual(
+                    payload["network_difficulty"],
+                    str(public_api.scaled_network_difficulty("1b0404cb")),
+                )
+
+    def test_missing_compact_bits_fail_endpoints_before_reward_ledger_reads(self) -> None:
+        ledger = FakePublicLedger()
+        handler = make_audit_handler(
+            FakeCoordinator(ledger=ledger, rpc=FakeRpc(template_bits=None))
+        )  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for path in (
+                "/public/v1/pool-summary",
+                "/public/v1/leaderboard?window=reward",
+                "/public/v1/miners/miner-a",
+            ):
+                with self.subTest(path=path):
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(
+                            f"http://127.0.0.1:{server.server_port}{path}",
+                            timeout=5,
+                        )
+                    self.assertEqual(raised.exception.code, 503)
+                    payload = json.loads(raised.exception.read())
+                    raised.exception.close()
+                    self.assertEqual(payload["error"]["code"], "upstream_unavailable")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(ledger.pool_snapshot_calls, 0)
+        self.assertEqual(ledger.reward_leaderboard_calls, [])
+        self.assertIsNone(ledger.reward_window_network_difficulty)
 
     def test_network_summary_tolerates_null_or_invalid_rpc_counters(self) -> None:
         payload = public_api.network_summary(
@@ -616,6 +743,116 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v1")
         self.assertEqual(series["subject"], {"type": "miner", "id": "miner-a"})
         self.assertEqual(series["bucket"], "1h")
+
+    def test_omitted_leaderboard_window_retains_exact_legacy_v1_keys(self) -> None:
+        payload = self.get_json("/public/v1/leaderboard")
+
+        self.assertEqual(payload["schema"], "prism.dashboard.leaderboard.v1")
+        self.assertEqual(set(payload), {"schema", "generated_at", "window", "totals", "pagination", "rows"})
+        self.assertEqual(set(payload["window"]), {"id", "started_at", "ended_at"})
+        self.assertEqual(payload["window"]["id"], "3h")
+        self.assertEqual(
+            set(payload["totals"]),
+            {"pool_hashrate_ths", "pool_accepted_share_difficulty", "participant_count"},
+        )
+        self.assertEqual(
+            set(payload["rows"][0]),
+            {
+                "rank",
+                "recipient_id",
+                "display_name",
+                "hashrate_ths_3h",
+                "share_percent",
+                "hash_percent",
+                "blocks_found",
+                "last_share_at",
+            },
+        )
+
+    def test_reward_leaderboard_uses_v2_work_window_contract(self) -> None:
+        payload = self.get_json("/public/v1/leaderboard?window=reward&page=1&limit=15")
+
+        self.assertEqual(payload["schema"], "prism.dashboard.leaderboard.v2")
+        self.assertEqual(payload["generated_at"], payload["window"]["ended_at"])
+        self.assertEqual(payload["window"]["id"], "reward")
+        self.assertEqual(payload["window"]["window_multiplier"], 8)
+        self.assertTrue(payload["window"]["is_complete"])
+        self.assertNotIn("basis", payload["window"])
+        self.assertNotIn("newest_share_accepted_at", payload["window"])
+        self.assertEqual(
+            Decimal(payload["window"]["counted_window_weight"]),
+            Decimal(payload["totals"]["pool_counted_share_difficulty"]),
+        )
+        self.assertEqual([row["rank"] for row in payload["rows"]], [1, 2])
+
+    def test_reward_leaderboard_exact_lookup_preserves_global_rank_and_totals(self) -> None:
+        ledger = FakePublicLedger()
+        coordinator = FakeCoordinator(ledger=ledger)
+
+        status, payload = public_api.dispatch(
+            coordinator,
+            "/public/v1/leaderboard",
+            {"window": ["reward"], "recipient_id": ["miner-b"]},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["rows"][0]["rank"], 2)
+        self.assertEqual(payload["rows"][0]["recipient_id"], "miner-b")
+        self.assertEqual(payload["totals"]["participant_count"], 2)
+        self.assertEqual(payload["pagination"]["total_count"], 1)
+        self.assertEqual(ledger.reward_leaderboard_calls[-1]["recipient_id"], "miner-b")
+        self.assertEqual(ledger.reward_leaderboard_network_difficulty, "1000000")
+
+    def test_reward_leaderboard_rejects_search_with_exact_recipient(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.get_json("/public/v1/leaderboard?window=reward&search=miner&recipient_id=miner-a")
+
+        self.assertEqual(raised.exception.code, 400)
+        payload = json.loads(raised.exception.read())
+        raised.exception.close()
+        self.assertEqual(payload["error"]["message"], "search and recipient_id are mutually exclusive")
+
+    def test_legacy_leaderboard_rejects_reward_recipient_filter(self) -> None:
+        for path in (
+            "/public/v1/leaderboard?recipient_id=miner-a",
+            "/public/v1/leaderboard?window=3h&recipient_id=miner-a",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    self.get_json(path)
+
+                self.assertEqual(raised.exception.code, 400)
+                payload = json.loads(raised.exception.read())
+                raised.exception.close()
+                self.assertEqual(payload["error"]["message"], "recipient_id requires window=reward")
+
+    def test_origin_cache_separates_legacy_and_reward_leaderboards(self) -> None:
+        ledger = FakePublicLedger()
+        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict(os.environ, {"PRISM_PUBLIC_CACHE_TTL_SECONDS": "30"}, clear=True):
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/public/v1/leaderboard?window=3h",
+                    timeout=5,
+                ) as legacy_response:
+                    legacy = json.loads(legacy_response.read())
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/public/v1/leaderboard?window=reward",
+                    timeout=5,
+                ) as reward_response:
+                    reward = json.loads(reward_response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(legacy["schema"], "prism.dashboard.leaderboard.v1")
+        self.assertEqual(reward["schema"], "prism.dashboard.leaderboard.v2")
+        self.assertEqual(ledger.leaderboard_calls, 1)
+        self.assertEqual(len(ledger.reward_leaderboard_calls), 1)
 
     def test_public_api_successes_emit_cache_headers_and_hit_origin_cache(self) -> None:
         ledger = FakePublicLedger()
@@ -877,7 +1114,10 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         raised.exception.close()
         self.assertEqual(set(payload.keys()), {"schema", "error"})
         self.assertEqual(payload["schema"], "prism.dashboard.error.v1")
-        self.assertEqual(payload["error"], {"code": "bad_request", "message": "window must be 3h", "request_id": None})
+        self.assertEqual(
+            payload["error"],
+            {"code": "bad_request", "message": "window must be one of 3h, reward", "request_id": None},
+        )
 
         with self.assertRaises(urllib.error.HTTPError) as raised:
             self.get_json(f"/public/v1/leaderboard?search={'x' * 129}")

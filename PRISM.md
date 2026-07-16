@@ -231,6 +231,21 @@ verifiers before enabling a non-zero stale-grace window in production.
 9. The coordinator submits the block to qbit and persists the block, payout
    rows, audit bundle, and settlement artifacts.
 
+The `8 * network_difficulty` rule defines a work window, not a fixed wall-clock
+period. qbit's permissionless lane targets one block every 75 seconds, so eight
+network-difficulty units correspond to a nominal 600 seconds (10 minutes) when
+the pool has all permissionless hashrate. If the pool has fraction `p` of that
+hashrate, the expected span is `600 / p` seconds, equivalently eight times the
+pool's expected permissionless block time. The observed span can be shorter or
+longer as pool hashrate, vardiff, and share timing change. It is separate from
+the coinbase-maturity delay.
+
+The public live reward leaderboard anchors at its snapshot time and uses the
+current permissionless difficulty, making it a prospective next-block view.
+Every found block instead freezes its own window at that job's issue time and
+difficulty; its audit bundle is the authoritative historical record. Startup
+collection jobs remain the exception described below.
+
 Eligibility is intentionally strict. A share can enter the found block's window
 only when both `job_issued_at <= anchor_job_issued_at` and
 `accepted_at <= anchor_job_issued_at`. That prevents a delayed old-job share

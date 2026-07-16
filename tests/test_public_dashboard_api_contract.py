@@ -11,6 +11,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from lab.prism import public_api
+
 
 ROOT = Path(__file__).resolve().parents[1]
 OPENAPI_PATH = ROOT / "docs" / "public-dashboard-api-v1.openapi.yaml"
@@ -20,7 +22,8 @@ FIXTURE_DIR = CONTRACT_DIR / "fixtures"
 EXPECTED_FIXTURES = {
     "pool-summary.json": "prism.dashboard.pool-summary.v1",
     "hashrate-series.json": "prism.dashboard.hashrate-series.v1",
-    "leaderboard.json": "prism.dashboard.leaderboard.v1",
+    "leaderboard.json": "prism.dashboard.leaderboard.v2",
+    "leaderboard-legacy.json": "prism.dashboard.leaderboard.v1",
     "blocks.json": "prism.dashboard.blocks.v1",
     "settlement-artifacts.json": "prism.dashboard.settlement-artifacts.v1",
     "settlement-artifacts-direct-coinbase.json": "prism.dashboard.settlement-artifacts.v1",
@@ -95,6 +98,7 @@ class PublicDashboardApiContractTests(unittest.TestCase):
         self.assertIn("type: \"null\"", text)
         self.assertIn("const: miner", text)
         self.assertIn("minLength: 1", text)
+        self.assertIn("Rejected for `window=3h`", text)
         self.assertIn(
             "pool_fee_bps:\n          type: integer\n          minimum: 0\n          maximum: 10000",
             text,
@@ -123,6 +127,7 @@ class PublicDashboardApiContractTests(unittest.TestCase):
     def test_pagination_fixtures_are_consistent(self) -> None:
         for fixture_name in (
             "leaderboard.json",
+            "leaderboard-legacy.json",
             "blocks.json",
             "pending-fanouts.json",
             "miner-earnings.json",
@@ -170,19 +175,6 @@ class PublicDashboardApiContractTests(unittest.TestCase):
             )
             self.assertEqual(Decimal(row["reward_share_percent"]), expected_percent)
 
-            miner = self.load_fixture("miner.json")
-            self.assertEqual(Decimal(miner["estimated_next_block"]["share_percent"]), expected_percent)
-            self.assertEqual(Decimal(miner["reward_window_percent"]), expected_percent)
-
-            leaderboard = self.load_fixture("leaderboard.json")
-            matching_rows = [
-                item
-                for item in leaderboard["rows"]
-                if item["recipient_id"] == self.load_fixture("miner-earnings.json")["recipient_id"]
-            ]
-            self.assertEqual(len(matching_rows), 1)
-            self.assertEqual(Decimal(matching_rows[0]["share_percent"]), expected_percent)
-
             self.assertIn(row["block_hash"], payouts_by_hash)
             self.assertIn(row["block_hash"], recent_payouts_by_hash)
             payout = payouts_by_hash[row["block_hash"]]
@@ -190,14 +182,89 @@ class PublicDashboardApiContractTests(unittest.TestCase):
             self.assertLessEqual(payout["onchain_amount_bits"], net)
             self.assertEqual(recent_payout["onchain_amount_bits"], payout["onchain_amount_bits"])
 
-    def test_leaderboard_hash_percent_matches_hashrate_share(self) -> None:
+    def test_live_reward_share_is_consistent_and_distinct_from_historical_payout(self) -> None:
+        miner = self.load_fixture("miner.json")
+        earnings = self.load_fixture("miner-earnings.json")
         leaderboard = self.load_fixture("leaderboard.json")
+        matching_rows = [
+            row
+            for row in leaderboard["rows"]
+            if row["recipient_id"] == earnings["recipient_id"]
+        ]
+
+        self.assertEqual(len(matching_rows), 1)
+        live_percent = Decimal(miner["reward_window_percent"])
+        self.assertEqual(Decimal(miner["estimated_next_block"]["share_percent"]), live_percent)
+        self.assertEqual(Decimal(matching_rows[0]["share_percent"]), live_percent)
+        self.assertNotEqual(Decimal(earnings["rows"][0]["reward_share_percent"]), live_percent)
+
+        latest_coinbase = self.load_fixture("blocks.json")["rows"][0]["coinbase_value_bits"]
+        pool_fee_bps = self.load_fixture("mining-configuration.json")["configurations"][0]["pool_fee_bps"]
+        self.assertEqual(
+            miner["estimated_next_block"]["estimated_reward_bits"],
+            public_api.estimated_next_block_reward_bits(
+                share_percent=str(live_percent),
+                expected_coinbase_bits=latest_coinbase,
+                pool_fee_bps=pool_fee_bps,
+            ),
+        )
+
+    def test_reward_leaderboard_share_percent_matches_counted_work(self) -> None:
+        leaderboard = self.load_fixture("leaderboard.json")
+        counted_window_weight = Decimal(leaderboard["window"]["counted_window_weight"])
         pool_hashrate = Decimal(leaderboard["totals"]["pool_hashrate_ths"])
+        observed_span = leaderboard["window"]["observed_span_seconds"]
+        self.assertEqual(
+            counted_window_weight,
+            Decimal(leaderboard["totals"]["pool_counted_share_difficulty"]),
+        )
+        self.assertEqual(
+            pool_hashrate,
+            Decimal(public_api.hashrate_ths_from_difficulty(counted_window_weight, observed_span)),
+        )
         for row in leaderboard["rows"]:
-            expected_percent = (Decimal(row["hashrate_ths_3h"]) * Decimal("100") / pool_hashrate).quantize(
+            expected_percent = (Decimal(row["counted_share_difficulty"]) * Decimal("100") / counted_window_weight).quantize(
                 Decimal("0.01")
             )
-            self.assertEqual(Decimal(row["hash_percent"]), expected_percent)
+            self.assertEqual(Decimal(row["share_percent"]), expected_percent)
+            self.assertEqual(
+                Decimal(row["hashrate_ths"]),
+                Decimal(public_api.hashrate_ths_from_difficulty(row["counted_share_difficulty"], observed_span)),
+            )
+            hashrate_percent = (Decimal(row["hashrate_ths"]) * Decimal("100") / pool_hashrate).quantize(
+                Decimal("0.01")
+            )
+            self.assertEqual(Decimal(row["share_percent"]), hashrate_percent)
+
+    def test_complete_reward_window_fixture_eta_matches_observed_span(self) -> None:
+        leaderboard = self.load_fixture("leaderboard.json")
+
+        self.assertTrue(leaderboard["window"]["is_complete"])
+        observed_span = leaderboard["window"]["observed_span_seconds"]
+        expected_eta = leaderboard["totals"]["expected_time_to_block_seconds"]
+        self.assertLessEqual(abs(expected_eta - observed_span / leaderboard["window"]["window_multiplier"]), 1)
+
+    def test_legacy_leaderboard_fixture_retains_exact_v1_shape(self) -> None:
+        leaderboard = self.load_fixture("leaderboard-legacy.json")
+
+        self.assertEqual(leaderboard["window"]["id"], "3h")
+        self.assertEqual(
+            set(leaderboard["totals"]),
+            {"pool_hashrate_ths", "pool_accepted_share_difficulty", "participant_count"},
+        )
+        self.assertEqual(
+            set(leaderboard["rows"][0]),
+            {
+                "rank",
+                "recipient_id",
+                "display_name",
+                "hashrate_ths_3h",
+                "share_percent",
+                "hash_percent",
+                "blocks_found",
+                "last_share_at",
+            },
+        )
 
     def test_hashrate_subject_fixture_matches_subject_type(self) -> None:
         subject = self.load_fixture("hashrate-series.json")["subject"]
@@ -233,6 +300,33 @@ class PublicDashboardApiContractTests(unittest.TestCase):
             if row["reward_window_weight"] is None:
                 continue
             self.assertEqual(Decimal(row["reward_window_weight"]), Decimal(row["network_difficulty"]) * window_multiplier)
+
+    def test_current_fixture_difficulty_is_derived_from_compact_bits(self) -> None:
+        pool_summary = self.load_fixture("pool-summary.json")
+        expected_difficulty = public_api.scaled_network_difficulty(pool_summary["network"]["bits"])
+
+        self.assertEqual(
+            Decimal(pool_summary["network"]["network_difficulty"]),
+            expected_difficulty,
+        )
+        self.assertEqual(
+            Decimal(self.load_fixture("leaderboard.json")["window"]["network_difficulty"]),
+            expected_difficulty,
+        )
+        self.assertEqual(
+            pool_summary["pool"]["expected_time_to_block_seconds"],
+            public_api.expected_time_to_block_seconds(
+                hashrate_ths=pool_summary["pool"]["hashrate_ths"]["h3"],
+                network_difficulty=str(expected_difficulty),
+            ),
+        )
+
+    def test_historical_block_fixture_difficulty_is_derived_from_compact_bits(self) -> None:
+        for row in self.load_fixture("blocks.json")["rows"]:
+            self.assertEqual(
+                Decimal(row["network_difficulty"]),
+                public_api.scaled_network_difficulty(row["bits"]),
+            )
 
     def test_miner_summary_embeds_only_bounded_previews(self) -> None:
         miner = self.load_fixture("miner.json")
