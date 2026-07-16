@@ -62,6 +62,13 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_STRATUM_STALE_GRACE_SECONDS": "4",
                 "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "19",
                 "PRISM_WORKER_METRICS_LIMIT": "8",
+                "PRISM_STRATUM_MAX_CONNECTIONS": "1900",
+                "PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME": "400",
+                "PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS": "2",
+                "PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES": "2048",
+                "PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS": "1800",
+                "PRISM_COORDINATOR_NOFILE_SOFT": "60000",
+                "PRISM_COORDINATOR_NOFILE_HARD": "65000",
             }
         )
         completed = subprocess.run(
@@ -138,6 +145,14 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_STRATUM_STALE_GRACE_SECONDS"], "4")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS"], "19")
         self.assertEqual(env["PRISM_WORKER_METRICS_LIMIT"], "8")
+        self.assertEqual(env["PRISM_STRATUM_MAX_CONNECTIONS"], "1900")
+        self.assertEqual(env["PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME"], "400")
+        self.assertEqual(
+            env["PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS"],
+            "2",
+        )
+        self.assertEqual(env["PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES"], "2048")
+        self.assertEqual(env["PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS"], "1800")
         self.assertEqual(env["PRISM_STRATUM_BIND"], "0.0.0.0")
         self.assertEqual(env["PRISM_STRATUM_PORT"], "43340")
         self.assertEqual(env["PRISM_PUBLIC_STRATUM_URL"], "stratum+tcp://public-pool.example:3335")
@@ -213,6 +228,11 @@ class PrismComposeProfileTests(unittest.TestCase):
         # stopped. Postgres should still come back after daemon/host restarts.
         self.assertEqual(self.config["services"]["prism-coordinator"].get("restart"), "on-failure")
         self.assertEqual(self.config["services"]["prism-postgres"].get("restart"), "unless-stopped")
+
+    def test_prism_coordinator_descriptor_limit_is_configurable(self) -> None:
+        nofile = self.config["services"]["prism-coordinator"]["ulimits"]["nofile"]
+
+        self.assertEqual(nofile, {"soft": 60000, "hard": 65000})
 
     def _service_environment(self, name: str) -> dict[str, str]:
         raw_env = self.config["services"][name]["environment"]

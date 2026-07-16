@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 import dataclasses
+import errno
 import hashlib
 import http.client
 import json
@@ -71,6 +73,11 @@ DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS = 10.0
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS = 20.0
+DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS = 0
+DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME = 0
+DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS = 1.0
+DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES = 4_096
+DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
 DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
@@ -734,6 +741,14 @@ class WorkerIdentity:
     p2mr_program_hex: str
 
 
+@dataclass
+class _P2mrAddressValidationFlight:
+    event: threading.Event = field(default_factory=threading.Event)
+    result: tuple[str, str] | None = None
+    error: BaseException | None = None
+    waiters: int = 0
+
+
 @dataclass(frozen=True)
 class PrismJobContext:
     job: direct_stratum.DirectQbitStratumJob
@@ -895,15 +910,26 @@ class ClientState:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
-        self.sock.close()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 class StratumError(RuntimeError):
-    def __init__(self, code: int, message: str, *, reason: str | None = None):
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        *,
+        reason: str | None = None,
+        disconnect: bool = False,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.reason = reason
+        self.disconnect = disconnect
 
 
 class TemplateRefreshBlocked(RuntimeError):
@@ -998,6 +1024,29 @@ class PrismCoordinator:
         self.stratum_send_timeout_seconds = env_nonnegative_float(
             "PRISM_STRATUM_SEND_TIMEOUT_SECONDS",
             DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS,
+        )
+        # Zero preserves the historical unlimited behavior. Operators can set
+        # positive admission limits after sizing them for their miner/proxy
+        # topology instead of inheriting an arbitrary coordinator default.
+        self.stratum_max_connections = env_nonnegative_int(
+            "PRISM_STRATUM_MAX_CONNECTIONS",
+            DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+        )
+        self.stratum_max_connections_per_username = env_nonnegative_int(
+            "PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME",
+            DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME,
+        )
+        self.stratum_accept_resource_exhaustion_backoff_seconds = env_positive_float(
+            "PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS",
+            DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS,
+        )
+        self.payout_address_cache_max_entries = env_nonnegative_int(
+            "PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES",
+            DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES,
+        )
+        self.payout_address_cache_ttl_seconds = env_nonnegative_float(
+            "PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS",
+            DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS,
         )
         self.coinbase_tag_hex = default_prism_coinbase_tag_hex()
         self.share_difficulty = env_decimal("PRISM_STRATUM_SHARE_DIFF", "0.000000001")
@@ -1098,6 +1147,16 @@ class PrismCoordinator:
         self.ctv_fanout_broadcast_daemon: CtvFanoutBroadcastDaemon | None = None
         self.lock = threading.RLock()
         self.clients: set[ClientState] = set()
+        self.connection_limit_rejection_counts = {"global": 0, "username": 0}
+        self.accept_resource_exhaustion_count = 0
+        self.connection_setup_failure_count = 0
+        self._p2mr_address_cache_lock = threading.Lock()
+        self._p2mr_address_cache: OrderedDict[
+            str, tuple[float, tuple[str, str]]
+        ] = OrderedDict()
+        self._p2mr_address_validation_inflight: dict[
+            str, _P2mrAddressValidationFlight
+        ] = {}
         self.jobs: dict[str, PrismJobContext] = {}
         self.recent_share_keys: set[tuple[object, ...]] = set()
         self.connection_counter = 0
@@ -2145,32 +2204,187 @@ class PrismCoordinator:
                 sock, address = server.accept()
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as exc:
                 # The listener socket is torn down by serve()'s ExitStack on
                 # shutdown while secondary accept threads may still be blocked
-                # in accept(); anything else is a real error.
+                # in accept(). Descriptor exhaustion is recoverable: keep the
+                # accept loop alive and refresh its watchdog heartbeat while
+                # waiting for client/RPC descriptors to drain.
                 if self.stop_event.is_set():
                     return
+                if exc.errno in {errno.EMFILE, errno.ENFILE}:
+                    self._record_stratum_resource_exhaustion(
+                        listener_name=profile.name,
+                        location="accept",
+                        error_number=exc.errno,
+                    )
+                    self._wait_after_stratum_resource_failure(profile.heartbeat_name)
+                    continue
                 raise
-            sock.settimeout(None)
-            self.apply_stratum_send_timeout(sock)
+
             with self.lock:
-                self.connection_counter += 1
-                connection_id = self.connection_counter
-            client = ClientState(
-                sock=sock,
-                address=address,
-                connection_id=connection_id,
-                extranonce1_hex=f"{connection_id & 0xFFFFFFFF:08x}",
-                listener_name=profile.name,
-                listener_vardiff_config=profile.vardiff_config,
-                minimum_advertised_difficulty=profile.minimum_advertised_difficulty,
-                share_difficulty=self.client_startup_difficulty(profile),
+                max_connections = int(
+                    getattr(
+                        self,
+                        "stratum_max_connections",
+                        DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+                    )
+                )
+                if max_connections > 0 and len(self.clients) >= max_connections:
+                    rejection_count = self._note_connection_limit_rejection_locked("global")
+                    client = None
+                else:
+                    self.connection_counter += 1
+                    connection_id = self.connection_counter
+                    client = ClientState(
+                        sock=sock,
+                        address=address,
+                        connection_id=connection_id,
+                        extranonce1_hex=f"{connection_id & 0xFFFFFFFF:08x}",
+                        listener_name=profile.name,
+                        listener_vardiff_config=profile.vardiff_config,
+                        minimum_advertised_difficulty=profile.minimum_advertised_difficulty,
+                        share_difficulty=self.client_startup_difficulty(profile),
+                    )
+                    self.clients.add(client)
+            if client is None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                if rejection_count == 1 or rejection_count % 100 == 0:
+                    print(
+                        "prism coordinator: rejected stratum connection at global limit "
+                        f"limit={max_connections} count={rejection_count}",
+                        flush=True,
+                    )
+                continue
+            try:
+                sock.settimeout(None)
+                self.apply_stratum_send_timeout(sock)
+                thread = threading.Thread(target=self.handle_client, args=(client,), daemon=True)
+                thread.start()
+            except (OSError, RuntimeError) as exc:
+                # Admission is atomic with the global count. Undo it if socket
+                # setup or thread creation fails before a handler owns cleanup,
+                # then keep this listener alive for the next connection.
+                try:
+                    self.disconnect_client(client)
+                except Exception:
+                    print(
+                        "prism coordinator: failed to fully close rejected stratum client "
+                        f"address={address}",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+                with self.lock:
+                    self.connection_setup_failure_count = int(
+                        getattr(self, "connection_setup_failure_count", 0)
+                    ) + 1
+                    setup_failure_count = self.connection_setup_failure_count
+                if isinstance(exc, OSError) and exc.errno in {errno.EMFILE, errno.ENFILE}:
+                    self._record_stratum_resource_exhaustion(
+                        listener_name=profile.name,
+                        location="connection-setup",
+                        error_number=exc.errno,
+                    )
+                if setup_failure_count == 1 or setup_failure_count % 100 == 0:
+                    print(
+                        "prism coordinator: stratum connection setup failed; backing off "
+                        f"listener={profile.name} address={address} "
+                        f"error={exc!r} count={setup_failure_count}",
+                        flush=True,
+                    )
+                self._wait_after_stratum_resource_failure(profile.heartbeat_name)
+                continue
+
+    def _record_stratum_resource_exhaustion(
+        self,
+        *,
+        listener_name: str,
+        location: str,
+        error_number: int | None,
+    ) -> int:
+        with self.lock:
+            self.accept_resource_exhaustion_count = int(
+                getattr(self, "accept_resource_exhaustion_count", 0)
+            ) + 1
+            exhaustion_count = self.accept_resource_exhaustion_count
+        if exhaustion_count == 1 or exhaustion_count % 100 == 0:
+            print(
+                "prism coordinator: stratum resource exhaustion "
+                f"listener={listener_name} location={location} errno={error_number} "
+                f"count={exhaustion_count}",
+                flush=True,
             )
-            with self.lock:
-                self.clients.add(client)
-            thread = threading.Thread(target=self.handle_client, args=(client,), daemon=True)
-            thread.start()
+        return exhaustion_count
+
+    def _wait_after_stratum_resource_failure(self, heartbeat_name: str) -> None:
+        backoff_seconds = getattr(
+            self,
+            "stratum_accept_resource_exhaustion_backoff_seconds",
+            DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS,
+        )
+        remaining_seconds = max(0.0, float(backoff_seconds))
+        watchdog_timeout_seconds = max(
+            0.001,
+            float(getattr(self, "watchdog_timeout_seconds", 120.0)),
+        )
+        heartbeat_interval_seconds = max(
+            0.001,
+            min(1.0, watchdog_timeout_seconds / 2.0),
+        )
+        deadline = time.monotonic() + remaining_seconds
+        while not self.stop_event.is_set():
+            self._record_heartbeat(heartbeat_name)
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                return
+            if self.stop_event.wait(min(remaining_seconds, heartbeat_interval_seconds)):
+                return
+
+    def _ensure_connection_capacity_state(self) -> None:
+        if not hasattr(self, "connection_limit_rejection_counts"):
+            self.connection_limit_rejection_counts = {"global": 0, "username": 0}
+
+    def _note_connection_limit_rejection_locked(self, scope: str) -> int:
+        self._ensure_connection_capacity_state()
+        count = int(self.connection_limit_rejection_counts.get(scope, 0)) + 1
+        self.connection_limit_rejection_counts[scope] = count
+        return count
+
+    def reserve_client_username(self, client: ClientState, worker: WorkerIdentity) -> bool:
+        """Atomically reserve an exact Stratum username for one connection."""
+        with self.lock:
+            self._ensure_connection_capacity_state()
+            limit = int(
+                getattr(
+                    self,
+                    "stratum_max_connections_per_username",
+                    DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME,
+                )
+            )
+            active_for_username = sum(
+                1
+                for other in self.clients
+                if (
+                    other is not client
+                    and other.worker is not None
+                    and other.username == worker.username
+                )
+            )
+            if limit > 0 and active_for_username >= limit:
+                rejection_count = self._note_connection_limit_rejection_locked("username")
+                if rejection_count == 1 or rejection_count % 100 == 0:
+                    print(
+                        "prism coordinator: rejected stratum authorization at username limit "
+                        f"username={worker.username!r} limit={limit} count={rejection_count}",
+                        flush=True,
+                    )
+                return False
+            client.worker = worker
+            client.username = worker.username
+            return True
 
     def start_audit_server(self) -> None:
         self.start_health_snapshot_refresher()
@@ -2969,8 +3183,9 @@ class PrismCoordinator:
         )
 
     def handle_client(self, client: ClientState) -> None:
-        reader = client.sock.makefile("r", encoding="utf-8", newline="\n")
+        reader = None
         try:
+            reader = client.sock.makefile("r", encoding="utf-8", newline="\n")
             for line in reader:
                 if self.stop_event.is_set():
                     break
@@ -2988,6 +3203,8 @@ class PrismCoordinator:
                     self.send_error(client, request_id, 20, f"invalid JSON: {exc.msg}")
                 except StratumError as exc:
                     self.send_error(client, request_id, exc.code, exc.message, reason=exc.reason)
+                    if exc.disconnect:
+                        break
                 except Exception:
                     print(
                         f"prism coordinator: client thread failed address={client.address}",
@@ -2995,9 +3212,26 @@ class PrismCoordinator:
                     )
                     traceback.print_exc()
                     break
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, OSError) and exc.errno in {errno.EMFILE, errno.ENFILE}:
+                self._record_stratum_resource_exhaustion(
+                    listener_name=client.listener_name,
+                    location="client-reader",
+                    error_number=exc.errno,
+                )
+            print(
+                "prism coordinator: stratum client socket failed "
+                f"address={client.address} error={exc!r}",
+                flush=True,
+            )
         finally:
-            reader.close()
-            self.disconnect_client(client)
+            try:
+                if reader is not None:
+                    reader.close()
+            except (OSError, ValueError):
+                pass
+            finally:
+                self.disconnect_client(client)
 
     def disconnect_client(self, client: ClientState) -> None:
         with self.lock:
@@ -3027,8 +3261,17 @@ class PrismCoordinator:
         if method == "mining.authorize":
             username = str(params[0]) if params else ""
             password = str(params[1]) if len(params) > 1 and params[1] is not None else ""
-            client.worker = self.resolve_worker(username)
-            client.username = username
+            worker = self.resolve_worker(username)
+            if not self.reserve_client_username(client, worker):
+                raise StratumError(
+                    20,
+                    "too many connections for username",
+                    # A new connection has no useful session to preserve. A
+                    # live miner re-authorizing to a full username does: keep
+                    # its prior worker/session active after returning the
+                    # capacity error.
+                    disconnect=not client.authorized,
+                )
             # The password is authoritative for password-derived options: a
             # re-authorize without d=/md= clears any prior override (a stored
             # suggest_difficulty still applies via the request resolution).
@@ -3135,13 +3378,92 @@ class PrismCoordinator:
         )
 
     def validate_p2mr_address(self, address: str, *, label: str) -> tuple[str, str]:
-        validation = self.rpc.call("validateaddress", [address])
-        if not isinstance(validation, dict) or not validation.get("isvalid"):
-            raise StratumError(20, f"{label} is not a valid qbit address: {address}")
-        script = str(validation.get("scriptPubKey") or "")
-        if not script.startswith("5220") or len(script) != 68:
-            raise StratumError(20, f"{label} does not resolve to a P2MR script: {address}")
-        return script, script[4:]
+        self._ensure_p2mr_address_cache_state()
+        with self._p2mr_address_cache_lock:
+            cached = self._p2mr_address_cache.get(address)
+            if cached is not None:
+                expires_monotonic, cached_result = cached
+                if expires_monotonic > time.monotonic():
+                    self._p2mr_address_cache.move_to_end(address)
+                    return cached_result
+                self._p2mr_address_cache.pop(address, None)
+            pending = self._p2mr_address_validation_inflight.get(address)
+            is_leader = pending is None
+            if pending is None:
+                pending = _P2mrAddressValidationFlight()
+                self._p2mr_address_validation_inflight[address] = pending
+            else:
+                pending.waiters += 1
+
+        if not is_leader:
+            pending.event.wait()
+            if pending.result is not None:
+                return pending.result
+            if pending.error is not None:
+                self._raise_shared_p2mr_address_validation_error(pending.error)
+            raise RuntimeError("payout address validation completed without a result")
+
+        try:
+            validation = self.rpc.call("validateaddress", [address])
+            if not isinstance(validation, dict) or not validation.get("isvalid"):
+                raise StratumError(20, f"{label} is not a valid qbit address: {address}")
+            script = str(validation.get("scriptPubKey") or "")
+            if not script.startswith("5220") or len(script) != 68:
+                raise StratumError(20, f"{label} does not resolve to a P2MR script: {address}")
+            result = (script, script[4:])
+            with self._p2mr_address_cache_lock:
+                max_entries = int(
+                    getattr(
+                        self,
+                        "payout_address_cache_max_entries",
+                        DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES,
+                    )
+                )
+                ttl_seconds = float(
+                    getattr(
+                        self,
+                        "payout_address_cache_ttl_seconds",
+                        DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS,
+                    )
+                )
+                if max_entries > 0 and ttl_seconds > 0:
+                    self._p2mr_address_cache[address] = (
+                        time.monotonic() + ttl_seconds,
+                        result,
+                    )
+                    self._p2mr_address_cache.move_to_end(address)
+                    while len(self._p2mr_address_cache) > max_entries:
+                        self._p2mr_address_cache.popitem(last=False)
+                pending.result = result
+            return result
+        except BaseException as exc:
+            with self._p2mr_address_cache_lock:
+                pending.error = exc
+            raise
+        finally:
+            with self._p2mr_address_cache_lock:
+                if self._p2mr_address_validation_inflight.get(address) is pending:
+                    self._p2mr_address_validation_inflight.pop(address, None)
+                pending.event.set()
+
+    @staticmethod
+    def _raise_shared_p2mr_address_validation_error(error: BaseException) -> None:
+        if isinstance(error, StratumError):
+            raise StratumError(
+                error.code,
+                error.message,
+                reason=error.reason,
+                disconnect=error.disconnect,
+            ) from error
+        raise RuntimeError(str(error)) from error
+
+    def _ensure_p2mr_address_cache_state(self) -> None:
+        if not hasattr(self, "_p2mr_address_cache_lock"):
+            self._p2mr_address_cache_lock = threading.Lock()
+        if not hasattr(self, "_p2mr_address_cache"):
+            self._p2mr_address_cache = OrderedDict()
+        if not hasattr(self, "_p2mr_address_validation_inflight"):
+            self._p2mr_address_validation_inflight = {}
 
     def maybe_send_job(
         self,
@@ -5266,6 +5588,18 @@ class PrismCoordinator:
         rejection_counts = getattr(self, "rejection_counts_by_reason", {})
         grace_credited_share_count = int(getattr(self, "grace_credited_share_count", 0))
         idle_retarget_count = int(getattr(self, "idle_retarget_count", 0))
+        with self.lock:
+            self._ensure_connection_capacity_state()
+            active_connection_count = len(self.clients)
+            connection_limit_rejection_counts = dict(
+                self.connection_limit_rejection_counts
+            )
+            accept_resource_exhaustion_count = int(
+                getattr(self, "accept_resource_exhaustion_count", 0)
+            )
+            connection_setup_failure_count = int(
+                getattr(self, "connection_setup_failure_count", 0)
+            )
         self._ensure_worker_metrics_state()
         with self.worker_metrics_lock:
             worker_share_counts = {
@@ -5317,6 +5651,21 @@ class PrismCoordinator:
             "# HELP qbit_prism_submitted_shares_total Stratum share submissions seen by the PRISM coordinator.",
             "# TYPE qbit_prism_submitted_shares_total counter",
             f"qbit_prism_submitted_shares_total {self.submitted_share_count}",
+            "# HELP qbit_prism_stratum_active_connections Active admitted Stratum connections across all listeners.",
+            "# TYPE qbit_prism_stratum_active_connections gauge",
+            f"qbit_prism_stratum_active_connections {active_connection_count}",
+            "# HELP qbit_prism_stratum_connection_limit_rejections_total Stratum connections rejected by an explicitly configured admission limit.",
+            "# TYPE qbit_prism_stratum_connection_limit_rejections_total counter",
+            *[
+                f'qbit_prism_stratum_connection_limit_rejections_total{{scope="{scope}"}} {int(connection_limit_rejection_counts.get(scope, 0))}'
+                for scope in ("global", "username")
+            ],
+            "# HELP qbit_prism_stratum_accept_resource_exhaustions_total Recoverable Stratum accept or client-setup failures caused by process or system descriptor exhaustion.",
+            "# TYPE qbit_prism_stratum_accept_resource_exhaustions_total counter",
+            f"qbit_prism_stratum_accept_resource_exhaustions_total {accept_resource_exhaustion_count}",
+            "# HELP qbit_prism_stratum_connection_setup_failures_total Admitted Stratum connections cleaned up after socket or handler-thread setup failure.",
+            "# TYPE qbit_prism_stratum_connection_setup_failures_total counter",
+            f"qbit_prism_stratum_connection_setup_failures_total {connection_setup_failure_count}",
             "# HELP qbit_prism_stale_shares_total Stratum shares rejected or ignored as stale.",
             "# TYPE qbit_prism_stale_shares_total counter",
             f"qbit_prism_stale_shares_total {self.stale_share_count}",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import queue
@@ -1011,6 +1012,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.rejection_counts_by_reason["low-difficulty"] = 3
         server.tip_refresh_job_count = 4
         server.post_accept_refresh_failure_count = 5
+        server.connection_limit_rejection_counts = {"global": 2, "username": 3}
+        server.accept_resource_exhaustion_count = 4
+        server.connection_setup_failure_count = 5
 
         metrics = server.metrics_payload()
 
@@ -1019,6 +1023,17 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_duplicate_shares_total 1", metrics)
         self.assertIn("qbit_prism_low_difficulty_shares_total 3", metrics)
         self.assertIn("qbit_prism_grace_credited_shares_total 6", metrics)
+        self.assertIn("qbit_prism_stratum_active_connections 0", metrics)
+        self.assertIn(
+            'qbit_prism_stratum_connection_limit_rejections_total{scope="global"} 2',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_stratum_connection_limit_rejections_total{scope="username"} 3',
+            metrics,
+        )
+        self.assertIn("qbit_prism_stratum_accept_resource_exhaustions_total 4", metrics)
+        self.assertIn("qbit_prism_stratum_connection_setup_failures_total 5", metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="stale-job"} 2', metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="duplicate-share"} 1', metrics)
         self.assertIn('qbit_prism_rejections_total{reason_id="low-difficulty"} 3', metrics)
@@ -1306,6 +1321,150 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(worker.payout_address, PAYOUT_ADDRESS)
         self.assertEqual(worker.worker_name, "rig-a")
         self.assertEqual(worker.p2mr_program_hex, "33" * 32)
+
+    def test_resolve_worker_caches_successful_address_validation(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        rpc = AddressValidationRpc(script_byte="33")
+        server.rpc = rpc
+
+        first = server.resolve_worker(f"{PAYOUT_ADDRESS}.rig-a")
+        second = server.resolve_worker(f"{PAYOUT_ADDRESS}.rig-b")
+
+        self.assertEqual(rpc.validated, [PAYOUT_ADDRESS])
+        self.assertEqual(first.p2mr_program_hex, second.p2mr_program_hex)
+
+    def test_payout_address_cache_evicts_least_recently_used_entry(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server.payout_address_cache_max_entries = 2
+        server.payout_address_cache_ttl_seconds = 60
+
+        class AnyAddressRpc:
+            def __init__(self) -> None:
+                self.validated: list[str] = []
+
+            def call(self, method: str, params: list[object] | None = None) -> object:
+                address = str((params or [""])[0])
+                self.validated.append(address)
+                return {"isvalid": True, "scriptPubKey": "5220" + "33" * 32}
+
+        rpc = AnyAddressRpc()
+        server.rpc = rpc
+
+        server.validate_p2mr_address("address-a", label="test")
+        server.validate_p2mr_address("address-b", label="test")
+        server.validate_p2mr_address("address-a", label="test")
+        server.validate_p2mr_address("address-c", label="test")
+
+        self.assertEqual(rpc.validated, ["address-a", "address-b", "address-c"])
+        self.assertEqual(list(server._p2mr_address_cache), ["address-a", "address-c"])
+
+        server.validate_p2mr_address("address-b", label="test")
+        self.assertEqual(rpc.validated[-1], "address-b")
+        self.assertEqual(len(server._p2mr_address_cache), 2)
+
+    def test_payout_address_cache_revalidates_expired_entry(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server.payout_address_cache_max_entries = 2
+        server.payout_address_cache_ttl_seconds = 5
+        rpc = AddressValidationRpc(script_byte="33")
+        server.rpc = rpc
+        now = 100.0
+
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: now,
+        ):
+            server.validate_p2mr_address(PAYOUT_ADDRESS, label="test")
+            now = 104.0
+            server.validate_p2mr_address(PAYOUT_ADDRESS, label="test")
+            now = 106.0
+            server.validate_p2mr_address(PAYOUT_ADDRESS, label="test")
+
+        self.assertEqual(rpc.validated, [PAYOUT_ADDRESS, PAYOUT_ADDRESS])
+
+    def test_concurrent_worker_resolution_singleflights_address_validation(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingAddressRpc(AddressValidationRpc):
+            def call(self, method: str, params: list[object] | None = None) -> object:
+                if method == "validateaddress":
+                    entered.set()
+                    if not release.wait(timeout=5):
+                        raise TimeoutError("test did not release validateaddress")
+                return super().call(method, params)
+
+        rpc = BlockingAddressRpc(script_byte="33")
+        server.rpc = rpc
+        server._ensure_p2mr_address_cache_state()
+        workers: list[WorkerIdentity] = []
+        errors: list[BaseException] = []
+
+        def resolve(index: int) -> None:
+            try:
+                workers.append(server.resolve_worker(f"{PAYOUT_ADDRESS}.rig-{index}"))
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=resolve, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(entered.wait(timeout=5))
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(workers), 8)
+        self.assertEqual(rpc.validated, [PAYOUT_ADDRESS])
+
+    def test_concurrent_failed_worker_resolution_shares_singleflight_error(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        entered = threading.Event()
+        release = threading.Event()
+
+        class FailingAddressRpc:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def call(self, method: str, params: list[object] | None = None) -> object:
+                self.calls += 1
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release validateaddress")
+                raise RuntimeError("qbitd unavailable")
+
+        rpc = FailingAddressRpc()
+        server.rpc = rpc
+        server._ensure_p2mr_address_cache_state()
+        errors: list[BaseException] = []
+
+        def resolve() -> None:
+            try:
+                server.resolve_worker(PAYOUT_ADDRESS)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=resolve) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(entered.wait(timeout=5))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with server._p2mr_address_cache_lock:
+                pending = server._p2mr_address_validation_inflight[PAYOUT_ADDRESS]
+                if pending.waiters == 7:
+                    break
+            time.sleep(0.001)
+        self.assertEqual(pending.waiters, 7)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(rpc.calls, 1)
+        self.assertEqual(len(errors), 8)
+        self.assertTrue(all("qbitd unavailable" in str(exc) for exc in errors))
 
     def test_resolve_worker_rejects_invalid_base_address_with_worker_suffix(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
@@ -5399,6 +5558,273 @@ class PrismListenerProfileTests(unittest.TestCase):
         )
         self.assertEqual(len(send_job_calls), 2)
         self.assertEqual(state.pending_share_difficulty, Decimal("0.5"))
+
+    def test_authorize_rejects_and_disconnects_above_username_connection_limit(self) -> None:
+        server, first, _ = self.authorize_server_and_client()
+        server.stratum_max_connections_per_username = 1
+        second = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=4,
+            extranonce1_hex="00000004",
+        )
+        second.send = lambda payload: None  # type: ignore[method-assign]
+        server.clients.update({first, second})
+
+        server.handle_request(
+            first,
+            {"id": 5, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "x"]},
+        )
+        with self.assertRaises(StratumError) as raised:
+            server.handle_request(
+                second,
+                {"id": 6, "method": "mining.authorize", "params": [PAYOUT_ADDRESS, "x"]},
+            )
+
+        self.assertTrue(raised.exception.disconnect)
+        self.assertEqual(raised.exception.message, "too many connections for username")
+        self.assertEqual(server.connection_limit_rejection_counts["username"], 1)
+        self.assertFalse(second.authorized)
+
+    def test_reauthorize_limit_error_preserves_live_session(self) -> None:
+        server, live, _ = self.authorize_server_and_client()
+        server.stratum_max_connections_per_username = 1
+        occupant = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=4,
+            extranonce1_hex="00000004",
+        )
+        occupant.send = lambda payload: None  # type: ignore[method-assign]
+        server.clients.update({live, occupant})
+
+        server.handle_request(
+            live,
+            {
+                "id": 5,
+                "method": "mining.authorize",
+                "params": [f"{PAYOUT_ADDRESS}.original", "x"],
+            },
+        )
+        server.handle_request(
+            occupant,
+            {
+                "id": 6,
+                "method": "mining.authorize",
+                "params": [f"{PAYOUT_ADDRESS}.full", "x"],
+            },
+        )
+        original_worker = live.worker
+
+        with self.assertRaises(StratumError) as raised:
+            server.handle_request(
+                live,
+                {
+                    "id": 7,
+                    "method": "mining.authorize",
+                    "params": [f"{PAYOUT_ADDRESS}.full", "x"],
+                },
+            )
+
+        self.assertFalse(raised.exception.disconnect)
+        self.assertTrue(live.authorized)
+        self.assertIs(live.worker, original_worker)
+        self.assertEqual(live.username, f"{PAYOUT_ADDRESS}.original")
+
+    def test_username_connection_limit_is_disabled_by_default(self) -> None:
+        server = coordinator()
+        first = client()
+        second = client()
+        server.clients.update({first, second})
+        worker = WorkerIdentity(
+            username=PAYOUT_ADDRESS,
+            payout_address=PAYOUT_ADDRESS,
+            worker_name=None,
+            script_pubkey_hex="5220" + "11" * 32,
+            p2mr_program_hex="11" * 32,
+        )
+
+        self.assertTrue(server.reserve_client_username(first, worker))
+        self.assertTrue(server.reserve_client_username(second, worker))
+        self.assertEqual(server.connection_limit_rejection_counts["username"], 0)
+
+    def test_username_limit_does_not_count_idle_clients_for_empty_username(self) -> None:
+        server = coordinator()
+        server.stratum_max_connections_per_username = 1
+        idle = client()
+        first = client()
+        second = client()
+        server.clients.update({idle, first, second})
+        worker = WorkerIdentity(
+            username="",
+            payout_address=PAYOUT_ADDRESS,
+            worker_name=None,
+            script_pubkey_hex="5220" + "11" * 32,
+            p2mr_program_hex="11" * 32,
+        )
+
+        self.assertTrue(server.reserve_client_username(first, worker))
+        self.assertFalse(server.reserve_client_username(second, worker))
+        self.assertEqual(server.connection_limit_rejection_counts["username"], 1)
+
+    def test_accept_loop_rejects_above_global_connection_limit(self) -> None:
+        server = coordinator()
+        server.stratum_max_connections = 1
+        server.clients.add(client())
+
+        class AcceptedSocket:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        accepted = AcceptedSocket()
+
+        class OneConnectionListener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def accept(self) -> tuple[object, tuple[str, int]]:
+                self.calls += 1
+                if self.calls == 1:
+                    return accepted, ("127.0.0.1", 1000)
+                server.stop_event.set()
+                raise socket.timeout()
+
+        profile = StratumListenerProfile(
+            name="default",
+            bind="127.0.0.1",
+            port=3340,
+            share_difficulty=server.share_difficulty,
+            vardiff_config=server.vardiff_config,
+            heartbeat_name="stratum_accept",
+        )
+
+        server.accept_loop(OneConnectionListener(), profile)  # type: ignore[arg-type]
+
+        self.assertTrue(accepted.closed)
+        self.assertEqual(server.connection_limit_rejection_counts["global"], 1)
+
+    def test_accept_loop_recovers_from_descriptor_exhaustion(self) -> None:
+        server = coordinator()
+        server.stratum_accept_resource_exhaustion_backoff_seconds = 0
+
+        class ExhaustedListener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def accept(self) -> tuple[object, tuple[str, int]]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError(errno.EMFILE, "too many open files")
+                server.stop_event.set()
+                raise socket.timeout()
+
+        listener = ExhaustedListener()
+        profile = StratumListenerProfile(
+            name="default",
+            bind="127.0.0.1",
+            port=3340,
+            share_difficulty=server.share_difficulty,
+            vardiff_config=server.vardiff_config,
+            heartbeat_name="stratum_accept",
+        )
+
+        server.accept_loop(listener, profile)  # type: ignore[arg-type]
+
+        self.assertEqual(listener.calls, 2)
+        self.assertEqual(server.accept_resource_exhaustion_count, 1)
+
+    def test_resource_backoff_keeps_accept_watchdog_heartbeat_fresh(self) -> None:
+        server = coordinator()
+        server.stratum_accept_resource_exhaustion_backoff_seconds = 0.03
+        server.watchdog_timeout_seconds = 0.01
+
+        server._wait_after_stratum_resource_failure("stratum_accept")
+
+        self.assertFalse(server._overdue_heartbeats(time.monotonic()))
+
+    def test_accept_loop_recovers_when_handler_thread_cannot_start(self) -> None:
+        server = coordinator()
+        server.connection_counter = 0
+        server.stratum_send_timeout_seconds = 0
+        server.stratum_accept_resource_exhaustion_backoff_seconds = 0
+
+        class AcceptedSocket:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def settimeout(self, timeout: object) -> None:
+                pass
+
+            def shutdown(self, how: int) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        accepted = AcceptedSocket()
+
+        class OneConnectionListener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def accept(self) -> tuple[object, tuple[str, int]]:
+                self.calls += 1
+                if self.calls == 1:
+                    return accepted, ("127.0.0.1", 1000)
+                server.stop_event.set()
+                raise socket.timeout()
+
+        listener = OneConnectionListener()
+        profile = StratumListenerProfile(
+            name="default",
+            bind="127.0.0.1",
+            port=3340,
+            share_difficulty=server.share_difficulty,
+            vardiff_config=server.vardiff_config,
+            heartbeat_name="stratum_accept",
+        )
+
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+            server.accept_loop(listener, profile)  # type: ignore[arg-type]
+
+        self.assertEqual(listener.calls, 2)
+        self.assertTrue(accepted.closed)
+        self.assertFalse(server.clients)
+        self.assertEqual(server.connection_setup_failure_count, 1)
+
+    def test_handle_client_cleans_up_when_makefile_hits_descriptor_limit(self) -> None:
+        server = coordinator()
+
+        class MakefileFailureSocket:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def makefile(self, *args: object, **kwargs: object) -> object:
+                raise OSError(errno.EMFILE, "too many open files")
+
+            def shutdown(self, how: int) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        sock = MakefileFailureSocket()
+        state = ClientState(
+            sock=sock,  # type: ignore[arg-type]
+            address=("127.0.0.1", 1000),
+            connection_id=1,
+            extranonce1_hex="00000001",
+        )
+        server.clients.add(state)
+
+        server.handle_client(state)
+
+        self.assertTrue(sock.closed)
+        self.assertNotIn(state, server.clients)
+        self.assertEqual(server.accept_resource_exhaustion_count, 1)
 
     def test_accept_loop_assigns_listener_profiles_and_unique_extranonce(self) -> None:
         server = coordinator()
