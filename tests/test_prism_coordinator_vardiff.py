@@ -3385,6 +3385,43 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertIsNone(ledger.pending[0].credit_policy)
 
+    def test_retained_share_dedup_uses_original_worker_after_reauthorization(self) -> None:
+        tip = "00" * 32
+        server, state, ledger = submit_coordinator(tip=tip)
+        server.bury_evicted_job(state, "job-1")
+        server.jobs.pop("job-1")
+        state.active_job_ids.clear()
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            self.assertFalse(
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+            )
+            state.username = "miner-b"
+            state.worker = worker_identity("miner-b")
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    state,
+                    ["miner-b", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_DUPLICATE_SHARE)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.pending[0].share_id, "miner-a:" + "cf" * 32)
+        self.assertEqual(server.worker_share_counts["miner-a"]["accepted"], 1)
+        self.assertEqual(server.worker_share_counts["miner-b"]["accepted"], 0)
+
     def test_evicted_same_tip_share_survives_beyond_legacy_one_second_floor(self) -> None:
         tip = "00" * 32
         server, state, ledger = submit_coordinator(tip=tip)

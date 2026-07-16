@@ -4830,7 +4830,10 @@ class PrismCoordinator:
                 f"malformed submit: {exc}",
                 worker=worker_name,
             )
-        share_key = (client.username, submission.header_hex)
+        # A retained job keeps its original worker even if the connection is
+        # later re-authorized. Deduplication must use that immutable identity:
+        # otherwise the same header can be replayed under each new username.
+        share_key = (context.worker.username, submission.header_hex)
         with self.lock:
             if share_key in self.recent_share_keys:
                 self.reject_stratum(
@@ -4876,7 +4879,6 @@ class PrismCoordinator:
             )
 
         pending_share = self.pending_share_from_submission(
-            client=client,
             context=context,
             submission=submission,
             ntime_hex=ntime_hex,
@@ -5013,7 +5015,7 @@ class PrismCoordinator:
             ),
             "extranonce1_hex": candidate.extranonce1_hex,
             "extranonce2_hex": candidate.extranonce2_hex,
-            "username": candidate.client.username,
+            "username": context.worker.username,
             "pending_share": dataclasses.asdict(candidate.pending_share),
             "credit_share_on_accept": candidate.credit_share_on_accept,
             "collection_only": bool(context.collection_only),
@@ -5080,14 +5082,13 @@ class PrismCoordinator:
     def pending_share_from_submission(
         self,
         *,
-        client: ClientState,
         context: PrismJobContext,
         submission: direct_stratum.DirectQbitSubmission,
         ntime_hex: str,
         credit_policy: str | None = None,
     ) -> PendingShare:
         return PendingShare(
-            share_id=f"{client.username}:{submission.block_hash_hex}",
+            share_id=f"{context.worker.username}:{submission.block_hash_hex}",
             miner_id=context.worker.payout_address,
             order_key=context.worker.payout_address,
             p2mr_program_hex=context.worker.p2mr_program_hex,
@@ -5113,7 +5114,7 @@ class PrismCoordinator:
     ) -> None:
         entry = PendingShareAppend(
             pending_share=pending_share,
-            username=client.username,
+            username=context.worker.username,
             job_id=context.job.job_id,
             block_hash_hex=submission.block_hash_hex,
             collection_only=bool(context.collection_only),
@@ -5126,7 +5127,7 @@ class PrismCoordinator:
             self._append_share_entry(entry)
         # Only committed shares affect public accounting, vardiff, and the
         # response that handle_request sends immediately after this returns.
-        self.note_worker_accepted_share(client.username, credit_policy)
+        self.note_worker_accepted_share(context.worker.username, credit_policy)
         self.note_vardiff_accepted_share(client, context.job)
 
     def enqueue_share_append(self, entry: PendingShareAppend, *, wait: bool = False) -> None:
