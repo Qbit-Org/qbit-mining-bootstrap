@@ -3182,8 +3182,15 @@ class PrismCoordinator:
             if self.stop_event.is_set():
                 return 0
         try:
+            observation_sequence = self._reserve_tip_observation_sequence()
             snapshot = self.fetch_qbit_tip_template_snapshot()
-            self.observe_tip_first_seen(snapshot.bestblockhash)
+            if not self.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=observation_sequence,
+            ):
+                raise TemplateRefreshBlocked(
+                    "tip/template poll was superseded by a newer tip observation"
+                )
             self.prune_evicted_job_graveyard(force=False)
             self.pool_readiness_latched()
             if not self.ensure_reorg_reconciled_for_tip(snapshot.bestblockhash):
@@ -3314,16 +3321,36 @@ class PrismCoordinator:
                 time.monotonic() - refresh_started,
             )
 
-    def observe_tip_first_seen(self, tip_hash: str) -> None:
+    def _reserve_tip_observation_sequence(self) -> int:
+        with self.lock:
+            sequence = int(getattr(self, "tip_observation_sequence", 0)) + 1
+            self.tip_observation_sequence = sequence
+            return sequence
+
+    def observe_tip_first_seen(
+        self,
+        tip_hash: str,
+        *,
+        observation_sequence: int | None = None,
+    ) -> bool:
+        if observation_sequence is None:
+            observation_sequence = self._reserve_tip_observation_sequence()
         now = time.monotonic()
         with self.lock:
+            current_sequence = int(
+                getattr(self, "current_tip_observation_sequence", 0)
+            )
+            if observation_sequence < current_sequence:
+                return False
             first_seen = getattr(self, "current_tip_first_seen", None)
             if first_seen is not None and first_seen[0] == tip_hash:
-                return
+                self.current_tip_observation_sequence = observation_sequence
+                return True
             # The first tip this process observes is a startup baseline, not a
             # tip flip: a None stamp keeps the stale-grace window closed. Only
             # a change away from a previously observed tip records a flip time.
             self.current_tip_first_seen = (tip_hash, now if first_seen is not None else None)
+            self.current_tip_observation_sequence = observation_sequence
             self.current_tip_parent = None
 
         # Parent lookup is best-effort cleanup metadata, so never hold the
@@ -3337,8 +3364,13 @@ class PrismCoordinator:
 
         with self.lock:
             current = getattr(self, "current_tip_first_seen", None)
-            if current is None or current[0] != tip_hash:
-                return
+            if (
+                current is None
+                or current[0] != tip_hash
+                or int(getattr(self, "current_tip_observation_sequence", 0))
+                != observation_sequence
+            ):
+                return False
             if parent_hash is not None:
                 self.current_tip_parent = (tip_hash, parent_hash)
             # Reclassify formerly same-tip entries immediately. On mainnet the
@@ -3346,6 +3378,7 @@ class PrismCoordinator:
             # the actual chain parent removes multi-tip-behind entries while
             # the independently configured grace lifetime protects one-back.
             self.prune_evicted_job_graveyard(now=now, force=True)
+        return True
 
     def _fetch_tip_parent_hash(self, tip_hash: str) -> str | None:
         block = self.rpc.call("getblock", [tip_hash])

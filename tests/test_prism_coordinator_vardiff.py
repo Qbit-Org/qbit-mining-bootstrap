@@ -2275,6 +2275,31 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIsNone(server.current_tip_first_seen)
         self.assertIsNone(server._template_artifacts)
 
+    def test_slow_tip_poll_cannot_regress_newer_blockwait_observation(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server = coordinator()
+        old_snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=old_tip,
+            previousblockhash=old_tip,
+            template_fingerprint="22" * 32,
+        )
+
+        def overtake_poll() -> QbitTipTemplateSnapshot:
+            self.assertTrue(server.observe_tip_first_seen(new_tip))
+            return old_snapshot
+
+        server.fetch_qbit_tip_template_snapshot = overtake_poll  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "superseded by a newer tip observation",
+        ):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(server.current_tip_first_seen[0], new_tip)
+        self.assertIsNone(server.tip_template_snapshot)
+
     def test_same_tip_template_refresh_sends_non_clean_job_and_keeps_old_job_submittable(self) -> None:
         tip = "00" * 32
         server = coordinator()
