@@ -82,7 +82,6 @@ DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
 DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS = 30.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
-DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_GLOBAL = 4_096
 DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
 DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
@@ -136,7 +135,7 @@ PRISM_JOB_CACHE_KINDS = ("template", "bundle")
 PRISM_TIP_REFRESH_RESULTS = ("sent", "skipped", "disconnected", "failed")
 PRISM_EVICTED_JOB_CLASSES = ("same_tip", "stale_grace")
 PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = ("accepted_same_tip", "credited_stale_grace")
-PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection", "global")
+PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection",)
 PRISM_REJECTION_STALE_JOB = "stale-job"
 PRISM_REJECTION_DUPLICATE_SHARE = "duplicate-share"
 PRISM_REJECTION_LOW_DIFFICULTY = "low-difficulty"
@@ -318,6 +317,27 @@ def production_mode() -> bool:
     )
 
 
+def validate_same_tip_job_retention_limits(
+    *,
+    retention_seconds: float,
+    per_connection: int,
+    max_connections: int,
+    production: bool,
+) -> None:
+    if retention_seconds <= 0:
+        return
+    if per_connection <= 0:
+        raise SystemExit(
+            "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION must be positive "
+            "when same-tip retention is enabled"
+        )
+    if production and max_connections <= 0:
+        raise SystemExit(
+            "production mode requires a positive PRISM_STRATUM_MAX_CONNECTIONS "
+            "when same-tip retention is enabled"
+        )
+
+
 def require_production_env(name: str) -> str:
     value = env_optional(name)
     if value is None:
@@ -405,6 +425,22 @@ def validate_prism_production_gate() -> None:
     ):
         require_production_env("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")
         env_positive_int("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT", 0)
+
+    validate_same_tip_job_retention_limits(
+        retention_seconds=env_nonnegative_float(
+            "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS",
+            DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS,
+        ),
+        per_connection=env_nonnegative_int(
+            "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION",
+            DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION,
+        ),
+        max_connections=env_nonnegative_int(
+            "PRISM_STRATUM_MAX_CONNECTIONS",
+            DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+        ),
+        production=True,
+    )
 
 
 def validate_hex(value: str, *, name: str, expected_bytes: int | None = None) -> str:
@@ -1032,21 +1068,6 @@ class PrismCoordinator:
             "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION",
             DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION,
         )
-        self.same_tip_job_retention_global = env_nonnegative_int(
-            "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL",
-            DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_GLOBAL,
-        )
-        if self.same_tip_job_retention_seconds > 0:
-            if self.same_tip_job_retention_per_connection <= 0:
-                raise SystemExit(
-                    "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION must be positive "
-                    "when same-tip retention is enabled"
-                )
-            if self.same_tip_job_retention_global <= 0:
-                raise SystemExit(
-                    "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_GLOBAL must be positive "
-                    "when same-tip retention is enabled"
-                )
         self.tip_refresh_max_workers = env_positive_int(
             "PRISM_TIP_REFRESH_MAX_WORKERS",
             DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS,
@@ -1109,6 +1130,12 @@ class PrismCoordinator:
         self.stratum_max_connections_per_username = env_nonnegative_int(
             "PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME",
             DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME,
+        )
+        validate_same_tip_job_retention_limits(
+            retention_seconds=self.same_tip_job_retention_seconds,
+            per_connection=self.same_tip_job_retention_per_connection,
+            max_connections=self.stratum_max_connections,
+            production=production_mode(),
         )
         self.stratum_accept_resource_exhaustion_backoff_seconds = env_positive_float(
             "PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS",
@@ -1251,9 +1278,9 @@ class PrismCoordinator:
         self.worker_metrics_lock = threading.Lock()
         self.worker_share_counts: dict[str, dict[str, int]] = {}
         self.worker_rejection_counts: dict[tuple[str, str], int] = {}
-        # Globally insertion ordered, with a same-tip per-connection index for
-        # the independent TTL and capacity limits. Prior-tip entries never
-        # consume the same-tip caps while stale-grace still protects them.
+        # Globally insertion ordered, with per-connection indexes for the
+        # independent TTL and capacity limits. Prior-tip entries never consume
+        # the same-tip cap while stale-grace still protects them.
         self.evicted_job_graveyard: OrderedDict[str, EvictedJobEntry] = OrderedDict()
         self.evicted_jobs_by_connection: dict[int, OrderedDict[str, None]] = {}
         self.evicted_same_tip_by_connection: dict[int, OrderedDict[str, None]] = {}
@@ -3272,9 +3299,6 @@ class PrismCoordinator:
             self.same_tip_job_retention_per_connection = (
                 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION
             )
-        if not hasattr(self, "same_tip_job_retention_global"):
-            self.same_tip_job_retention_global = DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_GLOBAL
-
         current_tip = self._current_observed_tip_hash_locked()
         if self.evicted_job_index_tip_hash != current_tip:
             rebuild_indexes = True
@@ -3352,12 +3376,6 @@ class PrismCoordinator:
                 self._remove_evicted_job_locked(oldest_job_id)
                 self.evicted_job_capacity_eviction_counts["connection"] += 1
                 job_ids = self.evicted_same_tip_by_connection.get(candidate_connection_id)
-
-        global_cap = int(self.same_tip_job_retention_global)
-        while len(self.evicted_same_tip_job_ids) > global_cap:
-            oldest_job_id = next(iter(self.evicted_same_tip_job_ids))
-            self._remove_evicted_job_locked(oldest_job_id)
-            self.evicted_job_capacity_eviction_counts["global"] += 1
 
     def _stale_grace_entry_expired_locked(
         self,
