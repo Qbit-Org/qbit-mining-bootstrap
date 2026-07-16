@@ -188,6 +188,11 @@ def public_cache_key(path: str, query: dict[str, list[str]]) -> tuple[str, tuple
 def public_cache_policy(path: str) -> PublicCachePolicy:
     if not env_bool("PRISM_PUBLIC_CACHE_ENABLED", default=True):
         return PublicCachePolicy(ttl_seconds=0, stale_while_revalidate_seconds=0)
+    dynamic_ttl_seconds = env_nonnegative_int("PRISM_PUBLIC_CACHE_TTL_SECONDS", 5)
+    dynamic_stale_while_revalidate_seconds = env_nonnegative_int(
+        "PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS",
+        30,
+    )
     if path == "/public/v1/mining-configuration":
         return PublicCachePolicy(
             ttl_seconds=env_nonnegative_int("PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS", 300),
@@ -200,10 +205,13 @@ def public_cache_policy(path: str) -> PublicCachePolicy:
         block_hash = path[len("/public/v1/blocks/"):-len("/settlement-artifacts")].strip()
         if _is_hex64(block_hash):
             return PublicCachePolicy(
-                ttl_seconds=env_nonnegative_int("PRISM_PUBLIC_SETTLEMENT_CACHE_TTL_SECONDS", 5),
+                ttl_seconds=env_nonnegative_int(
+                    "PRISM_PUBLIC_SETTLEMENT_CACHE_TTL_SECONDS",
+                    dynamic_ttl_seconds,
+                ),
                 stale_while_revalidate_seconds=env_nonnegative_int(
                     "PRISM_PUBLIC_SETTLEMENT_CACHE_STALE_WHILE_REVALIDATE_SECONDS",
-                    30,
+                    dynamic_stale_while_revalidate_seconds,
                 ),
             )
     if path.startswith("/public/v1/artifacts/"):
@@ -216,11 +224,8 @@ def public_cache_policy(path: str) -> PublicCachePolicy:
             immutable=True,
         )
     return PublicCachePolicy(
-        ttl_seconds=env_nonnegative_int("PRISM_PUBLIC_CACHE_TTL_SECONDS", 5),
-        stale_while_revalidate_seconds=env_nonnegative_int(
-            "PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS",
-            30,
-        ),
+        ttl_seconds=dynamic_ttl_seconds,
+        stale_while_revalidate_seconds=dynamic_stale_while_revalidate_seconds,
     )
 
 

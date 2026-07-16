@@ -43,6 +43,11 @@ seconds. Settlement-artifact responses also default to 5 seconds because they
 include live fanout status and broadcast attempts. Content-addressed artifact
 routes default to 86400 seconds with an immutable shared-cache hint.
 
+Settlement-specific cache controls are blank by default and inherit
+`PRISM_PUBLIC_CACHE_TTL_SECONDS` and
+`PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS`. Set them only when an
+explicit route-specific override is required.
+
 Operators can tune the defaults with:
 
 - `PRISM_PUBLIC_CACHE_ENABLED`

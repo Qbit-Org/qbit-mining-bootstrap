@@ -886,6 +886,22 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(policy.ttl_seconds, 5)
         self.assertEqual(policy.stale_while_revalidate_seconds, 30)
 
+    def test_settlement_artifact_cache_inherits_global_overrides(self) -> None:
+        path = f"/public/v1/blocks/{FakePublicLedger.block_hash}/settlement-artifacts"
+
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_PUBLIC_CACHE_TTL_SECONDS": "0",
+                "PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS": "7",
+            },
+            clear=True,
+        ):
+            policy = public_api.public_cache_policy(path)
+
+        self.assertEqual(policy.ttl_seconds, 0)
+        self.assertEqual(policy.stale_while_revalidate_seconds, 7)
+
     def test_public_api_errors_use_public_error_schema(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as raised:
             self.get_json("/public/v1/leaderboard?window=24h")
