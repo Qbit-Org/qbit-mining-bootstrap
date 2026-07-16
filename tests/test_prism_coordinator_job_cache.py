@@ -384,6 +384,98 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(recorded["calls"], 2)
 
+    def test_payout_state_change_during_build_retries_before_cache_or_return(self) -> None:
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None
+        identity = worker()
+        original_build = server.build_shared_job_bundle
+        built_generations: list[int] = []
+
+        def mutate_after_first_build(
+            build_artifacts: object,
+            build_worker: WorkerIdentity,
+        ) -> object:
+            bundle = original_build(build_artifacts, build_worker)  # type: ignore[arg-type]
+            built_generations.append(bundle.payout_state_generation)
+            if len(built_generations) == 1:
+                server._advance_payout_state_generation()
+            return bundle
+
+        server.build_shared_job_bundle = mutate_after_first_build  # type: ignore[method-assign]
+
+        bundle = server.shared_job_bundle(artifacts, identity)
+        cached = server.shared_job_bundle(artifacts, identity)
+
+        self.assertEqual(built_generations, [0, 1])
+        self.assertEqual(recorded["calls"], 2)
+        self.assertEqual(bundle.payout_state_generation, 1)
+        self.assertIs(cached, bundle)
+
+    def test_payout_generation_advance_does_not_cancel_new_generation_fanout(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+        cancellations: list[str] = []
+
+        class CurrentToken:
+            payout_state_generation = 1
+
+        class Cancellation:
+            def cancel(self) -> None:
+                cancellations.append("cancelled")
+
+        class InjectCurrentFanoutLock:
+            def __enter__(self) -> object:
+                server._active_tip_refresh = (CurrentToken(), Cancellation())
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        # Model a new-generation refresh registering after the cache-state
+        # increment but before the invalidator reaches the coordinator lock.
+        server.lock = InjectCurrentFanoutLock()  # type: ignore[assignment]
+
+        self.assertEqual(server._advance_payout_state_generation(), 1)
+        self.assertEqual(cancellations, [])
+        self.assertFalse(server._tip_refresh_retry.is_set())
+
+    def test_escaped_stale_bundle_is_rejected_before_direct_delivery(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server._ensure_tip_refresh_state()
+        state = client(1)
+        sent: list[dict[str, object]] = []
+        state.send = sent.append  # type: ignore[method-assign]
+        original_shared_job_bundle = server.shared_job_bundle
+        advanced = False
+
+        def advance_after_bundle(*args: object, **kwargs: object) -> object:
+            nonlocal advanced
+            bundle = original_shared_job_bundle(*args, **kwargs)  # type: ignore[arg-type]
+            if not advanced:
+                advanced = True
+                server._advance_payout_state_generation()
+            return bundle
+
+        server.shared_job_bundle = advance_after_bundle  # type: ignore[method-assign]
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(sent, [])
+        self.assertIsNone(state.active_job)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+        self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
+        self.assertIsNotNone(state.active_job)
+        self.assertEqual(state.active_job.payout_state_generation, 1)
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+
     def test_zero_template_ttl_fetches_template_per_build(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
@@ -1235,6 +1327,44 @@ class JobBundleCacheTests(unittest.TestCase):
             ["mining.set_difficulty", "mining.notify"],
         )
 
+    def test_newer_template_does_not_supersede_current_payout_refresh(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None and state.worker is not None
+        stale_bundle = server.shared_job_bundle(artifacts, state.worker)
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        stale_intervening_job = dataclass_replace(
+            server.stamp_job_for_client(
+                state,
+                stale_bundle,
+                clean_jobs=False,
+            ),
+            template_generation=snapshot.template_generation + 1,
+        )
+        server._advance_payout_state_generation()
+
+        self.assertFalse(
+            server.intervening_job_supersedes_snapshot(
+                stale_intervening_job,
+                None,
+                snapshot,
+            )
+        )
+        current_intervening_job = dataclass_replace(
+            stale_intervening_job,
+            payout_state_generation=server._payout_state_generation,
+        )
+        self.assertTrue(
+            server.intervening_job_supersedes_snapshot(
+                current_intervening_job,
+                None,
+                snapshot,
+            )
+        )
+
     def test_broken_socket_disconnects_only_that_client(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
@@ -1316,8 +1446,11 @@ class JobBundleCacheTests(unittest.TestCase):
             state.send = sent.append  # type: ignore[method-assign]
         server.clients = set(states)
         original_shared_job_bundle = server.shared_job_bundle
+        race_calls = 0
 
         def race_artifacts(artifacts: object, identity: WorkerIdentity) -> object:
+            nonlocal race_calls
+            race_calls += 1
             bundle = original_shared_job_bundle(artifacts, identity)
             with server._job_cache_lock:
                 server._template_artifacts = dataclass_replace(
@@ -1330,6 +1463,7 @@ class JobBundleCacheTests(unittest.TestCase):
 
         refreshed = server.poll_qbit_tip_template_once()
 
+        self.assertEqual(race_calls, 1)
         self.assertEqual(refreshed, 2)
         self.assertEqual(len(sent), 4)
         self.assertIsNotNone(server.tip_template_snapshot)

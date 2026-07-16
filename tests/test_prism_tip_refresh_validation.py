@@ -6,11 +6,13 @@ from __future__ import annotations
 import threading
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 
 from lab.prism.prism_coordinator import (
     TemplateRefreshBlocked,
     TipRefreshValidationToken,
+    _FanoutCancellation,
 )
 from tests.test_prism_coordinator_job_cache import (
     FakeLedger,
@@ -52,35 +54,111 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertTrue(all(state.active_job.collection_only for state in clients))
         self.assertLessEqual(rpc.count("getbestblockhash"), 3)
 
-    def test_reconciliation_runs_after_bundle_and_immediately_before_fanout(self) -> None:
-        server, _rpc = coordinator()
-        install_fake_bundle_builder(server)
+    def test_orphan_reconciliation_rebuilds_bundle_from_post_reorg_balances(self) -> None:
+        orphaned_balance = {
+            "recipient_id": "orphaned-miner",
+            "order_key": "orphaned-miner",
+            "p2mr_program_hex": "44" * 32,
+            "balance_sats": 12_345,
+        }
+
+        class OrphanBalanceLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prior_balances = [dict(orphaned_balance)]
+                self.inactive_calls = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                return [dict(balance) for balance in self.prior_balances]
+
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                self.assert_active_tip_height = active_tip_height
+                return [
+                    {
+                        "block_height": 99,
+                        "block_hash": "aa" * 32,
+                        "chain_state": "confirmed",
+                    }
+                ]
+
+            def mark_pool_block_inactive(
+                self,
+                *,
+                block_hash: str,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                self.inactive_calls += 1
+                self.prior_balances.clear()
+                events.append("reconcile")
+                return {"inactive_count": 1}
+
+            def mark_mature_pool_payouts(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                return {"matured_count": 0}
+
+        events: list[str] = []
+        ledger = OrphanBalanceLedger()
+        server, rpc = coordinator(ledger=ledger)
+        recorded = install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
         state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
         server.clients = [state]  # type: ignore[assignment]
-        events: list[str] = []
-        original_prepare = server.prepare_tip_refresh_bundle
+        original_rpc_call = rpc.call
 
-        def prepare(bundle_snapshot: object, clients: object) -> object:
-            result = original_prepare(bundle_snapshot, clients)  # type: ignore[arg-type]
-            events.append("bundle")
-            return result
+        def reorg_rpc_call(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getblockhash" and params == [99]:
+                return "bb" * 32
+            return original_rpc_call(method, params)
 
-        def reconcile(_tip_hash: str) -> bool:
-            events.append("reconcile")
-            return True
+        rpc.call = reorg_rpc_call  # type: ignore[method-assign]
+        original_build = server.build_audit_bundle
+        signed_balance_snapshots: list[list[dict[str, object]]] = []
 
-        def chain_view_untrusted() -> bool:
-            events.append("chain_view")
-            return False
+        def record_signed_balances(**kwargs: object) -> dict[str, object]:
+            balances = [
+                dict(balance)
+                for balance in kwargs["prior_balances"]  # type: ignore[union-attr]
+            ]
+            signed_balance_snapshots.append(balances)
+            events.append(f"bundle:{sum(int(row['balance_sats']) for row in balances)}")
+            bundle = original_build(**kwargs)
+            bundle["prior_balances"] = balances
+            return bundle
+
+        server.build_audit_bundle = record_signed_balances  # type: ignore[method-assign]
+
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(artifacts)
+        stale_bundle = server.shared_job_bundle(artifacts, state.worker)  # type: ignore[arg-type]
+        self.assertEqual(stale_bundle.prior_balances, [orphaned_balance])
+        self.assertEqual(recorded["calls"], 1)
+        stale_context = server.stamp_job_for_client(
+            state,
+            stale_bundle,
+            clean_jobs=False,
+        )
+        state.active_job = stale_context
+        state.active_job_ids.add(stale_context.job.job_id)
+        server.jobs[stale_context.job.job_id] = stale_context
+        events.clear()
+        clean_notifications: list[bool] = []
 
         def record_send(payload: dict[str, object]) -> None:
             if payload["method"] == "mining.notify":
                 events.append("fanout")
+                clean_notifications.append(bool(payload["params"][-1]))  # type: ignore[index]
 
-        server.prepare_tip_refresh_bundle = prepare  # type: ignore[method-assign]
-        server.ensure_reorg_reconciled_for_tip = reconcile  # type: ignore[method-assign]
-        server.qbit_chain_view_untrusted = chain_view_untrusted  # type: ignore[method-assign]
         state.send = record_send  # type: ignore[method-assign]
 
         try:
@@ -88,7 +166,24 @@ class TipRefreshValidationTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
-        self.assertEqual(events, ["bundle", "reconcile", "chain_view", "fanout"])
+        self.assertEqual(events, ["reconcile", "bundle:0", "fanout"])
+        self.assertEqual(ledger.inactive_calls, 1)
+        self.assertEqual(server.reorg_inactive_block_count, 1)
+        self.assertEqual(
+            signed_balance_snapshots,
+            [[orphaned_balance], []],
+        )
+        self.assertEqual(recorded["calls"], 2)
+        self.assertIsNotNone(state.active_job)
+        self.assertEqual(state.active_job.prior_balances, [])
+        self.assertEqual(state.active_job.bundle["prior_balances"], [])
+        self.assertIsNot(state.active_job.bundle, stale_bundle.bundle)
+        self.assertIn("signed_coinbase_manifest", state.active_job.bundle)
+        self.assertEqual(stale_bundle.payout_state_generation, 0)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(state.active_job.payout_state_generation, 1)
+        self.assertEqual(clean_notifications, [True])
+        self.assertNotIn(stale_context.job.job_id, state.active_job_ids)
 
     def test_hundred_client_refresh_validates_chain_once(self) -> None:
         server, rpc = coordinator()
@@ -181,6 +276,10 @@ class TipRefreshValidationTests(unittest.TestCase):
             server.tip_template_snapshot.template_generation,
         )
         self.assertEqual(
+            token.payout_state_generation,
+            server._payout_state_generation,
+        )
+        self.assertEqual(
             token.observation_sequence,
             server.current_tip_observation_sequence,
         )
@@ -231,7 +330,7 @@ class TipRefreshValidationTests(unittest.TestCase):
 
     def test_reconciliation_failure_before_fanout_sends_zero_jobs(self) -> None:
         server, _rpc = coordinator()
-        install_fake_bundle_builder(server)
+        recorded = install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
         clients = [client(1), client(2)]
         sent: list[dict[str, object]] = []
@@ -259,6 +358,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             server.shutdown_tip_refresh_executor()
 
         self.assertEqual(reconciliation_calls, [server.rpc.tip])
+        self.assertEqual(recorded["calls"], 0)
         self.assertEqual(sent, [])
         self.assertTrue(all(state.active_job is None for state in clients))
 
@@ -391,6 +491,232 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(results, [3])
         self.assertEqual(notifications, {1, 2, 3})
         self.assertFalse(server._tip_refresh_retry.is_set())
+
+    def test_post_fanout_payout_change_schedules_immediate_retry(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        original_rpc_call = rpc.call
+
+        def advance_during_post_fanout_tip_check(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            result = original_rpc_call(method, params)
+            if method == "getbestblockhash" and rpc.count(method) == 4:
+                server._advance_payout_state_generation()
+            return result
+
+        rpc.call = advance_during_post_fanout_tip_check  # type: ignore[method-assign]
+
+        try:
+            with self.assertRaises(TemplateRefreshBlocked):
+                server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertIsNotNone(state.active_job)
+        self.assertEqual(state.active_job.payout_state_generation, 0)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_payout_mutation_waits_for_prepared_network_delivery(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        server.clients = [state]  # type: ignore[assignment]
+        send_started = threading.Event()
+        release_send = threading.Event()
+        mutation_started = threading.Event()
+        mutation_completed = threading.Event()
+        poll_errors: list[BaseException] = []
+
+        def block_notify(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                send_started.set()
+                self.assertTrue(release_send.wait(5))
+
+        state.send = block_notify  # type: ignore[method-assign]
+
+        def poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                poll_errors.append(exc)
+
+        def mutate() -> None:
+            mutation_started.set()
+            server._advance_payout_state_generation()
+            mutation_completed.set()
+
+        poll_thread = threading.Thread(target=poll)
+        mutation_thread = threading.Thread(target=mutate)
+        poll_thread.start()
+        try:
+            self.assertTrue(send_started.wait(5))
+            mutation_thread.start()
+            self.assertTrue(mutation_started.wait(5))
+            self.assertFalse(mutation_completed.wait(0.1))
+            self.assertEqual(server._payout_state_generation, 0)
+        finally:
+            release_send.set()
+            mutation_thread.join(5)
+            poll_thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(mutation_thread.is_alive())
+        self.assertFalse(poll_thread.is_alive())
+        self.assertTrue(mutation_completed.is_set())
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(len(poll_errors), 1)
+        self.assertIsInstance(poll_errors[0], TemplateRefreshBlocked)
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_prepared_skip_after_admission_releases_cancellation_gate(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        server.clients = [state]  # type: ignore[assignment]
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = snapshot
+        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+        token = server._validate_prepared_tip_refresh(
+            bundle,
+            snapshot,
+            sequence,
+        )
+        cancellation = _FanoutCancellation()
+        original_gate = server._payout_state_delivery_gate
+
+        class RemoveClientAtAdmission:
+            @contextmanager
+            def delivery(self) -> object:
+                with original_gate.delivery():
+                    server.clients = []  # type: ignore[assignment]
+                    yield
+
+            def mutation(self) -> object:
+                return original_gate.mutation()
+
+        server._payout_state_delivery_gate = RemoveClientAtAdmission()
+
+        result = server.send_prepared_job(
+            state,
+            bundle,
+            snapshot,
+            token,
+            state.connection_id,
+            None,
+            cancellation,
+        )
+
+        self.assertEqual(result.result, "skipped")
+        self.assertEqual(cancellation._active_deliveries, 0)
+        cancellation.set()
+
+    def test_sequential_payout_change_schedules_immediate_retry(self) -> None:
+        server, _rpc = coordinator(ledger=FakeLedger(miners=["solo"]))
+        install_fake_bundle_builder(server)
+        first, second = client(1), client(2)
+        server.clients = [first, second]  # type: ignore[assignment]
+        first_notifications = 0
+
+        def record_first_send(payload: dict[str, object]) -> None:
+            nonlocal first_notifications
+            if payload["method"] == "mining.notify":
+                first_notifications += 1
+
+        first.send = record_first_send  # type: ignore[method-assign]
+        second.send = lambda _payload: None  # type: ignore[method-assign]
+        original_maybe_send_job = server.maybe_send_job
+        send_calls = 0
+
+        def advance_between_clients(*args: object, **kwargs: object) -> bool:
+            nonlocal send_calls
+            sent = original_maybe_send_job(*args, **kwargs)  # type: ignore[arg-type]
+            send_calls += 1
+            if send_calls == 1:
+                server._advance_payout_state_generation()
+            return sent
+
+        server.maybe_send_job = advance_between_clients  # type: ignore[method-assign]
+
+        with self.assertRaises(TemplateRefreshBlocked):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(first_notifications, 1)
+        self.assertIsNotNone(first.active_job)
+        self.assertIsNotNone(second.active_job)
+        self.assertEqual(first.active_job.payout_state_generation, 0)
+        self.assertEqual(second.active_job.payout_state_generation, 1)
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_payout_change_after_client_selection_retries_full_same_tip_set(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        first = client(1)
+        second = client(2)
+        first_sent: list[dict[str, object]] = []
+        second_sent: list[dict[str, object]] = []
+        first.send = first_sent.append  # type: ignore[method-assign]
+        second.send = second_sent.append  # type: ignore[method-assign]
+        server.clients = [second]  # type: ignore[assignment]
+
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            self.assertIsNotNone(second.active_job)
+            self.assertEqual(second.active_job.payout_state_generation, 0)
+
+            server.clients = [first, second]  # type: ignore[assignment]
+            original_prepare = server.prepare_tip_refresh_bundle
+            advanced = False
+
+            def advance_before_prepare(*args: object, **kwargs: object) -> object:
+                nonlocal advanced
+                if not advanced:
+                    advanced = True
+                    server._advance_payout_state_generation()
+                return original_prepare(*args, **kwargs)  # type: ignore[arg-type]
+
+            server.prepare_tip_refresh_bundle = advance_before_prepare  # type: ignore[method-assign]
+
+            with self.assertRaises(TemplateRefreshBlocked):
+                server.poll_qbit_tip_template_once()
+
+            self.assertIsNone(first.active_job)
+            self.assertEqual(second.active_job.payout_state_generation, 0)
+            self.assertTrue(server._tip_refresh_retry.is_set())
+
+            self.assertEqual(server.poll_qbit_tip_template_once(), 2)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertIsNotNone(first.active_job)
+        self.assertIsNotNone(second.active_job)
+        self.assertEqual(first.active_job.payout_state_generation, 1)
+        self.assertEqual(second.active_job.payout_state_generation, 1)
+        self.assertEqual(
+            sum(payload["method"] == "mining.notify" for payload in first_sent),
+            1,
+        )
+        self.assertEqual(
+            sum(payload["method"] == "mining.notify" for payload in second_sent),
+            2,
+        )
 
     def test_executor_submission_failure_cancels_and_drains_started_work(self) -> None:
         server, _rpc = coordinator()
