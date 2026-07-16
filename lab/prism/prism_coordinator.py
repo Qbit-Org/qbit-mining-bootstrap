@@ -1305,7 +1305,6 @@ class PrismCoordinator:
         # The stamp is when the refresh path saw the tip CHANGE; None marks the
         # startup baseline tip, which never opens the stale-grace window.
         self.current_tip_first_seen: tuple[str, float | None] | None = None
-        self.current_tip_previous_observed_hash: str | None = None
         self.current_tip_parent: tuple[str, str] | None = None
         # Block candidates are landed by a dedicated submitter thread so a
         # winning share's ack (and every other client's) never waits on
@@ -3256,12 +3255,10 @@ class PrismCoordinator:
             first_seen = getattr(self, "current_tip_first_seen", None)
             if first_seen is not None and first_seen[0] == tip_hash:
                 return
-            previous_tip_hash = str(first_seen[0]) if first_seen is not None else None
             # The first tip this process observes is a startup baseline, not a
             # tip flip: a None stamp keeps the stale-grace window closed. Only
             # a change away from a previously observed tip records a flip time.
             self.current_tip_first_seen = (tip_hash, now if first_seen is not None else None)
-            self.current_tip_previous_observed_hash = previous_tip_hash
             self.current_tip_parent = None
             # Reclassify formerly same-tip entries immediately. On mainnet the
             # zero stale-grace TTL removes them in this pass; on other chains
@@ -3498,10 +3495,18 @@ class PrismCoordinator:
         ):
             return True
 
-        # Once another observed tip replaces the one that first made this job
-        # stale, it is more than one refresh behind and cannot receive grace.
-        previous_tip = getattr(self, "current_tip_previous_observed_hash", None)
-        if previous_tip is not None and entry.previousblockhash != previous_tip:
+        # Submit eligibility is exactly one chain parent behind, so pruning
+        # must use that same relationship. The prior poll observation can lag
+        # (for example when authorize/vardiff issued work on an intermediate
+        # tip), and using it here would drop work submit would still credit.
+        # Until the parent RPC has populated the cache, retain conservatively;
+        # submit classification fetches it before granting stale grace.
+        cached_parent = getattr(self, "current_tip_parent", None)
+        if (
+            cached_parent is not None
+            and cached_parent[0] == current_tip
+            and entry.previousblockhash != cached_parent[1]
+        ):
             return True
 
         client = entry.client

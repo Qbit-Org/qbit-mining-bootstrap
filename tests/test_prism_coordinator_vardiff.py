@@ -3628,6 +3628,47 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertNotIn("job-1", server.evicted_job_graveyard)
         self.assertEqual(server.evicted_job_expiration_counts["stale_grace"], 1)
 
+    def test_graveyard_uses_chain_parent_when_poller_skips_an_observed_tip(self) -> None:
+        observed_tip = "00" * 32
+        intermediate_tip = "11" * 32
+        current_tip = "22" * 32
+        server, state, _ledger = submit_coordinator(tip=intermediate_tip)
+        server.clients = {state}
+        server.current_tip_first_seen = (observed_tip, None)
+        server.stale_grace_seconds = 3
+        server.jobs["older-job"] = prism_context(
+            "older-job",
+            observed_tip,
+            worker=state.worker,
+        )
+        server.bury_evicted_job(state, "older-job", now=100.0, prune=False)
+        server.bury_evicted_job(state, "job-1", now=110.0, prune=False)
+        server.rpc = ParentTipRpc(tip=current_tip, parent=intermediate_tip)
+
+        with patch("lab.prism.prism_coordinator.time.monotonic", return_value=120.0):
+            server.observe_tip_first_seen(current_tip)
+
+        # The poller's previous observation is not authoritative: retain both
+        # until the current tip's actual parent is known.
+        self.assertIn("older-job", server.evicted_job_graveyard)
+        self.assertIn("job-1", server.evicted_job_graveyard)
+
+        self.assertEqual(
+            server.current_tip_parent_hash(current_tip),
+            intermediate_tip,
+        )
+        server.prune_evicted_job_graveyard(now=120.0)
+
+        self.assertNotIn("older-job", server.evicted_job_graveyard)
+        self.assertIn("job-1", server.evicted_job_graveyard)
+        entry = server.evicted_job_entry(state, "job-1")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(
+            server.evicted_submit_context(state, entry, current_tip),
+            (entry.context, PRISM_CREDIT_POLICY_STALE_GRACE),
+        )
+
     def test_retained_same_tip_duplicate_remains_duplicate_share(self) -> None:
         tip = "00" * 32
         server, state, ledger = submit_coordinator(tip=tip)
