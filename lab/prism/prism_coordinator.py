@@ -2822,7 +2822,11 @@ class PrismCoordinator:
         with client.job_update_lock:
             if self.stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
                 return RefreshResult("skipped")
-            self._tip_refresh_artifacts(snapshot)
+            # prepare_tip_refresh_bundle validates the exact cache fingerprint
+            # before any fanout task is submitted. From that point onward the
+            # immutable bundle is the refresh snapshot: consulting the mutable
+            # global cache here would let an unrelated same-tip job build abort
+            # a partially delivered pass after replacing _template_artifacts.
             with self.lock:
                 if (
                     client not in self.clients
