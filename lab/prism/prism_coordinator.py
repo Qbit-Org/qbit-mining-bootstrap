@@ -1267,6 +1267,7 @@ class PrismCoordinator:
         # The stamp is when the refresh path saw the tip CHANGE; None marks the
         # startup baseline tip, which never opens the stale-grace window.
         self.current_tip_first_seen: tuple[str, float | None] | None = None
+        self.current_tip_previous_observed_hash: str | None = None
         self.current_tip_parent: tuple[str, str] | None = None
         # Block candidates are landed by a dedicated submitter thread so a
         # winning share's ack (and every other client's) never waits on
@@ -2814,6 +2815,7 @@ class PrismCoordinator:
         bundle: CachedJobBundle,
         snapshot: QbitTipTemplateSnapshot,
         expected_connection_id: int,
+        expected_active_job: PrismJobContext | None,
         cancel_event: threading.Event | None = None,
     ) -> RefreshResult:
         started = time.monotonic()
@@ -2831,6 +2833,7 @@ class PrismCoordinator:
                 if (
                     client not in self.clients
                     or client.connection_id != expected_connection_id
+                    or client.active_job is not expected_active_job
                     or not self.client_can_receive_jobs(client)
                     or not self.client_needs_tip_template_refresh(client, snapshot)
                 ):
@@ -2879,11 +2882,18 @@ class PrismCoordinator:
         bundle: CachedJobBundle,
         snapshot: QbitTipTemplateSnapshot,
         *,
+        expected_active_jobs: dict[ClientState, PrismJobContext | None] | None = None,
         heartbeat_name: str,
     ) -> tuple[int, float | None, float | None, int]:
         executor = self.tip_refresh_executor()
         cancel_event = threading.Event()
         futures: dict[Future[RefreshResult], ClientState] = {}
+        if expected_active_jobs is None:
+            with self.lock:
+                expected_active_jobs = {
+                    client: client.active_job
+                    for client in clients
+                }
         for client in clients:
             if self.stop_event.is_set():
                 break
@@ -2894,6 +2904,7 @@ class PrismCoordinator:
                     bundle,
                     snapshot,
                     client.connection_id,
+                    expected_active_jobs.get(client),
                     cancel_event,
                 )
             except RuntimeError:
@@ -3004,6 +3015,15 @@ class PrismCoordinator:
                         if self.client_can_receive_jobs(client)
                         and self.client_needs_tip_template_refresh(client, snapshot)
                     ]
+                # Capture the exact job each client had when this refresh pass
+                # selected it. A Vardiff/authorize path may install fresher
+                # work while the shared bundle is prepared or while its task
+                # waits in the executor queue; that task must then skip rather
+                # than overwrite the intervening job with this older snapshot.
+                expected_active_jobs = {
+                    client: client.active_job
+                    for client in clients
+                }
 
             refreshed = 0
             build_failures = 0
@@ -3029,6 +3049,7 @@ class PrismCoordinator:
                     clients,
                     bundle,
                     snapshot,
+                    expected_active_jobs=expected_active_jobs,
                     heartbeat_name=heartbeat_name,
                 )
             else:
@@ -3098,10 +3119,12 @@ class PrismCoordinator:
             first_seen = getattr(self, "current_tip_first_seen", None)
             if first_seen is not None and first_seen[0] == tip_hash:
                 return
+            previous_tip_hash = str(first_seen[0]) if first_seen is not None else None
             # The first tip this process observes is a startup baseline, not a
             # tip flip: a None stamp keeps the stale-grace window closed. Only
             # a change away from a previously observed tip records a flip time.
             self.current_tip_first_seen = (tip_hash, now if first_seen is not None else None)
+            self.current_tip_previous_observed_hash = previous_tip_hash
             self.current_tip_parent = None
             # Reclassify formerly same-tip entries immediately. On mainnet the
             # zero stale-grace TTL removes them in this pass; on other chains
@@ -3256,6 +3279,51 @@ class PrismCoordinator:
             index.setdefault(entry.connection_id, OrderedDict())[job_id] = None
         self.evicted_same_tip_by_connection = index
 
+    def _stale_grace_entry_expired_locked(
+        self,
+        entry: EvictedJobEntry,
+        *,
+        now: float,
+        ttl: float,
+    ) -> bool:
+        current_tip = self._current_observed_tip_hash_locked()
+        first_seen = getattr(self, "current_tip_first_seen", None)
+        if (
+            ttl <= 0
+            or current_tip is None
+            or first_seen is None
+            or str(first_seen[0]) != current_tip
+            or first_seen[1] is None
+        ):
+            return True
+
+        # Once another observed tip replaces the one that first made this job
+        # stale, it is more than one refresh behind and cannot receive grace.
+        previous_tip = getattr(self, "current_tip_previous_observed_hash", None)
+        if previous_tip is not None and entry.previousblockhash != previous_tip:
+            return True
+
+        client = next(
+            (
+                candidate
+                for candidate in self.clients
+                if candidate.connection_id == entry.connection_id
+            ),
+            None,
+        )
+        if client is not None:
+            delivered = client.tip_work_delivered
+            if delivered is None or delivered[0] != current_tip:
+                # Match stale_grace_deadline_open: prior-tip shares stay in
+                # flight until this connection receives replacement work.
+                return False
+            anchor = delivered[1]
+        else:
+            # Disconnect normally removes these entries. Keep legacy/test
+            # orphan state bounded from the refresh path's tip-flip anchor.
+            anchor = float(first_seen[1])
+        return now - anchor > ttl
+
     def bury_evicted_job(
         self,
         client: ClientState,
@@ -3292,8 +3360,18 @@ class PrismCoordinator:
             )
             for job_id, entry in tuple(self.evicted_job_graveyard.items()):
                 job_class = self._evicted_job_class_locked(entry)
-                ttl = same_tip_ttl if job_class == "same_tip" else stale_grace_ttl
-                if ttl <= 0 or now - entry.evicted_monotonic > ttl:
+                if job_class == "same_tip":
+                    expired = (
+                        same_tip_ttl <= 0
+                        or now - entry.evicted_monotonic > same_tip_ttl
+                    )
+                else:
+                    expired = self._stale_grace_entry_expired_locked(
+                        entry,
+                        now=now,
+                        ttl=stale_grace_ttl,
+                    )
+                if expired:
                     self._remove_evicted_job_locked(job_id)
                     self.evicted_job_expiration_counts[job_class] += 1
 

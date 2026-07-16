@@ -3475,6 +3475,30 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.disconnect_client(state)
         self.assertEqual(server.evicted_job_graveyard, {})
 
+    def test_tip_flip_reanchors_retained_job_grace_to_client_delivery(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server, state, _ledger = submit_coordinator(tip=old_tip)
+        server.clients = {state}
+        server.current_tip_first_seen = (old_tip, None)
+        server.stale_grace_seconds = 3
+        server.bury_evicted_job(state, "job-1", now=100.0)
+
+        with patch("lab.prism.prism_coordinator.time.monotonic", return_value=120.0):
+            server.observe_tip_first_seen(new_tip)
+
+        # Burial predates the flip by twenty seconds, but grace does not begin
+        # until this connection actually receives replacement work.
+        server.prune_evicted_job_graveyard(now=130.0)
+        self.assertIn("job-1", server.evicted_job_graveyard)
+
+        state.tip_work_delivered = (new_tip, 130.0)
+        server.prune_evicted_job_graveyard(now=132.9)
+        self.assertIn("job-1", server.evicted_job_graveyard)
+        server.prune_evicted_job_graveyard(now=133.1)
+        self.assertNotIn("job-1", server.evicted_job_graveyard)
+        self.assertEqual(server.evicted_job_expiration_counts["stale_grace"], 1)
+
     def test_retained_same_tip_duplicate_remains_duplicate_share(self) -> None:
         tip = "00" * 32
         server, state, ledger = submit_coordinator(tip=tip)

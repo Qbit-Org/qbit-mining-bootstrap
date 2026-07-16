@@ -698,6 +698,61 @@ class JobBundleCacheTests(unittest.TestCase):
             ["mining.set_difficulty", "mining.notify"],
         )
 
+    def test_queued_fanout_does_not_overwrite_intervening_job(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 1
+        first = client(1)
+        second = client(2)
+        server.clients = [first, second]  # type: ignore[assignment]
+        first_blocked = threading.Event()
+        release_first = threading.Event()
+        second_sent: list[dict[str, object]] = []
+
+        def first_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                first_blocked.set()
+                self.assertTrue(release_first.wait(5))
+
+        first.send = first_send  # type: ignore[method-assign]
+        second.send = second_sent.append  # type: ignore[method-assign]
+        refreshed: list[int] = []
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                refreshed.append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # noqa: BLE001 - surface to the test
+                errors.append(exc)
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(first_blocked.wait(5))
+            replacement = dict(rpc.template)
+            replacement["coinbasevalue"] = int(replacement["coinbasevalue"]) + 1
+            replacement_artifacts = server.store_template_artifacts(replacement)
+            self.assertIsNotNone(replacement_artifacts)
+            self.assertTrue(server.maybe_send_job(second, clean_jobs=False))
+            intervening_job = second.active_job
+            self.assertEqual(
+                intervening_job.template_fingerprint,
+                replacement_artifacts.fingerprint,
+            )
+        finally:
+            release_first.set()
+            thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(refreshed, [1])
+        self.assertIs(second.active_job, intervening_job)
+        self.assertEqual(
+            [payload["method"] for payload in second_sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+
     def test_broken_socket_disconnects_only_that_client(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
