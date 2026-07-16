@@ -758,7 +758,8 @@ class JobBundleCacheTests(unittest.TestCase):
         chain_view_trusted = True
         trust_checks: list[bool] = []
 
-        def current_tip_trusted() -> bool:
+        def current_tip_trusted(*, expected_tip_hash: str | None = None) -> bool:
+            self.assertEqual(expected_tip_hash, server.rpc.tip)
             trust_checks.append(chain_view_trusted)
             return chain_view_trusted
 
@@ -806,6 +807,52 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIsNone(second.active_job)
         self.assertEqual(second_sent, [])
 
+    def test_queued_fanout_stops_when_live_tip_changes(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 1
+        first = client(1)
+        second = client(2)
+        server.clients = [first, second]  # type: ignore[assignment]
+        first_blocked = threading.Event()
+        release_first = threading.Event()
+        second_sent: list[dict[str, object]] = []
+
+        def first_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                first_blocked.set()
+                self.assertTrue(release_first.wait(5))
+
+        first.send = first_send  # type: ignore[method-assign]
+        second.send = second_sent.append  # type: ignore[method-assign]
+        refreshed: list[int] = []
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                refreshed.append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # noqa: BLE001 - surface to the test
+                errors.append(exc)
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(first_blocked.wait(5))
+            rpc.tip = "33" * 32
+        finally:
+            release_first.set()
+            thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(refreshed, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+        self.assertIn("tip changed while prepared work was queued", str(errors[0]))
+        self.assertIsNotNone(first.active_job)
+        self.assertIsNone(second.active_job)
+        self.assertEqual(second_sent, [])
+
     def test_multiworker_cancel_waits_for_admitted_delivery_and_blocks_queue(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
@@ -837,7 +884,8 @@ class JobBundleCacheTests(unittest.TestCase):
                     invalidation_finished.set()
                 raise
 
-        def current_tip_trusted() -> bool:
+        def current_tip_trusted(*, expected_tip_hash: str | None = None) -> bool:
+            self.assertEqual(expected_tip_hash, server.rpc.tip)
             state = worker_local.client
             if state is admitted:
                 return True

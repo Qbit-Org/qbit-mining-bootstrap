@@ -2982,7 +2982,9 @@ class PrismCoordinator:
                     return RefreshResult("skipped")
             phase_started = time.monotonic()
             try:
-                if not self.ensure_reorg_reconciled_for_current_tip():
+                if not self.ensure_reorg_reconciled_for_current_tip(
+                    expected_tip_hash=snapshot.bestblockhash,
+                ):
                     raise TemplateRefreshBlocked(
                         "qbit chain view became untrusted before prepared job delivery"
                     )
@@ -3764,10 +3766,22 @@ class PrismCoordinator:
             template_generation=generation,
         )
 
-    def ensure_reorg_reconciled_for_current_tip(self) -> bool:
-        if not getattr(self, "reorg_reconciler_enabled", True):
+    def ensure_reorg_reconciled_for_current_tip(
+        self,
+        *,
+        expected_tip_hash: str | None = None,
+    ) -> bool:
+        reconciler_enabled = getattr(self, "reorg_reconciler_enabled", True)
+        if not reconciler_enabled and expected_tip_hash is None:
             return True
         current_tip = str(self.rpc.call("getbestblockhash"))
+        if expected_tip_hash is not None and current_tip != expected_tip_hash:
+            raise TemplateRefreshBlocked(
+                "qbit tip changed while prepared work was queued "
+                f"expected={expected_tip_hash} current={current_tip}"
+            )
+        if not reconciler_enabled:
+            return True
         # A trusted reconciliation for this same tip within the cache window is
         # reused: the blockpoll loop re-reconciles every poll anyway, so
         # per-client job builds do not each need a full ledger reconcile pass.
