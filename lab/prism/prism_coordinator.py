@@ -3322,21 +3322,44 @@ class PrismCoordinator:
             # a change away from a previously observed tip records a flip time.
             self.current_tip_first_seen = (tip_hash, now if first_seen is not None else None)
             self.current_tip_parent = None
+
+        # Parent lookup is best-effort cleanup metadata, so never hold the
+        # coordinator lock across RPC or fail tip observation when it is
+        # temporarily unavailable. Submit classification independently fetches
+        # and requires the parent before granting stale grace.
+        try:
+            parent_hash = self._fetch_tip_parent_hash(tip_hash)
+        except Exception:
+            parent_hash = None
+
+        with self.lock:
+            current = getattr(self, "current_tip_first_seen", None)
+            if current is None or current[0] != tip_hash:
+                return
+            if parent_hash is not None:
+                self.current_tip_parent = (tip_hash, parent_hash)
             # Reclassify formerly same-tip entries immediately. On mainnet the
             # zero stale-grace TTL removes them in this pass; on other chains
-            # only the independently configured stale-grace lifetime applies.
+            # the actual chain parent removes multi-tip-behind entries while
+            # the independently configured grace lifetime protects one-back.
             self.prune_evicted_job_graveyard(now=now, force=True)
+
+    def _fetch_tip_parent_hash(self, tip_hash: str) -> str | None:
+        block = self.rpc.call("getblock", [tip_hash])
+        if not isinstance(block, dict):
+            return None
+        parent = str(block.get("previousblockhash", "") or "")
+        if not parent:
+            return None
+        return parent
 
     def current_tip_parent_hash(self, tip_hash: str) -> str | None:
         with self.lock:
             cached = getattr(self, "current_tip_parent", None)
             if cached is not None and cached[0] == tip_hash:
                 return cached[1]
-        block = self.rpc.call("getblock", [tip_hash])
-        if not isinstance(block, dict):
-            return None
-        parent = str(block.get("previousblockhash", "") or "")
-        if not parent:
+        parent = self._fetch_tip_parent_hash(tip_hash)
+        if parent is None:
             return None
         with self.lock:
             self.current_tip_parent = (tip_hash, parent)

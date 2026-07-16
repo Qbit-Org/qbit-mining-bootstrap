@@ -3628,7 +3628,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertNotIn("job-1", server.evicted_job_graveyard)
         self.assertEqual(server.evicted_job_expiration_counts["stale_grace"], 1)
 
-    def test_graveyard_uses_chain_parent_when_poller_skips_an_observed_tip(self) -> None:
+    def test_tip_flip_prunes_by_chain_parent_when_poller_skips_observed_tip(self) -> None:
         observed_tip = "00" * 32
         intermediate_tip = "11" * 32
         current_tip = "22" * 32
@@ -3648,19 +3648,15 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with patch("lab.prism.prism_coordinator.time.monotonic", return_value=120.0):
             server.observe_tip_first_seen(current_tip)
 
-        # The poller's previous observation is not authoritative: retain both
-        # until the current tip's actual parent is known.
-        self.assertIn("older-job", server.evicted_job_graveyard)
+        # The poller's previous observation is not authoritative. Tip
+        # observation proactively loads the actual parent, drops older work,
+        # and preserves the intermediate-tip context that submit can credit.
+        self.assertNotIn("older-job", server.evicted_job_graveyard)
         self.assertIn("job-1", server.evicted_job_graveyard)
-
         self.assertEqual(
             server.current_tip_parent_hash(current_tip),
             intermediate_tip,
         )
-        server.prune_evicted_job_graveyard(now=120.0)
-
-        self.assertNotIn("older-job", server.evicted_job_graveyard)
-        self.assertIn("job-1", server.evicted_job_graveyard)
         entry = server.evicted_job_entry(state, "job-1")
         self.assertIsNotNone(entry)
         assert entry is not None
