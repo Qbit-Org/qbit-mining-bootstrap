@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 import dataclasses
 import errno
@@ -128,6 +129,7 @@ PRISM_JOB_BUILD_SECONDS_BUCKETS = (
     10.0,
     30.0,
 )
+PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_JOB_BUILD_PHASES = ("reorg", "template", "merkle", "ledger", "bundle", "stamp", "send")
 PRISM_JOB_CACHE_KINDS = ("template", "bundle")
 PRISM_TIP_REFRESH_RESULTS = ("sent", "skipped", "disconnected", "failed")
@@ -931,6 +933,18 @@ class ClientState:
         with self.send_lock:
             self.sock.sendall(data)
 
+    def send_batch(self, payloads: list[dict[str, object]]) -> None:
+        # Tests and embedders may replace ``send`` with an in-memory recorder;
+        # retain that seam while production sockets write the whole difficulty
+        # + notify pair under one send lock with no response interleaving.
+        if "send" in self.__dict__:
+            for payload in payloads:
+                self.send(payload)
+            return
+        data = b"".join(json.dumps(payload).encode() + b"\n" for payload in payloads)
+        with self.send_lock:
+            self.sock.sendall(data)
+
     def close(self) -> None:
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
@@ -1319,6 +1333,8 @@ class PrismCoordinator:
         self.latest_bundle: dict[str, Any] | None = None
         self.tip_template_snapshot: QbitTipTemplateSnapshot | None = None
         self._tip_refresh_lock = threading.Lock()
+        self._tip_refresh_executor_lock = threading.Lock()
+        self._tip_refresh_executor: ThreadPoolExecutor | None = None
         self.last_reorg_reconciled_tip_hash: str | None = None
         self.last_reorg_reconciled_trusted = False
         self.last_reorg_reconciled_monotonic: float | None = None
@@ -2048,6 +2064,78 @@ class PrismCoordinator:
     def _ensure_tip_refresh_state(self) -> None:
         if not hasattr(self, "_tip_refresh_lock"):
             self._tip_refresh_lock = threading.Lock()
+        if not hasattr(self, "_tip_refresh_executor_lock"):
+            self._tip_refresh_executor_lock = threading.Lock()
+        if not hasattr(self, "_tip_refresh_executor"):
+            self._tip_refresh_executor: ThreadPoolExecutor | None = None
+        if not hasattr(self, "tip_refresh_max_workers"):
+            self.tip_refresh_max_workers = DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS
+        if not hasattr(self, "_tip_refresh_metrics_lock"):
+            self._tip_refresh_metrics_lock = threading.Lock()
+        if not hasattr(self, "tip_refresh_histograms"):
+            self.tip_refresh_histograms = {
+                name: {
+                    "buckets": {bucket: 0 for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS},
+                    "sum": 0.0,
+                    "count": 0,
+                }
+                for name in ("refresh", "bundle_build", "first_delivery", "last_delivery")
+            }
+        if not hasattr(self, "tip_refresh_client_counts"):
+            self.tip_refresh_client_counts = {
+                result: 0 for result in PRISM_TIP_REFRESH_RESULTS
+            }
+        if not hasattr(self, "tip_refresh_inflight"):
+            self.tip_refresh_inflight = 0
+
+    def _observe_tip_refresh_seconds(self, name: str, elapsed_seconds: float) -> None:
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_metrics_lock:
+            histogram = self.tip_refresh_histograms[name]
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + elapsed_seconds
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
+    def _record_tip_refresh_client_result(self, result: str) -> None:
+        if result not in PRISM_TIP_REFRESH_RESULTS:
+            raise ValueError(f"unknown tip refresh result: {result}")
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_metrics_lock:
+            self.tip_refresh_client_counts[result] += 1
+
+    def _tip_refresh_future_started(self) -> None:
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_metrics_lock:
+            self.tip_refresh_inflight += 1
+
+    def _tip_refresh_future_finished(self, _future: Future[RefreshResult]) -> None:
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_metrics_lock:
+            self.tip_refresh_inflight = max(0, self.tip_refresh_inflight - 1)
+
+    def tip_refresh_executor(self) -> ThreadPoolExecutor:
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_executor_lock:
+            executor = self._tip_refresh_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=self.tip_refresh_max_workers,
+                    thread_name_prefix="prism-tip-refresh",
+                )
+                self._tip_refresh_executor = executor
+            return executor
+
+    def shutdown_tip_refresh_executor(self) -> None:
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_executor_lock:
+            executor = self._tip_refresh_executor
+            self._tip_refresh_executor = None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _record_heartbeat(self, name: str) -> None:
         self._ensure_watchdog_state()
@@ -2265,6 +2353,7 @@ class PrismCoordinator:
             share_writer_thread.join(timeout=5)
             if ctv_broadcaster_thread is not None:
                 ctv_broadcaster_thread.join(timeout=1)
+            self.shutdown_tip_refresh_executor()
 
     def accept_loop(self, server: socket.socket, profile: StratumListenerProfile) -> None:
         while not self.stop_event.is_set():
@@ -2469,10 +2558,10 @@ class PrismCoordinator:
     def apply_stratum_send_timeout(self, sock: socket.socket) -> None:
         """Bound blocking sends to miners without touching receive semantics.
 
-        Job refreshes iterate clients sequentially; an unresponsive peer whose
-        TCP buffer is full would otherwise block ``sendall`` indefinitely and
-        stall job delivery for every other miner. SO_SNDTIMEO turns that into
-        an OSError, which the existing failure paths treat as a dead client.
+        Job refreshes use a bounded executor, but an unresponsive peer whose
+        TCP buffer is full must still release its worker eventually.
+        SO_SNDTIMEO turns that into an OSError, which the refresh path treats
+        as a dead client without failing delivery to other miners.
         A plain socket timeout is not usable here: it would also apply to
         recv, disconnecting idle-but-healthy miners.
         """
@@ -2660,8 +2749,228 @@ class PrismCoordinator:
             if self.stop_event.wait(self.ctv_broadcaster_interval_seconds):
                 break
 
+    def _tip_refresh_artifacts(
+        self,
+        snapshot: QbitTipTemplateSnapshot,
+    ) -> CachedTemplateArtifacts:
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            artifacts = self._template_artifacts
+        if (
+            artifacts is None
+            or artifacts.fingerprint != snapshot.template_fingerprint
+            or artifacts.previousblockhash != snapshot.previousblockhash
+        ):
+            raise TemplateRefreshBlocked(
+                "tip/template cache changed while preparing refreshed work"
+            )
+        return artifacts
+
+    def prepare_tip_refresh_bundle(
+        self,
+        snapshot: QbitTipTemplateSnapshot,
+        clients: list[ClientState],
+    ) -> CachedJobBundle:
+        artifacts = self._tip_refresh_artifacts(snapshot)
+        with self.lock:
+            representative = next(
+                (
+                    client
+                    for client in clients
+                    if client in self.clients and self.client_can_receive_jobs(client)
+                ),
+                None,
+            )
+            worker = representative.worker if representative is not None else None
+        if worker is None:
+            raise TemplateRefreshBlocked(
+                "no authorized representative remained for prepared refresh"
+            )
+        build_started = time.monotonic()
+        try:
+            bundle = self.shared_job_bundle(artifacts, worker)
+        except Exception as exc:
+            with self.lock:
+                self.job_build_failure_count += 1
+            raise TemplateRefreshBlocked("prepared refresh bundle build failed") from exc
+        finally:
+            self._observe_tip_refresh_seconds(
+                "bundle_build",
+                time.monotonic() - build_started,
+            )
+        # Another path may have refreshed the shared artifact cache while the
+        # heavy ledger/bundle build was in flight. Fail before submitting any
+        # fanout task rather than issuing work from the superseded snapshot.
+        self._tip_refresh_artifacts(snapshot)
+        if bundle.collection_only:
+            raise TemplateRefreshBlocked(
+                "ready-pool prepared refresh unexpectedly produced a collection bundle"
+            )
+        return bundle
+
+    def send_prepared_job(
+        self,
+        client: ClientState,
+        bundle: CachedJobBundle,
+        snapshot: QbitTipTemplateSnapshot,
+        expected_connection_id: int,
+        cancel_event: threading.Event | None = None,
+    ) -> RefreshResult:
+        started = time.monotonic()
+        phases = self._job_build_phases()
+        phases.clear()
+        with client.job_update_lock:
+            if self.stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                return RefreshResult("skipped")
+            self._tip_refresh_artifacts(snapshot)
+            with self.lock:
+                if (
+                    client not in self.clients
+                    or client.connection_id != expected_connection_id
+                    or not self.client_can_receive_jobs(client)
+                    or not self.client_needs_tip_template_refresh(client, snapshot)
+                ):
+                    return RefreshResult("skipped")
+                clean_jobs = self.client_tip_changed_for_snapshot(client, snapshot)
+                stamp_started = time.monotonic()
+                context = self.stamp_job_for_client(
+                    client,
+                    bundle,
+                    clean_jobs=clean_jobs,
+                )
+                phases["stamp"] = time.monotonic() - stamp_started
+                client.active_job = context
+                if clean_jobs:
+                    for job_id in tuple(client.active_job_ids):
+                        self.bury_evicted_job(client, job_id, prune=False)
+                        self.jobs.pop(job_id, None)
+                    client.active_job_ids.clear()
+                    self.prune_evicted_job_graveyard()
+                self.jobs[context.job.job_id] = context
+                client.active_job_ids.add(context.job.job_id)
+                self.prune_client_active_jobs(client)
+
+            phase_started = time.monotonic()
+            self.send_job_update(client, context.job)
+            self.apply_job_difficulty(client, context.job)
+            self.note_tip_work_delivered(
+                client,
+                str(context.template["previousblockhash"]),
+            )
+            delivered_monotonic = time.monotonic()
+            phases["send"] = delivered_monotonic - phase_started
+            elapsed = delivered_monotonic - started
+            self.observe_job_build_elapsed(elapsed, phases)
+            print(
+                "prism coordinator: sent prepared job "
+                f"connection={client.connection_id} username={client.username} "
+                f"job={context.job.job_id} elapsed={elapsed:.3f}s",
+                flush=True,
+            )
+            return RefreshResult("sent", delivered_monotonic)
+
+    def _fanout_prepared_tip_refresh(
+        self,
+        clients: list[ClientState],
+        bundle: CachedJobBundle,
+        snapshot: QbitTipTemplateSnapshot,
+        *,
+        heartbeat_name: str,
+    ) -> tuple[int, float | None, float | None, int]:
+        executor = self.tip_refresh_executor()
+        cancel_event = threading.Event()
+        futures: dict[Future[RefreshResult], ClientState] = {}
+        for client in clients:
+            if self.stop_event.is_set():
+                break
+            try:
+                future = executor.submit(
+                    self.send_prepared_job,
+                    client,
+                    bundle,
+                    snapshot,
+                    client.connection_id,
+                    cancel_event,
+                )
+            except RuntimeError:
+                if self.stop_event.is_set():
+                    break
+                raise
+            self._tip_refresh_future_started()
+            future.add_done_callback(self._tip_refresh_future_finished)
+            futures[future] = client
+
+        pending = set(futures)
+        sent = 0
+        failed = 0
+        first_delivery: float | None = None
+        last_delivery: float | None = None
+        invalidation: TemplateRefreshBlocked | None = None
+        while pending:
+            self._record_heartbeat(heartbeat_name)
+            if self.stop_event.is_set():
+                cancel_event.set()
+                for future in pending:
+                    future.cancel()
+                break
+            done, pending = wait(
+                pending,
+                timeout=1.0,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                client = futures[future]
+                if future.cancelled():
+                    self._record_tip_refresh_client_result("skipped")
+                    continue
+                try:
+                    result = future.result()
+                except OSError:
+                    self._record_tip_refresh_client_result("disconnected")
+                    self.disconnect_client(client)
+                    continue
+                except TemplateRefreshBlocked as exc:
+                    failed += 1
+                    self._record_tip_refresh_client_result("failed")
+                    invalidation = exc
+                    cancel_event.set()
+                    for pending_future in pending:
+                        pending_future.cancel()
+                    continue
+                except Exception:
+                    failed += 1
+                    self._record_tip_refresh_client_result("failed")
+                    with self.lock:
+                        self.job_build_failure_count += 1
+                    print(
+                        "prism coordinator: prepared job fanout failed "
+                        f"connection={client.connection_id} username={client.username}",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+                    continue
+                self._record_tip_refresh_client_result(result.result)
+                if result.result == "sent":
+                    sent += 1
+                    delivered = result.delivered_monotonic
+                    if delivered is not None:
+                        first_delivery = (
+                            delivered
+                            if first_delivery is None
+                            else min(first_delivery, delivered)
+                        )
+                        last_delivery = (
+                            delivered
+                            if last_delivery is None
+                            else max(last_delivery, delivered)
+                        )
+        if invalidation is not None:
+            raise invalidation
+        return sent, first_delivery, last_delivery, failed
+
     def poll_qbit_tip_template_once(self, *, heartbeat_name: str = "qbit_blockpoll") -> int:
         self._ensure_tip_refresh_state()
+        refresh_started = time.monotonic()
         while not self._tip_refresh_lock.acquire(timeout=1.0):
             self._record_heartbeat(heartbeat_name)
             if self.stop_event.is_set():
@@ -2694,26 +3003,65 @@ class PrismCoordinator:
 
             refreshed = 0
             build_failures = 0
-            for client in clients:
-                if self.stop_event.is_set():
-                    break
-                # The refresh loop runs on the blockpoll/blockwait/post-accept
-                # path; keep its liveness heartbeat fresh per client so a long
-                # refresh pass (many clients, or one blocked send) is never
-                # mistaken for a hung poller.
-                self._record_heartbeat(heartbeat_name)
+            first_delivery: float | None = None
+            last_delivery: float | None = None
+            use_prepared_fanout = bool(
+                clients
+                and getattr(self, "_pool_ready_latched", False)
+            )
+            if use_prepared_fanout:
                 try:
-                    if self.maybe_send_job(
-                        client,
-                        clean_jobs=self.client_tip_changed_for_snapshot(client, snapshot),
-                        raise_on_reorg_failure=True,
-                        raise_on_build_failure=True,
-                    ):
-                        refreshed += 1
-                except _JobBuildFailed:
-                    build_failures += 1
-                except OSError:
-                    self.disconnect_client(client)
+                    bundle = self.prepare_tip_refresh_bundle(snapshot, clients)
+                except TemplateRefreshBlocked:
+                    for _client in clients:
+                        self._record_tip_refresh_client_result("failed")
+                    raise
+                (
+                    refreshed,
+                    first_delivery,
+                    last_delivery,
+                    build_failures,
+                ) = self._fanout_prepared_tip_refresh(
+                    clients,
+                    bundle,
+                    snapshot,
+                    heartbeat_name=heartbeat_name,
+                )
+            else:
+                for client in clients:
+                    if self.stop_event.is_set():
+                        break
+                    # Collection bundles are worker-specific, so this first
+                    # implementation retains their sequential build/send path.
+                    self._record_heartbeat(heartbeat_name)
+                    try:
+                        if self.maybe_send_job(
+                            client,
+                            clean_jobs=self.client_tip_changed_for_snapshot(client, snapshot),
+                            raise_on_reorg_failure=True,
+                            raise_on_build_failure=True,
+                        ):
+                            delivered = time.monotonic()
+                            refreshed += 1
+                            first_delivery = (
+                                delivered
+                                if first_delivery is None
+                                else min(first_delivery, delivered)
+                            )
+                            last_delivery = (
+                                delivered
+                                if last_delivery is None
+                                else max(last_delivery, delivered)
+                            )
+                            self._record_tip_refresh_client_result("sent")
+                        else:
+                            self._record_tip_refresh_client_result("skipped")
+                    except _JobBuildFailed:
+                        build_failures += 1
+                        self._record_tip_refresh_client_result("failed")
+                    except OSError:
+                        self._record_tip_refresh_client_result("disconnected")
+                        self.disconnect_client(client)
 
             if refreshed == 0 and build_failures:
                 raise TemplateRefreshBlocked(
@@ -2722,10 +3070,23 @@ class PrismCoordinator:
             if refreshed:
                 with self.lock:
                     self.tip_refresh_job_count += refreshed
+                assert first_delivery is not None and last_delivery is not None
+                self._observe_tip_refresh_seconds(
+                    "first_delivery",
+                    first_delivery - refresh_started,
+                )
+                self._observe_tip_refresh_seconds(
+                    "last_delivery",
+                    last_delivery - refresh_started,
+                )
             self.last_successful_template_refresh_monotonic = time.monotonic()
             return refreshed
         finally:
             self._tip_refresh_lock.release()
+            self._observe_tip_refresh_seconds(
+                "refresh",
+                time.monotonic() - refresh_started,
+            )
 
     def observe_tip_first_seen(self, tip_hash: str) -> None:
         now = time.monotonic()
@@ -3450,40 +3811,46 @@ class PrismCoordinator:
             self.handle_configure(client, request_id, params)
             return
         if method == "mining.subscribe":
-            client.subscribed = True
-            self.send_result(client, request_id, [[], client.extranonce1_hex, self.extranonce2_size])
-            self.maybe_send_job(client, clean_jobs=True)
+            with client.job_update_lock:
+                client.subscribed = True
+                self.send_result(
+                    client,
+                    request_id,
+                    [[], client.extranonce1_hex, self.extranonce2_size],
+                )
+                self.maybe_send_job(client, clean_jobs=True)
             return
         if method == "mining.authorize":
-            username = str(params[0]) if params else ""
-            password = str(params[1]) if len(params) > 1 and params[1] is not None else ""
-            worker = self.resolve_worker(username)
-            if not self.reserve_client_username(client, worker):
-                raise StratumError(
-                    20,
-                    "too many connections for username",
-                    # A new connection has no useful session to preserve. A
-                    # live miner re-authorizing to a full username does: keep
-                    # its prior worker/session active after returning the
-                    # capacity error.
-                    disconnect=not client.authorized,
+            with client.job_update_lock:
+                username = str(params[0]) if params else ""
+                password = str(params[1]) if len(params) > 1 and params[1] is not None else ""
+                worker = self.resolve_worker(username)
+                if not self.reserve_client_username(client, worker):
+                    raise StratumError(
+                        20,
+                        "too many connections for username",
+                        # A new connection has no useful session to preserve. A
+                        # live miner re-authorizing to a full username does: keep
+                        # its prior worker/session active after returning the
+                        # capacity error.
+                        disconnect=not client.authorized,
+                    )
+                # The password is authoritative for password-derived options: a
+                # re-authorize without d=/md= clears any prior override (a stored
+                # suggest_difficulty still applies via the request resolution).
+                client.requested_difficulty, client.requested_min_difficulty = (
+                    parse_stratum_password_options(password)
                 )
-            # The password is authoritative for password-derived options: a
-            # re-authorize without d=/md= clears any prior override (a stored
-            # suggest_difficulty still applies via the request resolution).
-            client.requested_difficulty, client.requested_min_difficulty = (
-                parse_stratum_password_options(password)
-            )
-            target = self.apply_client_difficulty_requests(client)
-            difficulty_job_delivered = False
-            if target is not None:
-                difficulty_job_delivered = self.advertise_client_difficulty(client, target)
-            client.authorized = True
-            self.send_result(client, request_id, True)
-            # On a re-authorize whose new options already advertised a fresh
-            # difficulty/job pair, do not send a second back-to-back pair.
-            if not difficulty_job_delivered:
-                self.maybe_send_job(client, clean_jobs=True)
+                target = self.apply_client_difficulty_requests(client)
+                difficulty_job_delivered = False
+                if target is not None:
+                    difficulty_job_delivered = self.advertise_client_difficulty(client, target)
+                client.authorized = True
+                self.send_result(client, request_id, True)
+                # On a re-authorize whose new options already advertised a fresh
+                # difficulty/job pair, do not send a second back-to-back pair.
+                if not difficulty_job_delivered:
+                    self.maybe_send_job(client, clean_jobs=True)
             return
         if method == "mining.extranonce.subscribe":
             self.send_result(client, request_id, True)
@@ -3503,20 +3870,21 @@ class PrismCoordinator:
         raise StratumError(20, f"unsupported method {method}")
 
     def handle_suggest_difficulty(self, client: ClientState, request_id: object, params: list[object]) -> None:
-        suggested: Decimal | None = None
-        if params:
-            try:
-                suggested = Decimal(str(params[0]))
-            except Exception:
-                suggested = None
-            if suggested is not None and (not suggested.is_finite() or suggested <= 0):
-                suggested = None
-        if suggested is not None:
-            client.suggested_difficulty = suggested
-            target = self.apply_client_difficulty_requests(client)
-            if target is not None:
-                self.advertise_client_difficulty(client, target)
-        self.send_result(client, request_id, True)
+        with client.job_update_lock:
+            suggested: Decimal | None = None
+            if params:
+                try:
+                    suggested = Decimal(str(params[0]))
+                except Exception:
+                    suggested = None
+                if suggested is not None and (not suggested.is_finite() or suggested <= 0):
+                    suggested = None
+            if suggested is not None:
+                client.suggested_difficulty = suggested
+                target = self.apply_client_difficulty_requests(client)
+                if target is not None:
+                    self.advertise_client_difficulty(client, target)
+            self.send_result(client, request_id, True)
 
     def handle_configure(self, client: ClientState, request_id: object, params: list[object]) -> None:
         extensions = params[0] if params else []
@@ -3669,6 +4037,22 @@ class PrismCoordinator:
         raise_on_reorg_failure: bool = False,
         raise_on_build_failure: bool = False,
     ) -> bool:
+        with client.job_update_lock:
+            return self._maybe_send_job_locked(
+                client,
+                clean_jobs=clean_jobs,
+                raise_on_reorg_failure=raise_on_reorg_failure,
+                raise_on_build_failure=raise_on_build_failure,
+            )
+
+    def _maybe_send_job_locked(
+        self,
+        client: ClientState,
+        *,
+        clean_jobs: bool,
+        raise_on_reorg_failure: bool = False,
+        raise_on_build_failure: bool = False,
+    ) -> bool:
         if not client.subscribed or not client.authorized or client.worker is None:
             return False
         self._ensure_job_cache_state()
@@ -3737,8 +4121,7 @@ class PrismCoordinator:
             client.active_job_ids.add(context.job.job_id)
             self.prune_client_active_jobs(client)
         phase_started = time.monotonic()
-        self.send_difficulty(client, context.job)
-        self.send_job(client, context.job)
+        self.send_job_update(client, context.job)
         self.apply_job_difficulty(client, context.job)
         self.note_tip_work_delivered(client, str(context.template["previousblockhash"]))
         phases["send"] = time.monotonic() - phase_started
@@ -3772,13 +4155,15 @@ class PrismCoordinator:
         self.send_difficulty_value(client, job.share_difficulty)
 
     def send_difficulty_value(self, client: ClientState, difficulty: Decimal) -> None:
-        client.send(
-            {
-                "id": None,
-                "method": "mining.set_difficulty",
-                "params": [float(difficulty)],
-            }
-        )
+        client.send(self.difficulty_payload(difficulty))
+
+    @staticmethod
+    def difficulty_payload(difficulty: Decimal) -> dict[str, object]:
+        return {
+            "id": None,
+            "method": "mining.set_difficulty",
+            "params": [float(difficulty)],
+        }
 
     def client_vardiff_config(self, client: ClientState) -> vardiff.VardiffConfig:
         """The difficulty policy for one client: its per-client specialization
@@ -3874,6 +4259,14 @@ class PrismCoordinator:
         is advertised together with the job it applies to, or not at all.
         Returns True only when a fresh set_difficulty/notify pair went out, so
         callers about to send their own job can skip a duplicate pair."""
+        with client.job_update_lock:
+            return self._advertise_client_difficulty_locked(client, target)
+
+    def _advertise_client_difficulty_locked(
+        self,
+        client: ClientState,
+        target: Decimal,
+    ) -> bool:
         with self.lock:
             current = client.pending_share_difficulty or client.share_difficulty
             if target == current:
@@ -3916,22 +4309,42 @@ class PrismCoordinator:
         )
 
     def send_job(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
-        client.send(
-            {
-                "id": None,
-                "method": "mining.notify",
-                "params": [
-                    job.job_id,
-                    job.prevhash,
-                    job.coinb1,
-                    job.coinb2,
-                    list(job.merkle_branch),
-                    job.version,
-                    job.nbits,
-                    job.ntime,
-                    job.clean_jobs,
-                ],
-            }
+        client.send(self.job_payload(job))
+
+    @staticmethod
+    def job_payload(job: direct_stratum.DirectQbitStratumJob) -> dict[str, object]:
+        return {
+            "id": None,
+            "method": "mining.notify",
+            "params": [
+                job.job_id,
+                job.prevhash,
+                job.coinb1,
+                job.coinb2,
+                list(job.merkle_branch),
+                job.version,
+                job.nbits,
+                job.ntime,
+                job.clean_jobs,
+            ],
+        }
+
+    def send_job_update(
+        self,
+        client: ClientState,
+        job: direct_stratum.DirectQbitStratumJob,
+    ) -> None:
+        # Preserve instance-level send method replacements used by focused
+        # tests; normal coordinators use the atomic socket batch below.
+        if "send_difficulty" in self.__dict__ or "send_job" in self.__dict__:
+            self.send_difficulty(client, job)
+            self.send_job(client, job)
+            return
+        client.send_batch(
+            [
+                self.difficulty_payload(job.share_difficulty),
+                self.job_payload(job),
+            ]
         )
 
     def build_job_for_client(self, client: ClientState, *, clean_jobs: bool) -> PrismJobContext:
@@ -4858,6 +5271,28 @@ class PrismCoordinator:
         return retargeted
 
     def retarget_client(
+        self,
+        client: ClientState,
+        *,
+        current_difficulty: Decimal,
+        accepted_shares: int,
+        submitted_shares: int,
+        accepted_difficulty: Decimal,
+        elapsed_seconds: Decimal,
+        require_idle: bool = False,
+    ) -> bool:
+        with client.job_update_lock:
+            return self._retarget_client_locked(
+                client,
+                current_difficulty=current_difficulty,
+                accepted_shares=accepted_shares,
+                submitted_shares=submitted_shares,
+                accepted_difficulty=accepted_difficulty,
+                elapsed_seconds=elapsed_seconds,
+                require_idle=require_idle,
+            )
+
+    def _retarget_client_locked(
         self,
         client: ClientState,
         *,
@@ -6075,6 +6510,7 @@ class PrismCoordinator:
             f"qbit_prism_audit_artifact_scan_error {audit_metrics['scan_error']}",
         ]
         lines.extend(self.job_build_metrics_lines())
+        lines.extend(self.tip_refresh_metrics_lines())
         return "\n".join(lines) + "\n"
 
     def audit_artifact_metrics(self) -> dict[str, dict[str, int] | int]:
@@ -6120,6 +6556,74 @@ class PrismCoordinator:
         if name.startswith("prism-live-audit-bundle-") and name.endswith(".json"):
             return "live_bundle"
         return "other"
+
+    def tip_refresh_metrics_lines(self) -> list[str]:
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_executor_lock:
+            executor_workers = (
+                self.tip_refresh_max_workers
+                if self._tip_refresh_executor is not None
+                else 0
+            )
+        with self._tip_refresh_metrics_lock:
+            histograms = {
+                name: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
+                }
+                for name, histogram in self.tip_refresh_histograms.items()
+            }
+            client_counts = dict(self.tip_refresh_client_counts)
+            inflight = self.tip_refresh_inflight
+
+        metric_names = {
+            "refresh": "qbit_prism_tip_refresh_seconds",
+            "bundle_build": "qbit_prism_tip_refresh_bundle_build_seconds",
+            "first_delivery": "qbit_prism_tip_refresh_first_delivery_seconds",
+            "last_delivery": "qbit_prism_tip_refresh_last_delivery_seconds",
+        }
+        descriptions = {
+            "refresh": "Full qbit tip/template refresh pass wall time.",
+            "bundle_build": "Shared ready-pool refresh bundle preparation wall time.",
+            "first_delivery": "Tip observation to first successful client delivery.",
+            "last_delivery": "Tip observation to last successful client delivery.",
+        }
+        lines: list[str] = []
+        for name, metric_name in metric_names.items():
+            histogram = histograms[name]
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            lines.extend(
+                [
+                    f"# HELP {metric_name} {descriptions[name]}",
+                    f"# TYPE {metric_name} histogram",
+                    *[
+                        f'{metric_name}_bucket{{le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+                        for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS
+                    ],
+                    f'{metric_name}_bucket{{le="+Inf"}} {histogram["count"]}',
+                    f'{metric_name}_sum {float(histogram["sum"]):.6f}',
+                    f'{metric_name}_count {histogram["count"]}',
+                ]
+            )
+        lines.extend(
+            [
+                "# HELP qbit_prism_tip_refresh_clients_total Client outcomes from tip/template refresh passes.",
+                "# TYPE qbit_prism_tip_refresh_clients_total counter",
+                *[
+                    f'qbit_prism_tip_refresh_clients_total{{result="{result}"}} {int(client_counts.get(result, 0))}'
+                    for result in PRISM_TIP_REFRESH_RESULTS
+                ],
+                "# HELP qbit_prism_tip_refresh_inflight Prepared refresh client tasks currently queued or running.",
+                "# TYPE qbit_prism_tip_refresh_inflight gauge",
+                f"qbit_prism_tip_refresh_inflight {inflight}",
+                "# HELP qbit_prism_tip_refresh_executor_workers Configured persistent refresh executor workers, or zero before creation.",
+                "# TYPE qbit_prism_tip_refresh_executor_workers gauge",
+                f"qbit_prism_tip_refresh_executor_workers {executor_workers}",
+            ]
+        )
+        return lines
 
     def job_build_metrics_lines(self) -> list[str]:
         self._ensure_job_cache_state()
@@ -6479,6 +6983,7 @@ def main() -> int:
     try:
         coordinator.serve()
     finally:
+        coordinator.shutdown_tip_refresh_executor()
         coordinator.release_ledger_lease()
     return 0
 

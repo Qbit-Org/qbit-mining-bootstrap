@@ -6,7 +6,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal
 
 from lab.auxpow import vardiff
@@ -16,6 +16,7 @@ from lab.prism.prism_coordinator import (
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     PRISM_REJECTION_REASON_IDS,
     PrismCoordinator,
+    TemplateRefreshBlocked,
     WorkerIdentity,
     default_prism_coinbase_tag_hex,
     qbit_template_fingerprint,
@@ -164,6 +165,8 @@ def client(connection_id: int, identity: WorkerIdentity | None = None) -> Client
     state.pending_share_difficulty = None
     state.active_job_ids = set()
     state.post_accept_refresh_block = None
+    state.tip_work_delivered = None
+    state.job_update_lock = threading.RLock()
     state.send_lock = threading.Lock()
     return state
 
@@ -525,6 +528,218 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(recorded["calls"], 1)
+
+    def test_ready_tip_refresh_builds_once_and_stamps_every_client(self) -> None:
+        server, _ = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        clients = [client(1), client(2), client(3)]
+        clients[1].pending_share_difficulty = Decimal("8")
+        sent: dict[int, list[dict[str, object]]] = {state.connection_id: [] for state in clients}
+        for state in clients:
+            state.send = (  # type: ignore[method-assign]
+                lambda payload, connection_id=state.connection_id: sent[connection_id].append(payload)
+            )
+        server.clients = set(clients)
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 3)
+        self.assertEqual(recorded["calls"], 1)
+        contexts = [state.active_job for state in clients]
+        self.assertEqual(len({context.job.job_id for context in contexts}), 3)
+        self.assertEqual(
+            [context.job.extranonce1_hex for context in contexts],
+            [state.extranonce1_hex for state in clients],
+        )
+        self.assertEqual(contexts[1].job.share_difficulty, Decimal("8"))
+        self.assertEqual(
+            [payload["method"] for payload in sent[2]],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        metrics = server.metrics_payload()
+        self.assertIn('qbit_prism_tip_refresh_clients_total{result="sent"} 3', metrics)
+        self.assertIn("qbit_prism_tip_refresh_first_delivery_seconds_count 1", metrics)
+        self.assertIn("qbit_prism_tip_refresh_last_delivery_seconds_count 1", metrics)
+
+    def test_ready_tip_refresh_respects_executor_bound(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 2
+        clients = [client(index + 1) for index in range(6)]
+        server.clients = set(clients)
+        release = threading.Event()
+        two_started = threading.Event()
+        counter_lock = threading.Lock()
+        active = 0
+        maximum = 0
+
+        def send(payload: dict[str, object]) -> None:
+            nonlocal active, maximum
+            if payload["method"] != "mining.notify":
+                return
+            with counter_lock:
+                active += 1
+                maximum = max(maximum, active)
+                if active == 2:
+                    two_started.set()
+            try:
+                self.assertTrue(release.wait(5))
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        for state in clients:
+            state.send = send  # type: ignore[method-assign]
+        result: list[int] = []
+        thread = threading.Thread(target=lambda: result.append(server.poll_qbit_tip_template_once()))
+        thread.start()
+        try:
+            self.assertTrue(two_started.wait(5))
+            self.assertLessEqual(maximum, 2)
+        finally:
+            release.set()
+            thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [6])
+        self.assertEqual(maximum, 2)
+
+    def test_blocked_socket_does_not_delay_another_client(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 2
+        blocked = client(1)
+        healthy = client(2)
+        server.clients = {blocked, healthy}
+        blocked_started = threading.Event()
+        healthy_delivered = threading.Event()
+        release = threading.Event()
+
+        def blocked_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                blocked_started.set()
+                self.assertTrue(release.wait(5))
+
+        def healthy_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                healthy_delivered.set()
+
+        blocked.send = blocked_send  # type: ignore[method-assign]
+        healthy.send = healthy_send  # type: ignore[method-assign]
+        result: list[int] = []
+        thread = threading.Thread(target=lambda: result.append(server.poll_qbit_tip_template_once()))
+        thread.start()
+        try:
+            self.assertTrue(blocked_started.wait(5))
+            self.assertTrue(healthy_delivered.wait(5))
+        finally:
+            release.set()
+            thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(result, [2])
+
+    def test_broken_socket_disconnects_only_that_client(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        broken = client(1)
+        healthy = client(2)
+        server.clients = {broken, healthy}
+        healthy_sent: list[dict[str, object]] = []
+        disconnected: list[ClientState] = []
+        broken.send = lambda _payload: (_ for _ in ()).throw(OSError("closed"))  # type: ignore[method-assign]
+        healthy.send = healthy_sent.append  # type: ignore[method-assign]
+        server.disconnect_client = disconnected.append  # type: ignore[method-assign]
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 1)
+        self.assertEqual(disconnected, [broken])
+        self.assertEqual(
+            [payload["method"] for payload in healthy_sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+
+    def test_client_removed_before_pending_task_runs_is_skipped(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 1
+        first = client(1)
+        removed = client(2)
+        clients = [first, removed]
+        server.clients = set(clients)
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        server.observe_tip_first_seen(snapshot.bestblockhash)
+        server.pool_readiness_latched()
+        server.tip_template_snapshot = snapshot
+        bundle = server.prepare_tip_refresh_bundle(snapshot, clients)
+        blocked = threading.Event()
+        release = threading.Event()
+
+        def first_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                blocked.set()
+                self.assertTrue(release.wait(5))
+
+        first.send = first_send  # type: ignore[method-assign]
+        removed.send = lambda _payload: self.fail("removed client received a job")  # type: ignore[method-assign]
+        result: list[tuple[int, float | None, float | None, int]] = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                server._fanout_prepared_tip_refresh(
+                    clients,
+                    bundle,
+                    snapshot,
+                    heartbeat_name="qbit_blockpoll",
+                )
+            )
+        )
+        thread.start()
+        try:
+            self.assertTrue(blocked.wait(5))
+            with server.lock:
+                server.clients.remove(removed)
+        finally:
+            release.set()
+            thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(result[0][0], 1)
+        self.assertIsNone(removed.active_job)
+        self.assertEqual(removed.active_job_ids, set())
+
+    def test_template_fingerprint_race_aborts_before_fanout(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        states = [client(1), client(2)]
+        sent: list[dict[str, object]] = []
+        for state in states:
+            state.send = sent.append  # type: ignore[method-assign]
+        server.clients = set(states)
+        original_shared_job_bundle = server.shared_job_bundle
+
+        def race_artifacts(artifacts: object, identity: WorkerIdentity) -> object:
+            bundle = original_shared_job_bundle(artifacts, identity)
+            with server._job_cache_lock:
+                server._template_artifacts = dataclass_replace(
+                    server._template_artifacts,
+                    fingerprint="ff" * 32,
+                )
+            return bundle
+
+        server.shared_job_bundle = race_artifacts  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "cache changed"):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(sent, [])
 
 
 class HealthSnapshotTests(unittest.TestCase):
