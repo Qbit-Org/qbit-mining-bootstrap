@@ -7658,15 +7658,23 @@ class PrismCoordinator:
             # replay can safely repeat any step after a crash.
             self._record_heartbeat("block_submitter")
             self._ensure_job_cache_state()
+            # Persistence only creates ``prepared`` payout rows, which the
+            # current-balance queries deliberately ignore.  Keep its expensive
+            # canonicalization, audit-body writes, deep copies, and bulk SQL
+            # outside the delivery gate so replacement work can keep flowing
+            # while the accepted-block audit is made durable.
+            persistence = self.ledger.persist_accepted_block(
+                block_hash=submission.block_hash_hex,
+                block_height=expected_height,
+                parent_hash=str(context.template["previousblockhash"]),
+                final_bundle=final_bundle,
+                audit_report=report,
+            )
+            self._record_heartbeat("block_submitter")
+            # Confirmation is the actual payout-state mutation: it makes the
+            # prepared carry-forward rows visible.  Keep that transition and
+            # its generation invalidation atomic with respect to delivery.
             with self._payout_state_delivery_gate.mutation():
-                persistence = self.ledger.persist_accepted_block(
-                    block_hash=submission.block_hash_hex,
-                    block_height=expected_height,
-                    parent_hash=str(context.template["previousblockhash"]),
-                    final_bundle=final_bundle,
-                    audit_report=report,
-                )
-                self._record_heartbeat("block_submitter")
                 confirmation = self.ledger.confirm_accepted_block(
                     block_hash=block_hash,
                     active_tip_height=active_tip_height,

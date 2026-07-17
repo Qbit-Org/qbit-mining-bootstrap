@@ -5100,6 +5100,106 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(active_fanout.is_set())
         self.assertTrue(server._tip_refresh_retry.is_set())
 
+    def test_accepted_block_persistence_does_not_hold_payout_delivery_gate(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        persist_started = threading.Event()
+        persist_finished = threading.Event()
+        release_persist = threading.Event()
+        confirm_started = threading.Event()
+        release_delivery = threading.Event()
+        original_persist = ledger.persist_accepted_block
+        original_confirm = ledger.confirm_accepted_block
+
+        def blocking_persist(**kwargs: object) -> dict[str, object]:
+            persist_started.set()
+            if not release_persist.wait(15):
+                raise AssertionError("timed out waiting to release accepted-block persistence")
+            result = original_persist(**kwargs)
+            persist_finished.set()
+            return result
+
+        def observed_confirm(**kwargs: object) -> dict[str, object]:
+            confirm_started.set()
+            return original_confirm(**kwargs)
+
+        ledger.persist_accepted_block = blocking_persist  # type: ignore[method-assign]
+        ledger.confirm_accepted_block = observed_confirm  # type: ignore[method-assign]
+        accepted: list[bool] = []
+        errors: list[BaseException] = []
+        delivery_admitted = threading.Event()
+        delivery_thread: threading.Thread | None = None
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            block_hash = "cd" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+            candidate = block_candidate(server, state, submission)
+
+            def submit() -> None:
+                try:
+                    accepted.append(server.submit_block_candidate(candidate))
+                except BaseException as exc:  # noqa: BLE001 - asserted below
+                    errors.append(exc)
+
+            def deliver() -> None:
+                try:
+                    with server._payout_state_delivery_gate.delivery():
+                        delivery_admitted.set()
+                        if not release_delivery.wait(15):
+                            raise AssertionError(
+                                "timed out waiting to release payout delivery"
+                            )
+                except BaseException as exc:  # noqa: BLE001 - asserted below
+                    errors.append(exc)
+
+            submit_thread = threading.Thread(target=submit)
+            submit_thread.start()
+            confirmation_waited_for_delivery = False
+            try:
+                self.assertTrue(persist_started.wait(5))
+                delivery_thread = threading.Thread(target=deliver)
+                delivery_thread.start()
+                admitted_while_persisting = delivery_admitted.wait(5)
+                if admitted_while_persisting:
+                    release_persist.set()
+                    self.assertTrue(persist_finished.wait(5))
+                    confirmation_waited_for_delivery = not confirm_started.wait(0.1)
+            finally:
+                release_persist.set()
+                release_delivery.set()
+                submit_thread.join(10)
+                if delivery_thread is not None:
+                    delivery_thread.join(10)
+
+            self.assertFalse(submit_thread.is_alive())
+            self.assertIsNotNone(delivery_thread)
+            self.assertFalse(delivery_thread.is_alive())
+            if errors:
+                raise errors[0]
+            self.assertTrue(admitted_while_persisting)
+            self.assertTrue(confirmation_waited_for_delivery)
+            self.assertTrue(confirm_started.is_set())
+            self.assertEqual(accepted, [True])
+            self.assertEqual(server._payout_state_generation, 1)
+
     def test_active_ancestor_candidate_resumes_full_finalization_without_resubmit(self) -> None:
         server, state, ledger = submit_coordinator()
         with tempfile.TemporaryDirectory() as tempdir:
