@@ -511,7 +511,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         state = client(1)
         server.clients = [state]  # type: ignore[assignment]
         snapshot = server.fetch_qbit_tip_template_snapshot()
-        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
         original_rpc_call = rpc.call
 
         def fail_tip_validation(
@@ -539,7 +539,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         state = client(1)
         server.clients = [state]  # type: ignore[assignment]
         snapshot = server.fetch_qbit_tip_template_snapshot()
-        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
 
         def fail_chain_trust_check() -> bool:
             raise RuntimeError("getblockchaininfo unavailable")
@@ -1415,7 +1415,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         )
         with server.lock:
             server.tip_template_snapshot = snapshot
-        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
         token = server._validate_prepared_tip_refresh(bundle, snapshot, sequence)
 
         class ManualClock:
@@ -1753,7 +1753,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             self.assertEqual(poll_results, [1])
         self.assertTrue(server._tip_refresh_retry.is_set())
 
-    def test_prepared_skip_after_admission_releases_cancellation_gate(self) -> None:
+    def test_prepared_disconnection_after_admission_releases_cancellation_gate(self) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)
         state = client(1)
@@ -1769,7 +1769,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         )
         with server.lock:
             server.tip_template_snapshot = snapshot
-        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
         token = server._validate_prepared_tip_refresh(
             bundle,
             snapshot,
@@ -1807,7 +1807,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             cancellation,
         )
 
-        self.assertEqual(result.result, "skipped")
+        self.assertEqual(result.result, "disconnected")
         self.assertEqual(cancellation._active_deliveries, 0)
         cancellation.set()
 

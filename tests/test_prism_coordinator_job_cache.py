@@ -396,9 +396,14 @@ class JobBundleCacheTests(unittest.TestCase):
 
         def mutate_after_first_build(
             build_artifacts: object,
-            build_worker: WorkerIdentity,
+            build_worker: WorkerIdentity | None,
+            **kwargs: object,
         ) -> object:
-            bundle = original_build(build_artifacts, build_worker)  # type: ignore[arg-type]
+            bundle = original_build(  # type: ignore[arg-type]
+                build_artifacts,
+                build_worker,
+                **kwargs,
+            )
             built_generations.append(bundle.payout_state_generation)
             if len(built_generations) == 1:
                 server._advance_payout_state_generation()
@@ -676,18 +681,21 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(recorded["calls"], 2)
         self.assertEqual(ledger.snapshot_calls, 1)
 
-    def test_ready_empty_collection_bundle_rebuilds_on_cache_hit(self) -> None:
+    def test_ready_empty_snapshot_does_not_fall_back_to_worker_collection(self) -> None:
         ledger = ReadyLedgerWithEmptyFirstSnapshot()
         server, _ = coordinator(ledger=ledger)
         recorded = install_fake_bundle_builder(server)
         state = client(1)
 
-        empty_context = server.build_job_for_client(state, clean_jobs=True)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "ready-pool ledger snapshot contained no payout shares",
+        ):
+            server.build_job_for_client(state, clean_jobs=True)
         ready_context = server.build_job_for_client(state, clean_jobs=True)
 
-        self.assertTrue(empty_context.collection_only)
         self.assertFalse(ready_context.collection_only)
-        self.assertEqual(recorded["calls"], 2)
+        self.assertEqual(recorded["calls"], 1)
         self.assertEqual(ledger.snapshot_calls, 2)
 
     def test_vardiff_difficulty_is_stamped_per_client(self) -> None:
@@ -1542,7 +1550,7 @@ class JobBundleCacheTests(unittest.TestCase):
         server.observe_tip_first_seen(snapshot.bestblockhash)
         server.pool_readiness_latched()
         server.tip_template_snapshot = snapshot
-        bundle = server.prepare_tip_refresh_bundle(snapshot, clients)
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
         blocked = threading.Event()
         release = threading.Event()
 
@@ -1589,10 +1597,14 @@ class JobBundleCacheTests(unittest.TestCase):
         original_shared_job_bundle = server.shared_job_bundle
         race_calls = 0
 
-        def race_artifacts(artifacts: object, identity: WorkerIdentity) -> object:
+        def race_artifacts(
+            artifacts: object,
+            identity: WorkerIdentity | None = None,
+            **kwargs: object,
+        ) -> object:
             nonlocal race_calls
             race_calls += 1
-            bundle = original_shared_job_bundle(artifacts, identity)
+            bundle = original_shared_job_bundle(artifacts, identity, **kwargs)
             with server._job_cache_lock:
                 server._template_artifacts = dataclass_replace(
                     server._template_artifacts,
