@@ -1056,6 +1056,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_low_difficulty_shares_total 3", metrics)
         self.assertIn("qbit_prism_grace_credited_shares_total 6", metrics)
         self.assertIn("qbit_prism_stratum_active_connections 0", metrics)
+        self.assertIn("qbit_prism_stratum_connection_limit 384", metrics)
+        self.assertIn("qbit_prism_stratum_peak_active_connections 0", metrics)
+        self.assertIn("qbit_prism_stratum_pending_initial_jobs 0", metrics)
+        self.assertIn("qbit_prism_stratum_pending_initial_job_limit 128", metrics)
+        self.assertIn("qbit_prism_stratum_current_tip_job_coverage 1.0", metrics)
+        self.assertIn("qbit_prism_stratum_handler_threads 0", metrics)
+        self.assertIn("qbit_prism_job_delivery_queue_depth 0", metrics)
+        self.assertIn("qbit_prism_job_delivery_active_workers 0", metrics)
         self.assertIn(
             'qbit_prism_stratum_connection_limit_rejections_total{scope="global"} 2',
             metrics,
@@ -3102,6 +3110,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaisesRegex(SystemExit, "PRISM_STRATUM_MAX_CONNECTIONS"):
+                validate_prism_production_gate()
+
+        with patch.dict(
+            os.environ,
+            {**base, "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS",
+            ):
+                validate_prism_production_gate()
+
+        with patch.dict(
+            os.environ,
+            {**base, "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
+            ):
                 validate_prism_production_gate()
 
         with patch.dict(

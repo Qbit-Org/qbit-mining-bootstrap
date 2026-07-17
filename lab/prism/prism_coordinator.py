@@ -6,7 +6,7 @@ from __future__ import annotations
 import base64
 import copy
 from collections import OrderedDict
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import ExitStack, contextmanager
 import dataclasses
 import errno
@@ -83,8 +83,11 @@ DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS = 20.0
-DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS = 0
+DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS = 384
 DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME = 0
+DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS = 128
+DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS = 30.0
+DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS = 30.0
 DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS = 1.0
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES = 4_096
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
@@ -181,6 +184,9 @@ PRISM_TIP_REFRESH_CANCELLATION_STAGES = (
     "client_lock",
     "payout_gate",
 )
+PRISM_DELIVERY_PRIORITY_INITIAL = 0
+PRISM_DELIVERY_PRIORITY_NEW_TIP = 1
+PRISM_DELIVERY_PRIORITY_SAME_TIP = 2
 PRISM_EVICTED_JOB_CLASSES = ("same_tip", "stale_grace")
 PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = ("accepted_same_tip", "credited_stale_grace")
 PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection",)
@@ -462,6 +468,26 @@ def validate_prism_production_gate() -> None:
 
     if env_optional("PRISM_LEDGER_WRITER_SESSION_TOKEN") is not None:
         raise SystemExit("production mode requires managed ledger session tokens; unset PRISM_LEDGER_WRITER_SESSION_TOKEN")
+
+    if env_nonnegative_int(
+        "PRISM_STRATUM_MAX_CONNECTIONS",
+        DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+    ) <= 0:
+        raise SystemExit(
+            "production mode requires a positive PRISM_STRATUM_MAX_CONNECTIONS"
+        )
+    env_positive_int(
+        "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
+        DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
+    )
+    if env_nonnegative_float(
+        "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS",
+        DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS,
+    ) <= 0:
+        raise SystemExit(
+            "production mode requires a positive "
+            "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS"
+        )
 
     require_production_env("QBIT_RPC_USER")
     qbit_rpc_password = require_production_env("QBIT_RPC_PASSWORD")
@@ -1048,6 +1074,135 @@ class _PayoutDeliveryAdmission:
         self.delivered = True
 
 
+@dataclass(eq=False)
+class PendingInitialJob:
+    client: ClientState
+    authorization_generation: int
+    worker: WorkerIdentity
+    requested_monotonic: float
+    deadline_monotonic: float | None
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    future: Future[bool] | None = None
+
+
+class _DeliveryQueueFull(RuntimeError):
+    """The bounded delivery executor cannot admit another task."""
+
+
+class _JobBuildCancelled(RuntimeError):
+    """A bundle waiter became obsolete before it acquired preparation."""
+
+
+class _BoundedPriorityExecutor:
+    """Small Future-compatible executor with bounded, priority-ordered work."""
+
+    def __init__(self, *, max_workers: int, max_queue_size: int) -> None:
+        self.max_workers = max_workers
+        self.max_queue_size = max_queue_size
+        self._queue: queue.PriorityQueue[tuple[object, ...]] = queue.PriorityQueue(
+            maxsize=max_queue_size
+        )
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._active_workers = 0
+        self._shutdown = False
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"prism-job-delivery-{index + 1}",
+                daemon=True,
+            )
+            for index in range(max_workers)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def submit(
+        self,
+        function: Callable[..., Any],
+        /,
+        *args: object,
+        priority: int = PRISM_DELIVERY_PRIORITY_SAME_TIP,
+        **kwargs: object,
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("delivery executor is shut down")
+            self._sequence += 1
+            item = (
+                int(priority),
+                self._sequence,
+                future,
+                function,
+                args,
+                kwargs,
+            )
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full as exc:
+                raise _DeliveryQueueFull("delivery executor queue is full") from exc
+        return future
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            _, _, future, function, args, kwargs = item
+            if function is None:
+                self._queue.task_done()
+                return
+            assert isinstance(future, Future)
+            if not future.set_running_or_notify_cancel():
+                self._queue.task_done()
+                continue
+            with self._lock:
+                self._active_workers += 1
+            try:
+                result = function(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+            finally:
+                with self._lock:
+                    self._active_workers -= 1
+                self._queue.task_done()
+
+    def stats(self) -> tuple[int, int]:
+        with self._lock:
+            return self._queue.qsize(), self._active_workers
+
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
+        with self._lock:
+            if self._shutdown:
+                threads = list(self._threads)
+                already_shutdown = True
+            else:
+                self._shutdown = True
+                threads = list(self._threads)
+                already_shutdown = False
+        if already_shutdown:
+            if wait:
+                for thread in threads:
+                    thread.join()
+            return
+        if cancel_futures:
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                future = item[2]
+                if isinstance(future, Future):
+                    future.cancel()
+                self._queue.task_done()
+        for index in range(len(threads)):
+            self._queue.put((math.inf, index, None, None, (), {}))
+        if wait:
+            for thread in threads:
+                thread.join()
+
+
 class _FanoutCancellation:
     """Cancel a fanout without racing already-admitted deliveries.
 
@@ -1275,6 +1430,7 @@ class ClientState:
     extranonce1_hex: str
     subscribed: bool = False
     authorized: bool = False
+    authorization_generation: int = 0
     username: str = ""
     worker: WorkerIdentity | None = None
     version_mask: int = 0
@@ -1317,6 +1473,7 @@ class ClientState:
     # common maybe_send_job path while retaining the same serialization scope.
     job_update_lock: threading.RLock = field(default_factory=threading.RLock)
     send_lock: threading.Lock = field(default_factory=threading.Lock)
+    handler_thread_registered: bool = False
 
     def send(self, payload: dict[str, object]) -> None:
         data = json.dumps(payload).encode() + b"\n"
@@ -1738,9 +1895,9 @@ class PrismCoordinator:
             "PRISM_STRATUM_SEND_TIMEOUT_SECONDS",
             DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS,
         )
-        # Zero preserves the historical unlimited behavior. Operators can set
-        # positive admission limits after sizing them for their miner/proxy
-        # topology instead of inheriting an arbitrary coordinator default.
+        # Zero remains an explicit unlimited option for focused local/regtest
+        # use. Deployments default to a conservative ceiling above PRISM's
+        # normal 200-250 connection population.
         self.stratum_max_connections = env_nonnegative_int(
             "PRISM_STRATUM_MAX_CONNECTIONS",
             DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
@@ -1748,6 +1905,26 @@ class PrismCoordinator:
         self.stratum_max_connections_per_username = env_nonnegative_int(
             "PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME",
             DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME,
+        )
+        self.stratum_max_pending_initial_jobs = env_positive_int(
+            "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
+            DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
+        )
+        if (
+            self.stratum_max_connections > 0
+            and self.stratum_max_pending_initial_jobs > self.stratum_max_connections
+        ):
+            raise SystemExit(
+                "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS cannot exceed "
+                "PRISM_STRATUM_MAX_CONNECTIONS"
+            )
+        self.stratum_initial_job_timeout_seconds = env_nonnegative_float(
+            "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS",
+            DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS,
+        )
+        self.mining_health_startup_grace_seconds = env_nonnegative_float(
+            "PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS",
+            DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,
         )
         validate_same_tip_job_retention_limits(
             retention_seconds=self.same_tip_job_retention_seconds,
@@ -1887,8 +2064,18 @@ class PrismCoordinator:
         self.lock = threading.RLock()
         self.clients: set[ClientState] = set()
         self.connection_limit_rejection_counts = {"global": 0, "username": 0}
+        self.peak_active_connection_count = 0
+        self.handler_thread_count = 0
         self.accept_resource_exhaustion_count = 0
         self.connection_setup_failure_count = 0
+        self.pending_initial_jobs: dict[ClientState, PendingInitialJob] = {}
+        self.initial_job_queue_rejection_count = 0
+        self.initial_job_timeout_count = 0
+        self.initial_job_cancelled_count = 0
+        self.initial_job_coalesced_count = 0
+        self.last_initial_job_delivery_monotonic: float | None = None
+        self._mining_overload_started_monotonic: float | None = None
+        self._mining_delivery_failure_started_monotonic: float | None = None
         self._p2mr_address_cache_lock = threading.Lock()
         self._p2mr_address_cache: OrderedDict[
             str, tuple[float, tuple[str, str]]
@@ -2013,7 +2200,7 @@ class PrismCoordinator:
         self.tip_template_snapshot: QbitTipTemplateSnapshot | None = None
         self._tip_refresh_lock = threading.Lock()
         self._tip_refresh_executor_lock = threading.Lock()
-        self._tip_refresh_executor: ThreadPoolExecutor | None = None
+        self._tip_refresh_executor: _BoundedPriorityExecutor | None = None
         self._tip_refresh_executor_shutdown = False
         self._tip_refresh_pending_event = threading.Event()
         self._tip_refresh_pending_counter = 0
@@ -2390,6 +2577,8 @@ class PrismCoordinator:
             self._job_cache_lock = threading.Lock()
         if not hasattr(self, "_job_build_lock"):
             self._job_build_lock = threading.Lock()
+        if not hasattr(self, "_job_build_locks"):
+            self._job_build_locks: dict[tuple[object, ...], threading.Lock] = {}
         if not hasattr(self, "_template_artifacts"):
             self._template_artifacts: CachedTemplateArtifacts | None = None
         if not hasattr(self, "_template_artifact_generation"):
@@ -2954,6 +3143,11 @@ class PrismCoordinator:
                     for key, entry in self._job_bundle_cache.items()
                     if entry.template_fingerprint == artifacts.fingerprint
                 )
+                self._job_build_locks = {
+                    key: build_lock
+                    for key, build_lock in self._job_build_locks.items()
+                    if key[0] == artifacts.fingerprint or build_lock.locked()
+                }
             return True
 
     def store_template_artifacts(
@@ -3190,6 +3384,7 @@ class PrismCoordinator:
         worker: WorkerIdentity | None = None,
         *,
         mode: str | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> CachedJobBundle:
         """Return the cached heavy build for this template, building at most once.
 
@@ -3220,7 +3415,16 @@ class PrismCoordinator:
                 self._record_job_cache_event("bundle", hit=True)
                 assert cached is not None
                 return self._bind_cached_bundle_to_artifacts(cached, artifacts)
-            with self._job_build_lock:
+            while not self._job_build_lock.acquire(timeout=0.1):
+                if cancelled is not None and cancelled():
+                    raise _JobBuildCancelled(
+                        "job bundle waiter was cancelled before preparation"
+                    )
+            try:
+                if cancelled is not None and cancelled():
+                    raise _JobBuildCancelled(
+                        "job bundle request was cancelled before preparation"
+                    )
                 with self._job_cache_lock:
                     locked_payout_state_generation = self._payout_state_generation
                 if locked_payout_state_generation != payout_state_generation:
@@ -3248,7 +3452,13 @@ class PrismCoordinator:
                 # payout snapshot; retry against the new generation instead.
                 if not self._cache_job_bundle_if_current(built, artifacts):
                     continue
+                if cancelled is not None and cancelled():
+                    raise _JobBuildCancelled(
+                        "job bundle request was superseded during preparation"
+                    )
                 return built
+            finally:
+                self._job_build_lock.release()
 
     def build_shared_job_bundle(
         self,
@@ -3525,13 +3735,64 @@ class PrismCoordinator:
         if not hasattr(self, "worker_rejection_counts"):
             self.worker_rejection_counts = {}
 
+    def _ensure_initial_job_state(self) -> None:
+        if not hasattr(self, "pending_initial_jobs"):
+            self.pending_initial_jobs: dict[ClientState, PendingInitialJob] = {}
+        if not hasattr(self, "stratum_max_pending_initial_jobs"):
+            self.stratum_max_pending_initial_jobs = (
+                DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS
+            )
+        if not hasattr(self, "stratum_initial_job_timeout_seconds"):
+            self.stratum_initial_job_timeout_seconds = (
+                DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS
+            )
+        if not hasattr(self, "initial_job_queue_rejection_count"):
+            self.initial_job_queue_rejection_count = 0
+        if not hasattr(self, "initial_job_timeout_count"):
+            self.initial_job_timeout_count = 0
+        if not hasattr(self, "initial_job_cancelled_count"):
+            self.initial_job_cancelled_count = 0
+        if not hasattr(self, "initial_job_coalesced_count"):
+            self.initial_job_coalesced_count = 0
+        if not hasattr(self, "last_initial_job_delivery_monotonic"):
+            self.last_initial_job_delivery_monotonic = None
+        if not hasattr(self, "handler_thread_count"):
+            self.handler_thread_count = 0
+        if not hasattr(self, "peak_active_connection_count"):
+            self.peak_active_connection_count = len(getattr(self, "clients", ()))
+        if not hasattr(self, "_mining_overload_started_monotonic"):
+            self._mining_overload_started_monotonic = None
+        if not hasattr(self, "_mining_delivery_failure_started_monotonic"):
+            self._mining_delivery_failure_started_monotonic = None
+
+    def delivery_queue_limit(self) -> int:
+        pending_limit = int(
+            getattr(
+                self,
+                "stratum_max_pending_initial_jobs",
+                DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
+            )
+        )
+        connection_limit = int(
+            getattr(
+                self,
+                "stratum_max_connections",
+                DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+            )
+        )
+        return max(
+            int(getattr(self, "tip_refresh_max_workers", DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS)),
+            pending_limit,
+            connection_limit if connection_limit > 0 else pending_limit,
+        )
+
     def _ensure_tip_refresh_state(self) -> None:
         if not hasattr(self, "_tip_refresh_lock"):
             self._tip_refresh_lock = threading.Lock()
         if not hasattr(self, "_tip_refresh_executor_lock"):
             self._tip_refresh_executor_lock = threading.Lock()
         if not hasattr(self, "_tip_refresh_executor"):
-            self._tip_refresh_executor: ThreadPoolExecutor | None = None
+            self._tip_refresh_executor: _BoundedPriorityExecutor | None = None
         if not hasattr(self, "_tip_refresh_executor_shutdown"):
             self._tip_refresh_executor_shutdown = False
         if not hasattr(self, "tip_refresh_max_workers"):
@@ -3820,16 +4081,16 @@ class PrismCoordinator:
         with self._tip_refresh_metrics_lock:
             self.tip_refresh_inflight = max(0, self.tip_refresh_inflight - 1)
 
-    def tip_refresh_executor(self) -> ThreadPoolExecutor:
+    def tip_refresh_executor(self) -> _BoundedPriorityExecutor:
         self._ensure_tip_refresh_state()
         with self._tip_refresh_executor_lock:
             if self._tip_refresh_executor_shutdown:
                 raise RuntimeError("tip refresh executor is shut down")
             executor = self._tip_refresh_executor
             if executor is None:
-                executor = ThreadPoolExecutor(
+                executor = _BoundedPriorityExecutor(
                     max_workers=self.tip_refresh_max_workers,
-                    thread_name_prefix="prism-tip-refresh",
+                    max_queue_size=self.delivery_queue_limit(),
                 )
                 self._tip_refresh_executor = executor
             return executor
@@ -3845,6 +4106,330 @@ class PrismCoordinator:
             # socket send. Drain them before serve returns and the writer lease
             # is released; queued workers are cancelled without starting.
             executor.shutdown(wait=True, cancel_futures=True)
+
+    def _initial_request_current_locked(self, request: PendingInitialJob) -> bool:
+        client = request.client
+        return (
+            self.pending_initial_jobs.get(client) is request
+            and client in self.clients
+            and client.authorized
+            and client.subscribed
+            and client.worker == request.worker
+            and int(getattr(client, "authorization_generation", 0))
+            == request.authorization_generation
+            and not request.cancelled.is_set()
+        )
+
+    def _initial_request_cancelled(self, request: PendingInitialJob) -> bool:
+        if request.cancelled.is_set() or self.stop_event.is_set():
+            return True
+        with self.lock:
+            self._ensure_initial_job_state()
+            return not self._initial_request_current_locked(request)
+
+    def _cancel_pending_initial_job_locked(
+        self,
+        client: ClientState,
+        *,
+        count: bool,
+    ) -> PendingInitialJob | None:
+        self._ensure_initial_job_state()
+        request = self.pending_initial_jobs.pop(client, None)
+        if request is None:
+            return None
+        request.cancelled.set()
+        if request.future is not None:
+            request.future.cancel()
+        if count:
+            self.initial_job_cancelled_count += 1
+        return request
+
+    def _client_has_current_tip_job_locked(self, client: ClientState) -> bool:
+        context = client.active_job
+        if context is None:
+            return False
+        payout_generation = int(getattr(self, "_payout_state_generation", 0))
+        if int(getattr(context, "payout_state_generation", payout_generation)) != payout_generation:
+            return False
+        current_tip = self._current_observed_tip_hash_locked()
+        if current_tip is None:
+            return True
+        return str(context.template.get("previousblockhash", "")) == current_tip
+
+    def note_initial_job_delivered(
+        self,
+        client: ClientState,
+        *,
+        validated_current: bool = False,
+    ) -> None:
+        with self.lock:
+            self._ensure_initial_job_state()
+            if not validated_current and not self._client_has_current_tip_job_locked(client):
+                return
+            request = self.pending_initial_jobs.pop(client, None)
+            if request is not None:
+                request.cancelled.set()
+                if request.future is not None:
+                    request.future.cancel()
+            self.last_initial_job_delivery_monotonic = time.monotonic()
+
+    def schedule_initial_job(self, client: ClientState) -> bool:
+        """Coalesce and enqueue one first-job request without blocking its handler."""
+        # Focused tests and embedders replace maybe_send_job on the instance as
+        # a synchronous seam. Preserve it without affecting the production
+        # class path, which always uses the bounded executor below.
+        if "maybe_send_job" in self.__dict__:
+            return bool(self.maybe_send_job(client, clean_jobs=True))
+
+        now = time.monotonic()
+        reject = False
+        with self.lock:
+            self._ensure_initial_job_state()
+            if (
+                not client.subscribed
+                or not client.authorized
+                or client.worker is None
+                or getattr(client, "closing", False)
+            ):
+                return True
+            generation = int(getattr(client, "authorization_generation", 0))
+            existing = self.pending_initial_jobs.get(client)
+            if existing is not None and existing.authorization_generation == generation:
+                self.initial_job_coalesced_count += 1
+                return True
+            if existing is not None:
+                self._cancel_pending_initial_job_locked(client, count=True)
+            if self._client_has_current_tip_job_locked(client):
+                return True
+            if len(self.pending_initial_jobs) >= self.stratum_max_pending_initial_jobs:
+                self.initial_job_queue_rejection_count += 1
+                reject = True
+                request = None
+            else:
+                timeout = float(self.stratum_initial_job_timeout_seconds)
+                request = PendingInitialJob(
+                    client=client,
+                    authorization_generation=generation,
+                    worker=client.worker,
+                    requested_monotonic=now,
+                    deadline_monotonic=now + timeout if timeout > 0 else None,
+                )
+                self.pending_initial_jobs[client] = request
+        if reject or request is None:
+            self.disconnect_client(client)
+            return False
+
+        try:
+            future = self._submit_delivery_task(
+                self.tip_refresh_executor(),
+                self._run_initial_job,
+                request,
+                priority=PRISM_DELIVERY_PRIORITY_INITIAL,
+            )
+        except (_DeliveryQueueFull, RuntimeError):
+            with self.lock:
+                if self.pending_initial_jobs.get(client) is request:
+                    self.pending_initial_jobs.pop(client, None)
+                    request.cancelled.set()
+                    self.initial_job_queue_rejection_count += 1
+            self.disconnect_client(client)
+            return False
+        with self.lock:
+            if self.pending_initial_jobs.get(client) is request:
+                request.future = future
+            else:
+                future.cancel()
+        return True
+
+    def _run_initial_job(self, request: PendingInitialJob) -> bool:
+        """Prepare outside client locks, then atomically stamp and send current work."""
+        try:
+            while not self._initial_request_cancelled(request):
+                try:
+                    if not self.ensure_reorg_reconciled_for_current_tip():
+                        return False
+                    artifacts = self.current_template_artifacts()
+                    if self._initial_request_cancelled(request):
+                        return False
+                    bundle = self.shared_job_bundle(
+                        artifacts,
+                        request.worker,
+                        cancelled=lambda: (
+                            self._initial_request_cancelled(request)
+                            or not self._template_artifacts_are_current(artifacts)
+                        ),
+                    )
+                    live_tip = str(self.rpc.call("getbestblockhash"))
+                    if artifacts.previousblockhash != live_tip:
+                        with self._job_cache_lock:
+                            if self._template_artifacts is artifacts:
+                                self._template_artifacts = None
+                        continue
+                except _JobBuildCancelled:
+                    if self._initial_request_cancelled(request):
+                        return False
+                    continue
+                except Exception:
+                    with self.lock:
+                        self.job_build_failure_count = int(
+                            getattr(self, "job_build_failure_count", 0)
+                        ) + 1
+                    print(
+                        "prism coordinator: initial job preparation failed "
+                        f"connection={request.client.connection_id}",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+                    return False
+                delivered = self._deliver_initial_bundle(request, artifacts, bundle)
+                if delivered is None:
+                    continue
+                return delivered
+            return False
+        except OSError:
+            self.disconnect_client(request.client)
+            return False
+
+    def _template_artifacts_are_current(self, artifacts: CachedTemplateArtifacts) -> bool:
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            current = self._template_artifacts
+            return (
+                current is artifacts
+                or (
+                    current is not None
+                    and current.fingerprint == artifacts.fingerprint
+                    and current.generation == artifacts.generation
+                )
+            )
+
+    def _acquire_client_job_lock(
+        self,
+        client: ClientState,
+        cancelled: Callable[[], bool],
+    ) -> bool:
+        while not cancelled():
+            if client.job_update_lock.acquire(timeout=0.1):
+                return True
+        return False
+
+    @contextmanager
+    def _cancellable_client_job_lock(
+        self,
+        client: ClientState,
+        cancelled: Callable[[], bool],
+    ) -> Iterator[bool]:
+        acquired = self._acquire_client_job_lock(client, cancelled)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                client.job_update_lock.release()
+
+    def _payout_delivery(
+        self,
+        cancelled: Callable[[], bool],
+    ) -> Any:
+        """Use cancellable admission while retaining focused gate test seams."""
+        gate = self._payout_state_delivery_gate
+        delivery_cancelable = getattr(gate, "delivery_cancelable", None)
+        if callable(delivery_cancelable):
+            return delivery_cancelable(cancelled)
+        delivery = gate.delivery
+        try:
+            return delivery(cancelled)
+        except TypeError:
+            return delivery()
+
+    @staticmethod
+    def _submit_delivery_task(
+        executor: object,
+        function: Callable[..., Any],
+        *args: object,
+        priority: int,
+    ) -> Future[Any]:
+        submit = getattr(executor, "submit")
+        if isinstance(executor, _BoundedPriorityExecutor):
+            return submit(function, *args, priority=priority)
+        return submit(function, *args)
+
+    def _deliver_initial_bundle(
+        self,
+        request: PendingInitialJob,
+        artifacts: CachedTemplateArtifacts,
+        bundle: CachedJobBundle,
+    ) -> bool | None:
+        client = request.client
+        cancelled = lambda: self._initial_request_cancelled(request)
+        if not self._acquire_client_job_lock(client, cancelled):
+            return False
+        try:
+            if cancelled():
+                return False
+            if not self._template_artifacts_are_current(artifacts):
+                return None
+            self._ensure_job_cache_state()
+            with self._payout_delivery(cancelled) as admitted:
+                if not admitted or cancelled():
+                    return False
+                with self._job_cache_lock:
+                    payout_current = (
+                        bundle.payout_state_generation == self._payout_state_generation
+                    )
+                if not payout_current or not self._template_artifacts_are_current(artifacts):
+                    return None
+                with self.lock:
+                    if not self._initial_request_current_locked(request):
+                        return False
+                    context = self.stamp_job_for_client(
+                        client,
+                        bundle,
+                        clean_jobs=True,
+                    )
+                    client.active_job = context
+                    for job_id in tuple(client.active_job_ids):
+                        self.bury_evicted_job(client, job_id, prune=False)
+                        self.jobs.pop(job_id, None)
+                    client.active_job_ids.clear()
+                    self.prune_evicted_job_graveyard(force=False)
+                    self.jobs[context.job.job_id] = context
+                    client.active_job_ids.add(context.job.job_id)
+                self.send_job_update(client, context.job)
+                self.apply_job_difficulty(client, context.job)
+                self.note_tip_work_delivered(
+                    client,
+                    str(context.template["previousblockhash"]),
+                )
+                self.note_initial_job_delivered(client, validated_current=True)
+                return True
+        finally:
+            client.job_update_lock.release()
+
+    def sweep_initial_job_timeouts(self, *, now: float | None = None) -> int:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self._ensure_initial_job_state()
+            expired = [
+                request
+                for request in self.pending_initial_jobs.values()
+                if request.deadline_monotonic is not None
+                and request.deadline_monotonic <= now
+            ]
+            for request in expired:
+                if self.pending_initial_jobs.get(request.client) is not request:
+                    continue
+                self.pending_initial_jobs.pop(request.client, None)
+                request.cancelled.set()
+                if request.future is not None:
+                    request.future.cancel()
+                self.initial_job_timeout_count += 1
+        for request in expired:
+            self.disconnect_client(request.client)
+        return len(expired)
+
+    def initial_job_timeout_loop(self) -> None:
+        while not self.stop_event.wait(1.0):
+            self.sweep_initial_job_timeouts()
 
     def _record_heartbeat(self, name: str) -> None:
         self._ensure_watchdog_state()
@@ -4160,6 +4745,14 @@ class PrismCoordinator:
                     daemon=True,
                 )
                 vardiff_idle_sweep_thread.start()
+            initial_job_timeout_thread: threading.Thread | None = None
+            if self.stratum_initial_job_timeout_seconds > 0:
+                initial_job_timeout_thread = threading.Thread(
+                    target=self.initial_job_timeout_loop,
+                    name="prism-initial-job-timeouts",
+                    daemon=True,
+                )
+                initial_job_timeout_thread.start()
             self._record_heartbeat("block_submitter")
             block_submitter_thread = threading.Thread(
                 target=self.block_submit_loop,
@@ -4174,6 +4767,8 @@ class PrismCoordinator:
                 drain_threads.append((blockwait_thread, 1.0))
             if vardiff_idle_sweep_thread is not None:
                 drain_threads.append((vardiff_idle_sweep_thread, 1.0))
+            if initial_job_timeout_thread is not None:
+                drain_threads.append((initial_job_timeout_thread, 1.0))
             # Replay any shares stranded on disk by a prior ledger-outage
             # shutdown before serving, so no acked share is lost across restart.
             if not self._run_startup_writer_replay(
@@ -4316,6 +4911,11 @@ class PrismCoordinator:
                         share_difficulty=self.client_startup_difficulty(profile),
                     )
                     self.clients.add(client)
+                    self._ensure_initial_job_state()
+                    self.peak_active_connection_count = max(
+                        self.peak_active_connection_count,
+                        len(self.clients),
+                    )
             if client is None:
                 try:
                     sock.close()
@@ -4332,12 +4932,22 @@ class PrismCoordinator:
                 sock.settimeout(None)
                 self.apply_stratum_send_timeout(sock)
                 thread = threading.Thread(target=self.handle_client, args=(client,), daemon=True)
+                with self.lock:
+                    client.handler_thread_registered = True
+                    self.handler_thread_count += 1
                 thread.start()
             except (OSError, RuntimeError) as exc:
                 # Admission is atomic with the global count. Undo it if socket
                 # setup or thread creation fails before a handler owns cleanup,
                 # then keep this listener alive for the next connection.
                 try:
+                    with self.lock:
+                        if client.handler_thread_registered:
+                            client.handler_thread_registered = False
+                            self.handler_thread_count = max(
+                                0,
+                                self.handler_thread_count - 1,
+                            )
                     self.disconnect_client(client)
                 except Exception:
                     print(
@@ -4959,6 +5569,15 @@ class PrismCoordinator:
         started = worker_started if submitted_monotonic is None else submitted_monotonic
         phases = self._job_build_phases()
         phases.clear()
+        cancelled = lambda: (
+            self._prepared_tip_refresh_obsolete(
+                validation_token,
+                bundle,
+                snapshot,
+                cancel_event,
+            )
+            or getattr(client, "closing", False)
+        )
         phases["executor_queue"] = max(0.0, worker_started - started)
         client_lock_started = worker_started
         client_lock_acquired = False
@@ -4972,12 +5591,7 @@ class PrismCoordinator:
                         or getattr(client, "closing", False)
                     ):
                         return RefreshResult("disconnected")
-                if self._prepared_tip_refresh_obsolete(
-                    validation_token,
-                    bundle,
-                    snapshot,
-                    cancel_event,
-                ):
+                if cancelled():
                     phases["client_lock"] = max(
                         0.0,
                         time.monotonic() - client_lock_started,
@@ -4996,12 +5610,7 @@ class PrismCoordinator:
                 0.0,
                 time.monotonic() - client_lock_started,
             )
-            if self._prepared_tip_refresh_obsolete(
-                validation_token,
-                bundle,
-                snapshot,
-                cancel_event,
-            ):
+            if cancelled():
                 self._record_tip_refresh_cancellation("client_lock")
                 return RefreshResult("skipped")
             with self.lock:
@@ -5023,12 +5632,7 @@ class PrismCoordinator:
             self._ensure_job_cache_state()
             payout_gate_started = time.monotonic()
             with self._payout_state_delivery_gate.delivery_cancelable(
-                lambda: self._prepared_tip_refresh_obsolete(
-                    validation_token,
-                    bundle,
-                    snapshot,
-                    cancel_event,
-                ),
+                cancelled,
                 generation=bundle.payout_state_generation,
                 priority=True,
             ) as payout_admitted:
@@ -5041,12 +5645,7 @@ class PrismCoordinator:
                     generation=bundle.payout_state_generation,
                     fallback_wait_seconds=phases["payout_gate"],
                 )
-                if not payout_admitted or self._prepared_tip_refresh_obsolete(
-                    validation_token,
-                    bundle,
-                    snapshot,
-                    cancel_event,
-                ):
+                if not payout_admitted or cancelled():
                     self._record_tip_refresh_cancellation("payout_gate")
                     return RefreshResult("skipped")
                 fanout_admitted = (
@@ -5125,6 +5724,7 @@ class PrismCoordinator:
                         client,
                         str(context.template["previousblockhash"]),
                     )
+                    self.note_initial_job_delivered(client, validated_current=True)
                     delivered_monotonic = time.monotonic()
                     self._record_first_payout_delivery(
                         context.payout_state_generation,
@@ -5224,7 +5824,15 @@ class PrismCoordinator:
                 except StopIteration:
                     return
                 submitted = time.monotonic()
-                future = executor.submit(
+                active_job = expected_active_jobs.get(client)
+                if active_job is None:
+                    priority = PRISM_DELIVERY_PRIORITY_INITIAL
+                elif self.client_tip_changed_for_snapshot(client, snapshot):
+                    priority = PRISM_DELIVERY_PRIORITY_NEW_TIP
+                else:
+                    priority = PRISM_DELIVERY_PRIORITY_SAME_TIP
+                future = self._submit_delivery_task(
+                    executor,
                     self.send_prepared_job,
                     client,
                     bundle,
@@ -5234,6 +5842,7 @@ class PrismCoordinator:
                     expected_active_jobs.get(client),
                     cancel_event,
                     submitted,
+                    priority=priority,
                 )
                 self._tip_refresh_future_started()
                 future.add_done_callback(self._tip_refresh_future_finished)
@@ -7104,6 +7713,14 @@ class PrismCoordinator:
                 pass
             finally:
                 self.disconnect_client(client)
+                with self.lock:
+                    self._ensure_initial_job_state()
+                    if getattr(client, "handler_thread_registered", False):
+                        client.handler_thread_registered = False
+                        self.handler_thread_count = max(
+                            0,
+                            self.handler_thread_count - 1,
+                        )
 
     def disconnect_client(self, client: ClientState) -> None:
         # Retire admission and fanout eligibility without waiting behind job
@@ -7113,6 +7730,7 @@ class PrismCoordinator:
                 return
             client.closing = True
             self.clients.discard(client)
+            self._cancel_pending_initial_job_locked(client, count=True)
 
         # Do not take send_lock here: shutdown must interrupt an in-flight
         # sendall as well as the handler's blocking reader.
@@ -7132,6 +7750,9 @@ class PrismCoordinator:
                         self.evicted_jobs_by_connection.get(client.connection_id, ())
                     ):
                         self._remove_evicted_job_locked(job_id)
+                    client.authorized = False
+                    client.worker = None
+                    client.username = ""
             self._retain_current_collection_refresh_if_unrepresented()
 
     def handle_request(self, client: ClientState, request: dict[str, object]) -> None:
@@ -7177,7 +7798,8 @@ class PrismCoordinator:
                     [[], client.extranonce1_hex, self.extranonce2_size],
                 )
                 self._note_collection_identity_available(client)
-                self.maybe_send_job(client, clean_jobs=True)
+                if client.authorized:
+                    self.schedule_initial_job(client)
             return
         if method == "mining.authorize":
             with client.job_update_lock:
@@ -7204,13 +7826,16 @@ class PrismCoordinator:
                 difficulty_job_delivered = False
                 if target is not None:
                     difficulty_job_delivered = self.advertise_client_difficulty(client, target)
+                client.authorization_generation = int(
+                    getattr(client, "authorization_generation", 0)
+                ) + 1
                 client.authorized = True
                 self.send_result(client, request_id, True)
                 self._note_collection_identity_available(client)
                 # On a re-authorize whose new options already advertised a fresh
                 # difficulty/job pair, do not send a second back-to-back pair.
                 if not difficulty_job_delivered:
-                    self.maybe_send_job(client, clean_jobs=True)
+                    self.schedule_initial_job(client)
             return
         if method == "mining.extranonce.subscribe":
             self.send_result(client, request_id, True)
@@ -7614,6 +8239,10 @@ class PrismCoordinator:
                 delivered_monotonic,
             )
             self._consume_retained_collection_refresh(context)
+            self.note_initial_job_delivered(
+                client,
+                validated_current=guarded_refresh,
+            )
             phases["send"] = delivered_monotonic - phase_started
             elapsed = time.monotonic() - started
             self.observe_job_build_elapsed(elapsed, phases)
@@ -7764,8 +8393,11 @@ class PrismCoordinator:
             current = client.pending_share_difficulty or client.share_difficulty
             if target == current:
                 return False
-            if not (client.subscribed and client.authorized):
+            if not (client.subscribed and client.authorized) or (
+                client.active_job is None and "maybe_send_job" not in self.__dict__
+            ):
                 client.share_difficulty = target
+                client.pending_share_difficulty = None
                 return False
             prior_pending = client.pending_share_difficulty
             client.pending_share_difficulty = target
@@ -9878,10 +10510,155 @@ class PrismCoordinator:
     def ready_miner_count(self) -> int:
         return self.accepted_share_stats()[1]
 
+    def mining_delivery_snapshot(self, *, now: float | None = None) -> dict[str, object]:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self._ensure_initial_job_state()
+            active = len(self.clients)
+            subscribed = sum(1 for client in self.clients if client.subscribed)
+            authorized_clients = [
+                client
+                for client in self.clients
+                if client.subscribed and client.authorized and client.worker is not None
+            ]
+            authorized = len(authorized_clients)
+            current = sum(
+                1
+                for client in authorized_clients
+                if self._client_has_current_tip_job_locked(client)
+            )
+            pending_requests = list(self.pending_initial_jobs.values())
+            pending = len(pending_requests)
+            oldest_age = max(
+                (now - request.requested_monotonic for request in pending_requests),
+                default=0.0,
+            )
+            connection_limit = int(
+                getattr(
+                    self,
+                    "stratum_max_connections",
+                    DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+                )
+            )
+            pending_limit = int(self.stratum_max_pending_initial_jobs)
+            coverage = current / authorized if authorized else 1.0
+            cap_saturated = connection_limit > 0 and active >= connection_limit
+            pending_saturated = pending >= pending_limit
+            poor_coverage = authorized > 0 and coverage < 0.1
+            if poor_coverage:
+                if self._mining_delivery_failure_started_monotonic is None:
+                    self._mining_delivery_failure_started_monotonic = now
+            else:
+                self._mining_delivery_failure_started_monotonic = None
+            delivery_failure_age = (
+                max(0.0, now - self._mining_delivery_failure_started_monotonic)
+                if self._mining_delivery_failure_started_monotonic is not None
+                else 0.0
+            )
+            overload_now = pending_saturated or (cap_saturated and poor_coverage)
+            if overload_now:
+                if self._mining_overload_started_monotonic is None:
+                    self._mining_overload_started_monotonic = now
+            else:
+                self._mining_overload_started_monotonic = None
+            overload_age = (
+                max(0.0, now - self._mining_overload_started_monotonic)
+                if self._mining_overload_started_monotonic is not None
+                else 0.0
+            )
+            last_delivery = self.last_initial_job_delivery_monotonic
+            timeout = float(self.stratum_initial_job_timeout_seconds)
+            timeout_disconnects = self.initial_job_timeout_count
+            queue_rejections = self.initial_job_queue_rejection_count
+            cancelled = self.initial_job_cancelled_count
+            coalesced = self.initial_job_coalesced_count
+            peak = self.peak_active_connection_count
+            handlers = self.handler_thread_count
+
+        deadline = timeout if timeout > 0 else DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS
+        startup_age = max(0.0, now - getattr(self, "started_monotonic", now))
+        startup_grace = float(
+            getattr(
+                self,
+                "mining_health_startup_grace_seconds",
+                DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,
+            )
+        )
+        in_startup_grace = startup_age < startup_grace
+        no_delivery_progress = poor_coverage and (
+            delivery_failure_age >= deadline
+            or (
+                pending > 0
+                and (
+                    (last_delivery is None and oldest_age >= deadline)
+                    or (last_delivery is not None and now - last_delivery >= deadline)
+                )
+            )
+        )
+        stale_unknown = int(
+            getattr(self, "rejection_counts_by_reason", {}).get(
+                PRISM_REJECTION_STALE_JOB,
+                0,
+            )
+        ) + int(
+            getattr(self, "rejection_counts_by_reason", {}).get(
+                PRISM_REJECTION_UNKNOWN_JOB,
+                0,
+            )
+        )
+        submitted = int(getattr(self, "submitted_share_count", 0))
+        reject_storm = (
+            poor_coverage
+            and submitted > 0
+            and stale_unknown / submitted >= 0.95
+        )
+        persistent_overload = overload_age >= deadline
+        unhealthy_reasons: list[str] = []
+        if not in_startup_grace:
+            if poor_coverage and no_delivery_progress:
+                unhealthy_reasons.append("initial-delivery-stalled")
+            if pending_saturated and persistent_overload:
+                unhealthy_reasons.append("pending-initial-jobs-saturated")
+            if cap_saturated and poor_coverage and persistent_overload:
+                unhealthy_reasons.append("connection-capacity-saturated")
+            if reject_storm:
+                unhealthy_reasons.append("stale-unknown-rejection-storm")
+        mining_ready = not unhealthy_reasons
+        executor = getattr(self, "_tip_refresh_executor", None)
+        queue_depth, active_workers = executor.stats() if executor is not None else (0, 0)
+        return {
+            "mining_ready": mining_ready,
+            "mining_health_startup_grace": in_startup_grace,
+            "active_connections": active,
+            "connection_capacity": connection_limit,
+            "peak_active_connections": peak,
+            "subscribed_connections": subscribed,
+            "authorized_connections": authorized,
+            "pending_initial_jobs": pending,
+            "pending_initial_job_capacity": pending_limit,
+            "oldest_pending_initial_job_age_seconds": round(oldest_age, 3),
+            "clients_with_current_tip_jobs": current,
+            "current_tip_job_coverage": round(coverage, 6),
+            "connection_capacity_saturated": cap_saturated,
+            "pending_initial_jobs_saturated": pending_saturated,
+            "initial_delivery_stalled": no_delivery_progress,
+            "overload": bool(overload_now or reject_storm),
+            "overload_age_seconds": round(overload_age, 3),
+            "unhealthy_reasons": unhealthy_reasons,
+            "initial_job_queue_rejections": queue_rejections,
+            "initial_job_timeout_disconnects": timeout_disconnects,
+            "initial_job_cancelled_tasks": cancelled,
+            "initial_job_coalesced_tasks": coalesced,
+            "handler_threads": handlers,
+            "delivery_executor_queue_depth": queue_depth,
+            "delivery_executor_active_workers": active_workers,
+        }
+
     def health_payload(self) -> dict[str, object]:
         accepted_share_count, ready_miner_count = self.accepted_share_stats()
+        mining = self.mining_delivery_snapshot()
         return {
-            "ok": True,
+            "ok": bool(mining["mining_ready"]),
             "schema": "qbit.prism.audit-health.v1",
             "ledger_backend": self.ledger.backend_name,
             "accepted_share_count": accepted_share_count,
@@ -9889,6 +10666,7 @@ class PrismCoordinator:
             "accepted_block": self.accepted_block_count > 0,
             "accepted_block_count": self.accepted_block_count,
             "max_blocks": self.max_blocks,
+            **mining,
         }
 
     def refresh_health_snapshot(self) -> dict[str, object]:
@@ -9920,7 +10698,8 @@ class PrismCoordinator:
             if not loop_running:
                 # No refresher (tests, or audit HTTP without serve()): compute
                 # inline like the legacy endpoint did.
-                return 200, self.refresh_health_snapshot()
+                payload = self.refresh_health_snapshot()
+                return (200 if payload.get("ok") else 503), payload
             return 503, {
                 "ok": False,
                 "schema": "qbit.prism.audit-health.v1",
@@ -9937,7 +10716,7 @@ class PrismCoordinator:
             }
         payload = dict(snapshot)
         payload["snapshot_age_seconds"] = round(age_seconds, 3)
-        return 200, payload
+        return (200 if payload.get("ok") else 503), payload
 
     def health_snapshot_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -10005,9 +10784,27 @@ class PrismCoordinator:
             "recent_payouts": self.ledger.recipient_payout_history(recipient_id=recipient_id),
         }
 
+    @staticmethod
+    def process_resource_metrics() -> tuple[int, int]:
+        """Return cheap Linux RSS/descriptor gauges without extra processes."""
+        rss_bytes = -1
+        open_descriptors = -1
+        try:
+            statm = Path("/proc/self/statm").read_text(encoding="ascii").split()
+            rss_bytes = int(statm[1]) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            open_descriptors = len(tuple(Path("/proc/self/fd").iterdir()))
+        except OSError:
+            pass
+        return rss_bytes, open_descriptors
+
     def metrics_payload(self) -> str:
         ledger_metrics = self.ledger.metrics()
         audit_metrics = self.audit_artifact_metrics()
+        mining_metrics = self.mining_delivery_snapshot()
+        process_rss_bytes, process_open_fds = self.process_resource_metrics()
         accepted_share_count = self.accepted_share_stats()[0]
         elapsed = max(0.001, time.monotonic() - self.started_monotonic)
         shares_per_second = accepted_share_count / elapsed
@@ -10095,6 +10892,58 @@ class PrismCoordinator:
             "# HELP qbit_prism_stratum_active_connections Active admitted Stratum connections across all listeners.",
             "# TYPE qbit_prism_stratum_active_connections gauge",
             f"qbit_prism_stratum_active_connections {active_connection_count}",
+            "# HELP qbit_prism_stratum_connection_limit Configured global Stratum connection ceiling; zero means unlimited.",
+            "# TYPE qbit_prism_stratum_connection_limit gauge",
+            f"qbit_prism_stratum_connection_limit {mining_metrics['connection_capacity']}",
+            "# HELP qbit_prism_stratum_peak_active_connections Peak admitted Stratum connections since process start.",
+            "# TYPE qbit_prism_stratum_peak_active_connections gauge",
+            f"qbit_prism_stratum_peak_active_connections {mining_metrics['peak_active_connections']}",
+            "# HELP qbit_prism_stratum_subscribed_connections Active subscribed Stratum connections.",
+            "# TYPE qbit_prism_stratum_subscribed_connections gauge",
+            f"qbit_prism_stratum_subscribed_connections {mining_metrics['subscribed_connections']}",
+            "# HELP qbit_prism_stratum_authorized_connections Active subscribed and authorized Stratum connections.",
+            "# TYPE qbit_prism_stratum_authorized_connections gauge",
+            f"qbit_prism_stratum_authorized_connections {mining_metrics['authorized_connections']}",
+            "# HELP qbit_prism_stratum_pending_initial_jobs Authorized clients awaiting their first usable current-tip job.",
+            "# TYPE qbit_prism_stratum_pending_initial_jobs gauge",
+            f"qbit_prism_stratum_pending_initial_jobs {mining_metrics['pending_initial_jobs']}",
+            "# HELP qbit_prism_stratum_pending_initial_job_limit Configured bound for clients awaiting their first usable job.",
+            "# TYPE qbit_prism_stratum_pending_initial_job_limit gauge",
+            f"qbit_prism_stratum_pending_initial_job_limit {mining_metrics['pending_initial_job_capacity']}",
+            "# HELP qbit_prism_stratum_oldest_pending_initial_job_seconds Age of the oldest pending first-job request.",
+            "# TYPE qbit_prism_stratum_oldest_pending_initial_job_seconds gauge",
+            f"qbit_prism_stratum_oldest_pending_initial_job_seconds {mining_metrics['oldest_pending_initial_job_age_seconds']}",
+            "# HELP qbit_prism_stratum_initial_job_queue_rejections_total Sessions closed because bounded first-job delivery was full.",
+            "# TYPE qbit_prism_stratum_initial_job_queue_rejections_total counter",
+            f"qbit_prism_stratum_initial_job_queue_rejections_total {mining_metrics['initial_job_queue_rejections']}",
+            "# HELP qbit_prism_stratum_initial_job_timeouts_total Sessions disconnected after first-job delivery timed out.",
+            "# TYPE qbit_prism_stratum_initial_job_timeouts_total counter",
+            f"qbit_prism_stratum_initial_job_timeouts_total {mining_metrics['initial_job_timeout_disconnects']}",
+            "# HELP qbit_prism_stratum_initial_job_tasks_total First-job tasks canceled or coalesced before duplicate work.",
+            "# TYPE qbit_prism_stratum_initial_job_tasks_total counter",
+            f'qbit_prism_stratum_initial_job_tasks_total{{result="cancelled"}} {mining_metrics["initial_job_cancelled_tasks"]}',
+            f'qbit_prism_stratum_initial_job_tasks_total{{result="coalesced"}} {mining_metrics["initial_job_coalesced_tasks"]}',
+            "# HELP qbit_prism_stratum_clients_with_current_tip_jobs Authorized clients holding usable current-tip work.",
+            "# TYPE qbit_prism_stratum_clients_with_current_tip_jobs gauge",
+            f"qbit_prism_stratum_clients_with_current_tip_jobs {mining_metrics['clients_with_current_tip_jobs']}",
+            "# HELP qbit_prism_stratum_current_tip_job_coverage Ratio of authorized clients holding current-tip work.",
+            "# TYPE qbit_prism_stratum_current_tip_job_coverage gauge",
+            f"qbit_prism_stratum_current_tip_job_coverage {mining_metrics['current_tip_job_coverage']}",
+            "# HELP qbit_prism_stratum_handler_threads Active per-connection Stratum handler threads.",
+            "# TYPE qbit_prism_stratum_handler_threads gauge",
+            f"qbit_prism_stratum_handler_threads {mining_metrics['handler_threads']}",
+            "# HELP qbit_prism_job_delivery_queue_depth Current bounded delivery executor queue depth.",
+            "# TYPE qbit_prism_job_delivery_queue_depth gauge",
+            f"qbit_prism_job_delivery_queue_depth {mining_metrics['delivery_executor_queue_depth']}",
+            "# HELP qbit_prism_job_delivery_active_workers Delivery executor workers currently running tasks.",
+            "# TYPE qbit_prism_job_delivery_active_workers gauge",
+            f"qbit_prism_job_delivery_active_workers {mining_metrics['delivery_executor_active_workers']}",
+            "# HELP qbit_prism_process_resident_memory_bytes Current process RSS bytes, or -1 when unavailable.",
+            "# TYPE qbit_prism_process_resident_memory_bytes gauge",
+            f"qbit_prism_process_resident_memory_bytes {process_rss_bytes}",
+            "# HELP qbit_prism_process_open_file_descriptors Current process open descriptor count, or -1 when unavailable.",
+            "# TYPE qbit_prism_process_open_file_descriptors gauge",
+            f"qbit_prism_process_open_file_descriptors {process_open_fds}",
             "# HELP qbit_prism_stratum_connection_limit_rejections_total Stratum connections rejected by an explicitly configured admission limit.",
             "# TYPE qbit_prism_stratum_connection_limit_rejections_total counter",
             *[

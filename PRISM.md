@@ -125,6 +125,31 @@ the same coordinator, share ledger, and settlement path. Because the reward
 window is difficulty-weighted, shares from either port earn proportional
 credit with no settlement changes.
 
+### Reconnect backpressure
+
+PRISM applies one global admission ceiling across the default and high-diff
+listeners before it allocates `ClientState` or starts a handler thread.
+`PRISM_STRATUM_MAX_CONNECTIONS` defaults to 384, above the normal 200-250
+production population. An environment that explicitly overrides it to `0`
+remains unlimited in local/regtest mode and must remove that override to receive
+containment; production startup rejects the unlimited override.
+
+After subscribe and authorize, clients awaiting first current-tip work enter a
+single priority delivery lane. `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS`
+(default 128) bounds that population, and
+`PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS` (default 30) expires requests that
+cannot be served. A zero timeout is supported for focused local tests, but the
+pending bound stays active. Initial delivery outranks new-tip replacement,
+same-tip/Vardiff refresh, and routine maintenance; duplicate authorization work
+is coalesced by connection and authorization generation.
+
+`/healthz` reports connection and pending capacity, current-tip job coverage,
+delivery progress, and overload state. It uses
+`PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS` (default 30) before persistent
+delivery failure can make health non-green. A full connection cap alone does
+not fail health while admitted miners retain current work and delivery is
+progressing.
+
 The high-diff listener is disabled unless `PRISM_STRATUM_HIGHDIFF_PORT` is
 set:
 
