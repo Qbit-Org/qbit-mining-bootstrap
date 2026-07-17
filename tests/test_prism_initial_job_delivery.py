@@ -396,6 +396,26 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
 
+    def test_zero_initial_timeout_disables_delivery_stall_health_deadline(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.prewarm_current_tip_ready_bundle()
+        state = client(1)
+        state.authorization_generation = 1
+        state.authorized_monotonic = time.monotonic() - 60
+        server.clients = {state}
+        server.started_monotonic = time.monotonic() - 60
+        server.mining_health_startup_grace_seconds = 5
+        server.stratum_initial_job_timeout_seconds = 0
+
+        status, payload = server.cached_health_payload()
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["mining_ready"])
+        self.assertFalse(payload["initial_delivery_stalled"])
+        self.assertNotIn("initial-delivery-stalled", payload["unhealthy_reasons"])
+
     def test_health_flags_sustained_eighty_seven_percent_coverage_loss(self) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)

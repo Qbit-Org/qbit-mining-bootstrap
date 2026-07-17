@@ -11114,11 +11114,7 @@ class PrismCoordinator:
             and prepared_bundle.payout_state_generation == payout_generation
         )
 
-        deadline = (
-            timeout
-            if timeout > 0
-            else DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS
-        )
+        deadline = timeout if timeout > 0 else None
         startup_age = max(0.0, now - getattr(self, "started_monotonic", now))
         startup_grace = float(
             getattr(
@@ -11128,14 +11124,21 @@ class PrismCoordinator:
             )
         )
         in_startup_grace = startup_age < startup_grace
-        no_delivery_progress = poor_coverage and (
-            delivery_failure_age >= deadline
-            or oldest_missing_age >= deadline
-            or (
-                pending > 0
-                and (
-                    (last_delivery is None and oldest_age >= deadline)
-                    or (last_delivery is not None and now - last_delivery >= deadline)
+        no_delivery_progress = bool(
+            deadline is not None
+            and poor_coverage
+            and (
+                delivery_failure_age >= deadline
+                or oldest_missing_age >= deadline
+                or (
+                    pending > 0
+                    and (
+                        (last_delivery is None and oldest_age >= deadline)
+                        or (
+                            last_delivery is not None
+                            and now - last_delivery >= deadline
+                        )
+                    )
                 )
             )
         )
@@ -11156,7 +11159,7 @@ class PrismCoordinator:
             and submitted > 0
             and stale_unknown / submitted >= 0.95
         )
-        persistent_overload = overload_age >= deadline
+        persistent_overload = deadline is not None and overload_age >= deadline
         unhealthy_reasons: list[str] = []
         if not in_startup_grace:
             if poor_coverage and no_delivery_progress:
