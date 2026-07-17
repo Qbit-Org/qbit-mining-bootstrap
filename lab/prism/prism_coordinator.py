@@ -8863,14 +8863,11 @@ class PrismCoordinator:
             ctv_fee_parent_hash=str(context.template["previousblockhash"]),
             canonical_output_path=candidate_bundle_path,
         )
-        persistence_canonical_bundle_path = (
-            candidate_bundle_path if candidate_bundle_path.exists() else None
-        )
         # Tests and alternate builders may not implement the optional canonical
         # output yet. Their Python-serialized fallback is valid verifier input,
         # but it must not be labeled canonical during persistence: the ledger
         # will canonicalize final_bundle itself on this compatibility path.
-        if persistence_canonical_bundle_path is None:
+        if not candidate_bundle_path.exists():
             candidate_bundle_path = self.write_temporary_audit_bundle(
                 final_bundle,
                 block_hash=submission.block_hash_hex,
@@ -8905,6 +8902,14 @@ class PrismCoordinator:
                 submission.coinbase_tx_hex,
                 self.trusted_ledger_writer_public_key_hex(final_bundle),
                 expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
+            )
+            # Existence alone does not prove that an alternate/older builder
+            # emitted canonical bytes. Only forward the verifier candidate to
+            # persistence when its exact bytes match the verifier's canonical
+            # digest; otherwise the ledger canonicalizes final_bundle itself.
+            persistence_canonical_bundle_path = self.verified_canonical_bundle_path(
+                candidate_bundle_path,
+                report,
             )
             self._record_heartbeat("block_submitter")
             # Finalization is exact-idempotent so an active-tip/active-ancestor
@@ -9126,6 +9131,20 @@ class PrismCoordinator:
         return self.audit_dir / (
             f".prism-live-audit-bundle-candidate-{block_hash}-{uuid.uuid4().hex}.json.tmp"
         )
+
+    @staticmethod
+    def verified_canonical_bundle_path(
+        candidate_bundle_path: Path,
+        report: dict[str, Any],
+    ) -> Path | None:
+        expected_sha256 = str(report["audit_bundle_sha256_hex"]).lower()
+        digest = hashlib.sha256()
+        with candidate_bundle_path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        if digest.hexdigest() != expected_sha256:
+            return None
+        return candidate_bundle_path
 
     def write_temporary_audit_bundle(self, bundle: dict[str, Any], *, block_hash: str) -> Path:
         path = self.temporary_audit_bundle_path(block_hash=block_hash)

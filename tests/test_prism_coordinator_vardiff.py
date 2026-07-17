@@ -5199,9 +5199,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server.jobs["job-1"].job.transaction_hexes = (witness_tx,)
             build_kwargs: list[dict[str, object]] = []
             # Deliberately use insertion order that differs from this fixture's
-            # stand-in canonical serialization. The alternate builder ignores
-            # canonical_output_path, so the coordinator must treat its Python
-            # fallback as verifier input only.
+            # stand-in canonical serialization. The alternate builder creates
+            # the requested output but writes pretty, noncanonical JSON, so
+            # existence alone must not make the path eligible for persistence.
             alternate_bundle = {
                 "signed_coinbase_manifest": {
                     "manifest": {
@@ -5222,14 +5222,20 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
             def fake_build_audit_bundle(**kwargs: object) -> dict[str, object]:
                 build_kwargs.append(kwargs)
+                output_path = kwargs["canonical_output_path"]
+                assert isinstance(output_path, Path)
+                output_path.write_text(
+                    json.dumps(alternate_bundle, indent=2),
+                    encoding="utf-8",
+                )
                 return alternate_bundle
 
             def fake_verify_bundle(bundle_path: Path, *_args: object, **_kwargs: object) -> dict[str, object]:
-                fallback_bytes = bundle_path.read_bytes()
-                self.assertEqual(json.loads(fallback_bytes), alternate_bundle)
-                self.assertNotEqual(fallback_bytes, canonical_bytes)
+                candidate_bytes = bundle_path.read_bytes()
+                self.assertEqual(json.loads(candidate_bytes), alternate_bundle)
+                self.assertNotEqual(candidate_bytes, canonical_bytes)
                 self.assertNotEqual(
-                    hashlib.sha256(fallback_bytes).hexdigest(),
+                    hashlib.sha256(candidate_bytes).hexdigest(),
                     canonical_sha256,
                 )
                 return {
@@ -5288,9 +5294,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.persisted[0]["block_hash"], block_hash)
         self.assertEqual(ledger.persisted[0]["block_height"], 10)
         self.assertTrue(ledger.persisted[0]["submit_seen_at_persist"])
-        # This alternate test builder ignores canonical_output_path. Its
-        # Python JSON fallback is verifier input only, never a claimed
-        # byte-canonical artifact for ledger persistence.
+        # This alternate test builder wrote noncanonical bytes to the requested
+        # path. The verified content is valid, but the path is never claimed as
+        # a byte-canonical artifact for ledger persistence.
         self.assertIsNone(ledger.persisted[0]["canonical_bundle_path"])
         self.assertEqual(server._payout_state_generation, 1)
         self.assertEqual(server._job_bundle_cache, {})
@@ -5667,6 +5673,27 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.payout_state_candidates_discarded, 1)
         self.assertEqual(server.reorg_reconcile_skip_count, 1)
 
+    def test_verified_canonical_bundle_path_requires_exact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            candidate_path = Path(tempdir) / "candidate.json"
+            candidate_bytes = b'{"canonical":true}'
+            candidate_path.write_bytes(candidate_bytes)
+            canonical_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+
+            self.assertEqual(
+                PrismCoordinator.verified_canonical_bundle_path(
+                    candidate_path,
+                    {"audit_bundle_sha256_hex": canonical_sha256.upper()},
+                ),
+                candidate_path,
+            )
+            self.assertIsNone(
+                PrismCoordinator.verified_canonical_bundle_path(
+                    candidate_path,
+                    {"audit_bundle_sha256_hex": "00" * 32},
+                )
+            )
+
     def test_active_ancestor_candidate_resumes_full_finalization_without_resubmit(self) -> None:
         server, state, ledger = submit_coordinator()
         with tempfile.TemporaryDirectory() as tempdir:
@@ -5720,6 +5747,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
 
         self.assertEqual(ledger.persisted[0]["block_hash"], block_hash)
+        # This compatibility builder ignores canonical_output_path, so its
+        # Python fallback remains verifier-only.
+        self.assertIsNone(ledger.persisted[0]["canonical_bundle_path"])
         self.assertEqual(ledger.confirmed[0]["active_tip_height"], 11)
         self.assertEqual(ledger.confirmed[0]["block_hash"], block_hash)
         self.assertFalse(ledger.confirmed[0]["submit_seen_at_confirm"])
