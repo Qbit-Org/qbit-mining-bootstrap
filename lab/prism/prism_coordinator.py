@@ -3827,6 +3827,25 @@ class PrismCoordinator:
                     "qbit tip changed during prepared fanout; immediate retry scheduled "
                     f"expected={snapshot.bestblockhash} current={post_fanout_tip}"
                 )
+            try:
+                post_fanout_untrusted = bool(
+                    getattr(self, "reorg_reconciler_enabled", True)
+                    and self.qbit_chain_view_untrusted()
+                )
+            except Exception as exc:
+                cancel_event.set()
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "qbit chain trust check failed after prepared fanout; "
+                    "immediate retry scheduled"
+                ) from exc
+            if post_fanout_untrusted:
+                cancel_event.set()
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "qbit chain view became untrusted during prepared fanout; "
+                    "immediate retry scheduled"
+                )
             with self.lock:
                 token_current = self._tip_refresh_token_current_locked(
                     validation_token,
@@ -5050,6 +5069,18 @@ class PrismCoordinator:
         ):
             # Template ordering cannot make a payout-stale intervening job
             # authoritative. Let the reconciled refresh replace it.
+            return False
+        active_parent_hash = str(
+            getattr(active_job, "template", {}).get("previousblockhash", "")
+        )
+        if (
+            active_parent_hash != snapshot.bestblockhash
+            or active_parent_hash != snapshot.previousblockhash
+        ):
+            # Artifact generations order fetch starts, not chain tips. A fetch
+            # for the old tip can start after this exact new-tip observation
+            # and therefore carry a larger generation; it must not prevent
+            # the new-tip snapshot from replacing that stale work.
             return False
         active_generation = int(getattr(active_job, "template_generation", 0))
         snapshot_generation = int(getattr(snapshot, "template_generation", 0))
@@ -7296,19 +7327,27 @@ class PrismCoordinator:
             # Finalization is exact-idempotent so an active-tip/active-ancestor
             # replay can safely repeat any step after a crash.
             self._record_heartbeat("block_submitter")
-            persistence = self.ledger.persist_accepted_block(
-                block_hash=submission.block_hash_hex,
-                block_height=expected_height,
-                parent_hash=str(context.template["previousblockhash"]),
-                final_bundle=final_bundle,
-                audit_report=report,
-            )
-            self._record_heartbeat("block_submitter")
-            confirmation = self.ledger.confirm_accepted_block(
-                block_hash=block_hash,
-                active_tip_height=active_tip_height,
-            )
-            if int(confirmation.get("confirmed_count", 0)) not in {0, 1}:
+            self._ensure_job_cache_state()
+            with self._payout_state_delivery_gate.mutation():
+                persistence = self.ledger.persist_accepted_block(
+                    block_hash=submission.block_hash_hex,
+                    block_height=expected_height,
+                    parent_hash=str(context.template["previousblockhash"]),
+                    final_bundle=final_bundle,
+                    audit_report=report,
+                )
+                self._record_heartbeat("block_submitter")
+                confirmation = self.ledger.confirm_accepted_block(
+                    block_hash=block_hash,
+                    active_tip_height=active_tip_height,
+                )
+                confirmed_count = int(confirmation.get("confirmed_count", 0))
+                if confirmed_count in {0, 1} and confirmed_count:
+                    # Confirmation activates the newly persisted carry-forward
+                    # rows. Advance before releasing delivery admission so no
+                    # old-balance bundle can land after this durable boundary.
+                    self._advance_payout_state_generation()
+            if confirmed_count not in {0, 1}:
                 self.stop_event.set()
                 self._abandon_block_candidate(
                     PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,

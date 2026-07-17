@@ -295,7 +295,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(notifications, {state.connection_id for state in clients})
         self.assertTrue(all(state.active_job is not None for state in clients))
         self.assertEqual(reconciliation_calls, [rpc.tip])
-        self.assertEqual(chain_view_checks, 1)
+        self.assertEqual(chain_view_checks, 2)
         self.assertEqual(forbidden_worker_checks, 0)
         self.assertEqual(len(validation_tokens), 1)
 
@@ -362,6 +362,50 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertTrue(all(state.active_job is None for state in clients))
         self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_untrusted_post_fanout_does_not_report_refresh_success(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        clients = [client(1), client(2)]
+        notifications: list[int] = []
+        for state in clients:
+            state.send = (  # type: ignore[method-assign]
+                lambda payload, connection_id=state.connection_id: (
+                    notifications.append(connection_id)
+                    if payload["method"] == "mining.notify"
+                    else None
+                )
+            )
+        server.clients = clients  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        chain_view_checks = 0
+
+        def becomes_untrusted() -> bool:
+            nonlocal chain_view_checks
+            chain_view_checks += 1
+            return chain_view_checks == 2
+
+        server.qbit_chain_view_untrusted = becomes_untrusted  # type: ignore[method-assign]
+
+        try:
+            with self.assertRaisesRegex(
+                TemplateRefreshBlocked,
+                "qbit chain view became untrusted during prepared fanout",
+            ):
+                server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(chain_view_checks, 2)
+        self.assertEqual(
+            set(notifications),
+            {state.connection_id for state in clients},
+        )
+        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertIsNone(
+            getattr(server, "last_successful_template_refresh_monotonic", None)
+        )
 
     def test_prevalidation_rpc_failure_schedules_immediate_retry(self) -> None:
         server, rpc = coordinator()

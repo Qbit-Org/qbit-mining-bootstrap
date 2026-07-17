@@ -45,6 +45,7 @@ from lab.prism.prism_coordinator import (
     TemplateRefreshBlocked,
     PrismCoordinator,
     WorkerIdentity,
+    _FanoutCancellation,
     default_prism_coinbase_tag_hex,
     default_prism_username_fallback_address,
     load_prism_highdiff_listener,
@@ -5017,6 +5018,15 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
     def test_block_candidate_submits_before_full_audit_persistence(self) -> None:
         server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server._ensure_tip_refresh_state()
+        stale_bundle_key = ("stale-payout-bundle",)
+        server._job_bundle_cache[stale_bundle_key] = object()  # type: ignore[assignment]
+        active_fanout = _FanoutCancellation()
+        server._active_tip_refresh = (  # type: ignore[assignment]
+            SimpleNamespace(payout_state_generation=0),
+            active_fanout,
+        )
         with tempfile.TemporaryDirectory() as tempdir:
             server.audit_dir = Path(tempdir)
             server.evidence_path = Path(tempdir) / "evidence.json"
@@ -5085,6 +5095,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.persisted[0]["block_hash"], block_hash)
         self.assertEqual(ledger.persisted[0]["block_height"], 10)
         self.assertTrue(ledger.persisted[0]["submit_seen_at_persist"])
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._job_bundle_cache, {})
+        self.assertTrue(active_fanout.is_set())
+        self.assertTrue(server._tip_refresh_retry.is_set())
 
     def test_active_ancestor_candidate_resumes_full_finalization_without_resubmit(self) -> None:
         server, state, ledger = submit_coordinator()

@@ -855,7 +855,7 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(refreshed, 100)
         self.assertEqual(reconciled, [rpc.tip])
-        self.assertEqual(trust_checks, 1)
+        self.assertEqual(trust_checks, 2)
         # The early priority probe, snapshot coherence, pre-fanout validation,
         # and post-fanout detection are each constant-cost regardless of
         # client count.
@@ -1439,6 +1439,40 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertTrue(
             server.intervening_job_supersedes_snapshot(
                 current_intervening_job,
+                None,
+                snapshot,
+            )
+        )
+
+    def test_higher_generation_old_tip_does_not_supersede_new_tip_snapshot(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        old_artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(old_artifacts)
+        assert old_artifacts is not None and state.worker is not None
+        old_bundle = server.shared_job_bundle(old_artifacts, state.worker)
+
+        new_tip = "22" * 32
+        rpc.tip = new_tip
+        rpc.template = base_template(height=11, prevhash=new_tip)
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        old_tip_job = dataclass_replace(
+            server.stamp_job_for_client(
+                state,
+                old_bundle,
+                clean_jobs=False,
+            ),
+            template_generation=snapshot.template_generation + 1,
+        )
+
+        self.assertNotEqual(
+            old_tip_job.template_fingerprint,
+            snapshot.template_fingerprint,
+        )
+        self.assertFalse(
+            server.intervening_job_supersedes_snapshot(
+                old_tip_job,
                 None,
                 snapshot,
             )
