@@ -475,26 +475,27 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(bundle.payout_state_generation, 1)
         self.assertIs(cached, bundle)
 
-    def test_readiness_latch_during_build_lock_wait_reselects_ready_mode(self) -> None:
+    def test_readiness_latch_during_preparation_admission_reselects_ready_mode(self) -> None:
         ledger = FakeLedger(miners=["solo"])
         server, rpc = coordinator(ledger=ledger)
         recorded = install_fake_bundle_builder(server)
         artifacts = server.store_template_artifacts(dict(rpc.template))
         self.assertIsNotNone(artifacts)
         assert artifacts is not None
-        first_mode_resolved = threading.Event()
-        original_job_bundle_mode = server._job_bundle_mode
-        mode_calls = 0
+        first_lookup_entered = threading.Event()
+        release_first_lookup = threading.Event()
+        original_lookup = server._lookup_job_bundle
+        lookup_calls = 0
 
-        def record_mode_resolution(requested_mode: str | None) -> str:
-            nonlocal mode_calls
-            resolved = original_job_bundle_mode(requested_mode)
-            mode_calls += 1
-            if mode_calls == 1:
-                first_mode_resolved.set()
-            return resolved
+        def block_first_lookup(key: tuple[object, ...]) -> object:
+            nonlocal lookup_calls
+            lookup_calls += 1
+            if lookup_calls == 1:
+                first_lookup_entered.set()
+                self.assertTrue(release_first_lookup.wait(2.0))
+            return original_lookup(key)
 
-        server._job_bundle_mode = record_mode_resolution  # type: ignore[method-assign]
+        server._lookup_job_bundle = block_first_lookup  # type: ignore[method-assign]
         bundles: list[object] = []
         errors: list[BaseException] = []
 
@@ -504,11 +505,11 @@ class JobBundleCacheTests(unittest.TestCase):
             except BaseException as exc:  # pragma: no cover - assertion reports it
                 errors.append(exc)
 
-        with server._job_build_lock:
-            build_thread = threading.Thread(target=build_bundle)
-            build_thread.start()
-            self.assertTrue(first_mode_resolved.wait(2.0))
-            ledger.miners = ["miner-a", "miner-b", "miner-c"]
+        build_thread = threading.Thread(target=build_bundle)
+        build_thread.start()
+        self.assertTrue(first_lookup_entered.wait(2.0))
+        ledger.miners = ["miner-a", "miner-b", "miner-c"]
+        release_first_lookup.set()
 
         build_thread.join(2.0)
 

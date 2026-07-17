@@ -112,6 +112,7 @@ def coordinator(*, connection_limit: int = 3, pending_limit: int = 2) -> PrismCo
     server.stratum_initial_job_timeout_seconds = 30.0
     server.mining_health_startup_grace_seconds = 30.0
     server.tip_refresh_max_workers = 1
+    server.tip_template_snapshot = None
     server.started_monotonic = 0.0
     server.submitted_share_count = 0
     server.rejection_counts_by_reason = {}
@@ -294,6 +295,58 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertEqual(replacement.authorization_generation, 2)
         release.set()
         server.shutdown_tip_refresh_executor()
+
+    def test_difficulty_change_replaces_pending_first_job_generation(self) -> None:
+        server = coordinator(connection_limit=3, pending_limit=2)
+        server.current_tip_first_seen = ("aa" * 32, time.monotonic())
+        state = client(server, 1)
+        started = threading.Event()
+        release = threading.Event()
+
+        def deliver(request: PendingInitialJob) -> bool:
+            if request.difficulty_generation == 0:
+                started.set()
+                release.wait(5)
+            if server._initial_request_cancelled(request):
+                return False
+            request.client.active_job = SimpleNamespace(
+                template={"previousblockhash": "aa" * 32},
+                payout_state_generation=0,
+                connection_id=request.connection_id,
+                authorization_generation=request.authorization_generation,
+                difficulty_generation=request.difficulty_generation,
+            )
+            server.note_initial_job_delivered(request.client)
+            return True
+
+        server._run_initial_job = deliver  # type: ignore[method-assign]
+        self.assertTrue(server.request_initial_job_delivery(state))
+        self.assertTrue(started.wait(5))
+        original = server.pending_initial_jobs[state]
+
+        self.assertFalse(
+            server.advertise_client_difficulty(state, Decimal("4"))
+        )
+
+        replacement = server.pending_initial_jobs[state]
+        self.assertIsNot(replacement, original)
+        self.assertTrue(original.cancelled.is_set())
+        self.assertEqual(replacement.difficulty_generation, 1)
+        self.assertEqual(state.difficulty_generation, 1)
+        self.assertEqual(state.share_difficulty, Decimal("4"))
+        self.assertIsNone(state.pending_share_difficulty)
+
+        release.set()
+        deadline = time.monotonic() + 5
+        while server.pending_initial_jobs and time.monotonic() < deadline:
+            time.sleep(0.01)
+        server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(server.pending_initial_jobs, {})
+        self.assertIn(state, server.clients)
+        self.assertFalse(state.sock.closed)
+        self.assertIsNotNone(state.active_job)
+        self.assertEqual(state.active_job.difficulty_generation, 1)
 
     def test_timeout_cleans_state_and_prevents_late_delivery(self) -> None:
         server = coordinator(connection_limit=3, pending_limit=2)

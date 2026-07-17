@@ -6688,6 +6688,7 @@ class PrismListenerProfileTests(unittest.TestCase):
         server = coordinator()
         state = client()
         state.share_difficulty = Decimal("1")
+        state.difficulty_generation = 7
         state.send = lambda payload: None  # type: ignore[method-assign]
         server.maybe_send_job = lambda client, *, clean_jobs: False  # type: ignore[method-assign]
 
@@ -6695,6 +6696,7 @@ class PrismListenerProfileTests(unittest.TestCase):
 
         self.assertIsNone(state.pending_share_difficulty)
         self.assertEqual(state.share_difficulty, Decimal("1"))
+        self.assertEqual(state.difficulty_generation, 7)
 
     def test_suggest_difficulty_yields_to_password_d_option(self) -> None:
         server = coordinator()

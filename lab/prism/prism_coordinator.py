@@ -8834,6 +8834,8 @@ class PrismCoordinator:
         client: ClientState,
         target: Decimal,
     ) -> bool:
+        applied_directly = False
+        schedule_initial = False
         with self.lock:
             current = client.pending_share_difficulty or client.share_difficulty
             if target == current:
@@ -8846,12 +8848,27 @@ class PrismCoordinator:
                 client.difficulty_generation = int(
                     getattr(client, "difficulty_generation", 0)
                 ) + 1
-                return False
-            prior_pending = client.pending_share_difficulty
-            client.pending_share_difficulty = target
-            client.difficulty_generation = int(
-                getattr(client, "difficulty_generation", 0)
-            ) + 1
+                applied_directly = True
+                schedule_initial = bool(
+                    client.subscribed
+                    and client.authorized
+                    and client.worker is not None
+                )
+            else:
+                prior_pending = client.pending_share_difficulty
+                prior_generation = int(
+                    getattr(client, "difficulty_generation", 0)
+                )
+                advertised_generation = prior_generation + 1
+                client.pending_share_difficulty = target
+                client.difficulty_generation = advertised_generation
+        if applied_directly:
+            if schedule_initial:
+                # A pending first-job request captured the previous difficulty
+                # generation. Replace it atomically so its cancellation callback
+                # hands the client slot to current work instead of disconnecting.
+                self.request_initial_job_delivery(client)
+            return False
         with self.lock:
             self._ensure_initial_job_state()
             initial_pending = client in self.pending_initial_jobs
@@ -8861,8 +8878,13 @@ class PrismCoordinator:
         if not self.stop_event.is_set() and self.maybe_send_job(client, clean_jobs=True):
             return True
         with self.lock:
-            if client.pending_share_difficulty == target:
+            if (
+                client.pending_share_difficulty == target
+                and int(getattr(client, "difficulty_generation", 0))
+                == advertised_generation
+            ):
                 client.pending_share_difficulty = prior_pending
+                client.difficulty_generation = prior_generation
         return False
 
     def normalized_prior_balances(self, balances: list[dict[str, object]]) -> list[dict[str, object]]:
