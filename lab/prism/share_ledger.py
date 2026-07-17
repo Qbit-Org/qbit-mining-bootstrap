@@ -1530,6 +1530,9 @@ records AS (
     UNION ALL
     SELECT
         inserted_shares.*, payload.ordinality, true AS newly_inserted,
+        -- Data-modifying CTEs and this main query share one pre-statement
+        -- MVCC snapshot. This base-table probe cannot see inserted_shares;
+        -- only the RETURNING CTE exposes those new rows to this statement.
         NOT EXISTS (
             SELECT 1
             FROM qbit_share_ledger existing_miner
