@@ -537,6 +537,24 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
         self.assertTrue(server.tip_refresh_is_pending())
 
+    def test_payout_publication_fence_is_not_a_job_build_failure(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        server._pool_ready_latched = True
+        server._reserve_payout_state_source("payout_only")
+        server._block_payout_state_publication()
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "pending publication"):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertEqual(server.tip_refresh_client_counts["failed"], 0)
+        self.assertEqual(server.tip_refresh_client_counts["skipped"], 1)
+
     def test_successful_poll_clears_payout_pending_created_during_reconcile(self) -> None:
         server, _rpc = coordinator()
         server._ensure_tip_refresh_state()

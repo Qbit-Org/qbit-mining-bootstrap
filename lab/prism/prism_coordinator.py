@@ -1348,6 +1348,10 @@ class TemplateRefreshBlocked(RuntimeError):
     """A live template was fetched, but safe work could not be issued."""
 
 
+class _PayoutStatePublicationBlocked(TemplateRefreshBlocked):
+    """Job construction is waiting for a prepared payout publication."""
+
+
 class CollectionIdentityUnavailable(TemplateRefreshBlocked):
     """Current collection work is waiting for an authorized worker identity."""
 
@@ -2290,6 +2294,43 @@ class PrismCoordinator:
             )
             return generation
 
+    def _reserve_payout_state_source_if_current(
+        self,
+        expected_source_generation: int,
+        cause: str,
+        *,
+        tip_hash: str | None = None,
+        invalidated_monotonic: float | None = None,
+    ) -> tuple[int, int, str | None, str, float] | None:
+        """Reserve and capture a source only if preparation was not superseded."""
+
+        self._ensure_job_cache_state()
+        invalidated = (
+            time.monotonic()
+            if invalidated_monotonic is None
+            else invalidated_monotonic
+        )
+        # Match publication's lock order so the returned base generation and
+        # newly reserved source form one atomic candidate identity.
+        with self._job_cache_lock:
+            with self.lock:
+                if self._payout_state_source[0] != expected_source_generation:
+                    return None
+                source_generation = expected_source_generation + 1
+                self._payout_state_source = (
+                    source_generation,
+                    tip_hash,
+                    cause,
+                    invalidated,
+                )
+                return (
+                    self._payout_state_generation,
+                    source_generation,
+                    tip_hash,
+                    cause,
+                    invalidated,
+                )
+
     def _capture_payout_state_source(
         self,
     ) -> tuple[int, int, str | None, str, float]:
@@ -2893,7 +2934,7 @@ class PrismCoordinator:
             with self._job_cache_lock:
                 publication_blocked = self._payout_state_publication_blocked
             if publication_blocked:
-                raise TemplateRefreshBlocked(
+                raise _PayoutStatePublicationBlocked(
                     "payout state invalidation is pending publication"
                 )
             if payout_state_generation is None:
@@ -4161,6 +4202,8 @@ class PrismCoordinator:
         build_started = time.monotonic()
         try:
             bundle = self.shared_job_bundle(artifacts, mode="ready")
+        except TemplateRefreshBlocked:
+            raise
         except Exception as exc:
             with self.lock:
                 self.job_build_failure_count += 1
@@ -4666,8 +4709,7 @@ class PrismCoordinator:
                         self.disconnect_client(client)
                         continue
                     except TemplateRefreshBlocked as exc:
-                        failed += 1
-                        self._record_tip_refresh_client_result("failed")
+                        self._record_tip_refresh_client_result("skipped")
                         invalidation = exc
                         cancel_pending_futures(pending)
                         continue
@@ -4936,6 +4978,11 @@ class PrismCoordinator:
                 )
                 try:
                     bundle = self.prepare_tip_refresh_bundle(snapshot)
+                except _PayoutStatePublicationBlocked:
+                    for _client in clients:
+                        self._record_tip_refresh_client_result("skipped")
+                    self._schedule_tip_refresh_retry()
+                    raise
                 except TemplateRefreshBlocked:
                     for _client in clients:
                         self._record_tip_refresh_client_result("failed")
@@ -6752,6 +6799,11 @@ class PrismCoordinator:
                 )
             else:
                 context = self.build_job_for_client(client, clean_jobs=clean_jobs)
+        except TemplateRefreshBlocked:
+            self._schedule_tip_refresh_retry()
+            if guarded_refresh or raise_on_reorg_failure or raise_on_build_failure:
+                raise
+            return False
         except Exception as exc:
             # A single bad template (e.g. a coinbase whose bytes collide with the
             # extranonce placeholder, or a transient getblocktemplate failure) must
@@ -8558,17 +8610,15 @@ class PrismCoordinator:
                     worker=worker,
                 )
                 return False
-        # Establish ordering as soon as the candidate is known active, before
-        # audit reconstruction or verification. A newer observed tip can now
-        # supersede this source while that expensive preparation is running.
+        # Capture the current source as soon as the candidate is known active.
+        # The direct-block source itself is reserved only after durable ledger
+        # confirmation: a failed audit/RPC preparation therefore cannot leave
+        # an orphaned publishable source. A newer source arriving during this
+        # expensive phase makes the conditional reservation below fail and
+        # explicitly supersedes this prepared result.
         payout_source_tip = current_tip if already_active else block_hash
         payout_preparation_started = time.monotonic()
-        self._reserve_payout_state_source(
-            "direct_block",
-            tip_hash=payout_source_tip,
-            invalidated_monotonic=payout_preparation_started,
-        )
-        direct_payout_source = self._capture_payout_state_source()
+        direct_source_preparation_token = self._capture_payout_state_source()[1]
         active_tip_height = int(self.rpc.call("getblockcount"))
         self._record_heartbeat("block_submitter")
         final_bundle = self.build_audit_bundle(
@@ -8613,7 +8663,6 @@ class PrismCoordinator:
             self._record_heartbeat("block_submitter")
             self._ensure_job_cache_state()
             with self._payout_state_prepare_lock:
-                captured_source = direct_payout_source
                 try:
                     persistence = self.ledger.persist_accepted_block(
                         block_hash=submission.block_hash_hex,
@@ -8628,6 +8677,24 @@ class PrismCoordinator:
                         active_tip_height=active_tip_height,
                     )
                     confirmed_count = int(confirmation.get("confirmed_count", 0))
+                except Exception:
+                    # A database error may be reported after a durable partial
+                    # commit. Reserve the direct source if it is still current,
+                    # then fence delivery until reconciliation proves and
+                    # publishes the resulting ledger state. Audit/RPC failures
+                    # above this transaction never create such a source.
+                    if (
+                        self._reserve_payout_state_source_if_current(
+                            direct_source_preparation_token,
+                            "direct_block",
+                            tip_hash=payout_source_tip,
+                            invalidated_monotonic=payout_preparation_started,
+                        )
+                        is None
+                    ):
+                        self._record_discarded_payout_candidate()
+                    self._block_payout_state_publication()
+                    raise
                 finally:
                     self._observe_payout_state_seconds(
                         "preparation",
@@ -8637,17 +8704,29 @@ class PrismCoordinator:
                         ),
                     )
                 if confirmed_count in {0, 1}:
+                    direct_payout_source = (
+                        self._reserve_payout_state_source_if_current(
+                            direct_source_preparation_token,
+                            "direct_block",
+                            tip_hash=payout_source_tip,
+                            invalidated_monotonic=payout_preparation_started,
+                        )
+                    )
                     # Confirmation activates carry-forward rows. A zero count
                     # is an idempotent replay, but the direct-tip source still
                     # has to cross publication unless a newer source superseded
                     # it. Persistence and confirmation stayed outside the
                     # delivery barrier in either case.
-                    payout_candidate = self._prepared_payout_state_candidate(
-                        captured_source
-                    )
-                    published = self._publish_payout_state_candidate(
-                        payout_candidate
-                    )
+                    if direct_payout_source is None:
+                        self._record_discarded_payout_candidate()
+                        published = None
+                    else:
+                        payout_candidate = self._prepared_payout_state_candidate(
+                            direct_payout_source
+                        )
+                        published = self._publish_payout_state_candidate(
+                            payout_candidate
+                        )
                     if published is None and getattr(
                         self,
                         "reorg_reconciler_enabled",
@@ -8674,8 +8753,23 @@ class PrismCoordinator:
                         # supersession result leaves the source unpublished so
                         # job builds remain fenced until the scheduled retry.
                         published = self._publish_current_payout_state_with_retry_budget(
-                            initial_attempted=True,
+                            initial_attempted=direct_payout_source is not None,
                         )
+                else:
+                    # An unexpected confirmation result is just as uncertain
+                    # as an exception after persistence: keep all delivery
+                    # fenced until reconciliation establishes the ledger state.
+                    if (
+                        self._reserve_payout_state_source_if_current(
+                            direct_source_preparation_token,
+                            "direct_block",
+                            tip_hash=payout_source_tip,
+                            invalidated_monotonic=payout_preparation_started,
+                        )
+                        is None
+                    ):
+                        self._record_discarded_payout_candidate()
+                    self._block_payout_state_publication()
             if confirmed_count not in {0, 1}:
                 self.stop_event.set()
                 self._abandon_block_candidate(

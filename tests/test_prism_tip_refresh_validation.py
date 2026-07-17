@@ -2338,7 +2338,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         )
         with server.lock:
             server.tip_template_snapshot = snapshot
-        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
         token = server._validate_prepared_tip_refresh(
             bundle,
             snapshot,
