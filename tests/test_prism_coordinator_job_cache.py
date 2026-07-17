@@ -896,9 +896,9 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIn("qbit_prism_tip_refresh_first_delivery_seconds_count 1", metrics)
         self.assertIn("qbit_prism_tip_refresh_last_delivery_seconds_count 1", metrics)
 
-    def test_ready_tip_refresh_validates_chain_once_for_one_hundred_clients(self) -> None:
+    def test_ready_tip_refresh_shares_one_bundle_across_250_clients(self) -> None:
         server, rpc = coordinator()
-        install_fake_bundle_builder(server)
+        recorded = install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
         reconciled: list[str] = []
         trust_checks = 0
@@ -917,7 +917,7 @@ class JobBundleCacheTests(unittest.TestCase):
         server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
             lambda **_kwargs: self.fail("fanout repeated current-tip validation")
         )
-        clients = [client(index + 1) for index in range(100)]
+        clients = [client(index + 1) for index in range(250)]
         sent: dict[int, list[dict[str, object]]] = {
             state.connection_id: [] for state in clients
         }
@@ -934,7 +934,12 @@ class JobBundleCacheTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
-        self.assertEqual(refreshed, 100)
+        self.assertEqual(refreshed, 250)
+        self.assertEqual(recorded["calls"], 1)
+        self.assertEqual(
+            len({id(state.active_job.bundle) for state in clients}),
+            1,
+        )
         self.assertEqual(reconciled, [rpc.tip])
         self.assertEqual(trust_checks, 2)
         # The early priority probe, snapshot coherence, pre-fanout validation,
@@ -1739,6 +1744,29 @@ class JobBuildMetricsTests(unittest.TestCase):
         self.assertIn('qbit_prism_job_cache_misses_total{cache="bundle"} 1', metrics)
         self.assertIn('qbit_prism_job_build_phase_seconds_total{phase="bundle"} 0.2', metrics)
         self.assertIn("qbit_prism_connected_clients 0", metrics)
+
+    def test_metrics_split_payout_preparation_publication_and_delivery(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+
+        self.assertEqual(server._advance_payout_state_generation(), 1)
+        self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
+
+        metrics = server.metrics_payload()
+
+        self.assertIn("qbit_prism_payout_preparation_seconds_count 1", metrics)
+        self.assertIn("qbit_prism_payout_publish_seconds_count 1", metrics)
+        self.assertIn(
+            "qbit_prism_payout_invalidation_first_delivery_seconds_count 1",
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_payout_gate_wait_seconds_count{generation="current"} 1',
+            metrics,
+        )
+        self.assertIn("qbit_prism_payout_candidates_discarded_total 0", metrics)
 
 
 if __name__ == "__main__":

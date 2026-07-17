@@ -5100,6 +5100,75 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(active_fanout.is_set())
         self.assertTrue(server._tip_refresh_retry.is_set())
 
+    def test_direct_block_preparation_does_not_hold_delivery_gate(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        entered = threading.Event()
+        release = threading.Event()
+        accepted: list[bool] = []
+        errors: list[BaseException] = []
+        block_hash = "cf" * 32
+        original_persist = ledger.persist_accepted_block
+
+        def blocking_persist(**kwargs: object) -> dict[str, object]:
+            self.assertIsNone(
+                server._payout_state_delivery_gate._mutation_owner
+            )
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("test did not release direct-block preparation")
+            return original_persist(**kwargs)
+
+        ledger.persist_accepted_block = blocking_persist  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            def submit() -> None:
+                try:
+                    accepted.append(
+                        server.submit_block_candidate(
+                            block_candidate(server, state, submission)
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            thread = threading.Thread(target=submit)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                with server._payout_state_delivery_gate.delivery_cancelable(
+                    lambda: False,
+                    generation=0,
+                ) as admission:
+                    self.assertTrue(admission)
+            finally:
+                release.set()
+                thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(accepted, [True])
+        self.assertEqual(server._payout_state_generation, 1)
+
     def test_active_ancestor_candidate_resumes_full_finalization_without_resubmit(self) -> None:
         server, state, ledger = submit_coordinator()
         with tempfile.TemporaryDirectory() as tempdir:

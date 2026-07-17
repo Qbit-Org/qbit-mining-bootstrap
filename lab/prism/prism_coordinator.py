@@ -157,6 +157,7 @@ PRISM_CTV_BROADCASTER_SECONDS_BUCKETS = (
 PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS = (1, 2, 5, 10, 25, 50, 100)
 PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
+PRISM_PAYOUT_DELIVERY_GENERATIONS = ("current", "stale", "future")
 PRISM_JOB_BUILD_PHASES = (
     "reorg",
     "template",
@@ -1004,6 +1005,40 @@ class TipRefreshValidationToken:
     snapshot: QbitTipTemplateSnapshot = field(repr=False)
 
 
+@dataclass(frozen=True)
+class PayoutStateCandidate:
+    """Immutable result of payout work prepared outside delivery admission."""
+
+    base_generation: int
+    source_generation: int
+    source_tip_hash: str | None
+    cause: str
+    invalidated_monotonic: float
+    prepared_monotonic: float
+
+
+@dataclass(frozen=True)
+class PublishedPayoutState:
+    """The payout snapshot identity to which cached jobs are stamped."""
+
+    generation: int
+    source_generation: int
+    source_tip_hash: str | None
+    published_monotonic: float
+
+
+@dataclass(frozen=True)
+class _PayoutDeliveryAdmission:
+    admitted: bool
+    wait_seconds: float
+    generation: int
+    published_generation: int
+    relation: str
+
+    def __bool__(self) -> bool:
+        return self.admitted
+
+
 class _FanoutCancellation:
     """Cancel a fanout without racing already-admitted deliveries.
 
@@ -1048,72 +1083,118 @@ class _FanoutCancellation:
 
 
 class _PayoutStateDeliveryGate:
-    """Allow parallel sends while making payout mutations exclusive."""
+    """Order delivery admission around a very short payout publication.
+
+    A publisher first closes admission and drains sends that already crossed
+    the boundary.  It does not own the atomic publication section while that
+    drain is in progress.  Once drained, publication ownership is transferred
+    to the caller for the generation/cache pointer swap only.
+    """
 
     def __init__(self) -> None:
         self._condition = threading.Condition()
         self._active_deliveries = 0
+        self._publisher_waiting = False
         self._mutation_owner: int | None = None
         self._mutation_depth = 0
+        self._published_generation = 0
+        self._priority_generation: int | None = None
+
+    @staticmethod
+    def _generation_relation(generation: int, published_generation: int) -> str:
+        if generation < published_generation:
+            return "stale"
+        if generation > published_generation:
+            return "future"
+        return "current"
 
     @contextmanager
     def delivery(self) -> Iterator[None]:
-        with self._condition:
-            while self._mutation_owner is not None:
-                self._condition.wait()
-            self._active_deliveries += 1
-        try:
+        with self.delivery_cancelable(lambda: False, priority=True) as admission:
+            if not admission:
+                raise RuntimeError("uncancelled payout delivery was not admitted")
             yield
-        finally:
-            with self._condition:
-                if self._active_deliveries <= 0:
-                    raise RuntimeError("payout delivery gate released without admission")
-                self._active_deliveries -= 1
-                if self._active_deliveries == 0:
-                    self._condition.notify_all()
 
     @contextmanager
     def delivery_cancelable(
         self,
         cancelled: Callable[[], bool],
         *,
+        generation: int | None = None,
+        priority: bool = False,
         poll_seconds: float = PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
-    ) -> Iterator[bool]:
+    ) -> Iterator[_PayoutDeliveryAdmission]:
         """Admit a delivery unless cancellation wins while mutation owns the gate."""
 
+        started = time.monotonic()
         admitted = False
         with self._condition:
-            while self._mutation_owner is not None:
+            if generation is None:
+                generation = self._published_generation
+            while True:
                 if cancelled():
                     break
+                if generation < self._published_generation:
+                    break
+                publication_blocked = (
+                    self._publisher_waiting or self._mutation_owner is not None
+                )
+                priority_blocked = (
+                    self._priority_generation is not None
+                    and generation == self._priority_generation
+                    and not priority
+                )
+                future_blocked = generation > self._published_generation
+                if (
+                    not publication_blocked
+                    and not priority_blocked
+                    and not future_blocked
+                ):
+                    self._active_deliveries += 1
+                    admitted = True
+                    break
                 self._condition.wait(timeout=poll_seconds)
-            if self._mutation_owner is None and not cancelled():
-                self._active_deliveries += 1
-                admitted = True
+            published_generation = self._published_generation
+            relation = self._generation_relation(generation, published_generation)
+            admission = _PayoutDeliveryAdmission(
+                admitted=admitted,
+                wait_seconds=max(0.0, time.monotonic() - started),
+                generation=generation,
+                published_generation=published_generation,
+                relation=relation,
+            )
         try:
-            yield admitted
+            yield admission
         finally:
             if admitted:
                 with self._condition:
                     if self._active_deliveries <= 0:
                         raise RuntimeError("payout delivery gate released without admission")
                     self._active_deliveries -= 1
+                    if priority and generation == self._priority_generation:
+                        # Keep routine same-generation sends queued until the
+                        # first prioritized current-tip socket delivery exits.
+                        self._priority_generation = None
                     if self._active_deliveries == 0:
+                        self._condition.notify_all()
+                    elif self._priority_generation is None:
                         self._condition.notify_all()
 
     @contextmanager
-    def mutation(self) -> Iterator[None]:
+    def publication(self) -> Iterator[None]:
         owner = threading.get_ident()
         with self._condition:
             if self._mutation_owner == owner:
                 self._mutation_depth += 1
             else:
-                while self._mutation_owner is not None:
+                while self._mutation_owner is not None or self._publisher_waiting:
+                    self._condition.wait()
+                self._publisher_waiting = True
+                while self._active_deliveries:
                     self._condition.wait()
                 self._mutation_owner = owner
                 self._mutation_depth = 1
-                while self._active_deliveries:
-                    self._condition.wait()
+                self._publisher_waiting = False
         try:
             yield
         finally:
@@ -1124,6 +1205,23 @@ class _PayoutStateDeliveryGate:
                 if self._mutation_depth == 0:
                     self._mutation_owner = None
                     self._condition.notify_all()
+
+    def publish_generation(self, generation: int, *, prioritize_delivery: bool) -> None:
+        owner = threading.get_ident()
+        with self._condition:
+            if self._mutation_owner != owner:
+                raise RuntimeError("payout generation published outside atomic section")
+            if generation <= self._published_generation:
+                raise RuntimeError("payout generation did not advance")
+            self._published_generation = generation
+            self._priority_generation = generation if prioritize_delivery else None
+
+    @contextmanager
+    def mutation(self) -> Iterator[None]:
+        """Compatibility alias for tests and callers that only need exclusion."""
+
+        with self.publication():
+            yield
 
 
 @dataclass(eq=False)
@@ -1995,10 +2093,57 @@ class PrismCoordinator:
             ] = OrderedDict()
         if not hasattr(self, "_payout_state_generation"):
             self._payout_state_generation = 0
+        if not hasattr(self, "_payout_state_prepare_lock"):
+            # Ledger mutations and the ledger reads used to build signed jobs
+            # share this lock. They may be expensive, but they never block
+            # delivery of an already-published immutable generation.
+            self._payout_state_prepare_lock = threading.RLock()
+        if not hasattr(self, "_payout_state_source"):
+            self._payout_state_source: tuple[int, str | None, str, float] = (
+                0,
+                None,
+                "startup",
+                time.monotonic(),
+            )
+        if not hasattr(self, "_published_payout_state"):
+            self._published_payout_state = PublishedPayoutState(
+                generation=self._payout_state_generation,
+                source_generation=0,
+                source_tip_hash=None,
+                published_monotonic=time.monotonic(),
+            )
         if not hasattr(self, "_payout_state_delivery_gate"):
             # Orders reconciliation mutations against final job-delivery
             # admission while preserving parallel sends to different miners.
             self._payout_state_delivery_gate = _PayoutStateDeliveryGate()
+        if not hasattr(self, "_payout_state_metrics_lock"):
+            self._payout_state_metrics_lock = threading.Lock()
+        if not hasattr(self, "payout_state_histograms"):
+            self.payout_state_histograms = {
+                name: {
+                    "buckets": {
+                        bucket: 0 for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS
+                    },
+                    "sum": 0.0,
+                    "count": 0,
+                }
+                for name in ("preparation", "publish", "first_delivery")
+            }
+        if not hasattr(self, "payout_gate_wait_histograms"):
+            self.payout_gate_wait_histograms = {
+                relation: {
+                    "buckets": {
+                        bucket: 0 for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS
+                    },
+                    "sum": 0.0,
+                    "count": 0,
+                }
+                for relation in PRISM_PAYOUT_DELIVERY_GENERATIONS
+            }
+        if not hasattr(self, "payout_state_candidates_discarded"):
+            self.payout_state_candidates_discarded = 0
+        if not hasattr(self, "_payout_first_delivery_pending"):
+            self._payout_first_delivery_pending: tuple[int, float] | None = None
         if not hasattr(self, "_job_build_phase_local"):
             self._job_build_phase_local = threading.local()
         if not hasattr(self, "job_cache_hit_counts"):
@@ -2044,39 +2189,223 @@ class PrismCoordinator:
         with self._job_cache_lock:
             return bundle.payout_state_generation == self._payout_state_generation
 
-    def _advance_payout_state_generation(self) -> int:
-        """Invalidate signed bundles after reconciliation mutates payout state."""
+    def _observe_payout_state_seconds(
+        self,
+        name: str,
+        elapsed_seconds: float,
+        *,
+        relation: str | None = None,
+    ) -> None:
         self._ensure_job_cache_state()
-        with self._payout_state_delivery_gate.mutation():
-            with self._job_cache_lock:
-                self._payout_state_generation += 1
-                generation = self._payout_state_generation
-                self._job_bundle_cache.clear()
-            # A concurrent refresh token binds the previous payout state.
-            # Close admission for its remaining tasks and wait for deliveries
-            # admitted before this generation boundary to finish. When no
-            # current-generation fanout exists, queue a coalesced refresh so
-            # same-tip clients cannot retain old payout work indefinitely.
-            cancelled_refresh: _FanoutCancellation | None = None
-            schedule_retry = False
+        with self._payout_state_metrics_lock:
+            if name == "gate_wait":
+                if relation not in PRISM_PAYOUT_DELIVERY_GENERATIONS:
+                    raise ValueError(f"unknown payout delivery generation: {relation}")
+                histogram = self.payout_gate_wait_histograms[str(relation)]
+            else:
+                histogram = self.payout_state_histograms[name]
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + elapsed_seconds
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
+    def _observe_payout_gate_admission(
+        self,
+        admission: object,
+        *,
+        generation: int,
+        fallback_wait_seconds: float,
+    ) -> None:
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            published_generation = self._payout_state_generation
+        relation = getattr(admission, "relation", None)
+        if relation not in PRISM_PAYOUT_DELIVERY_GENERATIONS:
+            relation = _PayoutStateDeliveryGate._generation_relation(
+                generation,
+                published_generation,
+            )
+        wait_seconds = float(
+            getattr(admission, "wait_seconds", fallback_wait_seconds)
+        )
+        self._observe_payout_state_seconds(
+            "gate_wait",
+            max(0.0, wait_seconds),
+            relation=relation,
+        )
+
+    def _reserve_payout_state_source(
+        self,
+        cause: str,
+        *,
+        tip_hash: str | None = None,
+        invalidated_monotonic: float | None = None,
+    ) -> int:
+        self._ensure_job_cache_state()
+        invalidated = (
+            time.monotonic()
+            if invalidated_monotonic is None
+            else invalidated_monotonic
+        )
+        with self.lock:
+            generation = self._payout_state_source[0] + 1
+            self._payout_state_source = (
+                generation,
+                tip_hash,
+                cause,
+                invalidated,
+            )
+            return generation
+
+    def _capture_payout_state_source(
+        self,
+    ) -> tuple[int, int, str | None, str, float]:
+        self._ensure_job_cache_state()
+        with self.lock:
+            source_generation, source_tip, cause, invalidated = (
+                self._payout_state_source
+            )
+        with self._job_cache_lock:
+            base_generation = self._payout_state_generation
+        return (
+            base_generation,
+            source_generation,
+            source_tip,
+            cause,
+            invalidated,
+        )
+
+    @staticmethod
+    def _prepared_payout_state_candidate(
+        captured: tuple[int, int, str | None, str, float],
+    ) -> PayoutStateCandidate:
+        base_generation, source_generation, source_tip, cause, invalidated = captured
+        return PayoutStateCandidate(
+            base_generation=base_generation,
+            source_generation=source_generation,
+            source_tip_hash=source_tip,
+            cause=cause,
+            invalidated_monotonic=invalidated,
+            prepared_monotonic=time.monotonic(),
+        )
+
+    def _current_payout_state_candidate(self) -> PayoutStateCandidate:
+        return self._prepared_payout_state_candidate(
+            self._capture_payout_state_source()
+        )
+
+    def _record_discarded_payout_candidate(self) -> None:
+        self._ensure_job_cache_state()
+        with self._payout_state_metrics_lock:
+            self.payout_state_candidates_discarded += 1
+
+    def _publish_payout_state_candidate(
+        self,
+        candidate: PayoutStateCandidate,
+    ) -> int | None:
+        """Publish a prepared candidate, or reject it if its source moved."""
+
+        self._ensure_job_cache_state()
+        published_generation: int | None = None
+        schedule_retry = False
+        active_to_cancel: _FanoutCancellation | None = None
+        publish_started = 0.0
+        with self._job_cache_lock:
             with self.lock:
-                self._retained_collection_refresh = None
-                active = getattr(self, "_active_tip_refresh", None)
-                if active is None:
-                    schedule_retry = True
-                elif active[0].payout_state_generation < generation:
-                    active[1].cancel()
-                    cancelled_refresh = active[1]
-                    schedule_retry = True
-            if cancelled_refresh is not None:
-                cancelled_refresh.set()
-            if schedule_retry:
-                # Payout-only invalidation can happen without a new tip
-                # observation. Advertise the queued refresh immediately so
-                # CTV maintenance yields until blockpoll claims this signal.
-                self._mark_tip_refresh_pending(generation)
-                self._schedule_tip_refresh_retry()
-        return generation
+                if (
+                    candidate.source_generation != self._payout_state_source[0]
+                    or candidate.base_generation != self._payout_state_generation
+                ):
+                    self._record_discarded_payout_candidate()
+                    return None
+        with self._payout_state_delivery_gate.publication():
+            # publication() has already drained admitted old sends. Start the
+            # critical-section timer only now; drain latency is delivery wait,
+            # not time spent holding the atomic payout mutation section.
+            publish_started = time.monotonic()
+            with self._job_cache_lock:
+                with self.lock:
+                    source_generation = self._payout_state_source[0]
+                    if (
+                        candidate.source_generation == source_generation
+                        and candidate.base_generation
+                        == self._payout_state_generation
+                    ):
+                        self._payout_state_generation += 1
+                        published_generation = self._payout_state_generation
+                        self._published_payout_state = PublishedPayoutState(
+                            generation=published_generation,
+                            source_generation=candidate.source_generation,
+                            source_tip_hash=candidate.source_tip_hash,
+                            published_monotonic=publish_started,
+                        )
+                        self._job_bundle_cache.clear()
+                        self._retained_collection_refresh = None
+                        active = getattr(self, "_active_tip_refresh", None)
+                        if active is None:
+                            schedule_retry = True
+                        elif active[0].payout_state_generation < published_generation:
+                            # The payout gate itself rejects this old generation.
+                            # Signal its fanout only after atomic publication.
+                            active_to_cancel = active[1]
+                            schedule_retry = True
+                        self._payout_state_delivery_gate.publish_generation(
+                            published_generation,
+                            prioritize_delivery=True,
+                        )
+                        with self._payout_state_metrics_lock:
+                            self._payout_first_delivery_pending = (
+                                published_generation,
+                                candidate.invalidated_monotonic,
+                            )
+        self._observe_payout_state_seconds(
+            "publish",
+            max(0.0, time.monotonic() - publish_started),
+        )
+        if published_generation is None:
+            self._record_discarded_payout_candidate()
+            return None
+        if active_to_cancel is not None:
+            active_to_cancel.cancel()
+        if schedule_retry:
+            self._mark_tip_refresh_pending(published_generation)
+            self._schedule_tip_refresh_retry()
+        return published_generation
+
+    def _record_first_payout_delivery(
+        self,
+        generation: int,
+        delivered_monotonic: float,
+    ) -> None:
+        self._ensure_job_cache_state()
+        elapsed: float | None = None
+        with self._payout_state_metrics_lock:
+            pending = self._payout_first_delivery_pending
+            if pending is not None and pending[0] == generation:
+                elapsed = max(0.0, delivered_monotonic - pending[1])
+                self._payout_first_delivery_pending = None
+        if elapsed is not None:
+            self._observe_payout_state_seconds("first_delivery", elapsed)
+
+    def _advance_payout_state_generation(self) -> int:
+        """Publish a payout-only invalidation with no expensive gate work."""
+        self._ensure_job_cache_state()
+        self._reserve_payout_state_source("payout_only")
+        prepared_started = time.monotonic()
+        with self._payout_state_prepare_lock:
+            while True:
+                candidate = self._current_payout_state_candidate()
+                self._observe_payout_state_seconds(
+                    "preparation",
+                    max(0.0, time.monotonic() - prepared_started),
+                )
+                generation = self._publish_payout_state_candidate(candidate)
+                if generation is not None:
+                    return generation
+                prepared_started = time.monotonic()
 
     def observe_job_build_elapsed(self, elapsed_seconds: float, phases: dict[str, float]) -> None:
         self._ensure_job_cache_state()
@@ -2451,37 +2780,38 @@ class PrismCoordinator:
             raise CollectionIdentityUnavailable(
                 "collection-mode worker identity is temporarily unavailable"
             )
-        if payout_state_generation is None:
-            with self._job_cache_lock:
-                payout_state_generation = self._payout_state_generation
-        if key is None:
-            key = self._job_bundle_key(
-                artifacts,
-                mode=resolved_mode,
-                payout_state_generation=payout_state_generation,
-                worker=worker,
-            )
-        issued_at_ms = now_ms()
         started = time.monotonic()
-        # Bound the snapshot to a superset of the 8x reward window rather than
-        # the whole accepted history: same audit bundle and digest, but the
-        # ledger phase no longer scales with total ledger size.
-        snapshot_window_weight = (
-            PRISM_REWARD_WINDOW_MULTIPLIER
-            * PRISM_SNAPSHOT_WINDOW_MARGIN
-            * int(artifacts.network_difficulty)
-        )
-        shares: list[dict[str, object]] = (
-            [
-                record.to_prism_json()
-                for record in self.ledger.snapshot_at_job_issue(
-                    issued_at_ms, window_weight=snapshot_window_weight
+        with self._payout_state_prepare_lock:
+            if payout_state_generation is None:
+                with self._job_cache_lock:
+                    payout_state_generation = self._payout_state_generation
+            if key is None:
+                key = self._job_bundle_key(
+                    artifacts,
+                    mode=resolved_mode,
+                    payout_state_generation=payout_state_generation,
+                    worker=worker,
                 )
-            ]
-            if resolved_mode == "ready"
-            else []
-        )
-        prior_balances = self.ledger.current_prior_balances()
+            issued_at_ms = now_ms()
+            # Bound the snapshot to a superset of the 8x reward window rather
+            # than the whole accepted history: same audit bundle and digest,
+            # but the ledger phase no longer scales with total ledger size.
+            snapshot_window_weight = (
+                PRISM_REWARD_WINDOW_MULTIPLIER
+                * PRISM_SNAPSHOT_WINDOW_MARGIN
+                * int(artifacts.network_difficulty)
+            )
+            shares: list[dict[str, object]] = (
+                [
+                    record.to_prism_json()
+                    for record in self.ledger.snapshot_at_job_issue(
+                        issued_at_ms, window_weight=snapshot_window_weight
+                    )
+                ]
+                if resolved_mode == "ready"
+                else []
+            )
+            prior_balances = self.ledger.current_prior_balances()
         phases["ledger"] = phases.get("ledger", 0.0) + (time.monotonic() - started)
         started = time.monotonic()
         placeholder_suffix_hex = self.coinbase_script_sig_suffix_hex(
@@ -2932,7 +3262,13 @@ class PrismCoordinator:
     ) -> bool:
         """Atomically acknowledge pending work handled by a completed poll."""
         self._ensure_job_cache_state()
-        with self._payout_state_delivery_gate.delivery():
+        with self._payout_state_delivery_gate.delivery_cancelable(
+            lambda: self._payout_state_generation != payout_state_generation,
+            generation=payout_state_generation,
+            priority=True,
+        ) as admission:
+            if not admission:
+                return False
             with self._job_cache_lock:
                 payout_state_current = (
                     self._payout_state_generation == payout_state_generation
@@ -3963,11 +4299,18 @@ class PrismCoordinator:
                     bundle,
                     snapshot,
                     cancel_event,
-                )
+                ),
+                generation=bundle.payout_state_generation,
+                priority=True,
             ) as payout_admitted:
                 phases["payout_gate"] = max(
                     0.0,
                     time.monotonic() - payout_gate_started,
+                )
+                self._observe_payout_gate_admission(
+                    payout_admitted,
+                    generation=bundle.payout_state_generation,
+                    fallback_wait_seconds=phases["payout_gate"],
                 )
                 if not payout_admitted or self._prepared_tip_refresh_obsolete(
                     validation_token,
@@ -4053,6 +4396,10 @@ class PrismCoordinator:
                         str(context.template["previousblockhash"]),
                     )
                     delivered_monotonic = time.monotonic()
+                    self._record_first_payout_delivery(
+                        context.payout_state_generation,
+                        delivered_monotonic,
+                    )
                     if getattr(self, "hot_path_log_enabled", False):
                         print(
                             "prism coordinator: sent prepared job "
@@ -4786,6 +5133,14 @@ class PrismCoordinator:
         if same_tip:
             return True
         if tip_changed:
+            # Supersede payout preparation immediately. The preparer will
+            # discard its old immutable candidate before publication; this
+            # marker does not wait for its ledger/RPC work to finish.
+            self._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=tip_hash,
+                invalidated_monotonic=now,
+            )
             self._mark_tip_refresh_pending(observation_sequence)
             self._schedule_tip_refresh_retry()
 
@@ -5523,7 +5878,13 @@ class PrismCoordinator:
                 f"configured={configured_rate} required={required_rate} bits/1000 weight"
             )
 
-    def reconcile_prism_pool_blocks_once(self, *, tip_hash: str | None = None) -> dict[str, object]:
+    def reconcile_prism_pool_blocks_once(
+        self,
+        *,
+        tip_hash: str | None = None,
+        _force_publish: bool = False,
+        _source_reserved: bool = False,
+    ) -> dict[str, object]:
         summary: dict[str, object] = {
             "enabled": bool(getattr(self, "reorg_reconciler_enabled", True)),
             "untrusted": False,
@@ -5535,72 +5896,134 @@ class PrismCoordinator:
         if not getattr(self, "reorg_reconciler_enabled", True):
             return summary
         self._ensure_job_cache_state()
-        try:
-            if self.qbit_chain_view_untrusted():
-                with self.lock:
-                    self.reorg_reconcile_skip_count += 1
-                    self.last_reorg_reconciled_tip_hash = tip_hash
-                    self.last_reorg_reconciled_trusted = False
-                    self.last_reorg_reconciled_monotonic = time.monotonic()
-                summary["untrusted"] = True
-                return summary
-
-            active_tip_height = int(self.rpc.call("getblockcount"))
-            watch_blocks = getattr(self.ledger, "reorg_watch_blocks", None)
-            if not callable(watch_blocks):
-                return summary
-            rows = watch_blocks(active_tip_height=active_tip_height)
-            summary["watched_blocks"] = len(rows)
-
+        if not _source_reserved:
+            invalidated = time.monotonic()
+            self._reserve_payout_state_source(
+                "external_tip" if tip_hash is not None else "payout_only",
+                tip_hash=tip_hash,
+                invalidated_monotonic=invalidated,
+            )
+        with self._payout_state_prepare_lock:
+            prepared_started = time.monotonic()
+            captured_source = self._capture_payout_state_source()
+            payout_changed = False
             inactive_blocks = 0
             reactivated_blocks = 0
-            for row in rows:
-                block_height = int(row["block_height"])
-                block_hash = str(row["block_hash"]).lower()
-                chain_state = str(row.get("chain_state", ""))
-                if block_height > active_tip_height:
-                    if chain_state == "confirmed":
-                        with self._payout_state_delivery_gate.mutation():
+            matured_payouts = 0
+            try:
+                if self.qbit_chain_view_untrusted():
+                    with self.lock:
+                        self.reorg_reconcile_skip_count += 1
+                        self.last_reorg_reconciled_tip_hash = tip_hash
+                        self.last_reorg_reconciled_trusted = False
+                        self.last_reorg_reconciled_monotonic = time.monotonic()
+                    summary["untrusted"] = True
+                    if _force_publish:
+                        forced_candidate = self._prepared_payout_state_candidate(
+                            captured_source
+                        )
+                        while (
+                            self._publish_payout_state_candidate(forced_candidate)
+                            is None
+                        ):
+                            forced_candidate = self._current_payout_state_candidate()
+                    return summary
+
+                active_tip_height = int(self.rpc.call("getblockcount"))
+                watch_blocks = getattr(self.ledger, "reorg_watch_blocks", None)
+                if not callable(watch_blocks):
+                    if _force_publish:
+                        forced_candidate = self._prepared_payout_state_candidate(
+                            captured_source
+                        )
+                        while (
+                            self._publish_payout_state_candidate(forced_candidate)
+                            is None
+                        ):
+                            forced_candidate = self._current_payout_state_candidate()
+                    return summary
+                rows = watch_blocks(active_tip_height=active_tip_height)
+                summary["watched_blocks"] = len(rows)
+
+                for row in rows:
+                    block_height = int(row["block_height"])
+                    block_hash = str(row["block_hash"]).lower()
+                    chain_state = str(row.get("chain_state", ""))
+                    if block_height > active_tip_height:
+                        if chain_state == "confirmed":
                             inactive = self.ledger.mark_pool_block_inactive(
                                 block_hash=block_hash,
                                 active_tip_height=active_tip_height,
                             )
                             inactive_count = int(inactive.get("inactive_count", 0))
                             inactive_blocks += inactive_count
-                            if inactive_count:
-                                self._advance_payout_state_generation()
-                    continue
-                active_hash = str(self.rpc.call("getblockhash", [block_height])).lower()
-                on_active_chain = active_hash == block_hash
-                if on_active_chain and chain_state == "inactive":
-                    with self._payout_state_delivery_gate.mutation():
+                            payout_changed = payout_changed or bool(inactive_count)
+                        continue
+                    active_hash = str(
+                        self.rpc.call("getblockhash", [block_height])
+                    ).lower()
+                    on_active_chain = active_hash == block_hash
+                    if on_active_chain and chain_state == "inactive":
                         reactivated = self.ledger.reactivate_pool_block(
                             block_hash=block_hash,
                             active_tip_height=active_tip_height,
                         )
-                        reactivated_count = int(reactivated.get("reactivated_count", 0))
+                        reactivated_count = int(
+                            reactivated.get("reactivated_count", 0)
+                        )
                         reactivated_blocks += reactivated_count
-                        if reactivated_count:
-                            self._advance_payout_state_generation()
-                elif not on_active_chain and chain_state == "confirmed":
-                    with self._payout_state_delivery_gate.mutation():
+                        payout_changed = payout_changed or bool(reactivated_count)
+                    elif not on_active_chain and chain_state == "confirmed":
                         inactive = self.ledger.mark_pool_block_inactive(
                             block_hash=block_hash,
                             active_tip_height=active_tip_height,
                         )
                         inactive_count = int(inactive.get("inactive_count", 0))
                         inactive_blocks += inactive_count
-                        if inactive_count:
-                            self._advance_payout_state_generation()
+                        payout_changed = payout_changed or bool(inactive_count)
 
-            matured_payouts = 0
-            mark_mature = getattr(self.ledger, "mark_mature_pool_payouts", None)
-            if callable(mark_mature):
-                with self._payout_state_delivery_gate.mutation():
+                mark_mature = getattr(self.ledger, "mark_mature_pool_payouts", None)
+                if callable(mark_mature):
                     matured = mark_mature(active_tip_height=active_tip_height)
                     matured_payouts = int(matured.get("matured_count", 0))
-                    if matured_payouts:
-                        self._advance_payout_state_generation()
+                    payout_changed = payout_changed or bool(matured_payouts)
+            except Exception:
+                # Individual ledger mutations are durable. If a later RPC or
+                # reconciliation step fails, publish the completed state before
+                # releasing snapshot readers, then surface the original error.
+                if payout_changed:
+                    candidate = self._prepared_payout_state_candidate(
+                        captured_source
+                    )
+                    while self._publish_payout_state_candidate(candidate) is None:
+                        candidate = self._current_payout_state_candidate()
+                with self.lock:
+                    self.reorg_reconcile_error_count += 1
+                    self.last_reorg_reconciled_trusted = False
+                    self.last_reorg_reconciled_monotonic = time.monotonic()
+                raise
+            finally:
+                self._observe_payout_state_seconds(
+                    "preparation",
+                    max(0.0, time.monotonic() - prepared_started),
+                )
+
+            if payout_changed or _force_publish:
+                candidate = self._prepared_payout_state_candidate(captured_source)
+                if self._publish_payout_state_candidate(candidate) is None:
+                    # A newer tip/payout source arrived during preparation or
+                    # while admitted old delivery drained. Reconcile again
+                    # under the still-held preparation lock and publish only
+                    # the newest result. _force_publish covers durable changes
+                    # made by this discarded pass even if the next pass is a
+                    # no-op because those changes remain correct.
+                    with self.lock:
+                        latest_tip = self._payout_state_source[1]
+                    return self.reconcile_prism_pool_blocks_once(
+                        tip_hash=latest_tip or tip_hash,
+                        _force_publish=True,
+                        _source_reserved=True,
+                    )
 
             with self.lock:
                 self.reorg_inactive_block_count += inactive_blocks
@@ -5613,12 +6036,6 @@ class PrismCoordinator:
             summary["reactivated_blocks"] = reactivated_blocks
             summary["matured_payouts"] = matured_payouts
             return summary
-        except Exception:
-            with self.lock:
-                self.reorg_reconcile_error_count += 1
-                self.last_reorg_reconciled_trusted = False
-                self.last_reorg_reconciled_monotonic = time.monotonic()
-            raise
 
     def client_can_receive_jobs(self, client: ClientState) -> bool:
         return client.subscribed and client.authorized and client.worker is not None
@@ -6159,23 +6576,40 @@ class PrismCoordinator:
                     f"job build failed for connection {client.connection_id}"
                 ) from exc
             return False
-        # Linearize direct delivery against reconciliation. The bundle build
-        # stays outside this lock, but a generation change after it escapes is
-        # rejected before registration; reconciliation cannot mutate payout
-        # state between this check and the network send.
-        with self._payout_state_delivery_gate.delivery():
-            with self._job_cache_lock:
-                context_payout_generation = int(
-                    getattr(
-                        context,
-                        "payout_state_generation",
-                        self._payout_state_generation,
-                    )
-                )
-                payout_state_current = (
-                    context_payout_generation == self._payout_state_generation
-                )
-            if not payout_state_current:
+        # Linearize direct delivery against the immutable publication pointer.
+        # Expensive build and ledger reads happened under the preparation lock,
+        # outside this admission boundary.
+        context_payout_generation = int(
+            getattr(
+                context,
+                "payout_state_generation",
+                self._payout_state_generation,
+            )
+        )
+        with self._job_cache_lock:
+            published_tip = self._published_payout_state.source_tip_hash
+        priority_delivery = (
+            context_payout_generation == self._payout_state_generation
+            and (
+                published_tip is None
+                or str(context.template.get("previousblockhash", ""))
+                == published_tip
+            )
+        )
+        payout_gate_started = time.monotonic()
+        with self._payout_state_delivery_gate.delivery_cancelable(
+            lambda: context_payout_generation != self._payout_state_generation,
+            generation=context_payout_generation,
+            priority=priority_delivery,
+        ) as payout_admitted:
+            payout_gate_wait = max(0.0, time.monotonic() - payout_gate_started)
+            phases["payout_gate"] = phases.get("payout_gate", 0.0) + payout_gate_wait
+            self._observe_payout_gate_admission(
+                payout_admitted,
+                generation=context_payout_generation,
+                fallback_wait_seconds=payout_gate_wait,
+            )
+            if not payout_admitted:
                 self._schedule_tip_refresh_retry()
                 if guarded_refresh:
                     raise TemplateRefreshBlocked(
@@ -6217,8 +6651,13 @@ class PrismCoordinator:
             self.send_job_update(client, context.job)
             self.apply_job_difficulty(client, context.job)
             self.note_tip_work_delivered(client, str(context.template["previousblockhash"]))
+            delivered_monotonic = time.monotonic()
+            self._record_first_payout_delivery(
+                context_payout_generation,
+                delivered_monotonic,
+            )
             self._consume_retained_collection_refresh(context)
-            phases["send"] = time.monotonic() - phase_started
+            phases["send"] = delivered_monotonic - phase_started
             elapsed = time.monotonic() - started
             self.observe_job_build_elapsed(elapsed, phases)
             if getattr(self, "hot_path_log_enabled", False):
@@ -7919,6 +8358,17 @@ class PrismCoordinator:
                     worker=worker,
                 )
                 return False
+        # Establish ordering as soon as the candidate is known active, before
+        # audit reconstruction or verification. A newer observed tip can now
+        # supersede this source while that expensive preparation is running.
+        payout_source_tip = current_tip if already_active else block_hash
+        payout_preparation_started = time.monotonic()
+        self._reserve_payout_state_source(
+            "direct_block",
+            tip_hash=payout_source_tip,
+            invalidated_monotonic=payout_preparation_started,
+        )
+        direct_payout_source = self._capture_payout_state_source()
         active_tip_height = int(self.rpc.call("getblockcount"))
         self._record_heartbeat("block_submitter")
         final_bundle = self.build_audit_bundle(
@@ -7962,25 +8412,64 @@ class PrismCoordinator:
             # replay can safely repeat any step after a crash.
             self._record_heartbeat("block_submitter")
             self._ensure_job_cache_state()
-            with self._payout_state_delivery_gate.mutation():
-                persistence = self.ledger.persist_accepted_block(
-                    block_hash=submission.block_hash_hex,
-                    block_height=expected_height,
-                    parent_hash=str(context.template["previousblockhash"]),
-                    final_bundle=final_bundle,
-                    audit_report=report,
-                )
-                self._record_heartbeat("block_submitter")
-                confirmation = self.ledger.confirm_accepted_block(
-                    block_hash=block_hash,
-                    active_tip_height=active_tip_height,
-                )
-                confirmed_count = int(confirmation.get("confirmed_count", 0))
+            with self._payout_state_prepare_lock:
+                captured_source = direct_payout_source
+                try:
+                    persistence = self.ledger.persist_accepted_block(
+                        block_hash=submission.block_hash_hex,
+                        block_height=expected_height,
+                        parent_hash=str(context.template["previousblockhash"]),
+                        final_bundle=final_bundle,
+                        audit_report=report,
+                    )
+                    self._record_heartbeat("block_submitter")
+                    confirmation = self.ledger.confirm_accepted_block(
+                        block_hash=block_hash,
+                        active_tip_height=active_tip_height,
+                    )
+                    confirmed_count = int(confirmation.get("confirmed_count", 0))
+                finally:
+                    self._observe_payout_state_seconds(
+                        "preparation",
+                        max(
+                            0.0,
+                            time.monotonic() - payout_preparation_started,
+                        ),
+                    )
                 if confirmed_count in {0, 1} and confirmed_count:
-                    # Confirmation activates the newly persisted carry-forward
-                    # rows. Advance before releasing delivery admission so no
-                    # old-balance bundle can land after this durable boundary.
-                    self._advance_payout_state_generation()
+                    # Confirmation activates carry-forward rows. Publish only
+                    # their immutable generation identity under the delivery
+                    # barrier; persistence and confirmation stayed outside it.
+                    payout_candidate = self._prepared_payout_state_candidate(
+                        captured_source
+                    )
+                    published = self._publish_payout_state_candidate(
+                        payout_candidate
+                    )
+                    if published is None and getattr(
+                        self,
+                        "reorg_reconciler_enabled",
+                        True,
+                    ):
+                        with self.lock:
+                            latest_tip = self._payout_state_source[1]
+                        summary = self.reconcile_prism_pool_blocks_once(
+                            tip_hash=latest_tip,
+                            _force_publish=True,
+                            _source_reserved=True,
+                        )
+                        if summary.get("untrusted"):
+                            published = None
+                        else:
+                            published = self._payout_state_generation
+                    while published is None:
+                        # Collection-only tests disable reorg reconciliation;
+                        # production reaches this fallback only while chain
+                        # trust is closed, so no job can consume the snapshot.
+                        payout_candidate = self._current_payout_state_candidate()
+                        published = self._publish_payout_state_candidate(
+                            payout_candidate
+                        )
             if confirmed_count not in {0, 1}:
                 self.stop_event.set()
                 self._abandon_block_candidate(
@@ -8638,6 +9127,7 @@ class PrismCoordinator:
         lines.extend(self.ctv_fanout_broadcaster_metrics_lines())
         lines.extend(self.job_build_metrics_lines())
         lines.extend(self.tip_refresh_metrics_lines())
+        lines.extend(self.payout_state_metrics_lines())
         return "\n".join(lines) + "\n"
 
     def audit_artifact_metrics(self) -> dict[str, dict[str, int] | int]:
@@ -8866,6 +9356,87 @@ class PrismCoordinator:
                 "# HELP qbit_prism_connected_clients Currently connected Stratum clients.",
                 "# TYPE qbit_prism_connected_clients gauge",
                 f"qbit_prism_connected_clients {connected_clients}",
+            ]
+        )
+        return lines
+
+    def payout_state_metrics_lines(self) -> list[str]:
+        self._ensure_job_cache_state()
+        with self._payout_state_metrics_lock:
+            state_histograms = {
+                name: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
+                }
+                for name, histogram in self.payout_state_histograms.items()
+            }
+            gate_histograms = {
+                relation: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
+                }
+                for relation, histogram in self.payout_gate_wait_histograms.items()
+            }
+            discarded = self.payout_state_candidates_discarded
+
+        metric_names = {
+            "preparation": "qbit_prism_payout_preparation_seconds",
+            "publish": "qbit_prism_payout_publish_seconds",
+            "first_delivery": "qbit_prism_payout_invalidation_first_delivery_seconds",
+        }
+        descriptions = {
+            "preparation": "Payout reconciliation and candidate preparation outside delivery publication.",
+            "publish": "Atomic payout generation/cache publication gate-hold time.",
+            "first_delivery": "Payout invalidation to first delivery of the published generation.",
+        }
+        lines: list[str] = []
+        for name, metric_name in metric_names.items():
+            histogram = state_histograms[name]
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            lines.extend(
+                [
+                    f"# HELP {metric_name} {descriptions[name]}",
+                    f"# TYPE {metric_name} histogram",
+                    *[
+                        f'{metric_name}_bucket{{le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+                        for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS
+                    ],
+                    f'{metric_name}_bucket{{le="+Inf"}} {histogram["count"]}',
+                    f'{metric_name}_sum {float(histogram["sum"]):.6f}',
+                    f'{metric_name}_count {histogram["count"]}',
+                ]
+            )
+
+        gate_name = "qbit_prism_payout_gate_wait_seconds"
+        lines.extend(
+            [
+                "# HELP qbit_prism_payout_gate_wait_seconds Delivery admission wait by generation relationship to the published payout state.",
+                "# TYPE qbit_prism_payout_gate_wait_seconds histogram",
+            ]
+        )
+        for relation in PRISM_PAYOUT_DELIVERY_GENERATIONS:
+            histogram = gate_histograms[relation]
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            lines.extend(
+                [
+                    *[
+                        f'{gate_name}_bucket{{generation="{relation}",le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+                        for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS
+                    ],
+                    f'{gate_name}_bucket{{generation="{relation}",le="+Inf"}} {histogram["count"]}',
+                    f'{gate_name}_sum{{generation="{relation}"}} {float(histogram["sum"]):.6f}',
+                    f'{gate_name}_count{{generation="{relation}"}} {histogram["count"]}',
+                ]
+            )
+        lines.extend(
+            [
+                "# HELP qbit_prism_payout_candidates_discarded_total Prepared payout candidates discarded after source supersession.",
+                "# TYPE qbit_prism_payout_candidates_discarded_total counter",
+                f"qbit_prism_payout_candidates_discarded_total {discarded}",
             ]
         )
         return lines
