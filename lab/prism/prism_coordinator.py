@@ -4540,11 +4540,22 @@ class PrismCoordinator:
 
     def _run_initial_job(self, request: PendingInitialJob) -> bool:
         """Prepare outside client locks, then atomically stamp and send current work."""
+        retry_delay = 0.05
+        last_failure_log_monotonic: float | None = None
+
+        def retry_later() -> bool:
+            nonlocal retry_delay
+            request.cancelled.wait(retry_delay)
+            retry_delay = min(1.0, retry_delay * 2)
+            return not self._initial_request_cancelled(request)
+
         try:
             while not self._initial_request_cancelled(request):
                 try:
                     if not self.ensure_reorg_reconciled_for_current_tip():
-                        return False
+                        if not retry_later():
+                            return False
+                        continue
                     artifacts = self.current_template_artifacts()
                     if self._initial_request_cancelled(request):
                         return False
@@ -4565,9 +4576,13 @@ class PrismCoordinator:
                 except _JobBuildCancelled:
                     if self._initial_request_cancelled(request):
                         return False
+                    if not retry_later():
+                        return False
                     continue
                 except TemplateRefreshBlocked:
                     if self._initial_request_cancelled(request):
+                        return False
+                    if not retry_later():
                         return False
                     continue
                 except Exception:
@@ -4575,13 +4590,21 @@ class PrismCoordinator:
                         self.job_build_failure_count = int(
                             getattr(self, "job_build_failure_count", 0)
                         ) + 1
-                    print(
-                        "prism coordinator: initial job preparation failed "
-                        f"connection={request.client.connection_id}",
-                        flush=True,
-                    )
-                    traceback.print_exc()
-                    return False
+                    now = time.monotonic()
+                    if (
+                        last_failure_log_monotonic is None
+                        or now - last_failure_log_monotonic >= 5.0
+                    ):
+                        last_failure_log_monotonic = now
+                        print(
+                            "prism coordinator: initial job preparation failed "
+                            f"connection={request.client.connection_id}; retrying",
+                            flush=True,
+                        )
+                        traceback.print_exc()
+                    if not retry_later():
+                        return False
+                    continue
                 delivered = self._deliver_initial_bundle(request, artifacts, bundle)
                 if delivered is None:
                     continue

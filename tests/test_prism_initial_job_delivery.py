@@ -67,6 +67,47 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             ],
         )
 
+    def test_initial_delivery_retries_transient_reorg_and_build_failures(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.prewarm_current_tip_ready_bundle()
+        state = client(1)
+        state.authorization_generation = 1
+        state.authorized_monotonic = time.monotonic()
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+
+        reorg_attempts = 0
+
+        def transient_reorg() -> bool:
+            nonlocal reorg_attempts
+            reorg_attempts += 1
+            return reorg_attempts > 1
+
+        artifact_attempts = 0
+        original_artifacts = server.current_template_artifacts
+
+        def transient_artifacts() -> object:
+            nonlocal artifact_attempts
+            artifact_attempts += 1
+            if artifact_attempts == 1:
+                raise RuntimeError("temporary template failure")
+            return original_artifacts()
+
+        server.ensure_reorg_reconciled_for_current_tip = transient_reorg  # type: ignore[method-assign]
+        server.current_template_artifacts = transient_artifacts  # type: ignore[method-assign]
+
+        server.request_initial_job_delivery(state)
+        try:
+            wait_until(lambda: state.active_job is not None)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(reorg_attempts, 3)
+        self.assertEqual(artifact_attempts, 2)
+        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertIn(state, server.clients)
+
     def test_250_client_reconnect_storm_uses_one_build_without_client_locks(self) -> None:
         server, _rpc = coordinator()
         recorded = install_fake_bundle_builder(server)
