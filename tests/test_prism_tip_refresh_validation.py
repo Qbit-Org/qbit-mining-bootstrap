@@ -349,6 +349,167 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(server.payout_state_candidates_discarded, 1)
         self.assertEqual(server._published_payout_state.source_tip_hash, new_tip)
 
+    def test_supersession_retry_preserves_durable_reorg_counts(self) -> None:
+        new_tip = "78" * 32
+
+        class SupersedingLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.server: object | None = None
+                self.rpc: FakeRpc | None = None
+                self.inactive_calls = 0
+
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "block_height": active_tip_height + 1,
+                        "block_hash": "bc" * 32,
+                        "chain_state": "confirmed",
+                    }
+                ]
+
+            def mark_pool_block_inactive(
+                self,
+                *,
+                block_hash: str,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                self.inactive_calls += 1
+                if self.inactive_calls == 1:
+                    assert self.server is not None
+                    assert self.rpc is not None
+                    _advance_fake_tip(self.rpc, new_tip, 11)
+                    self.server._reserve_payout_state_source(  # type: ignore[attr-defined]
+                        "external_tip",
+                        tip_hash=new_tip,
+                    )
+                    return {"inactive_count": 1}
+                return {"inactive_count": 0}
+
+            def mark_mature_pool_payouts(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                return {"matured_count": 0}
+
+        ledger = SupersedingLedger()
+        server, rpc = coordinator(ledger=ledger)
+        ledger.server = server
+        ledger.rpc = rpc
+        server.reorg_reconciler_enabled = True
+        old_tip = rpc.tip
+
+        summary = server.reconcile_prism_pool_blocks_once(tip_hash=old_tip)
+
+        self.assertEqual(ledger.inactive_calls, 2)
+        self.assertEqual(summary["inactive_blocks"], 1)
+        self.assertEqual(server.reorg_inactive_block_count, 1)
+        self.assertEqual(summary["published_generation"], 1)
+        self.assertEqual(server.payout_state_candidates_discarded, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, new_tip)
+
+    def test_failed_superseded_reconcile_does_not_publish_latest_source(self) -> None:
+        newer_tip = "79" * 32
+
+        class FailingSupersededLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.server: object | None = None
+
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "block_height": active_tip_height + 1,
+                        "block_hash": "bd" * 32,
+                        "chain_state": "confirmed",
+                    }
+                ]
+
+            def mark_pool_block_inactive(
+                self,
+                *,
+                block_hash: str,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                assert self.server is not None
+                self.server._reserve_payout_state_source(  # type: ignore[attr-defined]
+                    "external_tip",
+                    tip_hash=newer_tip,
+                )
+                return {"inactive_count": 1}
+
+            def mark_mature_pool_payouts(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                raise RuntimeError("maturity RPC failed")
+
+        ledger = FailingSupersededLedger()
+        server, rpc = coordinator(ledger=ledger)
+        ledger.server = server
+        server.reorg_reconciler_enabled = True
+
+        with self.assertRaisesRegex(RuntimeError, "maturity RPC failed"):
+            server.reconcile_prism_pool_blocks_once(tip_hash=rpc.tip)
+
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertIsNone(server._published_payout_state.source_tip_hash)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertEqual(server.payout_state_candidates_discarded, 1)
+        self.assertEqual(server.reorg_inactive_block_count, 1)
+        self.assertTrue(server.tip_refresh_is_pending())
+
+    def test_tip_churn_bounds_reconcile_retries_and_fences_job_builds(self) -> None:
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.payout_reconcile_supersession_retries = 2
+        server.qbit_chain_view_untrusted = lambda: True  # type: ignore[method-assign]
+        real_publish = server._publish_payout_state_candidate
+        publish_attempts = 0
+
+        def supersede_before_publish(candidate: object) -> int | None:
+            nonlocal publish_attempts
+            publish_attempts += 1
+            newer_tip = f"{publish_attempts + 1:064x}"
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=newer_tip,
+            )
+            return real_publish(candidate)  # type: ignore[arg-type]
+
+        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+
+        summary = server.reconcile_prism_pool_blocks_once(
+            tip_hash=rpc.tip,
+            _force_publish=True,
+        )
+
+        self.assertTrue(summary["superseded"])
+        self.assertEqual(publish_attempts, 3)
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertEqual(server.payout_state_candidates_discarded, 3)
+        self.assertTrue(server._payout_state_publication_blocked)
+        state = client(1)
+        assert state.worker is not None
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "pending publication",
+        ):
+            server.build_shared_job_bundle(
+                server.current_template_artifacts(),
+                state.worker,
+            )
+
     def test_published_generation_prioritizes_current_tip_over_waiters(self) -> None:
         gate = _PayoutStateDeliveryGate()
         active_entered = threading.Event()
