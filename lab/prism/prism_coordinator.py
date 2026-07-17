@@ -8863,9 +8863,14 @@ class PrismCoordinator:
             ctv_fee_parent_hash=str(context.template["previousblockhash"]),
             canonical_output_path=candidate_bundle_path,
         )
+        persistence_canonical_bundle_path = (
+            candidate_bundle_path if candidate_bundle_path.exists() else None
+        )
         # Tests and alternate builders may not implement the optional canonical
-        # output yet.  Production's Rust builder always creates it.
-        if not candidate_bundle_path.exists():
+        # output yet. Their Python-serialized fallback is valid verifier input,
+        # but it must not be labeled canonical during persistence: the ledger
+        # will canonicalize final_bundle itself on this compatibility path.
+        if persistence_canonical_bundle_path is None:
             candidate_bundle_path = self.write_temporary_audit_bundle(
                 final_bundle,
                 block_hash=submission.block_hash_hex,
@@ -8918,7 +8923,7 @@ class PrismCoordinator:
                         parent_hash=str(context.template["previousblockhash"]),
                         final_bundle=final_bundle,
                         audit_report=report,
-                        canonical_bundle_path=candidate_bundle_path,
+                        canonical_bundle_path=persistence_canonical_bundle_path,
                     )
                     self._record_heartbeat("block_submitter")
                     confirmation = self.ledger.confirm_accepted_block(

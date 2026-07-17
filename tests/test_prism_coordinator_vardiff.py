@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import queue
@@ -5197,28 +5198,60 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             witness_tx = synthetic_witness_transaction("44")
             server.jobs["job-1"].job.transaction_hexes = (witness_tx,)
             build_kwargs: list[dict[str, object]] = []
-
-            def fake_build_audit_bundle(**kwargs: object) -> dict[str, object]:
-                build_kwargs.append(kwargs)
-                return {
-                "found_block": {"coinbase_value_sats": 50_00000000},
-                "ledger_window_attestation": {"signature": {"public_key_hex": "aa" * 32}},
-                "payout_policy_manifest": {"accounts": []},
+            # Deliberately use insertion order that differs from this fixture's
+            # stand-in canonical serialization. The alternate builder ignores
+            # canonical_output_path, so the coordinator must treat its Python
+            # fallback as verifier input only.
+            alternate_bundle = {
                 "signed_coinbase_manifest": {
                     "manifest": {
                         "coinbase_tx_hex": "c0ffee",
                         "payout_count": 1,
                     }
                 },
+                "payout_policy_manifest": {"accounts": []},
+                "ledger_window_attestation": {"signature": {"public_key_hex": "aa" * 32}},
+                "found_block": {"coinbase_value_sats": 50_00000000},
+            }
+            canonical_bytes = json.dumps(
+                alternate_bundle,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+
+            def fake_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+                build_kwargs.append(kwargs)
+                return alternate_bundle
+
+            def fake_verify_bundle(bundle_path: Path, *_args: object, **_kwargs: object) -> dict[str, object]:
+                fallback_bytes = bundle_path.read_bytes()
+                self.assertEqual(json.loads(fallback_bytes), alternate_bundle)
+                self.assertNotEqual(fallback_bytes, canonical_bytes)
+                self.assertNotEqual(
+                    hashlib.sha256(fallback_bytes).hexdigest(),
+                    canonical_sha256,
+                )
+                return {
+                    "coinbase_txid": "11" * 32,
+                    "coinbase_manifest_sha256_hex": "22" * 32,
+                    "audit_bundle_sha256_hex": canonical_sha256,
+                    "coinbase_tx_hex": "c0ffee",
                 }
 
+            persist_accepted_block = ledger.persist_accepted_block
+
+            def persist_with_canonicalization(**kwargs: object) -> dict[str, object]:
+                self.assertIsNone(kwargs["canonical_bundle_path"])
+                self.assertEqual(kwargs["final_bundle"], alternate_bundle)
+                report = kwargs["audit_report"]
+                assert isinstance(report, dict)
+                self.assertEqual(report["audit_bundle_sha256_hex"], canonical_sha256)
+                return persist_accepted_block(**kwargs)
+
             server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
-            server.verify_bundle = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
-                "coinbase_txid": "11" * 32,
-                "coinbase_manifest_sha256_hex": "22" * 32,
-                "audit_bundle_sha256_hex": "33" * 32,
-                "coinbase_tx_hex": "c0ffee",
-            }
+            server.verify_bundle = fake_verify_bundle  # type: ignore[method-assign]
+            ledger.persist_accepted_block = persist_with_canonicalization  # type: ignore[method-assign]
             submission = SimpleNamespace(
                 coinbase_tx_hex="c0ffee",
                 block_hash_hex=block_hash,
@@ -5239,7 +5272,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertEqual(envelope["schema"], "qbit.prism.live-audit-bundle-envelope.v1")
             self.assertEqual(envelope["block_hash"], block_hash)
             self.assertEqual(envelope["block_height"], 10)
-            self.assertEqual(envelope["audit_bundle_sha256"], "33" * 32)
+            self.assertEqual(envelope["audit_bundle_sha256"], canonical_sha256)
             self.assertNotIn("signed_coinbase_manifest", envelope)
             self.assertEqual(server.latest_evidence["audit_bundle_path"], str(live_files[0]))
 
@@ -5255,6 +5288,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.persisted[0]["block_hash"], block_hash)
         self.assertEqual(ledger.persisted[0]["block_height"], 10)
         self.assertTrue(ledger.persisted[0]["submit_seen_at_persist"])
+        # This alternate test builder ignores canonical_output_path. Its
+        # Python JSON fallback is verifier input only, never a claimed
+        # byte-canonical artifact for ledger persistence.
+        self.assertIsNone(ledger.persisted[0]["canonical_bundle_path"])
         self.assertEqual(server._payout_state_generation, 1)
         self.assertEqual(server._job_bundle_cache, {})
         self.assertTrue(active_fanout.is_set())
