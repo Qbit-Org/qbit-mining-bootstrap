@@ -494,6 +494,34 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIsNotNone(server.last_successful_template_refresh_monotonic)
         self.assertFalse(server.tip_refresh_is_pending())
 
+    def test_failed_poll_preserves_pending_signal_until_successful_retry(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+        pending_token = server._mark_tip_refresh_pending("seed")
+
+        def fail_reconciliation(_tip_hash: str) -> bool:
+            server._schedule_tip_refresh_retry()
+            raise RuntimeError("ledger unavailable")
+
+        server.ensure_reorg_reconciled_for_tip = fail_reconciliation  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "qbit reorg reconciliation failed",
+        ):
+            server.poll_qbit_tip_template_once()
+
+        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server.tip_refresh_is_pending())
+        self.assertEqual(server._tip_refresh_pending_token, pending_token)
+
+        # Model blockpoll claiming the immediate wake and completing the retry.
+        server._tip_refresh_retry.clear()
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertFalse(server.tip_refresh_is_pending())
+
     def test_completed_refresh_cannot_clear_newer_payout_pending(self) -> None:
         server, _rpc = coordinator()
         snapshot = server.fetch_qbit_tip_template_snapshot()

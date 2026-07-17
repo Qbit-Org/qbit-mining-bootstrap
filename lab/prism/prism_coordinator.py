@@ -4139,8 +4139,6 @@ class PrismCoordinator:
             self.last_successful_template_refresh_monotonic = time.monotonic()
             return refreshed
         finally:
-            if pending_signal_token is not None:
-                self._clear_tip_refresh_pending(pending_signal_token)
             self._tip_refresh_lock.release()
             self._observe_tip_refresh_seconds(
                 "refresh",
