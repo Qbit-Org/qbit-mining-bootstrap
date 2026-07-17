@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
 
 from lab.prism.prism_coordinator import (
@@ -186,6 +187,89 @@ class RepresentativeIndependentRefreshTests(unittest.TestCase):
         self.assertIsNotNone(authorized.active_job)
         assert authorized.active_job is not None and retained is not None
         self.assertTrue(authorized.active_job.collection_only)
+        self.assertIs(
+            authorized.active_job.template,
+            retained.snapshot.template_artifacts.template,
+        )
+
+    def test_authorization_during_same_tip_publication_keeps_retained_wake(
+        self,
+    ) -> None:
+        server, rpc = coordinator(ledger=FakeLedger(miners=["solo"]))
+        recorded = install_fake_bundle_builder(server)
+        server.template_cache_seconds = 0.0
+        server.clients = set()
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        retained = server._retained_collection_refresh
+        self.assertIsNotNone(retained)
+        self.assertEqual(rpc.count("getblocktemplate"), 1)
+        server._tip_refresh_retry.clear()
+
+        publication_window = threading.Event()
+        release_publication = threading.Event()
+        original_observe_tip = server.observe_tip_first_seen
+
+        def pause_after_same_tip_observation(
+            *args: object,
+            **kwargs: object,
+        ) -> bool:
+            observed = original_observe_tip(*args, **kwargs)
+            if kwargs.get("publish_refresh_observation"):
+                publication_window.set()
+                self.assertTrue(release_publication.wait(5.0))
+            return observed
+
+        server.observe_tip_first_seen = pause_after_same_tip_observation  # type: ignore[method-assign]
+        poll_results: list[int] = []
+        poll_errors: list[BaseException] = []
+
+        def poll_same_tip() -> None:
+            try:
+                poll_results.append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # pragma: no cover - asserted below
+                poll_errors.append(exc)
+
+        poll_thread = threading.Thread(target=poll_same_tip)
+        poll_thread.start()
+        authorized = client(2)
+        sent: list[dict[str, object]] = []
+        authorized.send = sent.append  # type: ignore[method-assign]
+        try:
+            self.assertTrue(publication_window.wait(5.0))
+            with server.lock:
+                server.clients.add(authorized)
+            server._note_collection_identity_available(authorized)
+
+            self.assertTrue(server.tip_refresh_is_pending())
+            self.assertTrue(server._tip_refresh_retry.is_set())
+            self.assertTrue(server.maybe_send_job(authorized, clean_jobs=True))
+            self.assertEqual(rpc.count("getblocktemplate"), 2)
+            self.assertEqual(recorded["calls"], 1)
+        finally:
+            release_publication.set()
+            poll_thread.join(5.0)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(poll_thread.is_alive())
+        self.assertEqual(poll_errors, [])
+        self.assertEqual(poll_results, [0])
+        self.assertFalse(server.tip_refresh_is_pending())
+        self.assertTrue(server._tip_refresh_retry.is_set())
+        current_artifacts = server._retained_collection_artifacts()
+        self.assertIsNotNone(current_artifacts)
+        published_snapshot = server.tip_template_snapshot
+        assert current_artifacts is not None and published_snapshot is not None
+        self.assertIs(
+            current_artifacts,
+            published_snapshot.template_artifacts,
+        )
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertIsNotNone(authorized.active_job)
+        assert authorized.active_job is not None and retained is not None
         self.assertIs(
             authorized.active_job.template,
             retained.snapshot.template_artifacts.template,

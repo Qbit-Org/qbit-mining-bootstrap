@@ -2785,7 +2785,14 @@ class PrismCoordinator:
             )
 
     def _retained_collection_artifacts(self) -> CachedTemplateArtifacts | None:
-        """Return retained exact artifacts only while their generation is current."""
+        """Return retained artifacts while their published work stays current.
+
+        A same-tip poll advances its observation sequence before atomically
+        replacing ``tip_template_snapshot``. The published snapshot remains
+        reusable on both sides of that handoff even if the retained marker has
+        not yet been updated; a new tip or payout generation still invalidates
+        it immediately.
+        """
         self._ensure_job_cache_state()
         self._ensure_tip_refresh_state()
         with self._job_cache_lock:
@@ -2796,12 +2803,15 @@ class PrismCoordinator:
                 return None
             if retained.payout_state_generation != payout_state_generation:
                 return None
-            if not self._tip_refresh_snapshot_current_locked(
-                retained.snapshot,
-                retained.observation_sequence,
+            current_tip = getattr(self, "current_tip_first_seen", None)
+            published_snapshot = self.tip_template_snapshot
+            if (
+                published_snapshot is None
+                or current_tip is None
+                or current_tip[0] != published_snapshot.bestblockhash
             ):
                 return None
-            return self._tip_refresh_artifacts(retained.snapshot)
+            return self._tip_refresh_artifacts(published_snapshot)
 
     def _retain_current_collection_refresh_if_unrepresented(self) -> None:
         """Keep the last published collection work when the fleet empties."""
