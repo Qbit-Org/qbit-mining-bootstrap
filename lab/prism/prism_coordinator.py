@@ -2381,8 +2381,9 @@ class PrismCoordinator:
         Concurrent callers needing the same missing entry single-flight behind
         the build lock: the first one pays for the ledger snapshot and the
         signed audit bundle, the rest reuse it. Mode is resolved before cache
-        lookup: ready work has no representative input, while collection work
-        requires and is isolated by its payout identity.
+        lookup and again immediately before a build after lock admission:
+        ready work has no representative input, while collection work requires
+        and is isolated by its payout identity.
         """
         self._ensure_job_cache_state()
         while True:
@@ -2414,6 +2415,11 @@ class PrismCoordinator:
                     self._record_job_cache_event("bundle", hit=True)
                     assert cached is not None
                     return self._bind_cached_bundle_to_artifacts(cached, artifacts)
+                # Readiness can latch while this caller waits behind another
+                # expensive build. Re-select the mode and its cache key instead
+                # of issuing collection-only work after the pool became ready.
+                if self._job_bundle_mode(mode) != resolved_mode:
+                    continue
                 self._record_job_cache_event("bundle", hit=False)
                 built = self.build_shared_job_bundle(
                     artifacts,

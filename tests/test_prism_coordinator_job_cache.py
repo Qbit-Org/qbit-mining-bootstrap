@@ -419,6 +419,51 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(bundle.payout_state_generation, 1)
         self.assertIs(cached, bundle)
 
+    def test_readiness_latch_during_build_lock_wait_reselects_ready_mode(self) -> None:
+        ledger = FakeLedger(miners=["solo"])
+        server, rpc = coordinator(ledger=ledger)
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None
+        first_mode_resolved = threading.Event()
+        original_job_bundle_mode = server._job_bundle_mode
+        mode_calls = 0
+
+        def record_mode_resolution(requested_mode: str | None) -> str:
+            nonlocal mode_calls
+            resolved = original_job_bundle_mode(requested_mode)
+            mode_calls += 1
+            if mode_calls == 1:
+                first_mode_resolved.set()
+            return resolved
+
+        server._job_bundle_mode = record_mode_resolution  # type: ignore[method-assign]
+        bundles: list[object] = []
+        errors: list[BaseException] = []
+
+        def build_bundle() -> None:
+            try:
+                bundles.append(server.shared_job_bundle(artifacts, worker()))
+            except BaseException as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+
+        with server._job_build_lock:
+            build_thread = threading.Thread(target=build_bundle)
+            build_thread.start()
+            self.assertTrue(first_mode_resolved.wait(2.0))
+            ledger.miners = ["miner-a", "miner-b", "miner-c"]
+
+        build_thread.join(2.0)
+
+        self.assertFalse(build_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(bundles), 1)
+        bundle = bundles[0]
+        self.assertFalse(bundle.collection_only)  # type: ignore[union-attr]
+        self.assertEqual(recorded["calls"], 1)
+        self.assertEqual(ledger.snapshot_calls, 1)
+
     def test_payout_generation_advance_does_not_cancel_new_generation_fanout(self) -> None:
         server, _rpc = coordinator()
         server._ensure_tip_refresh_state()
