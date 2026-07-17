@@ -2759,6 +2759,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(server.ensure_reorg_reconciled_for_tip(tip))
 
         self.assertEqual(ledger.events, [("watch", 10), ("mature", 10), ("watch", 10), ("mature", 10)])
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_source[0], 1)
 
     def test_reconciliation_reactivates_inactive_block_that_returns_to_active_chain(self) -> None:
         pool_block_hash = "cc" * 32
@@ -5099,6 +5101,376 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server._job_bundle_cache, {})
         self.assertTrue(active_fanout.is_set())
         self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_direct_block_preparation_does_not_hold_delivery_gate(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        entered = threading.Event()
+        release = threading.Event()
+        accepted: list[bool] = []
+        errors: list[BaseException] = []
+        block_hash = "cf" * 32
+        original_persist = ledger.persist_accepted_block
+
+        def blocking_persist(**kwargs: object) -> dict[str, object]:
+            self.assertIsNone(
+                server._payout_state_delivery_gate._mutation_owner
+            )
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("test did not release direct-block preparation")
+            return original_persist(**kwargs)
+
+        ledger.persist_accepted_block = blocking_persist  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            def submit() -> None:
+                try:
+                    accepted.append(
+                        server.submit_block_candidate(
+                            block_candidate(server, state, submission)
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            thread = threading.Thread(target=submit)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                with server._payout_state_delivery_gate.delivery_cancelable(
+                    lambda: False,
+                    generation=0,
+                ) as admission:
+                    self.assertTrue(admission)
+                    release.set()
+                    with server._payout_state_delivery_gate._condition:
+                        self.assertTrue(
+                            server._payout_state_delivery_gate._condition.wait_for(
+                                lambda: (
+                                    server._payout_state_delivery_gate._publisher_waiting
+                                ),
+                                timeout=5,
+                            )
+                        )
+                    self.assertTrue(
+                        server._payout_state_prepare_lock.acquire(timeout=1)
+                    )
+                    server._payout_state_prepare_lock.release()
+            finally:
+                release.set()
+                thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(accepted, [True])
+        self.assertEqual(server._payout_state_generation, 1)
+
+    def test_failed_direct_block_audit_does_not_reserve_payout_source(self) -> None:
+        for failure_phase in ("build", "verify"):
+            with self.subTest(failure_phase=failure_phase):
+                server, state, ledger = submit_coordinator()
+                server._ensure_job_cache_state()
+                initial_source = server._payout_state_source
+                initial_published = server._published_payout_state
+                block_hash = "ce" * 32
+                server.rpc = SubmitRpc(
+                    tip="00" * 32,
+                    block_hash=block_hash,
+                    ledger=ledger,
+                )
+                submission = SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                )
+
+                with tempfile.TemporaryDirectory() as tempdir:
+                    server.audit_dir = Path(tempdir)
+                    server.ledger_writer_public_key_hex = "aa" * 32
+                    if failure_phase == "build":
+                        server.build_audit_bundle = (  # type: ignore[method-assign]
+                            lambda **_kwargs: (_ for _ in ()).throw(
+                                RuntimeError("audit reconstruction failed")
+                            )
+                        )
+                    else:
+                        server.build_audit_bundle = (  # type: ignore[method-assign]
+                            lambda **_kwargs: verified_block_bundle()
+                        )
+                        server.verify_bundle = (  # type: ignore[method-assign]
+                            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                                RuntimeError("audit verification failed")
+                            )
+                        )
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "audit (reconstruction|verification) failed",
+                    ):
+                        server.submit_block_candidate(
+                            block_candidate(server, state, submission)
+                        )
+
+                self.assertEqual(server._payout_state_source, initial_source)
+                self.assertEqual(server._published_payout_state, initial_published)
+                self.assertEqual(server._payout_state_generation, 0)
+                self.assertEqual(ledger.persisted, [])
+
+    def test_uncertain_direct_block_ledger_commit_fences_delivery(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        block_hash = "cd" * 32
+        server.rpc = SubmitRpc(
+            tip="00" * 32,
+            block_hash=block_hash,
+            ledger=ledger,
+        )
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+        ledger.confirm_accepted_block = (  # type: ignore[method-assign]
+            lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("ledger confirmation unavailable")
+            )
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.ledger_writer_public_key_hex = "aa" * 32
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ledger confirmation unavailable",
+            ):
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+
+        self.assertEqual(len(ledger.persisted), 1)
+        self.assertEqual(server._payout_state_source[0], 1)
+        self.assertEqual(server._published_payout_state.source_generation, 0)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+
+    def test_uncertain_commit_supersedes_concurrently_published_source(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        block_hash = "cb" * 32
+        newer_tip = "dc" * 32
+        server.rpc = SubmitRpc(
+            tip="00" * 32,
+            block_hash=block_hash,
+            ledger=ledger,
+        )
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+
+        def publish_newer_source_then_fail(**_kwargs: object) -> dict[str, object]:
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=newer_tip,
+            )
+            self.assertEqual(
+                server._publish_payout_state_candidate(
+                    server._current_payout_state_candidate()
+                ),
+                1,
+            )
+            raise RuntimeError("ledger confirmation unavailable")
+
+        ledger.confirm_accepted_block = publish_newer_source_then_fail  # type: ignore[method-assign]
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.ledger_writer_public_key_hex = "aa" * 32
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ledger confirmation unavailable",
+            ):
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._published_payout_state.source_generation, 1)
+        self.assertEqual(server._payout_state_source[0], 2)
+        self.assertEqual(server._payout_state_source[1], newer_tip)
+        self.assertEqual(
+            server._payout_state_source[2],
+            "direct_block_uncertain",
+        )
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+
+    def test_idempotent_direct_block_confirmation_publishes_reserved_source(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        block_hash = "d0" * 32
+        ledger.confirm_accepted_block = (  # type: ignore[method-assign]
+            lambda **_kwargs: {"backend": "fake", "confirmed_count": 0}
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, block_hash)
+
+    def test_direct_block_disabled_reconciler_bounds_publish_supersession(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.payout_reconcile_supersession_retries = 2
+        block_hash = "d3" * 32
+        real_publish = server._publish_payout_state_candidate
+        publish_attempts = 0
+
+        def supersede_before_publish(candidate: object) -> int | None:
+            nonlocal publish_attempts
+            publish_attempts += 1
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=f"{publish_attempts + 20:064x}",
+            )
+            return real_publish(candidate)  # type: ignore[arg-type]
+
+        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(publish_attempts, 3)
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertTrue(server.tip_refresh_is_pending())
+
+    def test_untrusted_direct_block_reconcile_does_not_publish_twice(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.reorg_reconciler_enabled = True
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: True  # type: ignore[method-assign]
+        block_hash = "d1" * 32
+        newer_tip = "d2" * 32
+
+        def superseding_noop_confirmation(**_kwargs: object) -> dict[str, object]:
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=newer_tip,
+            )
+            return {"backend": "fake", "confirmed_count": 0}
+
+        ledger.confirm_accepted_block = superseding_noop_confirmation  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, newer_tip)
+        self.assertEqual(server.payout_state_candidates_discarded, 1)
+        self.assertEqual(server.reorg_reconcile_skip_count, 1)
 
     def test_active_ancestor_candidate_resumes_full_finalization_without_resubmit(self) -> None:
         server, state, ledger = submit_coordinator()

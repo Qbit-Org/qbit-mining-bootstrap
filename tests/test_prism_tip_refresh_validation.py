@@ -14,6 +14,7 @@ from lab.prism.prism_coordinator import (
     TemplateRefreshBlocked,
     TipRefreshValidationToken,
     _FanoutCancellation,
+    _PayoutStateDeliveryGate,
 )
 from tests.test_prism_coordinator_job_cache import (
     FakeLedger,
@@ -99,9 +100,13 @@ class ObservedPayoutGate:
         return self.delegate.delivery()  # type: ignore[attr-defined,no-any-return]
 
     @contextmanager
-    def delivery_cancelable(self, cancelled: object) -> object:
+    def delivery_cancelable(
+        self,
+        cancelled: object,
+        **kwargs: object,
+    ) -> object:
         self.delivery_wait_started.set()
-        with self.delegate.delivery_cancelable(cancelled) as admitted:  # type: ignore[attr-defined]
+        with self.delegate.delivery_cancelable(cancelled, **kwargs) as admitted:  # type: ignore[attr-defined]
             yield admitted
 
     def mutation(self) -> object:
@@ -151,6 +156,610 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertTrue(all(state.active_job is not None for state in clients))
         self.assertTrue(all(state.active_job.collection_only for state in clients))
         self.assertLessEqual(rpc.count("getbestblockhash"), 3)
+
+    def test_external_tip_preparation_does_not_hold_delivery_gate(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingExternalTipLedger(FakeLedger):
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "block_height": active_tip_height + 1,
+                        "block_hash": "aa" * 32,
+                        "chain_state": "confirmed",
+                    }
+                ]
+
+            def mark_pool_block_inactive(
+                self,
+                *,
+                block_hash: str,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                self.assert_not_atomic()
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("test did not release external-tip preparation")
+                return {"inactive_count": 1}
+
+            def mark_mature_pool_payouts(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                return {"matured_count": 0}
+
+        ledger = BlockingExternalTipLedger()
+        server, rpc = coordinator(ledger=ledger)
+        server.reorg_reconciler_enabled = True
+        server._ensure_job_cache_state()
+        ledger.assert_not_atomic = lambda: self.assertIsNone(  # type: ignore[attr-defined]
+            server._payout_state_delivery_gate._mutation_owner
+        )
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+
+        def reconcile() -> None:
+            try:
+                results.append(
+                    server.reconcile_prism_pool_blocks_once(tip_hash=rpc.tip)
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=reconcile)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            with server._payout_state_delivery_gate.delivery_cancelable(
+                lambda: False,
+                generation=0,
+            ) as admission:
+                self.assertTrue(admission)
+                release.set()
+                with server._payout_state_delivery_gate._condition:
+                    self.assertTrue(
+                        server._payout_state_delivery_gate._condition.wait_for(
+                            lambda: (
+                                server._payout_state_delivery_gate._publisher_waiting
+                            ),
+                            timeout=5,
+                        )
+                    )
+                self.assertTrue(
+                    server._payout_state_prepare_lock.acquire(timeout=1)
+                )
+                server._payout_state_prepare_lock.release()
+        finally:
+            release.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results[0]["inactive_blocks"], 1)
+        self.assertEqual(server._payout_state_generation, 1)
+
+    def test_payout_only_preparation_does_not_hold_delivery_gate(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingMaturityLedger(FakeLedger):
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                return []
+
+            def mark_mature_pool_payouts(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                self.assert_not_atomic()
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("test did not release payout-only preparation")
+                return {"matured_count": 1}
+
+        ledger = BlockingMaturityLedger()
+        server, rpc = coordinator(ledger=ledger)
+        server.reorg_reconciler_enabled = True
+        server._ensure_job_cache_state()
+        ledger.assert_not_atomic = lambda: self.assertIsNone(  # type: ignore[attr-defined]
+            server._payout_state_delivery_gate._mutation_owner
+        )
+        results: list[dict[str, object]] = []
+
+        thread = threading.Thread(
+            target=lambda: results.append(
+                server.reconcile_prism_pool_blocks_once(tip_hash=rpc.tip)
+            )
+        )
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            with server._payout_state_delivery_gate.delivery_cancelable(
+                lambda: False,
+                generation=0,
+            ) as admission:
+                self.assertTrue(admission)
+                release.set()
+                with server._payout_state_delivery_gate._condition:
+                    self.assertTrue(
+                        server._payout_state_delivery_gate._condition.wait_for(
+                            lambda: (
+                                server._payout_state_delivery_gate._publisher_waiting
+                            ),
+                            timeout=5,
+                        )
+                    )
+                self.assertTrue(
+                    server._payout_state_prepare_lock.acquire(timeout=1)
+                )
+                server._payout_state_prepare_lock.release()
+        finally:
+            release.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results[0]["matured_payouts"], 1)
+        self.assertEqual(server._payout_state_generation, 1)
+
+    def test_tip_poll_reuses_reconciled_external_source(self) -> None:
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        initial_snapshot = server.fetch_qbit_tip_template_snapshot()
+        initial_sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                initial_snapshot.bestblockhash,
+                observation_sequence=initial_sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = initial_snapshot
+
+        next_tip = "76" * 32
+        _advance_fake_tip(rpc, next_tip, 11)
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_source[0], 1)
+        self.assertEqual(server._published_payout_state.source_generation, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, next_tip)
+        self.assertFalse(server.tip_refresh_is_pending())
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_source[0], 1)
+
+    def test_newer_tip_discards_in_progress_payout_candidate(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class SupersededLedger(FakeLedger):
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "block_height": active_tip_height + 1,
+                        "block_hash": "bb" * 32,
+                        "chain_state": "confirmed",
+                    }
+                ]
+
+            def mark_pool_block_inactive(
+                self,
+                *,
+                block_hash: str,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("test did not release superseded preparation")
+                return {"inactive_count": 1}
+
+            def mark_mature_pool_payouts(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                return {"matured_count": 0}
+
+        server, rpc = coordinator(ledger=SupersededLedger())
+        server.reorg_reconciler_enabled = True
+        self.assertTrue(server.observe_tip_first_seen(rpc.tip))
+        old_tip = rpc.tip
+        errors: list[BaseException] = []
+
+        def reconcile() -> None:
+            try:
+                server.reconcile_prism_pool_blocks_once(tip_hash=old_tip)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=reconcile)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            new_tip = "77" * 32
+            rpc.tip = new_tip
+            rpc.template = base_template(height=11, prevhash=new_tip)
+            self.assertTrue(server.observe_tip_first_seen(new_tip))
+        finally:
+            release.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server.payout_state_candidates_discarded, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, new_tip)
+
+    def test_supersession_retry_preserves_durable_reorg_counts(self) -> None:
+        new_tip = "78" * 32
+
+        class SupersedingLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.server: object | None = None
+                self.rpc: FakeRpc | None = None
+                self.inactive_calls = 0
+
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "block_height": active_tip_height + 1,
+                        "block_hash": "bc" * 32,
+                        "chain_state": "confirmed",
+                    }
+                ]
+
+            def mark_pool_block_inactive(
+                self,
+                *,
+                block_hash: str,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                self.inactive_calls += 1
+                if self.inactive_calls == 1:
+                    assert self.server is not None
+                    assert self.rpc is not None
+                    _advance_fake_tip(self.rpc, new_tip, 11)
+                    self.server._reserve_payout_state_source(  # type: ignore[attr-defined]
+                        "external_tip",
+                        tip_hash=new_tip,
+                    )
+                    return {"inactive_count": 1}
+                return {"inactive_count": 0}
+
+            def mark_mature_pool_payouts(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                return {"matured_count": 0}
+
+        ledger = SupersedingLedger()
+        server, rpc = coordinator(ledger=ledger)
+        ledger.server = server
+        ledger.rpc = rpc
+        server.reorg_reconciler_enabled = True
+        old_tip = rpc.tip
+
+        summary = server.reconcile_prism_pool_blocks_once(tip_hash=old_tip)
+
+        self.assertEqual(ledger.inactive_calls, 2)
+        self.assertEqual(summary["watched_blocks"], 1)
+        self.assertEqual(summary["inactive_blocks"], 1)
+        self.assertEqual(server.reorg_inactive_block_count, 1)
+        self.assertEqual(summary["published_generation"], 1)
+        self.assertEqual(server.payout_state_candidates_discarded, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, new_tip)
+
+    def test_failed_superseded_reconcile_does_not_publish_latest_source(self) -> None:
+        newer_tip = "79" * 32
+
+        class FailingSupersededLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.server: object | None = None
+
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "block_height": active_tip_height + 1,
+                        "block_hash": "bd" * 32,
+                        "chain_state": "confirmed",
+                    }
+                ]
+
+            def mark_pool_block_inactive(
+                self,
+                *,
+                block_hash: str,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                assert self.server is not None
+                self.server._reserve_payout_state_source(  # type: ignore[attr-defined]
+                    "external_tip",
+                    tip_hash=newer_tip,
+                )
+                return {"inactive_count": 1}
+
+            def mark_mature_pool_payouts(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                raise RuntimeError("maturity RPC failed")
+
+        ledger = FailingSupersededLedger()
+        server, rpc = coordinator(ledger=ledger)
+        ledger.server = server
+        server.reorg_reconciler_enabled = True
+
+        with self.assertRaisesRegex(RuntimeError, "maturity RPC failed"):
+            server.reconcile_prism_pool_blocks_once(tip_hash=rpc.tip)
+
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertIsNone(server._published_payout_state.source_tip_hash)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertEqual(server.payout_state_candidates_discarded, 1)
+        self.assertEqual(server.reorg_inactive_block_count, 1)
+        self.assertTrue(server.tip_refresh_is_pending())
+
+    def test_tip_churn_bounds_reconcile_retries_and_fences_job_builds(self) -> None:
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.payout_reconcile_supersession_retries = 2
+        server.qbit_chain_view_untrusted = lambda: True  # type: ignore[method-assign]
+        real_publish = server._publish_payout_state_candidate
+        publish_attempts = 0
+
+        def supersede_before_publish(candidate: object) -> int | None:
+            nonlocal publish_attempts
+            publish_attempts += 1
+            newer_tip = f"{publish_attempts + 1:064x}"
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=newer_tip,
+            )
+            return real_publish(candidate)  # type: ignore[arg-type]
+
+        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+
+        summary = server.reconcile_prism_pool_blocks_once(
+            tip_hash=rpc.tip,
+            _force_publish=True,
+        )
+
+        self.assertTrue(summary["superseded"])
+        self.assertEqual(publish_attempts, 3)
+        self.assertEqual(server.reorg_reconcile_skip_count, 1)
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertEqual(server.payout_state_candidates_discarded, 3)
+        self.assertTrue(server._payout_state_publication_blocked)
+        state = client(1)
+        assert state.worker is not None
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "pending publication",
+        ):
+            server.build_shared_job_bundle(
+                server.current_template_artifacts(),
+                state.worker,
+            )
+
+    def test_published_generation_prioritizes_current_tip_over_waiters(self) -> None:
+        gate = _PayoutStateDeliveryGate()
+        active_entered = threading.Event()
+        release_active = threading.Event()
+        publication_done = threading.Event()
+        stale_done = threading.Event()
+        admitted_order: list[str] = []
+
+        def active_delivery() -> None:
+            with gate.delivery_cancelable(lambda: False, generation=0) as admission:
+                self.assertTrue(admission)
+                active_entered.set()
+                self.assertTrue(release_active.wait(5))
+
+        def publish() -> None:
+            with gate.publication():
+                gate.publish_generation(1, prioritize_delivery=True)
+            publication_done.set()
+
+        def wait_for_delivery(name: str, *, priority: bool) -> None:
+            with gate.delivery_cancelable(
+                lambda: False,
+                generation=1,
+                priority=priority,
+            ) as admission:
+                if admission:
+                    admitted_order.append(name)
+                    admission.mark_delivered()
+
+        def stale_waiter() -> None:
+            with gate.delivery_cancelable(lambda: False, generation=0) as admission:
+                self.assertFalse(admission)
+            stale_done.set()
+
+        active_thread = threading.Thread(target=active_delivery)
+        publish_thread = threading.Thread(target=publish)
+        routine_thread = threading.Thread(
+            target=wait_for_delivery,
+            args=("routine",),
+            kwargs={"priority": False},
+        )
+        priority_thread = threading.Thread(
+            target=wait_for_delivery,
+            args=("priority",),
+            kwargs={"priority": True},
+        )
+        stale_thread = threading.Thread(target=stale_waiter)
+        active_thread.start()
+        self.assertTrue(active_entered.wait(5))
+        publish_thread.start()
+        with gate._condition:
+            self.assertTrue(
+                gate._condition.wait_for(lambda: gate._publisher_waiting, timeout=5)
+            )
+        routine_thread.start()
+        stale_thread.start()
+        priority_thread.start()
+        release_active.set()
+        for thread in (
+            active_thread,
+            publish_thread,
+            routine_thread,
+            priority_thread,
+            stale_thread,
+        ):
+            thread.join(5)
+
+        self.assertTrue(publication_done.is_set())
+        self.assertTrue(stale_done.is_set())
+        self.assertFalse(routine_thread.is_alive())
+        self.assertEqual(admitted_order[:1], ["priority"])
+        if admitted_order == ["priority"]:
+            with gate.delivery_cancelable(
+                lambda: False,
+                generation=1,
+                priority=False,
+            ) as admission:
+                self.assertTrue(admission)
+                admitted_order.append("routine")
+        self.assertEqual(admitted_order, ["priority", "routine"])
+
+    def test_priority_reservation_rejects_nonpriority_without_waiting(self) -> None:
+        gate = _PayoutStateDeliveryGate()
+        with gate.publication():
+            gate.publish_generation(1, prioritize_delivery=True)
+        cancellation_checks = 0
+
+        def cancel_after_first_wait() -> bool:
+            nonlocal cancellation_checks
+            cancellation_checks += 1
+            return cancellation_checks > 1
+
+        with gate.delivery_cancelable(
+            cancel_after_first_wait,
+            generation=1,
+            priority=False,
+            poll_seconds=0.0,
+        ) as admission:
+            self.assertFalse(admission)
+
+        self.assertEqual(cancellation_checks, 1)
+        with gate.delivery_cancelable(
+            lambda: False,
+            generation=1,
+            priority=True,
+        ) as admission:
+            self.assertTrue(admission)
+            admission.mark_delivered()
+
+    def test_publication_updates_gate_without_coordinator_locks(self) -> None:
+        server, _rpc = coordinator()
+        server._reserve_payout_state_source("payout_only")
+        original_publish_generation = (
+            server._payout_state_delivery_gate.publish_generation
+        )
+        lock_snapshots: list[tuple[bool, bool]] = []
+
+        def observe_locks(
+            generation: int,
+            *,
+            prioritize_delivery: bool,
+        ) -> None:
+            lock_snapshots.append(
+                (
+                    server._job_cache_lock.locked(),
+                    server.lock._is_owned(),  # type: ignore[attr-defined]
+                )
+            )
+            original_publish_generation(
+                generation,
+                prioritize_delivery=prioritize_delivery,
+            )
+
+        server._payout_state_delivery_gate.publish_generation = observe_locks  # type: ignore[method-assign]
+
+        self.assertEqual(
+            server._publish_payout_state_candidate(
+                server._current_payout_state_candidate()
+            ),
+            1,
+        )
+        self.assertEqual(lock_snapshots, [(False, False)])
+
+    def test_pending_clear_does_not_consume_first_delivery_priority(self) -> None:
+        server, _rpc = coordinator()
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = snapshot
+        server._reserve_payout_state_source("payout_only")
+        self.assertEqual(
+            server._publish_payout_state_candidate(
+                server._current_payout_state_candidate()
+            ),
+            1,
+        )
+
+        self.assertTrue(
+            server._clear_tip_refresh_pending_for_completed_refresh(
+                snapshot,
+                sequence,
+                1,
+            )
+        )
+        self.assertEqual(
+            server._payout_state_delivery_gate._priority_generation,
+            1,
+        )
+        with server._payout_state_delivery_gate.delivery_cancelable(
+            lambda: False,
+            generation=1,
+            priority=False,
+        ) as routine_admission:
+            self.assertFalse(routine_admission)
+        with server._payout_state_delivery_gate.delivery_cancelable(
+            lambda: False,
+            generation=1,
+            priority=True,
+        ) as first_delivery:
+            self.assertTrue(first_delivery)
+            first_delivery.mark_delivered()
+        self.assertIsNone(
+            server._payout_state_delivery_gate._priority_generation
+        )
 
     def test_collection_refresh_stops_when_chain_becomes_untrusted(self) -> None:
         server, _rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
@@ -1440,10 +2049,22 @@ class TipRefreshValidationTests(unittest.TestCase):
                 return None
 
         class AdvancingGate:
+            class Admission:
+                def __bool__(self) -> bool:
+                    return True
+
+                @staticmethod
+                def mark_delivered() -> None:
+                    pass
+
             @contextmanager
-            def delivery_cancelable(self, _cancelled: object) -> object:
+            def delivery_cancelable(
+                self,
+                _cancelled: object,
+                **_kwargs: object,
+            ) -> object:
                 clock.advance(4.0)
-                yield True
+                yield self.Admission()
 
         state.job_update_lock = AdvancingLock()  # type: ignore[assignment]
         server._payout_state_delivery_gate = AdvancingGate()  # type: ignore[assignment]
@@ -1736,6 +2357,17 @@ class TipRefreshValidationTests(unittest.TestCase):
             self.assertTrue(mutation_started.wait(5))
             self.assertFalse(mutation_completed.wait(0.1))
             self.assertEqual(server._payout_state_generation, 0)
+            with server._payout_state_delivery_gate._condition:
+                self.assertTrue(
+                    server._payout_state_delivery_gate._publisher_waiting
+                )
+                self.assertIsNone(
+                    server._payout_state_delivery_gate._mutation_owner
+                )
+            self.assertTrue(
+                server._payout_state_prepare_lock.acquire(timeout=1)
+            )
+            server._payout_state_prepare_lock.release()
         finally:
             release_send.set()
             mutation_thread.join(5)
@@ -1786,8 +2418,12 @@ class TipRefreshValidationTests(unittest.TestCase):
                     yield
 
             @contextmanager
-            def delivery_cancelable(self, cancelled: object) -> object:
-                with original_gate.delivery_cancelable(cancelled) as admitted:
+            def delivery_cancelable(
+                self,
+                cancelled: object,
+                **kwargs: object,
+            ) -> object:
+                with original_gate.delivery_cancelable(cancelled, **kwargs) as admitted:
                     if admitted:
                         server.clients = []  # type: ignore[assignment]
                     yield admitted
@@ -1810,6 +2446,66 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(result.result, "disconnected")
         self.assertEqual(cancellation._active_deliveries, 0)
         cancellation.set()
+
+    def test_publication_block_fences_escaped_prepared_bundle(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        sent: list[dict[str, object]] = []
+        state.send = sent.append  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = snapshot
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
+        token = server._validate_prepared_tip_refresh(
+            bundle,
+            snapshot,
+            sequence,
+        )
+        cancellation = _FanoutCancellation()
+
+        server._reserve_payout_state_source("payout_only")
+        server._block_payout_state_publication()
+
+        with server.lock:
+            self.assertTrue(
+                server._tip_refresh_token_current_locked(token, bundle, snapshot)
+            )
+        self.assertFalse(cancellation.is_set())
+        result = server.send_prepared_job(
+            state,
+            bundle,
+            snapshot,
+            token,
+            state.connection_id,
+            None,
+            cancellation,
+        )
+
+        self.assertEqual(result.result, "skipped")
+        self.assertEqual(sent, [])
+        self.assertIsNone(state.active_job)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+
+        published = server._publish_payout_state_candidate(
+            server._current_payout_state_candidate()
+        )
+        self.assertEqual(published, 1)
+        with server._payout_state_delivery_gate.delivery_cancelable(
+            lambda: False,
+            generation=1,
+            priority=True,
+        ) as admission:
+            self.assertTrue(admission)
 
     def test_sequential_payout_change_schedules_immediate_retry(self) -> None:
         server, _rpc = coordinator(ledger=FakeLedger(miners=["solo"]))

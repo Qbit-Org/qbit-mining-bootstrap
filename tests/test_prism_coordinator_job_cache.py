@@ -6,8 +6,10 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal
+from types import SimpleNamespace
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
@@ -506,6 +508,53 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         self.assertFalse(server.tip_refresh_is_pending())
 
+    def test_payout_only_advance_bounds_publish_supersession(self) -> None:
+        server, _rpc = coordinator()
+        server.payout_reconcile_supersession_retries = 2
+        real_publish = server._publish_payout_state_candidate
+        publish_attempts = 0
+
+        def supersede_before_publish(candidate: object) -> int | None:
+            nonlocal publish_attempts
+            publish_attempts += 1
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=f"{publish_attempts + 30:064x}",
+            )
+            return real_publish(candidate)  # type: ignore[arg-type]
+
+        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "payout-only invalidation was superseded",
+        ):
+            server._advance_payout_state_generation()
+
+        self.assertEqual(publish_attempts, 3)
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertTrue(server.tip_refresh_is_pending())
+
+    def test_payout_publication_fence_is_not_a_job_build_failure(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        server._pool_ready_latched = True
+        server._reserve_payout_state_source("payout_only")
+        server._block_payout_state_publication()
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "pending publication"):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertEqual(server.tip_refresh_client_counts["failed"], 0)
+        self.assertEqual(server.tip_refresh_client_counts["skipped"], 1)
+
     def test_successful_poll_clears_payout_pending_created_during_reconcile(self) -> None:
         server, _rpc = coordinator()
         server._ensure_tip_refresh_state()
@@ -632,6 +681,60 @@ class JobBundleCacheTests(unittest.TestCase):
             [payload["method"] for payload in sent],
             ["mining.set_difficulty", "mining.notify"],
         )
+
+    def test_priority_decision_uses_one_publication_snapshot(self) -> None:
+        server, _rpc = coordinator()
+        state = client(1)
+        context = SimpleNamespace(
+            payout_state_generation=0,
+            template={"previousblockhash": "11" * 32},
+        )
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.build_job_for_client = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: context
+        )
+        original_lock = server._job_cache_lock
+
+        class PublishAfterPrioritySnapshot:
+            advanced = False
+
+            def __enter__(self) -> object:
+                original_lock.acquire()
+                return self
+
+            def __exit__(
+                self,
+                _exc_type: object,
+                _exc: object,
+                _traceback: object,
+            ) -> None:
+                original_lock.release()
+                if not self.advanced:
+                    self.advanced = True
+                    server._payout_state_generation = 1
+
+        priorities: list[bool] = []
+
+        class RecordingGate:
+            @contextmanager
+            def delivery_cancelable(
+                self,
+                _cancelled: object,
+                *,
+                priority: bool,
+                **_kwargs: object,
+            ) -> object:
+                priorities.append(priority)
+                yield False
+
+        server._job_cache_lock = PublishAfterPrioritySnapshot()  # type: ignore[assignment]
+        server._payout_state_delivery_gate = RecordingGate()  # type: ignore[assignment]
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(priorities, [True])
+        self.assertEqual(server._payout_state_generation, 1)
 
     def test_zero_template_ttl_fetches_template_per_build(self) -> None:
         server, rpc = coordinator()
@@ -896,9 +999,9 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIn("qbit_prism_tip_refresh_first_delivery_seconds_count 1", metrics)
         self.assertIn("qbit_prism_tip_refresh_last_delivery_seconds_count 1", metrics)
 
-    def test_ready_tip_refresh_validates_chain_once_for_one_hundred_clients(self) -> None:
+    def test_ready_tip_refresh_shares_one_bundle_across_250_clients(self) -> None:
         server, rpc = coordinator()
-        install_fake_bundle_builder(server)
+        recorded = install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
         reconciled: list[str] = []
         trust_checks = 0
@@ -917,7 +1020,7 @@ class JobBundleCacheTests(unittest.TestCase):
         server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
             lambda **_kwargs: self.fail("fanout repeated current-tip validation")
         )
-        clients = [client(index + 1) for index in range(100)]
+        clients = [client(index + 1) for index in range(250)]
         sent: dict[int, list[dict[str, object]]] = {
             state.connection_id: [] for state in clients
         }
@@ -934,7 +1037,12 @@ class JobBundleCacheTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
-        self.assertEqual(refreshed, 100)
+        self.assertEqual(refreshed, 250)
+        self.assertEqual(recorded["calls"], 1)
+        self.assertEqual(
+            len({id(state.active_job.bundle) for state in clients}),
+            1,
+        )
         self.assertEqual(reconciled, [rpc.tip])
         self.assertEqual(trust_checks, 2)
         # The early priority probe, snapshot coherence, pre-fanout validation,
@@ -1739,6 +1847,29 @@ class JobBuildMetricsTests(unittest.TestCase):
         self.assertIn('qbit_prism_job_cache_misses_total{cache="bundle"} 1', metrics)
         self.assertIn('qbit_prism_job_build_phase_seconds_total{phase="bundle"} 0.2', metrics)
         self.assertIn("qbit_prism_connected_clients 0", metrics)
+
+    def test_metrics_split_payout_preparation_publication_and_delivery(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+
+        self.assertEqual(server._advance_payout_state_generation(), 1)
+        self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
+
+        metrics = server.metrics_payload()
+
+        self.assertIn("qbit_prism_payout_preparation_seconds_count 1", metrics)
+        self.assertIn("qbit_prism_payout_publish_seconds_count 1", metrics)
+        self.assertIn(
+            "qbit_prism_payout_invalidation_first_delivery_seconds_count 1",
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_payout_gate_wait_seconds_count{generation="current"} 1',
+            metrics,
+        )
+        self.assertIn("qbit_prism_payout_candidates_discarded_total 0", metrics)
 
 
 if __name__ == "__main__":
