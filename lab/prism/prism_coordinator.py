@@ -2029,6 +2029,14 @@ class PrismCoordinator:
             self._accepted_block_payout_previews: dict[
                 str, _AcceptedBlockPayoutTransition
             ] = {}
+        if not hasattr(self, "_invalidated_accepted_block_payout_previews"):
+            # A landed transition can be withdrawn before durability catches
+            # up. Keep a height-bearing tombstone so a new exact/descendant
+            # build cannot fall through to database balances that omit it in
+            # the gap before durable retry re-registers the candidate.
+            self._invalidated_accepted_block_payout_previews: dict[
+                str, int | None
+            ] = {}
         if not hasattr(self, "_accounted_accepted_block_hashes"):
             self._accounted_accepted_block_hashes: set[str] = set()
         if not hasattr(self, "_job_build_phase_local"):
@@ -2103,6 +2111,7 @@ class PrismCoordinator:
         self._ensure_job_cache_state()
         key = block_hash.lower()
         with self._accepted_block_payout_preview_condition:
+            self._invalidated_accepted_block_payout_previews.pop(key, None)
             existing = self._accepted_block_payout_previews.get(key)
             if existing is None:
                 self._accepted_block_payout_previews[key] = (
@@ -2189,6 +2198,7 @@ class PrismCoordinator:
                         key,
                         _AcceptedBlockPayoutTransition(landed=True),
                     )
+                    self._invalidated_accepted_block_payout_previews.pop(key, None)
                     self._accepted_block_payout_previews[key] = dataclass_replace(
                         transition,
                         landed=True,
@@ -2273,16 +2283,30 @@ class PrismCoordinator:
                 with self._accepted_block_payout_preview_condition:
                     existing = self._accepted_block_payout_previews.get(key)
                     self._accepted_block_payout_previews.pop(key, None)
+                    if (
+                        invalidate_published
+                        and existing is not None
+                        and existing.landed
+                    ):
+                        self._invalidated_accepted_block_payout_previews[key] = (
+                            existing.block_height
+                        )
+                    elif not invalidate_published:
+                        self._invalidated_accepted_block_payout_previews.pop(
+                            key,
+                            None,
+                        )
                     self._accepted_block_payout_preview_condition.notify_all()
                 if (
                     invalidate_published
                     and existing is not None
                     and existing.preview is not None
                 ):
-                    # Withdraw the pointer before advancing. A concurrent build
-                    # can then observe either the old generation+preview or the
-                    # old generation+database, both of which the bump rejects;
-                    # no build can bind the new generation to this preview.
+                    # Withdraw the pointer before advancing. Existing builds
+                    # retain the old generation, while the tombstone rejects
+                    # new exact/descendant builds until retry re-registers the
+                    # transition; no build can bind the new generation to this
+                    # preview or to database balances that omit it.
                     self._advance_payout_state_generation()
 
     def _accepted_block_payout_preview_published(self, block_hash: str) -> bool:
@@ -2308,34 +2332,71 @@ class PrismCoordinator:
         key = parent_hash.lower()
         with self._accepted_block_payout_preview_condition:
             exact_transition = self._accepted_block_payout_previews.get(key)
+            exact_invalidated = (
+                key in self._invalidated_accepted_block_payout_previews
+            )
             ancestor_candidates = [
-                (candidate_hash, transition.block_height)
+                (candidate_hash, transition.block_height, False)
                 for candidate_hash, transition in self._accepted_block_payout_previews.items()
                 if exact_transition is None
+                and not exact_invalidated
                 and transition.block_height is not None
                 and parent_height is not None
                 and transition.block_height <= parent_height
             ]
-        selected_key: str | None = key if exact_transition is not None else None
+            ancestor_candidates.extend(
+                (
+                    candidate_hash,
+                    candidate_height,
+                    True,
+                )
+                for candidate_hash, candidate_height in (
+                    self._invalidated_accepted_block_payout_previews.items()
+                )
+                if exact_transition is None
+                and not exact_invalidated
+                and candidate_height is not None
+                and parent_height is not None
+                and candidate_height <= parent_height
+            )
+        selected_key: str | None = (
+            key if exact_transition is not None or exact_invalidated else None
+        )
+        selected_invalidated = exact_invalidated
         if selected_key is None and ancestor_candidates:
-            active_ancestors: list[tuple[int, str]] = []
+            active_ancestors: list[tuple[int, str, bool]] = []
             try:
-                for candidate_hash, candidate_height in ancestor_candidates:
+                for (
+                    candidate_hash,
+                    candidate_height,
+                    candidate_invalidated,
+                ) in ancestor_candidates:
                     assert candidate_height is not None
                     active_hash = str(
                         self.rpc.call("getblockhash", [candidate_height])
                     ).lower()
                     if active_hash == candidate_hash:
-                        active_ancestors.append((candidate_height, candidate_hash))
+                        active_ancestors.append(
+                            (
+                                candidate_height,
+                                candidate_hash,
+                                candidate_invalidated,
+                            )
+                        )
             except Exception as exc:
                 self._schedule_tip_refresh_retry()
                 raise TemplateRefreshBlocked(
                     "could not validate an accepted payout preview on the active chain"
                 ) from exc
             if active_ancestors:
-                _, selected_key = max(active_ancestors)
+                _, selected_key, selected_invalidated = max(active_ancestors)
         if selected_key is None:
             return self.ledger.current_prior_balances()
+        if selected_invalidated:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "accepted parent payout preview was withdrawn"
+            )
 
         wait_seconds = max(
             0.0,
@@ -2349,6 +2410,7 @@ class PrismCoordinator:
         )
         deadline = time.monotonic() + wait_seconds
         timed_out = False
+        invalidated = False
         with self._accepted_block_payout_preview_condition:
             while selected_key in self._accepted_block_payout_previews:
                 transition = self._accepted_block_payout_previews[selected_key]
@@ -2367,6 +2429,14 @@ class PrismCoordinator:
                 self._accepted_block_payout_preview_condition.wait(
                     timeout=min(0.25, remaining)
                 )
+            invalidated = (
+                selected_key in self._invalidated_accepted_block_payout_previews
+            )
+        if invalidated:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "accepted parent payout preview was withdrawn"
+            )
         if timed_out:
             self._schedule_tip_refresh_retry()
             raise TemplateRefreshBlocked(

@@ -537,6 +537,129 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         self.assertEqual(server._payout_state_generation, 2)
         self.assertEqual(server._accepted_block_payout_previews, {})
+        self.assertEqual(
+            server._invalidated_accepted_block_payout_previews,
+            {parent_hash: None},
+        )
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "was withdrawn"):
+            server._prior_balances_for_job_parent(parent_hash)
+
+        server._begin_accepted_block_payout_preview(parent_hash)
+        self.assertEqual(server._invalidated_accepted_block_payout_previews, {})
+        server._clear_accepted_block_payout_preview(parent_hash)
+
+    def test_withdrawn_landed_transition_blocks_active_descendant_fallback(
+        self,
+    ) -> None:
+        class CountingLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.current_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.current_balance_reads += 1
+                return []
+
+        ledger = CountingLedger()
+        server, rpc = coordinator(ledger=ledger)
+        accepted_hash = "bc" * 32
+        descendant_hash = "bd" * 32
+        original_rpc_call = rpc.call
+
+        def active_chain_call(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getblockhash":
+                self.assertEqual(params, [10])
+                return accepted_hash
+            return original_rpc_call(method, params)
+
+        rpc.call = active_chain_call  # type: ignore[method-assign]
+        server._begin_accepted_block_payout_preview(
+            accepted_hash,
+            block_height=10,
+        )
+        server._mark_accepted_block_payout_landed(
+            accepted_hash,
+            block_height=10,
+        )
+        server._clear_accepted_block_payout_preview(
+            accepted_hash,
+            invalidate_published=True,
+        )
+
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "was withdrawn"):
+            server._prior_balances_for_job_parent(
+                descendant_hash,
+                parent_height=11,
+            )
+        self.assertEqual(ledger.current_balance_reads, 0)
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_waiting_child_does_not_fall_back_after_transition_withdrawal(
+        self,
+    ) -> None:
+        class CountingLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.current_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.current_balance_reads += 1
+                return []
+
+        class ObservedCondition(threading.Condition):
+            def __init__(self) -> None:
+                super().__init__()
+                self.wait_entered = threading.Event()
+
+            def wait(self, timeout: float | None = None) -> bool:
+                self.wait_entered.set()
+                return super().wait(timeout)
+
+        ledger = CountingLedger()
+        server, _rpc = coordinator(ledger=ledger)
+        parent_hash = "be" * 32
+        preview_condition = ObservedCondition()
+        server._accepted_block_payout_preview_condition = preview_condition
+        server.accepted_block_payout_preview_wait_seconds = 10
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=10,
+        )
+        server._mark_accepted_block_payout_landed(
+            parent_hash,
+            block_height=10,
+        )
+        errors: list[BaseException] = []
+
+        def read_parent_balances() -> None:
+            try:
+                server._prior_balances_for_job_parent(
+                    parent_hash,
+                    parent_height=10,
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=read_parent_balances, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(preview_condition.wait_entered.wait(2))
+            self.assertTrue(thread.is_alive())
+        finally:
+            server._clear_accepted_block_payout_preview(
+                parent_hash,
+                invalidate_published=True,
+            )
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+        self.assertIn("was withdrawn", str(errors[0]))
+        self.assertEqual(ledger.current_balance_reads, 0)
 
     def test_pending_parent_preview_wait_is_bounded_and_retryable(self) -> None:
         server, _rpc = coordinator()
