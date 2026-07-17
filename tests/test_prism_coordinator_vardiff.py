@@ -5207,6 +5207,56 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server._payout_state_generation, 1)
         self.assertEqual(server._published_payout_state.source_tip_hash, block_hash)
 
+    def test_direct_block_disabled_reconciler_bounds_publish_supersession(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.payout_reconcile_supersession_retries = 2
+        block_hash = "d3" * 32
+        real_publish = server._publish_payout_state_candidate
+        publish_attempts = 0
+
+        def supersede_before_publish(candidate: object) -> int | None:
+            nonlocal publish_attempts
+            publish_attempts += 1
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=f"{publish_attempts + 20:064x}",
+            )
+            return real_publish(candidate)  # type: ignore[arg-type]
+
+        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(publish_attempts, 3)
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertTrue(server.tip_refresh_is_pending())
+
     def test_untrusted_direct_block_reconcile_does_not_publish_twice(self) -> None:
         server, state, ledger = submit_coordinator()
         server._ensure_job_cache_state()

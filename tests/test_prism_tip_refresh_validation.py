@@ -2254,6 +2254,66 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(cancellation._active_deliveries, 0)
         cancellation.set()
 
+    def test_publication_block_fences_escaped_prepared_bundle(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        sent: list[dict[str, object]] = []
+        state.send = sent.append  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = snapshot
+        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+        token = server._validate_prepared_tip_refresh(
+            bundle,
+            snapshot,
+            sequence,
+        )
+        cancellation = _FanoutCancellation()
+
+        server._reserve_payout_state_source("payout_only")
+        server._block_payout_state_publication()
+
+        with server.lock:
+            self.assertTrue(
+                server._tip_refresh_token_current_locked(token, bundle, snapshot)
+            )
+        self.assertFalse(cancellation.is_set())
+        result = server.send_prepared_job(
+            state,
+            bundle,
+            snapshot,
+            token,
+            state.connection_id,
+            None,
+            cancellation,
+        )
+
+        self.assertEqual(result.result, "skipped")
+        self.assertEqual(sent, [])
+        self.assertIsNone(state.active_job)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+
+        published = server._publish_payout_state_candidate(
+            server._current_payout_state_candidate()
+        )
+        self.assertEqual(published, 1)
+        with server._payout_state_delivery_gate.delivery_cancelable(
+            lambda: False,
+            generation=1,
+            priority=True,
+        ) as admission:
+            self.assertTrue(admission)
+
     def test_sequential_payout_change_schedules_immediate_retry(self) -> None:
         server, _rpc = coordinator(ledger=FakeLedger(miners=["solo"]))
         install_fake_bundle_builder(server)

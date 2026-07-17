@@ -1100,6 +1100,7 @@ class _PayoutStateDeliveryGate:
         self._mutation_depth = 0
         self._published_generation = 0
         self._priority_generation: int | None = None
+        self._delivery_blocked = False
 
     @staticmethod
     def _generation_relation(generation: int, published_generation: int) -> str:
@@ -1134,6 +1135,8 @@ class _PayoutStateDeliveryGate:
                 generation = self._published_generation
             while True:
                 if cancelled():
+                    break
+                if self._delivery_blocked:
                     break
                 if generation < self._published_generation:
                     break
@@ -1216,6 +1219,25 @@ class _PayoutStateDeliveryGate:
                 raise RuntimeError("payout generation did not advance")
             self._published_generation = generation
             self._priority_generation = generation if prioritize_delivery else None
+            self._delivery_blocked = False
+
+    def block_delivery(
+        self,
+        mark_blocked: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Reject admission until publication, atomically with caller state."""
+
+        with self._condition:
+            # A publisher drops the condition while swapping its immutable
+            # pointer. Wait only for that short section, never for admitted
+            # socket sends or fanout cancellation.
+            while self._mutation_owner is not None:
+                self._condition.wait()
+            if mark_blocked is not None and not mark_blocked():
+                return False
+            self._delivery_blocked = True
+            self._condition.notify_all()
+            return True
 
     @contextmanager
     def mutation(self) -> Iterator[None]:
@@ -2305,6 +2327,40 @@ class PrismCoordinator:
         with self._payout_state_metrics_lock:
             self.payout_state_candidates_discarded += 1
 
+    def _block_payout_state_publication(self) -> None:
+        """Fence prepared jobs after supersession exhausts safe publication."""
+
+        self._ensure_job_cache_state()
+
+        pending_source: int | None = None
+
+        def mark_blocked() -> bool:
+            nonlocal pending_source
+            with self._job_cache_lock:
+                with self.lock:
+                    pending_source = self._payout_state_source[0]
+                    if (
+                        pending_source
+                        == self._published_payout_state.source_generation
+                    ):
+                        return False
+                    self._payout_state_publication_blocked = True
+                    self._job_bundle_cache.clear()
+                    return True
+
+        # Close fleet admission atomically with the cache fence. Escaped
+        # immutable bundles remain stamped with the old generation, but cannot
+        # cross the boundary while the ledger has newer unpublished state.
+        if not self._payout_state_delivery_gate.block_delivery(mark_blocked):
+            return
+        with self.lock:
+            active = getattr(self, "_active_tip_refresh", None)
+        if active is not None:
+            active[1].cancel()
+        assert pending_source is not None
+        self._mark_tip_refresh_pending(pending_source)
+        self._schedule_tip_refresh_retry()
+
     def _payout_source_requires_publication(
         self,
         candidate: PayoutStateCandidate | None = None,
@@ -2424,6 +2480,27 @@ class PrismCoordinator:
                 if generation is not None:
                     return generation
                 prepared_started = time.monotonic()
+
+    def _publish_current_payout_state_with_retry_budget(self) -> int | None:
+        """Bound test-mode publication retries after a source is superseded."""
+
+        max_retries = max(
+            0,
+            int(
+                getattr(
+                    self,
+                    "payout_reconcile_supersession_retries",
+                    DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
+                )
+            ),
+        )
+        for _attempt in range(max_retries):
+            candidate = self._current_payout_state_candidate()
+            published = self._publish_payout_state_candidate(candidate)
+            if published is not None:
+                return published
+        self._block_payout_state_publication()
+        return None
 
     def observe_job_build_elapsed(self, elapsed_seconds: float, phases: dict[str, float]) -> None:
         self._ensure_job_cache_state()
@@ -2634,7 +2711,7 @@ class PrismCoordinator:
         """
         if cached is None:
             return False
-        with self.lock:
+        with self._job_cache_lock:
             if self._payout_state_publication_blocked:
                 return False
         if not self._job_bundle_payout_state_current(cached):
@@ -2803,7 +2880,7 @@ class PrismCoordinator:
             )
         started = time.monotonic()
         with self._payout_state_prepare_lock:
-            with self.lock:
+            with self._job_cache_lock:
                 publication_blocked = self._payout_state_publication_blocked
             if publication_blocked:
                 raise TemplateRefreshBlocked(
@@ -5971,11 +6048,7 @@ class PrismCoordinator:
             supersession_retries += 1
             if supersession_retries > max_supersession_retries:
                 summary["superseded"] = True
-                with self.lock:
-                    pending_source = self._payout_state_source[0]
-                    self._payout_state_publication_blocked = True
-                self._mark_tip_refresh_pending(pending_source)
-                self._schedule_tip_refresh_retry()
+                self._block_payout_state_publication()
                 return False
             with self.lock:
                 latest_tip = self._payout_state_source[1]
@@ -6100,11 +6173,7 @@ class PrismCoordinator:
                             # Do not stamp the current source onto payout work
                             # prepared for an older tip. Fence job builds and
                             # let the scheduled retry reconcile that source.
-                            with self.lock:
-                                pending_source = self._payout_state_source[0]
-                                self._payout_state_publication_blocked = True
-                            self._mark_tip_refresh_pending(pending_source)
-                            self._schedule_tip_refresh_retry()
+                            self._block_payout_state_publication()
                     with self.lock:
                         self.reorg_inactive_block_count += inactive_blocks_total
                         self.reorg_reactivated_block_count += reactivated_blocks_total
@@ -6683,17 +6752,20 @@ class PrismCoordinator:
         # Linearize direct delivery against the immutable publication pointer.
         # Expensive build and ledger reads happened under the preparation lock,
         # outside this admission boundary.
-        context_payout_generation = int(
-            getattr(
-                context,
-                "payout_state_generation",
-                self._payout_state_generation,
-            )
-        )
         with self._job_cache_lock:
+            current_payout_generation = self._payout_state_generation
             published_tip = self._published_payout_state.source_tip_hash
+            publication_blocked = self._payout_state_publication_blocked
+            context_payout_generation = int(
+                getattr(
+                    context,
+                    "payout_state_generation",
+                    current_payout_generation,
+                )
+            )
         priority_delivery = (
-            context_payout_generation == self._payout_state_generation
+            not publication_blocked
+            and context_payout_generation == current_payout_generation
             and (
                 published_tip is None
                 or str(context.template.get("previousblockhash", ""))
@@ -8567,7 +8639,7 @@ class PrismCoordinator:
                         reconciled_generation = summary.get("published_generation")
                         if isinstance(reconciled_generation, int):
                             published = reconciled_generation
-                    while published is None and not getattr(
+                    if published is None and not getattr(
                         self,
                         "reorg_reconciler_enabled",
                         True,
@@ -8577,10 +8649,7 @@ class PrismCoordinator:
                         # production reconciler. In production, a bounded
                         # supersession result leaves the source unpublished so
                         # job builds remain fenced until the scheduled retry.
-                        payout_candidate = self._current_payout_state_candidate()
-                        published = self._publish_payout_state_candidate(
-                            payout_candidate
-                        )
+                        published = self._publish_current_payout_state_with_retry_budget()
             if confirmed_count not in {0, 1}:
                 self.stop_event.set()
                 self._abandon_block_candidate(

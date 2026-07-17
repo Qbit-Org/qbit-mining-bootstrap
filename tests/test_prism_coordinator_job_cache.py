@@ -6,8 +6,10 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal
+from types import SimpleNamespace
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
@@ -632,6 +634,60 @@ class JobBundleCacheTests(unittest.TestCase):
             [payload["method"] for payload in sent],
             ["mining.set_difficulty", "mining.notify"],
         )
+
+    def test_priority_decision_uses_one_publication_snapshot(self) -> None:
+        server, _rpc = coordinator()
+        state = client(1)
+        context = SimpleNamespace(
+            payout_state_generation=0,
+            template={"previousblockhash": "11" * 32},
+        )
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.build_job_for_client = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: context
+        )
+        original_lock = server._job_cache_lock
+
+        class PublishAfterPrioritySnapshot:
+            advanced = False
+
+            def __enter__(self) -> object:
+                original_lock.acquire()
+                return self
+
+            def __exit__(
+                self,
+                _exc_type: object,
+                _exc: object,
+                _traceback: object,
+            ) -> None:
+                original_lock.release()
+                if not self.advanced:
+                    self.advanced = True
+                    server._payout_state_generation = 1
+
+        priorities: list[bool] = []
+
+        class RecordingGate:
+            @contextmanager
+            def delivery_cancelable(
+                self,
+                _cancelled: object,
+                *,
+                priority: bool,
+                **_kwargs: object,
+            ) -> object:
+                priorities.append(priority)
+                yield False
+
+        server._job_cache_lock = PublishAfterPrioritySnapshot()  # type: ignore[assignment]
+        server._payout_state_delivery_gate = RecordingGate()  # type: ignore[assignment]
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(priorities, [True])
+        self.assertEqual(server._payout_state_generation, 1)
 
     def test_zero_template_ttl_fetches_template_per_build(self) -> None:
         server, rpc = coordinator()
