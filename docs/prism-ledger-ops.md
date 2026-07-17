@@ -227,7 +227,10 @@ execution backends over the same SQL and the same durability contract:
   long-lived connection instead of one `psql` fork+connect per statement; the
   batch statement's own `set_config('synchronous_commit', 'on', true)` keeps
   the Stratum ACK boundary at the database commit. Reads share a pool bounded
-  by `PRISM_POSTGRES_READ_CONCURRENCY` plus one writer slot.
+  by `PRISM_POSTGRES_READ_CONCURRENCY` plus one writer slot. Read-only
+  statements retry once after a lost connection; mutations do not re-execute
+  automatically because a lost response cannot prove that PostgreSQL did not
+  commit the first execution.
 - **`psql-subprocess` (fallback):** the legacy zero-Python-dependency backend
   that shells out one `psql` per statement. It remains fully supported for
   regtest portability and as the operational escape hatch.

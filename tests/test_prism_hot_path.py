@@ -29,6 +29,7 @@ from lab.prism.prism_coordinator import (
     PRISM_REJECTION_STALE_JOB,
     PrismCoordinator,
     StratumError,
+    TemplateRefreshBlocked,
     WorkerIdentity,
     default_prism_coinbase_tag_hex,
 )
@@ -507,6 +508,70 @@ class FanOutRpcEconomyTests(unittest.TestCase):
             "getblock",
         ):
             self.assertEqual(small.count(method), large.count(method), method)
+
+    def test_driver_live_trust_check_aborts_queued_delivery(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 1
+        server.reorg_reconciler_enabled = True
+
+        def reconcile_live_chain_view(tip_hash: str) -> bool:
+            self.assertEqual(tip_hash, OLD_TIP)
+            return not server.qbit_chain_view_untrusted()
+
+        server.ensure_reorg_reconciled_for_tip = reconcile_live_chain_view  # type: ignore[method-assign]
+        first = client(1)
+        second = client(2)
+        server.clients = [first, second]  # type: ignore[assignment]
+        first_delivery_started = threading.Event()
+        release_first_delivery = threading.Event()
+        second_notifications: list[dict[str, object]] = []
+
+        def block_first_delivery(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                first_delivery_started.set()
+                self.assertTrue(release_first_delivery.wait(10))
+
+        first.send = block_first_delivery  # type: ignore[method-assign]
+        second.send = second_notifications.append  # type: ignore[method-assign]
+        refreshed: list[int] = []
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                refreshed.append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        poll_thread = threading.Thread(target=poll)
+        poll_thread.start()
+        try:
+            self.assertTrue(first_delivery_started.wait(5))
+            chain_info_calls_before_mismatch = rpc.count("getblockchaininfo")
+            rpc.blockchain_info["headers"] = 101
+            deadline = time.monotonic() + 5
+            while (
+                rpc.count("getblockchaininfo") <= chain_info_calls_before_mismatch
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertGreater(
+                rpc.count("getblockchaininfo"),
+                chain_info_calls_before_mismatch,
+                "driver live trust check never ran",
+            )
+        finally:
+            release_first_delivery.set()
+            poll_thread.join(10)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(poll_thread.is_alive())
+        self.assertEqual(refreshed, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+        self.assertIn("chain view became untrusted", str(errors[0]))
+        self.assertEqual(second_notifications, [])
+        self.assertIsNone(second.active_job)
 
 
 if __name__ == "__main__":

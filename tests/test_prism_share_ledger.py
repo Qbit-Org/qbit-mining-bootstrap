@@ -29,6 +29,7 @@ from lab.prism.share_ledger import (
     PsqlShareLedger,
     AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
     SingleWriterShareLedger,
+    _NativePostgresClient,
     _prism_window_shares,
     sha256_json_hex,
 )
@@ -2210,8 +2211,9 @@ class NativeClientSelectionTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.statements: list[str] = []
 
-            def run_json(self, sql: str) -> Any:
+            def run_json(self, sql: str, *, retry_safe: bool = False) -> Any:
                 self.statements.append(sql)
+                self.retry_safe = retry_safe
                 return {"accepted_share_count": 5, "miner_ids": ["miner-a"]}
 
             def close(self) -> None:
@@ -2234,6 +2236,114 @@ class NativeClientSelectionTests(unittest.TestCase):
         )
         self.assertEqual(len(native.statements), 1)
         self.assertIn("qbit_share_ledger", native.statements[0])
+        self.assertTrue(native.retry_safe)
+
+    def test_native_mutation_operational_error_is_not_retried(self) -> None:
+        class OperationalError(Exception):
+            pass
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+        executions: list[str] = []
+        outcomes: list[object] = [OperationalError("response lost"), {"ok": True}]
+
+        class FakeConnection:
+            def execute(self, sql: str) -> FakeConnection:
+                executions.append(sql)
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                self.row = outcome
+                return self
+
+            def fetchone(self) -> tuple[object]:
+                return (self.row,)
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+
+        @contextlib.contextmanager
+        def connection() -> Any:
+            yield FakeConnection()
+
+        client.connection = connection  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "postgres query failed"):
+            client.run_json("UPDATE counter SET value = value + 1 RETURNING value")
+
+        self.assertEqual(executions, ["UPDATE counter SET value = value + 1 RETURNING value"])
+        self.assertEqual(len(outcomes), 1)
+
+    def test_native_retry_safe_read_retries_once(self) -> None:
+        class OperationalError(Exception):
+            pass
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+        executions: list[str] = []
+        outcomes: list[object] = [OperationalError("stale connection"), {"count": 11}]
+
+        class FakeConnection:
+            def execute(self, sql: str) -> FakeConnection:
+                executions.append(sql)
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                self.row = outcome
+                return self
+
+            def fetchone(self) -> tuple[object]:
+                return (self.row,)
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+
+        @contextlib.contextmanager
+        def connection() -> Any:
+            yield FakeConnection()
+
+        client.connection = connection  # type: ignore[method-assign]
+
+        result = client.run_json("SELECT count(*)", retry_safe=True)
+
+        self.assertEqual(result, {"count": 11})
+        self.assertEqual(executions, ["SELECT count(*)", "SELECT count(*)"])
+
+    def test_ctv_attempt_journal_uses_non_retrying_native_execution(self) -> None:
+        class FakeNative:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, bool]] = []
+
+            def run_json(self, sql: str, *, retry_safe: bool = False) -> Any:
+                self.calls.append((sql, retry_safe))
+                raise RuntimeError("ambiguous connection loss")
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._lock = threading.Lock()
+        ledger._ctv_broadcast_attempt_detail_limit = 20
+        ledger._ctv_broadcast_retry_backoff_seconds = 300
+        ledger._writer_id = "writer-a"
+        ledger._writer_epoch = 1
+        ledger._writer_session_token = "session-a"
+        ledger._lease_interval_sql = "make_interval(secs => 30)"
+        native = FakeNative()
+        ledger._native = native
+
+        with self.assertRaisesRegex(RuntimeError, "ambiguous connection loss"):
+            ledger.record_ctv_fanout_broadcast_attempt(
+                fanout_txid="22" * 32,
+                attempt_status="submitted",
+            )
+
+        self.assertEqual(len(native.calls), 1)
+        sql, retry_safe = native.calls[0]
+        self.assertFalse(retry_safe)
+        self.assertIn("INSERT INTO qbit_ctv_fanout_broadcast_attempts", sql)
+        self.assertIn("broadcast_attempt_count = artifact.broadcast_attempt_count + 1", sql)
 
 
 class AcceptedStatsCacheTests(unittest.TestCase):
@@ -2244,6 +2354,11 @@ class AcceptedStatsCacheTests(unittest.TestCase):
                 stats_payload(10, ["miner-a", "miner-b"]),
                 record_payload(3, share_seq=11),
                 {"records": [record_payload(6, share_seq=12)]},
+                {
+                    "records": [
+                        {**record_payload(6, share_seq=12), "newly_inserted": False}
+                    ]
+                },
             ],
             accepted_stats_cache_seconds=60.0,
         )
@@ -2273,46 +2388,109 @@ class AcceptedStatsCacheTests(unittest.TestCase):
             ledger.accepted_share_stats(),
             {"accepted_share_count": 12, "distinct_miner_count": 3},
         )
-
-    def test_refresh_replays_notes_committed_during_aggregate_query(self) -> None:
-        # A share this writer commits while the reconcile's aggregate query is
-        # in flight is invisible to the query's MVCC snapshot but already
-        # acknowledged; the refresh must replay its note onto the snapshot
-        # instead of erasing it until the next reconcile.
-        note_during_query: list[dict[str, object]] = []
-
-        class MidQueryNoteLedger(CannedQueryPsqlShareLedger):
-            def _run_json(self, sql: str) -> Any:
-                result = super()._run_json(sql)
-                if "miner_ids" in sql and note_during_query:
-                    record = PsqlShareLedger._record_from_json(note_during_query.pop())
-                    self._note_appended_share(record)
-                return result
-
-        ledger = MidQueryNoteLedger(
-            [
-                acquired_lease_result(),
-                stats_payload(10, ["miner-a"]),
-                record_payload(4, share_seq=12),
-            ],
-            accepted_stats_cache_seconds=60.0,
-        )
-        # record_payload(1) mines as miner-1, absent from the snapshot.
-        note_during_query.append(record_payload(1, share_seq=11))
-
-        stats = ledger.accepted_share_stats()
-
-        self.assertEqual(
-            stats,
-            {"accepted_share_count": 11, "distinct_miner_count": 2},
-        )
-        # The buffer is closed after the refresh: a normal append advances the
-        # merged counts exactly once; record_payload(4) is miner-1 again.
-        ledger.append(pending_share(4))
+        # Replaying the same committed batch returns its existing record but
+        # does not increment the cache again.
+        ledger.append_batch([(pending_share(6), None)])
         self.assertEqual(
             ledger.accepted_share_stats(),
-            {"accepted_share_count": 12, "distinct_miner_count": 2},
+            {"accepted_share_count": 12, "distinct_miner_count": 3},
         )
+
+    def test_refresh_does_not_replay_note_already_in_aggregate_snapshot(self) -> None:
+        append_committed = threading.Event()
+        append_can_publish_note = threading.Event()
+        aggregate_can_return = threading.Event()
+        stats_database_lock_attempted = threading.Event()
+
+        class NotifyingLock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+
+            def acquire(self, *args: Any, **kwargs: Any) -> bool:
+                if threading.current_thread().name == "stats-refresh":
+                    stats_database_lock_attempted.set()
+                return self._lock.acquire(*args, **kwargs)
+
+            def release(self) -> None:
+                self._lock.release()
+
+            def __enter__(self) -> NotifyingLock:
+                self.acquire()
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                self.release()
+
+        class CommitBeforeNoteLedger(CannedQueryPsqlShareLedger):
+            def __init__(self) -> None:
+                super().__init__(
+                    [acquired_lease_result()],
+                    accepted_stats_cache_seconds=60.0,
+                )
+                self._lock = NotifyingLock()  # type: ignore[assignment]
+
+            def _run_json(self, sql: str) -> Any:
+                self.queries.append(sql)
+                if "miner_ids" in sql:
+                    self.assert_aggregate_wait()
+                    return stats_payload(11, ["miner-a", "miner-1"])
+                if "INSERT INTO qbit_share_ledger" in sql:
+                    return record_payload(1, share_seq=11)
+                return super()._run_json(sql)
+
+            @staticmethod
+            def assert_aggregate_wait() -> None:
+                if not aggregate_can_return.wait(5):
+                    raise AssertionError("aggregate query was not released")
+
+            def _record_from_json(self, payload: dict[str, Any]) -> Any:
+                record = PsqlShareLedger._record_from_json(payload)
+                if record.share_id == "share-1":
+                    append_committed.set()
+                    if not append_can_publish_note.wait(5):
+                        raise AssertionError("append note was not released")
+                return record
+
+        ledger = CommitBeforeNoteLedger()
+        appended: list[object] = []
+        stats: list[dict[str, int]] = []
+        errors: list[BaseException] = []
+
+        def append_share() -> None:
+            try:
+                appended.append(ledger.append(pending_share(1)))
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        def refresh_stats() -> None:
+            try:
+                stats.append(ledger.accepted_share_stats())
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        append_thread = threading.Thread(target=append_share, name="share-append")
+        stats_thread = threading.Thread(target=refresh_stats, name="stats-refresh")
+        append_thread.start()
+        try:
+            self.assertTrue(append_committed.wait(5))
+            stats_thread.start()
+            self.assertTrue(stats_database_lock_attempted.wait(5))
+        finally:
+            append_can_publish_note.set()
+            aggregate_can_return.set()
+            append_thread.join(5)
+            if stats_thread.ident is not None:
+                stats_thread.join(5)
+
+        self.assertFalse(append_thread.is_alive())
+        self.assertFalse(stats_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(appended), 1)
+        self.assertEqual(
+            stats,
+            [{"accepted_share_count": 11, "distinct_miner_count": 2}],
+        )
+        self.assertEqual(ledger.accepted_share_stats(), stats[0])
 
     def test_stats_requery_after_ttl_reconciles(self) -> None:
         ledger = CannedQueryPsqlShareLedger(
