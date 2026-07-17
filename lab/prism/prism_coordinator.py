@@ -4367,12 +4367,16 @@ class PrismCoordinator:
             with self.lock:
                 observed = getattr(self, "current_tip_first_seen", None)
                 observed_at = getattr(self, "current_tip_observed_monotonic", None)
-            if (
-                observed is not None
-                and observed_at is not None
-                and time.monotonic() - observed_at <= max_age
-            ):
-                return observed[0]
+                # Keep the freshness decision and selected hash in the same
+                # critical section as tip observation. Otherwise a poller can
+                # publish a newer tip after these fields are copied but before
+                # this method returns the superseded hash.
+                if (
+                    observed is not None
+                    and observed_at is not None
+                    and time.monotonic() - observed_at <= max_age
+                ):
+                    return observed[0]
         return str(self.rpc.call("getbestblockhash"))
 
     def stale_grace_deadline_open(

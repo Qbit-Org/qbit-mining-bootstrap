@@ -20,6 +20,7 @@ import threading
 import time
 import unittest
 from decimal import Decimal
+from unittest import mock
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
@@ -360,6 +361,66 @@ def submit_params(state: ClientState, context: object) -> list[object]:
 
 
 class SubmitTipCheckTests(unittest.TestCase):
+    def test_submit_tip_selection_is_atomic_with_observation_update(self) -> None:
+        server, rpc = coordinator()
+        observed_at = time.monotonic()
+        with server.lock:
+            server.current_tip_first_seen = (OLD_TIP, None)
+            server.current_tip_observed_monotonic = observed_at
+
+        freshness_check_started = threading.Event()
+        release_freshness_check = threading.Event()
+        tip_update_finished = threading.Event()
+        selected: list[str] = []
+        errors: list[BaseException] = []
+        real_monotonic = time.monotonic
+
+        def controlled_monotonic() -> float:
+            if threading.current_thread().name == "submit-tip":
+                freshness_check_started.set()
+                if not release_freshness_check.wait(5):
+                    raise AssertionError("freshness check was not released")
+                return observed_at
+            return real_monotonic()
+
+        def select_tip() -> None:
+            try:
+                selected.append(server.submit_stale_check_tip())
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        def update_tip() -> None:
+            with server.lock:
+                server.current_tip_first_seen = (NEW_TIP, real_monotonic())
+                server.current_tip_observed_monotonic = real_monotonic()
+            tip_update_finished.set()
+
+        submit_thread = threading.Thread(target=select_tip, name="submit-tip")
+        update_thread = threading.Thread(target=update_tip, name="tip-observer")
+        with mock.patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=controlled_monotonic,
+        ):
+            submit_thread.start()
+            try:
+                self.assertTrue(freshness_check_started.wait(5))
+                update_thread.start()
+                # A new observation cannot supersede the selected hash before
+                # submit_stale_check_tip returns its point-in-time result.
+                self.assertFalse(tip_update_finished.wait(0.1))
+            finally:
+                release_freshness_check.set()
+                submit_thread.join(5)
+                if update_thread.ident is not None:
+                    update_thread.join(5)
+
+        self.assertFalse(submit_thread.is_alive())
+        self.assertFalse(update_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(selected, [OLD_TIP])
+        self.assertTrue(tip_update_finished.is_set())
+        self.assertEqual(rpc.count("getbestblockhash"), 0)
+
     def test_submit_uses_observed_tip_without_rpc(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
