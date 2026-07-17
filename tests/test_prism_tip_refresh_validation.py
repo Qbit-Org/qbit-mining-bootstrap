@@ -283,6 +283,35 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(results[0]["matured_payouts"], 1)
         self.assertEqual(server._payout_state_generation, 1)
 
+    def test_tip_poll_reuses_reconciled_external_source(self) -> None:
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        initial_snapshot = server.fetch_qbit_tip_template_snapshot()
+        initial_sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                initial_snapshot.bestblockhash,
+                observation_sequence=initial_sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = initial_snapshot
+
+        next_tip = "76" * 32
+        _advance_fake_tip(rpc, next_tip, 11)
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_source[0], 1)
+        self.assertEqual(server._published_payout_state.source_generation, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, next_tip)
+        self.assertFalse(server.tip_refresh_is_pending())
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_source[0], 1)
+
     def test_newer_tip_discards_in_progress_payout_candidate(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -578,7 +607,44 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         self.assertTrue(publication_done.is_set())
         self.assertTrue(stale_done.is_set())
+        self.assertFalse(routine_thread.is_alive())
+        self.assertEqual(admitted_order[:1], ["priority"])
+        if admitted_order == ["priority"]:
+            with gate.delivery_cancelable(
+                lambda: False,
+                generation=1,
+                priority=False,
+            ) as admission:
+                self.assertTrue(admission)
+                admitted_order.append("routine")
         self.assertEqual(admitted_order, ["priority", "routine"])
+
+    def test_priority_reservation_rejects_nonpriority_without_waiting(self) -> None:
+        gate = _PayoutStateDeliveryGate()
+        with gate.publication():
+            gate.publish_generation(1, prioritize_delivery=True)
+        cancellation_checks = 0
+
+        def cancel_after_first_wait() -> bool:
+            nonlocal cancellation_checks
+            cancellation_checks += 1
+            return cancellation_checks > 1
+
+        with gate.delivery_cancelable(
+            cancel_after_first_wait,
+            generation=1,
+            priority=False,
+            poll_seconds=0.0,
+        ) as admission:
+            self.assertFalse(admission)
+
+        self.assertEqual(cancellation_checks, 1)
+        with gate.delivery_cancelable(
+            lambda: False,
+            generation=1,
+            priority=True,
+        ) as admission:
+            self.assertTrue(admission)
 
     def test_collection_refresh_stops_when_chain_becomes_untrusted(self) -> None:
         server, _rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))

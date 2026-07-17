@@ -508,6 +508,35 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         self.assertFalse(server.tip_refresh_is_pending())
 
+    def test_payout_only_advance_bounds_publish_supersession(self) -> None:
+        server, _rpc = coordinator()
+        server.payout_reconcile_supersession_retries = 2
+        real_publish = server._publish_payout_state_candidate
+        publish_attempts = 0
+
+        def supersede_before_publish(candidate: object) -> int | None:
+            nonlocal publish_attempts
+            publish_attempts += 1
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=f"{publish_attempts + 30:064x}",
+            )
+            return real_publish(candidate)  # type: ignore[arg-type]
+
+        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "payout-only invalidation was superseded",
+        ):
+            server._advance_payout_state_generation()
+
+        self.assertEqual(publish_attempts, 3)
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertTrue(server.tip_refresh_is_pending())
+
     def test_successful_poll_clears_payout_pending_created_during_reconcile(self) -> None:
         server, _rpc = coordinator()
         server._ensure_tip_refresh_state()

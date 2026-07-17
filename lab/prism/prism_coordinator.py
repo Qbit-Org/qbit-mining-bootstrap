@@ -1148,10 +1148,15 @@ class _PayoutStateDeliveryGate:
                     and generation == self._priority_generation
                     and not priority
                 )
+                if priority_blocked:
+                    # A same-generation job that is not for the published tip
+                    # must not occupy a waiter slot indefinitely. Reject it so
+                    # its caller can rebuild current-tip work; the reserved
+                    # first-delivery lane remains available to priority work.
+                    break
                 future_blocked = generation > self._published_generation
                 if (
                     not publication_blocked
-                    and not priority_blocked
                     and not future_blocked
                 ):
                     self._active_deliveries += 1
@@ -2470,19 +2475,23 @@ class PrismCoordinator:
         self._reserve_payout_state_source("payout_only")
         prepared_started = time.monotonic()
         with self._payout_state_prepare_lock:
-            while True:
-                candidate = self._current_payout_state_candidate()
-                self._observe_payout_state_seconds(
-                    "preparation",
-                    max(0.0, time.monotonic() - prepared_started),
-                )
-                generation = self._publish_payout_state_candidate(candidate)
-                if generation is not None:
-                    return generation
-                prepared_started = time.monotonic()
+            self._observe_payout_state_seconds(
+                "preparation",
+                max(0.0, time.monotonic() - prepared_started),
+            )
+            generation = self._publish_current_payout_state_with_retry_budget()
+        if generation is None:
+            raise TemplateRefreshBlocked(
+                "payout-only invalidation was superseded; immediate retry scheduled"
+            )
+        return generation
 
-    def _publish_current_payout_state_with_retry_budget(self) -> int | None:
-        """Bound test-mode publication retries after a source is superseded."""
+    def _publish_current_payout_state_with_retry_budget(
+        self,
+        *,
+        initial_attempted: bool = False,
+    ) -> int | None:
+        """Publish the current source with a bounded supersession budget."""
 
         max_retries = max(
             0,
@@ -2494,7 +2503,8 @@ class PrismCoordinator:
                 )
             ),
         )
-        for _attempt in range(max_retries):
+        attempts = max_retries + (0 if initial_attempted else 1)
+        for _attempt in range(attempts):
             candidate = self._current_payout_state_candidate()
             published = self._publish_payout_state_candidate(candidate)
             if published is not None:
@@ -5240,11 +5250,25 @@ class PrismCoordinator:
             # Supersede payout preparation immediately. The preparer will
             # discard its old immutable candidate before publication; this
             # marker does not wait for its ledger/RPC work to finish.
-            self._reserve_payout_state_source(
-                "external_tip",
-                tip_hash=tip_hash,
-                invalidated_monotonic=now,
-            )
+            self._ensure_job_cache_state()
+            with self.lock:
+                current = getattr(self, "current_tip_first_seen", None)
+                current_sequence = int(
+                    getattr(self, "current_tip_observation_sequence", 0)
+                )
+                if (
+                    current is not None
+                    and current[0] == tip_hash
+                    and current_sequence == observation_sequence
+                    and self._payout_state_source[1] != tip_hash
+                ):
+                    source_generation = self._payout_state_source[0] + 1
+                    self._payout_state_source = (
+                        source_generation,
+                        tip_hash,
+                        "external_tip",
+                        now,
+                    )
             self._mark_tip_refresh_pending(observation_sequence)
             self._schedule_tip_refresh_retry()
 
@@ -8649,7 +8673,9 @@ class PrismCoordinator:
                         # production reconciler. In production, a bounded
                         # supersession result leaves the source unpublished so
                         # job builds remain fenced until the scheduled retry.
-                        published = self._publish_current_payout_state_with_retry_budget()
+                        published = self._publish_current_payout_state_with_retry_budget(
+                            initial_attempted=True,
+                        )
             if confirmed_count not in {0, 1}:
                 self.stop_event.set()
                 self._abandon_block_candidate(
