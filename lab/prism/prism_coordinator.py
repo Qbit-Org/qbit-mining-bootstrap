@@ -3929,6 +3929,7 @@ class PrismCoordinator:
             self._record_heartbeat(heartbeat_name)
             if self.stop_event.is_set():
                 return 0
+            self._probe_tip_while_refresh_waiting()
         observation_sequence = 0
         pending_signal_token: int | None = None
         try:
@@ -3996,6 +3997,10 @@ class PrismCoordinator:
             build_failures = 0
             first_delivery: float | None = None
             last_delivery: float | None = None
+            self._raise_if_tip_refresh_superseded(
+                snapshot,
+                observation_sequence,
+            )
             try:
                 reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
                     snapshot.bestblockhash
@@ -4041,6 +4046,10 @@ class PrismCoordinator:
             )
             bundle: CachedJobBundle | None = None
             if use_prepared_fanout:
+                self._raise_if_tip_refresh_superseded(
+                    snapshot,
+                    observation_sequence,
+                )
                 try:
                     bundle = self.prepare_tip_refresh_bundle(snapshot, clients)
                 except TemplateRefreshBlocked:
@@ -4202,6 +4211,47 @@ class PrismCoordinator:
             self._observe_tip_refresh_seconds(
                 "refresh",
                 time.monotonic() - refresh_started,
+            )
+
+    def _probe_tip_while_refresh_waiting(self) -> None:
+        """Publish a changed live tip without entering the heavy refresh lane."""
+        observation_sequence = self._reserve_tip_observation_sequence()
+        try:
+            observed_tip = str(self.rpc.call("getbestblockhash"))
+        except Exception:
+            # The owning refresh still has to unwind or complete. Preserve its
+            # pending state and let the next bounded lock wait probe again.
+            return
+        with self.lock:
+            current_tip = getattr(self, "current_tip_first_seen", None)
+        if current_tip is None or current_tip[0] == observed_tip:
+            return
+        self.observe_tip_first_seen(
+            observed_tip,
+            observation_sequence=observation_sequence,
+            publish_refresh_observation=False,
+        )
+
+    def _raise_if_tip_refresh_superseded(
+        self,
+        snapshot: QbitTipTemplateSnapshot,
+        observation_sequence: int,
+    ) -> None:
+        """Stop obsolete work before entering another expensive phase."""
+        with self.lock:
+            current_tip = getattr(self, "current_tip_first_seen", None)
+            current_sequence = int(
+                getattr(self, "current_tip_observation_sequence", 0)
+            )
+        if (
+            current_tip is not None
+            and current_tip[0] != snapshot.bestblockhash
+            and current_sequence > observation_sequence
+        ):
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "tip/template poll was superseded by a newer tip observation "
+                "before refresh preparation"
             )
 
     def _reserve_tip_observation_sequence(self) -> int:
