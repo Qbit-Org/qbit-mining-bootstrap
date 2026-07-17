@@ -325,6 +325,34 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertTrue(state.sock.closed)
         self.assertEqual(sent, [])
 
+    def test_timeout_commits_closing_before_disconnect_handoff(self) -> None:
+        server = coordinator(connection_limit=3, pending_limit=2)
+        state = client(server, 1)
+        request = PendingInitialJob(
+            client=state,
+            authorization_generation=state.authorization_generation,
+            worker=state.worker,
+            requested_monotonic=0.0,
+            deadline_monotonic=1.0,
+        )
+        server.pending_initial_jobs[state] = request
+        disconnect_client = server.disconnect_client
+        rescheduled: list[bool] = []
+
+        def observe_handoff(current: ClientState) -> None:
+            self.assertTrue(current.closing.is_set())
+            rescheduled.append(server.schedule_initial_job(current))
+            self.assertNotIn(current, server.pending_initial_jobs)
+            disconnect_client(current)
+
+        server.disconnect_client = observe_handoff  # type: ignore[method-assign]
+
+        self.assertEqual(server.sweep_initial_job_timeouts(now=2.0), 1)
+
+        self.assertEqual(rescheduled, [True])
+        self.assertNotIn(state, server.clients)
+        self.assertTrue(state.sock.closed)
+
     def test_overload_rejection_never_evicts_current_work(self) -> None:
         server = coordinator(connection_limit=4, pending_limit=1)
         healthy = client(server, 1, with_job=True)

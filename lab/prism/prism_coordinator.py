@@ -4451,6 +4451,7 @@ class PrismCoordinator:
 
     def sweep_initial_job_timeouts(self, *, now: float | None = None) -> int:
         now = time.monotonic() if now is None else now
+        timed_out: list[PendingInitialJob] = []
         with self.lock:
             self._ensure_initial_job_state()
             expired = [
@@ -4466,10 +4467,19 @@ class PrismCoordinator:
                 request.cancelled.set()
                 if request.future is not None:
                     request.future.cancel()
+                closing = getattr(request.client, "closing", None)
+                if closing is None:
+                    closing = threading.Event()
+                    request.client.closing = closing
+                # Commit teardown while this request still owns the pending
+                # slot. A concurrent reauthorization will observe closing and
+                # cannot install a replacement between expiry and disconnect.
+                closing.set()
                 self.initial_job_timeout_count += 1
-        for request in expired:
+                timed_out.append(request)
+        for request in timed_out:
             self.disconnect_client(request.client)
-        return len(expired)
+        return len(timed_out)
 
     def initial_job_timeout_loop(self) -> None:
         while not self.stop_event.wait(1.0):
