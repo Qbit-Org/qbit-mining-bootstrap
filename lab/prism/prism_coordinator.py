@@ -1981,6 +1981,12 @@ class PrismCoordinator:
             # Orders reconciliation mutations against final job-delivery
             # admission while preserving parallel sends to different miners.
             self._payout_state_delivery_gate = _PayoutStateDeliveryGate()
+        if not hasattr(self, "_payout_balance_mutation_lock"):
+            # Keep durable payout-balance transitions serialized even when their
+            # preparation intentionally runs outside the delivery gate.  The
+            # accepted-block path can hold this lock across expensive writes
+            # without preventing replacement jobs from reaching miners.
+            self._payout_balance_mutation_lock = threading.RLock()
         if not hasattr(self, "_job_build_phase_local"):
             self._job_build_phase_local = threading.local()
         if not hasattr(self, "job_cache_hit_counts"):
@@ -2025,6 +2031,14 @@ class PrismCoordinator:
         self._ensure_job_cache_state()
         with self._job_cache_lock:
             return bundle.payout_state_generation == self._payout_state_generation
+
+    @contextmanager
+    def _payout_balance_mutation(self) -> Iterator[None]:
+        """Serialize a durable balance change and exclude job delivery."""
+        self._ensure_job_cache_state()
+        with self._payout_balance_mutation_lock:
+            with self._payout_state_delivery_gate.mutation():
+                yield
 
     def _advance_payout_state_generation(self) -> int:
         """Invalidate signed bundles after reconciliation mutates payout state."""
@@ -5273,7 +5287,7 @@ class PrismCoordinator:
                 chain_state = str(row.get("chain_state", ""))
                 if block_height > active_tip_height:
                     if chain_state == "confirmed":
-                        with self._payout_state_delivery_gate.mutation():
+                        with self._payout_balance_mutation():
                             inactive = self.ledger.mark_pool_block_inactive(
                                 block_hash=block_hash,
                                 active_tip_height=active_tip_height,
@@ -5286,7 +5300,7 @@ class PrismCoordinator:
                 active_hash = str(self.rpc.call("getblockhash", [block_height])).lower()
                 on_active_chain = active_hash == block_hash
                 if on_active_chain and chain_state == "inactive":
-                    with self._payout_state_delivery_gate.mutation():
+                    with self._payout_balance_mutation():
                         reactivated = self.ledger.reactivate_pool_block(
                             block_hash=block_hash,
                             active_tip_height=active_tip_height,
@@ -5296,7 +5310,7 @@ class PrismCoordinator:
                         if reactivated_count:
                             self._advance_payout_state_generation()
                 elif not on_active_chain and chain_state == "confirmed":
-                    with self._payout_state_delivery_gate.mutation():
+                    with self._payout_balance_mutation():
                         inactive = self.ledger.mark_pool_block_inactive(
                             block_hash=block_hash,
                             active_tip_height=active_tip_height,
@@ -7661,30 +7675,34 @@ class PrismCoordinator:
             # Persistence only creates ``prepared`` payout rows, which the
             # current-balance queries deliberately ignore.  Keep its expensive
             # canonicalization, audit-body writes, deep copies, and bulk SQL
-            # outside the delivery gate so replacement work can keep flowing
-            # while the accepted-block audit is made durable.
-            persistence = self.ledger.persist_accepted_block(
-                block_hash=submission.block_hash_hex,
-                block_height=expected_height,
-                parent_hash=str(context.template["previousblockhash"]),
-                final_bundle=final_bundle,
-                audit_report=report,
-            )
-            self._record_heartbeat("block_submitter")
-            # Confirmation is the actual payout-state mutation: it makes the
-            # prepared carry-forward rows visible.  Keep that transition and
-            # its generation invalidation atomic with respect to delivery.
-            with self._payout_state_delivery_gate.mutation():
-                confirmation = self.ledger.confirm_accepted_block(
-                    block_hash=block_hash,
-                    active_tip_height=active_tip_height,
+            # outside the delivery gate so replacement work can keep flowing.
+            # The separate mutation lock still prevents reconciliation from
+            # changing the confirmed balances that those prepared rows extend
+            # before confirmation makes them visible.
+            with self._payout_balance_mutation_lock:
+                persistence = self.ledger.persist_accepted_block(
+                    block_hash=submission.block_hash_hex,
+                    block_height=expected_height,
+                    parent_hash=str(context.template["previousblockhash"]),
+                    final_bundle=final_bundle,
+                    audit_report=report,
                 )
-                confirmed_count = int(confirmation.get("confirmed_count", 0))
-                if confirmed_count in {0, 1} and confirmed_count:
-                    # Confirmation activates the newly persisted carry-forward
-                    # rows. Advance before releasing delivery admission so no
-                    # old-balance bundle can land after this durable boundary.
-                    self._advance_payout_state_generation()
+                self._record_heartbeat("block_submitter")
+                # Confirmation is the actual payout-state mutation: it makes
+                # the prepared carry-forward rows visible. Keep that transition
+                # and its generation invalidation atomic with respect to
+                # delivery.
+                with self._payout_state_delivery_gate.mutation():
+                    confirmation = self.ledger.confirm_accepted_block(
+                        block_hash=block_hash,
+                        active_tip_height=active_tip_height,
+                    )
+                    confirmed_count = int(confirmation.get("confirmed_count", 0))
+                    if confirmed_count in {0, 1} and confirmed_count:
+                        # Confirmation activates the newly persisted carry-forward
+                        # rows. Advance before releasing delivery admission so no
+                        # old-balance bundle can land after this durable boundary.
+                        self._advance_payout_state_generation()
             if confirmed_count not in {0, 1}:
                 self.stop_event.set()
                 self._abandon_block_candidate(

@@ -5100,7 +5100,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(active_fanout.is_set())
         self.assertTrue(server._tip_refresh_retry.is_set())
 
-    def test_accepted_block_persistence_does_not_hold_payout_delivery_gate(self) -> None:
+    def test_accepted_block_persistence_allows_delivery_but_serializes_reconciliation(
+        self,
+    ) -> None:
         server, state, ledger = submit_coordinator()
         server._ensure_job_cache_state()
         persist_started = threading.Event()
@@ -5108,27 +5110,67 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         release_persist = threading.Event()
         confirm_started = threading.Event()
         release_delivery = threading.Event()
+        reconcile_lock_attempted = threading.Event()
+        reconcile_mutated = threading.Event()
+        event_lock = threading.Lock()
+        events: list[str] = []
         original_persist = ledger.persist_accepted_block
         original_confirm = ledger.confirm_accepted_block
 
+        def note(name: str) -> None:
+            with event_lock:
+                events.append(name)
+
         def blocking_persist(**kwargs: object) -> dict[str, object]:
+            note("persist-start")
             persist_started.set()
             if not release_persist.wait(15):
                 raise AssertionError("timed out waiting to release accepted-block persistence")
             result = original_persist(**kwargs)
+            note("persist-end")
             persist_finished.set()
             return result
 
         def observed_confirm(**kwargs: object) -> dict[str, object]:
+            note("confirm")
             confirm_started.set()
             return original_confirm(**kwargs)
 
+        ledger.reorg_watch_blocks = lambda *, active_tip_height: [  # type: ignore[method-assign]
+            {
+                "block_height": active_tip_height - 2,
+                "block_hash": "aa" * 32,
+                "chain_state": "confirmed",
+            }
+        ]
+
+        def mark_pool_block_inactive(**_kwargs: object) -> dict[str, object]:
+            note("reconcile-mutation")
+            reconcile_mutated.set()
+            return {"backend": "fake", "inactive_count": 1}
+
         ledger.persist_accepted_block = blocking_persist  # type: ignore[method-assign]
         ledger.confirm_accepted_block = observed_confirm  # type: ignore[method-assign]
+        ledger.mark_pool_block_inactive = mark_pool_block_inactive  # type: ignore[method-assign]
         accepted: list[bool] = []
+        reconcile_results: list[dict[str, object]] = []
         errors: list[BaseException] = []
         delivery_admitted = threading.Event()
         delivery_thread: threading.Thread | None = None
+        reconcile_thread: threading.Thread | None = None
+        mutation_lock = server._payout_balance_mutation_lock
+
+        class ObservedBalanceLock:
+            def __enter__(self) -> ObservedBalanceLock:
+                if threading.current_thread() is reconcile_thread:
+                    reconcile_lock_attempted.set()
+                mutation_lock.acquire()
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                mutation_lock.release()
+
+        server._payout_balance_mutation_lock = ObservedBalanceLock()  # type: ignore[assignment]
 
         with tempfile.TemporaryDirectory() as tempdir:
             server.audit_dir = Path(tempdir)
@@ -5162,6 +5204,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             def deliver() -> None:
                 try:
                     with server._payout_state_delivery_gate.delivery():
+                        note("replacement-delivery")
                         delivery_admitted.set()
                         if not release_delivery.wait(15):
                             raise AssertionError(
@@ -5170,15 +5213,29 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 except BaseException as exc:  # noqa: BLE001 - asserted below
                     errors.append(exc)
 
+            def reconcile() -> None:
+                try:
+                    reconcile_results.append(
+                        server.reconcile_prism_pool_blocks_once(tip_hash=block_hash)
+                    )
+                except BaseException as exc:  # noqa: BLE001 - asserted below
+                    errors.append(exc)
+
             submit_thread = threading.Thread(target=submit)
             submit_thread.start()
             confirmation_waited_for_delivery = False
             try:
                 self.assertTrue(persist_started.wait(5))
+                server.reorg_reconciler_enabled = True
+                reconcile_thread = threading.Thread(target=reconcile)
+                reconcile_thread.start()
+                self.assertTrue(reconcile_lock_attempted.wait(5))
+                self.assertFalse(reconcile_mutated.is_set())
                 delivery_thread = threading.Thread(target=deliver)
                 delivery_thread.start()
                 admitted_while_persisting = delivery_admitted.wait(5)
                 if admitted_while_persisting:
+                    self.assertFalse(reconcile_mutated.is_set())
                     release_persist.set()
                     self.assertTrue(persist_finished.wait(5))
                     confirmation_waited_for_delivery = not confirm_started.wait(0.1)
@@ -5188,17 +5245,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 submit_thread.join(10)
                 if delivery_thread is not None:
                     delivery_thread.join(10)
+                if reconcile_thread is not None:
+                    reconcile_thread.join(10)
 
             self.assertFalse(submit_thread.is_alive())
             self.assertIsNotNone(delivery_thread)
             self.assertFalse(delivery_thread.is_alive())
+            self.assertIsNotNone(reconcile_thread)
+            self.assertFalse(reconcile_thread.is_alive())
             if errors:
                 raise errors[0]
             self.assertTrue(admitted_while_persisting)
             self.assertTrue(confirmation_waited_for_delivery)
             self.assertTrue(confirm_started.is_set())
+            self.assertTrue(reconcile_mutated.is_set())
             self.assertEqual(accepted, [True])
-            self.assertEqual(server._payout_state_generation, 1)
+            self.assertEqual(len(reconcile_results), 1)
+            self.assertEqual(reconcile_results[0]["inactive_blocks"], 1)
+            self.assertEqual(server._payout_state_generation, 2)
+            self.assertLess(events.index("persist-start"), events.index("replacement-delivery"))
+            self.assertLess(events.index("replacement-delivery"), events.index("persist-end"))
+            self.assertLess(events.index("persist-end"), events.index("confirm"))
+            self.assertLess(events.index("confirm"), events.index("reconcile-mutation"))
 
     def test_active_ancestor_candidate_resumes_full_finalization_without_resubmit(self) -> None:
         server, state, ledger = submit_coordinator()
