@@ -2848,6 +2848,32 @@ class PrismCoordinator:
         self._mark_tip_refresh_pending(client.connection_id)
         self._schedule_tip_refresh_retry()
 
+    def _consume_retained_collection_refresh(
+        self,
+        context: PrismJobContext,
+    ) -> None:
+        """Consume retention only after its collection work was delivered."""
+        if not context.collection_only:
+            return
+        with self.lock:
+            retained = self._retained_collection_refresh
+            published_snapshot = self.tip_template_snapshot
+            artifacts = (
+                published_snapshot.template_artifacts
+                if published_snapshot is not None
+                else None
+            )
+            if (
+                retained is not None
+                and retained.payout_state_generation
+                == context.payout_state_generation
+                and artifacts is not None
+                and context.template is artifacts.template
+                and context.template_fingerprint == artifacts.fingerprint
+                and context.template_generation == artifacts.generation
+            ):
+                self._retained_collection_refresh = None
+
     def tip_refresh_is_pending(self) -> bool:
         return self._tip_refresh_pending()
 
@@ -5611,7 +5637,9 @@ class PrismCoordinator:
         except Exception:
             return False
         if ready_miner_count >= getattr(self, "min_ready_miners", 3):
-            self._pool_ready_latched = True
+            with self.lock:
+                self._pool_ready_latched = True
+                self._retained_collection_refresh = None
             return True
         return False
 
@@ -6189,6 +6217,7 @@ class PrismCoordinator:
             self.send_job_update(client, context.job)
             self.apply_job_difficulty(client, context.job)
             self.note_tip_work_delivered(client, str(context.template["previousblockhash"]))
+            self._consume_retained_collection_refresh(context)
             phases["send"] = time.monotonic() - phase_started
             elapsed = time.monotonic() - started
             self.observe_job_build_elapsed(elapsed, phases)

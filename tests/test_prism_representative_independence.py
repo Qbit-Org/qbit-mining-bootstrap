@@ -191,6 +191,16 @@ class RepresentativeIndependentRefreshTests(unittest.TestCase):
             authorized.active_job.template,
             retained.snapshot.template_artifacts.template,
         )
+        self.assertIsNone(server._retained_collection_refresh)
+
+        pending_token = server._tip_refresh_pending_token
+        if pending_token is not None:
+            server._clear_tip_refresh_pending(pending_token)
+        server._tip_refresh_retry.clear()
+        server._note_collection_identity_available(authorized)
+
+        self.assertFalse(server.tip_refresh_is_pending())
+        self.assertFalse(server._tip_refresh_retry.is_set())
 
     def test_authorization_during_same_tip_publication_keeps_retained_wake(
         self,
@@ -256,14 +266,7 @@ class RepresentativeIndependentRefreshTests(unittest.TestCase):
         self.assertEqual(poll_results, [0])
         self.assertFalse(server.tip_refresh_is_pending())
         self.assertTrue(server._tip_refresh_retry.is_set())
-        current_artifacts = server._retained_collection_artifacts()
-        self.assertIsNotNone(current_artifacts)
-        published_snapshot = server.tip_template_snapshot
-        assert current_artifacts is not None and published_snapshot is not None
-        self.assertIs(
-            current_artifacts,
-            published_snapshot.template_artifacts,
-        )
+        self.assertIsNone(server._retained_collection_refresh)
         self.assertEqual(
             [payload["method"] for payload in sent],
             ["mining.set_difficulty", "mining.notify"],
@@ -274,6 +277,18 @@ class RepresentativeIndependentRefreshTests(unittest.TestCase):
             authorized.active_job.template,
             retained.snapshot.template_artifacts.template,
         )
+
+    def test_ready_latch_discards_retained_collection_marker(self) -> None:
+        ledger = FakeLedger(miners=["solo"])
+        server, _rpc = coordinator(ledger=ledger)
+        server.clients = set()
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertIsNotNone(server._retained_collection_refresh)
+        ledger.miners = ["miner-a", "miner-b", "miner-c"]
+
+        self.assertTrue(server.pool_readiness_latched())
+        self.assertIsNone(server._retained_collection_refresh)
 
     def test_collection_reauthorization_reselects_identity_without_template_refetch(
         self,
