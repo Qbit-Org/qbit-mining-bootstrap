@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import hashlib
 import io
 import json
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import unittest
 import unittest.mock
 
@@ -1635,6 +1637,319 @@ class PrismShareLedgerTests(unittest.TestCase):
             assert resolved is not None
             self.assertEqual(resolved["audit_bundle"], bundle)
             self.assertNotIn("body_uri", resolved)
+
+    def test_psql_reuses_complete_10k_share_slot_without_parse_merge_or_memory_amplification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                audit_body_dir=tmp,
+                audit_share_segment_size=10_000,
+            )
+            shares = [
+                {
+                    "share_seq": share_seq,
+                    "share_id": f"worker-{share_seq % 128}:{share_seq:016x}",
+                    "miner_id": f"miner-{share_seq % 128}",
+                    "order_key": f"{share_seq:020d}",
+                    "p2mr_program_hex": f"{share_seq % 256:02x}" * 32,
+                    "share_difficulty": 100_000 + share_seq,
+                    "network_difficulty": 1_000_000,
+                    "template_height": 123_456,
+                    "job_id": f"job-{share_seq // 64}",
+                    "job_issued_at_ms": 1_700_000_000_000 + share_seq,
+                    "accepted_at_ms": 1_700_000_001_000 + share_seq,
+                    "ntime": 1_700_000_000 + share_seq,
+                }
+                for share_seq in range(1, 10_001)
+            ]
+            segment_uri, expected_range_sha256 = ledger._write_audit_share_segment_range(
+                segment_first_share_seq=1,
+                segment_last_share_seq=10_000,
+                first_share_seq=1,
+                last_share_seq=10_000,
+                shares=shares,
+            )
+            segment_path = Path(segment_uri)
+            expected_bytes = segment_path.read_bytes()
+            expected_file_sha256 = hashlib.sha256(expected_bytes).hexdigest()
+            expected_mtime_ns = segment_path.stat().st_mtime_ns
+
+            gc.collect()
+            tracemalloc.start()
+            try:
+                with (
+                    unittest.mock.patch(
+                        "lab.prism.share_ledger.json.loads",
+                        side_effect=AssertionError("complete share slot must not be parsed"),
+                    ),
+                    unittest.mock.patch.object(
+                        ledger,
+                        "_merge_audit_share_ranges",
+                        side_effect=AssertionError("complete share slot must not be merged"),
+                    ),
+                ):
+                    reused_uri, reused_range_sha256 = ledger._write_audit_share_segment_range(
+                        segment_first_share_seq=1,
+                        segment_last_share_seq=10_000,
+                        first_share_seq=1,
+                        last_share_seq=10_000,
+                        shares=shares,
+                    )
+                _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+
+            self.assertEqual(reused_uri, segment_uri)
+            self.assertEqual(reused_range_sha256, expected_range_sha256)
+            self.assertEqual(segment_path.read_bytes(), expected_bytes)
+            self.assertEqual(hashlib.sha256(segment_path.read_bytes()).hexdigest(), expected_file_sha256)
+            self.assertEqual(segment_path.stat().st_mtime_ns, expected_mtime_ns)
+            self.assertLess(
+                peak_bytes,
+                4 * len(expected_bytes),
+                f"complete-slot reuse peaked at {peak_bytes} bytes for a {len(expected_bytes)}-byte slot",
+            )
+
+    def test_psql_segment_slow_path_rewrites_semantically_equal_byte_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                audit_body_dir=tmp,
+                audit_share_segment_size=2,
+            )
+            existing_shares = [
+                {"share_seq": 1, "share_id": "s1"},
+                {"share_seq": 2, "share_id": "s2"},
+            ]
+            segment_uri, old_range_sha256 = ledger._write_audit_share_segment_range(
+                segment_first_share_seq=1,
+                segment_last_share_seq=2,
+                first_share_seq=1,
+                last_share_seq=2,
+                shares=existing_shares,
+            )
+            segment_path = Path(segment_uri)
+            old_bytes = segment_path.read_bytes()
+            # Dict equality ignores insertion order, while the canonical range
+            # hash binds exact JSON bytes. The slow path must rewrite these.
+            incoming_shares = [
+                {"share_id": "s1", "share_seq": 1},
+                {"share_id": "s2", "share_seq": 2},
+            ]
+            expected_bytes = ledger._storage_json_bytes(
+                ledger._audit_share_segment_payload(
+                    first_share_seq=1,
+                    last_share_seq=2,
+                    shares=incoming_shares,
+                )
+            )
+
+            reused_uri, new_range_sha256 = ledger._write_audit_share_segment_range(
+                segment_first_share_seq=1,
+                segment_last_share_seq=2,
+                first_share_seq=1,
+                last_share_seq=2,
+                shares=incoming_shares,
+            )
+
+            self.assertEqual(reused_uri, segment_uri)
+            self.assertNotEqual(old_bytes, expected_bytes)
+            self.assertNotEqual(old_range_sha256, new_range_sha256)
+            self.assertEqual(segment_path.read_bytes(), expected_bytes)
+            self.assertEqual(new_range_sha256, hashlib.sha256(expected_bytes).hexdigest())
+
+    def test_psql_canonical_bundle_path_skips_canonicalizer_and_is_retry_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            body_dir = root / "body-store"
+            candidate_path = root / "canonical-candidate.json"
+            bundle = {
+                "schema": "qbit.prism.audit-bundle.v1",
+                "shares": [{"share_seq": 1, "share_id": "s1"}],
+                "found_block": {"bits": "207fffff"},
+            }
+            canonical_bytes = fake_audit_bundle_bytes(bundle)
+            candidate_path.write_bytes(canonical_bytes)
+            body_sha = hashlib.sha256(canonical_bytes).hexdigest()
+            canonicalizer = unittest.mock.Mock(
+                side_effect=AssertionError("canonical candidate must not be canonicalized again")
+            )
+            ledger = FakeLeasePsqlShareLedger(
+                [
+                    acquired_lease(),
+                    {"existing_block": False, "existing_body_uri": None},
+                    {"existing_block": False, "existing_body_uri": None},
+                ],
+                audit_body_dir=body_dir,
+                audit_bundle_canonicalizer=canonicalizer,
+                audit_share_segment_size=0,
+            )
+            payload = {
+                "block_hash": "aa" * 32,
+                "audit_bundle_sha256": body_sha,
+                "coinbase_tx_hex": "00",
+                "coinbase_txid": "11" * 32,
+                "payout_manifest_sha256": "22" * 32,
+                "block_height": 10,
+                "parent_hash": "bb" * 32,
+                "writer_id": ledger._writer_id,
+                "writer_epoch": ledger._writer_epoch,
+                "writer_session_token": ledger._writer_session_token,
+            }
+
+            first_uri = ledger._prepare_external_audit_body(
+                payload,
+                bundle,
+                canonical_bundle_path=candidate_path,
+            )
+            assert first_uri is not None
+            body_path = Path(first_uri)
+            first_stat = body_path.stat()
+            self.assertEqual(body_path.read_bytes(), canonical_bytes)
+
+            # This models a retry after the atomic body rename succeeded but
+            # before the corresponding database row was committed.
+            second_uri = ledger._prepare_external_audit_body(
+                payload,
+                bundle,
+                canonical_bundle_path=candidate_path,
+            )
+
+            self.assertEqual(second_uri, first_uri)
+            self.assertEqual(body_path.read_bytes(), canonical_bytes)
+            self.assertEqual(hashlib.sha256(body_path.read_bytes()).hexdigest(), body_sha)
+            self.assertEqual(body_path.stat().st_ino, first_stat.st_ino)
+            self.assertEqual(body_path.stat().st_mtime_ns, first_stat.st_mtime_ns)
+            canonicalizer.assert_not_called()
+            self.assertEqual(list(body_dir.glob(".*.tmp")), [])
+
+    def test_psql_compact_v2_retry_stays_bounded_and_skips_reconstruction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            body_dir = root / "body-store"
+            candidate_path = root / "canonical-candidate.json"
+            bundle = {
+                "schema": "qbit.prism.audit-bundle.v1",
+                "shares": [
+                    {"share_seq": 1, "share_id": "s1"},
+                    {"share_seq": 2, "share_id": "s2"},
+                ],
+                "found_block": {"bits": "207fffff"},
+            }
+            canonical_bytes = fake_audit_bundle_bytes(bundle)
+            candidate_path.write_bytes(canonical_bytes)
+            body_sha = hashlib.sha256(canonical_bytes).hexdigest()
+            canonicalizer = unittest.mock.Mock(
+                side_effect=AssertionError("compact retry must not canonicalize a full bundle")
+            )
+            ledger = FakeLeasePsqlShareLedger(
+                [
+                    acquired_lease(),
+                    {"existing_block": False, "existing_body_uri": None},
+                    {"existing_block": False, "existing_body_uri": None},
+                ],
+                audit_body_dir=body_dir,
+                audit_bundle_canonicalizer=canonicalizer,
+                audit_share_segment_size=1,
+            )
+            payload = {
+                "block_hash": "aa" * 32,
+                "audit_bundle_sha256": body_sha,
+                "coinbase_tx_hex": "00",
+                "coinbase_txid": "11" * 32,
+                "payout_manifest_sha256": "22" * 32,
+                "block_height": 10,
+                "parent_hash": "bb" * 32,
+                "writer_id": ledger._writer_id,
+                "writer_epoch": ledger._writer_epoch,
+                "writer_session_token": ledger._writer_session_token,
+            }
+
+            first_uri = ledger._prepare_external_audit_body(
+                payload,
+                bundle,
+                canonical_bundle_path=candidate_path,
+            )
+            assert first_uri is not None
+            body_path = Path(first_uri)
+            body_stat = body_path.stat()
+            segment_paths = sorted(body_dir.glob("prism-audit-share-segment-slot-*.json"))
+            segment_stats = {path: path.stat() for path in segment_paths}
+            self.assertEqual(
+                json.loads(body_path.read_text(encoding="utf-8"))["schema"],
+                "qbit.prism.audit-bundle.v2",
+            )
+
+            with (
+                unittest.mock.patch.object(
+                    ledger,
+                    "_external_body_matches_sha",
+                    side_effect=AssertionError("same-version compact retry must compare bounded storage"),
+                ),
+                unittest.mock.patch.object(
+                    ledger,
+                    "_resolve_audit_bundle_v2",
+                    side_effect=AssertionError("compact retry must not reconstruct every segment"),
+                ),
+            ):
+                second_uri = ledger._prepare_external_audit_body(
+                    payload,
+                    bundle,
+                    canonical_bundle_path=candidate_path,
+                )
+
+            self.assertEqual(second_uri, first_uri)
+            self.assertEqual(body_path.stat().st_ino, body_stat.st_ino)
+            self.assertEqual(body_path.stat().st_mtime_ns, body_stat.st_mtime_ns)
+            self.assertEqual(segment_paths, sorted(body_dir.glob("prism-audit-share-segment-slot-*.json")))
+            for path, first_stat in segment_stats.items():
+                self.assertEqual(path.stat().st_ino, first_stat.st_ino)
+                self.assertEqual(path.stat().st_mtime_ns, first_stat.st_mtime_ns)
+            canonicalizer.assert_not_called()
+            self.assertEqual(list(body_dir.glob(".*.tmp")), [])
+
+    def test_psql_canonical_bundle_path_hash_mismatch_publishes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            body_dir = root / "body-store"
+            candidate_path = root / "canonical-candidate.json"
+            bundle = {"schema": "qbit.prism.audit-bundle.v1", "shares": []}
+            candidate_path.write_bytes(fake_audit_bundle_bytes(bundle))
+            canonicalizer = unittest.mock.Mock(
+                side_effect=AssertionError("mismatched candidate must not be canonicalized")
+            )
+            ledger = FakeLeasePsqlShareLedger(
+                [
+                    acquired_lease(),
+                    {"existing_block": False, "existing_body_uri": None},
+                ],
+                audit_body_dir=body_dir,
+                audit_bundle_canonicalizer=canonicalizer,
+                audit_share_segment_size=0,
+            )
+            payload = {
+                "block_hash": "aa" * 32,
+                "audit_bundle_sha256": "00" * 32,
+                "coinbase_tx_hex": "00",
+                "coinbase_txid": "11" * 32,
+                "payout_manifest_sha256": "22" * 32,
+                "block_height": 10,
+                "parent_hash": "bb" * 32,
+                "writer_id": ledger._writer_id,
+                "writer_epoch": ledger._writer_epoch,
+                "writer_session_token": ledger._writer_session_token,
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "audit bundle sha256 mismatch"):
+                ledger._prepare_external_audit_body(
+                    payload,
+                    bundle,
+                    canonical_bundle_path=candidate_path,
+                )
+
+            canonicalizer.assert_not_called()
+            self.assertEqual(len(ledger.lease_results), 1)
+            self.assertFalse(body_dir.exists())
 
     def test_psql_compact_audit_body_writes_v2_range_proof_and_resolves_v1_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
