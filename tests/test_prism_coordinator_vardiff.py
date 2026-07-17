@@ -3187,21 +3187,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         ):
             server.validate_live_template_and_fee_policy()
 
-    def test_template_refresh_failure_budget_distinguishes_transient_and_sustained_outage(self) -> None:
+    def test_template_refresh_failure_budget_starts_at_first_failure(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
         server.template_refresh_failure_exit_seconds = 120
         server.last_successful_template_refresh_monotonic = 100.0
 
-        self.assertFalse(server.template_refresh_failure_expired(219.999))
-        self.assertTrue(server.template_refresh_failure_expired(220.0))
+        self.assertFalse(server.template_refresh_failure_expired(500.0))
+        self.assertEqual(server.template_refresh_failure_started_monotonic, 500.0)
+        self.assertFalse(server.template_refresh_failure_expired(619.999))
+        self.assertTrue(server.template_refresh_failure_expired(620.0))
 
-        server.last_successful_template_refresh_monotonic = 219.0
-        self.assertFalse(server.template_refresh_failure_expired(220.0))
+    def test_disabled_template_refresh_failure_budget_does_not_start_or_expire(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server.template_refresh_failure_exit_seconds = 0
+
+        self.assertFalse(server.template_refresh_failure_expired(500.0))
+        self.assertFalse(hasattr(server, "template_refresh_failure_started_monotonic"))
 
     def test_healthy_noop_template_poll_resets_refresh_failure_clock(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
         server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_started_monotonic = 190.0
         server.template_refresh_failure_exit_seconds = 10.0
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         snapshot = QbitTipTemplateSnapshot(
@@ -3209,6 +3216,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             previousblockhash="11" * 32,
             template_fingerprint="22" * 32,
         )
+        server.tip_template_snapshot = snapshot
         server.rpc = TipRpc(snapshot.bestblockhash)
         server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
 
@@ -3221,6 +3229,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server.blockpoll_loop()
 
         self.assertEqual(server.last_successful_template_refresh_monotonic, 200.0)
+        self.assertIsNone(server.template_refresh_failure_started_monotonic)
+        self.assertFalse(server.template_refresh_failure_expired(300.0))
+        self.assertEqual(server.template_refresh_failure_started_monotonic, 300.0)
 
     def test_shared_template_poll_records_success_for_blockwait_callers(self) -> None:
         server = coordinator()
@@ -3244,6 +3255,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server = coordinator()
         server.blockpoll_seconds = 0
         server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_started_monotonic = 100.0
         server.template_refresh_failure_exit_seconds = 10.0
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         snapshot = QbitTipTemplateSnapshot(
@@ -3272,6 +3284,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server = coordinator()
         server.blockpoll_seconds = 0
         server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_started_monotonic = 100.0
         server.template_refresh_failure_exit_seconds = 10.0
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         state = client()
