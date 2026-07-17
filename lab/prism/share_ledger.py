@@ -12,12 +12,13 @@ import shlex
 import subprocess
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from lab.prism.prism_tools import prism_tool_command
 
@@ -962,6 +963,151 @@ def _series_start(now: datetime, range_id: str) -> datetime:
     return datetime.fromtimestamp(0, timezone.utc)
 
 
+def database_url_from_psql_command(command: list[str]) -> str | None:
+    """Best-effort DSN extraction from a psql invocation.
+
+    Handles the common shapes the coordinator and deploy tooling produce:
+    ``psql postgres://...``, ``psql -d postgres://...`` and
+    ``psql --dbname=postgres://...``. Anything else (host/user flags, service
+    files) stays on the subprocess backend rather than risking a mistranslated
+    connection.
+    """
+    expect_dbname = False
+    for arg in command[1:]:
+        if expect_dbname:
+            candidate = arg
+            expect_dbname = False
+        elif arg in {"-d", "--dbname"}:
+            expect_dbname = True
+            continue
+        elif arg.startswith("--dbname="):
+            candidate = arg.split("=", 1)[1]
+        else:
+            candidate = arg
+        if candidate.startswith("postgres://") or candidate.startswith("postgresql://"):
+            return candidate
+    return None
+
+
+class _NativePostgresClient:
+    """Persistent pooled psycopg client for the share ledger.
+
+    Executes the exact same self-contained SQL text the psql subprocess
+    backend runs (values are inlined by the callers), but over long-lived
+    connections instead of one fork+connect per statement. Every statement
+    returns a single JSON value, mirroring the psql `--tuples-only` contract.
+    Connections are created lazily, run in autocommit (each statement is its
+    own synchronous commit, exactly like a psql invocation — including the
+    group-commit ``append_batch`` statement, whose durability comes from its
+    own ``set_config('synchronous_commit', 'on', true)``), and a connection
+    that raises is discarded so the next acquisition reconnects.
+    """
+
+    def __init__(self, conninfo: str, *, pool_size: int):
+        import psycopg  # deferred: the subprocess backend must work without it
+
+        self._psycopg = psycopg
+        self._conninfo = conninfo
+        self._pool_size = max(1, int(pool_size))
+        self._slots = BoundedSemaphore(self._pool_size)
+        self._idle: list[Any] = []
+        self._idle_lock = Lock()
+        self._closed = False
+
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
+
+    def _connect(self) -> Any:
+        return self._psycopg.connect(self._conninfo, autocommit=True)
+
+    @contextmanager
+    def connection(self) -> Iterator[Any]:
+        """Borrow a pooled connection; discard it if the caller raises."""
+        self._slots.acquire()
+        conn = None
+        try:
+            with self._idle_lock:
+                if self._closed:
+                    raise RuntimeError("postgres client is closed")
+                if self._idle:
+                    conn = self._idle.pop()
+            if conn is None or conn.closed:
+                conn = self._connect()
+            yield conn
+        except BaseException:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            raise
+        else:
+            with self._idle_lock:
+                if self._closed:
+                    keep = False
+                else:
+                    self._idle.append(conn)
+                    keep = True
+            if not keep:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        finally:
+            self._slots.release()
+
+    def run_json(self, sql: str) -> Any:
+        """Run one JSON-returning statement, retrying once on a dead connection.
+
+        Mirrors JsonRpc.call's retry contract: the usual cause is the server
+        having closed an idle keep-alive connection, in which case the
+        statement never ran. If the first attempt committed and the connection
+        died returning the result, re-execution is safe for every ledger
+        statement: appends dedup on share_id (the batch statement is
+        explicitly idempotent), the lease upsert and block persists are
+        guarded by identity checks, and reads have no side effects.
+        """
+        for attempt in (0, 1):
+            try:
+                with self.connection() as conn:
+                    row = conn.execute(sql).fetchone()
+                return parse_single_json_value(row[0] if row else None)
+            except self._psycopg.OperationalError as exc:
+                if attempt:
+                    raise RuntimeError(f"postgres query failed: {exc}") from exc
+        raise AssertionError("unreachable")
+
+    def run_script(self, sql: str) -> None:
+        """Run a multi-statement script (schema initialization)."""
+        with self.connection() as conn:
+            conn.execute(sql)
+
+    def close(self) -> None:
+        with self._idle_lock:
+            self._closed = True
+            idle, self._idle = self._idle, []
+        for conn in idle:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def parse_single_json_value(value: object) -> Any:
+    """Normalize a one-row/one-column JSON query result.
+
+    psycopg already decodes json/jsonb columns to Python objects; the psql
+    subprocess path yields text. A NULL result matches the subprocess
+    behavior of raising on empty output.
+    """
+    if value is None:
+        raise RuntimeError("postgres query returned no JSON")
+    if isinstance(value, (str, bytes, bytearray)):
+        return json.loads(value)
+    return value
+
+
 class PsqlShareLedger:
     """Postgres-backed implementation of the coordinator share-ledger API.
 
@@ -974,6 +1120,8 @@ class PsqlShareLedger:
         self,
         *,
         psql_command: str,
+        database_url: str | None = None,
+        native_client_mode: str = "auto",
         writer_id: str = "prism-coordinator",
         writer_epoch: int = 1,
         writer_session_token: str | None = None,
@@ -983,6 +1131,7 @@ class PsqlShareLedger:
         lease_retry_max_sleep_seconds: float = 15.0,
         lease_ttl_seconds: float = 60.0,
         read_concurrency: int = 4,
+        accepted_stats_cache_seconds: float = 60.0,
         audit_body_dir: str | Path | None = None,
         audit_bundle_canonicalizer: Callable[[dict[str, Any]], bytes] | None = None,
         audit_share_segment_size: int = 0,
@@ -991,6 +1140,9 @@ class PsqlShareLedger:
     ):
         if writer_epoch < 0:
             raise ValueError("writer_epoch must be >= 0")
+        accepted_stats_cache_seconds = float(accepted_stats_cache_seconds)
+        if not math.isfinite(accepted_stats_cache_seconds) or accepted_stats_cache_seconds < 0:
+            raise ValueError("accepted_stats_cache_seconds must be finite and non-negative")
         lease_retry_max_sleep_seconds = float(lease_retry_max_sleep_seconds)
         if lease_retry_max_sleep_seconds <= 0:
             raise ValueError("lease_retry_max_sleep_seconds must be positive")
@@ -1032,10 +1184,68 @@ class PsqlShareLedger:
         if ctv_broadcast_retry_backoff_seconds < 0:
             raise ValueError("ctv_broadcast_retry_backoff_seconds must be non-negative")
         self._ctv_broadcast_retry_backoff_seconds = ctv_broadcast_retry_backoff_seconds
+        self._accepted_stats_cache_seconds = accepted_stats_cache_seconds
+        self._stats_lock = Lock()
+        self._stats_refresh_lock = Lock()
+        self._stats_counts: dict[str, int] | None = None
+        self._stats_miner_ids: set[str] = set()
+        self._stats_refreshed_monotonic: float | None = None
+        self._stats_refresh_note_buffer: list[str] | None = None
+        self._native = self._make_native_client(
+            native_client_mode,
+            database_url,
+            read_concurrency=read_concurrency,
+        )
         if initialize_schema:
             path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
-            self._run_sql(path.read_text(encoding="utf-8"))
+            self._run_script(path.read_text(encoding="utf-8"))
         self._ensure_writer_lease()
+
+    def _make_native_client(
+        self,
+        native_client_mode: str,
+        database_url: str | None,
+        *,
+        read_concurrency: int,
+    ) -> _NativePostgresClient | None:
+        mode = (native_client_mode or "auto").strip().lower()
+        if mode in {"0", "false", "no", "off", "psql"}:
+            return None
+        if mode not in {"auto", "1", "true", "yes", "on", "native"}:
+            raise ValueError(f"unsupported native client mode: {native_client_mode!r}")
+        required = mode != "auto"
+        conninfo = database_url or database_url_from_psql_command(self._command)
+        if conninfo is None:
+            if required:
+                raise ValueError(
+                    "PRISM_POSTGRES_NATIVE_CLIENT=1 requires PRISM_DATABASE_URL or a "
+                    "postgres:// DSN inside PRISM_POSTGRES_PSQL_COMMAND"
+                )
+            return None
+        try:
+            # One pooled connection per concurrent reader plus one for the
+            # serialized write path (the coordinator's share writer thread).
+            return _NativePostgresClient(conninfo, pool_size=read_concurrency + 1)
+        except ImportError:
+            if required:
+                raise ValueError(
+                    "PRISM_POSTGRES_NATIVE_CLIENT=1 requires the psycopg package"
+                ) from None
+            # Silent fallback: which execution backend is active is reported
+            # by the owning daemon's startup line via execution_backend.
+            return None
+
+    @property
+    def execution_backend(self) -> str:
+        if getattr(self, "_native", None) is not None:
+            return "psycopg-pool"
+        return "psql-subprocess"
+
+    def close(self) -> None:
+        """Release pooled native connections. Safe to call multiple times."""
+        native = getattr(self, "_native", None)
+        if native is not None:
+            native.close()
 
     @property
     def backend_name(self) -> str:
@@ -1138,7 +1348,9 @@ END;
         result = self._run_fenced_json(sql)
         if "error" in result:
             raise RuntimeError(str(result["error"]))
-        return self._record_from_json(result)
+        record = self._record_from_json(result)
+        self._note_appended_share(record)
+        return record
 
     def append_batch(
         self,
@@ -1346,7 +1558,10 @@ END;
         records = result.get("records")
         if not isinstance(records, list) or len(records) != len(entries):
             raise RuntimeError("Postgres share batch returned an incomplete result")
-        return [self._record_from_json(record) for record in records]
+        parsed = [self._record_from_json(record) for record in records]
+        for record in parsed:
+            self._note_appended_share(record)
+        return parsed
 
     def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
         """Persist candidate work that is not yet eligible for share credit."""
@@ -1581,24 +1796,115 @@ WHERE accepted;
     def accepted_share_stats(self) -> dict[str, int]:
         """Aggregate counts without materializing the full share history.
 
-        Health checks and readiness gates only need these two numbers; the
-        full ``all_shares`` fetch grows with ledger history and is far too
-        heavy to run per health probe or per job build.
+        Health checks and readiness gates only need these two numbers, but
+        they ask for them every few seconds (bundle readiness re-checks, the
+        health refresher, metrics scrapes). Running the aggregate per call
+        parallel-seq-scans the whole ledger each time, so the counts are kept
+        incrementally instead: this process is the single lease-holding
+        writer, every accepted share passes through ``append``/``append_batch``,
+        and the counters are reconciled against the database once per
+        ``accepted_stats_cache_seconds`` in case anything mutated rows out of
+        band (e.g. reorg reversals flipping ``accepted``).
         """
+        ttl = getattr(self, "_accepted_stats_cache_seconds", 0.0)
+        stats_lock = getattr(self, "_stats_lock", None)
+        if stats_lock is not None and ttl > 0:
+            now = time.monotonic()
+            with stats_lock:
+                if (
+                    self._stats_counts is not None
+                    and self._stats_refreshed_monotonic is not None
+                    and now - self._stats_refreshed_monotonic <= ttl
+                ):
+                    return dict(self._stats_counts)
+        return self._refresh_accepted_share_stats()
+
+    def _refresh_accepted_share_stats(self) -> dict[str, int]:
+        # Single-flight: concurrent TTL expiries (health refresher plus a
+        # metrics scrape) must not both run the aggregate and then race their
+        # cache writes, or an older snapshot could overwrite a newer one along
+        # with any increments noted in between. The second caller waits, sees
+        # the fresh cache, and returns it without another query.
+        refresh_lock = getattr(self, "_stats_refresh_lock", None)
+        stats_lock = getattr(self, "_stats_lock", None)
+        if refresh_lock is None or stats_lock is None:
+            return self._query_accepted_share_stats()[0]
+        with refresh_lock:
+            ttl = getattr(self, "_accepted_stats_cache_seconds", 0.0)
+            if ttl > 0:
+                now = time.monotonic()
+                with stats_lock:
+                    if (
+                        self._stats_counts is not None
+                        and self._stats_refreshed_monotonic is not None
+                        and now - self._stats_refreshed_monotonic <= ttl
+                    ):
+                        return dict(self._stats_counts)
+            # Shares committed while the aggregate runs are invisible to its
+            # MVCC snapshot but already acknowledged and noted; buffering
+            # their notes and replaying them onto the snapshot keeps the
+            # cache from regressing below what this writer has committed.
+            with stats_lock:
+                self._stats_refresh_note_buffer = []
+            try:
+                counts, miner_ids = self._query_accepted_share_stats()
+            except BaseException:
+                with stats_lock:
+                    self._stats_refresh_note_buffer = None
+                raise
+            with stats_lock:
+                replayed = self._stats_refresh_note_buffer or []
+                self._stats_refresh_note_buffer = None
+                for miner_id in replayed:
+                    counts["accepted_share_count"] += 1
+                    miner_ids.add(miner_id)
+                counts["distinct_miner_count"] = len(miner_ids)
+                self._stats_counts = dict(counts)
+                self._stats_miner_ids = miner_ids
+                self._stats_refreshed_monotonic = time.monotonic()
+        return counts
+
+    def _query_accepted_share_stats(self) -> tuple[dict[str, int], set[str]]:
         sql = """
 SELECT json_build_object(
     'accepted_share_count', count(*),
-    'distinct_miner_count', count(DISTINCT miner_id)
+    'miner_ids', COALESCE(json_agg(DISTINCT miner_id), '[]'::json)
 )
 FROM qbit_share_ledger
 WHERE accepted;
 """
         with self._lock:
-            stats = self._run_json(sql)
-        return {
-            "accepted_share_count": int(stats["accepted_share_count"]),
-            "distinct_miner_count": int(stats["distinct_miner_count"]),
+            payload = self._run_json(sql)
+        miner_ids = {str(miner_id) for miner_id in payload["miner_ids"]}
+        counts = {
+            "accepted_share_count": int(payload["accepted_share_count"]),
+            "distinct_miner_count": len(miner_ids),
         }
+        return counts, miner_ids
+
+    def _note_appended_share(self, record: AcceptedShareRecord) -> None:
+        """Advance the cached stats for a share this writer just committed.
+
+        A note landing while a reconcile's aggregate query is in flight is
+        also buffered and replayed onto that query's snapshot (the snapshot
+        cannot contain it), so a refresh never erases increments for shares
+        this writer already committed and acknowledged. An idempotent
+        ``append_batch`` replay of an already-committed share can over-advance
+        the counter by one; the periodic TTL reconcile absorbs it.
+        """
+        stats_lock = getattr(self, "_stats_lock", None)
+        if stats_lock is None:
+            return
+        with stats_lock:
+            buffer = getattr(self, "_stats_refresh_note_buffer", None)
+            if buffer is not None:
+                buffer.append(record.miner_id)
+            if self._stats_counts is None:
+                return
+            self._stats_counts["accepted_share_count"] += 1
+            if record.miner_id not in self._stats_miner_ids:
+                self._stats_miner_ids.add(record.miner_id)
+                self._stats_counts["distinct_miner_count"] += 1
 
     def current_owed_balances(self) -> list[dict[str, object]]:
         sql = """
@@ -3073,9 +3379,12 @@ END;
         }
 
     def metrics(self) -> dict[str, int]:
+        # The accepted-share count comes from the incrementally maintained
+        # stats (see accepted_share_stats) so metrics scrapes never seq-scan
+        # the share ledger; the block/payout tables stay small.
+        accepted_share_count = int(self.accepted_share_stats()["accepted_share_count"])
         sql = """
 SELECT json_build_object(
-    'shares', (SELECT count(*) FROM qbit_share_ledger WHERE accepted),
     'blocks', (SELECT count(*) FROM qbit_pool_blocks),
     'confirmed_blocks', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'confirmed'),
     'inactive_blocks', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'inactive'),
@@ -3088,7 +3397,9 @@ SELECT json_build_object(
 """
         with self._lock:
             metrics = self._run_json(sql)
-        return {str(key): int(value) for key, value in metrics.items()}
+        report = {str(key): int(value) for key, value in metrics.items()}
+        report["shares"] = accepted_share_count
+        return report
 
     def dashboard_pool_snapshot(
         self,
@@ -5105,10 +5416,20 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
         return int(result.get("released", 0)) > 0
 
     def _run_json(self, sql: str) -> Any:
+        native = getattr(self, "_native", None)
+        if native is not None:
+            return native.run_json(sql)
         output = self._run_sql(sql).strip()
         if not output:
             raise RuntimeError("psql query returned no JSON")
         return json.loads(output.splitlines()[-1])
+
+    def _run_script(self, sql: str) -> None:
+        native = getattr(self, "_native", None)
+        if native is not None:
+            native.run_script(sql)
+            return
+        self._run_sql(sql)
 
     def _run_sql(self, sql: str) -> str:
         cmd = [

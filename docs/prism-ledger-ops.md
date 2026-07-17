@@ -214,8 +214,41 @@ Useful environment variables:
 - `QBIT_PRISM_THROUGHPUT_REPORT`: JSON report path.
 
 The throughput harness measures schema/query capacity. It is separate from the
-lab `psql` adapter, which favors zero Python dependencies and shells out per
-operation for portability in regtest.
+lab ledger adapter's execution backends described below.
+
+## Hot-Path Execution Backends
+
+The lab ledger adapter (`PsqlShareLedger`) supports two interchangeable
+execution backends over the same SQL and the same durability contract:
+
+- **`psycopg-pool` (production default):** a persistent pooled psycopg client.
+  The coordinator's share-writer group commits (`PRISM_SHARE_COMMIT_BATCH_SIZE`
+  / `PRISM_SHARE_COMMIT_LINGER_MILLISECONDS`) execute as one round trip on a
+  long-lived connection instead of one `psql` fork+connect per statement; the
+  batch statement's own `set_config('synchronous_commit', 'on', true)` keeps
+  the Stratum ACK boundary at the database commit. Reads share a pool bounded
+  by `PRISM_POSTGRES_READ_CONCURRENCY` plus one writer slot.
+- **`psql-subprocess` (fallback):** the legacy zero-Python-dependency backend
+  that shells out one `psql` per statement. It remains fully supported for
+  regtest portability and as the operational escape hatch.
+
+`PRISM_POSTGRES_NATIVE_CLIENT` selects the backend: `auto` (default) uses the
+pooled client when psycopg is importable and a `postgres://` DSN is available
+(from `PRISM_DATABASE_URL` or inside `PRISM_POSTGRES_PSQL_COMMAND`), `1`
+requires it, and `0` forces the subprocess fallback. The coordinator startup
+line reports the active backend as `ledger_execution=`.
+
+Readiness and health counters (`accepted_share_stats`) are maintained
+incrementally by the single lease-holding writer and reconciled against the
+database once per `PRISM_ACCEPTED_STATS_CACHE_SECONDS` (default 60) instead of
+running `count(*) / count(DISTINCT miner_id)` aggregates every few seconds.
+
+`make test-prism-postgres-native-ledger` is the opt-in end-to-end validation
+for the pooled backend: it provisions a temporary Postgres container and
+exercises schema init, lease guards, concurrent batched appends, duplicate
+replay, cached stats, and cross-backend read consistency with the `psql`
+fallback. Run it on any docker host with `psycopg` installed before rolling
+the pooled backend into an environment.
 
 It does not simulate live Stratum miner swarms, reconnect storms, malformed
 client messages, or stale-share bursts across job changes. Those remain separate

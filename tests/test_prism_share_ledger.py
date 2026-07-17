@@ -6,10 +6,12 @@ import contextlib
 import hashlib
 import io
 import json
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -19,6 +21,8 @@ from typing import Any
 from lab.prism.backfill_ctv_fanouts import backfill_input_from_path, backfill_input_from_payload, infer_block_hash_from_path
 from lab.prism import public_api
 from lab.prism.share_ledger import (
+    database_url_from_psql_command,
+    parse_single_json_value,
     AUDIT_BODY_REF_SCHEMA,
     AUDIT_BUNDLE_V2_SCHEMA,
     PendingShare,
@@ -2088,6 +2092,284 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.sleeps, [])
         self.assertEqual(len(ledger.lease_queries), 1)
         self.assertEqual(stdout.getvalue(), "")
+
+
+class CannedQueryPsqlShareLedger(PsqlShareLedger):
+    """Subprocess-mode ledger whose _run_json pops canned results.
+
+    Mirrors FakeLeasePsqlShareLedger but is used for the hot-path stats and
+    native-backend tests, which also need the recorded SQL for assertions.
+    """
+
+    def __init__(self, results: list[object], **kwargs: Any):
+        self.canned_results = list(results)
+        self.queries: list[str] = []
+        kwargs.setdefault("native_client_mode", "0")
+        super().__init__(
+            psql_command="psql postgresql://example.invalid/qbit",
+            lease_retry_sleep=lambda _seconds: None,
+            **kwargs,
+        )
+
+    def _run_json(self, sql: str) -> Any:
+        self.queries.append(sql)
+        if not self.canned_results:
+            raise AssertionError(f"unexpected extra query: {sql[:120]}")
+        result = self.canned_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def acquired_lease_result() -> dict[str, object]:
+    return acquired_lease(writer_id="prism-coordinator", writer_epoch=1)
+
+
+def record_payload(index: int, share_seq: int) -> dict[str, object]:
+    pending = pending_share(index)
+    return {
+        "share_seq": share_seq,
+        "share_id": pending.share_id,
+        "miner_id": pending.miner_id,
+        "order_key": pending.order_key,
+        "p2mr_program_hex": pending.p2mr_program_hex,
+        "share_difficulty": str(pending.share_difficulty),
+        "network_difficulty": str(pending.network_difficulty),
+        "template_height": pending.template_height,
+        "job_id": pending.job_id,
+        "job_issued_at_ms": pending.job_issued_at_ms,
+        "accepted_at_ms": pending.accepted_at_ms,
+        "ntime": pending.ntime,
+        "credit_policy": None,
+    }
+
+
+def stats_payload(count: int, miner_ids: list[str]) -> dict[str, object]:
+    return {"accepted_share_count": count, "miner_ids": miner_ids}
+
+
+class NativeClientSelectionTests(unittest.TestCase):
+    def test_database_url_extraction_variants(self) -> None:
+        self.assertEqual(
+            database_url_from_psql_command(["psql", "postgres://u:p@h:5432/db"]),
+            "postgres://u:p@h:5432/db",
+        )
+        self.assertEqual(
+            database_url_from_psql_command(["psql", "-d", "postgresql://h/db"]),
+            "postgresql://h/db",
+        )
+        self.assertEqual(
+            database_url_from_psql_command(["psql", "--dbname=postgresql://h/db"]),
+            "postgresql://h/db",
+        )
+        self.assertIsNone(database_url_from_psql_command(["psql", "-h", "host", "-U", "user"]))
+        self.assertIsNone(database_url_from_psql_command(["./fake-psql.sh"]))
+
+    def test_mode_off_forces_subprocess_backend(self) -> None:
+        ledger = CannedQueryPsqlShareLedger([acquired_lease_result()], native_client_mode="0")
+        self.assertIsNone(ledger._native)
+        self.assertEqual(ledger.execution_backend, "psql-subprocess")
+
+    def test_auto_mode_without_dsn_stays_on_subprocess(self) -> None:
+        class NoDsnLedger(CannedQueryPsqlShareLedger):
+            def __init__(self) -> None:
+                self.canned_results = [acquired_lease_result()]
+                self.queries = []
+                PsqlShareLedger.__init__(
+                    self,
+                    psql_command="./fake-psql.sh --flag",
+                    native_client_mode="auto",
+                    lease_retry_sleep=lambda _seconds: None,
+                )
+
+        ledger = NoDsnLedger()
+        self.assertIsNone(ledger._native)
+
+    def test_forced_native_without_dsn_raises(self) -> None:
+        # The DSN-free command means _make_native_client must raise before
+        # any lease query regardless of whether psycopg is installed.
+        with self.assertRaises(ValueError):
+            PsqlShareLedger(psql_command="./fake-psql.sh", native_client_mode="1")
+
+    def test_forced_native_without_psycopg_raises(self) -> None:
+        with unittest.mock.patch.dict(sys.modules, {"psycopg": None}):
+            with self.assertRaises(ValueError):
+                PsqlShareLedger(
+                    psql_command="psql postgres://example.invalid/qbit",
+                    native_client_mode="1",
+                )
+
+    def test_parse_single_json_value_contract(self) -> None:
+        self.assertEqual(parse_single_json_value('{"a": 1}'), {"a": 1})
+        self.assertEqual(parse_single_json_value({"a": 1}), {"a": 1})
+        with self.assertRaises(RuntimeError):
+            parse_single_json_value(None)
+
+    def test_run_json_routes_through_native_client(self) -> None:
+        class FakeNative:
+            def __init__(self) -> None:
+                self.statements: list[str] = []
+
+            def run_json(self, sql: str) -> Any:
+                self.statements.append(sql)
+                return {"accepted_share_count": 5, "miner_ids": ["miner-a"]}
+
+            def close(self) -> None:
+                return None
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._lock = threading.Lock()
+        ledger._stats_lock = threading.Lock()
+        ledger._stats_counts = None
+        ledger._stats_miner_ids = set()
+        ledger._stats_refreshed_monotonic = None
+        ledger._accepted_stats_cache_seconds = 60.0
+        native = FakeNative()
+        ledger._native = native
+
+        stats = PsqlShareLedger.accepted_share_stats(ledger)
+        self.assertEqual(
+            stats,
+            {"accepted_share_count": 5, "distinct_miner_count": 1},
+        )
+        self.assertEqual(len(native.statements), 1)
+        self.assertIn("qbit_share_ledger", native.statements[0])
+
+
+class AcceptedStatsCacheTests(unittest.TestCase):
+    def test_stats_cached_within_ttl_and_incremented_by_appends(self) -> None:
+        ledger = CannedQueryPsqlShareLedger(
+            [
+                acquired_lease_result(),
+                stats_payload(10, ["miner-a", "miner-b"]),
+                record_payload(3, share_seq=11),
+                {"records": [record_payload(6, share_seq=12)]},
+            ],
+            accepted_stats_cache_seconds=60.0,
+        )
+        first = ledger.accepted_share_stats()
+        self.assertEqual(
+            first,
+            {"accepted_share_count": 10, "distinct_miner_count": 2},
+        )
+        queries_after_seed = len(ledger.queries)
+
+        # Repeated reads inside the TTL never touch the database.
+        for _ in range(5):
+            self.assertEqual(ledger.accepted_share_stats(), first)
+        self.assertEqual(len(ledger.queries), queries_after_seed)
+
+        # A committed append advances the counters without a query;
+        # pending_share(3) mines as miner-0, a brand new miner id.
+        ledger.append(pending_share(3))
+        self.assertEqual(
+            ledger.accepted_share_stats(),
+            {"accepted_share_count": 11, "distinct_miner_count": 3},
+        )
+        # The writer-thread batch path advances the counters the same way;
+        # pending_share(6) is miner-0 again so only the share count moves.
+        ledger.append_batch([(pending_share(6), None)])
+        self.assertEqual(
+            ledger.accepted_share_stats(),
+            {"accepted_share_count": 12, "distinct_miner_count": 3},
+        )
+
+    def test_refresh_replays_notes_committed_during_aggregate_query(self) -> None:
+        # A share this writer commits while the reconcile's aggregate query is
+        # in flight is invisible to the query's MVCC snapshot but already
+        # acknowledged; the refresh must replay its note onto the snapshot
+        # instead of erasing it until the next reconcile.
+        note_during_query: list[dict[str, object]] = []
+
+        class MidQueryNoteLedger(CannedQueryPsqlShareLedger):
+            def _run_json(self, sql: str) -> Any:
+                result = super()._run_json(sql)
+                if "miner_ids" in sql and note_during_query:
+                    record = PsqlShareLedger._record_from_json(note_during_query.pop())
+                    self._note_appended_share(record)
+                return result
+
+        ledger = MidQueryNoteLedger(
+            [
+                acquired_lease_result(),
+                stats_payload(10, ["miner-a"]),
+                record_payload(4, share_seq=12),
+            ],
+            accepted_stats_cache_seconds=60.0,
+        )
+        # record_payload(1) mines as miner-1, absent from the snapshot.
+        note_during_query.append(record_payload(1, share_seq=11))
+
+        stats = ledger.accepted_share_stats()
+
+        self.assertEqual(
+            stats,
+            {"accepted_share_count": 11, "distinct_miner_count": 2},
+        )
+        # The buffer is closed after the refresh: a normal append advances the
+        # merged counts exactly once; record_payload(4) is miner-1 again.
+        ledger.append(pending_share(4))
+        self.assertEqual(
+            ledger.accepted_share_stats(),
+            {"accepted_share_count": 12, "distinct_miner_count": 2},
+        )
+
+    def test_stats_requery_after_ttl_reconciles(self) -> None:
+        ledger = CannedQueryPsqlShareLedger(
+            [
+                acquired_lease_result(),
+                stats_payload(10, ["miner-a"]),
+                stats_payload(4, ["miner-a", "miner-b"]),
+            ],
+            accepted_stats_cache_seconds=0.05,
+        )
+        self.assertEqual(
+            ledger.accepted_share_stats(),
+            {"accepted_share_count": 10, "distinct_miner_count": 1},
+        )
+        time.sleep(0.06)
+        self.assertEqual(
+            ledger.accepted_share_stats(),
+            {"accepted_share_count": 4, "distinct_miner_count": 2},
+        )
+
+    def test_stats_query_disabled_cache_runs_every_time(self) -> None:
+        ledger = CannedQueryPsqlShareLedger(
+            [
+                acquired_lease_result(),
+                stats_payload(1, ["miner-a"]),
+                stats_payload(2, ["miner-a"]),
+            ],
+            accepted_stats_cache_seconds=0.0,
+        )
+        self.assertEqual(ledger.accepted_share_stats()["accepted_share_count"], 1)
+        self.assertEqual(ledger.accepted_share_stats()["accepted_share_count"], 2)
+
+    def test_metrics_reports_shares_without_share_ledger_scan(self) -> None:
+        metrics_payload = {
+            "blocks": 2,
+            "confirmed_blocks": 1,
+            "inactive_blocks": 0,
+            "rejected_blocks": 0,
+            "reversed_blocks": 1,
+            "payout_entries": 5,
+            "owed_accounts": 3,
+            "ctv_fanouts_failed": 0,
+        }
+        ledger = CannedQueryPsqlShareLedger(
+            [
+                acquired_lease_result(),
+                stats_payload(7, ["miner-a"]),
+                metrics_payload,
+            ],
+            accepted_stats_cache_seconds=60.0,
+        )
+        metrics = ledger.metrics()
+        self.assertEqual(metrics["shares"], 7)
+        self.assertEqual(metrics["blocks"], 2)
+        metrics_sql = ledger.queries[-1]
+        self.assertNotIn("qbit_share_ledger", metrics_sql)
+
 
 
 if __name__ == "__main__":

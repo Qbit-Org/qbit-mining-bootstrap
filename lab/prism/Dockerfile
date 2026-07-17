@@ -12,6 +12,10 @@ RUN apt-get update \
         rustc \
     && rm -rf /var/lib/apt/lists/*
 
+# Persistent pooled Postgres client for the share-ledger hot path. The psql
+# binary stays installed as the fallback backend (PRISM_POSTGRES_NATIVE_CLIENT=0).
+RUN pip install --no-cache-dir "psycopg[binary]==3.2.*"
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY lab/auxpow/ ./lab/auxpow/
