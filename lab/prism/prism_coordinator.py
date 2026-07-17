@@ -10,6 +10,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 import dataclasses
 import errno
+from functools import wraps
 import hashlib
 import http.client
 import json
@@ -114,6 +115,7 @@ MAX_PENDING_SHARE_APPENDS = 4_096
 DEFAULT_SHARE_COMMIT_BATCH_SIZE = 64
 DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS = 5.0
 DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS = 15.0
+DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS = 15.0
 DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS = 120
 # The reward window is 8x network difficulty (must match PRISM_WINDOW_MULTIPLIER
 # in crates/qbit-prism/src/lib.rs and the SQL). The job-build snapshot only needs
@@ -876,6 +878,7 @@ class PendingShareAppend:
     committed: threading.Event = field(default_factory=threading.Event)
     record: Any | None = None
     error: BaseException | None = None
+    writer_token: _WriterOperationToken | None = None
 
 
 @dataclass(frozen=True)
@@ -1359,6 +1362,249 @@ class StratumError(RuntimeError):
         self.disconnect = disconnect
 
 
+class ShutdownInProgress(RuntimeError):
+    """Raised when work that could mutate the ledger arrives after shutdown."""
+
+
+class _WriterOperationToken:
+    """One transferable writer admission held until durable work completes."""
+
+    def __init__(self, controller: "CoordinatorShutdownController", component: str):
+        self.controller = controller
+        self.component = component
+        self.finished = False
+
+    def finish(self) -> None:
+        self.controller.finish_token(self)
+
+
+class CoordinatorShutdownController:
+    """Coordinates the writer barrier, one-shot lease release, and final drain.
+
+    Writer operations enter through :meth:`enter_writer` before shutdown or
+    inherit an already-admitted operation on the same thread. Queue admissions
+    use transferable tokens so a share remains visible to the barrier while it
+    moves from a client thread to the group-commit writer.
+    """
+
+    def __init__(self, writer_quiescence_timeout_seconds: float):
+        self.writer_quiescence_timeout_seconds = writer_quiescence_timeout_seconds
+        self.condition = threading.Condition(threading.RLock())
+        self.local = threading.local()
+        self.phase = "running"
+        self.reason: str | None = None
+        self.signal_number: int | None = None
+        self.sigterm_monotonic: float | None = None
+        self.shutdown_started_monotonic: float | None = None
+        self.active_writers: dict[str, int] = {}
+        self.shutdowns_total = 0
+        self.writer_quiescence_outcomes = {"success": 0, "timeout": 0}
+        self.writer_quiescence_seconds = 0.0
+        self.lease_release_attempts_total = 0
+        self.lease_release_outcomes = {
+            "success": 0,
+            "not_held": 0,
+            "unsupported": 0,
+            "failure": 0,
+        }
+        self.lease_release_seconds = 0.0
+        self.lease_release_attempted = False
+        self.lease_release_succeeded = False
+        self.lease_was_released = False
+        self.sigterm_to_lease_release_seconds = 0.0
+        self.sigterm_release_observed = False
+        self.release_withheld_total = 0
+        self.non_writer_drain_seconds = 0.0
+        self.non_writer_drains_total = 0
+        self._drain_claimed = False
+
+    def request_shutdown(self, signum: int | None) -> None:
+        """Close admission atomically; the caller only needs to set its event."""
+        now = time.monotonic()
+        with self.condition:
+            if signum == signal.SIGTERM and self.sigterm_monotonic is None:
+                self.sigterm_monotonic = now
+            if self.signal_number is None and signum is not None:
+                self.signal_number = signum
+            if self.phase == "running":
+                self.phase = "requested"
+            self.condition.notify_all()
+
+    def begin_shutdown(self, reason: str) -> bool:
+        with self.condition:
+            if self.phase not in {"running", "requested"}:
+                return False
+            self.phase = "quiescing_writers"
+            self.reason = reason
+            self.shutdown_started_monotonic = time.monotonic()
+            self.shutdowns_total += 1
+            self.condition.notify_all()
+            return True
+
+    def wait_for_lease_handling(self) -> bool:
+        """Wait for the one shutdown owner to release or safely withhold."""
+        in_progress = {
+            "requested",
+            "quiescing_writers",
+            "writers_quiesced",
+            "releasing_lease",
+        }
+        with self.condition:
+            while self.phase in in_progress:
+                self.condition.wait()
+            return self.lease_release_succeeded
+
+    def _thread_writer_depth(self) -> int:
+        return int(getattr(self.local, "writer_depth", 0))
+
+    def _admit_writer_locked(self, component: str, *, inherited: bool) -> _WriterOperationToken:
+        if self.lease_release_attempted:
+            raise ShutdownInProgress("PRISM writer lease release has already started")
+        if self.phase != "running" and not inherited:
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+        self.active_writers[component] = self.active_writers.get(component, 0) + 1
+        return _WriterOperationToken(self, component)
+
+    def enter_writer(self, component: str) -> _WriterOperationToken:
+        depth = self._thread_writer_depth()
+        with self.condition:
+            token = self._admit_writer_locked(component, inherited=depth > 0)
+        self.local.writer_depth = depth + 1
+        return token
+
+    def exit_writer(self, token: _WriterOperationToken) -> None:
+        depth = self._thread_writer_depth()
+        self.local.writer_depth = max(0, depth - 1)
+        token.finish()
+
+    def reserve_writer(self, component: str) -> _WriterOperationToken:
+        """Reserve work that will finish on another thread."""
+        with self.condition:
+            return self._admit_writer_locked(
+                component,
+                inherited=self._thread_writer_depth() > 0,
+            )
+
+    def finish_token(self, token: _WriterOperationToken) -> None:
+        with self.condition:
+            if token.finished:
+                return
+            token.finished = True
+            remaining = self.active_writers.get(token.component, 0) - 1
+            if remaining > 0:
+                self.active_writers[token.component] = remaining
+            else:
+                self.active_writers.pop(token.component, None)
+            self.condition.notify_all()
+
+    def has_active_writer(self, components: set[str]) -> bool:
+        with self.condition:
+            return any(self.active_writers.get(component, 0) for component in components)
+
+    def wait_for_writer_quiescence(self) -> tuple[bool, float, dict[str, int]]:
+        started = time.monotonic()
+        deadline = started + self.writer_quiescence_timeout_seconds
+        with self.condition:
+            while self.active_writers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.condition.wait(remaining)
+            elapsed = max(0.0, time.monotonic() - started)
+            quiesced = not self.active_writers
+            blockers = dict(sorted(self.active_writers.items()))
+            outcome = "success" if quiesced else "timeout"
+            self.writer_quiescence_outcomes[outcome] += 1
+            self.writer_quiescence_seconds = elapsed
+            if quiesced:
+                self.phase = "writers_quiesced"
+            else:
+                self.phase = "release_withheld"
+                self.release_withheld_total += 1
+            self.condition.notify_all()
+            return quiesced, elapsed, blockers
+
+    def claim_lease_release(self) -> tuple[bool, dict[str, int]]:
+        with self.condition:
+            if self.lease_release_attempted:
+                return False, {}
+            if self.active_writers:
+                return False, dict(sorted(self.active_writers.items()))
+            self.lease_release_attempted = True
+            self.lease_release_attempts_total += 1
+            self.phase = "releasing_lease"
+            self.condition.notify_all()
+            return True, {}
+
+    def finish_lease_release(self, outcome: str, elapsed: float, *, released: bool) -> None:
+        with self.condition:
+            self.lease_release_outcomes[outcome] += 1
+            self.lease_release_seconds = elapsed
+            self.lease_release_succeeded = outcome != "failure"
+            self.lease_was_released = released
+            self.phase = "lease_released" if outcome != "failure" else "lease_release_failed"
+            if outcome != "failure" and self.sigterm_monotonic is not None:
+                self.sigterm_to_lease_release_seconds = max(
+                    0.0,
+                    time.monotonic() - self.sigterm_monotonic,
+                )
+                self.sigterm_release_observed = True
+            self.condition.notify_all()
+
+    def claim_non_writer_drain(self) -> bool:
+        with self.condition:
+            if self._drain_claimed:
+                return False
+            if self.phase not in {
+                "lease_released",
+                "lease_release_failed",
+                "release_withheld",
+            }:
+                return False
+            self._drain_claimed = True
+            self.phase = "draining_non_writers"
+            return True
+
+    def finish_non_writer_drain(self, elapsed: float) -> None:
+        with self.condition:
+            self.non_writer_drain_seconds = elapsed
+            self.non_writer_drains_total += 1
+            self.phase = "complete"
+            self.condition.notify_all()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.condition:
+            return {
+                "phase": self.phase,
+                "active_writers": dict(self.active_writers),
+                "shutdowns_total": self.shutdowns_total,
+                "writer_quiescence_outcomes": dict(self.writer_quiescence_outcomes),
+                "writer_quiescence_seconds": self.writer_quiescence_seconds,
+                "lease_release_attempts_total": self.lease_release_attempts_total,
+                "lease_release_outcomes": dict(self.lease_release_outcomes),
+                "lease_release_seconds": self.lease_release_seconds,
+                "sigterm_to_lease_release_seconds": self.sigterm_to_lease_release_seconds,
+                "sigterm_release_observed": self.sigterm_release_observed,
+                "release_withheld_total": self.release_withheld_total,
+                "non_writer_drain_seconds": self.non_writer_drain_seconds,
+                "non_writer_drains_total": self.non_writer_drains_total,
+            }
+
+
+def ledger_writer_operation(component: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorate an entry point that can mutate the PRISM ledger."""
+
+    def decorate(method: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(method)
+        def guarded(self: "PrismCoordinator", *args: Any, **kwargs: Any) -> Any:
+            with self._writer_operation(component):
+                return method(self, *args, **kwargs)
+
+        return guarded
+
+    return decorate
+
+
 class TemplateRefreshBlocked(RuntimeError):
     """A live template was fetched, but safe work could not be issued."""
 
@@ -1584,6 +1830,10 @@ class PrismCoordinator:
             raise SystemExit(str(exc)) from exc
         self.version_mask_selection = self.resolve_version_rolling_mask(fallback_version_mask)
         self.version_mask = self.version_mask_selection.selected_mask
+        self.writer_quiescence_timeout_seconds = env_positive_float(
+            "PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS",
+            DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS,
+        )
         self.ledger = self.make_ledger()
         configured_ctv_broadcaster_enabled = env_optional_bool("PRISM_CTV_BROADCASTER_ENABLED")
         self.ctv_broadcaster_enabled = (
@@ -1775,6 +2025,9 @@ class PrismCoordinator:
         self._prism_payout_policy_cache: dict[str, object] | None = None
         self._ensure_job_cache_state()
         self.stop_event = threading.Event()
+        self._shutdown_controller = CoordinatorShutdownController(
+            self.writer_quiescence_timeout_seconds
+        )
         # Liveness watchdog: each monitored loop stamps a monotonic heartbeat;
         # if any goes stale past the timeout the process exits non-zero so the
         # container/systemd restart policy recovers a *hung* coordinator (a
@@ -3661,21 +3914,175 @@ class PrismCoordinator:
                 # idempotent if Postgres committed just before this exit.
                 os._exit(1)
 
-    def release_ledger_lease(self) -> None:
-        """Best-effort writer-lease release for graceful shutdown so a restart
-        reacquires immediately instead of waiting out the lease TTL. No-op for
-        ledgers without a lease (the in-memory regtest ledger)."""
+    def _ensure_shutdown_controller(self) -> CoordinatorShutdownController:
+        controller = getattr(self, "_shutdown_controller", None)
+        if controller is not None:
+            return controller
+        candidate = CoordinatorShutdownController(
+            float(
+                getattr(
+                    self,
+                    "writer_quiescence_timeout_seconds",
+                    DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS,
+                )
+            )
+        )
+        # CPython's setdefault is atomic under the GIL. This lazy path exists
+        # for focused tests that construct a coordinator with __new__; normal
+        # instances create the controller in __init__ before threads start.
+        return self.__dict__.setdefault("_shutdown_controller", candidate)
+
+    @contextmanager
+    def _writer_operation(self, component: str) -> Iterator[None]:
+        controller = self._ensure_shutdown_controller()
+        token = controller.enter_writer(component)
+        try:
+            yield
+        finally:
+            controller.exit_writer(token)
+
+    def request_shutdown(self, signum: int | None = None) -> None:
+        """Signal-safe-sized shutdown request; the ordered work runs elsewhere."""
+        self._ensure_shutdown_controller().request_shutdown(signum)
+        self.stop_event.set()
+
+    @staticmethod
+    def _shutdown_log(event: str, **fields: object) -> None:
+        print(
+            "prism coordinator: "
+            + json.dumps({"event": event, **fields}, sort_keys=True),
+            flush=True,
+        )
+
+    def _cancel_active_tip_refresh_for_shutdown(self) -> None:
+        self._ensure_tip_refresh_state()
+        with self.lock:
+            active = self._active_tip_refresh
+            if active is not None:
+                active[1].cancel()
+            self._tip_refresh_retry.clear()
+
+    def shutdown(self, *, reason: str = "graceful") -> bool:
+        """Quiesce every ledger writer and release its lease exactly once.
+
+        Returns true when release completed safely (including a ledger without
+        lease support or an already-absent exact session lease). A timeout
+        deliberately withholds release while a tracked writer may still run.
+        """
+        controller = self._ensure_shutdown_controller()
+        if not controller.begin_shutdown(reason):
+            return controller.wait_for_lease_handling()
+
+        self.stop_event.set()
+        self._cancel_active_tip_refresh_for_shutdown()
+        self._shutdown_log(
+            "shutdown_start",
+            reason=reason,
+            signal=controller.signal_number,
+            writer_quiescence_timeout_seconds=controller.writer_quiescence_timeout_seconds,
+        )
+
+        quiesced, elapsed, blockers = controller.wait_for_writer_quiescence()
+        self._shutdown_log(
+            "writer_quiescence",
+            duration_seconds=round(elapsed, 6),
+            outcome="success" if quiesced else "timeout",
+            blockers=blockers,
+        )
+        if not quiesced:
+            for component, active_count in blockers.items():
+                self._shutdown_log(
+                    "lease_release_withheld",
+                    component=component,
+                    active_operations=active_count,
+                    reason="writer_quiescence_timeout",
+                )
+            return False
+        return self.release_ledger_lease()
+
+    def release_ledger_lease(self) -> bool:
+        """Release a quiesced writer lease at most once.
+
+        The exact-session database fence makes an already-absent lease safe.
+        Exceptions remain best-effort: they are observable, never retried from
+        a duplicate finally block, and leave TTL fencing intact.
+        """
+        controller = self._ensure_shutdown_controller()
+        claimed, blockers = controller.claim_lease_release()
+        if not claimed:
+            if blockers:
+                self._shutdown_log(
+                    "lease_release_withheld",
+                    reason="active_writer_operations",
+                    blockers=blockers,
+                )
+            return controller.lease_release_succeeded
+
         release = getattr(self.ledger, "release_writer_lease", None)
+        self._shutdown_log(
+            "lease_release_attempt",
+            supported=release is not None,
+        )
         if release is None:
-            return
+            controller.finish_lease_release("unsupported", 0.0, released=False)
+            self._shutdown_log(
+                "lease_release",
+                duration_seconds=0.0,
+                outcome="unsupported",
+                released=False,
+            )
+            return True
+        started = time.monotonic()
         try:
             released = release()
         except Exception:
-            print("prism coordinator: writer lease release failed during shutdown", flush=True)
+            elapsed = max(0.0, time.monotonic() - started)
+            controller.finish_lease_release("failure", elapsed, released=False)
+            self._shutdown_log(
+                "lease_release",
+                duration_seconds=round(elapsed, 6),
+                outcome="failure",
+                released=False,
+            )
             traceback.print_exc()
+            return False
+        elapsed = max(0.0, time.monotonic() - started)
+        outcome = "success" if released else "not_held"
+        controller.finish_lease_release(outcome, elapsed, released=bool(released))
+        snapshot = controller.snapshot()
+        self._shutdown_log(
+            "lease_release",
+            duration_seconds=round(elapsed, 6),
+            outcome=outcome,
+            released=bool(released),
+            sigterm_to_release_seconds=(
+                round(float(snapshot["sigterm_to_lease_release_seconds"]), 6)
+                if snapshot["sigterm_release_observed"]
+                else None
+            ),
+        )
+        return True
+
+    def drain_non_writer_components(
+        self,
+        threads: list[tuple[threading.Thread, float]] | None = None,
+    ) -> None:
+        """Drain threads, fanout sends, and executors only after lease handling."""
+        controller = self._ensure_shutdown_controller()
+        if not controller.claim_non_writer_drain():
             return
-        if released:
-            print("prism coordinator: released writer lease on shutdown", flush=True)
+        started = time.monotonic()
+        for thread, timeout in threads or []:
+            thread.join(timeout=timeout)
+        self.shutdown_tip_refresh_executor()
+        elapsed = max(0.0, time.monotonic() - started)
+        controller.finish_non_writer_drain(elapsed)
+        self._shutdown_log(
+            "non_writer_drain",
+            duration_seconds=round(elapsed, 6),
+            lease_release_succeeded=controller.lease_release_succeeded,
+            outcome="complete",
+        )
 
     def serve(self) -> None:
         deadline = time.time() + 60
@@ -3795,19 +4202,25 @@ class PrismCoordinator:
                     args=(extra_server, extra_profile),
                     daemon=True,
                 ).start()
-            self.accept_loop(*listeners[0])
-            blockpoll_thread.join(timeout=1)
+            drain_threads: list[tuple[threading.Thread, float]] = [
+                (blockpoll_thread, 1.0),
+                (block_submitter_thread, 1.0),
+                (share_writer_thread, 5.0),
+            ]
             if blockwait_thread is not None:
-                blockwait_thread.join(timeout=1)
+                drain_threads.append((blockwait_thread, 1.0))
             if vardiff_idle_sweep_thread is not None:
-                vardiff_idle_sweep_thread.join(timeout=1)
-            block_submitter_thread.join(timeout=1)
-            # Give the share writer a real drain window on shutdown: acked
-            # shares still queued are payouts.
-            share_writer_thread.join(timeout=5)
+                drain_threads.append((vardiff_idle_sweep_thread, 1.0))
             if ctv_broadcaster_thread is not None:
-                ctv_broadcaster_thread.join(timeout=1)
-            self.shutdown_tip_refresh_executor()
+                drain_threads.append((ctv_broadcaster_thread, 1.0))
+            try:
+                self.accept_loop(*listeners[0])
+            finally:
+                # The writer barrier and lease release intentionally precede
+                # joins and the tip-refresh executor drain: those may be stuck
+                # in unrelated client delivery or obsolete fanout work.
+                self.shutdown(reason="serve_exit")
+                self.drain_non_writer_components(drain_threads)
 
     def accept_loop(self, server: socket.socket, profile: StratumListenerProfile) -> None:
         while not self.stop_event.is_set():
@@ -3834,7 +4247,26 @@ class PrismCoordinator:
                     continue
                 raise
 
+            if (
+                self.stop_event.is_set()
+                or self._ensure_shutdown_controller().phase != "running"
+            ):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return
+
             with self.lock:
+                if (
+                    self.stop_event.is_set()
+                    or self._ensure_shutdown_controller().phase != "running"
+                ):
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    return
                 max_connections = int(
                     getattr(
                         self,
@@ -4209,6 +4641,7 @@ class PrismCoordinator:
             fee_sats=self.ctv_broadcaster_fee_sats,
         )
 
+    @ledger_writer_operation("ctv_broadcast_state")
     def run_ctv_fanout_broadcaster_once(
         self,
         *,
@@ -5889,7 +6322,12 @@ class PrismCoordinator:
             self._ensure_evicted_job_state()
             self.evicted_job_submit_counts[outcome] += 1
 
-    def refresh_jobs_after_pending_accepted_block(self, client: ClientState) -> int:
+    def refresh_jobs_after_pending_accepted_block(
+        self,
+        client: ClientState,
+        *,
+        heartbeat_name: str = "qbit_blockpoll",
+    ) -> int:
         with self.lock:
             block = client.post_accept_refresh_block
             client.post_accept_refresh_block = None
@@ -5899,6 +6337,7 @@ class PrismCoordinator:
         return self.refresh_jobs_after_accepted_block(
             block_height=block_height,
             block_hash=block_hash,
+            heartbeat_name=heartbeat_name,
         )
 
     def refresh_jobs_after_accepted_block(
@@ -6162,6 +6601,7 @@ class PrismCoordinator:
                 f"configured={configured_rate} required={required_rate} bits/1000 weight"
             )
 
+    @ledger_writer_operation("payout_reconciliation")
     def reconcile_prism_pool_blocks_once(
         self,
         *,
@@ -6647,6 +7087,13 @@ class PrismCoordinator:
             self._retain_current_collection_refresh_if_unrepresented()
 
     def handle_request(self, client: ClientState, request: dict[str, object]) -> None:
+        if self.stop_event.is_set() or self._ensure_shutdown_controller().phase != "running":
+            raise StratumError(
+                20,
+                "coordinator is shutting down",
+                reason=PRISM_REJECTION_POOL_CLOSED,
+                disconnect=True,
+            )
         method = request.get("method")
         params = request.get("params", [])
         request_id = request.get("id")
@@ -7515,6 +7962,7 @@ class PrismCoordinator:
         extranonce2_hex = validate_hex(extranonce2_hex, name="extranonce2")
         return self.coinbase_tag_hex + extranonce1_hex + extranonce2_hex
 
+    @ledger_writer_operation("share_submission")
     def handle_submit(self, client: ClientState, params: list[object]) -> bool:
         if len(params) < 5:
             self.reject_stratum(
@@ -7917,6 +8365,7 @@ class PrismCoordinator:
             credit_policy=credit_policy,
         )
 
+    @ledger_writer_operation("share_persistence")
     def append_accepted_share(
         self,
         client: ClientState,
@@ -7950,6 +8399,10 @@ class PrismCoordinator:
         if queue_obj is None:
             queue_obj = queue.Queue(maxsize=MAX_PENDING_SHARE_APPENDS)
             self.share_append_queue = queue_obj
+        if entry.writer_token is None:
+            entry.writer_token = self._ensure_shutdown_controller().reserve_writer(
+                "share_persistence"
+            )
         try:
             if wait:
                 queue_obj.put(
@@ -7959,6 +8412,8 @@ class PrismCoordinator:
             else:
                 queue_obj.put_nowait(entry)
         except queue.Full:
+            entry.writer_token.finish()
+            entry.writer_token = None
             raise StratumError(
                 20,
                 "share ledger commit queue is full",
@@ -7988,7 +8443,13 @@ class PrismCoordinator:
             try:
                 entry = queue_obj.get(timeout=0.2 if stopping else 1.0)
             except queue.Empty:
-                if stopping:
+                if stopping and not self._ensure_shutdown_controller().has_active_writer(
+                    {
+                        "share_submission",
+                        "share_persistence",
+                        "accepted_block_handling",
+                    }
+                ):
                     return
                 continue
             batch = [entry]
@@ -8053,6 +8514,9 @@ class PrismCoordinator:
         finally:
             for entry in batch:
                 entry.committed.set()
+                if entry.writer_token is not None:
+                    entry.writer_token.finish()
+                    entry.writer_token = None
 
     def _recover_share_to_disk(self, entry: PendingShareAppend, reason: str) -> None:
         """Durably capture an acked share the writer could not persist.
@@ -8099,6 +8563,7 @@ class PrismCoordinator:
                 )
                 traceback.print_exc()
 
+    @ledger_writer_operation("share_recovery_replay")
     def replay_recovered_shares(self) -> int:
         """Replay any recovery-file shares into the ledger at startup.
 
@@ -8498,6 +8963,7 @@ class PrismCoordinator:
             )
             return False
 
+    @ledger_writer_operation("accepted_block_handling")
     def replay_pending_block_candidates(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
         pending_rows = getattr(self.ledger, "pending_block_candidate_rows", None)
@@ -8568,11 +9034,6 @@ class PrismCoordinator:
             self.submit_next_block_candidate(timeout=1.0)
 
     def submit_next_block_candidate(self, timeout: float | None = None) -> bool:
-        """Dequeue and land one block candidate; returns True when one ran.
-
-        The block-submitter loop calls this continuously; tests call it
-        directly to drain the queue deterministically.
-        """
         queue_obj = getattr(self, "block_candidate_queue", None)
         if queue_obj is None:
             return False
@@ -8583,6 +9044,38 @@ class PrismCoordinator:
                 candidate = queue_obj.get(timeout=timeout)
         except queue.Empty:
             return False
+
+        outcome = getattr(self, "_block_candidate_outcome", None)
+        if outcome is None:
+            outcome = threading.local()
+            self._block_candidate_outcome = outcome
+        outcome.refresh_client = None
+        try:
+            with self._writer_operation("accepted_block_handling"):
+                ran = self._submit_next_block_candidate_writer(candidate)
+                refresh_client = getattr(outcome, "refresh_client", None)
+                outcome.refresh_client = None
+        except ShutdownInProgress:
+            # The durable outbox remains pending and the replacement process
+            # will replay it. Dequeuing the in-memory wakeup during the
+            # admission-close race cannot lose candidate work.
+            return False
+        # Fresh-job fanout is deliberately outside the writer admission. Once
+        # the candidate outbox is finalized it cannot mutate the ledger, so a
+        # blocked client send must not hold the writer lease during shutdown.
+        if refresh_client is not None and not self.stop_event.is_set():
+            self.refresh_jobs_after_pending_accepted_block(
+                refresh_client,
+                heartbeat_name="block_submitter",
+            )
+        return ran
+
+    def _submit_next_block_candidate_writer(self, candidate: PrismBlockCandidate) -> bool:
+        """Land one dequeued block candidate; returns True when one ran.
+
+        The block-submitter loop calls this continuously; tests call it
+        directly to drain the queue deterministically.
+        """
         accepted = False
         error = "candidate became stale or submission failed"
         outcome = getattr(self, "_block_candidate_outcome", None)
@@ -8643,6 +9136,8 @@ class PrismCoordinator:
                     flush=True,
                 )
                 traceback.print_exc()
+        if accepted:
+            outcome.refresh_client = candidate.client
         return True
 
     def _next_block_candidate_retry_delay(self, block_hash: str) -> float:
@@ -8741,6 +9236,7 @@ class PrismCoordinator:
             return None
         return height if confirmations > 0 else None
 
+    @ledger_writer_operation("accepted_block_handling")
     def submit_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
         """Land one block candidate, then finalize its audit and payout state.
 
@@ -9130,16 +9626,13 @@ class PrismCoordinator:
             if should_stop:
                 self.stop_event.set()
             else:
-                # Fresh work is the most urgent post-block action: push it
-                # directly from the submitter instead of waiting for the
-                # winning client's next message. Stamp the block_submitter
-                # heartbeat (not the poller's) through the refresh so a long
-                # multi-client push on this thread is not mistaken for a hang
-                # and does not trip a false liveness-watchdog exit.
-                self.refresh_jobs_after_accepted_block(
-                    block_height=expected_height,
-                    block_hash=block_hash,
-                    heartbeat_name="block_submitter",
+                # The public submitter wrapper performs this fanout only after
+                # its writer scope (including outbox finalization) exits. The
+                # synchronous rare-share path consumes the same marker from
+                # handle_request after the submit result is sent.
+                candidate.client.post_accept_refresh_block = (
+                    expected_height,
+                    block_hash,
                 )
             return True
         finally:
@@ -9148,6 +9641,7 @@ class PrismCoordinator:
             except FileNotFoundError:
                 pass
 
+    @ledger_writer_operation("accepted_block_handling")
     def reject_prepared_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
         reject = getattr(self.ledger, "reject_prepared_block", None)
         if callable(reject):
@@ -9730,11 +10224,67 @@ class PrismCoordinator:
             "# TYPE qbit_prism_audit_artifact_scan_error gauge",
             f"qbit_prism_audit_artifact_scan_error {audit_metrics['scan_error']}",
         ]
+        lines.extend(self.shutdown_metrics_lines())
         lines.extend(self.ctv_fanout_broadcaster_metrics_lines())
         lines.extend(self.job_build_metrics_lines())
         lines.extend(self.tip_refresh_metrics_lines())
         lines.extend(self.payout_state_metrics_lines())
         return "\n".join(lines) + "\n"
+
+    def shutdown_metrics_lines(self) -> list[str]:
+        snapshot = self._ensure_shutdown_controller().snapshot()
+        quiescence = snapshot["writer_quiescence_outcomes"]
+        release = snapshot["lease_release_outcomes"]
+        active = snapshot["active_writers"]
+        assert isinstance(quiescence, dict)
+        assert isinstance(release, dict)
+        assert isinstance(active, dict)
+        return [
+            "# HELP qbit_prism_shutdowns_total Controlled coordinator shutdown sequences started.",
+            "# TYPE qbit_prism_shutdowns_total counter",
+            f"qbit_prism_shutdowns_total {int(snapshot['shutdowns_total'])}",
+            "# HELP qbit_prism_shutdown_writer_operations Active admitted ledger-mutating operations by component.",
+            "# TYPE qbit_prism_shutdown_writer_operations gauge",
+            *[
+                f'qbit_prism_shutdown_writer_operations{{component="{self.prometheus_label_value(str(component))}"}} {int(count)}'
+                for component, count in sorted(active.items())
+            ],
+            "# HELP qbit_prism_shutdown_writer_quiescence_total Writer-quiescence outcomes.",
+            "# TYPE qbit_prism_shutdown_writer_quiescence_total counter",
+            *[
+                f'qbit_prism_shutdown_writer_quiescence_total{{outcome="{outcome}"}} {int(quiescence.get(outcome, 0))}'
+                for outcome in ("success", "timeout")
+            ],
+            "# HELP qbit_prism_shutdown_writer_quiescence_seconds Duration of the latest writer-quiescence barrier.",
+            "# TYPE qbit_prism_shutdown_writer_quiescence_seconds gauge",
+            f"qbit_prism_shutdown_writer_quiescence_seconds {float(snapshot['writer_quiescence_seconds']):.6f}",
+            "# HELP qbit_prism_shutdown_lease_release_attempts_total Writer-lease release attempts.",
+            "# TYPE qbit_prism_shutdown_lease_release_attempts_total counter",
+            f"qbit_prism_shutdown_lease_release_attempts_total {int(snapshot['lease_release_attempts_total'])}",
+            "# HELP qbit_prism_shutdown_lease_release_total Writer-lease release outcomes.",
+            "# TYPE qbit_prism_shutdown_lease_release_total counter",
+            *[
+                f'qbit_prism_shutdown_lease_release_total{{outcome="{outcome}"}} {int(release.get(outcome, 0))}'
+                for outcome in ("success", "not_held", "unsupported", "failure")
+            ],
+            "# HELP qbit_prism_shutdown_lease_release_seconds Duration of the latest writer-lease release attempt.",
+            "# TYPE qbit_prism_shutdown_lease_release_seconds gauge",
+            f"qbit_prism_shutdown_lease_release_seconds {float(snapshot['lease_release_seconds']):.6f}",
+            "# HELP qbit_prism_shutdown_sigterm_to_lease_release_seconds Time from SIGTERM admission close to safe lease release, or -1 if unobserved.",
+            "# TYPE qbit_prism_shutdown_sigterm_to_lease_release_seconds gauge",
+            "qbit_prism_shutdown_sigterm_to_lease_release_seconds "
+            + (
+                f"{float(snapshot['sigterm_to_lease_release_seconds']):.6f}"
+                if snapshot["sigterm_release_observed"]
+                else "-1"
+            ),
+            "# HELP qbit_prism_shutdown_release_withheld_total Shutdowns that withheld lease release because a writer did not quiesce.",
+            "# TYPE qbit_prism_shutdown_release_withheld_total counter",
+            f"qbit_prism_shutdown_release_withheld_total {int(snapshot['release_withheld_total'])}",
+            "# HELP qbit_prism_shutdown_non_writer_drain_seconds Duration of cleanup after writer lease handling.",
+            "# TYPE qbit_prism_shutdown_non_writer_drain_seconds gauge",
+            f"qbit_prism_shutdown_non_writer_drain_seconds {float(snapshot['non_writer_drain_seconds']):.6f}",
+        ]
 
     def audit_artifact_metrics(self) -> dict[str, dict[str, int] | int]:
         metrics: dict[str, dict[str, int] | int] = {
@@ -10340,16 +10890,18 @@ def main() -> int:
     coordinator = PrismCoordinator()
 
     def _request_shutdown(signum: int, _frame: Any) -> None:
-        print(f"prism coordinator: received signal {signum}; shutting down", flush=True)
-        coordinator.stop_event.set()
+        # Keep the handler to an atomic admission close plus wakeup. Writer
+        # quiescence, lease I/O, logging, and thread drainage run in normal
+        # control flow after serve observes the event.
+        coordinator.request_shutdown(signum)
 
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
     try:
         coordinator.serve()
     finally:
-        coordinator.shutdown_tip_refresh_executor()
-        coordinator.release_ledger_lease()
+        coordinator.shutdown(reason="main_finally")
+        coordinator.drain_non_writer_components()
     return 0
 
 

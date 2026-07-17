@@ -69,6 +69,7 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_STRATUM_MAX_CONNECTIONS": "1900",
                 "PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME": "400",
                 "PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS": "2",
+                "PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS": "9",
                 "PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES": "2048",
                 "PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS": "1800",
                 "PRISM_COORDINATOR_NOFILE_SOFT": "60000",
@@ -141,6 +142,7 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_POSTGRES_INIT_SCHEMA"], "1")
         self.assertEqual(env["PRISM_POSTGRES_READ_CONCURRENCY"], "4")
         self.assertEqual(env["PRISM_LEDGER_LEASE_TTL_SECONDS"], "60")
+        self.assertEqual(env["PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS"], "9")
         self.assertEqual(env["PRISM_WATCHDOG_ENABLED"], "1")
         self.assertEqual(env["PRISM_WATCHDOG_TIMEOUT_SECONDS"], "120")
         self.assertEqual(env["PRISM_WATCHDOG_INTERVAL_SECONDS"], "15")
