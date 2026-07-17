@@ -5265,6 +5265,65 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(server._payout_state_publication_blocked)
         self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
 
+    def test_uncertain_commit_supersedes_concurrently_published_source(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        block_hash = "cb" * 32
+        newer_tip = "dc" * 32
+        server.rpc = SubmitRpc(
+            tip="00" * 32,
+            block_hash=block_hash,
+            ledger=ledger,
+        )
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+
+        def publish_newer_source_then_fail(**_kwargs: object) -> dict[str, object]:
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=newer_tip,
+            )
+            self.assertEqual(
+                server._publish_payout_state_candidate(
+                    server._current_payout_state_candidate()
+                ),
+                1,
+            )
+            raise RuntimeError("ledger confirmation unavailable")
+
+        ledger.confirm_accepted_block = publish_newer_source_then_fail  # type: ignore[method-assign]
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.ledger_writer_public_key_hex = "aa" * 32
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ledger confirmation unavailable",
+            ):
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._published_payout_state.source_generation, 1)
+        self.assertEqual(server._payout_state_source[0], 2)
+        self.assertEqual(server._payout_state_source[1], newer_tip)
+        self.assertEqual(
+            server._payout_state_source[2],
+            "direct_block_uncertain",
+        )
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+
     def test_idempotent_direct_block_confirmation_publishes_reserved_source(self) -> None:
         server, state, ledger = submit_coordinator()
         server._ensure_job_cache_state()

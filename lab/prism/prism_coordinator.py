@@ -2386,8 +2386,12 @@ class PrismCoordinator:
         with self._payout_state_metrics_lock:
             self.payout_state_candidates_discarded += 1
 
-    def _block_payout_state_publication(self) -> None:
-        """Fence prepared jobs after supersession exhausts safe publication."""
+    def _block_payout_state_publication(
+        self,
+        *,
+        supersede_with: tuple[int, str | None, str, float] | None = None,
+    ) -> None:
+        """Atomically close delivery, optionally reserving a newer source."""
 
         self._ensure_job_cache_state()
 
@@ -2397,7 +2401,33 @@ class PrismCoordinator:
             nonlocal pending_source
             with self._job_cache_lock:
                 with self.lock:
-                    pending_source = self._payout_state_source[0]
+                    if supersede_with is not None:
+                        (
+                            expected_source,
+                            fallback_tip,
+                            cause,
+                            invalidated,
+                        ) = supersede_with
+                        current_source, current_tip, _, _ = (
+                            self._payout_state_source
+                        )
+                        # A newer tip/source wins its identity, but it must be
+                        # superseded so no candidate prepared before an
+                        # uncertain durable commit can publish afterward.
+                        source_tip = (
+                            fallback_tip
+                            if current_source == expected_source
+                            else current_tip
+                        )
+                        pending_source = current_source + 1
+                        self._payout_state_source = (
+                            pending_source,
+                            source_tip,
+                            cause,
+                            invalidated,
+                        )
+                    else:
+                        pending_source = self._payout_state_source[0]
                     if (
                         pending_source
                         == self._published_payout_state.source_generation
@@ -8704,17 +8734,14 @@ class PrismCoordinator:
                     # then fence delivery until reconciliation proves and
                     # publishes the resulting ledger state. Audit/RPC failures
                     # above this transaction never create such a source.
-                    if (
-                        self._reserve_payout_state_source_if_current(
+                    self._block_payout_state_publication(
+                        supersede_with=(
                             direct_source_preparation_token,
-                            "direct_block",
-                            tip_hash=payout_source_tip,
-                            invalidated_monotonic=payout_preparation_started,
+                            payout_source_tip,
+                            "direct_block_uncertain",
+                            payout_preparation_started,
                         )
-                        is None
-                    ):
-                        self._record_discarded_payout_candidate()
-                    self._block_payout_state_publication()
+                    )
                     raise
                 finally:
                     self._observe_payout_state_seconds(
@@ -8780,17 +8807,14 @@ class PrismCoordinator:
                     # An unexpected confirmation result is just as uncertain
                     # as an exception after persistence: keep all delivery
                     # fenced until reconciliation establishes the ledger state.
-                    if (
-                        self._reserve_payout_state_source_if_current(
+                    self._block_payout_state_publication(
+                        supersede_with=(
                             direct_source_preparation_token,
-                            "direct_block",
-                            tip_hash=payout_source_tip,
-                            invalidated_monotonic=payout_preparation_started,
+                            payout_source_tip,
+                            "direct_block_uncertain",
+                            payout_preparation_started,
                         )
-                        is None
-                    ):
-                        self._record_discarded_payout_candidate()
-                    self._block_payout_state_publication()
+                    )
             if confirmed_count not in {0, 1}:
                 self.stop_event.set()
                 self._abandon_block_candidate(
