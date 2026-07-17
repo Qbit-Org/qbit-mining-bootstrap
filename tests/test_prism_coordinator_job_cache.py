@@ -20,6 +20,7 @@ from lab.prism.prism_coordinator import (
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     PRISM_REJECTION_REASON_IDS,
     PrismCoordinator,
+    ShutdownInProgress,
     TemplateRefreshBlocked,
     WorkerIdentity,
     default_prism_coinbase_tag_hex,
@@ -673,6 +674,22 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         self.assertFalse(server.tip_refresh_is_pending())
+
+    def test_shutdown_during_reconciliation_stops_poll_without_refresh_failure(self) -> None:
+        server, _rpc = coordinator()
+
+        def rejected_reconciliation(_tip_hash: str) -> bool:
+            server.stop_event.set()
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            rejected_reconciliation
+        )
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertIsNone(
+            getattr(server, "last_successful_template_refresh_monotonic", None)
+        )
 
     def test_completed_refresh_cannot_clear_newer_payout_pending(self) -> None:
         server, _rpc = coordinator()

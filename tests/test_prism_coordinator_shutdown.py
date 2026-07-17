@@ -14,8 +14,10 @@ from lab.prism import prism_coordinator
 from lab.prism.prism_coordinator import (
     CoordinatorShutdownController,
     PendingShareAppend,
+    PRISM_REJECTION_POOL_CLOSED,
     PrismCoordinator,
     ShutdownInProgress,
+    StratumError,
 )
 
 
@@ -250,6 +252,57 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         snapshot = server._ensure_shutdown_controller().snapshot()
         self.assertTrue(snapshot["sigterm_release_observed"])
         self.assertGreaterEqual(snapshot["sigterm_to_lease_release_seconds"], 0)
+
+    def test_submit_admission_race_returns_pool_closed_stratum_error(self) -> None:
+        server = coordinator()
+
+        def rejected_submit(_client: object, _params: object) -> bool:
+            server.request_shutdown(signal.SIGTERM)
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+
+        server.handle_submit = rejected_submit  # type: ignore[method-assign]
+        with self.assertRaises(StratumError) as raised:
+            server.handle_request(
+                SimpleNamespace(),
+                {"id": 1, "method": "mining.submit", "params": []},
+            )
+
+        self.assertEqual(raised.exception.code, 20)
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_POOL_CLOSED)
+        self.assertTrue(raised.exception.disconnect)
+
+    def test_block_submit_loop_exits_if_shutdown_wins_admission_race(self) -> None:
+        server = coordinator()
+        submit_calls: list[bool] = []
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+
+        def rejected_replay() -> int:
+            server.request_shutdown(signal.SIGTERM)
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+
+        server.replay_pending_block_candidates = rejected_replay  # type: ignore[method-assign]
+        server.submit_next_block_candidate = (  # type: ignore[method-assign]
+            lambda **_kwargs: submit_calls.append(True) or False
+        )
+
+        server.block_submit_loop()
+
+        self.assertEqual(submit_calls, [])
+
+    def test_blockpoll_shutdown_race_does_not_take_hard_exit_path(self) -> None:
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+
+        def rejected_poll() -> int:
+            server.request_shutdown(signal.SIGTERM)
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+
+        server.poll_qbit_tip_template_once = rejected_poll  # type: ignore[method-assign]
+        with patch("lab.prism.prism_coordinator.os._exit") as hard_exit:
+            server.blockpoll_loop()
+
+        hard_exit.assert_not_called()
 
     def test_replacement_can_acquire_immediately_after_graceful_release(self) -> None:
         lease_lock = threading.Lock()

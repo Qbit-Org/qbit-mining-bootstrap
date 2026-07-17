@@ -4501,6 +4501,11 @@ class PrismCoordinator:
                         f"prism coordinator: refreshed {refreshed} client job(s) after qbit tip/template change",
                         flush=True,
                     )
+            except ShutdownInProgress:
+                # Admission can close after the loop condition but before a
+                # nested reconciliation enters the writer gate. That is an
+                # intentional shutdown stop, not a template-health failure.
+                return
             except Exception:
                 print("prism coordinator: qbit tip/template poll failed", flush=True)
                 traceback.print_exc()
@@ -5468,6 +5473,12 @@ class PrismCoordinator:
                 reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
                     snapshot.bestblockhash
                 )
+            except ShutdownInProgress:
+                # Shutdown may close writer admission after this refresh has
+                # fetched a snapshot. Leave the refresh incomplete and let
+                # the controlled shutdown proceed without consuming the
+                # template failure budget or taking the hard-exit path.
+                return 0
             except Exception as exc:
                 raise TemplateRefreshBlocked(
                     "qbit reorg reconciliation failed before refresh preparation"
@@ -7087,6 +7098,21 @@ class PrismCoordinator:
             self._retain_current_collection_refresh_if_unrepresented()
 
     def handle_request(self, client: ClientState, request: dict[str, object]) -> None:
+        """Dispatch one request, translating shutdown races to Stratum errors."""
+        try:
+            self._handle_request(client, request)
+        except ShutdownInProgress as exc:
+            # A request can pass the initial shutdown check immediately before
+            # writer admission closes. Preserve the normal protocol response
+            # instead of surfacing a generic client-thread failure.
+            raise StratumError(
+                20,
+                "coordinator is shutting down",
+                reason=PRISM_REJECTION_POOL_CLOSED,
+                disconnect=True,
+            ) from exc
+
+    def _handle_request(self, client: ClientState, request: dict[str, object]) -> None:
         if self.stop_event.is_set() or self._ensure_shutdown_controller().phase != "running":
             raise StratumError(
                 20,
@@ -9030,8 +9056,13 @@ class PrismCoordinator:
     def block_submit_loop(self) -> None:
         while not self.stop_event.is_set():
             self._record_heartbeat("block_submitter")
-            self.replay_pending_block_candidates()
-            self.submit_next_block_candidate(timeout=1.0)
+            try:
+                self.replay_pending_block_candidates()
+                self.submit_next_block_candidate(timeout=1.0)
+            except ShutdownInProgress:
+                # Admission can close after the loop condition. Durable block
+                # candidates remain in the outbox for the replacement writer.
+                return
 
     def submit_next_block_candidate(self, timeout: float | None = None) -> bool:
         queue_obj = getattr(self, "block_candidate_queue", None)
