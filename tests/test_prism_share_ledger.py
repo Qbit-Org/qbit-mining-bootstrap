@@ -1025,6 +1025,111 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual([row.share.share_seq for row in window_rows], [2, 1])
         self.assertEqual([row.counted_difficulty for row in window_rows], [Decimal(7), Decimal("2.5")])
 
+    def test_memory_reward_leaderboard_counts_partial_boundary_and_preserves_global_rank(self) -> None:
+        ledger = SingleWriterShareLedger()
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        ledger.append(
+            pending_share(
+                1,
+                share_difficulty=5,
+                job_issued_at_ms=now_ms - 10_000,
+                accepted_at_ms=now_ms - 9_000,
+            )
+        )
+        ledger.append(
+            pending_share(
+                2,
+                share_difficulty=6,
+                job_issued_at_ms=now_ms - 5_000,
+                accepted_at_ms=now_ms - 4_000,
+            )
+        )
+
+        payload = ledger.dashboard_reward_leaderboard(
+            page=1,
+            limit=15,
+            current_network_difficulty="1",
+            recipient_id="miner-1",
+        )
+
+        self.assertEqual(payload["window"]["requested_window_weight"], "8")
+        self.assertEqual(payload["window"]["counted_window_weight"], "8")
+        self.assertEqual(payload["window"]["included_share_count"], 2)
+        self.assertTrue(payload["window"]["is_complete"])
+        self.assertEqual(payload["totals"]["pool_counted_share_difficulty"], "8")
+        self.assertEqual(payload["totals"]["participant_count"], 2)
+        self.assertEqual(payload["pagination"]["total_count"], 1)
+        self.assertEqual(payload["rows"][0]["rank"], 2)
+        self.assertEqual(payload["rows"][0]["recipient_id"], "miner-1")
+        self.assertEqual(payload["rows"][0]["counted_share_difficulty"], "2")
+        self.assertEqual(payload["rows"][0]["share_percent"], "25")
+
+        searched = ledger.dashboard_reward_leaderboard(
+            page=1,
+            limit=15,
+            current_network_difficulty="1",
+            search="MINER-1",
+        )
+        self.assertEqual(searched["rows"][0]["rank"], 2)
+        self.assertEqual(searched["totals"]["participant_count"], 2)
+        self.assertEqual(searched["pagination"]["total_count"], 1)
+
+    def test_memory_reward_leaderboard_zero_weight_is_incomplete_and_has_null_rates(self) -> None:
+        ledger = SingleWriterShareLedger()
+
+        payload = ledger.dashboard_reward_leaderboard(
+            page=1,
+            limit=15,
+            current_network_difficulty="0",
+        )
+
+        self.assertEqual(payload["window"]["requested_window_weight"], "0")
+        self.assertEqual(payload["window"]["counted_window_weight"], "0")
+        self.assertFalse(payload["window"]["is_complete"])
+        self.assertIsNone(payload["window"]["observed_span_seconds"])
+        self.assertIsNone(payload["totals"]["pool_hashrate_ths"])
+        self.assertIsNone(payload["totals"]["expected_time_to_block_seconds"])
+        self.assertEqual(payload["rows"], [])
+
+    def test_memory_reward_leaderboard_underfilled_zero_span_has_null_rates(self) -> None:
+        ledger = SingleWriterShareLedger()
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        ledger.append(
+            pending_share(
+                1,
+                share_difficulty=5,
+                job_issued_at_ms=now_ms,
+                accepted_at_ms=now_ms,
+            )
+        )
+
+        payload = ledger.dashboard_reward_leaderboard(
+            page=1,
+            limit=15,
+            current_network_difficulty="2",
+        )
+
+        self.assertEqual(payload["window"]["requested_window_weight"], "16")
+        self.assertEqual(payload["window"]["counted_window_weight"], "5")
+        self.assertFalse(payload["window"]["is_complete"])
+        self.assertEqual(payload["window"]["observed_span_seconds"], 0)
+        self.assertIsNone(payload["totals"]["pool_hashrate_ths"])
+        self.assertIsNone(payload["totals"]["expected_time_to_block_seconds"])
+        self.assertIsNone(payload["rows"][0]["hashrate_ths"])
+        self.assertEqual(payload["rows"][0]["share_percent"], "100")
+
+    def test_memory_reward_leaderboard_rejects_ambiguous_filters(self) -> None:
+        ledger = SingleWriterShareLedger()
+
+        with self.assertRaisesRegex(ValueError, "search and recipient_id are mutually exclusive"):
+            ledger.dashboard_reward_leaderboard(
+                page=1,
+                limit=15,
+                current_network_difficulty="1",
+                search="miner",
+                recipient_id="miner-1",
+            )
+
     def test_postgres_pool_snapshot_reward_window_timestamps_come_from_window_rows(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
             [
@@ -1055,6 +1160,54 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("accepted_at <= bounds.ended_at", query)
         self.assertIn("'oldest_share_accepted_at', (SELECT oldest_share_accepted_at FROM window_summary)", query)
         self.assertIn("'included_share_count', (SELECT included_share_count FROM window_summary)", query)
+
+    def test_postgres_reward_leaderboard_uses_one_window_and_filters_after_global_rank(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "ended_at": "2026-06-26T20:45:00Z",
+                    "oldest_share_accepted_at": "2026-06-26T20:44:50Z",
+                    "observed_span_seconds": 10,
+                    "counted_window_weight": "8",
+                    "included_share_count": 2,
+                    "participant_count": 2,
+                    "total_count": 1,
+                    "rows": [
+                        {
+                            "rank": 2,
+                            "recipient_id": "miner-a",
+                            "display_name": None,
+                            "included_share_count": 1,
+                            "counted_share_difficulty": "2",
+                            "share_percent": "25",
+                            "blocks_found_total": 4,
+                            "last_share_at": "2026-06-26T20:44:50Z",
+                        }
+                    ],
+                },
+            ]
+        )
+
+        payload = ledger.dashboard_reward_leaderboard(
+            page=1,
+            limit=15,
+            current_network_difficulty="1",
+            recipient_id="miner-a",
+        )
+        query = ledger.lease_queries[-1]
+
+        self.assertEqual(query.count("qbit_prism_window("), 1)
+        self.assertIn("window_rows AS MATERIALIZED", query)
+        self.assertIn("ranked AS (", query)
+        self.assertIn("WHERE ranked.miner_id = 'miner-a'", query)
+        self.assertLess(query.index("ranked AS ("), query.index("WHERE ranked.miner_id = 'miner-a'"))
+        self.assertEqual(payload["rows"][0]["rank"], 2)
+        self.assertEqual(payload["rows"][0]["counted_share_difficulty"], "2")
+        self.assertEqual(payload["totals"]["participant_count"], 2)
+        self.assertEqual(payload["pagination"]["total_count"], 1)
+        self.assertEqual(payload["window"]["counted_window_weight"], "8")
+        self.assertTrue(payload["window"]["is_complete"])
 
     def test_postgres_dashboard_pending_fanout_rows_include_broadcast_attempts(self) -> None:
         ledger = FakeLeasePsqlShareLedger(

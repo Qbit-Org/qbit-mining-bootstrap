@@ -5,8 +5,8 @@
     "name": "qbit-signet",
     "height": 123456,
     "tip_hash": "0000000000000000000abc123000000000000000000000000000000000000001",
-    "bits": "1d00ffff",
-    "network_difficulty": "124930000000000",
+    "bits": "181b32da",
+    "network_difficulty": "86812541144089706339356132",
     "initial_block_download": false,
     "peers": 8
   },
@@ -21,7 +21,7 @@
     "blocks_found_total": 128,
     "prism_blocks_total": 128,
     "total_mined_bits": 32000000000,
-    "expected_time_to_block_seconds": 18000,
+    "expected_time_to_block_seconds": 75,
     "latest_block": {
       "height": 123450,
       "hash": "0000000000000000000abc1230000000000000000000000000000000000000aa",
@@ -32,8 +32,8 @@
     },
     "reward_window": {
       "window_multiplier": 8,
-      "requested_window_weight": "999440000000000",
-      "oldest_share_accepted_at": "2026-06-26T11:20:00Z",
+      "requested_window_weight": "694500329152717650714849056",
+      "oldest_share_accepted_at": "2026-06-26T20:35:00Z",
       "newest_share_accepted_at": "2026-06-26T20:44:53Z",
       "included_share_count": 1942
     }

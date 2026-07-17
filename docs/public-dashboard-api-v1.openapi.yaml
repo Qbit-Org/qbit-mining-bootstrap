@@ -95,8 +95,12 @@ paths:
           required: false
           schema:
             type: string
-            enum: [3h]
+            enum: [3h, reward]
             default: 3h
+          description: >
+            `3h` preserves the legacy three-hour hashrate leaderboard. `reward`
+            ranks the canonical live PRISM work window using counted share
+            difficulty from the latest 8x permissionless-difficulty window.
         - $ref: "#/components/parameters/Page"
         - $ref: "#/components/parameters/Limit"
         - name: search
@@ -105,6 +109,16 @@ paths:
           schema:
             type: string
             maxLength: 128
+          description: Case-insensitive recipient substring. Not valid with `recipient_id`.
+        - name: recipient_id
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 256
+          description: >
+            Exact recipient lookup for `window=reward`. Ranking and totals remain
+            global. Rejected for `window=3h` and not valid with `search`.
       responses:
         "200":
           description: Contributor leaderboard.
@@ -120,7 +134,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/LeaderboardResponse"
+                oneOf:
+                  - $ref: "#/components/schemas/LeaderboardResponse"
+                  - $ref: "#/components/schemas/RewardLeaderboardResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "503":
@@ -878,6 +894,132 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/LeaderboardRow"
+    RewardWindowInfo:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - started_at
+        - ended_at
+        - observed_span_seconds
+        - network_difficulty
+        - window_multiplier
+        - requested_window_weight
+        - counted_window_weight
+        - included_share_count
+        - is_complete
+      properties:
+        id:
+          type: string
+          const: reward
+        started_at:
+          $ref: "#/components/schemas/NullableTimestamp"
+        ended_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        observed_span_seconds:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+          description: >
+            Observed wall-clock span from the oldest included share to the
+            snapshot anchor. This is variable and is null for an empty window.
+        network_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        window_multiplier:
+          type: integer
+          const: 8
+        requested_window_weight:
+          $ref: "#/components/schemas/DecimalString"
+        counted_window_weight:
+          $ref: "#/components/schemas/DecimalString"
+        included_share_count:
+          type: integer
+          minimum: 0
+        is_complete:
+          type: boolean
+    RewardLeaderboardTotals:
+      type: object
+      additionalProperties: false
+      required:
+        - pool_hashrate_ths
+        - pool_counted_share_difficulty
+        - participant_count
+        - expected_time_to_block_seconds
+      properties:
+        pool_hashrate_ths:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        pool_counted_share_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        participant_count:
+          type: integer
+          minimum: 0
+        expected_time_to_block_seconds:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+    RewardLeaderboardRow:
+      type: object
+      additionalProperties: false
+      required:
+        - rank
+        - recipient_id
+        - display_name
+        - hashrate_ths
+        - included_share_count
+        - counted_share_difficulty
+        - share_percent
+        - blocks_found_total
+        - last_share_at
+      properties:
+        rank:
+          type: integer
+          minimum: 1
+        recipient_id:
+          type: string
+        display_name:
+          $ref: "#/components/schemas/NullableString"
+        hashrate_ths:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        included_share_count:
+          type: integer
+          minimum: 1
+        counted_share_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        share_percent:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        blocks_found_total:
+          type: integer
+          minimum: 0
+        last_share_at:
+          $ref: "#/components/schemas/NullableTimestamp"
+    RewardLeaderboardResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, window, totals, pagination, rows]
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.leaderboard.v2
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        window:
+          $ref: "#/components/schemas/RewardWindowInfo"
+        totals:
+          $ref: "#/components/schemas/RewardLeaderboardTotals"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/RewardLeaderboardRow"
     BlockRow:
       type: object
       additionalProperties: false

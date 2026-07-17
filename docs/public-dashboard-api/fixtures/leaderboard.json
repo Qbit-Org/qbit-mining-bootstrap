@@ -1,15 +1,23 @@
 {
-  "schema": "prism.dashboard.leaderboard.v1",
+  "schema": "prism.dashboard.leaderboard.v2",
   "generated_at": "2026-06-26T20:45:00Z",
   "window": {
-    "id": "3h",
-    "started_at": "2026-06-26T17:45:00Z",
-    "ended_at": "2026-06-26T20:45:00Z"
+    "id": "reward",
+    "window_multiplier": 8,
+    "network_difficulty": "86812541144089706339356132",
+    "requested_window_weight": "694500329152717650714849056",
+    "counted_window_weight": "694500329152717650714849056",
+    "is_complete": true,
+    "started_at": "2026-06-26T20:35:00Z",
+    "ended_at": "2026-06-26T20:45:00Z",
+    "observed_span_seconds": 600,
+    "included_share_count": 1942
   },
   "totals": {
-    "pool_hashrate_ths": "2315000.75",
-    "pool_accepted_share_difficulty": "441000000000",
-    "participant_count": 42
+    "pool_hashrate_ths": "2315001.373145394504128352701051973627245",
+    "pool_counted_share_difficulty": "694500329152717650714849056",
+    "participant_count": 42,
+    "expected_time_to_block_seconds": 75
   },
   "pagination": {
     "page": 1,
@@ -22,20 +30,22 @@
       "rank": 1,
       "recipient_id": "qbrt1prismminer000000000000000000000000000000000000001",
       "display_name": null,
-      "hashrate_ths_3h": "620000.5",
-      "share_percent": "27.05",
-      "hash_percent": "26.78",
-      "blocks_found": 12,
+      "hashrate_ths": "626439.3715731437528171322423926642409162",
+      "included_share_count": 480,
+      "counted_share_difficulty": "187931789068725396283438155",
+      "share_percent": "27.06",
+      "blocks_found_total": 12,
       "last_share_at": "2026-06-26T20:44:53Z"
     },
     {
       "rank": 2,
       "recipient_id": "qbrt1prismminer000000000000000000000000000000000000002",
       "display_name": "Denver Lab",
-      "hashrate_ths_3h": "410000.25",
+      "hashrate_ths": "409986.7431840493666811312639643046018645",
+      "included_share_count": 300,
+      "counted_share_difficulty": "122996008292946295941599768",
       "share_percent": "17.71",
-      "hash_percent": "17.71",
-      "blocks_found": 8,
+      "blocks_found_total": 8,
       "last_share_at": "2026-06-26T20:44:21Z"
     }
   ]

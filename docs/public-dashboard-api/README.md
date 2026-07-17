@@ -74,6 +74,43 @@ responses use `Cache-Control: no-store` and are not cached by that origin cache.
 - Optional fields are present as `null` when unavailable, so dashboard layout
   can remain stable.
 
+## Reward Leaderboard
+
+`GET /public/v1/leaderboard?window=reward` returns
+`prism.dashboard.leaderboard.v2`, ranked by each recipient's counted work in the
+live PRISM reward window. The window contains the newest eligible accepted
+shares totaling `8 * network_difficulty`; if the oldest share crosses the
+boundary, only the needed part of its difficulty is counted. The response
+therefore exposes both requested and counted window weight, the observed share
+count and wall-clock span, and whether enough work exists to complete the
+window.
+
+This is a work window, not a fixed time period. qbit's permissionless lane has a
+75-second block target, so the nominal duration at 100% of that lane's hashrate
+is `8 * 75 seconds = 600 seconds` (10 minutes). For a pool with fraction `p` of
+the permissionless hashrate, its expected duration is `600 / p` seconds—also
+eight times that pool's expected time to find a permissionless block. Actual
+duration varies with share arrival, vardiff, and pool hashrate. It is unrelated
+to the separate coinbase-maturity delay.
+
+The live endpoint uses the snapshot time and current permissionless network
+difficulty. A found block instead freezes eligibility at that block job's issue
+time and uses the difficulty committed for that job, so the live view is a
+prospective estimate rather than a reconstruction of a past payout. During
+startup collection mode, a solved collection job pays its solver directly; the
+collected ledger shares enter the next ready block's work window.
+
+Live reward calculations require authoritative compact target bits from qbit's
+block template or blockchain status. If neither source supplies valid bits, the
+pool summary, miner detail, and reward leaderboard return `503` instead of
+inventing a difficulty, reward split, or block-time estimate.
+
+For reward responses, `search` and exact `recipient_id` filters are mutually
+exclusive. Both are applied after the complete pool window has been grouped and
+ranked, so returned ranks and pool totals stay global. `recipient_id` is rejected
+when `window` is omitted or set to `3h`; those requests otherwise retain the
+legacy `prism.dashboard.leaderboard.v1` response during rollout.
+
 ## Settlement Artifacts
 
 PRISM settlement is not just a stats UI. When payouts route through CTV fanouts,
