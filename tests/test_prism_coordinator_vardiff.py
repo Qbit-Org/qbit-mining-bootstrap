@@ -6810,8 +6810,13 @@ class PrismListenerProfileTests(unittest.TestCase):
         server, state, _ = self.authorize_server_and_client()
         send_job_calls: list[bool] = []
 
-        def counting_send_job(client: object, *, clean_jobs: bool) -> bool:
+        def counting_send_job(current: ClientState, *, clean_jobs: bool) -> bool:
             send_job_calls.append(clean_jobs)
+            current.active_job = SimpleNamespace(
+                template={"previousblockhash": "aa" * 32},
+                payout_state_generation=0,
+            )
+            server.current_tip_first_seen = ("aa" * 32, None)
             return True
 
         server.maybe_send_job = counting_send_job  # type: ignore[method-assign]

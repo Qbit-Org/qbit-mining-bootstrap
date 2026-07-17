@@ -4153,7 +4153,10 @@ class PrismCoordinator:
             return False
         current_tip = self._current_observed_tip_hash_locked()
         if current_tip is None:
-            return True
+            # An active job is not proof that tip observation is alive. Keep
+            # coverage fail-closed until blockpoll/blockwait has published the
+            # tip that makes the job current.
+            return False
         return str(context.template.get("previousblockhash", "")) == current_tip
 
     def note_initial_job_delivered(
@@ -4239,7 +4242,48 @@ class PrismCoordinator:
                 request.future = future
             else:
                 future.cancel()
+        future.add_done_callback(
+            lambda completed: self._initial_job_future_finished(request, completed)
+        )
         return True
+
+    def _initial_job_future_finished(
+        self,
+        request: PendingInitialJob,
+        future: Future[bool],
+    ) -> None:
+        """Release failed first-job requests instead of stranding capacity."""
+        delivered = False
+        if not future.cancelled():
+            try:
+                delivered = bool(future.result())
+            except Exception:
+                with self.lock:
+                    self.job_build_failure_count = int(
+                        getattr(self, "job_build_failure_count", 0)
+                    ) + 1
+                print(
+                    "prism coordinator: initial job task failed "
+                    f"connection={request.client.connection_id}",
+                    flush=True,
+                )
+                traceback.print_exc()
+
+        disconnect = False
+        with self.lock:
+            self._ensure_initial_job_state()
+            if self.pending_initial_jobs.get(request.client) is not request:
+                return
+            if delivered and self._client_has_current_tip_job_locked(request.client):
+                self.pending_initial_jobs.pop(request.client, None)
+                request.cancelled.set()
+                self.last_initial_job_delivery_monotonic = time.monotonic()
+            else:
+                self.pending_initial_jobs.pop(request.client, None)
+                request.cancelled.set()
+                disconnect = True
+        if disconnect:
+            self.disconnect_client(request.client)
 
     def _run_initial_job(self, request: PendingInitialJob) -> bool:
         """Prepare outside client locks, then atomically stamp and send current work."""
@@ -7834,7 +7878,13 @@ class PrismCoordinator:
                 self._note_collection_identity_available(client)
                 # On a re-authorize whose new options already advertised a fresh
                 # difficulty/job pair, do not send a second back-to-back pair.
-                if not difficulty_job_delivered:
+                delivery_is_current = difficulty_job_delivered
+                if difficulty_job_delivered:
+                    with self.lock:
+                        delivery_is_current = self._client_has_current_tip_job_locked(
+                            client
+                        )
+                if not delivery_is_current:
                     self.schedule_initial_job(client)
             return
         if method == "mining.extranonce.subscribe":

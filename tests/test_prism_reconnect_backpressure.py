@@ -179,6 +179,24 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         )
         self.assertTrue(high_accepts.sockets[1].closed)
 
+    def test_current_job_coverage_requires_an_observed_matching_tip(self) -> None:
+        server = coordinator(connection_limit=2)
+        state = client(server, 1, with_job=True)
+
+        missing_tip = server.mining_delivery_snapshot(now=1.0)
+        self.assertEqual(missing_tip["clients_with_current_tip_jobs"], 0)
+        self.assertEqual(missing_tip["current_tip_job_coverage"], 0.0)
+
+        server.current_tip_first_seen = ("aa" * 32, None)
+        matching_tip = server.mining_delivery_snapshot(now=2.0)
+        self.assertEqual(matching_tip["clients_with_current_tip_jobs"], 1)
+        self.assertEqual(matching_tip["current_tip_job_coverage"], 1.0)
+
+        server.current_tip_first_seen = ("bb" * 32, time.monotonic())
+        advanced_tip = server.mining_delivery_snapshot(now=3.0)
+        self.assertEqual(advanced_tip["clients_with_current_tip_jobs"], 0)
+        self.assertEqual(advanced_tip["current_tip_job_coverage"], 0.0)
+
     def test_pending_initial_jobs_are_bounded_and_duplicate_requests_coalesce(self) -> None:
         server = coordinator(connection_limit=5, pending_limit=2)
         release = threading.Event()
@@ -216,6 +234,63 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         state.subscribed = True
         self.assertTrue(server.schedule_initial_job(state))
         self.assertIn(state, server.pending_initial_jobs)
+        release.set()
+        server.shutdown_tip_refresh_executor()
+
+    def test_failed_initial_job_releases_capacity_and_disconnects_client(self) -> None:
+        server = coordinator(connection_limit=3, pending_limit=1)
+        server._run_initial_job = lambda _request: False  # type: ignore[method-assign]
+        state = client(server, 1)
+
+        self.assertTrue(server.schedule_initial_job(state))
+        deadline = time.monotonic() + 5
+        while state in server.clients and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertNotIn(state, server.clients)
+        self.assertNotIn(state, server.pending_initial_jobs)
+        self.assertTrue(state.sock.closed)
+        server.shutdown_tip_refresh_executor()
+
+    def test_reauthorize_schedules_current_work_after_stale_direct_delivery(self) -> None:
+        server = coordinator(connection_limit=3, pending_limit=2)
+        server.current_tip_first_seen = ("bb" * 32, time.monotonic())
+        state = client(server, 1, with_job=True)
+        old_request = PendingInitialJob(
+            client=state,
+            authorization_generation=state.authorization_generation,
+            worker=state.worker,
+            requested_monotonic=0.0,
+            deadline_monotonic=30.0,
+        )
+        server.pending_initial_jobs[state] = old_request
+        release = threading.Event()
+        server._run_initial_job = lambda _request: release.wait(5)  # type: ignore[method-assign]
+        server.resolve_worker = lambda username: worker(username)  # type: ignore[method-assign]
+
+        def reserve(current: ClientState, identity: WorkerIdentity) -> bool:
+            current.worker = identity
+            current.username = identity.username
+            return True
+
+        server.reserve_client_username = reserve  # type: ignore[method-assign]
+        server.apply_client_difficulty_requests = lambda _client: Decimal("2")  # type: ignore[method-assign]
+        server.advertise_client_difficulty = lambda _client, _target: True  # type: ignore[method-assign]
+        server.send_result = lambda *_args: None  # type: ignore[method-assign]
+
+        server.handle_request(
+            state,
+            {
+                "id": 7,
+                "method": "mining.authorize",
+                "params": ["miner-new", "d=2"],
+            },
+        )
+
+        replacement = server.pending_initial_jobs[state]
+        self.assertIsNot(replacement, old_request)
+        self.assertTrue(old_request.cancelled.is_set())
+        self.assertEqual(replacement.authorization_generation, 2)
         release.set()
         server.shutdown_tip_refresh_executor()
 
@@ -273,6 +348,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
 
     def test_recovery_releases_pending_capacity_without_restart(self) -> None:
         server = coordinator(connection_limit=4, pending_limit=2)
+        server.current_tip_first_seen = ("aa" * 32, None)
         bundle_ready = threading.Event()
 
         def deliver(request: PendingInitialJob) -> bool:
@@ -344,6 +420,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertFalse(failed["mining_ready"])
         self.assertIn("initial-delivery-stalled", failed["unhealthy_reasons"])
 
+        server.current_tip_first_seen = ("aa" * 32, None)
         for state in (first, second):
             state.active_job = SimpleNamespace(
                 template={"previousblockhash": "aa" * 32},
