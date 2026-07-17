@@ -13,6 +13,7 @@ from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism.prism_coordinator import (
     ClientState,
+    MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     PRISM_REJECTION_REASON_IDS,
     PrismCoordinator,
@@ -383,6 +384,205 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(recorded["calls"], 2)
 
+    def test_payout_state_change_during_build_retries_before_cache_or_return(self) -> None:
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None
+        identity = worker()
+        original_build = server.build_shared_job_bundle
+        built_generations: list[int] = []
+
+        def mutate_after_first_build(
+            build_artifacts: object,
+            build_worker: WorkerIdentity,
+        ) -> object:
+            bundle = original_build(build_artifacts, build_worker)  # type: ignore[arg-type]
+            built_generations.append(bundle.payout_state_generation)
+            if len(built_generations) == 1:
+                server._advance_payout_state_generation()
+            return bundle
+
+        server.build_shared_job_bundle = mutate_after_first_build  # type: ignore[method-assign]
+
+        bundle = server.shared_job_bundle(artifacts, identity)
+        cached = server.shared_job_bundle(artifacts, identity)
+
+        self.assertEqual(built_generations, [0, 1])
+        self.assertEqual(recorded["calls"], 2)
+        self.assertEqual(bundle.payout_state_generation, 1)
+        self.assertIs(cached, bundle)
+
+    def test_payout_generation_advance_does_not_cancel_new_generation_fanout(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+        cancellations: list[str] = []
+
+        class CurrentToken:
+            payout_state_generation = 1
+
+        class Cancellation:
+            def cancel(self) -> None:
+                cancellations.append("cancelled")
+
+        class InjectCurrentFanoutLock:
+            def __enter__(self) -> object:
+                server._active_tip_refresh = (CurrentToken(), Cancellation())
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        # Model a new-generation refresh registering after the cache-state
+        # increment but before the invalidator reaches the coordinator lock.
+        server.lock = InjectCurrentFanoutLock()  # type: ignore[assignment]
+
+        self.assertEqual(server._advance_payout_state_generation(), 1)
+        self.assertEqual(cancellations, [])
+        self.assertFalse(server.tip_refresh_is_pending())
+        self.assertFalse(server._tip_refresh_retry.is_set())
+
+    def test_payout_generation_retry_marks_tip_refresh_pending(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+
+        self.assertFalse(server.tip_refresh_is_pending())
+        self.assertEqual(server._advance_payout_state_generation(), 1)
+
+        self.assertTrue(server.tip_refresh_is_pending())
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertFalse(server.tip_refresh_is_pending())
+
+    def test_successful_poll_clears_payout_pending_created_during_reconcile(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+        reconcile_entered = threading.Event()
+        allow_reconcile = threading.Event()
+        results: list[int] = []
+        errors: list[BaseException] = []
+
+        def reconcile(_tip_hash: str) -> bool:
+            reconcile_entered.set()
+            if not allow_reconcile.wait(5):
+                raise AssertionError("test did not release reconciliation")
+            return True
+
+        def poll() -> None:
+            try:
+                results.append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        server.ensure_reorg_reconciled_for_tip = reconcile  # type: ignore[method-assign]
+        server._mark_tip_refresh_pending("seed")
+        poll_thread = threading.Thread(target=poll)
+        poll_thread.start()
+        try:
+            self.assertTrue(reconcile_entered.wait(5))
+            self.assertEqual(server._advance_payout_state_generation(), 1)
+        finally:
+            allow_reconcile.set()
+            poll_thread.join(5)
+
+        self.assertFalse(poll_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [0])
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertIsNotNone(server.last_successful_template_refresh_monotonic)
+        self.assertFalse(server.tip_refresh_is_pending())
+
+    def test_failed_poll_preserves_pending_signal_until_successful_retry(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+        pending_token = server._mark_tip_refresh_pending("seed")
+
+        def fail_reconciliation(_tip_hash: str) -> bool:
+            server._schedule_tip_refresh_retry()
+            raise RuntimeError("ledger unavailable")
+
+        server.ensure_reorg_reconciled_for_tip = fail_reconciliation  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "qbit reorg reconciliation failed",
+        ):
+            server.poll_qbit_tip_template_once()
+
+        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server.tip_refresh_is_pending())
+        self.assertEqual(server._tip_refresh_pending_token, pending_token)
+
+        # Model blockpoll claiming the immediate wake and completing the retry.
+        server._tip_refresh_retry.clear()
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertFalse(server.tip_refresh_is_pending())
+
+    def test_completed_refresh_cannot_clear_newer_payout_pending(self) -> None:
+        server, _rpc = coordinator()
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = snapshot
+        completed_generation = server._payout_state_generation
+        self.assertEqual(server._advance_payout_state_generation(), 1)
+        newer_token = server._tip_refresh_pending_token
+
+        self.assertFalse(
+            server._clear_tip_refresh_pending_for_completed_refresh(
+                snapshot,
+                sequence,
+                completed_generation,
+            )
+        )
+        self.assertEqual(server._tip_refresh_pending_token, newer_token)
+        self.assertTrue(server.tip_refresh_is_pending())
+
+    def test_escaped_stale_bundle_is_rejected_before_direct_delivery(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server._ensure_tip_refresh_state()
+        state = client(1)
+        sent: list[dict[str, object]] = []
+        state.send = sent.append  # type: ignore[method-assign]
+        original_shared_job_bundle = server.shared_job_bundle
+        advanced = False
+
+        def advance_after_bundle(*args: object, **kwargs: object) -> object:
+            nonlocal advanced
+            bundle = original_shared_job_bundle(*args, **kwargs)  # type: ignore[arg-type]
+            if not advanced:
+                advanced = True
+                server._advance_payout_state_generation()
+            return bundle
+
+        server.shared_job_bundle = advance_after_bundle  # type: ignore[method-assign]
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(sent, [])
+        self.assertIsNone(state.active_job)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+        self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
+        self.assertIsNotNone(state.active_job)
+        self.assertEqual(state.active_job.payout_state_generation, 1)
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+
     def test_zero_template_ttl_fetches_template_per_build(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
@@ -643,6 +843,144 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIn("qbit_prism_tip_refresh_first_delivery_seconds_count 1", metrics)
         self.assertIn("qbit_prism_tip_refresh_last_delivery_seconds_count 1", metrics)
 
+    def test_ready_tip_refresh_validates_chain_once_for_one_hundred_clients(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        reconciled: list[str] = []
+        trust_checks = 0
+
+        def reconcile_once(tip_hash: str) -> bool:
+            reconciled.append(tip_hash)
+            return True
+
+        def chain_view_untrusted() -> bool:
+            nonlocal trust_checks
+            trust_checks += 1
+            return False
+
+        server.ensure_reorg_reconciled_for_tip = reconcile_once  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = chain_view_untrusted  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: self.fail("fanout repeated current-tip validation")
+        )
+        clients = [client(index + 1) for index in range(100)]
+        sent: dict[int, list[dict[str, object]]] = {
+            state.connection_id: [] for state in clients
+        }
+        for state in clients:
+            state.send = (  # type: ignore[method-assign]
+                lambda payload, connection_id=state.connection_id: sent[
+                    connection_id
+                ].append(payload)
+            )
+        server.clients = set(clients)
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 100)
+        self.assertEqual(reconciled, [rpc.tip])
+        self.assertEqual(trust_checks, 2)
+        # The early priority probe, snapshot coherence, pre-fanout validation,
+        # and post-fanout detection are each constant-cost regardless of
+        # client count.
+        self.assertEqual(rpc.count("getbestblockhash"), 4)
+        self.assertTrue(all(len(payloads) == 2 for payloads in sent.values()))
+        fingerprints = {state.active_job.template_fingerprint for state in clients}
+        self.assertEqual(len(fingerprints), 1)
+
+    def test_same_fingerprint_bundle_rebinds_exact_template_observation(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        identity = worker()
+        first = server.store_template_artifacts(base_template())
+        assert first is not None
+        original = server.shared_job_bundle(first, identity)
+        updated_template = dict(first.template)
+        updated_template["curtime"] = int(updated_template["curtime"]) + 30
+        second = server.store_template_artifacts(updated_template)
+        assert second is not None
+
+        rebound = server.shared_job_bundle(second, identity)
+
+        self.assertEqual(first.fingerprint, second.fingerprint)
+        self.assertIs(rebound.template, second.template)
+        self.assertIsNot(rebound.template, original.template)
+        self.assertEqual(rebound.template_generation, second.generation)
+        self.assertEqual(rebound.base_job.ntime, f'{updated_template["curtime"]:08x}')
+
+    def test_same_fingerprint_collection_bundle_rebuilds_exact_observation(self) -> None:
+        server, _ = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        recorded = install_fake_bundle_builder(server)
+        identity = worker()
+        first = server.store_template_artifacts(base_template())
+        assert first is not None
+        original = server.shared_job_bundle(first, identity)
+        updated_template = dict(first.template)
+        updated_template["curtime"] = int(updated_template["curtime"]) + 30
+        second = server.store_template_artifacts(updated_template)
+        assert second is not None
+
+        rebuilt = server.shared_job_bundle(second, identity)
+
+        self.assertTrue(original.collection_only)
+        self.assertTrue(rebuilt.collection_only)
+        self.assertEqual(first.fingerprint, second.fingerprint)
+        self.assertEqual(recorded["calls"], 2)
+        self.assertIsNot(rebuilt.bundle, original.bundle)
+        self.assertIs(rebuilt.template, second.template)
+        self.assertEqual(rebuilt.template_generation, second.generation)
+
+    def test_job_bundle_cache_is_bounded(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(base_template())
+        assert artifacts is not None
+        bundle = server.shared_job_bundle(artifacts, worker())
+
+        for index in range(MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES + 5):
+            candidate = dataclass_replace(
+                bundle,
+                key=(artifacts.fingerprint, "test", index),
+            )
+            server._cache_job_bundle_if_current(candidate, artifacts)
+
+        self.assertEqual(
+            len(server._job_bundle_cache),
+            MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
+        )
+        self.assertNotIn(
+            (artifacts.fingerprint, "test", 0),
+            server._job_bundle_cache,
+        )
+
+    def test_supersession_retry_wakes_blockpoll_without_full_interval(self) -> None:
+        server, _ = coordinator()
+        server.blockpoll_seconds = 60.0
+        server._ensure_tip_refresh_state()
+        poll_called = threading.Event()
+
+        def poll_once() -> int:
+            poll_called.set()
+            server.stop_event.set()
+            return 0
+
+        server.poll_qbit_tip_template_once = poll_once  # type: ignore[method-assign]
+        thread = threading.Thread(target=server.blockpoll_loop)
+        thread.start()
+        try:
+            server._schedule_tip_refresh_retry()
+            self.assertTrue(poll_called.wait(1))
+        finally:
+            server.stop_event.set()
+            server._schedule_tip_refresh_retry()
+            thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+
     def test_ready_tip_refresh_respects_executor_bound(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
@@ -780,60 +1118,32 @@ class JobBundleCacheTests(unittest.TestCase):
     def test_queued_fanout_stops_when_chain_view_becomes_untrusted(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
-        server.tip_refresh_max_workers = 1
         server.reorg_reconciler_enabled = True
         server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
-        chain_view_trusted = True
-        trust_checks: list[bool] = []
+        trust_checks = 0
 
-        def current_tip_trusted(*, expected_tip_hash: str | None = None) -> bool:
-            self.assertEqual(expected_tip_hash, server.rpc.tip)
-            trust_checks.append(chain_view_trusted)
-            return chain_view_trusted
+        def chain_view_untrusted() -> bool:
+            nonlocal trust_checks
+            trust_checks += 1
+            return True
 
-        server.ensure_reorg_reconciled_for_current_tip = current_tip_trusted  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = chain_view_untrusted  # type: ignore[method-assign]
         first = client(1)
         second = client(2)
         server.clients = [first, second]  # type: ignore[assignment]
-        first_blocked = threading.Event()
-        release_first = threading.Event()
-        second_sent: list[dict[str, object]] = []
-
-        def first_send(payload: dict[str, object]) -> None:
-            if payload["method"] == "mining.notify":
-                first_blocked.set()
-                self.assertTrue(release_first.wait(5))
-
-        first.send = first_send  # type: ignore[method-assign]
-        second.send = second_sent.append  # type: ignore[method-assign]
-        refreshed: list[int] = []
-        errors: list[BaseException] = []
-
-        def poll() -> None:
-            try:
-                refreshed.append(server.poll_qbit_tip_template_once())
-            except BaseException as exc:  # noqa: BLE001 - surface to the test
-                errors.append(exc)
-
-        thread = threading.Thread(target=poll)
-        thread.start()
+        sent: list[dict[str, object]] = []
+        first.send = sent.append  # type: ignore[method-assign]
+        second.send = sent.append  # type: ignore[method-assign]
         try:
-            self.assertTrue(first_blocked.wait(5))
-            chain_view_trusted = False
+            with self.assertRaisesRegex(TemplateRefreshBlocked, "became untrusted"):
+                server.poll_qbit_tip_template_once()
         finally:
-            release_first.set()
-            thread.join(5)
             server.shutdown_tip_refresh_executor()
 
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(refreshed, [])
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
-        self.assertIn("chain view became untrusted", str(errors[0]))
-        self.assertEqual(trust_checks, [True, False])
-        self.assertIsNotNone(first.active_job)
+        self.assertEqual(trust_checks, 1)
+        self.assertEqual(sent, [])
+        self.assertIsNone(first.active_job)
         self.assertIsNone(second.active_job)
-        self.assertEqual(second_sent, [])
 
     def test_queued_fanout_stops_when_live_tip_changes(self) -> None:
         server, rpc = coordinator()
@@ -876,62 +1186,32 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(refreshed, [])
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], TemplateRefreshBlocked)
-        self.assertIn("tip changed while prepared work was queued", str(errors[0]))
+        self.assertIn("immediate retry scheduled", str(errors[0]))
+        self.assertTrue(server._tip_refresh_retry.is_set())
         self.assertIsNotNone(first.active_job)
-        self.assertIsNone(second.active_job)
-        self.assertEqual(second_sent, [])
+        self.assertIsNotNone(second.active_job)
+        self.assertEqual(
+            [payload["method"] for payload in second_sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
 
     def test_multiworker_cancel_releases_client_lock_while_draining_peer(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
-        server.tip_refresh_max_workers = 2
-        server.reorg_reconciler_enabled = True
-        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.tip_refresh_max_workers = 1
         admitted = client(1)
-        invalidating = client(2)
-        queued = client(3)
-        server.clients = [admitted, invalidating, queued]  # type: ignore[assignment]
+        queued = client(2)
+        server.clients = [admitted, queued]  # type: ignore[assignment]
         admitted_send_started = threading.Event()
         release_admitted_send = threading.Event()
-        invalidation_started = threading.Event()
-        invalidation_finished = threading.Event()
         queued_sent: list[dict[str, object]] = []
-        worker_local = threading.local()
-        original_send_prepared_job = server.send_prepared_job
-
-        def controlled_send_prepared_job(
-            state: ClientState,
-            *args: object,
-            **kwargs: object,
-        ) -> object:
-            worker_local.client = state
-            try:
-                return original_send_prepared_job(state, *args, **kwargs)
-            except TemplateRefreshBlocked:
-                if state is invalidating:
-                    invalidation_finished.set()
-                raise
-
-        def current_tip_trusted(*, expected_tip_hash: str | None = None) -> bool:
-            self.assertEqual(expected_tip_hash, server.rpc.tip)
-            state = worker_local.client
-            if state is admitted:
-                return True
-            if state is invalidating:
-                self.assertTrue(admitted_send_started.wait(5))
-                invalidation_started.set()
-                return False
-            return True
 
         def admitted_send(payload: dict[str, object]) -> None:
             if payload["method"] == "mining.notify":
                 admitted_send_started.set()
                 self.assertTrue(release_admitted_send.wait(5))
 
-        server.send_prepared_job = controlled_send_prepared_job  # type: ignore[method-assign]
-        server.ensure_reorg_reconciled_for_current_tip = current_tip_trusted  # type: ignore[method-assign]
         admitted.send = admitted_send  # type: ignore[method-assign]
-        invalidating.send = lambda _payload: self.fail("invalidating client received work")  # type: ignore[method-assign]
         queued.send = queued_sent.append  # type: ignore[method-assign]
         refreshed: list[int] = []
         errors: list[BaseException] = []
@@ -946,12 +1226,11 @@ class JobBundleCacheTests(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(admitted_send_started.wait(5))
-            self.assertTrue(invalidation_started.wait(5))
-            self.assertTrue(invalidation_finished.wait(5))
-            lock_acquired = invalidating.job_update_lock.acquire(timeout=0.1)
+            server.observe_tip_first_seen("33" * 32)
+            lock_acquired = queued.job_update_lock.acquire(timeout=0.1)
             self.assertTrue(lock_acquired)
             if lock_acquired:
-                invalidating.job_update_lock.release()
+                queued.job_update_lock.release()
             # The coordinator still waits for the admitted peer delivery, but
             # queued workers observe cancellation without taking client state.
             self.assertTrue(thread.is_alive())
@@ -962,12 +1241,10 @@ class JobBundleCacheTests(unittest.TestCase):
             server.shutdown_tip_refresh_executor()
 
         self.assertFalse(thread.is_alive())
-        self.assertTrue(invalidation_finished.is_set())
         self.assertEqual(refreshed, [])
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], TemplateRefreshBlocked)
         self.assertIsNotNone(admitted.active_job)
-        self.assertIsNone(invalidating.active_job)
         self.assertIsNone(queued.active_job)
         self.assertEqual(queued_sent, [])
 
@@ -1157,6 +1434,78 @@ class JobBundleCacheTests(unittest.TestCase):
             ["mining.set_difficulty", "mining.notify"],
         )
 
+    def test_newer_template_does_not_supersede_current_payout_refresh(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None and state.worker is not None
+        stale_bundle = server.shared_job_bundle(artifacts, state.worker)
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        stale_intervening_job = dataclass_replace(
+            server.stamp_job_for_client(
+                state,
+                stale_bundle,
+                clean_jobs=False,
+            ),
+            template_generation=snapshot.template_generation + 1,
+        )
+        server._advance_payout_state_generation()
+
+        self.assertFalse(
+            server.intervening_job_supersedes_snapshot(
+                stale_intervening_job,
+                None,
+                snapshot,
+            )
+        )
+        current_intervening_job = dataclass_replace(
+            stale_intervening_job,
+            payout_state_generation=server._payout_state_generation,
+        )
+        self.assertTrue(
+            server.intervening_job_supersedes_snapshot(
+                current_intervening_job,
+                None,
+                snapshot,
+            )
+        )
+
+    def test_higher_generation_old_tip_does_not_supersede_new_tip_snapshot(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        old_artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(old_artifacts)
+        assert old_artifacts is not None and state.worker is not None
+        old_bundle = server.shared_job_bundle(old_artifacts, state.worker)
+
+        new_tip = "22" * 32
+        rpc.tip = new_tip
+        rpc.template = base_template(height=11, prevhash=new_tip)
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        old_tip_job = dataclass_replace(
+            server.stamp_job_for_client(
+                state,
+                old_bundle,
+                clean_jobs=False,
+            ),
+            template_generation=snapshot.template_generation + 1,
+        )
+
+        self.assertNotEqual(
+            old_tip_job.template_fingerprint,
+            snapshot.template_fingerprint,
+        )
+        self.assertFalse(
+            server.intervening_job_supersedes_snapshot(
+                old_tip_job,
+                None,
+                snapshot,
+            )
+        )
+
     def test_broken_socket_disconnects_only_that_client(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
@@ -1229,7 +1578,7 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIsNone(removed.active_job)
         self.assertEqual(removed.active_job_ids, set())
 
-    def test_template_fingerprint_race_aborts_before_fanout(self) -> None:
+    def test_template_fingerprint_race_uses_snapshot_owned_artifacts(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
         states = [client(1), client(2)]
@@ -1238,8 +1587,11 @@ class JobBundleCacheTests(unittest.TestCase):
             state.send = sent.append  # type: ignore[method-assign]
         server.clients = set(states)
         original_shared_job_bundle = server.shared_job_bundle
+        race_calls = 0
 
         def race_artifacts(artifacts: object, identity: WorkerIdentity) -> object:
+            nonlocal race_calls
+            race_calls += 1
             bundle = original_shared_job_bundle(artifacts, identity)
             with server._job_cache_lock:
                 server._template_artifacts = dataclass_replace(
@@ -1250,12 +1602,20 @@ class JobBundleCacheTests(unittest.TestCase):
 
         server.shared_job_bundle = race_artifacts  # type: ignore[method-assign]
 
-        with self.assertRaisesRegex(TemplateRefreshBlocked, "cache changed"):
-            server.poll_qbit_tip_template_once()
+        refreshed = server.poll_qbit_tip_template_once()
 
-        self.assertEqual(sent, [])
-        self.assertIsNone(getattr(server, "current_tip_first_seen", None))
-        self.assertIsNone(server.tip_template_snapshot)
+        self.assertEqual(race_calls, 1)
+        self.assertEqual(refreshed, 2)
+        self.assertEqual(len(sent), 4)
+        self.assertIsNotNone(server.tip_template_snapshot)
+        snapshot = server.tip_template_snapshot
+        assert snapshot is not None and snapshot.template_artifacts is not None
+        for state in states:
+            self.assertIs(state.active_job.template, snapshot.template_artifacts.template)
+            self.assertEqual(
+                state.active_job.template_fingerprint,
+                snapshot.template_fingerprint,
+            )
 
 
 class HealthSnapshotTests(unittest.TestCase):

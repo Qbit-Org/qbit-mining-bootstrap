@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+import threading
 import urllib.request
 import unittest
 from unittest.mock import patch
@@ -17,7 +18,9 @@ from lab.prism.ctv_broadcaster import (
 )
 from lab.prism.ctv_broadcaster_daemon import (
     CtvFanoutBroadcastDaemon,
+    CtvFanoutChunkResult,
     CtvFanoutDaemonResult,
+    MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE,
     artifact_from_status_row,
 )
 from lab.prism.run_ctv_broadcaster_daemon import env_positive_int, make_daemon_from_env
@@ -271,6 +274,230 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
                 (3, 1, 2),
             ],
         )
+
+    def test_yields_between_committed_chunks_and_processes_remaining_rows_next_pass(self) -> None:
+        txids = [f"{value:02x}" * 32 for value in range(1, 5)]
+
+        class LockTrackingLedger(FakeLedger):
+            def __init__(self, rows: list[dict[str, object]]) -> None:
+                super().__init__(rows)
+                self.write_active = False
+
+            def update_ctv_fanout_status(
+                self,
+                *,
+                fanout_txid: str,
+                settlement_status: str,
+            ) -> dict[str, int | str]:
+                self.write_active = True
+                try:
+                    return super().update_ctv_fanout_status(
+                        fanout_txid=fanout_txid,
+                        settlement_status=settlement_status,
+                    )
+                finally:
+                    self.write_active = False
+
+            def record_ctv_fanout_broadcast_attempt(
+                self,
+                *,
+                fanout_txid: str,
+                attempt_status: str,
+                package_tx_hexes: list[str] | None = None,
+                package_txids: list[str] | None = None,
+                submit_result: dict[str, object] | None = None,
+                error: str | None = None,
+            ) -> dict[str, int | str]:
+                self.write_active = True
+                try:
+                    return super().record_ctv_fanout_broadcast_attempt(
+                        fanout_txid=fanout_txid,
+                        attempt_status=attempt_status,
+                        package_tx_hexes=package_tx_hexes,
+                        package_txids=package_txids,
+                        submit_result=submit_result,
+                        error=error,
+                    )
+                finally:
+                    self.write_active = False
+
+        class IdempotentBroadcaster:
+            def __init__(self) -> None:
+                self.submitted_txids: set[str] = set()
+                self.calls: list[str] = []
+
+            def broadcast(self, artifact: object, fee_sats: int) -> BroadcastAttempt:
+                fanout_txid = str(getattr(artifact, "fanout_txid"))
+                self.calls.append(fanout_txid)
+                if fanout_txid in self.submitted_txids:
+                    return BroadcastAttempt(fanout_txid, BROADCAST, submitted=False)
+                self.submitted_txids.add(fanout_txid)
+                return BroadcastAttempt(
+                    fanout_txid,
+                    BROADCAST,
+                    submitted=True,
+                    fee_sats=fee_sats,
+                    package_msg="success",
+                )
+
+        ledger = LockTrackingLedger([pending_row(txid) for txid in txids])
+        broadcaster = IdempotentBroadcaster()
+        daemon = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0)
+        refresh_pending = threading.Event()
+        progress_count = 0
+        lock_states_at_refresh_checks: list[bool] = []
+        chunks: list[CtvFanoutChunkResult] = []
+
+        def record_progress_and_request_refresh() -> None:
+            nonlocal progress_count
+            progress_count += 1
+            if progress_count == 2:
+                refresh_pending.set()
+
+        def tip_refresh_pending() -> bool:
+            lock_states_at_refresh_checks.append(ledger.write_active)
+            return refresh_pending.is_set()
+
+        first_result = daemon.run_once(
+            limit=4,
+            chunk_size=2,
+            progress_callback=record_progress_and_request_refresh,
+            tip_refresh_pending=tip_refresh_pending,
+            chunk_callback=chunks.append,
+        )
+
+        self.assertEqual(
+            first_result,
+            CtvFanoutDaemonResult(
+                scanned_count=2,
+                submitted_count=2,
+                updated_count=0,
+                failed_count=0,
+                yielded_to_tip_refresh=True,
+            ),
+        )
+        self.assertEqual([chunk.processed_count for chunk in chunks], [2])
+        self.assertEqual([attempt["fanout_txid"] for attempt in ledger.attempts], txids[:2])
+        self.assertEqual(lock_states_at_refresh_checks, [False, False])
+
+        refresh_pending.clear()
+        second_result = daemon.run_once(limit=4, chunk_size=2)
+
+        self.assertEqual(second_result.scanned_count, 4)
+        self.assertEqual(second_result.submitted_count, 2)
+        self.assertEqual(second_result.updated_count, 2)
+        self.assertFalse(second_result.yielded_to_tip_refresh)
+        self.assertEqual(broadcaster.calls, txids[:2] + txids)
+        self.assertEqual(broadcaster.submitted_txids, set(txids))
+        self.assertEqual([attempt["fanout_txid"] for attempt in ledger.attempts], txids)
+
+    def test_pending_refresh_can_prepare_while_current_chunk_finishes(self) -> None:
+        first_txid = "61" * 32
+        second_txid = "62" * 32
+        ledger = FakeLedger([pending_row(first_txid), pending_row(second_txid)])
+        current_row_started = threading.Event()
+        release_current_row = threading.Event()
+        refresh_pending = threading.Event()
+        refresh_prepared = threading.Event()
+
+        class BlockingBroadcaster:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def broadcast(self, artifact: object, fee_sats: int) -> BroadcastAttempt:
+                fanout_txid = str(getattr(artifact, "fanout_txid"))
+                self.calls.append(fanout_txid)
+                current_row_started.set()
+                if not release_current_row.wait(timeout=5):
+                    raise AssertionError("test did not release broadcaster row")
+                return BroadcastAttempt(
+                    fanout_txid,
+                    BROADCAST,
+                    submitted=True,
+                    fee_sats=fee_sats,
+                    package_msg="success",
+                )
+
+        broadcaster = BlockingBroadcaster()
+        daemon = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0)
+        results: list[CtvFanoutDaemonResult] = []
+        failures: list[BaseException] = []
+
+        def run_broadcaster_pass() -> None:
+            try:
+                results.append(
+                    daemon.run_once(
+                        limit=2,
+                        chunk_size=1,
+                        tip_refresh_pending=refresh_pending.is_set,
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                failures.append(exc)
+
+        broadcaster_thread = threading.Thread(target=run_broadcaster_pass)
+        broadcaster_thread.start()
+        self.assertTrue(current_row_started.wait(timeout=5))
+
+        def prepare_refresh() -> None:
+            refresh_pending.set()
+            refresh_prepared.set()
+
+        refresh_thread = threading.Thread(target=prepare_refresh)
+        refresh_thread.start()
+        refresh_thread.join(timeout=5)
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertTrue(refresh_prepared.is_set())
+
+        release_current_row.set()
+        broadcaster_thread.join(timeout=5)
+        self.assertFalse(broadcaster_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(broadcaster.calls, [first_txid])
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].yielded_to_tip_refresh)
+        self.assertEqual(results[0].scanned_count, 1)
+
+    def test_chunk_observations_report_bounded_rows_and_deterministic_durations(self) -> None:
+        rows = [pending_row(f"{value:02x}" * 32) for value in range(3)]
+        for row in rows:
+            row["settlement_status"] = "failed"
+        chunks: list[CtvFanoutChunkResult] = []
+
+        with patch(
+            "lab.prism.ctv_broadcaster_daemon.monotonic",
+            side_effect=[10.0, 10.25, 20.0, 20.5],
+        ):
+            result = CtvFanoutBroadcastDaemon(
+                FakeLedger(rows),
+                FakeBroadcaster({}),
+                fee_sats=0,
+            ).run_once(chunk_size=2, chunk_callback=chunks.append)
+
+        self.assertEqual(result.scanned_count, 3)
+        self.assertEqual(
+            chunks,
+            [
+                CtvFanoutChunkResult(processed_count=2, elapsed_seconds=0.25),
+                CtvFanoutChunkResult(processed_count=1, elapsed_seconds=0.5),
+            ],
+        )
+
+    def test_rejects_nonpositive_chunk_size_before_querying_ledger(self) -> None:
+        ledger = FakeLedger([])
+        daemon = CtvFanoutBroadcastDaemon(ledger, FakeBroadcaster({}), fee_sats=0)
+
+        for chunk_size in (0, -1):
+            with self.subTest(chunk_size=chunk_size), self.assertRaisesRegex(
+                ValueError,
+                "chunk_size",
+            ):
+                daemon.run_once(chunk_size=chunk_size)
+
+        with self.assertRaisesRegex(ValueError, "at most"):
+            daemon.run_once(
+                chunk_size=MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE + 1
+            )
 
     def test_direct_parent_failure_is_journaled_without_terminal_rejection(self) -> None:
         fanout_txid = "45" * 32

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any, Callable, Protocol
 
 from lab.prism.ctv_broadcaster import (
@@ -32,6 +33,7 @@ LEDGER_STATUS_BY_BROADCASTER_STATUS = {
     CONFIRMED: "confirmed",
     REORGED: "reorged",
 }
+MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE = 10
 
 
 class CtvFanoutLedger(Protocol):
@@ -57,6 +59,13 @@ class CtvFanoutDaemonResult:
     submitted_count: int
     updated_count: int
     failed_count: int
+    yielded_to_tip_refresh: bool = False
+
+
+@dataclass(frozen=True)
+class CtvFanoutChunkResult:
+    processed_count: int
+    elapsed_seconds: float
 
 
 def artifact_from_status_row(row: dict[str, object]) -> FanoutArtifact:
@@ -84,65 +93,102 @@ class CtvFanoutBroadcastDaemon:
         self,
         *,
         limit: int = 100,
+        chunk_size: int = 1,
         progress_callback: Callable[[], None] | None = None,
+        tip_refresh_pending: Callable[[], bool] | None = None,
+        chunk_callback: Callable[[CtvFanoutChunkResult], None] | None = None,
     ) -> CtvFanoutDaemonResult:
-        """Process one batch, notifying after each row path has completed."""
+        """Process one batch in committed chunks that can yield to a tip refresh.
+
+        The ledger query returns materialized rows and each ledger mutation is a
+        complete operation. Consequently no ledger transaction or lock remains
+        held while the pending-refresh callback runs between chunks.
+        """
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if chunk_size > MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE:
+            raise ValueError(
+                "chunk_size must be at most "
+                f"{MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE}"
+            )
         rows = self.ledger.pending_ctv_fanout_statuses(limit=limit)
+        scanned_count = 0
         submitted_count = 0
         updated_count = 0
         failed_count = 0
+        yielded_to_tip_refresh = False
 
         def record_progress() -> None:
             if progress_callback is not None:
                 progress_callback()
 
-        for row in rows:
-            if str(row.get("settlement_status") or row.get("status") or "") in {
-                "confirmed",
-                "reorged",
-                "failed",
-            }:
-                record_progress()
-                continue
-            if not broadcast_attempt_due(row.get("next_broadcast_attempt_at")):
-                record_progress()
-                continue
-            artifact = artifact_from_status_row(row)
-            attempt = self.broadcaster.broadcast(artifact, self.fee_sats)
-            if attempt.submitted:
-                submitted_count += 1
-                self._journal_attempt(attempt, attempt_status="submitted")
-                # record_ctv_fanout_broadcast_attempt moves the durable row to
-                # broadcast_submitted, so do not double-update here.
-                record_progress()
-                continue
+        for chunk_start in range(0, len(rows), chunk_size):
+            if tip_refresh_pending is not None and tip_refresh_pending():
+                yielded_to_tip_refresh = True
+                break
 
-            if attempt.fee_sats is not None:
-                attempt_status = "planned" if attempt.package_msg == "error" else "rejected"
-                self._journal_attempt(attempt, attempt_status=attempt_status)
+            chunk_started = monotonic() if chunk_callback is not None else None
+            chunk_processed_count = 0
+            chunk = rows[chunk_start : chunk_start + chunk_size]
+            for row in chunk:
+                scanned_count += 1
+                chunk_processed_count += 1
+                if str(row.get("settlement_status") or row.get("status") or "") in {
+                    "confirmed",
+                    "reorged",
+                    "failed",
+                }:
+                    record_progress()
+                    continue
+                if not broadcast_attempt_due(row.get("next_broadcast_attempt_at")):
+                    record_progress()
+                    continue
+                artifact = artifact_from_status_row(row)
+                attempt = self.broadcaster.broadcast(artifact, self.fee_sats)
+                if attempt.submitted:
+                    submitted_count += 1
+                    self._journal_attempt(attempt, attempt_status="submitted")
+                    # record_ctv_fanout_broadcast_attempt moves the durable row to
+                    # broadcast_submitted, so do not double-update here.
+                    record_progress()
+                    continue
+
+                if attempt.fee_sats is not None:
+                    attempt_status = "planned" if attempt.package_msg == "error" else "rejected"
+                    self._journal_attempt(attempt, attempt_status=attempt_status)
+                    failed_count += 1
+                    record_progress()
+                    continue
+
+                next_status = LEDGER_STATUS_BY_BROADCASTER_STATUS.get(attempt.status)
+                if next_status is not None:
+                    self.ledger.update_ctv_fanout_status(
+                        fanout_txid=attempt.fanout_txid,
+                        settlement_status=next_status,
+                    )
+                    updated_count += 1
+                    record_progress()
+                    continue
+
+                self._journal_attempt(attempt, attempt_status="failed")
                 failed_count += 1
                 record_progress()
-                continue
 
-            next_status = LEDGER_STATUS_BY_BROADCASTER_STATUS.get(attempt.status)
-            if next_status is not None:
-                self.ledger.update_ctv_fanout_status(
-                    fanout_txid=attempt.fanout_txid,
-                    settlement_status=next_status,
+            if chunk_callback is not None:
+                assert chunk_started is not None
+                chunk_callback(
+                    CtvFanoutChunkResult(
+                        processed_count=chunk_processed_count,
+                        elapsed_seconds=max(0.0, monotonic() - chunk_started),
+                    )
                 )
-                updated_count += 1
-                record_progress()
-                continue
-
-            self._journal_attempt(attempt, attempt_status="failed")
-            failed_count += 1
-            record_progress()
 
         return CtvFanoutDaemonResult(
-            scanned_count=len(rows),
+            scanned_count=scanned_count,
             submitted_count=submitted_count,
             updated_count=updated_count,
             failed_count=failed_count,
+            yielded_to_tip_refresh=yielded_to_tip_refresh,
         )
 
     def _journal_attempt(self, attempt: BroadcastAttempt, *, attempt_status: str) -> None:
