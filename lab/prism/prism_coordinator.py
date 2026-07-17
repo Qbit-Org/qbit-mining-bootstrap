@@ -4162,9 +4162,20 @@ class PrismCoordinator:
                 daemon=True,
             )
             block_submitter_thread.start()
+            drain_threads: list[tuple[threading.Thread, float]] = [
+                (blockpoll_thread, 1.0),
+                (block_submitter_thread, 1.0),
+            ]
+            if blockwait_thread is not None:
+                drain_threads.append((blockwait_thread, 1.0))
+            if vardiff_idle_sweep_thread is not None:
+                drain_threads.append((vardiff_idle_sweep_thread, 1.0))
             # Replay any shares stranded on disk by a prior ledger-outage
             # shutdown before serving, so no acked share is lost across restart.
-            if not self._run_startup_writer_replay(self.replay_recovered_shares):
+            if not self._run_startup_writer_replay(
+                self.replay_recovered_shares,
+                drain_threads=drain_threads,
+            ):
                 return
             self._record_heartbeat("share_writer")
             self.share_writer_active = True
@@ -4173,6 +4184,7 @@ class PrismCoordinator:
                 daemon=True,
             )
             share_writer_thread.start()
+            drain_threads.append((share_writer_thread, 5.0))
             ctv_broadcaster_thread: threading.Thread | None = None
             if self.ctv_broadcaster_enabled:
                 self._record_heartbeat("ctv_fanout_broadcaster")
@@ -4181,6 +4193,7 @@ class PrismCoordinator:
                     daemon=True,
                 )
                 ctv_broadcaster_thread.start()
+                drain_threads.append((ctv_broadcaster_thread, 1.0))
                 print(
                     "prism coordinator: CTV fanout broadcaster enabled "
                     f"mode={'cpfp' if self.ctv_broadcaster_fee_sats > 0 else 'direct'} "
@@ -4205,17 +4218,6 @@ class PrismCoordinator:
                     args=(extra_server, extra_profile),
                     daemon=True,
                 ).start()
-            drain_threads: list[tuple[threading.Thread, float]] = [
-                (blockpoll_thread, 1.0),
-                (block_submitter_thread, 1.0),
-                (share_writer_thread, 5.0),
-            ]
-            if blockwait_thread is not None:
-                drain_threads.append((blockwait_thread, 1.0))
-            if vardiff_idle_sweep_thread is not None:
-                drain_threads.append((vardiff_idle_sweep_thread, 1.0))
-            if ctv_broadcaster_thread is not None:
-                drain_threads.append((ctv_broadcaster_thread, 1.0))
             try:
                 self.accept_loop(*listeners[0])
             finally:
@@ -4225,12 +4227,19 @@ class PrismCoordinator:
                 self.shutdown(reason="serve_exit")
                 self.drain_non_writer_components(drain_threads)
 
-    @staticmethod
-    def _run_startup_writer_replay(replay: Callable[[], int]) -> bool:
+    def _run_startup_writer_replay(
+        self,
+        replay: Callable[[], int],
+        *,
+        drain_threads: list[tuple[threading.Thread, float]] | None = None,
+    ) -> bool:
         """Run startup ledger replay, stopping cleanly if shutdown wins."""
         try:
             replay()
         except ShutdownInProgress:
+            if drain_threads is not None:
+                self.shutdown(reason="serve_startup_exit")
+                self.drain_non_writer_components(drain_threads)
             return False
         return True
 

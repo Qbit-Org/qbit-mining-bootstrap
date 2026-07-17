@@ -342,6 +342,28 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             with self.subTest(replay=replay.__name__):
                 self.assertFalse(server._run_startup_writer_replay(replay))
 
+        drain_threads = [(threading.current_thread(), 0.0)]
+        timeline: list[object] = []
+        server.shutdown = (  # type: ignore[method-assign]
+            lambda *, reason: timeline.append(("shutdown", reason)) or True
+        )
+        server.drain_non_writer_components = (  # type: ignore[method-assign]
+            lambda threads: timeline.append(("drain", threads))
+        )
+        self.assertFalse(
+            server._run_startup_writer_replay(
+                server.replay_recovered_shares,
+                drain_threads=drain_threads,
+            )
+        )
+        self.assertEqual(
+            timeline,
+            [
+                ("shutdown", "serve_startup_exit"),
+                ("drain", drain_threads),
+            ],
+        )
+
     def test_replacement_can_acquire_immediately_after_graceful_release(self) -> None:
         lease_lock = threading.Lock()
         holder: list[str | None] = [None]
