@@ -5712,6 +5712,47 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             )
         )
 
+    def test_blockwait_retries_tip_refresh_before_advancing_known_tip(self) -> None:
+        server = self._bare_coordinator()
+        tip_a = "aa" * 32
+        tip_b = "bb" * 32
+        server.rpc = SimpleNamespace(call=lambda method: tip_a)
+        server.blockpoll_seconds = 1.0
+        known_tips: list[str] = []
+        refresh_attempts: list[str] = []
+
+        def blockwait_once(known_tip: str) -> str:
+            known_tips.append(known_tip)
+            if len(known_tips) == 3:
+                server.stop_event.set()
+            return tip_b
+
+        def poll_qbit_tip_template_once(*, heartbeat_name: str) -> int:
+            refresh_attempts.append(heartbeat_name)
+            if len(refresh_attempts) == 1:
+                raise TemplateRefreshBlocked(
+                    "payout state changed after refresh client selection"
+                )
+            return 1
+
+        server.blockwait_once = blockwait_once  # type: ignore[method-assign]
+        server.poll_qbit_tip_template_once = (  # type: ignore[method-assign]
+            poll_qbit_tip_template_once
+        )
+        server.observe_tip_first_seen = lambda _tip: None  # type: ignore[method-assign]
+
+        with patch("builtins.print"), patch(
+            "lab.prism.prism_coordinator.traceback.print_exc"
+        ), patch.object(
+            server.stop_event,
+            "wait",
+            side_effect=lambda _timeout: server.stop_event.is_set(),
+        ):
+            server.blockwait_loop()
+
+        self.assertEqual(known_tips, [tip_a, tip_a, tip_b])
+        self.assertEqual(refresh_attempts, ["qbit_blockwait", "qbit_blockwait"])
+
     def test_blockwait_unsupported_removes_watchdog_heartbeat(self) -> None:
         server = coordinator()
         server.rpc = UnsupportedBlockwaitRpc("00" * 32)
