@@ -3424,6 +3424,7 @@ class PrismCoordinator:
         try:
             current_tip = str(self.rpc.call("getbestblockhash"))
         except Exception as exc:
+            self._schedule_tip_refresh_retry()
             raise TemplateRefreshBlocked(
                 "qbit tip validation failed before prepared fanout"
             ) from exc
@@ -3434,19 +3435,20 @@ class PrismCoordinator:
                 f"expected={snapshot.bestblockhash} current={current_tip}"
             )
         try:
-            if (
+            chain_view_untrusted = bool(
                 getattr(self, "reorg_reconciler_enabled", True)
                 and self.qbit_chain_view_untrusted()
-            ):
-                raise TemplateRefreshBlocked(
-                    "qbit chain view became untrusted before prepared fanout"
-                )
-        except TemplateRefreshBlocked:
-            raise
+            )
         except Exception as exc:
+            self._schedule_tip_refresh_retry()
             raise TemplateRefreshBlocked(
                 "qbit chain trust check failed before prepared fanout"
             ) from exc
+        if chain_view_untrusted:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "qbit chain view became untrusted before prepared fanout"
+            )
         token = TipRefreshValidationToken(
             tip_hash=snapshot.bestblockhash,
             template_fingerprint=artifacts.fingerprint,

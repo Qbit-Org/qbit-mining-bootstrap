@@ -361,6 +361,56 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(chain_view_checks, 1)
         self.assertEqual(sent, [])
         self.assertTrue(all(state.active_job is None for state in clients))
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_prevalidation_rpc_failure_schedules_immediate_retry(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        server.clients = [state]  # type: ignore[assignment]
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+        original_rpc_call = rpc.call
+
+        def fail_tip_validation(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getbestblockhash":
+                raise RuntimeError("qbit rpc unavailable")
+            return original_rpc_call(method, params)
+
+        rpc.call = fail_tip_validation  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "qbit tip validation failed before prepared fanout",
+        ):
+            server._validate_prepared_tip_refresh(bundle, snapshot, 1)
+
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_prevalidation_trust_check_failure_schedules_immediate_retry(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        state = client(1)
+        server.clients = [state]  # type: ignore[assignment]
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+
+        def fail_chain_trust_check() -> bool:
+            raise RuntimeError("getblockchaininfo unavailable")
+
+        server.qbit_chain_view_untrusted = fail_chain_trust_check  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "qbit chain trust check failed before prepared fanout",
+        ):
+            server._validate_prepared_tip_refresh(bundle, snapshot, 1)
+
+        self.assertTrue(server._tip_refresh_retry.is_set())
 
     def test_reconciliation_failure_before_fanout_sends_zero_jobs(self) -> None:
         server, _rpc = coordinator()
