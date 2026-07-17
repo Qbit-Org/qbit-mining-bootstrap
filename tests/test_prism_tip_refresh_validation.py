@@ -8,6 +8,7 @@ import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
+from unittest.mock import patch
 
 from lab.prism.prism_coordinator import (
     TemplateRefreshBlocked,
@@ -69,7 +70,57 @@ def _advance_fake_tip(rpc: FakeRpc, tip_hash: str, height: int) -> None:
     rpc.template = base_template(height=height, prevhash=tip_hash)
 
 
+class ObservedRLock:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.acquire_attempted = threading.Event()
+
+    def acquire(self, *args: object, **kwargs: object) -> bool:
+        self.acquire_attempted.set()
+        return self.lock.acquire(*args, **kwargs)  # type: ignore[arg-type]
+
+    def release(self) -> None:
+        self.lock.release()
+
+    def __enter__(self) -> ObservedRLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
+
+
+class ObservedPayoutGate:
+    def __init__(self, delegate: object) -> None:
+        self.delegate = delegate
+        self.delivery_wait_started = threading.Event()
+
+    def delivery(self) -> object:
+        return self.delegate.delivery()  # type: ignore[attr-defined,no-any-return]
+
+    @contextmanager
+    def delivery_cancelable(self, cancelled: object) -> object:
+        self.delivery_wait_started.set()
+        with self.delegate.delivery_cancelable(cancelled) as admitted:  # type: ignore[attr-defined]
+            yield admitted
+
+    def mutation(self) -> object:
+        return self.delegate.mutation()  # type: ignore[attr-defined,no-any-return]
+
+
 class TipRefreshValidationTests(unittest.TestCase):
+    def advance_tip(
+        self,
+        server: object,
+        rpc: object,
+        tip_hash: str,
+        *,
+        height: int,
+    ) -> None:
+        rpc.tip = tip_hash  # type: ignore[attr-defined]
+        rpc.template = base_template(height=height, prevhash=tip_hash)  # type: ignore[attr-defined]
+        self.assertTrue(server.observe_tip_first_seen(tip_hash))  # type: ignore[attr-defined]
+
     def test_collection_refresh_reconciles_once_for_multiple_clients(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
         install_fake_bundle_builder(server)
@@ -968,6 +1019,483 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(sent_tips, [tip_c])
         self.assertFalse(server.tip_refresh_is_pending())
 
+    def test_client_lock_waiter_cancels_before_lock_owner_releases(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        observed_lock = ObservedRLock()
+        state.job_update_lock = observed_lock  # type: ignore[assignment]
+        observed_lock.acquire()
+        observed_lock.acquire_attempted.clear()
+        notifications: list[dict[str, object]] = []
+        state.send = notifications.append  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        poll_done = threading.Event()
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                poll_done.set()
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(observed_lock.acquire_attempted.wait(5))
+            self.advance_tip(server, rpc, "33" * 32, height=11)
+            self.assertTrue(poll_done.wait(5))
+            self.assertEqual(notifications, [])
+            self.assertIsNone(state.active_job)
+        finally:
+            observed_lock.release()
+            thread.join(5)
+
+        try:
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(
+            sum(payload["method"] == "mining.notify" for payload in notifications),
+            1,
+        )
+        self.assertEqual(state.active_job.template["previousblockhash"], rpc.tip)
+        self.assertGreaterEqual(
+            server.tip_refresh_cancellation_counts["client_lock"],
+            1,
+        )
+
+    def test_payout_gate_waiter_cancels_while_mutation_remains_held(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifications: list[dict[str, object]] = []
+        state.send = notifications.append  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        gate = ObservedPayoutGate(server._payout_state_delivery_gate)
+        server._payout_state_delivery_gate = gate  # type: ignore[assignment]
+        poll_done = threading.Event()
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                poll_done.set()
+
+        thread = threading.Thread(target=poll)
+        with gate.mutation():  # type: ignore[attr-defined]
+            thread.start()
+            self.assertTrue(gate.delivery_wait_started.wait(5))
+            self.advance_tip(server, rpc, "44" * 32, height=11)
+            self.assertTrue(poll_done.wait(5))
+            self.assertEqual(notifications, [])
+            self.assertIsNone(state.active_job)
+        thread.join(5)
+
+        try:
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(
+            sum(payload["method"] == "mining.notify" for payload in notifications),
+            1,
+        )
+        self.assertEqual(state.active_job.template["previousblockhash"], rpc.tip)
+        self.assertGreaterEqual(
+            server.tip_refresh_cancellation_counts["payout_gate"],
+            1,
+        )
+
+    def test_obsolete_backlog_never_starts_the_unsubmitted_fleet(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 2
+        clients = [client(index + 1) for index in range(8)]
+        observed_locks = [ObservedRLock(), ObservedRLock()]
+        for state, observed_lock in zip(clients, observed_locks):
+            state.job_update_lock = observed_lock  # type: ignore[assignment]
+            observed_lock.acquire()
+            observed_lock.acquire_attempted.clear()
+        notifications: set[int] = set()
+        for state in clients:
+            state.send = (  # type: ignore[method-assign]
+                lambda payload, connection_id=state.connection_id: (
+                    notifications.add(connection_id)
+                    if payload["method"] == "mining.notify"
+                    else None
+                )
+            )
+        server.clients = clients  # type: ignore[assignment]
+        started_clients: list[int] = []
+        started_lock = threading.Lock()
+        original_send_prepared_job = server.send_prepared_job
+
+        def tracked_send_prepared_job(state: object, *args: object) -> object:
+            with started_lock:
+                started_clients.append(state.connection_id)  # type: ignore[attr-defined]
+            return original_send_prepared_job(state, *args)  # type: ignore[arg-type]
+
+        server.send_prepared_job = tracked_send_prepared_job  # type: ignore[method-assign]
+        poll_done = threading.Event()
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                poll_done.set()
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(observed_locks[0].acquire_attempted.wait(5))
+            self.assertTrue(observed_locks[1].acquire_attempted.wait(5))
+            self.advance_tip(server, rpc, "55" * 32, height=11)
+            self.assertTrue(poll_done.wait(5))
+            with started_lock:
+                obsolete_started = list(started_clients)
+            self.assertEqual(set(obsolete_started), {1, 2})
+            self.assertEqual(notifications, set())
+        finally:
+            for observed_lock in observed_locks:
+                observed_lock.release()
+            thread.join(5)
+
+        try:
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+            self.assertEqual(server.poll_qbit_tip_template_once(), len(clients))
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(notifications, {state.connection_id for state in clients})
+        self.assertGreaterEqual(
+            server.tip_refresh_cancellation_counts["client_lock"],
+            2,
+        )
+
+    def test_obsolete_executor_queue_entry_is_canceled_and_counted(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 2
+        server._ensure_tip_refresh_state()
+
+        class ObservedExecutor:
+            def __init__(self) -> None:
+                self.delegate = ThreadPoolExecutor(max_workers=1)
+                self.submission_count = 0
+                self.second_submitted = threading.Event()
+
+            def submit(self, function: object, *args: object) -> Future[object]:
+                self.submission_count += 1
+                future = self.delegate.submit(function, *args)  # type: ignore[arg-type]
+                if self.submission_count == 2:
+                    self.second_submitted.set()
+                return future
+
+            def shutdown(self, **kwargs: object) -> None:
+                self.delegate.shutdown(**kwargs)  # type: ignore[arg-type]
+
+        observed_executor = ObservedExecutor()
+        server._tip_refresh_executor = observed_executor  # type: ignore[assignment]
+        admitted = client(1)
+        queued = client(2)
+        server.clients = [admitted, queued]  # type: ignore[assignment]
+        admitted_send_started = threading.Event()
+        release_admitted_send = threading.Event()
+        queued_canceled = threading.Event()
+        queued_notifications: list[dict[str, object]] = []
+
+        def block_notify(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                admitted_send_started.set()
+                self.assertTrue(release_admitted_send.wait(5))
+
+        admitted.send = block_notify  # type: ignore[method-assign]
+        queued.send = queued_notifications.append  # type: ignore[method-assign]
+        original_record_cancellation = server._record_tip_refresh_cancellation
+
+        def record_cancellation(stage: str) -> None:
+            original_record_cancellation(stage)
+            if stage == "executor_queue":
+                queued_canceled.set()
+
+        server._record_tip_refresh_cancellation = record_cancellation  # type: ignore[method-assign]
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(admitted_send_started.wait(5))
+            self.assertTrue(observed_executor.second_submitted.wait(5))
+            self.advance_tip(server, rpc, "59" * 32, height=11)
+            self.assertTrue(queued_canceled.wait(5))
+            self.assertEqual(queued_notifications, [])
+            self.assertIsNone(queued.active_job)
+        finally:
+            release_admitted_send.set()
+            thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+        self.assertEqual(
+            server.tip_refresh_cancellation_counts["executor_queue"],
+            1,
+        )
+
+    def test_latest_pending_tip_wins_across_a_b_c_observations(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        observed_lock = ObservedRLock()
+        state.job_update_lock = observed_lock  # type: ignore[assignment]
+        observed_lock.acquire()
+        observed_lock.acquire_attempted.clear()
+        notifications: list[dict[str, object]] = []
+        state.send = notifications.append  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        poll_done = threading.Event()
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                poll_done.set()
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(observed_lock.acquire_attempted.wait(5))
+            self.advance_tip(server, rpc, "66" * 32, height=11)
+            self.advance_tip(server, rpc, "77" * 32, height=12)
+            newest_pending_token = server._tip_refresh_pending_token
+            self.assertTrue(poll_done.wait(5))
+            self.assertTrue(server.tip_refresh_is_pending())
+            self.assertEqual(server._tip_refresh_pending_token, newest_pending_token)
+            self.assertEqual(notifications, [])
+        finally:
+            observed_lock.release()
+            thread.join(5)
+
+        try:
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(server.tip_refresh_is_pending())
+        self.assertEqual(
+            sum(payload["method"] == "mining.notify" for payload in notifications),
+            1,
+        )
+        self.assertEqual(state.active_job.template["previousblockhash"], "77" * 32)
+
+    def test_admitted_old_send_finishes_before_new_tip_delivery(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_max_workers = 2
+        admitted = client(1)
+        waiting = client(2)
+        waiting_lock = ObservedRLock()
+        waiting.job_update_lock = waiting_lock  # type: ignore[assignment]
+        waiting_lock.acquire()
+        waiting_lock.acquire_attempted.clear()
+        server.clients = [admitted, waiting]  # type: ignore[assignment]
+        admitted_send_started = threading.Event()
+        release_admitted_send = threading.Event()
+        waiting_worker_finished = threading.Event()
+        notifications: dict[int, list[str]] = {1: [], 2: []}
+
+        def block_old_notify(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                notifications[1].append("A")
+                admitted_send_started.set()
+                self.assertTrue(release_admitted_send.wait(5))
+
+        admitted.send = block_old_notify  # type: ignore[method-assign]
+        waiting.send = (  # type: ignore[method-assign]
+            lambda payload: notifications[2].append("A")
+            if payload["method"] == "mining.notify"
+            else None
+        )
+        original_send_prepared_job = server.send_prepared_job
+
+        def tracked_send_prepared_job(state: object, *args: object) -> object:
+            try:
+                return original_send_prepared_job(state, *args)  # type: ignore[arg-type]
+            finally:
+                if state is waiting:
+                    waiting_worker_finished.set()
+
+        server.send_prepared_job = tracked_send_prepared_job  # type: ignore[method-assign]
+        poll_done = threading.Event()
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                poll_done.set()
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(admitted_send_started.wait(5))
+            self.assertTrue(waiting_lock.acquire_attempted.wait(5))
+            self.advance_tip(server, rpc, "88" * 32, height=11)
+            self.assertTrue(waiting_worker_finished.wait(5))
+            self.assertFalse(poll_done.is_set())
+            self.assertEqual(notifications[2], [])
+        finally:
+            release_admitted_send.set()
+            thread.join(5)
+            waiting_lock.release()
+
+        admitted.send = (  # type: ignore[method-assign]
+            lambda payload: notifications[1].append("B")
+            if payload["method"] == "mining.notify"
+            else None
+        )
+        waiting.send = (  # type: ignore[method-assign]
+            lambda payload: notifications[2].append("B")
+            if payload["method"] == "mining.notify"
+            else None
+        )
+        try:
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+            self.assertEqual(server.poll_qbit_tip_template_once(), 2)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(notifications[1], ["A", "B"])
+        self.assertEqual(notifications[2], ["B"])
+
+    def test_prepared_wait_phases_account_for_total_elapsed(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        server.clients = [state]  # type: ignore[assignment]
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = snapshot
+        bundle = server.prepare_tip_refresh_bundle(snapshot, [state])
+        token = server._validate_prepared_tip_refresh(bundle, snapshot, sequence)
+
+        class ManualClock:
+            def __init__(self) -> None:
+                self.now = 10.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def advance(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = ManualClock()
+
+        class AdvancingLock:
+            def acquire(self, *, timeout: float) -> bool:
+                self.timeout = timeout
+                clock.advance(2.0)
+                return True
+
+            def release(self) -> None:
+                return None
+
+        class AdvancingGate:
+            @contextmanager
+            def delivery_cancelable(self, _cancelled: object) -> object:
+                clock.advance(4.0)
+                yield True
+
+        state.job_update_lock = AdvancingLock()  # type: ignore[assignment]
+        server._payout_state_delivery_gate = AdvancingGate()  # type: ignore[assignment]
+        original_stamp = server.stamp_job_for_client
+
+        def advancing_stamp(*args: object, **kwargs: object) -> object:
+            clock.advance(5.0)
+            return original_stamp(*args, **kwargs)  # type: ignore[arg-type]
+
+        server.stamp_job_for_client = advancing_stamp  # type: ignore[method-assign]
+        state.send = lambda _payload: clock.advance(3.0)  # type: ignore[method-assign]
+
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            clock.monotonic,
+        ):
+            result = server.send_prepared_job(
+                state,
+                bundle,
+                snapshot,
+                token,
+                state.connection_id,
+                None,
+                _FanoutCancellation(),
+                submitted_monotonic=7.0,
+            )
+
+        self.assertEqual(result.result, "sent")
+        expected_phases = {
+            "executor_queue": 3.0,
+            "client_lock": 2.0,
+            "payout_gate": 4.0,
+            "stamp": 5.0,
+            "socket_send": 6.0,
+        }
+        for phase, expected in expected_phases.items():
+            self.assertAlmostEqual(
+                server.job_build_phase_seconds[phase],
+                expected,
+            )
+        self.assertAlmostEqual(server.job_build_seconds_sum, 20.0)
+        self.assertAlmostEqual(sum(expected_phases.values()), 20.0)
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_tip_refresh_cancellations_total{stage="executor_queue"} 0',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_job_build_phase_seconds_total{phase="payout_gate"} 4.000000',
+            metrics,
+        )
+
     def test_routine_same_tip_observation_keeps_active_fanout_valid(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
@@ -1256,6 +1784,13 @@ class TipRefreshValidationTests(unittest.TestCase):
                 with original_gate.delivery():
                     server.clients = []  # type: ignore[assignment]
                     yield
+
+            @contextmanager
+            def delivery_cancelable(self, cancelled: object) -> object:
+                with original_gate.delivery_cancelable(cancelled) as admitted:
+                    if admitted:
+                        server.clients = []  # type: ignore[assignment]
+                    yield admitted
 
             def mutation(self) -> object:
                 return original_gate.mutation()
