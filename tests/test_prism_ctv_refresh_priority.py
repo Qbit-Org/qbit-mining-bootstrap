@@ -188,6 +188,22 @@ class PrismCtvRefreshPriorityTests(unittest.TestCase):
         server._clear_tip_refresh_pending(newer_token)
         self.assertFalse(server._tip_refresh_pending())
 
+    def test_poll_local_mark_cannot_replace_newer_pending_work(self) -> None:
+        server = coordinator()
+
+        owned_token = server._claim_tip_refresh_pending()
+        self.assertIsNone(owned_token)
+        newer_token = server._mark_tip_refresh_pending(NEWER_TIP)
+
+        retained_token = server._mark_tip_refresh_pending_for_poll(
+            owned_token,
+            NEW_TIP,
+        )
+
+        self.assertIsNone(retained_token)
+        self.assertEqual(server._tip_refresh_pending_token, newer_token)
+        self.assertTrue(server._tip_refresh_pending())
+
     def test_routine_same_tip_observation_does_not_starve_ctv(self) -> None:
         server = coordinator()
         cancellations: list[bool] = []

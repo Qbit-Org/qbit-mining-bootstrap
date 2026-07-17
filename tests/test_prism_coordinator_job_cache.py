@@ -456,6 +456,71 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         self.assertFalse(server.tip_refresh_is_pending())
 
+    def test_successful_poll_clears_payout_pending_created_during_reconcile(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+        reconcile_entered = threading.Event()
+        allow_reconcile = threading.Event()
+        results: list[int] = []
+        errors: list[BaseException] = []
+
+        def reconcile(_tip_hash: str) -> bool:
+            reconcile_entered.set()
+            if not allow_reconcile.wait(5):
+                raise AssertionError("test did not release reconciliation")
+            return True
+
+        def poll() -> None:
+            try:
+                results.append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        server.ensure_reorg_reconciled_for_tip = reconcile  # type: ignore[method-assign]
+        server._mark_tip_refresh_pending("seed")
+        poll_thread = threading.Thread(target=poll)
+        poll_thread.start()
+        try:
+            self.assertTrue(reconcile_entered.wait(5))
+            self.assertEqual(server._advance_payout_state_generation(), 1)
+        finally:
+            allow_reconcile.set()
+            poll_thread.join(5)
+
+        self.assertFalse(poll_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [0])
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertIsNotNone(server.last_successful_template_refresh_monotonic)
+        self.assertFalse(server.tip_refresh_is_pending())
+
+    def test_completed_refresh_cannot_clear_newer_payout_pending(self) -> None:
+        server, _rpc = coordinator()
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = snapshot
+        completed_generation = server._payout_state_generation
+        self.assertEqual(server._advance_payout_state_generation(), 1)
+        newer_token = server._tip_refresh_pending_token
+
+        self.assertFalse(
+            server._clear_tip_refresh_pending_for_completed_refresh(
+                snapshot,
+                sequence,
+                completed_generation,
+            )
+        )
+        self.assertEqual(server._tip_refresh_pending_token, newer_token)
+        self.assertTrue(server.tip_refresh_is_pending())
+
     def test_escaped_stale_bundle_is_rejected_before_direct_delivery(self) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)

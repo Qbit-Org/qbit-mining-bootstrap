@@ -2569,12 +2569,63 @@ class PrismCoordinator:
             self._tip_refresh_pending_event.set()
             return token
 
+    def _claim_tip_refresh_pending(self) -> int | None:
+        """Snapshot pending work without replacing a newer producer's token."""
+        self._ensure_tip_refresh_state()
+        with self.lock:
+            if not self._tip_refresh_pending_event.is_set():
+                return None
+            return self._tip_refresh_pending_token
+
+    def _mark_tip_refresh_pending_for_poll(
+        self,
+        owned_token: int | None,
+        _observation: object,
+    ) -> int | None:
+        """Mark poll-owned work only while no newer producer has superseded it."""
+        self._ensure_tip_refresh_state()
+        with self.lock:
+            if self._tip_refresh_pending_token != owned_token:
+                return owned_token
+            if owned_token is not None:
+                self._tip_refresh_pending_event.set()
+                return owned_token
+            self._tip_refresh_pending_counter += 1
+            token = self._tip_refresh_pending_counter
+            self._tip_refresh_pending_token = token
+            self._tip_refresh_pending_event.set()
+            return token
+
     def _clear_tip_refresh_pending(self, token: int) -> None:
         self._ensure_tip_refresh_state()
         with self.lock:
             if self._tip_refresh_pending_token == token:
                 self._tip_refresh_pending_token = None
                 self._tip_refresh_pending_event.clear()
+
+    def _clear_tip_refresh_pending_for_completed_refresh(
+        self,
+        snapshot: QbitTipTemplateSnapshot,
+        observation_sequence: int,
+        payout_state_generation: int,
+    ) -> bool:
+        """Atomically acknowledge pending work handled by a completed poll."""
+        self._ensure_job_cache_state()
+        with self._payout_state_delivery_gate.delivery():
+            with self._job_cache_lock:
+                payout_state_current = (
+                    self._payout_state_generation == payout_state_generation
+                )
+            with self.lock:
+                refresh_current = self._tip_refresh_snapshot_current_locked(
+                    snapshot,
+                    observation_sequence,
+                )
+                if not payout_state_current or not refresh_current:
+                    return False
+                self._tip_refresh_pending_token = None
+                self._tip_refresh_pending_event.clear()
+                return True
 
     def _schedule_tip_refresh_retry(self) -> None:
         self._ensure_tip_refresh_state()
@@ -3804,10 +3855,7 @@ class PrismCoordinator:
         pending_signal_token: int | None = None
         try:
             observation_sequence = self._reserve_tip_observation_sequence()
-            if self.tip_refresh_is_pending():
-                pending_signal_token = self._mark_tip_refresh_pending(
-                    observation_sequence
-                )
+            pending_signal_token = self._claim_tip_refresh_pending()
             # The interval poller has no push notification to mark priority for
             # it. Probe the cheap best-tip RPC before fetching and deriving the
             # template so CTV maintenance can yield as soon as a changed tip is
@@ -3816,8 +3864,9 @@ class PrismCoordinator:
             with self.lock:
                 current_tip = getattr(self, "current_tip_first_seen", None)
             if current_tip is not None and current_tip[0] != observed_best_tip:
-                pending_signal_token = self._mark_tip_refresh_pending(
-                    observation_sequence
+                pending_signal_token = self._mark_tip_refresh_pending_for_poll(
+                    pending_signal_token,
+                    observation_sequence,
                 )
             snapshot = self.fetch_qbit_tip_template_snapshot()
             self.pool_readiness_latched()
@@ -3860,8 +3909,9 @@ class PrismCoordinator:
                 }
 
             if clients and snapshot_changed:
-                pending_signal_token = self._mark_tip_refresh_pending(
-                    observation_sequence
+                pending_signal_token = self._mark_tip_refresh_pending_for_poll(
+                    pending_signal_token,
+                    observation_sequence,
                 )
 
             refreshed = 0
@@ -3903,8 +3953,9 @@ class PrismCoordinator:
                         for client in clients
                     }
                 if clients:
-                    pending_signal_token = self._mark_tip_refresh_pending(
-                        observation_sequence
+                    pending_signal_token = self._mark_tip_refresh_pending_for_poll(
+                        pending_signal_token,
+                        observation_sequence,
                     )
             use_prepared_fanout = bool(
                 clients
@@ -4052,6 +4103,19 @@ class PrismCoordinator:
                 self._observe_tip_refresh_seconds(
                     "last_delivery",
                     last_delivery - refresh_started,
+                )
+            if not self._clear_tip_refresh_pending_for_completed_refresh(
+                snapshot,
+                observation_sequence,
+                payout_generation_after_reconciliation,
+            ):
+                # A newer tip or payout mutation won after the last delivery
+                # guard. Preserve its pending token and retry immediately.
+                pending_signal_token = None
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "tip or payout state changed before refresh completion; "
+                    "immediate retry scheduled"
                 )
             self.last_successful_template_refresh_monotonic = time.monotonic()
             return refreshed
