@@ -284,9 +284,31 @@ def dispatch(coordinator: Any, path: str, query: dict[str, list[str]]) -> tuple[
         page, limit = pagination_params(query)
         search = search_param(query)
         window = first_query_value(query, "window") or "3h"
-        if window != "3h":
-            raise PublicApiError(400, "invalid_window", "window must be 3h")
-        return 200, leaderboard(coordinator, page=page, limit=limit, search=search)
+        raw_recipient_id = first_query_value(query, "recipient_id")
+        if window == "3h":
+            if raw_recipient_id is not None:
+                raise PublicApiError(
+                    400,
+                    "invalid_reward_filter",
+                    "recipient_id requires window=reward",
+                )
+            return 200, leaderboard(coordinator, page=page, limit=limit, search=search)
+        if window == "reward":
+            recipient_id = clean_recipient_id(raw_recipient_id) if raw_recipient_id is not None else None
+            if search is not None and recipient_id is not None:
+                raise PublicApiError(
+                    400,
+                    "invalid_reward_filter",
+                    "search and recipient_id are mutually exclusive",
+                )
+            return 200, reward_leaderboard(
+                coordinator,
+                page=page,
+                limit=limit,
+                search=search,
+                recipient_id=recipient_id,
+            )
+        raise PublicApiError(400, "invalid_window", "window must be one of 3h, reward")
     if path == "/public/v1/hashrate-series":
         subject = first_query_value(query, "subject") or "pool"
         range_id = first_query_value(query, "range") or "1m"
@@ -407,6 +429,36 @@ def leaderboard(coordinator: Any, *, page: int, limit: int, search: str | None) 
             "started_at": payload["started_at"],
             "ended_at": payload["ended_at"],
         },
+        "totals": payload["totals"],
+        "pagination": payload["pagination"],
+        "rows": payload["rows"],
+    }
+
+
+def reward_leaderboard(
+    coordinator: Any,
+    *,
+    page: int,
+    limit: int,
+    search: str | None,
+    recipient_id: str | None,
+) -> dict[str, object]:
+    network = network_summary(coordinator)
+    payload = coordinator.ledger.dashboard_reward_leaderboard(
+        page=page,
+        limit=limit,
+        search=search,
+        recipient_id=recipient_id,
+        current_network_difficulty=network["network_difficulty"],
+    )
+    if Decimal(str(payload["window"]["counted_window_weight"])) != Decimal(
+        str(payload["totals"]["pool_counted_share_difficulty"])
+    ):
+        raise RuntimeError("reward leaderboard counted window weight does not match pool total")
+    return {
+        "schema": "prism.dashboard.leaderboard.v2",
+        "generated_at": payload["window"]["ended_at"],
+        "window": payload["window"],
         "totals": payload["totals"],
         "pagination": payload["pagination"],
         "rows": payload["rows"],
@@ -981,10 +1033,6 @@ def network_summary(coordinator: Any) -> dict[str, object]:
         network_info = coordinator.rpc.call("getnetworkinfo")
     except Exception:
         network_info = {}
-    raw_bits = first_present(template.get("bits"), blockchain_info.get("bits"))
-    bits = str(raw_bits if raw_bits is not None else "00000000").lower()
-    if len(bits) != 8 or any(char not in "0123456789abcdef" for char in bits):
-        raise PublicApiError(503, "qbit_rpc_unavailable", "qbit RPC returned invalid compact bits")
     # network_difficulty is reported in PRISM's scaled difficulty units
     # (QBIT_DIFFICULTY_SCALE, see scaled_network_difficulty) so it lines up with the
     # scaled per-share difficulties recorded in the ledger. Every downstream consumer
@@ -995,13 +1043,23 @@ def network_summary(coordinator: Any) -> dict[str, object]:
     # the raw getblockchaininfo.difficulty / getblocktemplate difficulty float, which is
     # ~QBIT_DIFFICULTY_SCALE (1e6) times smaller. Feeding the raw value here made the ETA
     # round to 0 and collapsed the reward window to a single share.
-    if raw_bits is not None:
+    bits = None
+    difficulty = None
+    for raw_bits in (template.get("bits"), blockchain_info.get("bits")):
+        if raw_bits is None:
+            continue
+        candidate = str(raw_bits).lower()
+        if len(candidate) != 8 or any(char not in "0123456789abcdef" for char in candidate):
+            continue
         try:
-            difficulty = scaled_network_difficulty(bits)
-        except ValueError as exc:
-            raise PublicApiError(503, "qbit_rpc_unavailable", "qbit RPC returned invalid compact bits") from exc
-    else:
-        difficulty = 1
+            candidate_difficulty = scaled_network_difficulty(candidate)
+        except ValueError:
+            continue
+        bits = candidate
+        difficulty = candidate_difficulty
+        break
+    if bits is None or difficulty is None:
+        raise PublicApiError(503, "qbit_rpc_unavailable", "qbit RPC did not provide valid compact bits")
     try:
         difficulty_string = decimal_string(difficulty)
     except Exception as exc:

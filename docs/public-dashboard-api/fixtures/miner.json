@@ -21,11 +21,11 @@
     "last_share_at": "2026-06-26T20:44:53Z"
   },
   "estimated_next_block": {
-    "share_percent": "27.05",
-    "estimated_reward_bits": 67620000
+    "share_percent": "27.06",
+    "estimated_reward_bits": 66973500
   },
   "estimated_time_to_minimum_payout_seconds": null,
-  "reward_window_percent": "27.05",
+  "reward_window_percent": "27.06",
   "workers_currently_hashing": 2,
   "workers": [
     {

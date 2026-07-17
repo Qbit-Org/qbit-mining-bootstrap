@@ -772,6 +772,135 @@ class SingleWriterShareLedger:
             "rows": rows[offset : offset + limit],
         }
 
+    def dashboard_reward_leaderboard(
+        self,
+        *,
+        page: int,
+        limit: int,
+        current_network_difficulty: int | str | Decimal,
+        search: str | None = None,
+        recipient_id: str | None = None,
+    ) -> dict[str, object]:
+        from lab.prism import public_api
+
+        if search is not None and recipient_id is not None:
+            raise ValueError("search and recipient_id are mutually exclusive")
+        now = datetime.now(timezone.utc)
+        anchor_ms = int(now.timestamp() * 1000)
+        requested_window_weight = _reward_window_weight(current_network_difficulty)
+        window_shares = _prism_window_shares(
+            self.all_shares(),
+            anchor_job_issued_at_ms=anchor_ms,
+            requested_window_weight=requested_window_weight,
+        )
+        counted_window_weight = sum(
+            (row.counted_difficulty for row in window_shares),
+            Decimal(0),
+        )
+        oldest_ms = min((row.share.accepted_at_ms for row in window_shares), default=None)
+        observed_span_seconds = None
+        if oldest_ms is not None:
+            observed_span_seconds = max(0, (anchor_ms - oldest_ms) // 1000)
+
+        by_miner: dict[str, dict[str, object]] = {}
+        for window_share in window_shares:
+            share = window_share.share
+            row = by_miner.setdefault(
+                share.miner_id,
+                {
+                    "recipient_id": share.miner_id,
+                    "included_share_count": 0,
+                    "counted_share_difficulty": Decimal(0),
+                    "last_share_at_ms": share.accepted_at_ms,
+                },
+            )
+            row["included_share_count"] = int(row["included_share_count"]) + 1
+            row["counted_share_difficulty"] = Decimal(row["counted_share_difficulty"]) + window_share.counted_difficulty
+            row["last_share_at_ms"] = max(int(row["last_share_at_ms"]), share.accepted_at_ms)
+
+        ranked = sorted(
+            by_miner.values(),
+            key=lambda row: (-Decimal(row["counted_share_difficulty"]), str(row["recipient_id"])),
+        )
+        rows: list[dict[str, object]] = []
+        for index, row in enumerate(ranked, start=1):
+            counted_share_difficulty = Decimal(row["counted_share_difficulty"])
+            share_percent = None
+            if counted_window_weight > 0:
+                share_percent = public_api.decimal_string(
+                    counted_share_difficulty * Decimal(100) / counted_window_weight
+                )
+            hashrate_ths = None
+            if observed_span_seconds is not None and observed_span_seconds > 0:
+                hashrate_ths = public_api.hashrate_ths_from_difficulty(
+                    counted_share_difficulty,
+                    observed_span_seconds,
+                )
+            rows.append(
+                {
+                    "rank": index,
+                    "recipient_id": row["recipient_id"],
+                    "display_name": None,
+                    "hashrate_ths": hashrate_ths,
+                    "included_share_count": int(row["included_share_count"]),
+                    "counted_share_difficulty": public_api.decimal_string(counted_share_difficulty),
+                    "share_percent": share_percent,
+                    "blocks_found_total": 0,
+                    "last_share_at": _iso_from_ms(int(row["last_share_at_ms"])),
+                }
+            )
+
+        filtered_rows = rows
+        if recipient_id is not None:
+            filtered_rows = [
+                row
+                for row in rows
+                if row["recipient_id"] == recipient_id
+            ]
+        elif search:
+            normalized_search = search.lower()
+            filtered_rows = [
+                row
+                for row in rows
+                if normalized_search in str(row["recipient_id"]).lower()
+            ]
+        offset = (page - 1) * limit
+
+        pool_hashrate_ths = None
+        expected_time_to_block = None
+        if observed_span_seconds is not None and observed_span_seconds > 0 and counted_window_weight > 0:
+            pool_hashrate_ths = public_api.hashrate_ths_from_difficulty(
+                counted_window_weight,
+                observed_span_seconds,
+            )
+            expected_time_to_block = public_api.expected_time_to_block_seconds(
+                hashrate_ths=pool_hashrate_ths,
+                network_difficulty=public_api.decimal_string(current_network_difficulty),
+            )
+
+        return {
+            "window": {
+                "id": "reward",
+                "started_at": _iso_from_ms(oldest_ms),
+                "ended_at": public_api.iso_datetime(now),
+                "observed_span_seconds": observed_span_seconds,
+                "network_difficulty": public_api.decimal_string(current_network_difficulty),
+                "window_multiplier": 8,
+                "requested_window_weight": public_api.decimal_string(requested_window_weight),
+                "counted_window_weight": public_api.decimal_string(counted_window_weight),
+                "included_share_count": len(window_shares),
+                "is_complete": requested_window_weight > 0 and counted_window_weight >= requested_window_weight,
+            },
+            "totals": {
+                "pool_hashrate_ths": pool_hashrate_ths,
+                "pool_counted_share_difficulty": public_api.decimal_string(counted_window_weight),
+                "participant_count": len(ranked),
+                "expected_time_to_block_seconds": expected_time_to_block,
+            },
+            "pagination": public_api.pagination(page, limit, len(filtered_rows)),
+            "rows": filtered_rows[offset : offset + limit],
+        }
+
     def dashboard_hashrate_series(
         self,
         *,
@@ -3793,6 +3922,199 @@ SELECT json_build_object(
                 "participant_count": participant_count,
             },
             "pagination": public_api.pagination(page, limit, participant_count),
+            "rows": rows,
+        }
+
+    def dashboard_reward_leaderboard(
+        self,
+        *,
+        page: int,
+        limit: int,
+        current_network_difficulty: int | str | Decimal,
+        search: str | None = None,
+        recipient_id: str | None = None,
+    ) -> dict[str, object]:
+        from lab.prism import public_api
+
+        if search is not None and recipient_id is not None:
+            raise ValueError("search and recipient_id are mutually exclusive")
+        offset = (page - 1) * limit
+        network_difficulty = public_api.decimal_string(current_network_difficulty)
+        requested_window_weight = _reward_window_weight(current_network_difficulty)
+        requested_window_weight_sql = public_api.decimal_string(requested_window_weight)
+        row_filter = ""
+        if recipient_id is not None:
+            row_filter = f"WHERE ranked.miner_id = {self._text_literal(recipient_id)}"
+        elif search:
+            row_filter = (
+                "WHERE strpos(lower(ranked.miner_id), "
+                f"{self._text_literal(search.lower())}) > 0"
+            )
+        sql = f"""
+WITH snapshot_clock AS (
+    SELECT clock_timestamp() AS ended_at
+),
+window_rows AS MATERIALIZED (
+    SELECT window_row.*
+    FROM snapshot_clock
+    CROSS JOIN LATERAL qbit_prism_window(
+        snapshot_clock.ended_at,
+        {requested_window_weight_sql}::numeric
+    ) AS window_row
+),
+window_summary AS (
+    SELECT
+        count(*) AS included_share_count,
+        COALESCE(sum(counted_difficulty), 0) AS counted_window_weight,
+        min(accepted_at) AS oldest_share_accepted_at
+    FROM window_rows
+),
+grouped AS (
+    SELECT
+        miner_id,
+        count(*) AS included_share_count,
+        sum(counted_difficulty) AS counted_share_difficulty,
+        max(accepted_at) AS last_share_at
+    FROM window_rows
+    GROUP BY miner_id
+),
+blocks AS (
+    SELECT solver.miner_id, count(*) AS blocks_found_total
+    FROM qbit_pool_blocks block
+    JOIN LATERAL (
+        SELECT share.miner_id
+        FROM qbit_share_ledger share
+        WHERE share.accepted
+          AND length(share.share_id) >= 65
+          AND lower(right(share.share_id, 64)) = block.block_hash
+        ORDER BY share.accepted_at DESC, share.share_seq DESC
+        LIMIT 1
+    ) solver ON true
+    WHERE block.chain_state <> 'reversed'
+    GROUP BY solver.miner_id
+),
+ranked AS (
+    SELECT
+        row_number() OVER (ORDER BY grouped.counted_share_difficulty DESC, grouped.miner_id ASC) AS rank,
+        grouped.miner_id,
+        grouped.included_share_count,
+        grouped.counted_share_difficulty,
+        grouped.last_share_at,
+        COALESCE(blocks.blocks_found_total, 0) AS blocks_found_total
+    FROM grouped
+    LEFT JOIN blocks
+      ON blocks.miner_id = grouped.miner_id
+),
+filtered AS (
+    SELECT *
+    FROM ranked
+    {row_filter}
+),
+page_rows AS (
+    SELECT *
+    FROM filtered
+    ORDER BY rank ASC
+    LIMIT {int(limit)} OFFSET {int(offset)}
+)
+SELECT json_build_object(
+    'ended_at', to_char(snapshot_clock.ended_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    'oldest_share_accepted_at', to_char(window_summary.oldest_share_accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    'observed_span_seconds', CASE
+        WHEN window_summary.oldest_share_accepted_at IS NULL THEN null
+        ELSE GREATEST(
+            0,
+            floor(extract(epoch FROM (snapshot_clock.ended_at - window_summary.oldest_share_accepted_at)))::bigint
+        )
+    END,
+    'counted_window_weight', window_summary.counted_window_weight::text,
+    'included_share_count', window_summary.included_share_count,
+    'participant_count', (SELECT count(*) FROM ranked),
+    'total_count', (SELECT count(*) FROM filtered),
+    'rows', COALESCE((
+        SELECT json_agg(json_build_object(
+            'rank', page_rows.rank,
+            'recipient_id', page_rows.miner_id,
+            'display_name', null,
+            'included_share_count', page_rows.included_share_count,
+            'counted_share_difficulty', page_rows.counted_share_difficulty::text,
+            'share_percent', CASE
+                WHEN window_summary.counted_window_weight > 0 THEN
+                    (page_rows.counted_share_difficulty * 100::numeric / window_summary.counted_window_weight)::text
+                ELSE null
+            END,
+            'blocks_found_total', page_rows.blocks_found_total,
+            'last_share_at', to_char(page_rows.last_share_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+        ) ORDER BY page_rows.rank ASC)
+        FROM page_rows
+    ), '[]'::json)
+)
+FROM snapshot_clock
+CROSS JOIN window_summary;
+"""
+        payload = self._run_read_json(sql)
+        counted_window_weight = Decimal(str(payload["counted_window_weight"]))
+        observed_span_seconds = (
+            int(payload["observed_span_seconds"])
+            if payload.get("observed_span_seconds") is not None
+            else None
+        )
+        pool_hashrate_ths = None
+        expected_time_to_block = None
+        if observed_span_seconds is not None and observed_span_seconds > 0 and counted_window_weight > 0:
+            pool_hashrate_ths = public_api.hashrate_ths_from_difficulty(
+                counted_window_weight,
+                observed_span_seconds,
+            )
+            expected_time_to_block = public_api.expected_time_to_block_seconds(
+                hashrate_ths=pool_hashrate_ths,
+                network_difficulty=network_difficulty,
+            )
+
+        rows: list[dict[str, object]] = []
+        for row in payload["rows"]:
+            counted_share_difficulty = public_api.decimal_string(row["counted_share_difficulty"])
+            hashrate_ths = None
+            if observed_span_seconds is not None and observed_span_seconds > 0:
+                hashrate_ths = public_api.hashrate_ths_from_difficulty(
+                    counted_share_difficulty,
+                    observed_span_seconds,
+                )
+            share_percent = row["share_percent"]
+            rows.append(
+                {
+                    "rank": int(row["rank"]),
+                    "recipient_id": row["recipient_id"],
+                    "display_name": row["display_name"],
+                    "hashrate_ths": hashrate_ths,
+                    "included_share_count": int(row["included_share_count"]),
+                    "counted_share_difficulty": counted_share_difficulty,
+                    "share_percent": public_api.decimal_string(share_percent) if share_percent is not None else None,
+                    "blocks_found_total": int(row["blocks_found_total"]),
+                    "last_share_at": row["last_share_at"],
+                }
+            )
+
+        participant_count = int(payload["participant_count"])
+        return {
+            "window": {
+                "id": "reward",
+                "started_at": payload["oldest_share_accepted_at"],
+                "ended_at": payload["ended_at"],
+                "observed_span_seconds": observed_span_seconds,
+                "network_difficulty": network_difficulty,
+                "window_multiplier": 8,
+                "requested_window_weight": requested_window_weight_sql,
+                "counted_window_weight": public_api.decimal_string(counted_window_weight),
+                "included_share_count": int(payload["included_share_count"]),
+                "is_complete": requested_window_weight > 0 and counted_window_weight >= requested_window_weight,
+            },
+            "totals": {
+                "pool_hashrate_ths": pool_hashrate_ths,
+                "pool_counted_share_difficulty": public_api.decimal_string(counted_window_weight),
+                "participant_count": participant_count,
+                "expected_time_to_block_seconds": expected_time_to_block,
+            },
+            "pagination": public_api.pagination(page, limit, int(payload["total_count"])),
             "rows": rows,
         }
 
