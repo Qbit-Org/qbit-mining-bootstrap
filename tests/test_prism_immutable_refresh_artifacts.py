@@ -88,12 +88,10 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
         with self.assertRaises(TemplateRefreshBlocked):
             server.prepare_tip_refresh_bundle(
                 dataclass_replace(snapshot, template_artifacts=None),
-                [state],
             )
         with self.assertRaises(TemplateRefreshBlocked):
             server.prepare_tip_refresh_bundle(
                 dataclass_replace(snapshot, bestblockhash="55" * 32),
-                [state],
             )
 
         changed_template = dict(artifacts.template)
@@ -127,7 +125,7 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
                     template_artifacts=mismatched,
                 )
                 with self.assertRaises(TemplateRefreshBlocked):
-                    server.prepare_tip_refresh_bundle(mismatched_snapshot, [state])
+                    server.prepare_tip_refresh_bundle(mismatched_snapshot)
 
         self.assertEqual(server.job_counter, 0)
         self.assertIsNone(state.active_job)
@@ -152,17 +150,18 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
 
         def blocked_shared_job_bundle(
             artifacts: CachedTemplateArtifacts,
-            identity: WorkerIdentity,
+            identity: WorkerIdentity | None = None,
+            **kwargs: object,
         ) -> CachedJobBundle:
             self.assertIs(artifacts, artifacts_a)
             build_entered.set()
             if not release_build.wait(5):
                 raise AssertionError("immutable artifact build was not released")
-            return original_shared_job_bundle(artifacts, identity)
+            return original_shared_job_bundle(artifacts, identity, **kwargs)
 
         def prepare() -> None:
             try:
-                bundles.append(server.prepare_tip_refresh_bundle(snapshot, states))
+                bundles.append(server.prepare_tip_refresh_bundle(snapshot))
             except BaseException as exc:  # noqa: BLE001 - surfaced by the test
                 errors.append(exc)
 
@@ -238,7 +237,8 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
 
         def block_first_shared_job_bundle(
             artifacts: CachedTemplateArtifacts,
-            identity: WorkerIdentity,
+            identity: WorkerIdentity | None = None,
+            **kwargs: object,
         ) -> CachedJobBundle:
             nonlocal build_count
             with build_count_lock:
@@ -248,7 +248,7 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
                 first_build_entered.set()
                 if not release_first_build.wait(5):
                     raise AssertionError("superseded artifact build was not released")
-            return original_shared_job_bundle(artifacts, identity)
+            return original_shared_job_bundle(artifacts, identity, **kwargs)
 
         server.shared_job_bundle = block_first_shared_job_bundle  # type: ignore[method-assign]
         old_results: list[int] = []

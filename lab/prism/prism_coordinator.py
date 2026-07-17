@@ -939,6 +939,15 @@ class QbitTipTemplateSnapshot:
 
 
 @dataclass(frozen=True)
+class RetainedCollectionRefresh:
+    """Current immutable preparation waiting for a collection identity."""
+
+    snapshot: QbitTipTemplateSnapshot
+    observation_sequence: int
+    payout_state_generation: int
+
+
+@dataclass(frozen=True)
 class CachedJobBundle:
     """One heavy job build (ledger snapshot + signed audit bundle + base job)
     shared across every client on the same template.
@@ -962,6 +971,10 @@ class CachedJobBundle:
     built_monotonic: float
     template_generation: int = 0
     payout_state_generation: int = 0
+    # Collection coinbases commit a synthetic share to this exact payout
+    # identity. Ready bundles have no worker-specific inputs and keep this
+    # unset, which makes accidental cross-worker stamping fail closed.
+    collection_identity: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1207,6 +1220,10 @@ class StratumError(RuntimeError):
 
 class TemplateRefreshBlocked(RuntimeError):
     """A live template was fetched, but safe work could not be issued."""
+
+
+class CollectionIdentityUnavailable(TemplateRefreshBlocked):
+    """Current collection work is waiting for an authorized worker identity."""
 
 
 class _JobBuildFailed(RuntimeError):
@@ -1602,6 +1619,7 @@ class PrismCoordinator:
             TipRefreshValidationToken,
             _FanoutCancellation,
         ] | None = None
+        self._retained_collection_refresh: RetainedCollectionRefresh | None = None
         self.last_reorg_reconciled_tip_hash: str | None = None
         self.last_reorg_reconciled_trusted = False
         self.last_reorg_reconciled_monotonic: float | None = None
@@ -2042,6 +2060,7 @@ class PrismCoordinator:
             cancelled_refresh: _FanoutCancellation | None = None
             schedule_retry = False
             with self.lock:
+                self._retained_collection_refresh = None
                 active = getattr(self, "_active_tip_refresh", None)
                 if active is None:
                     schedule_retry = True
@@ -2197,20 +2216,59 @@ class PrismCoordinator:
             raise RuntimeError("newer template artifacts disappeared after cache race")
         return current
 
-    def _lookup_job_bundle(self, fingerprint: str, worker: WorkerIdentity) -> CachedJobBundle | None:
+    @staticmethod
+    def _collection_bundle_identity(worker: WorkerIdentity) -> tuple[str, str]:
+        return worker.payout_address, worker.p2mr_program_hex
+
+    def _job_bundle_key(
+        self,
+        artifacts: CachedTemplateArtifacts,
+        *,
+        mode: str,
+        payout_state_generation: int,
+        worker: WorkerIdentity | None,
+    ) -> tuple[object, ...]:
+        if mode == "ready":
+            return (
+                artifacts.fingerprint,
+                "ready",
+                payout_state_generation,
+            )
+        if mode != "collection":
+            raise ValueError(f"unknown PRISM job-bundle mode: {mode}")
+        if worker is None:
+            raise CollectionIdentityUnavailable(
+                "collection-mode worker identity is temporarily unavailable"
+            )
+        return (
+            artifacts.fingerprint,
+            "collection",
+            artifacts.generation,
+            payout_state_generation,
+            *self._collection_bundle_identity(worker),
+        )
+
+    def _job_bundle_mode(self, requested_mode: str | None) -> str:
+        if requested_mode is not None:
+            if requested_mode not in {"ready", "collection"}:
+                raise ValueError(
+                    f"unknown PRISM job-bundle mode: {requested_mode}"
+                )
+            return requested_mode
+        return "ready" if self.pool_readiness_latched() else "collection"
+
+    def _lookup_job_bundle(
+        self,
+        key: tuple[object, ...],
+    ) -> CachedJobBundle | None:
         ttl = getattr(self, "job_bundle_cache_seconds", DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS)
         if ttl <= 0:
             return None
         now = time.monotonic()
         with self._job_cache_lock:
-            ready = self._job_bundle_cache.get((fingerprint, "ready"))
-            if ready is not None and now - ready.built_monotonic <= ttl:
-                return ready
-            collection = self._job_bundle_cache.get(
-                (fingerprint, "collection", worker.payout_address, worker.p2mr_program_hex)
-            )
-            if collection is not None and now - collection.built_monotonic <= ttl:
-                return collection
+            cached = self._job_bundle_cache.get(key)
+            if cached is not None and now - cached.built_monotonic <= ttl:
+                return cached
         return None
 
     def _job_bundle_entry_usable(
@@ -2311,28 +2369,65 @@ class PrismCoordinator:
                 self._job_bundle_cache.pop(oldest_key, None)
             return True
 
-    def shared_job_bundle(self, artifacts: CachedTemplateArtifacts, worker: WorkerIdentity) -> CachedJobBundle:
+    def shared_job_bundle(
+        self,
+        artifacts: CachedTemplateArtifacts,
+        worker: WorkerIdentity | None = None,
+        *,
+        mode: str | None = None,
+    ) -> CachedJobBundle:
         """Return the cached heavy build for this template, building at most once.
 
         Concurrent callers needing the same missing entry single-flight behind
         the build lock: the first one pays for the ledger snapshot and the
-        signed audit bundle, the rest reuse it.
+        signed audit bundle, the rest reuse it. Mode is resolved before cache
+        lookup and again immediately before a build after lock admission:
+        ready work has no representative input, while collection work requires
+        and is isolated by its payout identity.
         """
         self._ensure_job_cache_state()
         while True:
-            cached = self._lookup_job_bundle(artifacts.fingerprint, worker)
+            resolved_mode = self._job_bundle_mode(mode)
+            if resolved_mode == "collection" and worker is None:
+                raise CollectionIdentityUnavailable(
+                    "collection-mode worker identity is temporarily unavailable"
+                )
+            with self._job_cache_lock:
+                payout_state_generation = self._payout_state_generation
+            key = self._job_bundle_key(
+                artifacts,
+                mode=resolved_mode,
+                payout_state_generation=payout_state_generation,
+                worker=worker,
+            )
+            cached = self._lookup_job_bundle(key)
             if self._job_bundle_entry_usable(cached, artifacts):
                 self._record_job_cache_event("bundle", hit=True)
                 assert cached is not None
                 return self._bind_cached_bundle_to_artifacts(cached, artifacts)
             with self._job_build_lock:
-                cached = self._lookup_job_bundle(artifacts.fingerprint, worker)
+                with self._job_cache_lock:
+                    locked_payout_state_generation = self._payout_state_generation
+                if locked_payout_state_generation != payout_state_generation:
+                    continue
+                cached = self._lookup_job_bundle(key)
                 if self._job_bundle_entry_usable(cached, artifacts):
                     self._record_job_cache_event("bundle", hit=True)
                     assert cached is not None
                     return self._bind_cached_bundle_to_artifacts(cached, artifacts)
+                # Readiness can latch while this caller waits behind another
+                # expensive build. Re-select the mode and its cache key instead
+                # of issuing collection-only work after the pool became ready.
+                if self._job_bundle_mode(mode) != resolved_mode:
+                    continue
                 self._record_job_cache_event("bundle", hit=False)
-                built = self.build_shared_job_bundle(artifacts, worker)
+                built = self.build_shared_job_bundle(
+                    artifacts,
+                    worker,
+                    mode=resolved_mode,
+                    payout_state_generation=payout_state_generation,
+                    key=key,
+                )
                 # A reconciliation may have committed while this expensive
                 # build was running. Never cache or return its stale signed
                 # payout snapshot; retry against the new generation instead.
@@ -2343,16 +2438,31 @@ class PrismCoordinator:
     def build_shared_job_bundle(
         self,
         artifacts: CachedTemplateArtifacts,
-        worker: WorkerIdentity,
+        worker: WorkerIdentity | None = None,
+        *,
+        mode: str | None = None,
+        payout_state_generation: int | None = None,
+        key: tuple[object, ...] | None = None,
     ) -> CachedJobBundle:
         phases = self._job_build_phases()
         template = artifacts.template
-        with self._job_cache_lock:
-            payout_state_generation = self._payout_state_generation
+        resolved_mode = self._job_bundle_mode(mode)
+        if resolved_mode == "collection" and worker is None:
+            raise CollectionIdentityUnavailable(
+                "collection-mode worker identity is temporarily unavailable"
+            )
+        if payout_state_generation is None:
+            with self._job_cache_lock:
+                payout_state_generation = self._payout_state_generation
+        if key is None:
+            key = self._job_bundle_key(
+                artifacts,
+                mode=resolved_mode,
+                payout_state_generation=payout_state_generation,
+                worker=worker,
+            )
         issued_at_ms = now_ms()
         started = time.monotonic()
-        _, ready_miner_count = self.accepted_share_stats()
-        ready = ready_miner_count >= self.min_ready_miners
         # Bound the snapshot to a superset of the 8x reward window rather than
         # the whole accepted history: same audit bundle and digest, but the
         # ledger phase no longer scales with total ledger size.
@@ -2361,14 +2471,14 @@ class PrismCoordinator:
             * PRISM_SNAPSHOT_WINDOW_MARGIN
             * int(artifacts.network_difficulty)
         )
-        shares = (
+        shares: list[dict[str, object]] = (
             [
                 record.to_prism_json()
                 for record in self.ledger.snapshot_at_job_issue(
                     issued_at_ms, window_weight=snapshot_window_weight
                 )
             ]
-            if ready
+            if resolved_mode == "ready"
             else []
         )
         prior_balances = self.ledger.current_prior_balances()
@@ -2378,7 +2488,12 @@ class PrismCoordinator:
             PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
             "00" * self.extranonce2_size,
         )
-        if ready and shares:
+        collection_identity: tuple[str, str] | None = None
+        if resolved_mode == "ready":
+            if not shares:
+                raise RuntimeError(
+                    "ready-pool ledger snapshot contained no payout shares"
+                )
             bundle = self.build_audit_bundle(
                 shares=shares,
                 found_block={
@@ -2393,8 +2508,8 @@ class PrismCoordinator:
                 ctv_fee_parent_hash=str(template["previousblockhash"]),
             )
             collection_only = False
-            key: tuple[object, ...] = (artifacts.fingerprint, "ready")
         else:
+            assert worker is not None
             bundle = self.build_collection_bundle(
                 template=template,
                 transaction_hexes=artifacts.transaction_hexes,
@@ -2405,12 +2520,7 @@ class PrismCoordinator:
             )
             shares = []
             collection_only = True
-            key = (
-                artifacts.fingerprint,
-                "collection",
-                worker.payout_address,
-                worker.p2mr_program_hex,
-            )
+            collection_identity = self._collection_bundle_identity(worker)
         manifest = bundle["signed_coinbase_manifest"]["manifest"]
         base_job = direct_stratum.make_job_from_builder_manifest(
             job_id="prism-template-base",
@@ -2437,6 +2547,7 @@ class PrismCoordinator:
             built_monotonic=time.monotonic(),
             template_generation=artifacts.generation,
             payout_state_generation=payout_state_generation,
+            collection_identity=collection_identity,
         )
 
     def stamp_job_for_client(
@@ -2448,6 +2559,13 @@ class PrismCoordinator:
     ) -> PrismJobContext:
         if client.worker is None:
             raise StratumError(20, "client is not authorized")
+        if cached.collection_only and cached.collection_identity != (
+            self._collection_bundle_identity(client.worker)
+        ):
+            raise StratumError(
+                20,
+                "collection bundle payout identity no longer matches client authorization",
+            )
         with self.lock:
             self.job_counter += 1
             job_id = f"prism-{self.job_counter}"
@@ -2626,6 +2744,135 @@ class PrismCoordinator:
                 TipRefreshValidationToken,
                 _FanoutCancellation,
             ] | None = None
+        if not hasattr(self, "_retained_collection_refresh"):
+            self._retained_collection_refresh: RetainedCollectionRefresh | None = None
+
+    def _retain_collection_refresh(
+        self,
+        snapshot: QbitTipTemplateSnapshot,
+        observation_sequence: int,
+        payout_state_generation: int,
+    ) -> None:
+        """Retain reusable current work until an eligible identity appears."""
+        retained = RetainedCollectionRefresh(
+            snapshot=snapshot,
+            observation_sequence=observation_sequence,
+            payout_state_generation=payout_state_generation,
+        )
+        should_log = False
+        with self.lock:
+            if not self._tip_refresh_snapshot_current_locked(
+                snapshot,
+                observation_sequence,
+            ):
+                return
+            if any(
+                self.client_can_receive_jobs(client)
+                for client in self.clients
+            ):
+                return
+            previous = self._retained_collection_refresh
+            self._retained_collection_refresh = retained
+            should_log = previous is None or (
+                previous.snapshot.bestblockhash != snapshot.bestblockhash
+                or previous.payout_state_generation != payout_state_generation
+            )
+        if should_log:
+            print(
+                "prism coordinator: collection refresh retained while no "
+                "authorized worker identity is available",
+                flush=True,
+            )
+
+    def _retained_collection_artifacts(self) -> CachedTemplateArtifacts | None:
+        """Return retained artifacts while their published work stays current.
+
+        A same-tip poll advances its observation sequence before atomically
+        replacing ``tip_template_snapshot``. The published snapshot remains
+        reusable on both sides of that handoff even if the retained marker has
+        not yet been updated; a new tip or payout generation still invalidates
+        it immediately.
+        """
+        self._ensure_job_cache_state()
+        self._ensure_tip_refresh_state()
+        with self._job_cache_lock:
+            payout_state_generation = self._payout_state_generation
+        with self.lock:
+            retained = self._retained_collection_refresh
+            if retained is None:
+                return None
+            if retained.payout_state_generation != payout_state_generation:
+                return None
+            current_tip = getattr(self, "current_tip_first_seen", None)
+            published_snapshot = self.tip_template_snapshot
+            if (
+                published_snapshot is None
+                or current_tip is None
+                or current_tip[0] != published_snapshot.bestblockhash
+            ):
+                return None
+            return self._tip_refresh_artifacts(published_snapshot)
+
+    def _retain_current_collection_refresh_if_unrepresented(self) -> None:
+        """Keep the last published collection work when the fleet empties."""
+        self._ensure_tip_refresh_state()
+        if getattr(self, "_pool_ready_latched", False):
+            return
+        with self.lock:
+            if any(
+                self.client_can_receive_jobs(client)
+                for client in self.clients
+            ):
+                return
+            snapshot = self.tip_template_snapshot
+            observation_sequence = int(
+                getattr(self, "current_tip_observation_sequence", 0)
+            )
+        if snapshot is None:
+            return
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            payout_state_generation = self._payout_state_generation
+        self._retain_collection_refresh(
+            snapshot,
+            observation_sequence,
+            payout_state_generation,
+        )
+
+    def _note_collection_identity_available(self, client: ClientState) -> None:
+        """Wake a retained collection refresh as soon as a client is eligible."""
+        if not self.client_can_receive_jobs(client):
+            return
+        if self._retained_collection_artifacts() is None:
+            return
+        self._mark_tip_refresh_pending(client.connection_id)
+        self._schedule_tip_refresh_retry()
+
+    def _consume_retained_collection_refresh(
+        self,
+        context: PrismJobContext,
+    ) -> None:
+        """Consume retention only after its collection work was delivered."""
+        if not context.collection_only:
+            return
+        with self.lock:
+            retained = self._retained_collection_refresh
+            published_snapshot = self.tip_template_snapshot
+            artifacts = (
+                published_snapshot.template_artifacts
+                if published_snapshot is not None
+                else None
+            )
+            if (
+                retained is not None
+                and retained.payout_state_generation
+                == context.payout_state_generation
+                and artifacts is not None
+                and context.template is artifacts.template
+                and context.template_fingerprint == artifacts.fingerprint
+                and context.template_generation == artifacts.generation
+            ):
+                self._retained_collection_refresh = None
 
     def tip_refresh_is_pending(self) -> bool:
         return self._tip_refresh_pending()
@@ -3453,26 +3700,17 @@ class PrismCoordinator:
     def prepare_tip_refresh_bundle(
         self,
         snapshot: QbitTipTemplateSnapshot,
-        clients: list[ClientState],
     ) -> CachedJobBundle:
+        """Build ready-pool work from immutable shared inputs only.
+
+        Client selection belongs exclusively to fanout. In particular, a
+        connection disappearing before or during this build cannot affect the
+        signed payout bundle or its cache lifetime.
+        """
         artifacts = self._tip_refresh_artifacts(snapshot)
-        with self.lock:
-            representative = next(
-                (
-                    client
-                    for client in clients
-                    if client in self.clients and self.client_can_receive_jobs(client)
-                ),
-                None,
-            )
-            worker = representative.worker if representative is not None else None
-        if worker is None:
-            raise TemplateRefreshBlocked(
-                "no authorized representative remained for prepared refresh"
-            )
         build_started = time.monotonic()
         try:
-            bundle = self.shared_job_bundle(artifacts, worker)
+            bundle = self.shared_job_bundle(artifacts, mode="ready")
         except Exception as exc:
             with self.lock:
                 self.job_build_failure_count += 1
@@ -3705,7 +3943,10 @@ class PrismCoordinator:
                 if (
                     client not in self.clients
                     or client.connection_id != expected_connection_id
-                    or not self.client_can_receive_jobs(client)
+                ):
+                    return RefreshResult("disconnected")
+                if (
+                    not self.client_can_receive_jobs(client)
                     or self.intervening_job_supersedes_snapshot(
                         client.active_job,
                         expected_active_job,
@@ -3760,7 +4001,10 @@ class PrismCoordinator:
                         if (
                             client not in self.clients
                             or client.connection_id != expected_connection_id
-                            or not self.client_can_receive_jobs(client)
+                        ):
+                            return RefreshResult("disconnected")
+                        if (
+                            not self.client_can_receive_jobs(client)
                             or self.intervening_job_supersedes_snapshot(
                                 client.active_job,
                                 expected_active_job,
@@ -4222,6 +4466,7 @@ class PrismCoordinator:
                 clients
                 and getattr(self, "_pool_ready_latched", False)
             )
+            ready_mode = bool(getattr(self, "_pool_ready_latched", False))
             bundle: CachedJobBundle | None = None
             if use_prepared_fanout:
                 self._raise_if_tip_refresh_superseded(
@@ -4229,7 +4474,7 @@ class PrismCoordinator:
                     observation_sequence,
                 )
                 try:
-                    bundle = self.prepare_tip_refresh_bundle(snapshot, clients)
+                    bundle = self.prepare_tip_refresh_bundle(snapshot)
                 except TemplateRefreshBlocked:
                     for _client in clients:
                         self._record_tip_refresh_client_result("failed")
@@ -4275,6 +4520,19 @@ class PrismCoordinator:
                     )
                 self.tip_template_snapshot = snapshot
 
+            if not ready_mode:
+                with self.lock:
+                    eligible_collection_client = any(
+                        self.client_can_receive_jobs(client)
+                        for client in self.clients
+                    )
+                if not eligible_collection_client:
+                    self._retain_collection_refresh(
+                        snapshot,
+                        observation_sequence,
+                        payout_generation_after_reconciliation,
+                    )
+
             if use_prepared_fanout:
                 assert bundle is not None
                 (
@@ -4294,9 +4552,21 @@ class PrismCoordinator:
                 for client in clients:
                     if self.stop_event.is_set():
                         break
-                    # Collection bundles are worker-specific, so this first
-                    # implementation retains their sequential build/send path.
+                    # Collection bundles are worker-specific, so build and
+                    # validate each selected target independently.
                     self._record_heartbeat(heartbeat_name)
+                    with self.lock:
+                        target_connected = client in self.clients
+                        target_eligible = (
+                            target_connected
+                            and self.client_can_receive_jobs(client)
+                        )
+                    if not target_connected:
+                        self._record_tip_refresh_client_result("disconnected")
+                        continue
+                    if not target_eligible:
+                        self._record_tip_refresh_client_result("skipped")
+                        continue
                     try:
                         if self.maybe_send_job(
                             client,
@@ -4327,6 +4597,19 @@ class PrismCoordinator:
                     except OSError:
                         self._record_tip_refresh_client_result("disconnected")
                         self.disconnect_client(client)
+
+                if not ready_mode:
+                    with self.lock:
+                        eligible_collection_client = any(
+                            self.client_can_receive_jobs(client)
+                            for client in self.clients
+                        )
+                    if not eligible_collection_client:
+                        self._retain_collection_refresh(
+                            snapshot,
+                            observation_sequence,
+                            payout_generation_after_reconciliation,
+                        )
 
                 if clients:
                     try:
@@ -4488,6 +4771,10 @@ class PrismCoordinator:
                     tip_hash,
                     now if first_seen is not None else None,
                 )
+                # A retained collection snapshot is useful only for its exact
+                # tip. The new observation will install a replacement after
+                # reconciliation and publication if identity is still absent.
+                self._retained_collection_refresh = None
                 self.current_tip_observation_sequence = observation_sequence
                 self.current_tip_observed_monotonic = now
                 self.current_tip_parent = None
@@ -5350,7 +5637,9 @@ class PrismCoordinator:
         except Exception:
             return False
         if ready_miner_count >= getattr(self, "min_ready_miners", 3):
-            self._pool_ready_latched = True
+            with self.lock:
+                self._pool_ready_latched = True
+                self._retained_collection_refresh = None
             return True
         return False
 
@@ -5502,6 +5791,7 @@ class PrismCoordinator:
                 ):
                     self._remove_evicted_job_locked(job_id)
             client.close()
+        self._retain_current_collection_refresh_if_unrepresented()
 
     def handle_request(self, client: ClientState, request: dict[str, object]) -> None:
         method = request.get("method")
@@ -5523,6 +5813,7 @@ class PrismCoordinator:
                     request_id,
                     [[], client.extranonce1_hex, self.extranonce2_size],
                 )
+                self._note_collection_identity_available(client)
                 self.maybe_send_job(client, clean_jobs=True)
             return
         if method == "mining.authorize":
@@ -5552,6 +5843,7 @@ class PrismCoordinator:
                     difficulty_job_delivered = self.advertise_client_difficulty(client, target)
                 client.authorized = True
                 self.send_result(client, request_id, True)
+                self._note_collection_identity_available(client)
                 # On a re-authorize whose new options already advertised a fresh
                 # difficulty/job pair, do not send a second back-to-back pair.
                 if not difficulty_job_delivered:
@@ -5925,6 +6217,7 @@ class PrismCoordinator:
             self.send_job_update(client, context.job)
             self.apply_job_difficulty(client, context.job)
             self.note_tip_work_delivered(client, str(context.template["previousblockhash"]))
+            self._consume_retained_collection_refresh(context)
             phases["send"] = time.monotonic() - phase_started
             elapsed = time.monotonic() - started
             self.observe_job_build_elapsed(elapsed, phases)
@@ -6155,7 +6448,10 @@ class PrismCoordinator:
         if client.worker is None:
             raise StratumError(20, "client is not authorized")
         self._ensure_job_cache_state()
-        artifacts = self.current_template_artifacts()
+        artifacts = (
+            self._retained_collection_artifacts()
+            or self.current_template_artifacts()
+        )
         return self.build_job_for_client_from_artifacts(
             client,
             artifacts,
@@ -6169,11 +6465,19 @@ class PrismCoordinator:
         *,
         clean_jobs: bool,
     ) -> PrismJobContext:
-        if client.worker is None:
-            raise StratumError(20, "client is not authorized")
         self._ensure_job_cache_state()
         phases = self._job_build_phases()
-        cached_bundle = self.shared_job_bundle(artifacts, client.worker)
+        while True:
+            worker = client.worker
+            if worker is None:
+                raise StratumError(20, "client is not authorized")
+            cached_bundle = self.shared_job_bundle(artifacts, worker)
+            current_worker = client.worker
+            if not cached_bundle.collection_only or current_worker == worker:
+                break
+            # Reauthorization changed a genuine collection input while the
+            # worker-specific bundle was being built. Re-select the latest
+            # identity without refetching or discarding the exact artifacts.
         stamp_started = time.monotonic()
         context = self.stamp_job_for_client(client, cached_bundle, clean_jobs=clean_jobs)
         phases["stamp"] = phases.get("stamp", 0.0) + (time.monotonic() - stamp_started)
