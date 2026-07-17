@@ -98,6 +98,7 @@ DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS = 30.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
 DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
 DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
+PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
@@ -156,9 +157,26 @@ PRISM_CTV_BROADCASTER_SECONDS_BUCKETS = (
 PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS = (1, 2, 5, 10, 25, 50, 100)
 PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
-PRISM_JOB_BUILD_PHASES = ("reorg", "template", "merkle", "ledger", "bundle", "stamp", "send")
+PRISM_JOB_BUILD_PHASES = (
+    "reorg",
+    "template",
+    "merkle",
+    "ledger",
+    "bundle",
+    "executor_queue",
+    "client_lock",
+    "payout_gate",
+    "stamp",
+    "socket_send",
+    "send",
+)
 PRISM_JOB_CACHE_KINDS = ("template", "bundle")
 PRISM_TIP_REFRESH_RESULTS = ("sent", "skipped", "disconnected", "failed")
+PRISM_TIP_REFRESH_CANCELLATION_STAGES = (
+    "executor_queue",
+    "client_lock",
+    "payout_gate",
+)
 PRISM_EVICTED_JOB_CLASSES = ("same_tip", "stale_grace")
 PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = ("accepted_same_tip", "credited_stale_grace")
 PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection",)
@@ -1040,6 +1058,35 @@ class _PayoutStateDeliveryGate:
                 self._active_deliveries -= 1
                 if self._active_deliveries == 0:
                     self._condition.notify_all()
+
+    @contextmanager
+    def delivery_cancelable(
+        self,
+        cancelled: Callable[[], bool],
+        *,
+        poll_seconds: float = PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
+    ) -> Iterator[bool]:
+        """Admit a delivery unless cancellation wins while mutation owns the gate."""
+
+        admitted = False
+        with self._condition:
+            while self._mutation_owner is not None:
+                if cancelled():
+                    break
+                self._condition.wait(timeout=poll_seconds)
+            if self._mutation_owner is None and not cancelled():
+                self._active_deliveries += 1
+                admitted = True
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self._condition:
+                    if self._active_deliveries <= 0:
+                        raise RuntimeError("payout delivery gate released without admission")
+                    self._active_deliveries -= 1
+                    if self._active_deliveries == 0:
+                        self._condition.notify_all()
 
     @contextmanager
     def mutation(self) -> Iterator[None]:
@@ -2560,6 +2607,10 @@ class PrismCoordinator:
             self.tip_refresh_client_counts = {
                 result: 0 for result in PRISM_TIP_REFRESH_RESULTS
             }
+        if not hasattr(self, "tip_refresh_cancellation_counts"):
+            self.tip_refresh_cancellation_counts = {
+                stage: 0 for stage in PRISM_TIP_REFRESH_CANCELLATION_STAGES
+            }
         if not hasattr(self, "tip_refresh_inflight"):
             self.tip_refresh_inflight = 0
         if not hasattr(self, "_tip_refresh_pending_event"):
@@ -2672,6 +2723,13 @@ class PrismCoordinator:
         self._ensure_tip_refresh_state()
         with self._tip_refresh_metrics_lock:
             self.tip_refresh_client_counts[result] += 1
+
+    def _record_tip_refresh_cancellation(self, stage: str) -> None:
+        if stage not in PRISM_TIP_REFRESH_CANCELLATION_STAGES:
+            raise ValueError(f"unknown tip refresh cancellation stage: {stage}")
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_metrics_lock:
+            self.tip_refresh_cancellation_counts[stage] += 1
 
     def _tip_refresh_future_started(self) -> None:
         self._ensure_tip_refresh_state()
@@ -3569,6 +3627,27 @@ class PrismCoordinator:
             if active is not None and active[0] is token and active[1] is cancel_event:
                 self._active_tip_refresh = None
 
+    def _prepared_tip_refresh_obsolete(
+        self,
+        validation_token: TipRefreshValidationToken,
+        bundle: CachedJobBundle,
+        snapshot: QbitTipTemplateSnapshot,
+        cancel_event: _FanoutCancellation | None,
+    ) -> bool:
+        if self.stop_event.is_set() or (
+            cancel_event is not None and cancel_event.is_set()
+        ):
+            return True
+        with self.lock:
+            current = self._tip_refresh_token_current_locked(
+                validation_token,
+                bundle,
+                snapshot,
+            )
+        if not current and cancel_event is not None:
+            cancel_event.cancel()
+        return not current
+
     def send_prepared_job(
         self,
         client: ClientState,
@@ -3578,25 +3657,51 @@ class PrismCoordinator:
         expected_connection_id: int,
         expected_active_job: PrismJobContext | None,
         cancel_event: _FanoutCancellation | None = None,
+        submitted_monotonic: float | None = None,
     ) -> RefreshResult:
-        started = time.monotonic()
+        worker_started = time.monotonic()
+        started = worker_started if submitted_monotonic is None else submitted_monotonic
         phases = self._job_build_phases()
         phases.clear()
-        with client.job_update_lock:
-            if self.stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
-                return RefreshResult("skipped")
-            with self.lock:
-                token_current = self._tip_refresh_token_current_locked(
+        phases["executor_queue"] = max(0.0, worker_started - started)
+        client_lock_started = worker_started
+        client_lock_acquired = False
+        client_lock_attempted = False
+        try:
+            while True:
+                if self._prepared_tip_refresh_obsolete(
                     validation_token,
                     bundle,
                     snapshot,
-                )
-                if not token_current:
-                    if cancel_event is not None:
-                        cancel_event.cancel()
-                    raise TemplateRefreshBlocked(
-                        "prepared refresh token was superseded before delivery"
+                    cancel_event,
+                ):
+                    phases["client_lock"] = max(
+                        0.0,
+                        time.monotonic() - client_lock_started,
                     )
+                    self._record_tip_refresh_cancellation(
+                        "client_lock" if client_lock_attempted else "executor_queue"
+                    )
+                    return RefreshResult("skipped")
+                client_lock_attempted = True
+                client_lock_acquired = client.job_update_lock.acquire(
+                    timeout=PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS
+                )
+                if client_lock_acquired:
+                    break
+            phases["client_lock"] = max(
+                0.0,
+                time.monotonic() - client_lock_started,
+            )
+            if self._prepared_tip_refresh_obsolete(
+                validation_token,
+                bundle,
+                snapshot,
+                cancel_event,
+            ):
+                self._record_tip_refresh_cancellation("client_lock")
+                return RefreshResult("skipped")
+            with self.lock:
                 if (
                     client not in self.clients
                     or client.connection_id != expected_connection_id
@@ -3609,14 +3714,33 @@ class PrismCoordinator:
                     or not self.client_needs_tip_template_refresh(client, snapshot)
                 ):
                     return RefreshResult("skipped")
-            if self.stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
-                return RefreshResult("skipped")
             self._ensure_job_cache_state()
-            with self._payout_state_delivery_gate.delivery():
-                delivery_admitted = (
+            payout_gate_started = time.monotonic()
+            with self._payout_state_delivery_gate.delivery_cancelable(
+                lambda: self._prepared_tip_refresh_obsolete(
+                    validation_token,
+                    bundle,
+                    snapshot,
+                    cancel_event,
+                )
+            ) as payout_admitted:
+                phases["payout_gate"] = max(
+                    0.0,
+                    time.monotonic() - payout_gate_started,
+                )
+                if not payout_admitted or self._prepared_tip_refresh_obsolete(
+                    validation_token,
+                    bundle,
+                    snapshot,
+                    cancel_event,
+                ):
+                    self._record_tip_refresh_cancellation("payout_gate")
+                    return RefreshResult("skipped")
+                fanout_admitted = (
                     cancel_event is None or cancel_event.begin_delivery()
                 )
-                if not delivery_admitted:
+                if not fanout_admitted:
+                    self._record_tip_refresh_cancellation("payout_gate")
                     return RefreshResult("skipped")
                 try:
                     # The validation token binds this immutable bundle to the
@@ -3632,9 +3756,7 @@ class PrismCoordinator:
                         if not token_current:
                             if cancel_event is not None:
                                 cancel_event.cancel()
-                            raise TemplateRefreshBlocked(
-                                "prepared refresh token was superseded at delivery gate"
-                            )
+                            return RefreshResult("skipped")
                         if (
                             client not in self.clients
                             or client.connection_id != expected_connection_id
@@ -3672,28 +3794,40 @@ class PrismCoordinator:
                         client.active_job_ids.add(context.job.job_id)
                         self.prune_client_active_jobs(client)
 
-                    phase_started = time.monotonic()
-                    self.send_job_update(client, context.job)
+                    socket_send_started = time.monotonic()
+                    try:
+                        self.send_job_update(client, context.job)
+                    finally:
+                        socket_send_finished = time.monotonic()
+                        phases["socket_send"] = max(
+                            0.0,
+                            socket_send_finished - socket_send_started,
+                        )
                     self.apply_job_difficulty(client, context.job)
                     self.note_tip_work_delivered(
                         client,
                         str(context.template["previousblockhash"]),
                     )
                     delivered_monotonic = time.monotonic()
-                    phases["send"] = delivered_monotonic - phase_started
-                    elapsed = delivered_monotonic - started
-                    self.observe_job_build_elapsed(elapsed, phases)
                     if getattr(self, "hot_path_log_enabled", False):
                         print(
                             "prism coordinator: sent prepared job "
                             f"connection={client.connection_id} username={client.username} "
-                            f"job={context.job.job_id} elapsed={elapsed:.3f}s",
+                            f"job={context.job.job_id} "
+                            f"elapsed={delivered_monotonic - started:.3f}s",
                             flush=True,
                         )
                     return RefreshResult("sent", delivered_monotonic)
                 finally:
                     if cancel_event is not None:
                         cancel_event.end_delivery()
+        finally:
+            if client_lock_acquired:
+                client.job_update_lock.release()
+            self.observe_job_build_elapsed(
+                max(0.0, time.monotonic() - started),
+                phases,
+            )
 
     def _fanout_prepared_tip_refresh(
         self,
@@ -3724,16 +3858,51 @@ class PrismCoordinator:
             cancel_event,
         )
         futures: dict[Future[RefreshResult], ClientState] = {}
+        submitted_at: dict[Future[RefreshResult], float] = {}
+        queued_cancellations: set[Future[RefreshResult]] = set()
         if expected_active_jobs is None:
             with self.lock:
                 expected_active_jobs = {
                     client: client.active_job
                     for client in clients
                 }
-        for client in clients:
-            if self.stop_event.is_set():
-                break
-            try:
+        clients_iter = iter(clients)
+        max_inflight = max(1, int(self.tip_refresh_max_workers))
+
+        def record_queued_cancellation(future: Future[RefreshResult]) -> None:
+            if future in queued_cancellations:
+                return
+            queued_cancellations.add(future)
+            elapsed = max(0.0, time.monotonic() - submitted_at[future])
+            self.observe_job_build_elapsed(elapsed, {"executor_queue": elapsed})
+            self._record_tip_refresh_cancellation("executor_queue")
+
+        def cancel_pending_futures(pending: set[Future[RefreshResult]]) -> None:
+            cancel_event.cancel()
+            for future in pending:
+                if future.cancel():
+                    record_queued_cancellation(future)
+
+        def submit_available(pending: set[Future[RefreshResult]]) -> None:
+            while (
+                len(pending) < max_inflight
+                and not self.stop_event.is_set()
+                and not cancel_event.is_set()
+            ):
+                with self.lock:
+                    token_current = self._tip_refresh_token_current_locked(
+                        validation_token,
+                        bundle,
+                        snapshot,
+                    )
+                if not token_current:
+                    cancel_event.cancel()
+                    return
+                try:
+                    client = next(clients_iter)
+                except StopIteration:
+                    return
+                submitted = time.monotonic()
                 future = executor.submit(
                     self.send_prepared_job,
                     client,
@@ -3743,45 +3912,46 @@ class PrismCoordinator:
                     client.connection_id,
                     expected_active_jobs.get(client),
                     cancel_event,
+                    submitted,
                 )
-            except RuntimeError:
-                if self.stop_event.is_set():
-                    break
-                cancel_event.set()
-                for submitted_future in futures:
-                    submitted_future.cancel()
-                if futures:
-                    wait(set(futures))
-                self._schedule_tip_refresh_retry()
-                self._clear_active_tip_refresh(validation_token, cancel_event)
-                raise
-            self._tip_refresh_future_started()
-            future.add_done_callback(self._tip_refresh_future_finished)
-            futures[future] = client
+                self._tip_refresh_future_started()
+                future.add_done_callback(self._tip_refresh_future_finished)
+                futures[future] = client
+                submitted_at[future] = submitted
+                pending.add(future)
 
+        pending: set[Future[RefreshResult]] = set()
         try:
-            pending = set(futures)
             sent = 0
             failed = 0
             first_delivery: float | None = None
             last_delivery: float | None = None
             invalidation: TemplateRefreshBlocked | None = None
             last_live_trust_check = time.monotonic()
+            try:
+                submit_available(pending)
+            except RuntimeError:
+                cancel_pending_futures(pending)
+                cancel_event.set()
+                if pending:
+                    wait(pending)
+                if not self.stop_event.is_set():
+                    self._schedule_tip_refresh_retry()
+                    raise
             while pending:
                 self._record_heartbeat(heartbeat_name)
-                if self.stop_event.is_set():
-                    cancel_event.set()
-                    for future in pending:
-                        future.cancel()
-                    break
+                if self.stop_event.is_set() or cancel_event.is_set():
+                    cancel_pending_futures(pending)
                 done, pending = wait(
                     pending,
-                    timeout=1.0,
+                    timeout=PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
                     return_when=FIRST_COMPLETED,
                 )
                 for future in done:
                     client = futures[future]
                     if future.cancelled():
+                        if future not in queued_cancellations:
+                            record_queued_cancellation(future)
                         self._record_tip_refresh_client_result("skipped")
                         continue
                     try:
@@ -3794,9 +3964,7 @@ class PrismCoordinator:
                         failed += 1
                         self._record_tip_refresh_client_result("failed")
                         invalidation = exc
-                        cancel_event.set()
-                        for pending_future in pending:
-                            pending_future.cancel()
+                        cancel_pending_futures(pending)
                         continue
                     except Exception:
                         failed += 1
@@ -3854,10 +4022,20 @@ class PrismCoordinator:
                         )
                         invalidation.__cause__ = exc
                     if invalidation is not None:
+                        cancel_pending_futures(pending)
+                if invalidation is None:
+                    try:
+                        submit_available(pending)
+                    except RuntimeError:
+                        cancel_pending_futures(pending)
                         cancel_event.set()
-                        for pending_future in pending:
-                            pending_future.cancel()
+                        if pending:
+                            wait(pending)
+                        if not self.stop_event.is_set():
+                            self._schedule_tip_refresh_retry()
+                            raise
             if invalidation is not None:
+                cancel_event.set()
                 self._schedule_tip_refresh_retry()
                 raise invalidation
             with self.lock:
@@ -8274,6 +8452,7 @@ class PrismCoordinator:
                 for name, histogram in self.tip_refresh_histograms.items()
             }
             client_counts = dict(self.tip_refresh_client_counts)
+            cancellation_counts = dict(self.tip_refresh_cancellation_counts)
             inflight = self.tip_refresh_inflight
 
         metric_names = {
@@ -8314,6 +8493,12 @@ class PrismCoordinator:
                     f'qbit_prism_tip_refresh_clients_total{{result="{result}"}} {int(client_counts.get(result, 0))}'
                     for result in PRISM_TIP_REFRESH_RESULTS
                 ],
+                "# HELP qbit_prism_tip_refresh_cancellations_total Obsolete prepared refresh tasks canceled before delivery admission.",
+                "# TYPE qbit_prism_tip_refresh_cancellations_total counter",
+                *[
+                    f'qbit_prism_tip_refresh_cancellations_total{{stage="{stage}"}} {int(cancellation_counts.get(stage, 0))}'
+                    for stage in PRISM_TIP_REFRESH_CANCELLATION_STAGES
+                ],
                 "# HELP qbit_prism_tip_refresh_inflight Prepared refresh client tasks currently queued or running.",
                 "# TYPE qbit_prism_tip_refresh_inflight gauge",
                 f"qbit_prism_tip_refresh_inflight {inflight}",
@@ -8341,7 +8526,7 @@ class PrismCoordinator:
         else:
             connected_clients = len(getattr(self, "clients", ()))
         lines = [
-            "# HELP qbit_prism_job_build_seconds Wall time from job build start to job sent, per client job.",
+            "# HELP qbit_prism_job_build_seconds Wall time from client job build or prepared submission to completion, including skipped prepared tasks.",
             "# TYPE qbit_prism_job_build_seconds histogram",
         ]
         for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS:
