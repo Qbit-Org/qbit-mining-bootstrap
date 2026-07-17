@@ -30,6 +30,7 @@ from lab.prism.prism_coordinator import (
     PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
     PRISM_REJECTION_DUPLICATE_SHARE,
     PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
+    PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
     PRISM_REJECTION_LOW_DIFFICULTY,
     PendingShareAppend,
     PrismBlockCandidate,
@@ -4213,6 +4214,138 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
         self.assertEqual(ledger.persisted, [])
         self.assertEqual(ledger.pending, [])
+
+    def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
+        self,
+    ) -> None:
+        parent_hash = "ed" * 32
+        ancestor_hash = "ee" * 32
+        server, state, ledger = submit_coordinator(tip=parent_hash)
+        server.max_blocks = 10
+        server.stop_after_block = False
+        ledger.durable_payout_state = True
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        context = server.jobs["job-1"]
+        context.template["height"] = 12
+        context.prior_balances = preview
+        original_rpc_call = server.rpc.call
+        submit_calls: list[str] = []
+
+        def active_ancestor_call(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getblockhash":
+                self.assertEqual(params, [10])
+                return ancestor_hash
+            if method == "submitblock":
+                submit_calls.append(method)
+            return original_rpc_call(method, params)
+
+        server.rpc.call = active_ancestor_call  # type: ignore[method-assign]
+        server._begin_accepted_block_payout_preview(
+            ancestor_hash,
+            block_height=10,
+        )
+        server._publish_accepted_block_payout_preview(ancestor_hash, preview)
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("descendant must wait for ancestor durability")
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="ef" * 32,
+            block_hex="00",
+        )
+
+        accepted = server.submit_block_candidate(
+            block_candidate(server, state, submission)
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(submit_calls, [])
+        self.assertEqual(ledger.persisted, [])
+        self.assertEqual(
+            server._block_candidate_outcome.reason,
+            PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+        )
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
+        )
+        self.assertFalse(server.stop_event.is_set())
+
+    def test_active_descendant_replay_stays_landed_until_ancestor_is_durable(
+        self,
+    ) -> None:
+        parent_hash = "ea" * 32
+        ancestor_hash = "eb" * 32
+        descendant_hash = "ec" * 32
+        server, state, ledger = submit_coordinator(tip=parent_hash)
+        server.max_blocks = 10
+        server.stop_after_block = False
+        ledger.durable_payout_state = True
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        context = server.jobs["job-1"]
+        context.template["height"] = 12
+        context.prior_balances = preview
+        original_rpc_call = server.rpc.call
+
+        def active_descendant_call(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getbestblockhash":
+                return descendant_hash
+            if method == "getblockhash":
+                self.assertEqual(params, [10])
+                return ancestor_hash
+            if method == "submitblock":
+                raise AssertionError("active descendant must not be resubmitted")
+            return original_rpc_call(method, params)
+
+        server.rpc.call = active_descendant_call  # type: ignore[method-assign]
+        server._begin_accepted_block_payout_preview(
+            ancestor_hash,
+            block_height=10,
+        )
+        server._publish_accepted_block_payout_preview(ancestor_hash, preview)
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("active descendant must wait for ancestor durability")
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=descendant_hash,
+            block_hex="00",
+        )
+
+        accepted = server.submit_block_candidate(
+            block_candidate(server, state, submission)
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(ledger.persisted, [])
+        self.assertEqual(
+            server._block_candidate_outcome.reason,
+            PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+        )
+        transition = server._accepted_block_payout_previews[descendant_hash]
+        self.assertTrue(transition.landed)
+        self.assertIsNone(transition.preview)
+        self.assertFalse(server.stop_event.is_set())
 
     def test_block_submit_reconciliation_error_is_structured_rejection(self) -> None:
         tip = "f0" * 32

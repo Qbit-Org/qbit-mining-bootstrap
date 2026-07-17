@@ -2309,25 +2309,24 @@ class PrismCoordinator:
                     # preview or to database balances that omit it.
                     self._advance_payout_state_generation()
 
-    def _accepted_block_payout_preview_published(self, block_hash: str) -> bool:
-        self._ensure_job_cache_state()
-        with self._accepted_block_payout_preview_condition:
-            transition = self._accepted_block_payout_previews.get(block_hash.lower())
-            return transition is not None and transition.preview is not None
-
     def _accepted_block_payout_transition_landed(self, block_hash: str) -> bool:
         self._ensure_job_cache_state()
         with self._accepted_block_payout_preview_condition:
             transition = self._accepted_block_payout_previews.get(block_hash.lower())
             return transition is not None and transition.landed
 
-    def _prior_balances_for_job_parent(
+    def _accepted_block_payout_transition_for_parent(
         self,
         parent_hash: str,
         *,
         parent_height: int | None = None,
-    ) -> list[dict[str, object]]:
-        """Return confirmed or prospective balances for active-chain work."""
+    ) -> tuple[str, bool] | None:
+        """Select the highest active exact/ancestor payout transition.
+
+        The boolean result is true for an invalidated landed transition. The
+        caller decides whether to wait for a live preview or fail closed on its
+        tombstone.
+        """
         self._ensure_job_cache_state()
         key = parent_hash.lower()
         with self._accepted_block_payout_preview_condition:
@@ -2359,39 +2358,54 @@ class PrismCoordinator:
                 and parent_height is not None
                 and candidate_height <= parent_height
             )
-        selected_key: str | None = (
-            key if exact_transition is not None or exact_invalidated else None
-        )
-        selected_invalidated = exact_invalidated
-        if selected_key is None and ancestor_candidates:
-            active_ancestors: list[tuple[int, str, bool]] = []
-            try:
-                for (
-                    candidate_hash,
-                    candidate_height,
-                    candidate_invalidated,
-                ) in ancestor_candidates:
-                    assert candidate_height is not None
-                    active_hash = str(
-                        self.rpc.call("getblockhash", [candidate_height])
-                    ).lower()
-                    if active_hash == candidate_hash:
-                        active_ancestors.append(
-                            (
-                                candidate_height,
-                                candidate_hash,
-                                candidate_invalidated,
-                            )
+        if exact_transition is not None or exact_invalidated:
+            return key, exact_invalidated
+        if not ancestor_candidates:
+            return None
+
+        active_ancestors: list[tuple[int, str, bool]] = []
+        try:
+            for (
+                candidate_hash,
+                candidate_height,
+                candidate_invalidated,
+            ) in ancestor_candidates:
+                assert candidate_height is not None
+                active_hash = str(
+                    self.rpc.call("getblockhash", [candidate_height])
+                ).lower()
+                if active_hash == candidate_hash:
+                    active_ancestors.append(
+                        (
+                            candidate_height,
+                            candidate_hash,
+                            candidate_invalidated,
                         )
-            except Exception as exc:
-                self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
-                    "could not validate an accepted payout preview on the active chain"
-                ) from exc
-            if active_ancestors:
-                _, selected_key, selected_invalidated = max(active_ancestors)
-        if selected_key is None:
+                    )
+        except Exception as exc:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "could not validate an accepted payout preview on the active chain"
+            ) from exc
+        if not active_ancestors:
+            return None
+        _, selected_key, selected_invalidated = max(active_ancestors)
+        return selected_key, selected_invalidated
+
+    def _prior_balances_for_job_parent(
+        self,
+        parent_hash: str,
+        *,
+        parent_height: int | None = None,
+    ) -> list[dict[str, object]]:
+        """Return confirmed or prospective balances for active-chain work."""
+        selected = self._accepted_block_payout_transition_for_parent(
+            parent_hash,
+            parent_height=parent_height,
+        )
+        if selected is None:
             return self.ledger.current_prior_balances()
+        selected_key, selected_invalidated = selected
         if selected_invalidated:
             self._schedule_tip_refresh_retry()
             raise TemplateRefreshBlocked(
@@ -8298,6 +8312,56 @@ class PrismCoordinator:
             return None
         return height if confirmations > 0 else None
 
+    def _defer_for_pending_parent_payout_transition(
+        self,
+        *,
+        parent_hash: str,
+        parent_height: int,
+        worker: str | None,
+        active_candidate_hash: str | None = None,
+        active_candidate_height: int | None = None,
+    ) -> bool:
+        """Defer finalization while an active payout ancestor is not durable."""
+        if (active_candidate_hash is None) != (active_candidate_height is None):
+            raise ValueError("active candidate hash and height must be provided together")
+
+        def preserve_active_candidate_barrier() -> None:
+            if active_candidate_hash is None or active_candidate_height is None:
+                return
+            self._begin_accepted_block_payout_preview(
+                active_candidate_hash,
+                block_height=active_candidate_height,
+            )
+            self._mark_accepted_block_payout_landed(
+                active_candidate_hash,
+                block_height=active_candidate_height,
+            )
+
+        try:
+            pending_parent_transition = (
+                self._accepted_block_payout_transition_for_parent(
+                    parent_hash,
+                    parent_height=parent_height,
+                )
+            )
+        except TemplateRefreshBlocked as exc:
+            preserve_active_candidate_barrier()
+            self._abandon_block_candidate(
+                PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                f"could not validate pending ancestor payout state: {exc}",
+                worker=worker,
+            )
+            return True
+        if pending_parent_transition is None:
+            return False
+        preserve_active_candidate_barrier()
+        self._abandon_block_candidate(
+            PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+            "parent or ancestor payout confirmation is still pending",
+            worker=worker,
+        )
+        return True
+
     def _land_and_confirm_block_candidate(
         self,
         candidate: PrismBlockCandidate,
@@ -8327,15 +8391,13 @@ class PrismCoordinator:
             getattr(self.ledger, "durable_payout_state", False)
         )
         with self._payout_balance_mutation_lock:
-            if (
-                not already_active
-                and self._accepted_block_payout_preview_published(parent_hash)
+            if self._defer_for_pending_parent_payout_transition(
+                parent_hash=parent_hash,
+                parent_height=expected_height - 1,
+                worker=worker,
+                active_candidate_hash=block_hash if already_active else None,
+                active_candidate_height=expected_height if already_active else None,
             ):
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
-                    "parent payout confirmation is still pending",
-                    worker=worker,
-                )
                 return None
             block_state: dict[str, object] | None = None
             block_state_reader = getattr(self.ledger, "pool_block_state", None)
@@ -8410,6 +8472,16 @@ class PrismCoordinator:
                     "reorg reconciliation reported an untrusted chain view",
                     worker=worker,
                 )
+                return None
+            if (
+                already_active
+                and not already_confirmed
+                and self._defer_for_pending_parent_payout_transition(
+                    parent_hash=parent_hash,
+                    parent_height=expected_height - 1,
+                    worker=worker,
+                )
+            ):
                 return None
             if (
                 durable_payout_state
