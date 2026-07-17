@@ -115,6 +115,7 @@ def coordinator(*, connection_limit: int = 3, pending_limit: int = 2) -> PrismCo
     server.started_monotonic = 0.0
     server.submitted_share_count = 0
     server.rejection_counts_by_reason = {}
+    server.tip_template_snapshot = None
     server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
     server.apply_stratum_send_timeout = lambda _sock: None  # type: ignore[method-assign]
     server.client_startup_difficulty = lambda _profile: Decimal("1")  # type: ignore[method-assign]
@@ -340,7 +341,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         rescheduled: list[bool] = []
 
         def observe_handoff(current: ClientState) -> None:
-            self.assertTrue(current.closing.is_set())
+            self.assertTrue(current.closing)
             rescheduled.append(server.schedule_initial_job(current))
             self.assertNotIn(current, server.pending_initial_jobs)
             disconnect_client(current)
