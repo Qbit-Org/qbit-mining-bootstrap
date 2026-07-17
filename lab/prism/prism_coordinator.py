@@ -5334,6 +5334,13 @@ class PrismCoordinator:
                                 "qbit chain view became untrusted during prepared fanout"
                             )
                         last_live_trust_check = time.monotonic()
+                    except ShutdownInProgress:
+                        # Admission can close after the stop-event check above
+                        # but before reconciliation enters its writer scope.
+                        # Preserve the intentional shutdown signal so the
+                        # poller cannot consume its template-failure budget.
+                        cancel_pending_futures(pending)
+                        raise
                     except TemplateRefreshBlocked as exc:
                         invalidation = exc
                     except Exception as exc:
