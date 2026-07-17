@@ -1028,16 +1028,22 @@ class PublishedPayoutState:
     published_monotonic: float
 
 
-@dataclass(frozen=True)
+@dataclass
 class _PayoutDeliveryAdmission:
     admitted: bool
     wait_seconds: float
     generation: int
     published_generation: int
     relation: str
+    delivered: bool = False
 
     def __bool__(self) -> bool:
         return self.admitted
+
+    def mark_delivered(self) -> None:
+        if not self.admitted:
+            raise RuntimeError("payout delivery completed without admission")
+        self.delivered = True
 
 
 class _FanoutCancellation:
@@ -1116,6 +1122,7 @@ class _PayoutStateDeliveryGate:
             if not admission:
                 raise RuntimeError("uncancelled payout delivery was not admitted")
             yield
+            admission.mark_delivered()
 
     @contextmanager
     def delivery_cancelable(
@@ -1180,9 +1187,15 @@ class _PayoutStateDeliveryGate:
                     if self._active_deliveries <= 0:
                         raise RuntimeError("payout delivery gate released without admission")
                     self._active_deliveries -= 1
-                    if priority and generation == self._priority_generation:
+                    if (
+                        priority
+                        and admission.delivered
+                        and generation == self._priority_generation
+                    ):
                         # Keep routine same-generation sends queued until the
                         # first prioritized current-tip socket delivery exits.
+                        # Privileged synchronization admissions do not consume
+                        # this reservation merely by leaving the gate.
                         self._priority_generation = None
                     if self._active_deliveries == 0:
                         self._condition.notify_all()
@@ -2472,15 +2485,21 @@ class PrismCoordinator:
                             # Signal its fanout only after atomic publication.
                             active_to_cancel = active[1]
                             schedule_retry = True
-                        self._payout_state_delivery_gate.publish_generation(
-                            published_generation,
-                            prioritize_delivery=True,
-                        )
                         with self._payout_state_metrics_lock:
                             self._payout_first_delivery_pending = (
                                 published_generation,
                                 candidate.invalidated_monotonic,
                             )
+            if published_generation is not None:
+                # The mutation owner still blocks every delivery admission,
+                # so the pointer swap and gate generation remain one atomic
+                # publication boundary. Do not acquire the gate condition
+                # while holding coordinator locks: cancellation callbacks take
+                # those locks after entering the gate wait loop.
+                self._payout_state_delivery_gate.publish_generation(
+                    published_generation,
+                    prioritize_delivery=True,
+                )
         self._observe_payout_state_seconds(
             "publish",
             max(0.0, time.monotonic() - publish_started),
@@ -4541,6 +4560,7 @@ class PrismCoordinator:
                     socket_send_started = time.monotonic()
                     try:
                         self.send_job_update(client, context.job)
+                        payout_admitted.mark_delivered()
                     finally:
                         socket_send_finished = time.monotonic()
                         phases["socket_send"] = max(
@@ -6901,6 +6921,7 @@ class PrismCoordinator:
                 self.prune_client_active_jobs(client)
             phase_started = time.monotonic()
             self.send_job_update(client, context.job)
+            payout_admitted.mark_delivered()
             self.apply_job_difficulty(client, context.job)
             self.note_tip_work_delivered(client, str(context.template["previousblockhash"]))
             delivered_monotonic = time.monotonic()

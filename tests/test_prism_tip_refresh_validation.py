@@ -566,6 +566,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             ) as admission:
                 if admission:
                     admitted_order.append(name)
+                    admission.mark_delivered()
 
         def stale_waiter() -> None:
             with gate.delivery_cancelable(lambda: False, generation=0) as admission:
@@ -645,6 +646,90 @@ class TipRefreshValidationTests(unittest.TestCase):
             priority=True,
         ) as admission:
             self.assertTrue(admission)
+            admission.mark_delivered()
+
+    def test_publication_updates_gate_without_coordinator_locks(self) -> None:
+        server, _rpc = coordinator()
+        server._reserve_payout_state_source("payout_only")
+        original_publish_generation = (
+            server._payout_state_delivery_gate.publish_generation
+        )
+        lock_snapshots: list[tuple[bool, bool]] = []
+
+        def observe_locks(
+            generation: int,
+            *,
+            prioritize_delivery: bool,
+        ) -> None:
+            lock_snapshots.append(
+                (
+                    server._job_cache_lock.locked(),
+                    server.lock._is_owned(),  # type: ignore[attr-defined]
+                )
+            )
+            original_publish_generation(
+                generation,
+                prioritize_delivery=prioritize_delivery,
+            )
+
+        server._payout_state_delivery_gate.publish_generation = observe_locks  # type: ignore[method-assign]
+
+        self.assertEqual(
+            server._publish_payout_state_candidate(
+                server._current_payout_state_candidate()
+            ),
+            1,
+        )
+        self.assertEqual(lock_snapshots, [(False, False)])
+
+    def test_pending_clear_does_not_consume_first_delivery_priority(self) -> None:
+        server, _rpc = coordinator()
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = snapshot
+        server._reserve_payout_state_source("payout_only")
+        self.assertEqual(
+            server._publish_payout_state_candidate(
+                server._current_payout_state_candidate()
+            ),
+            1,
+        )
+
+        self.assertTrue(
+            server._clear_tip_refresh_pending_for_completed_refresh(
+                snapshot,
+                sequence,
+                1,
+            )
+        )
+        self.assertEqual(
+            server._payout_state_delivery_gate._priority_generation,
+            1,
+        )
+        with server._payout_state_delivery_gate.delivery_cancelable(
+            lambda: False,
+            generation=1,
+            priority=False,
+        ) as routine_admission:
+            self.assertFalse(routine_admission)
+        with server._payout_state_delivery_gate.delivery_cancelable(
+            lambda: False,
+            generation=1,
+            priority=True,
+        ) as first_delivery:
+            self.assertTrue(first_delivery)
+            first_delivery.mark_delivered()
+        self.assertIsNone(
+            server._payout_state_delivery_gate._priority_generation
+        )
 
     def test_collection_refresh_stops_when_chain_becomes_untrusted(self) -> None:
         server, _rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
@@ -1934,6 +2019,14 @@ class TipRefreshValidationTests(unittest.TestCase):
                 return None
 
         class AdvancingGate:
+            class Admission:
+                def __bool__(self) -> bool:
+                    return True
+
+                @staticmethod
+                def mark_delivered() -> None:
+                    pass
+
             @contextmanager
             def delivery_cancelable(
                 self,
@@ -1941,7 +2034,7 @@ class TipRefreshValidationTests(unittest.TestCase):
                 **_kwargs: object,
             ) -> object:
                 clock.advance(4.0)
-                yield True
+                yield self.Admission()
 
         state.job_update_lock = AdvancingLock()  # type: ignore[assignment]
         server._payout_state_delivery_gate = AdvancingGate()  # type: ignore[assignment]
