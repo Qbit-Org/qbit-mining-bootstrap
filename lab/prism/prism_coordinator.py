@@ -3766,6 +3766,7 @@ class PrismCoordinator:
             first_delivery: float | None = None
             last_delivery: float | None = None
             invalidation: TemplateRefreshBlocked | None = None
+            last_live_trust_check = time.monotonic()
             while pending:
                 self._record_heartbeat(heartbeat_name)
                 if self.stop_event.is_set():
@@ -3824,6 +3825,38 @@ class PrismCoordinator:
                                 if last_delivery is None
                                 else max(last_delivery, delivered)
                             )
+                if (
+                    pending
+                    and invalidation is None
+                    and not self.stop_event.is_set()
+                    and time.monotonic() - last_live_trust_check >= 1.0
+                ):
+                    # Validation tokens keep queued per-client deliveries
+                    # RPC-free, but they cannot observe headers advancing
+                    # ahead of blocks while the best-block hash stays fixed.
+                    # Recheck the live chain view from the fanout driver about
+                    # once per second and cancel every delivery still queued
+                    # if the view becomes untrusted.
+                    try:
+                        trusted = self.ensure_reorg_reconciled_for_current_tip(
+                            expected_tip_hash=snapshot.bestblockhash,
+                        )
+                        if not trusted:
+                            raise TemplateRefreshBlocked(
+                                "qbit chain view became untrusted during prepared fanout"
+                            )
+                        last_live_trust_check = time.monotonic()
+                    except TemplateRefreshBlocked as exc:
+                        invalidation = exc
+                    except Exception as exc:
+                        invalidation = TemplateRefreshBlocked(
+                            "qbit chain trust check failed during prepared fanout"
+                        )
+                        invalidation.__cause__ = exc
+                    if invalidation is not None:
+                        cancel_event.set()
+                        for pending_future in pending:
+                            pending_future.cancel()
             if invalidation is not None:
                 self._schedule_tip_refresh_retry()
                 raise invalidation

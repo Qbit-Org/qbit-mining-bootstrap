@@ -159,6 +159,11 @@ assert_equal(
 )
 for index, record in records.items():
     assert_equal(record.share_id, f"share-{index}", "each caller got its own share back")
+assert_equal(
+    ledger.accepted_share_stats()["accepted_share_count"],
+    single_count,
+    "cached share count before batch",
+)
 
 # The coordinator's share-writer group commit lands one atomic append_batch
 # statement; on the pooled client that is a single synchronously committed
@@ -176,14 +181,21 @@ assert_equal(
     list(range(single_count + 1, share_count + 1)),
     "batch extends the canonical sequence",
 )
+stats_before_replay = ledger.accepted_share_stats()
+assert_equal(stats_before_replay["accepted_share_count"], share_count, "cached share count before replay")
 
 # Replaying the exact same batch is idempotent: the same records come back
-# and nothing is double-committed.
+# and neither the database nor the accepted-share cache double-counts it.
 replayed_records = ledger.append_batch(batch_entries)
 assert_equal(
     [(record.share_seq, record.share_id) for record in replayed_records],
     [(record.share_seq, record.share_id) for record in batch_records],
     "batch replay returns the originally committed records",
+)
+assert_equal(
+    ledger.accepted_share_stats()["accepted_share_count"],
+    share_count,
+    "batch replay leaves cached share count unchanged",
 )
 
 try:

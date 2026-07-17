@@ -1057,24 +1057,22 @@ class _NativePostgresClient:
         finally:
             self._slots.release()
 
-    def run_json(self, sql: str) -> Any:
-        """Run one JSON-returning statement, retrying once on a dead connection.
+    def run_json(self, sql: str, *, retry_safe: bool = False) -> Any:
+        """Run one JSON-returning statement.
 
-        Mirrors JsonRpc.call's retry contract: the usual cause is the server
-        having closed an idle keep-alive connection, in which case the
-        statement never ran. If the first attempt committed and the connection
-        died returning the result, re-execution is safe for every ledger
-        statement: appends dedup on share_id (the batch statement is
-        explicitly idempotent), the lease upsert and block persists are
-        guarded by identity checks, and reads have no side effects.
+        An ``OperationalError`` does not reveal whether PostgreSQL committed
+        before the response was lost. Retry once only when the caller has
+        explicitly classified the statement as safe to execute again; every
+        mutation fails after the first ambiguous execution.
         """
-        for attempt in (0, 1):
+        attempts = 2 if retry_safe else 1
+        for attempt in range(attempts):
             try:
                 with self.connection() as conn:
                     row = conn.execute(sql).fetchone()
                 return parse_single_json_value(row[0] if row else None)
             except self._psycopg.OperationalError as exc:
-                if attempt:
+                if attempt + 1 >= attempts:
                     raise RuntimeError(f"postgres query failed: {exc}") from exc
         raise AssertionError("unreachable")
 
@@ -1190,7 +1188,6 @@ class PsqlShareLedger:
         self._stats_counts: dict[str, int] | None = None
         self._stats_miner_ids: set[str] = set()
         self._stats_refreshed_monotonic: float | None = None
-        self._stats_refresh_note_buffer: list[str] | None = None
         self._native = self._make_native_client(
             native_client_mode,
             database_url,
@@ -1345,12 +1342,17 @@ SELECT CASE
         ) FROM inserted)
 END;
 """
-        result = self._run_fenced_json(sql)
-        if "error" in result:
-            raise RuntimeError(str(result["error"]))
-        record = self._record_from_json(result)
-        self._note_appended_share(record)
-        return record
+        # Keep the database commit and its cache note in one critical section.
+        # A stats reconcile takes the same lock before opening its note buffer,
+        # so its aggregate cannot include this row and then replay its note a
+        # second time.
+        with self._lock:
+            result = self._run_json(sql)
+            if "error" in result:
+                raise RuntimeError(str(result["error"]))
+            record = self._record_from_json(result)
+            self._note_appended_share(record)
+            return record
 
     def append_batch(
         self,
@@ -1509,11 +1511,11 @@ inserted_candidates AS (
     RETURNING block_hash
 ),
 records AS (
-    SELECT ledger.*, payload.ordinality
+    SELECT ledger.*, payload.ordinality, false AS newly_inserted
     FROM payload
     JOIN qbit_share_ledger ledger ON ledger.share_id = payload.data->>'share_id'
     UNION ALL
-    SELECT inserted_shares.*, payload.ordinality
+    SELECT inserted_shares.*, payload.ordinality, true AS newly_inserted
     FROM inserted_shares
     JOIN payload ON payload.data->>'share_id' = inserted_shares.share_id
 )
@@ -1545,23 +1547,26 @@ SELECT CASE
                 'job_issued_at_ms', round(extract(epoch FROM records.job_issued_at) * 1000)::bigint,
                 'accepted_at_ms', round(extract(epoch FROM records.accepted_at) * 1000)::bigint,
                 'ntime', records.ntime,
-                'credit_policy', records.credit_policy
+                'credit_policy', records.credit_policy,
+                'newly_inserted', records.newly_inserted
             ) ORDER BY records.ordinality)
             FROM records
         )
     )
 END;
 """
-        result = self._run_fenced_json(sql)
-        if "error" in result:
-            raise RuntimeError(str(result["error"]))
-        records = result.get("records")
-        if not isinstance(records, list) or len(records) != len(entries):
-            raise RuntimeError("Postgres share batch returned an incomplete result")
-        parsed = [self._record_from_json(record) for record in records]
-        for record in parsed:
-            self._note_appended_share(record)
-        return parsed
+        with self._lock:
+            result = self._run_json(sql)
+            if "error" in result:
+                raise RuntimeError(str(result["error"]))
+            records = result.get("records")
+            if not isinstance(records, list) or len(records) != len(entries):
+                raise RuntimeError("Postgres share batch returned an incomplete result")
+            parsed = [self._record_from_json(record) for record in records]
+            for payload, record in zip(records, parsed, strict=True):
+                if bool(payload.get("newly_inserted", True)):
+                    self._note_appended_share(record)
+            return parsed
 
     def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
         """Persist candidate work that is not yet eligible for share credit."""
@@ -1646,7 +1651,7 @@ FROM (
 ) pending;
 """
         with self._lock:
-            return list(self._run_json(sql))
+            return list(self._run_retry_safe_read_json(sql))
 
     def mark_block_candidate_submitted(self, *, block_hash: str) -> bool:
         return self._finish_block_candidate(block_hash=block_hash, state="submitted", error=None)
@@ -1768,7 +1773,10 @@ SELECT COALESCE(json_agg(json_build_object(
 FROM rows;
 """
         with self._lock:
-            return [self._record_from_json(item) for item in self._run_json(sql)]
+            return [
+                self._record_from_json(item)
+                for item in self._run_retry_safe_read_json(sql)
+            ]
 
     def all_shares(self) -> list[AcceptedShareRecord]:
         sql = """
@@ -1791,7 +1799,10 @@ FROM qbit_share_ledger
 WHERE accepted;
 """
         with self._lock:
-            return [self._record_from_json(item) for item in self._run_json(sql)]
+            return [
+                self._record_from_json(item)
+                for item in self._run_retry_safe_read_json(sql)
+            ]
 
     def accepted_share_stats(self) -> dict[str, int]:
         """Aggregate counts without materializing the full share history.
@@ -1840,31 +1851,23 @@ WHERE accepted;
                         and now - self._stats_refreshed_monotonic <= ttl
                     ):
                         return dict(self._stats_counts)
-            # Shares committed while the aggregate runs are invisible to its
-            # MVCC snapshot but already acknowledged and noted; buffering
-            # their notes and replaying them onto the snapshot keeps the
-            # cache from regressing below what this writer has committed.
-            with stats_lock:
-                self._stats_refresh_note_buffer = []
-            try:
-                counts, miner_ids = self._query_accepted_share_stats()
-            except BaseException:
+            # Lock order is always database then stats. Appends retain the
+            # database lock through their cache note, so after this acquire a
+            # row is either already represented by its note or cannot commit
+            # until after the aggregate and cache publication complete.
+            with self._lock:
+                counts, miner_ids = self._query_accepted_share_stats_locked()
                 with stats_lock:
-                    self._stats_refresh_note_buffer = None
-                raise
-            with stats_lock:
-                replayed = self._stats_refresh_note_buffer or []
-                self._stats_refresh_note_buffer = None
-                for miner_id in replayed:
-                    counts["accepted_share_count"] += 1
-                    miner_ids.add(miner_id)
-                counts["distinct_miner_count"] = len(miner_ids)
-                self._stats_counts = dict(counts)
-                self._stats_miner_ids = miner_ids
-                self._stats_refreshed_monotonic = time.monotonic()
+                    self._stats_counts = dict(counts)
+                    self._stats_miner_ids = miner_ids
+                    self._stats_refreshed_monotonic = time.monotonic()
         return counts
 
     def _query_accepted_share_stats(self) -> tuple[dict[str, int], set[str]]:
+        with self._lock:
+            return self._query_accepted_share_stats_locked()
+
+    def _query_accepted_share_stats_locked(self) -> tuple[dict[str, int], set[str]]:
         sql = """
 SELECT json_build_object(
     'accepted_share_count', count(*),
@@ -1873,8 +1876,7 @@ SELECT json_build_object(
 FROM qbit_share_ledger
 WHERE accepted;
 """
-        with self._lock:
-            payload = self._run_json(sql)
+        payload = self._run_retry_safe_read_json(sql)
         miner_ids = {str(miner_id) for miner_id in payload["miner_ids"]}
         counts = {
             "accepted_share_count": int(payload["accepted_share_count"]),
@@ -1885,20 +1887,16 @@ WHERE accepted;
     def _note_appended_share(self, record: AcceptedShareRecord) -> None:
         """Advance the cached stats for a share this writer just committed.
 
-        A note landing while a reconcile's aggregate query is in flight is
-        also buffered and replayed onto that query's snapshot (the snapshot
-        cannot contain it), so a refresh never erases increments for shares
-        this writer already committed and acknowledged. An idempotent
-        ``append_batch`` replay of an already-committed share can over-advance
-        the counter by one; the periodic TTL reconcile absorbs it.
+        Append paths hold the database lock through this call, so a reconcile
+        observes the commit and note together or observes neither. Reconcile
+        snapshots therefore replace the cache directly without replaying
+        potentially overlapping notes. Idempotent ``append_batch`` replays are
+        not noted because the batch result identifies rows it actually inserted.
         """
         stats_lock = getattr(self, "_stats_lock", None)
         if stats_lock is None:
             return
         with stats_lock:
-            buffer = getattr(self, "_stats_refresh_note_buffer", None)
-            if buffer is not None:
-                buffer.append(record.miner_id)
             if self._stats_counts is None:
                 return
             self._stats_counts["accepted_share_count"] += 1
@@ -1918,7 +1916,7 @@ FROM qbit_current_owed_balances()
 WHERE owed_balance_sats > 0;
 """
         with self._lock:
-            balances = self._run_json(sql)
+            balances = self._run_retry_safe_read_json(sql)
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
@@ -1934,7 +1932,7 @@ SELECT COALESCE(json_agg(json_build_object(
 FROM qbit_current_carry_forward_balances();
 """
         with self._lock:
-            balances = self._run_json(sql)
+            balances = self._run_retry_safe_read_json(sql)
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
@@ -1942,7 +1940,7 @@ FROM qbit_current_carry_forward_balances();
     def carry_forward_integrity_report(self) -> dict[str, object]:
         sql = "SELECT qbit_carry_forward_integrity_report();"
         with self._lock:
-            report = self._run_json(sql)
+            report = self._run_retry_safe_read_json(sql)
             audit_head = self._carry_forward_audit_head_locked()
         report["backend"] = "postgres-psql"
         report.update(audit_head)
@@ -1988,7 +1986,7 @@ FROM (
       AND block.maturity_state <> 'reversed'
 ) active;
 """
-        rows = self._run_json(sql)
+        rows = self._run_retry_safe_read_json(sql)
         previous = bytes.fromhex("00" * 32)
         version = "qbit.prism.carry-forward-active-delta-chain.v1"
         for row in rows:
@@ -2027,7 +2025,7 @@ FROM qbit_audit_share_window(
 );
 """
         with self._lock:
-            rows = self._run_json(sql)
+            rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             for key in (
                 "window_multiplier",
@@ -2057,7 +2055,7 @@ SELECT COALESCE(json_agg(json_build_object(
 FROM qbit_audit_block_payouts({self._text_literal(block_hash)});
 """
         with self._lock:
-            rows = self._run_json(sql)
+            rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["carry_forward_balance_sats"] = int(row["carry_forward_balance_sats"])
         return rows
@@ -2092,7 +2090,7 @@ JOIN qbit_pool_blocks block
   ON block.block_hash = payout.block_hash;
 """
         with self._lock:
-            rows = self._run_json(sql)
+            rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["carry_forward_balance_sats"] = int(row["carry_forward_balance_sats"])
         return rows
@@ -2568,7 +2566,7 @@ SELECT COALESCE(
 );
 """
         with self._lock:
-            row = self._run_json(sql)
+            row = self._run_retry_safe_read_json(sql)
         return self._resolve_audit_bundle_row(row)
 
     def audit_bundle_by_commitment(self, *, commitment_leaf_hex: str) -> dict[str, object] | None:
@@ -2599,7 +2597,7 @@ SELECT COALESCE(
 );
 """
         with self._lock:
-            row = self._run_json(sql)
+            row = self._run_retry_safe_read_json(sql)
         return self._resolve_audit_bundle_row(row)
 
     def persist_ctv_fanout_manifest_set(
@@ -3396,7 +3394,7 @@ SELECT json_build_object(
 );
 """
         with self._lock:
-            metrics = self._run_json(sql)
+            metrics = self._run_retry_safe_read_json(sql)
         report = {str(key): int(value) for key, value in metrics.items()}
         report["shares"] = accepted_share_count
         return report
@@ -5179,7 +5177,7 @@ WHERE chain_state IN ('confirmed', 'inactive')
 ;
 """
         with self._lock:
-            rows = self._run_json(sql)
+            rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["block_height"] = int(row["block_height"])
         return rows
@@ -5261,7 +5259,7 @@ END;
     def __len__(self) -> int:
         sql = "SELECT json_build_object('count', count(*)) FROM qbit_share_ledger WHERE accepted;"
         with self._lock:
-            return int(self._run_json(sql)["count"])
+            return int(self._run_retry_safe_read_json(sql)["count"])
 
     def _run_fenced_json(self, sql: str) -> Any:
         with self._lock:
@@ -5269,7 +5267,13 @@ END;
 
     def _run_read_json(self, sql: str) -> Any:
         with self._read_semaphore:
-            return self._run_json(sql)
+            return self._run_retry_safe_read_json(sql)
+
+    def _run_retry_safe_read_json(self, sql: str) -> Any:
+        native = getattr(self, "_native", None)
+        if native is not None:
+            return native.run_json(sql, retry_safe=True)
+        return self._run_json(sql)
 
     def _ensure_writer_lease(self) -> None:
         while True:
