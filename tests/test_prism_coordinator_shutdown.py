@@ -225,9 +225,14 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         self.assertIn("accepted_block_handling", rendered)
         unblock.set()
         writer.join(1)
+        controller = server._ensure_shutdown_controller()
+        self.assertTrue(controller.claim_non_writer_drain())
+        controller.finish_non_writer_drain(0.0)
         with patch("builtins.print"):
             self.assertFalse(server.shutdown(reason="finally"))
+            self.assertFalse(server.release_ledger_lease())
         self.assertEqual(ledger.release_calls, 0)
+        self.assertTrue(controller.snapshot()["lease_release_withheld"])
 
     def test_repeated_shutdown_and_finally_release_at_most_once(self) -> None:
         ledger = RecordingLeaseLedger()
@@ -303,6 +308,39 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             server.blockpoll_loop()
 
         hard_exit.assert_not_called()
+
+    def test_ctv_loop_exits_cleanly_if_shutdown_wins_admission_race(self) -> None:
+        server = coordinator()
+        pass_observations: list[float] = []
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.observe_ctv_fanout_broadcaster_pass = (  # type: ignore[method-assign]
+            pass_observations.append
+        )
+
+        def rejected_pass(**_kwargs: object) -> object:
+            server.request_shutdown(signal.SIGTERM)
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+
+        server.run_ctv_fanout_broadcaster_once = rejected_pass  # type: ignore[method-assign]
+        with patch("builtins.print") as printed, patch(
+            "lab.prism.prism_coordinator.traceback.print_exc"
+        ) as traceback_printed:
+            server.ctv_fanout_broadcaster_loop()
+
+        self.assertEqual(pass_observations, [])
+        printed.assert_not_called()
+        traceback_printed.assert_not_called()
+
+    def test_startup_replays_stop_cleanly_after_shutdown_admission_closes(self) -> None:
+        server = coordinator()
+        server.request_shutdown(signal.SIGTERM)
+
+        for replay in (
+            server.replay_pending_block_candidates,
+            server.replay_recovered_shares,
+        ):
+            with self.subTest(replay=replay.__name__):
+                self.assertFalse(server._run_startup_writer_replay(replay))
 
     def test_replacement_can_acquire_immediately_after_graceful_release(self) -> None:
         lease_lock = threading.Lock()

@@ -1410,7 +1410,7 @@ class CoordinatorShutdownController:
         self.lease_release_seconds = 0.0
         self.lease_release_attempted = False
         self.lease_release_succeeded = False
-        self.lease_was_released = False
+        self.lease_release_withheld = False
         self.sigterm_to_lease_release_seconds = 0.0
         self.sigterm_release_observed = False
         self.release_withheld_total = 0
@@ -1520,13 +1520,14 @@ class CoordinatorShutdownController:
                 self.phase = "writers_quiesced"
             else:
                 self.phase = "release_withheld"
+                self.lease_release_withheld = True
                 self.release_withheld_total += 1
             self.condition.notify_all()
             return quiesced, elapsed, blockers
 
     def claim_lease_release(self) -> tuple[bool, dict[str, int]]:
         with self.condition:
-            if self.lease_release_attempted:
+            if self.lease_release_attempted or self.lease_release_withheld:
                 return False, {}
             if self.active_writers:
                 return False, dict(sorted(self.active_writers.items()))
@@ -1536,12 +1537,11 @@ class CoordinatorShutdownController:
             self.condition.notify_all()
             return True, {}
 
-    def finish_lease_release(self, outcome: str, elapsed: float, *, released: bool) -> None:
+    def finish_lease_release(self, outcome: str, elapsed: float) -> None:
         with self.condition:
             self.lease_release_outcomes[outcome] += 1
             self.lease_release_seconds = elapsed
             self.lease_release_succeeded = outcome != "failure"
-            self.lease_was_released = released
             self.phase = "lease_released" if outcome != "failure" else "lease_release_failed"
             if outcome != "failure" and self.sigterm_monotonic is not None:
                 self.sigterm_to_lease_release_seconds = max(
@@ -1583,6 +1583,7 @@ class CoordinatorShutdownController:
                 "lease_release_attempts_total": self.lease_release_attempts_total,
                 "lease_release_outcomes": dict(self.lease_release_outcomes),
                 "lease_release_seconds": self.lease_release_seconds,
+                "lease_release_withheld": self.lease_release_withheld,
                 "sigterm_to_lease_release_seconds": self.sigterm_to_lease_release_seconds,
                 "sigterm_release_observed": self.sigterm_release_observed,
                 "release_withheld_total": self.release_withheld_total,
@@ -4024,7 +4025,7 @@ class PrismCoordinator:
             supported=release is not None,
         )
         if release is None:
-            controller.finish_lease_release("unsupported", 0.0, released=False)
+            controller.finish_lease_release("unsupported", 0.0)
             self._shutdown_log(
                 "lease_release",
                 duration_seconds=0.0,
@@ -4037,7 +4038,7 @@ class PrismCoordinator:
             released = release()
         except Exception:
             elapsed = max(0.0, time.monotonic() - started)
-            controller.finish_lease_release("failure", elapsed, released=False)
+            controller.finish_lease_release("failure", elapsed)
             self._shutdown_log(
                 "lease_release",
                 duration_seconds=round(elapsed, 6),
@@ -4048,7 +4049,7 @@ class PrismCoordinator:
             return False
         elapsed = max(0.0, time.monotonic() - started)
         outcome = "success" if released else "not_held"
-        controller.finish_lease_release(outcome, elapsed, released=bool(released))
+        controller.finish_lease_release(outcome, elapsed)
         snapshot = controller.snapshot()
         self._shutdown_log(
             "lease_release",
@@ -4122,7 +4123,8 @@ class PrismCoordinator:
         # Recover block work before opening Stratum listeners.  New miners can
         # only add wakeups after every previously committed candidate has had a
         # chance to re-enter the submit queue.
-        self.replay_pending_block_candidates()
+        if not self._run_startup_writer_replay(self.replay_pending_block_candidates):
+            return
         with ExitStack() as listener_stack:
             listeners: list[tuple[socket.socket, StratumListenerProfile]] = []
             for profile in self.listener_profiles:
@@ -4162,7 +4164,8 @@ class PrismCoordinator:
             block_submitter_thread.start()
             # Replay any shares stranded on disk by a prior ledger-outage
             # shutdown before serving, so no acked share is lost across restart.
-            self.replay_recovered_shares()
+            if not self._run_startup_writer_replay(self.replay_recovered_shares):
+                return
             self._record_heartbeat("share_writer")
             self.share_writer_active = True
             share_writer_thread = threading.Thread(
@@ -4221,6 +4224,15 @@ class PrismCoordinator:
                 # in unrelated client delivery or obsolete fanout work.
                 self.shutdown(reason="serve_exit")
                 self.drain_non_writer_components(drain_threads)
+
+    @staticmethod
+    def _run_startup_writer_replay(replay: Callable[[], int]) -> bool:
+        """Run startup ledger replay, stopping cleanly if shutdown wins."""
+        try:
+            replay()
+        except ShutdownInProgress:
+            return False
+        return True
 
     def accept_loop(self, server: socket.socket, profile: StratumListenerProfile) -> None:
         while not self.stop_event.is_set():
@@ -4672,19 +4684,24 @@ class PrismCoordinator:
         while not self.stop_event.is_set():
             self._record_heartbeat("ctv_fanout_broadcaster")
             started = time.monotonic()
+            shutdown_admission_closed = False
             try:
                 try:
                     result = self.run_ctv_fanout_broadcaster_once(
                         progress_callback=self._record_ctv_fanout_broadcaster_progress,
                     )
+                except ShutdownInProgress:
+                    shutdown_admission_closed = True
+                    return
                 finally:
                     # Stamp completion before logging or entering the interval
                     # wait. A blocked row never reaches this finally clause, so
                     # the watchdog remains able to recover a wedged operation.
                     self._record_heartbeat("ctv_fanout_broadcaster")
-                    self.observe_ctv_fanout_broadcaster_pass(
-                        max(0.0, time.monotonic() - started)
-                    )
+                    if not shutdown_admission_closed:
+                        self.observe_ctv_fanout_broadcaster_pass(
+                            max(0.0, time.monotonic() - started)
+                        )
             except Exception:
                 print("prism coordinator: CTV fanout broadcaster pass failed", flush=True)
                 traceback.print_exc()
