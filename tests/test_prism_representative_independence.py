@@ -332,7 +332,7 @@ class RepresentativeIndependentRefreshTests(unittest.TestCase):
         self.assertEqual(rpc.count("getblocktemplate"), 1)
         self.assertIs(context.worker, worker_b)
         self.assertEqual(
-            context.bundle["found_block"]["coinbase_value_sats"],
+            context.found_block["coinbase_value_sats"],
             base_template()["coinbasevalue"],
         )
         self.assertEqual(

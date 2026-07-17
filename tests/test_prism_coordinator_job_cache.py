@@ -397,7 +397,7 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         server._job_bundle_cache[expired_key] = expired
 
-        looked_up = server._lookup_job_bundle(artifacts.fingerprint, worker())
+        looked_up = server._lookup_job_bundle(current.key)
 
         self.assertIs(looked_up, current)
         self.assertNotIn(expired_key, server._job_bundle_cache)
@@ -1069,9 +1069,13 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(refreshed, 250)
         self.assertEqual(recorded["calls"], 1)
+        cached = next(iter(server._job_bundle_cache.values()))
         self.assertEqual(
-            len({id(state.active_job.bundle) for state in clients}),
+            len({id(state.active_job.shares_json) for state in clients}),
             1,
+        )
+        self.assertTrue(
+            all(state.active_job.shares_json is cached.shares_json for state in clients)
         )
         self.assertEqual(reconciled, [rpc.tip])
         self.assertEqual(trust_checks, 2)
