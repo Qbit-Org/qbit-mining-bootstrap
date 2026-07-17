@@ -221,6 +221,20 @@ class TipRefreshValidationTests(unittest.TestCase):
                 generation=0,
             ) as admission:
                 self.assertTrue(admission)
+                release.set()
+                with server._payout_state_delivery_gate._condition:
+                    self.assertTrue(
+                        server._payout_state_delivery_gate._condition.wait_for(
+                            lambda: (
+                                server._payout_state_delivery_gate._publisher_waiting
+                            ),
+                            timeout=5,
+                        )
+                    )
+                self.assertTrue(
+                    server._payout_state_prepare_lock.acquire(timeout=1)
+                )
+                server._payout_state_prepare_lock.release()
         finally:
             release.set()
             thread.join(5)
@@ -275,6 +289,20 @@ class TipRefreshValidationTests(unittest.TestCase):
                 generation=0,
             ) as admission:
                 self.assertTrue(admission)
+                release.set()
+                with server._payout_state_delivery_gate._condition:
+                    self.assertTrue(
+                        server._payout_state_delivery_gate._condition.wait_for(
+                            lambda: (
+                                server._payout_state_delivery_gate._publisher_waiting
+                            ),
+                            timeout=5,
+                        )
+                    )
+                self.assertTrue(
+                    server._payout_state_prepare_lock.acquire(timeout=1)
+                )
+                server._payout_state_prepare_lock.release()
         finally:
             release.set()
             thread.join(5)
@@ -436,6 +464,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         summary = server.reconcile_prism_pool_blocks_once(tip_hash=old_tip)
 
         self.assertEqual(ledger.inactive_calls, 2)
+        self.assertEqual(summary["watched_blocks"], 1)
         self.assertEqual(summary["inactive_blocks"], 1)
         self.assertEqual(server.reorg_inactive_block_count, 1)
         self.assertEqual(summary["published_generation"], 1)
@@ -525,6 +554,7 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         self.assertTrue(summary["superseded"])
         self.assertEqual(publish_attempts, 3)
+        self.assertEqual(server.reorg_reconcile_skip_count, 1)
         self.assertEqual(server._payout_state_generation, 0)
         self.assertEqual(server.payout_state_candidates_discarded, 3)
         self.assertTrue(server._payout_state_publication_blocked)
@@ -2334,6 +2364,10 @@ class TipRefreshValidationTests(unittest.TestCase):
                 self.assertIsNone(
                     server._payout_state_delivery_gate._mutation_owner
                 )
+            self.assertTrue(
+                server._payout_state_prepare_lock.acquire(timeout=1)
+            )
+            server._payout_state_prepare_lock.release()
         finally:
             release_send.set()
             mutation_thread.join(5)

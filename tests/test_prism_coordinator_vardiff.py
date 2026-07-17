@@ -5162,6 +5162,20 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                     generation=0,
                 ) as admission:
                     self.assertTrue(admission)
+                    release.set()
+                    with server._payout_state_delivery_gate._condition:
+                        self.assertTrue(
+                            server._payout_state_delivery_gate._condition.wait_for(
+                                lambda: (
+                                    server._payout_state_delivery_gate._publisher_waiting
+                                ),
+                                timeout=5,
+                            )
+                        )
+                    self.assertTrue(
+                        server._payout_state_prepare_lock.acquire(timeout=1)
+                    )
+                    server._payout_state_prepare_lock.release()
             finally:
                 release.set()
                 thread.join(5)

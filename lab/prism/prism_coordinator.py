@@ -2389,6 +2389,7 @@ class PrismCoordinator:
     def _block_payout_state_publication(
         self,
         *,
+        force: bool = False,
         supersede_with: tuple[int, str | None, str, float] | None = None,
     ) -> None:
         """Atomically close delivery, optionally reserving a newer source."""
@@ -2429,7 +2430,9 @@ class PrismCoordinator:
                     else:
                         pending_source = self._payout_state_source[0]
                     if (
-                        pending_source
+                        not force
+                        and supersede_with is None
+                        and pending_source
                         == self._published_payout_state.source_generation
                     ):
                         return False
@@ -2442,12 +2445,19 @@ class PrismCoordinator:
         # cross the boundary while the ledger has newer unpublished state.
         if not self._payout_state_delivery_gate.block_delivery(mark_blocked):
             return
+        with self._job_cache_lock:
+            next_payout_generation = self._payout_state_generation + 1
         with self.lock:
             active = getattr(self, "_active_tip_refresh", None)
-        if active is not None:
+        if (
+            active is not None
+            and active[0].payout_state_generation < next_payout_generation
+        ):
             active[1].cancel()
+        elif active is not None:
+            return
         assert pending_source is not None
-        self._mark_tip_refresh_pending(pending_source)
+        self._mark_tip_refresh_pending(next_payout_generation)
         self._schedule_tip_refresh_retry()
 
     def _payout_source_requires_publication(
@@ -2565,11 +2575,15 @@ class PrismCoordinator:
         self._reserve_payout_state_source("payout_only")
         prepared_started = time.monotonic()
         with self._payout_state_prepare_lock:
+            # Close build/delivery admission before releasing snapshot readers.
+            # Publication may then drain already-admitted sends without holding
+            # the preparation lock needed by later ledger work.
+            self._block_payout_state_publication(force=True)
             self._observe_payout_state_seconds(
                 "preparation",
                 max(0.0, time.monotonic() - prepared_started),
             )
-            generation = self._publish_current_payout_state_with_retry_budget()
+        generation = self._publish_current_payout_state_with_retry_budget()
         if generation is None:
             raise TemplateRefreshBlocked(
                 "payout-only invalidation was superseded; immediate retry scheduled"
@@ -6140,6 +6154,7 @@ class PrismCoordinator:
         reactivated_blocks_total = 0
         matured_payouts_total = 0
         supersession_retries = 0
+        skip_recorded = False
         max_supersession_retries = max(
             0,
             int(
@@ -6176,160 +6191,223 @@ class PrismCoordinator:
             tip_hash = latest_tip or tip_hash
             return True
 
-        with self._payout_state_prepare_lock:
-            while True:
-                prepared_started = time.monotonic()
-                captured_source = self._capture_payout_state_source()
-                payout_changed = False
-                inactive_blocks = 0
-                reactivated_blocks = 0
-                matured_payouts = 0
-                summary["untrusted"] = False
-                try:
-                    if self.qbit_chain_view_untrusted():
+        while True:
+            candidate_to_publish: PayoutStateCandidate | None = None
+            error_candidate: PayoutStateCandidate | None = None
+            attempt_trusted = True
+            try:
+                with self._payout_state_prepare_lock:
+                    prepared_started = time.monotonic()
+                    captured_source = self._capture_payout_state_source()
+                    payout_changed = False
+                    inactive_blocks = 0
+                    reactivated_blocks = 0
+                    matured_payouts = 0
+                    summary["untrusted"] = False
+                    summary["watched_blocks"] = 0
+                    try:
+                        if self.qbit_chain_view_untrusted():
+                            if not skip_recorded:
+                                with self.lock:
+                                    self.reorg_reconcile_skip_count += 1
+                                skip_recorded = True
+                            summary["untrusted"] = True
+                            attempt_trusted = False
+                            if _force_publish:
+                                candidate_to_publish = (
+                                    self._prepared_payout_state_candidate(
+                                        captured_source
+                                    )
+                                )
+                        else:
+                            active_tip_height = int(self.rpc.call("getblockcount"))
+                            watch_blocks = getattr(
+                                self.ledger,
+                                "reorg_watch_blocks",
+                                None,
+                            )
+                            if not callable(watch_blocks):
+                                candidate = self._prepared_payout_state_candidate(
+                                    captured_source
+                                )
+                                if (
+                                    _force_publish
+                                    or self._payout_source_requires_publication(
+                                        candidate
+                                    )
+                                ):
+                                    candidate_to_publish = candidate
+                            else:
+                                rows = watch_blocks(
+                                    active_tip_height=active_tip_height
+                                )
+                                summary["watched_blocks"] = len(rows)
+
+                                for row in rows:
+                                    block_height = int(row["block_height"])
+                                    block_hash = str(row["block_hash"]).lower()
+                                    chain_state = str(row.get("chain_state", ""))
+                                    if block_height > active_tip_height:
+                                        if chain_state == "confirmed":
+                                            inactive = (
+                                                self.ledger.mark_pool_block_inactive(
+                                                    block_hash=block_hash,
+                                                    active_tip_height=active_tip_height,
+                                                )
+                                            )
+                                            inactive_count = int(
+                                                inactive.get("inactive_count", 0)
+                                            )
+                                            inactive_blocks += inactive_count
+                                            payout_changed = (
+                                                payout_changed
+                                                or bool(inactive_count)
+                                            )
+                                        continue
+                                    active_hash = str(
+                                        self.rpc.call(
+                                            "getblockhash",
+                                            [block_height],
+                                        )
+                                    ).lower()
+                                    on_active_chain = active_hash == block_hash
+                                    if (
+                                        on_active_chain
+                                        and chain_state == "inactive"
+                                    ):
+                                        reactivated = (
+                                            self.ledger.reactivate_pool_block(
+                                                block_hash=block_hash,
+                                                active_tip_height=active_tip_height,
+                                            )
+                                        )
+                                        reactivated_count = int(
+                                            reactivated.get(
+                                                "reactivated_count",
+                                                0,
+                                            )
+                                        )
+                                        reactivated_blocks += reactivated_count
+                                        payout_changed = (
+                                            payout_changed
+                                            or bool(reactivated_count)
+                                        )
+                                    elif (
+                                        not on_active_chain
+                                        and chain_state == "confirmed"
+                                    ):
+                                        inactive = (
+                                            self.ledger.mark_pool_block_inactive(
+                                                block_hash=block_hash,
+                                                active_tip_height=active_tip_height,
+                                            )
+                                        )
+                                        inactive_count = int(
+                                            inactive.get("inactive_count", 0)
+                                        )
+                                        inactive_blocks += inactive_count
+                                        payout_changed = (
+                                            payout_changed
+                                            or bool(inactive_count)
+                                        )
+
+                                mark_mature = getattr(
+                                    self.ledger,
+                                    "mark_mature_pool_payouts",
+                                    None,
+                                )
+                                if callable(mark_mature):
+                                    matured = mark_mature(
+                                        active_tip_height=active_tip_height
+                                    )
+                                    matured_payouts = int(
+                                        matured.get("matured_count", 0)
+                                    )
+                                    payout_changed = (
+                                        payout_changed
+                                        or bool(matured_payouts)
+                                    )
+
+                                inactive_blocks_total += inactive_blocks
+                                reactivated_blocks_total += reactivated_blocks
+                                matured_payouts_total += matured_payouts
+                                candidate = (
+                                    self._prepared_payout_state_candidate(
+                                        captured_source
+                                    )
+                                )
+                                if (
+                                    payout_changed
+                                    or _force_publish
+                                    or self._payout_source_requires_publication(
+                                        candidate
+                                    )
+                                ):
+                                    candidate_to_publish = candidate
+                    except Exception:
+                        inactive_blocks_total += inactive_blocks
+                        reactivated_blocks_total += reactivated_blocks
+                        matured_payouts_total += matured_payouts
+                        # Durable partial mutations close admission before the
+                        # preparation lock is released. Publication drains old
+                        # socket sends afterward without blocking new ledger
+                        # preparation or snapshot acquisition.
+                        if payout_changed:
+                            error_candidate = (
+                                self._prepared_payout_state_candidate(
+                                    captured_source
+                                )
+                            )
+                            self._block_payout_state_publication(force=True)
                         with self.lock:
-                            self.reorg_reconcile_skip_count += 1
-                        summary["untrusted"] = True
-                        if _force_publish:
-                            forced_candidate = self._prepared_payout_state_candidate(
-                                captured_source
+                            self.reorg_inactive_block_count += (
+                                inactive_blocks_total
                             )
-                            published = self._publish_payout_state_candidate(
-                                forced_candidate
+                            self.reorg_reactivated_block_count += (
+                                reactivated_blocks_total
                             )
-                            if published is None:
-                                if retry_superseded_candidate():
-                                    continue
-                                return finish(trusted=False)
-                            summary["published_generation"] = published
-                        return finish(trusted=False)
-
-                    active_tip_height = int(self.rpc.call("getblockcount"))
-                    watch_blocks = getattr(self.ledger, "reorg_watch_blocks", None)
-                    if not callable(watch_blocks):
-                        forced_candidate = self._prepared_payout_state_candidate(
-                            captured_source
+                            self.matured_payout_count += matured_payouts_total
+                            self.reorg_reconcile_error_count += 1
+                            self.last_reorg_reconciled_tip_hash = tip_hash
+                            self.last_reorg_reconciled_trusted = False
+                            self.last_reorg_reconciled_monotonic = (
+                                time.monotonic()
+                            )
+                        raise
+                    finally:
+                        self._observe_payout_state_seconds(
+                            "preparation",
+                            max(0.0, time.monotonic() - prepared_started),
                         )
-                        if _force_publish or self._payout_source_requires_publication(
-                            forced_candidate
-                        ):
-                            published = self._publish_payout_state_candidate(
-                                forced_candidate
-                            )
-                            if published is None:
-                                if retry_superseded_candidate():
-                                    continue
-                                return finish(trusted=False)
-                            summary["published_generation"] = published
-                        return finish(trusted=True)
-                    rows = watch_blocks(active_tip_height=active_tip_height)
-                    summary["watched_blocks"] = int(summary["watched_blocks"]) + len(
-                        rows
-                    )
 
-                    for row in rows:
-                        block_height = int(row["block_height"])
-                        block_hash = str(row["block_hash"]).lower()
-                        chain_state = str(row.get("chain_state", ""))
-                        if block_height > active_tip_height:
-                            if chain_state == "confirmed":
-                                inactive = self.ledger.mark_pool_block_inactive(
-                                    block_hash=block_hash,
-                                    active_tip_height=active_tip_height,
-                                )
-                                inactive_count = int(
-                                    inactive.get("inactive_count", 0)
-                                )
-                                inactive_blocks += inactive_count
-                                payout_changed = payout_changed or bool(
-                                    inactive_count
-                                )
-                            continue
-                        active_hash = str(
-                            self.rpc.call("getblockhash", [block_height])
-                        ).lower()
-                        on_active_chain = active_hash == block_hash
-                        if on_active_chain and chain_state == "inactive":
-                            reactivated = self.ledger.reactivate_pool_block(
-                                block_hash=block_hash,
-                                active_tip_height=active_tip_height,
-                            )
-                            reactivated_count = int(
-                                reactivated.get("reactivated_count", 0)
-                            )
-                            reactivated_blocks += reactivated_count
-                            payout_changed = payout_changed or bool(
-                                reactivated_count
-                            )
-                        elif not on_active_chain and chain_state == "confirmed":
-                            inactive = self.ledger.mark_pool_block_inactive(
-                                block_hash=block_hash,
-                                active_tip_height=active_tip_height,
-                            )
-                            inactive_count = int(inactive.get("inactive_count", 0))
-                            inactive_blocks += inactive_count
-                            payout_changed = payout_changed or bool(inactive_count)
+                    if candidate_to_publish is not None:
+                        # Atomically fence cache/build/delivery admission before
+                        # releasing the ledger snapshot lock. The potentially
+                        # slow drain then happens in publication() below.
+                        self._block_payout_state_publication(force=True)
+            except Exception:
+                if error_candidate is not None:
+                    if (
+                        self._publish_payout_state_candidate(error_candidate)
+                        is None
+                    ):
+                        self._block_payout_state_publication()
+                raise
 
-                    mark_mature = getattr(
-                        self.ledger,
-                        "mark_mature_pool_payouts",
-                        None,
-                    )
-                    if callable(mark_mature):
-                        matured = mark_mature(active_tip_height=active_tip_height)
-                        matured_payouts = int(matured.get("matured_count", 0))
-                        payout_changed = payout_changed or bool(matured_payouts)
-                except Exception:
-                    inactive_blocks_total += inactive_blocks
-                    reactivated_blocks_total += reactivated_blocks
-                    matured_payouts_total += matured_payouts
-                    # Individual ledger mutations are durable. If a later RPC
-                    # or reconciliation step fails, publish the completed state
-                    # before releasing snapshot readers, then surface the error.
-                    if payout_changed:
-                        candidate = self._prepared_payout_state_candidate(
-                            captured_source
-                        )
-                        if self._publish_payout_state_candidate(candidate) is None:
-                            # Do not stamp the current source onto payout work
-                            # prepared for an older tip. Fence job builds and
-                            # let the scheduled retry reconcile that source.
-                            self._block_payout_state_publication()
-                    with self.lock:
-                        self.reorg_inactive_block_count += inactive_blocks_total
-                        self.reorg_reactivated_block_count += reactivated_blocks_total
-                        self.matured_payout_count += matured_payouts_total
-                        self.reorg_reconcile_error_count += 1
-                        self.last_reorg_reconciled_tip_hash = tip_hash
-                        self.last_reorg_reconciled_trusted = False
-                        self.last_reorg_reconciled_monotonic = time.monotonic()
-                    raise
-                finally:
-                    self._observe_payout_state_seconds(
-                        "preparation",
-                        max(0.0, time.monotonic() - prepared_started),
-                    )
-
-                inactive_blocks_total += inactive_blocks
-                reactivated_blocks_total += reactivated_blocks
-                matured_payouts_total += matured_payouts
-                candidate = self._prepared_payout_state_candidate(captured_source)
-                if (
-                    payout_changed
-                    or _force_publish
-                    or self._payout_source_requires_publication(candidate)
-                ):
-                    published = self._publish_payout_state_candidate(candidate)
-                    if published is None:
-                        # Preserve durable counts and retry iteratively against
-                        # the newest source. The explicit budget prevents tip
-                        # churn from monopolizing the preparation lock forever;
-                        # an unpublished source fences subsequent job builds.
-                        if retry_superseded_candidate():
-                            continue
-                        return finish(trusted=False)
-                    summary["published_generation"] = published
-                return finish(trusted=True)
+            if candidate_to_publish is not None:
+                published = self._publish_payout_state_candidate(
+                    candidate_to_publish
+                )
+                if published is None:
+                    # Preserve durable counts and retry iteratively against the
+                    # newest source. The explicit budget prevents tip churn
+                    # from monopolizing preparation indefinitely; the fence
+                    # stays closed between attempts.
+                    if retry_superseded_candidate():
+                        continue
+                    return finish(trusted=False)
+                summary["published_generation"] = published
+            return finish(trusted=attempt_trusted)
 
     def client_can_receive_jobs(self, client: ClientState) -> bool:
         return client.subscribed and client.authorized and client.worker is not None
@@ -8713,6 +8791,10 @@ class PrismCoordinator:
             # replay can safely repeat any step after a crash.
             self._record_heartbeat("block_submitter")
             self._ensure_job_cache_state()
+            payout_candidate: PayoutStateCandidate | None = None
+            direct_payout_source: (
+                tuple[int, int, str | None, str, float] | None
+            ) = None
             with self._payout_state_prepare_lock:
                 try:
                     persistence = self.ledger.persist_accepted_block(
@@ -8767,42 +8849,16 @@ class PrismCoordinator:
                     # delivery barrier in either case.
                     if direct_payout_source is None:
                         self._record_discarded_payout_candidate()
-                        published = None
                     else:
                         payout_candidate = self._prepared_payout_state_candidate(
                             direct_payout_source
                         )
-                        published = self._publish_payout_state_candidate(
-                            payout_candidate
-                        )
-                    if published is None and getattr(
-                        self,
-                        "reorg_reconciler_enabled",
-                        True,
-                    ):
-                        with self.lock:
-                            latest_tip = self._payout_state_source[1]
-                        summary = self.reconcile_prism_pool_blocks_once(
-                            tip_hash=latest_tip,
-                            _force_publish=True,
-                            _source_reserved=True,
-                        )
-                        reconciled_generation = summary.get("published_generation")
-                        if isinstance(reconciled_generation, int):
-                            published = reconciled_generation
-                    if published is None and not getattr(
-                        self,
-                        "reorg_reconciler_enabled",
-                        True,
-                    ):
-                        # Collection-only tests disable reorg reconciliation;
-                        # publish their current in-memory source without the
-                        # production reconciler. In production, a bounded
-                        # supersession result leaves the source unpublished so
-                        # job builds remain fenced until the scheduled retry.
-                        published = self._publish_current_payout_state_with_retry_budget(
-                            initial_attempted=direct_payout_source is not None,
-                        )
+                    # Confirmation may have changed ledger-backed payout state
+                    # even when a newer tip superseded the direct source. Close
+                    # cache construction and delivery admission before releasing
+                    # the snapshot lock; publication and its old-send drain run
+                    # below, outside this preparation section.
+                    self._block_payout_state_publication(force=True)
                 else:
                     # An unexpected confirmation result is just as uncertain
                     # as an exception after persistence: keep all delivery
@@ -8823,6 +8879,39 @@ class PrismCoordinator:
                     worker=worker,
                 )
                 return False
+            published = (
+                self._publish_payout_state_candidate(payout_candidate)
+                if payout_candidate is not None
+                else None
+            )
+            if published is None and getattr(
+                self,
+                "reorg_reconciler_enabled",
+                True,
+            ):
+                with self.lock:
+                    latest_tip = self._payout_state_source[1]
+                summary = self.reconcile_prism_pool_blocks_once(
+                    tip_hash=latest_tip,
+                    _force_publish=True,
+                    _source_reserved=True,
+                )
+                reconciled_generation = summary.get("published_generation")
+                if isinstance(reconciled_generation, int):
+                    published = reconciled_generation
+            if published is None and not getattr(
+                self,
+                "reorg_reconciler_enabled",
+                True,
+            ):
+                # Collection-only tests disable reorg reconciliation; publish
+                # their current in-memory source without the production
+                # reconciler. In production, a bounded supersession result
+                # leaves the source unpublished so job builds remain fenced
+                # until the scheduled retry.
+                published = self._publish_current_payout_state_with_retry_budget(
+                    initial_attempted=direct_payout_source is not None,
+                )
             ctv_persistence = None
             ctv_manifest_set = final_bundle.get("ctv_fanout_manifest_set")
             if isinstance(ctv_manifest_set, dict):
