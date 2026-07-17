@@ -3264,9 +3264,9 @@ class PrismCoordinator:
                     if self.stop_event.wait(0.25):
                         return
                     continue
-                known_tip = new_tip
                 self.observe_tip_first_seen(new_tip)
                 refreshed = self.poll_qbit_tip_template_once(heartbeat_name="qbit_blockwait")
+                known_tip = new_tip
                 print(
                     f"prism coordinator: blockwait saw new tip {new_tip}; "
                     f"refreshed {refreshed} client job(s)",
