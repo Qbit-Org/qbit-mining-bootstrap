@@ -4514,12 +4514,16 @@ class PrismCoordinator:
                     # validate each selected target independently.
                     self._record_heartbeat(heartbeat_name)
                     with self.lock:
-                        target_connected = (
-                            client in self.clients
+                        target_connected = client in self.clients
+                        target_eligible = (
+                            target_connected
                             and self.client_can_receive_jobs(client)
                         )
                     if not target_connected:
                         self._record_tip_refresh_client_result("disconnected")
+                        continue
+                    if not target_eligible:
+                        self._record_tip_refresh_client_result("skipped")
                         continue
                     try:
                         if self.maybe_send_job(

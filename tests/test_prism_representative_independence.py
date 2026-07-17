@@ -112,6 +112,31 @@ class RepresentativeIndependentRefreshTests(unittest.TestCase):
         self.assertEqual(recorded["calls"], 1)
         self.assertEqual(server.ledger.snapshot_calls, 1)
 
+    def test_collection_ineligible_connected_target_is_skipped(self) -> None:
+        server, _rpc = coordinator(ledger=FakeLedger(miners=["solo"]))
+        state = client(1)
+        server.clients = {state}
+        original_observe_tip = server.observe_tip_first_seen
+
+        def make_target_ineligible(*args: object, **kwargs: object) -> bool:
+            observed = original_observe_tip(*args, **kwargs)
+            state.authorized = False
+            return observed
+
+        server.observe_tip_first_seen = make_target_ineligible  # type: ignore[method-assign]
+        server.maybe_send_job = lambda *_args, **_kwargs: self.fail(  # type: ignore[method-assign]
+            "ineligible collection target received work"
+        )
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 0)
+        self.assertEqual(server.tip_refresh_client_counts["skipped"], 1)
+        self.assertEqual(server.tip_refresh_client_counts["disconnected"], 0)
+
     def test_collection_identity_absence_has_a_distinct_temporary_result(self) -> None:
         server, _rpc = coordinator(ledger=FakeLedger(miners=["solo"]))
         artifacts = server.current_template_artifacts()
