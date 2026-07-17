@@ -3192,6 +3192,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.template_refresh_failure_exit_seconds = 120
         server.last_successful_template_refresh_monotonic = 100.0
 
+        server._record_template_refresh_failure(500.0)
         self.assertFalse(server.template_refresh_failure_expired(500.0))
         self.assertEqual(server.template_refresh_failure_started_monotonic, 500.0)
         self.assertFalse(server.template_refresh_failure_expired(619.999))
@@ -3201,6 +3202,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server = PrismCoordinator.__new__(PrismCoordinator)
         server.template_refresh_failure_exit_seconds = 0
 
+        server._record_template_refresh_failure(500.0)
         self.assertFalse(server.template_refresh_failure_expired(500.0))
         self.assertFalse(hasattr(server, "template_refresh_failure_started_monotonic"))
 
@@ -3231,6 +3233,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.last_successful_template_refresh_monotonic, 200.0)
         self.assertIsNone(server.template_refresh_failure_started_monotonic)
         self.assertFalse(server.template_refresh_failure_expired(300.0))
+        self.assertIsNone(server.template_refresh_failure_started_monotonic)
+        server._record_template_refresh_failure(300.0)
         self.assertEqual(server.template_refresh_failure_started_monotonic, 300.0)
 
     def test_shared_template_poll_records_success_for_blockwait_callers(self) -> None:
