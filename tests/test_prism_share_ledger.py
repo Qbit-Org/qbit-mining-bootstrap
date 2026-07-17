@@ -151,6 +151,7 @@ class FakeLeasePsqlShareLedger(PsqlShareLedger):
         self.lease_results = list(lease_results)
         self.lease_queries: list[str] = []
         self.sleeps: list[float] = []
+        kwargs.setdefault("native_client_mode", "0")
         super().__init__(
             psql_command="psql postgresql://example.invalid/qbit",
             lease_retry_sleep=self.sleeps.append,
@@ -2126,7 +2127,12 @@ def acquired_lease_result() -> dict[str, object]:
     return acquired_lease(writer_id="prism-coordinator", writer_epoch=1)
 
 
-def record_payload(index: int, share_seq: int) -> dict[str, object]:
+def record_payload(
+    index: int,
+    share_seq: int,
+    *,
+    new_miner: bool = False,
+) -> dict[str, object]:
     pending = pending_share(index)
     return {
         "share_seq": share_seq,
@@ -2142,11 +2148,20 @@ def record_payload(index: int, share_seq: int) -> dict[str, object]:
         "accepted_at_ms": pending.accepted_at_ms,
         "ntime": pending.ntime,
         "credit_policy": None,
+        "new_miner": new_miner,
     }
 
 
-def stats_payload(count: int, miner_ids: list[str]) -> dict[str, object]:
-    return {"accepted_share_count": count, "miner_ids": miner_ids}
+def stats_payload(
+    count: int,
+    distinct_miner_count: int,
+    max_share_seq: int,
+) -> dict[str, object]:
+    return {
+        "accepted_share_count": count,
+        "distinct_miner_count": distinct_miner_count,
+        "max_share_seq": max_share_seq,
+    }
 
 
 class NativeClientSelectionTests(unittest.TestCase):
@@ -2214,16 +2229,19 @@ class NativeClientSelectionTests(unittest.TestCase):
             def run_json(self, sql: str, *, retry_safe: bool = False) -> Any:
                 self.statements.append(sql)
                 self.retry_safe = retry_safe
-                return {"accepted_share_count": 5, "miner_ids": ["miner-a"]}
+                return stats_payload(5, 1, 8)
 
             def close(self) -> None:
                 return None
 
         ledger = PsqlShareLedger.__new__(PsqlShareLedger)
         ledger._lock = threading.Lock()
+        ledger._read_semaphore = threading.BoundedSemaphore(1)
         ledger._stats_lock = threading.Lock()
+        ledger._stats_refresh_lock = threading.Lock()
         ledger._stats_counts = None
-        ledger._stats_miner_ids = set()
+        ledger._stats_max_share_seq = 0
+        ledger._stats_note_buffer = None
         ledger._stats_refreshed_monotonic = None
         ledger._accepted_stats_cache_seconds = 60.0
         native = FakeNative()
@@ -2351,8 +2369,8 @@ class AcceptedStatsCacheTests(unittest.TestCase):
         ledger = CannedQueryPsqlShareLedger(
             [
                 acquired_lease_result(),
-                stats_payload(10, ["miner-a", "miner-b"]),
-                record_payload(3, share_seq=11),
+                stats_payload(10, 2, 10),
+                record_payload(3, share_seq=11, new_miner=True),
                 {"records": [record_payload(6, share_seq=12)]},
                 {
                     "records": [
@@ -2396,30 +2414,62 @@ class AcceptedStatsCacheTests(unittest.TestCase):
             {"accepted_share_count": 12, "distinct_miner_count": 3},
         )
 
+    def test_refresh_does_not_hold_writer_lock_during_aggregate(self) -> None:
+        aggregate_started = threading.Event()
+        aggregate_can_return = threading.Event()
+
+        class SlowAggregateLedger(CannedQueryPsqlShareLedger):
+            def __init__(self) -> None:
+                super().__init__(
+                    [acquired_lease_result()],
+                    accepted_stats_cache_seconds=60.0,
+                )
+
+            def _run_json(self, sql: str) -> Any:
+                self.queries.append(sql)
+                if "'max_share_seq'" in sql:
+                    aggregate_started.set()
+                    if not aggregate_can_return.wait(5):
+                        raise AssertionError("aggregate query was not released")
+                    return stats_payload(10, 2, 10)
+                if "INSERT INTO qbit_share_ledger" in sql:
+                    return record_payload(3, share_seq=11, new_miner=True)
+                return super()._run_json(sql)
+
+        ledger = SlowAggregateLedger()
+        stats: list[dict[str, int]] = []
+        errors: list[BaseException] = []
+
+        def refresh_stats() -> None:
+            try:
+                stats.append(ledger.accepted_share_stats())
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        stats_thread = threading.Thread(target=refresh_stats, name="stats-refresh")
+        stats_thread.start()
+        try:
+            self.assertTrue(aggregate_started.wait(5))
+            # The full-history aggregate is still blocked, but the serialized
+            # writer must be able to commit and publish its note immediately.
+            appended = ledger.append(pending_share(3))
+            self.assertEqual(appended.share_seq, 11)
+        finally:
+            aggregate_can_return.set()
+            stats_thread.join(5)
+
+        self.assertFalse(stats_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            stats,
+            [{"accepted_share_count": 11, "distinct_miner_count": 3}],
+        )
+
     def test_refresh_does_not_replay_note_already_in_aggregate_snapshot(self) -> None:
         append_committed = threading.Event()
         append_can_publish_note = threading.Event()
+        aggregate_started = threading.Event()
         aggregate_can_return = threading.Event()
-        stats_database_lock_attempted = threading.Event()
-
-        class NotifyingLock:
-            def __init__(self) -> None:
-                self._lock = threading.Lock()
-
-            def acquire(self, *args: Any, **kwargs: Any) -> bool:
-                if threading.current_thread().name == "stats-refresh":
-                    stats_database_lock_attempted.set()
-                return self._lock.acquire(*args, **kwargs)
-
-            def release(self) -> None:
-                self._lock.release()
-
-            def __enter__(self) -> NotifyingLock:
-                self.acquire()
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                self.release()
 
         class CommitBeforeNoteLedger(CannedQueryPsqlShareLedger):
             def __init__(self) -> None:
@@ -2427,21 +2477,17 @@ class AcceptedStatsCacheTests(unittest.TestCase):
                     [acquired_lease_result()],
                     accepted_stats_cache_seconds=60.0,
                 )
-                self._lock = NotifyingLock()  # type: ignore[assignment]
 
             def _run_json(self, sql: str) -> Any:
                 self.queries.append(sql)
-                if "miner_ids" in sql:
-                    self.assert_aggregate_wait()
-                    return stats_payload(11, ["miner-a", "miner-1"])
+                if "'max_share_seq'" in sql:
+                    aggregate_started.set()
+                    if not aggregate_can_return.wait(5):
+                        raise AssertionError("aggregate query was not released")
+                    return stats_payload(11, 2, 11)
                 if "INSERT INTO qbit_share_ledger" in sql:
-                    return record_payload(1, share_seq=11)
+                    return record_payload(1, share_seq=11, new_miner=True)
                 return super()._run_json(sql)
-
-            @staticmethod
-            def assert_aggregate_wait() -> None:
-                if not aggregate_can_return.wait(5):
-                    raise AssertionError("aggregate query was not released")
 
             def _record_from_json(self, payload: dict[str, Any]) -> Any:
                 record = PsqlShareLedger._record_from_json(payload)
@@ -2474,7 +2520,13 @@ class AcceptedStatsCacheTests(unittest.TestCase):
         try:
             self.assertTrue(append_committed.wait(5))
             stats_thread.start()
-            self.assertTrue(stats_database_lock_attempted.wait(5))
+            self.assertTrue(aggregate_started.wait(5))
+            # Publish a snapshot that already contains the committed share,
+            # then release its delayed cache note. The published watermark
+            # must suppress that late note rather than count share 11 twice.
+            aggregate_can_return.set()
+            stats_thread.join(5)
+            self.assertFalse(stats_thread.is_alive())
         finally:
             append_can_publish_note.set()
             aggregate_can_return.set()
@@ -2496,8 +2548,8 @@ class AcceptedStatsCacheTests(unittest.TestCase):
         ledger = CannedQueryPsqlShareLedger(
             [
                 acquired_lease_result(),
-                stats_payload(10, ["miner-a"]),
-                stats_payload(4, ["miner-a", "miner-b"]),
+                stats_payload(10, 1, 10),
+                stats_payload(4, 2, 12),
             ],
             accepted_stats_cache_seconds=0.05,
         )
@@ -2515,8 +2567,8 @@ class AcceptedStatsCacheTests(unittest.TestCase):
         ledger = CannedQueryPsqlShareLedger(
             [
                 acquired_lease_result(),
-                stats_payload(1, ["miner-a"]),
-                stats_payload(2, ["miner-a"]),
+                stats_payload(1, 1, 1),
+                stats_payload(2, 1, 2),
             ],
             accepted_stats_cache_seconds=0.0,
         )
@@ -2537,7 +2589,7 @@ class AcceptedStatsCacheTests(unittest.TestCase):
         ledger = CannedQueryPsqlShareLedger(
             [
                 acquired_lease_result(),
-                stats_payload(7, ["miner-a"]),
+                stats_payload(7, 1, 7),
                 metrics_payload,
             ],
             accepted_stats_cache_seconds=60.0,
@@ -2547,6 +2599,9 @@ class AcceptedStatsCacheTests(unittest.TestCase):
         self.assertEqual(metrics["blocks"], 2)
         metrics_sql = ledger.queries[-1]
         self.assertNotIn("qbit_share_ledger", metrics_sql)
+        stats_sql = ledger.queries[-2]
+        self.assertIn("count(DISTINCT miner_id)", stats_sql)
+        self.assertNotIn("json_agg(DISTINCT miner_id)", stats_sql)
 
 
 

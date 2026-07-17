@@ -91,10 +91,15 @@ import threading
 from lab.prism.share_ledger import PendingShare, PsqlShareLedger
 
 
-def pending(index: int, *, share_id: str | None = None) -> PendingShare:
+def pending(
+    index: int,
+    *,
+    share_id: str | None = None,
+    miner_id: str | None = None,
+) -> PendingShare:
     return PendingShare(
         share_id=share_id or f"share-{index}",
-        miner_id=f"miner-{index % 4}",
+        miner_id=miner_id or f"miner-{index % 4}",
         order_key=f"{index:04d}",
         p2mr_program_hex=f"{index % 256:02x}" * 32,
         share_difficulty=100 + index,
@@ -170,6 +175,8 @@ assert_equal(
 # round trip.
 share_count = 32
 batch_entries = [(pending(index), None) for index in range(single_count, share_count)]
+batch_entries[0] = (pending(single_count, miner_id="miner-new"), None)
+batch_entries[1] = (pending(single_count + 1, miner_id="miner-new"), None)
 batch_records = ledger.append_batch(batch_entries)
 assert_equal(
     [record.share_id for record in batch_records],
@@ -183,6 +190,11 @@ assert_equal(
 )
 stats_before_replay = ledger.accepted_share_stats()
 assert_equal(stats_before_replay["accepted_share_count"], share_count, "cached share count before replay")
+assert_equal(
+    stats_before_replay["distinct_miner_count"],
+    5,
+    "batch increments a new miner exactly once",
+)
 
 # Replaying the exact same batch is idempotent: the same records come back
 # and neither the database nor the accepted-share cache double-counts it.
@@ -211,7 +223,7 @@ else:
 ledger._accepted_stats_cache_seconds = 0.0
 stats = ledger.accepted_share_stats()
 assert_equal(stats["accepted_share_count"], share_count, "accepted share count")
-assert_equal(stats["distinct_miner_count"], 4, "distinct miner count")
+assert_equal(stats["distinct_miner_count"], 5, "distinct miner count")
 ledger._accepted_stats_cache_seconds = 60.0
 
 snapshot = ledger.snapshot_at_job_issue(1_700_000_002_000)

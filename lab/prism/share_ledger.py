@@ -1186,7 +1186,8 @@ class PsqlShareLedger:
         self._stats_lock = Lock()
         self._stats_refresh_lock = Lock()
         self._stats_counts: dict[str, int] | None = None
-        self._stats_miner_ids: set[str] = set()
+        self._stats_max_share_seq = 0
+        self._stats_note_buffer: dict[int, bool] | None = None
         self._stats_refreshed_monotonic: float | None = None
         self._native = self._make_native_client(
             native_client_mode,
@@ -1270,6 +1271,13 @@ existing_share AS (
     FROM qbit_share_ledger
     WHERE share_id = (SELECT data->>'share_id' FROM payload)
 ),
+existing_miner AS (
+    SELECT 1
+    FROM qbit_share_ledger
+    WHERE accepted
+      AND miner_id = (SELECT data->>'miner_id' FROM payload)
+    LIMIT 1
+),
 lease AS (
     UPDATE qbit_ledger_writer_lease
     SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
@@ -1338,20 +1346,23 @@ SELECT CASE
             'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
             'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
             'ntime', ntime,
-            'credit_policy', credit_policy
+            'credit_policy', credit_policy,
+            'new_miner', NOT EXISTS (SELECT 1 FROM existing_miner)
         ) FROM inserted)
 END;
 """
-        # Keep the database commit and its cache note in one critical section.
-        # A stats reconcile takes the same lock before opening its note buffer,
-        # so its aggregate cannot include this row and then replay its note a
-        # second time.
+        # Serialize the single writer through its durable commit and cache note.
+        # Stats reconciliation uses a separate read connection plus a share-seq
+        # watermark, so it never acquires this writer lock.
         with self._lock:
             result = self._run_json(sql)
             if "error" in result:
                 raise RuntimeError(str(result["error"]))
             record = self._record_from_json(result)
-            self._note_appended_share(record)
+            self._note_appended_share(
+                record,
+                new_miner=bool(result.get("new_miner", False)),
+            )
             return record
 
     def append_batch(
@@ -1511,11 +1522,26 @@ inserted_candidates AS (
     RETURNING block_hash
 ),
 records AS (
-    SELECT ledger.*, payload.ordinality, false AS newly_inserted
+    SELECT
+        ledger.*, payload.ordinality, false AS newly_inserted,
+        false AS new_miner
     FROM payload
     JOIN qbit_share_ledger ledger ON ledger.share_id = payload.data->>'share_id'
     UNION ALL
-    SELECT inserted_shares.*, payload.ordinality, true AS newly_inserted
+    SELECT
+        inserted_shares.*, payload.ordinality, true AS newly_inserted,
+        NOT EXISTS (
+            SELECT 1
+            FROM qbit_share_ledger existing_miner
+            WHERE existing_miner.accepted
+              AND existing_miner.miner_id = inserted_shares.miner_id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM inserted_shares earlier_insert
+            WHERE earlier_insert.miner_id = inserted_shares.miner_id
+              AND earlier_insert.share_seq < inserted_shares.share_seq
+        ) AS new_miner
     FROM inserted_shares
     JOIN payload ON payload.data->>'share_id' = inserted_shares.share_id
 )
@@ -1548,7 +1574,8 @@ SELECT CASE
                 'accepted_at_ms', round(extract(epoch FROM records.accepted_at) * 1000)::bigint,
                 'ntime', records.ntime,
                 'credit_policy', records.credit_policy,
-                'newly_inserted', records.newly_inserted
+                'newly_inserted', records.newly_inserted,
+                'new_miner', records.new_miner
             ) ORDER BY records.ordinality)
             FROM records
         )
@@ -1563,9 +1590,16 @@ END;
             if not isinstance(records, list) or len(records) != len(entries):
                 raise RuntimeError("Postgres share batch returned an incomplete result")
             parsed = [self._record_from_json(record) for record in records]
-            for payload, record in zip(records, parsed, strict=True):
+            committed = sorted(
+                zip(records, parsed, strict=True),
+                key=lambda item: item[1].share_seq,
+            )
+            for payload, record in committed:
                 if bool(payload.get("newly_inserted", True)):
-                    self._note_appended_share(record)
+                    self._note_appended_share(
+                        record,
+                        new_miner=bool(payload.get("new_miner", False)),
+                    )
             return parsed
 
     def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
@@ -1851,58 +1885,80 @@ WHERE accepted;
                         and now - self._stats_refreshed_monotonic <= ttl
                     ):
                         return dict(self._stats_counts)
-            # Lock order is always database then stats. Appends retain the
-            # database lock through their cache note, so after this acquire a
-            # row is either already represented by its note or cannot commit
-            # until after the aggregate and cache publication complete.
-            with self._lock:
-                counts, miner_ids = self._query_accepted_share_stats_locked()
+            # Open the note buffer before taking the database snapshot. The
+            # aggregate runs on the concurrent read pool, never under the
+            # writer lock, and returns the highest share sequence visible in
+            # the same MVCC snapshot as its scalar counts.
+            note_buffer: dict[int, bool] = {}
+            with stats_lock:
+                self._stats_note_buffer = note_buffer
+            try:
+                counts, snapshot_max_share_seq = self._query_accepted_share_stats()
+            except BaseException:
                 with stats_lock:
-                    self._stats_counts = dict(counts)
-                    self._stats_miner_ids = miner_ids
-                    self._stats_refreshed_monotonic = time.monotonic()
-        return counts
+                    if self._stats_note_buffer is note_buffer:
+                        self._stats_note_buffer = None
+                raise
+            with stats_lock:
+                for share_seq, new_miner in note_buffer.items():
+                    if share_seq <= snapshot_max_share_seq:
+                        continue
+                    counts["accepted_share_count"] += 1
+                    counts["distinct_miner_count"] += int(new_miner)
+                self._stats_counts = dict(counts)
+                self._stats_max_share_seq = max(
+                    [snapshot_max_share_seq, *note_buffer.keys()]
+                )
+                self._stats_note_buffer = None
+                self._stats_refreshed_monotonic = time.monotonic()
+                return dict(self._stats_counts)
 
-    def _query_accepted_share_stats(self) -> tuple[dict[str, int], set[str]]:
-        with self._lock:
-            return self._query_accepted_share_stats_locked()
-
-    def _query_accepted_share_stats_locked(self) -> tuple[dict[str, int], set[str]]:
+    def _query_accepted_share_stats(self) -> tuple[dict[str, int], int]:
         sql = """
 SELECT json_build_object(
     'accepted_share_count', count(*),
-    'miner_ids', COALESCE(json_agg(DISTINCT miner_id), '[]'::json)
+    'distinct_miner_count', count(DISTINCT miner_id),
+    'max_share_seq', COALESCE(max(share_seq), 0)
 )
 FROM qbit_share_ledger
 WHERE accepted;
 """
-        payload = self._run_retry_safe_read_json(sql)
-        miner_ids = {str(miner_id) for miner_id in payload["miner_ids"]}
+        payload = self._run_read_json(sql)
         counts = {
             "accepted_share_count": int(payload["accepted_share_count"]),
-            "distinct_miner_count": len(miner_ids),
+            "distinct_miner_count": int(payload["distinct_miner_count"]),
         }
-        return counts, miner_ids
+        return counts, int(payload["max_share_seq"])
 
-    def _note_appended_share(self, record: AcceptedShareRecord) -> None:
+    def _note_appended_share(
+        self,
+        record: AcceptedShareRecord,
+        *,
+        new_miner: bool,
+    ) -> None:
         """Advance the cached stats for a share this writer just committed.
 
-        Append paths hold the database lock through this call, so a reconcile
-        observes the commit and note together or observes neither. Reconcile
-        snapshots therefore replace the cache directly without replaying
-        potentially overlapping notes. Idempotent ``append_batch`` replays are
-        not noted because the batch result identifies rows it actually inserted.
+        A refresh buffers notes while its aggregate runs, then replays only
+        records newer than the aggregate's share-sequence watermark. The
+        published watermark also suppresses a delayed note for a commit that
+        was already visible in the snapshot. Idempotent ``append_batch``
+        replays are not noted because the batch result identifies rows it
+        actually inserted.
         """
         stats_lock = getattr(self, "_stats_lock", None)
         if stats_lock is None:
             return
         with stats_lock:
+            note_buffer = getattr(self, "_stats_note_buffer", None)
+            if note_buffer is not None:
+                note_buffer[record.share_seq] = new_miner
             if self._stats_counts is None:
                 return
+            if record.share_seq <= self._stats_max_share_seq:
+                return
             self._stats_counts["accepted_share_count"] += 1
-            if record.miner_id not in self._stats_miner_ids:
-                self._stats_miner_ids.add(record.miner_id)
-                self._stats_counts["distinct_miner_count"] += 1
+            self._stats_counts["distinct_miner_count"] += int(new_miner)
+            self._stats_max_share_seq = record.share_seq
 
     def current_owed_balances(self) -> list[dict[str, object]]:
         sql = """
