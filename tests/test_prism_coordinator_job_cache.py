@@ -419,6 +419,228 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(bundle.payout_state_generation, 1)
         self.assertIs(cached, bundle)
 
+    def test_child_bundle_waits_for_pending_parent_preview_without_confirmed_read(
+        self,
+    ) -> None:
+        class PreviewLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.current_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.current_balance_reads += 1
+                return []
+
+        class ObservedCondition(threading.Condition):
+            def __init__(self) -> None:
+                super().__init__()
+                self.wait_entered = threading.Event()
+
+            def wait(self, timeout: float | None = None) -> bool:
+                self.wait_entered.set()
+                return super().wait(timeout)
+
+        ledger = PreviewLedger()
+        server, rpc = coordinator(ledger=ledger)
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None
+        parent_hash = str(rpc.template["previousblockhash"])
+        preview_condition = ObservedCondition()
+        server._accepted_block_payout_preview_condition = preview_condition
+        server.accepted_block_payout_preview_wait_seconds = 10
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        bundles: list[object] = []
+        errors: list[BaseException] = []
+
+        def build_child_bundle() -> None:
+            try:
+                bundles.append(server.shared_job_bundle(artifacts, worker()))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        server._begin_accepted_block_payout_preview(parent_hash)
+        thread = threading.Thread(target=build_child_bundle, daemon=True)
+        thread.start()
+        try:
+            preview_wait_reached = preview_condition.wait_entered.wait(2)
+            waiting_for_preview = thread.is_alive()
+            confirmed_reads_while_pending = ledger.current_balance_reads
+            builds_while_pending = int(recorded["calls"])
+        finally:
+            server._publish_accepted_block_payout_preview(parent_hash, preview)
+            thread.join(5)
+            server._clear_accepted_block_payout_preview(parent_hash)
+
+        self.assertTrue(preview_wait_reached)
+        self.assertTrue(waiting_for_preview)
+        self.assertEqual(confirmed_reads_while_pending, 0)
+        self.assertEqual(builds_while_pending, 0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(bundles), 1)
+        bundle = bundles[0]
+        self.assertEqual(bundle.prior_balances, preview)  # type: ignore[union-attr]
+        self.assertEqual(recorded["last_kwargs"]["prior_balances"], preview)  # type: ignore[index]
+        self.assertEqual(ledger.current_balance_reads, 0)
+        self.assertEqual(  # type: ignore[union-attr]
+            bundle.payout_state_generation,
+            server._payout_state_generation,
+        )
+
+        self.assertEqual(server._prior_balances_for_job_parent(parent_hash), [])
+        self.assertEqual(ledger.current_balance_reads, 1)
+
+    def test_parent_preview_publication_is_idempotent_and_withdrawal_invalidates(
+        self,
+    ) -> None:
+        server, _rpc = coordinator()
+        parent_hash = "ab" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+
+        server._begin_accepted_block_payout_preview(parent_hash)
+        self.assertEqual(
+            server._publish_accepted_block_payout_preview(parent_hash, preview),
+            preview,
+        )
+        self.assertEqual(server._payout_state_generation, 1)
+
+        self.assertEqual(
+            server._publish_accepted_block_payout_preview(parent_hash, preview),
+            preview,
+        )
+        self.assertEqual(server._payout_state_generation, 1)
+        with self.assertRaisesRegex(RuntimeError, "changed during retry"):
+            server._publish_accepted_block_payout_preview(
+                parent_hash,
+                [{**preview[0], "balance_sats": 26}],
+            )
+
+        server._clear_accepted_block_payout_preview(
+            parent_hash,
+            invalidate_published=True,
+        )
+        self.assertEqual(server._payout_state_generation, 2)
+        self.assertEqual(server._accepted_block_payout_previews, {})
+
+    def test_pending_parent_preview_wait_is_bounded_and_retryable(self) -> None:
+        server, _rpc = coordinator()
+        parent_hash = "ac" * 32
+        server.accepted_block_payout_preview_wait_seconds = 0.01
+        server._begin_accepted_block_payout_preview(parent_hash)
+
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "not ready"):
+            server._prior_balances_for_job_parent(parent_hash)
+
+        self.assertTrue(server._tip_refresh_retry.is_set())
+        server._clear_accepted_block_payout_preview(parent_hash)
+
+    def test_replayed_active_ancestor_blocks_descendant_until_preview(self) -> None:
+        class PreviewLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.current_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.current_balance_reads += 1
+                return []
+
+        class ObservedCondition(threading.Condition):
+            def __init__(self) -> None:
+                super().__init__()
+                self.wait_entered = threading.Event()
+
+            def wait(self, timeout: float | None = None) -> bool:
+                self.wait_entered.set()
+                return super().wait(timeout)
+
+        ledger = PreviewLedger()
+        server, rpc = coordinator(ledger=ledger)
+        accepted_hash = "ad" * 32
+        descendant_hash = "ae" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        original_rpc_call = rpc.call
+
+        def active_chain_call(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getblockhash":
+                self.assertEqual(params, [10])
+                return accepted_hash
+            return original_rpc_call(method, params)
+
+        rpc.call = active_chain_call  # type: ignore[method-assign]
+        preview_condition = ObservedCondition()
+        server._accepted_block_payout_preview_condition = preview_condition
+        server.accepted_block_payout_preview_wait_seconds = 10
+        server._begin_accepted_block_payout_preview(accepted_hash, block_height=10)
+        balances: list[list[dict[str, object]]] = []
+        errors: list[BaseException] = []
+
+        def read_descendant_balances() -> None:
+            try:
+                balances.append(
+                    server._prior_balances_for_job_parent(
+                        descendant_hash,
+                        parent_height=11,
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=read_descendant_balances, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(preview_condition.wait_entered.wait(2))
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(ledger.current_balance_reads, 0)
+        finally:
+            server._publish_accepted_block_payout_preview(accepted_hash, preview)
+            thread.join(5)
+            server._clear_accepted_block_payout_preview(accepted_hash)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(balances, [preview])
+        self.assertEqual(ledger.current_balance_reads, 0)
+
+    def test_landed_transition_bars_reconciliation_before_preview(self) -> None:
+        server, _rpc = coordinator()
+        block_hash = "af" * 32
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "confirmation is still pending"):
+            with server._payout_balance_mutation():
+                self.fail("landed transition must bar payout reconciliation")
+
+        server._clear_accepted_block_payout_preview(block_hash)
+        with server._payout_balance_mutation():
+            pass
+
     def test_readiness_latch_during_build_lock_wait_reselects_ready_mode(self) -> None:
         ledger = FakeLedger(miners=["solo"])
         server, rpc = coordinator(ledger=ledger)

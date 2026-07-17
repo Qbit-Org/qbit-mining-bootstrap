@@ -595,6 +595,61 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("maturity_state = 'immature'", ledger.queries[0])
         self.assertNotIn("block_height + 1000", ledger.queries[0])
 
+    def test_pool_block_state_wraps_nullable_row_in_json(self) -> None:
+        ledger = CannedQueryPsqlShareLedger(
+            [
+                acquired_lease_result(),
+                {"state": None},
+                {
+                    "state": {
+                        "block_hash": "aa" * 32,
+                        "block_height": 10,
+                        "parent_hash": "bb" * 32,
+                        "chain_state": "confirmed",
+                        "maturity_state": "immature",
+                    }
+                },
+            ]
+        )
+
+        self.assertIsNone(ledger.pool_block_state(block_hash="aa" * 32))
+        self.assertEqual(
+            ledger.pool_block_state(block_hash="aa" * 32),
+            {
+                "block_hash": "aa" * 32,
+                "block_height": 10,
+                "parent_hash": "bb" * 32,
+                "chain_state": "confirmed",
+                "maturity_state": "immature",
+            },
+        )
+        self.assertIn("SELECT json_build_object(\n    'state'", ledger.queries[1])
+
+    def test_prior_balances_after_pool_block_is_height_bounded(self) -> None:
+        balance = {
+            "recipient_id": "miner-a",
+            "order_key": "miner-a",
+            "p2mr_program_hex": "11" * 32,
+            "balance_sats": "25",
+        }
+        ledger = CannedQueryPsqlShareLedger(
+            [acquired_lease_result(), [balance], []]
+        )
+
+        self.assertEqual(
+            ledger.prior_balances_after_pool_block(block_hash="aa" * 32),
+            [{**balance, "balance_sats": 25}],
+        )
+        query = ledger.queries[-1]
+        self.assertIn("block.block_height <= target.block_height", query)
+        self.assertIn("block.chain_state = 'confirmed'", query)
+        self.assertIn("carry.maturity_state <> 'reversed'", query)
+        self.assertIn("ORDER BY payout_order_key, miner_id", query)
+        self.assertEqual(
+            ledger.prior_balances_after_pool_block(block_hash="bb" * 32),
+            [],
+        )
+
     def test_memory_ledger_rejects_mutated_ctv_fanout_artifact(self) -> None:
         ledger = SingleWriterShareLedger()
         block_hash = "aa" * 32
@@ -907,6 +962,30 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(ledger.started_reads, 4)
         self.assertLessEqual(ledger.max_active_reads, 2)
+
+    def test_job_snapshot_does_not_wait_for_writer_connection_lock(self) -> None:
+        ledger = QueryCapturePsqlShareLedger()
+        snapshots: list[list[object]] = []
+        errors: list[BaseException] = []
+
+        def snapshot() -> None:
+            try:
+                snapshots.append(ledger.snapshot_at_job_issue(1_000, window_weight=8))
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        thread = threading.Thread(target=snapshot)
+        with ledger._lock:
+            thread.start()
+            thread.join(timeout=1)
+            completed_while_writer_locked = not thread.is_alive()
+        thread.join(timeout=5)
+
+        self.assertTrue(completed_while_writer_locked)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(snapshots, [[]])
+        self.assertIn("WITH RECURSIVE eligible", ledger.queries[0])
 
     def test_postgres_read_concurrency_must_be_positive(self) -> None:
         with self.assertRaisesRegex(ValueError, "read_concurrency"):

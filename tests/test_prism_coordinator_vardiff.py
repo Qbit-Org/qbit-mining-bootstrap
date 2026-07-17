@@ -27,6 +27,7 @@ from lab.prism.prism_coordinator import (
     MAX_PENDING_SHARE_APPENDS,
     PRISM_CREDIT_POLICY_STALE_GRACE,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+    PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
     PRISM_REJECTION_DUPLICATE_SHARE,
     PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
     PRISM_REJECTION_LOW_DIFFICULTY,
@@ -4185,6 +4186,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
     def test_block_submit_rejects_job_when_prior_balances_changed_before_persist(self) -> None:
         server, state, ledger = submit_coordinator()
+        ledger.durable_payout_state = True
         ledger.prior_balances = [
             {
                 "recipient_id": "miner-a",
@@ -4853,6 +4855,61 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server.metrics_payload(),
         )
 
+    def test_retryable_parent_stays_ahead_of_queued_child(self) -> None:
+        server, state, _ledger = submit_coordinator()
+        server.block_candidate_retry_initial_seconds = 0
+        server.block_candidate_retry_max_seconds = 0
+        parent = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="a1" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        child = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="b1" * 32,
+                block_hex="01",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        attempts: list[str] = []
+
+        def submit(candidate: PrismBlockCandidate) -> bool:
+            block_hash = str(candidate.submission.block_hash_hex)
+            attempts.append(block_hash)
+            if block_hash == "a1" * 32 and attempts.count(block_hash) == 1:
+                server._abandon_block_candidate(
+                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                    "temporary parent finalization failure",
+                    worker="miner-a",
+                )
+                return False
+            return True
+
+        server.submit_block_candidate = submit  # type: ignore[method-assign]
+        self.assertTrue(server.enqueue_block_candidate(parent))
+        self.assertTrue(server.enqueue_block_candidate(child))
+
+        self.assertTrue(server.submit_next_block_candidate())
+        self.assertIs(server._retry_block_candidate, parent)
+        self.assertEqual(server.block_candidate_queue.qsize(), 1)
+        self.assertTrue(server.submit_next_block_candidate())
+        self.assertIsNone(getattr(server, "_retry_block_candidate", None))
+        self.assertEqual(server.block_candidate_queue.qsize(), 1)
+        self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(attempts, ["a1" * 32, "a1" * 32, "b1" * 32])
+        self.assertTrue(server.block_candidate_queue.empty())
+
     def test_candidate_retry_backoff_is_capped_and_cleared_on_success(self) -> None:
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
@@ -5100,6 +5157,32 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(active_fanout.is_set())
         self.assertTrue(server._tip_refresh_retry.is_set())
 
+    def test_issued_preview_is_invalidated_when_final_coinbase_mismatches(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        block_hash = "cf" * 32
+        server.rpc = SubmitRpc(tip="00" * 32, block_hash=block_hash, ledger=ledger)
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle("deadbeef")
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+        candidate = block_candidate(server, state, submission)
+        candidate.context.bundle = verified_block_bundle()
+
+        self.assertFalse(server.submit_block_candidate(candidate))
+
+        self.assertEqual(server._payout_state_generation, 2)
+        self.assertEqual(server._accepted_block_payout_previews, {})
+        self.assertEqual(ledger.persisted, [])
+        self.assertEqual(
+            server._block_candidate_outcome.reason,
+            PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
+        )
+
     def test_accepted_block_persistence_allows_delivery_but_serializes_reconciliation(
         self,
     ) -> None:
@@ -5268,8 +5351,229 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertLess(events.index("persist-end"), events.index("confirm"))
             self.assertLess(events.index("confirm"), events.index("reconcile-mutation"))
 
+    def test_next_tip_preview_job_lands_after_parent_persistence(self) -> None:
+        old_tip = "00" * 32
+        parent_hash = "cd" * 32
+        child_hash = "ce" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        server._ensure_job_cache_state()
+        ledger.durable_payout_state = True
+        server.reorg_reconciler_enabled = False
+        server.stop_after_block = False
+        server.max_blocks = 10
+        server.clients = {state}
+        server.refresh_jobs_after_accepted_block = (  # type: ignore[method-assign]
+            lambda **_kwargs: None
+        )
+        build_started = threading.Event()
+        release_build = threading.Event()
+        persist_started = threading.Event()
+        release_persist = threading.Event()
+        original_persist = ledger.persist_accepted_block
+        original_confirm = ledger.confirm_accepted_block
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+
+        def payout_bundle_payload() -> dict[str, object]:
+            return {
+                "found_block": {"coinbase_value_sats": 50_00000000},
+                "ledger_window_attestation": {
+                    "signature": {"public_key_hex": "aa" * 32}
+                },
+                "payout_policy_manifest": {
+                    "accounts": [
+                        {
+                            "recipient_id": "miner-a",
+                            "order_key": "miner-a",
+                            "p2mr_program_hex": "11" * 32,
+                            "gross_amount_sats": 25,
+                            "prior_balance_sats": 0,
+                            "candidate_balance_sats": 25,
+                            "onchain_amount_sats": 0,
+                            "carry_forward_balance_sats": 25,
+                            "action": "accrued",
+                        }
+                    ]
+                },
+                "signed_coinbase_manifest": {
+                    "manifest": {"coinbase_tx_hex": "c0ffee", "payout_count": 1}
+                },
+            }
+
+        def blocking_payout_bundle(**_kwargs: object) -> dict[str, object]:
+            if not build_started.is_set():
+                build_started.set()
+                if not release_build.wait(15):
+                    raise AssertionError("timed out waiting to release parent bundle build")
+            return payout_bundle_payload()
+
+        def blocking_persist(**kwargs: object) -> dict[str, object]:
+            if str(kwargs["block_hash"]).lower() == parent_hash:
+                persist_started.set()
+                if not release_persist.wait(15):
+                    raise AssertionError("timed out waiting to release parent persistence")
+            return original_persist(**kwargs)
+
+        def expose_confirmed_preview(**kwargs: object) -> dict[str, object]:
+            persisted = next(
+                row
+                for row in reversed(ledger.persisted)
+                if str(row["block_hash"]).lower()
+                == str(kwargs["block_hash"]).lower()
+            )
+            ledger.prior_balances = server._accepted_block_payout_preview_from_bundle(
+                persisted["final_bundle"]  # type: ignore[arg-type]
+            )
+            return original_confirm(**kwargs)
+
+        ledger.persist_accepted_block = blocking_persist  # type: ignore[method-assign]
+        ledger.confirm_accepted_block = expose_confirmed_preview  # type: ignore[method-assign]
+
+        class TwoBlockRpc:
+            def __init__(self) -> None:
+                self.tip = old_tip
+                self.height = 9
+                self.hashes = {9: old_tip}
+                self.submitted: list[str] = []
+
+            def call(self, method: str, params: object = None) -> object:
+                if method == "getbestblockhash":
+                    return self.tip
+                if method == "getblockcount":
+                    return self.height
+                if method == "submitblock":
+                    block_hex = str((params or [""])[0])  # type: ignore[index]
+                    block_hash = parent_hash if block_hex == "00" else child_hash
+                    self.height += 1
+                    self.tip = block_hash
+                    self.hashes[self.height] = block_hash
+                    self.submitted.append(block_hash)
+                    ledger.submit_seen = True
+                    return None
+                if method == "getblockhash":
+                    return self.hashes[int((params or [0])[0])]  # type: ignore[index]
+                raise RuntimeError(method)
+
+        rpc = TwoBlockRpc()
+        server.rpc = rpc
+        server.build_audit_bundle = blocking_payout_bundle  # type: ignore[method-assign]
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+        sent: list[dict[str, object]] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+
+        def build_child_job(client: ClientState, *, clean_jobs: bool) -> object:
+            context = prism_context(
+                "child-job",
+                parent_hash,
+                worker=client.worker,
+                clean_jobs=clean_jobs,
+            )
+            context.template["height"] = 11
+            context.prior_balances = server._prior_balances_for_job_parent(parent_hash)
+            context.payout_state_generation = server._payout_state_generation
+            return context
+
+        server.build_job_for_client = build_child_job  # type: ignore[method-assign]
+        parent_submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=parent_hash,
+            block_hex="00",
+        )
+        parent_candidate = block_candidate(server, state, parent_submission)
+        parent_candidate.context.bundle = payout_bundle_payload()
+        parent_results: list[bool] = []
+        parent_errors: list[BaseException] = []
+
+        def submit_parent() -> None:
+            try:
+                parent_results.append(server.submit_block_candidate(parent_candidate))
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                parent_errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            parent_thread = threading.Thread(target=submit_parent)
+            parent_thread.start()
+            try:
+                self.assertTrue(build_started.wait(5))
+                self.assertEqual(ledger.current_prior_balances(), [])
+                self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
+                child_context = state.active_job
+                self.assertIsNotNone(child_context)
+                assert child_context is not None
+                self.assertTrue(parent_thread.is_alive())
+                self.assertEqual(child_context.prior_balances, preview)
+                self.assertEqual(
+                    child_context.payout_state_generation,
+                    server._payout_state_generation,
+                )
+                preview_generation = server._payout_state_generation
+                self.assertEqual(sent[-1]["method"], "mining.notify")
+                self.assertTrue(sent[-1]["params"][8])  # type: ignore[index]
+
+                child_submission = SimpleNamespace(
+                    header_hex="bb" * 80,
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=child_hash,
+                    block_hex="01",
+                    share_pass=True,
+                    block_pass=True,
+                )
+                with patch(
+                    "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+                    return_value=child_submission,
+                ):
+                    self.assertFalse(
+                        server.handle_submit(
+                            state,
+                            ["miner-a", "child-job", "00" * 8, "00000001", "00000002"],
+                        )
+                    )
+                self.assertEqual(server.block_candidate_queue.qsize(), 1)
+                release_build.set()
+                self.assertTrue(persist_started.wait(5))
+                self.assertTrue(parent_thread.is_alive())
+            finally:
+                release_build.set()
+                release_persist.set()
+                parent_thread.join(10)
+
+            self.assertFalse(parent_thread.is_alive())
+            if parent_errors:
+                raise parent_errors[0]
+            self.assertEqual(parent_results, [True])
+            self.assertEqual(ledger.current_prior_balances(), preview)
+            self.assertEqual(server._payout_state_generation, preview_generation)
+            self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(rpc.submitted, [parent_hash, child_hash])
+        self.assertEqual(server.accepted_block_count, 2)
+        self.assertEqual(len(ledger.persisted), 2)
+        self.assertEqual(len(ledger.confirmed), 2)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts.get(PRISM_REJECTION_STALE_JOB, 0),
+            0,
+        )
+        self.assertEqual(server._accepted_block_payout_previews, {})
+
     def test_active_ancestor_candidate_resumes_full_finalization_without_resubmit(self) -> None:
         server, state, ledger = submit_coordinator()
+        server.max_blocks = 10
+        server.stop_after_block = False
+        refreshes: list[str] = []
+        server.refresh_jobs_after_accepted_block = (  # type: ignore[method-assign]
+            lambda **kwargs: refreshes.append(str(kwargs["block_hash"]))
+        )
         with tempfile.TemporaryDirectory() as tempdir:
             server.audit_dir = Path(tempdir)
             server.evidence_path = Path(tempdir) / "evidence.json"
@@ -5277,6 +5581,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             block_hash = "ac" * 32
 
             class ActiveAncestorRpc:
+                def __init__(self) -> None:
+                    self.revalidated_heights: list[int] = []
+
                 def call(self, method: str, params: object = None) -> object:
                     if method == "getbestblockhash":
                         return "ef" * 32
@@ -5285,6 +5592,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                         return {"height": 10, "confirmations": 2}
                     if method == "getblockcount":
                         return 11
+                    if method == "getblockhash":
+                        if params != [10]:
+                            raise AssertionError(params)
+                        self.revalidated_heights.append(10)
+                        return block_hash
                     if method == "submitblock":
                         raise AssertionError("active ancestor must not be resubmitted")
                     raise RuntimeError(method)
@@ -5294,7 +5606,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                     if params != [block_hash]:
                         raise AssertionError(params)
 
-            server.rpc = ActiveAncestorRpc()
+            active_rpc = ActiveAncestorRpc()
+            server.rpc = active_rpc
             server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
             server.build_audit_bundle = lambda **_kwargs: {  # type: ignore[method-assign]
                 "found_block": {"coinbase_value_sats": 50_00000000},
@@ -5315,20 +5628,44 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 block_hash_hex=block_hash,
                 block_hex="00",
             )
+            candidate = block_candidate(server, state, submission)
 
-            self.assertTrue(
-                server.submit_block_candidate(block_candidate(server, state, submission))
+            self.assertTrue(server.submit_block_candidate(candidate))
+            # A failed outbox terminal update can replay A after later block B
+            # changes global balances. Validate A against its height-bounded
+            # active-chain view and suppress duplicate process-local accounting.
+            ledger.durable_payout_state = True
+            ledger.prior_balances = [
+                {
+                    "recipient_id": "later-miner",
+                    "order_key": "later-miner",
+                    "p2mr_program_hex": "22" * 32,
+                    "balance_sats": 50,
+                }
+            ]
+            ledger.pool_block_state = lambda **_kwargs: {  # type: ignore[attr-defined]
+                "block_hash": block_hash,
+                "block_height": 10,
+                "parent_hash": "00" * 32,
+                "chain_state": "confirmed",
+                "maturity_state": "immature",
+            }
+            ledger.prior_balances_after_pool_block = (  # type: ignore[attr-defined]
+                lambda **_kwargs: []
             )
+            self.assertTrue(server.submit_block_candidate(candidate))
 
-        self.assertEqual(ledger.persisted[0]["block_hash"], block_hash)
-        self.assertEqual(ledger.confirmed[0]["active_tip_height"], 11)
+        self.assertEqual([row["block_hash"] for row in ledger.persisted], [block_hash] * 2)
+        self.assertEqual(ledger.confirmed[0]["active_tip_height"], 10)
         self.assertEqual(ledger.confirmed[0]["block_hash"], block_hash)
+        self.assertEqual(active_rpc.revalidated_heights, [10, 10])
         self.assertFalse(ledger.confirmed[0]["submit_seen_at_confirm"])
         # The share credit happens on the client thread at submit time now;
         # the block path itself appends nothing.
         self.assertEqual(len(ledger.pending), 0)
-        # stop_after_block fires from the submitter once the block confirms.
-        self.assertTrue(server.stop_event.is_set())
+        self.assertFalse(server.stop_event.is_set())
+        self.assertEqual(server.accepted_block_count, 1)
+        self.assertEqual(refreshes, [block_hash])
         self.assertEqual(server.latest_evidence["persistence"]["block_count"], 1)
         self.assertEqual(server.latest_evidence["confirmation"]["confirmed_count"], 1)
         # Evidence carries an aggregate miner count, not a materialized list of
@@ -6907,6 +7244,44 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         self.assertEqual(len(ledger), 1)
         self.assertEqual(ledger.pending_block_candidates(), [])
 
+    def test_below_target_intent_failure_does_not_create_unsafe_retry_slot(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            coinbase_tx_hex="00",
+            block_hex="00",
+            block_hash_hex="be" * 32,
+            share_pass=False,
+            block_pass=True,
+        )
+        submit_calls = 0
+
+        def fail_intent(_intent: dict[str, object]) -> bool:
+            raise RuntimeError("outbox unavailable")
+
+        def unsafe_submit(_candidate: PrismBlockCandidate) -> bool:
+            nonlocal submit_calls
+            submit_calls += 1
+            return True
+
+        ledger.persist_block_candidate_intent = fail_intent  # type: ignore[method-assign]
+        server.submit_block_candidate = unsafe_submit  # type: ignore[method-assign]
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "outbox unavailable"):
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(submit_calls, 0)
+        self.assertIsNone(getattr(server, "_retry_block_candidate", None))
+        self.assertEqual(ledger.pending_block_candidates(), [])
+
     def test_block_worthy_below_target_rejects_low_difficulty_when_block_fails(self) -> None:
         # If the block does not land, the below-share-target hash earns nothing
         # and the miner is rejected as low-difficulty -- never acked accepted
@@ -6981,6 +7356,12 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         self.assertEqual(server.duplicate_share_count, 0)
         self.assertEqual(len(ledger), 0)
         self.assertEqual(len(ledger.pending_block_candidates()), 1)
+        self.assertIsNotNone(server._retry_block_candidate)
+        assert server._retry_block_candidate is not None
+        self.assertEqual(
+            server._retry_block_candidate.submission.block_hash_hex,
+            submission.block_hash_hex,
+        )
 
     def test_post_block_refresh_stamps_block_submitter_heartbeat(self) -> None:
         # The post-block job push runs on the block-submitter thread, so it must
