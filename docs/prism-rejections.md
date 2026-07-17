@@ -58,6 +58,33 @@ The existing broad counters remain for compatibility:
 - `qbit_prism_duplicate_shares_total`
 - `qbit_prism_low_difficulty_shares_total`
 
+## Stale Classification Tip Source
+
+The per-share `stale-job` check in `mining.submit` compares the job's parent
+hash against the tip the blockpoll/blockwait observers already confirmed, not
+against a per-share `getbestblockhash` RPC. This removes the
+submit-races-ahead-of-the-poller failure mode: a submit-path RPC could observe
+a new tip seconds before jobs refreshed, and with
+`PRISM_STRATUM_STALE_GRACE_SECONDS=0` (mainnet-forced) that rejected every
+in-flight share on the old tip. The observed tip is also the anchor the
+stale-grace window and evicted-job classification already use, so all three
+now agree.
+
+Fail-safe bound: the observed tip is trusted only while it is younger than
+`PRISM_SUBMIT_TIP_MAX_AGE_SECONDS` (default 10). If tip observation stalls
+(poller failing after a tip change), submits fall back to the live RPC read
+instead of accepting shares against a frozen snapshot.
+
+Rejections are counted, never logged per share or written to the ledger.
+Diagnose reject spikes from `qbit_prism_rejections_total`, the
+`qbit_prism_job_build_seconds` histogram, and the
+`qbit_prism_tip_refresh_seconds` histograms. Per-share/per-job stdout logging
+exists only behind `PRISM_HOT_PATH_LOG=1` for debugging and must stay off in
+production. Prepared fanout passes validate tip and chain-view trust once per
+pass (minting a validation token; per-client deliveries consult only
+in-memory token state) plus a post-fanout re-validation, so per-client RPC
+round trips never return to the delivery path.
+
 Additional private metrics relevant to attribution and grace behavior:
 
 - `qbit_prism_grace_credited_shares_total`

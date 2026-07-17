@@ -88,6 +88,12 @@ DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS = 1.0
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES = 4_096
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
 DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
+# How old the poller/blockwait-observed tip may be before mining.submit stops
+# trusting it and falls back to a live getbestblockhash per share. Healthy
+# coordinators re-observe the tip every blockpoll interval, so the fallback
+# only engages when tip observation is genuinely failing (fail-safe, never
+# fail-open on a frozen snapshot).
+DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS = 10.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS = 30.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
 DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
@@ -1202,6 +1208,15 @@ class PrismCoordinator:
             "PRISM_STRATUM_STALE_GRACE_SECONDS",
             DEFAULT_PRISM_STALE_GRACE_SECONDS,
         )
+        # Per-share/per-job stdout logging is debug-only: at production share
+        # rates each print is a journald flush on the Stratum hot path.
+        self.hot_path_log_enabled = env_bool("PRISM_HOT_PATH_LOG", "0")
+        # Zero disables the observed-tip reuse (every submit re-reads the tip
+        # over RPC, the legacy behavior).
+        self.submit_tip_max_age_seconds = env_nonnegative_float(
+            "PRISM_SUBMIT_TIP_MAX_AGE_SECONDS",
+            DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS,
+        )
         self.same_tip_job_retention_seconds = env_nonnegative_float(
             "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS",
             DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS,
@@ -1459,6 +1474,11 @@ class PrismCoordinator:
         # startup baseline tip, which never opens the stale-grace window.
         self.current_tip_first_seen: tuple[str, float | None] | None = None
         self.current_tip_parent: tuple[str, str] | None = None
+        # When the poller/blockwait last confirmed the observed tip against
+        # qbit (including same-tip re-observations). Bounds how long
+        # mining.submit may classify against the observed tip before falling
+        # back to a live RPC read (see submit_stale_check_tip).
+        self.current_tip_observed_monotonic: float | None = None
         # Block candidates are landed by a dedicated submitter thread so a
         # winning share's ack (and every other client's) never waits on
         # audit/persist/submitblock; see enqueue_block_candidate.
@@ -1704,12 +1724,15 @@ class PrismCoordinator:
         audit_body_dir = getattr(self, "audit_dir", None)
         return PsqlShareLedger(
             psql_command=psql_command,
+            database_url=database_url or None,
+            native_client_mode=env("PRISM_POSTGRES_NATIVE_CLIENT", "auto"),
             writer_id=env("PRISM_LEDGER_WRITER_ID", "prism-coordinator"),
             writer_epoch=env_int("PRISM_LEDGER_WRITER_EPOCH", 1),
             writer_session_token=writer_session_token,
             initialize_schema=env("PRISM_POSTGRES_INIT_SCHEMA", "0") in {"1", "true", "yes"},
             lease_ttl_seconds=env_positive_float("PRISM_LEDGER_LEASE_TTL_SECONDS", 60.0),
             read_concurrency=env_positive_int("PRISM_POSTGRES_READ_CONCURRENCY", 4),
+            accepted_stats_cache_seconds=env_nonnegative_float("PRISM_ACCEPTED_STATS_CACHE_SECONDS", 60.0),
             audit_body_dir=str(audit_body_dir) if audit_body_dir is not None else None,
             audit_share_segment_size=getattr(self, "audit_share_segment_size", DEFAULT_AUDIT_SHARE_SEGMENT_SIZE),
             ctv_broadcast_attempt_detail_limit=getattr(
@@ -2794,7 +2817,9 @@ class PrismCoordinator:
             f"blockpoll={self.blockpoll_seconds:g}s "
             f"version_mask={stratum_codec.format_mask_hex(self.version_mask)} "
             f"version_mask_source={self.version_mask_selection.source}:{self.version_mask_selection.detail} "
-            f"ledger={self.ledger.backend_name}",
+            f"ledger={self.ledger.backend_name} "
+            f"ledger_execution={getattr(self.ledger, 'execution_backend', self.ledger.backend_name)} "
+            f"hot_path_log={'on' if self.hot_path_log_enabled else 'off'}",
             flush=True,
         )
         for profile in self.listener_profiles[1:]:
@@ -3658,12 +3683,13 @@ class PrismCoordinator:
                     phases["send"] = delivered_monotonic - phase_started
                     elapsed = delivered_monotonic - started
                     self.observe_job_build_elapsed(elapsed, phases)
-                    print(
-                        "prism coordinator: sent prepared job "
-                        f"connection={client.connection_id} username={client.username} "
-                        f"job={context.job.job_id} elapsed={elapsed:.3f}s",
-                        flush=True,
-                    )
+                    if getattr(self, "hot_path_log_enabled", False):
+                        print(
+                            "prism coordinator: sent prepared job "
+                            f"connection={client.connection_id} username={client.username} "
+                            f"job={context.job.job_id} elapsed={elapsed:.3f}s",
+                            flush=True,
+                        )
                     return RefreshResult("sent", delivered_monotonic)
                 finally:
                     if cancel_event is not None:
@@ -3740,6 +3766,7 @@ class PrismCoordinator:
             first_delivery: float | None = None
             last_delivery: float | None = None
             invalidation: TemplateRefreshBlocked | None = None
+            last_live_trust_check = time.monotonic()
             while pending:
                 self._record_heartbeat(heartbeat_name)
                 if self.stop_event.is_set():
@@ -3798,6 +3825,38 @@ class PrismCoordinator:
                                 if last_delivery is None
                                 else max(last_delivery, delivered)
                             )
+                if (
+                    pending
+                    and invalidation is None
+                    and not self.stop_event.is_set()
+                    and time.monotonic() - last_live_trust_check >= 1.0
+                ):
+                    # Validation tokens keep queued per-client deliveries
+                    # RPC-free, but they cannot observe headers advancing
+                    # ahead of blocks while the best-block hash stays fixed.
+                    # Recheck the live chain view from the fanout driver about
+                    # once per second and cancel every delivery still queued
+                    # if the view becomes untrusted.
+                    try:
+                        trusted = self.ensure_reorg_reconciled_for_current_tip(
+                            expected_tip_hash=snapshot.bestblockhash,
+                        )
+                        if not trusted:
+                            raise TemplateRefreshBlocked(
+                                "qbit chain view became untrusted during prepared fanout"
+                            )
+                        last_live_trust_check = time.monotonic()
+                    except TemplateRefreshBlocked as exc:
+                        invalidation = exc
+                    except Exception as exc:
+                        invalidation = TemplateRefreshBlocked(
+                            "qbit chain trust check failed during prepared fanout"
+                        )
+                        invalidation.__cause__ = exc
+                    if invalidation is not None:
+                        cancel_event.set()
+                        for pending_future in pending:
+                            pending_future.cancel()
             if invalidation is not None:
                 self._schedule_tip_refresh_retry()
                 raise invalidation
@@ -4172,6 +4231,9 @@ class PrismCoordinator:
             first_seen = getattr(self, "current_tip_first_seen", None)
             if first_seen is not None and first_seen[0] == tip_hash:
                 same_tip = True
+                # A same-tip re-observation proves the tip view is live; the
+                # freshness stamp bounds submit_stale_check_tip reuse.
+                self.current_tip_observed_monotonic = now
                 active = getattr(self, "_active_tip_refresh", None)
                 # A routine blockwait/poll observation of the same hash carries
                 # no newer template. While that hash is actively fanning out,
@@ -4199,6 +4261,7 @@ class PrismCoordinator:
                     now if first_seen is not None else None,
                 )
                 self.current_tip_observation_sequence = observation_sequence
+                self.current_tip_observed_monotonic = now
                 self.current_tip_parent = None
 
         if active_to_cancel is not None:
@@ -4272,6 +4335,49 @@ class PrismCoordinator:
             ):
                 self.current_tip_parent = (tip_hash, parent)
         return parent
+
+    def submit_stale_check_tip(self) -> str:
+        """Best-known chain tip for per-share submit classification.
+
+        Prefers the tip the blockpoll/blockwait observers already confirmed
+        (refreshed at least every PRISM_BLOCKPOLL_SECONDS while healthy) so
+        mining.submit never blocks on a getbestblockhash RPC per share. This
+        also removes the submit-races-ahead-of-the-poller failure mode: a
+        submit-path RPC can observe a new tip seconds before jobs refresh, and
+        with PRISM_STRATUM_STALE_GRACE_SECONDS=0 (mainnet-forced) that
+        rejected every in-flight share on the old tip. Classifying against the
+        observed tip keeps shares valid exactly until the coordinator itself
+        sees the flip and refreshes work, and it is the same tip source the
+        stale-grace window and evicted-job classification are anchored to.
+
+        Fail-safe bound: the observed tip is only trusted while its freshness
+        stamp is younger than PRISM_SUBMIT_TIP_MAX_AGE_SECONDS. If tip
+        observation stalls (poller failing after a tip change, reconciliation
+        refusing a new tip), submits fall back to the live RPC read instead of
+        accepting shares against a frozen snapshot indefinitely.
+        """
+        max_age = float(
+            getattr(
+                self,
+                "submit_tip_max_age_seconds",
+                DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS,
+            )
+        )
+        if max_age > 0:
+            with self.lock:
+                observed = getattr(self, "current_tip_first_seen", None)
+                observed_at = getattr(self, "current_tip_observed_monotonic", None)
+                # Keep the freshness decision and selected hash in the same
+                # critical section as tip observation. Otherwise a poller can
+                # publish a newer tip after these fields are copied but before
+                # this method returns the superseded hash.
+                if (
+                    observed is not None
+                    and observed_at is not None
+                    and time.monotonic() - observed_at <= max_age
+                ):
+                    return observed[0]
+        return str(self.rpc.call("getbestblockhash"))
 
     def stale_grace_deadline_open(
         self,
@@ -5436,10 +5542,11 @@ class PrismCoordinator:
         started = time.monotonic()
         phases = self._job_build_phases()
         phases.clear()
-        print(
-            f"prism coordinator: building job connection={client.connection_id} username={client.username}",
-            flush=True,
-        )
+        if getattr(self, "hot_path_log_enabled", False):
+            print(
+                f"prism coordinator: building job connection={client.connection_id} username={client.username}",
+                flush=True,
+            )
         phase_started = time.monotonic()
         guarded_refresh = tip_refresh_snapshot is not None
         if guarded_refresh != (tip_refresh_observation_sequence is not None):
@@ -5593,17 +5700,18 @@ class PrismCoordinator:
             phases["send"] = time.monotonic() - phase_started
             elapsed = time.monotonic() - started
             self.observe_job_build_elapsed(elapsed, phases)
-            phase_report = ",".join(
-                f"{phase}:{phases[phase]:.3f}"
-                for phase in PRISM_JOB_BUILD_PHASES
-                if phase in phases
-            )
-            print(
-                f"prism coordinator: sent job connection={client.connection_id} username={client.username} "
-                f"job={context.job.job_id} collection={context.collection_only} elapsed={elapsed:.3f}s "
-                f"phases={phase_report}",
-                flush=True,
-            )
+            if getattr(self, "hot_path_log_enabled", False):
+                phase_report = ",".join(
+                    f"{phase}:{phases[phase]:.3f}"
+                    for phase in PRISM_JOB_BUILD_PHASES
+                    if phase in phases
+                )
+                print(
+                    f"prism coordinator: sent job connection={client.connection_id} username={client.username} "
+                    f"job={context.job.job_id} collection={context.collection_only} elapsed={elapsed:.3f}s "
+                    f"phases={phase_report}",
+                    flush=True,
+                )
             return True
 
     def prune_client_active_jobs(self, client: ClientState) -> None:
@@ -5993,14 +6101,7 @@ class PrismCoordinator:
                     "stale job",
                     worker=worker_name,
                 )
-        current_tip = str(self.rpc.call("getbestblockhash"))
-        # Do not anchor the stale-grace window from this submit-path tip read.
-        # Only blockpoll/blockwait may open the window (see
-        # stale_grace_deadline_open): a submit's getbestblockhash can observe a
-        # new tip while job refresh still lags, and anchoring here would start
-        # the grace clock late and credit prior-tip shares long after the real
-        # tip change.
-        #
+        current_tip = self.submit_stale_check_tip()
         # Share classification (normal and stale-grace alike) is deliberately
         # point-in-time against this single tip read: a tip that advances
         # between here and the ledger append does not retroactively invalidate
@@ -6448,15 +6549,17 @@ class PrismCoordinator:
                 records = [self.ledger.append(entry.pending_share) for entry in batch]
             if len(records) != len(batch):
                 raise RuntimeError("share ledger returned an incomplete commit batch")
+            hot_path_log = getattr(self, "hot_path_log_enabled", False)
             for entry, record in zip(batch, records, strict=True):
                 entry.record = record
-                print(
-                    "prism coordinator: accepted share "
-                    f"seq={record.share_seq} miner={entry.username} job={entry.job_id} "
-                    f"hash={entry.block_hash_hex} collection={entry.collection_only} "
-                    f"credit_policy={entry.credit_policy or 'normal'}",
-                    flush=True,
-                )
+                if hot_path_log:
+                    print(
+                        "prism coordinator: accepted share "
+                        f"seq={record.share_seq} miner={entry.username} job={entry.job_id} "
+                        f"hash={entry.block_hash_hex} collection={entry.collection_only} "
+                        f"credit_policy={entry.credit_policy or 'normal'}",
+                        flush=True,
+                    )
             return True
         except Exception as exc:
             with self.lock:
@@ -6642,13 +6745,14 @@ class PrismCoordinator:
                     return False
                 backoff_seconds = min(backoff_seconds * 2, 5.0)
                 self._record_heartbeat("share_writer")
-        print(
-            "prism coordinator: accepted share "
-            f"seq={record.share_seq} miner={entry.username} job={entry.job_id} "
-            f"hash={entry.block_hash_hex} collection={entry.collection_only} "
-            f"credit_policy={entry.credit_policy or 'normal'}",
-            flush=True,
-        )
+        if getattr(self, "hot_path_log_enabled", False):
+            print(
+                "prism coordinator: accepted share "
+                f"seq={record.share_seq} miner={entry.username} job={entry.job_id} "
+                f"hash={entry.block_hash_hex} collection={entry.collection_only} "
+                f"credit_policy={entry.credit_policy or 'normal'}",
+                flush=True,
+            )
         entry.committed.set()
         return True
 
