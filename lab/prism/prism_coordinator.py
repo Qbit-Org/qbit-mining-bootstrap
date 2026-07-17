@@ -1982,6 +1982,10 @@ class PrismCoordinator:
             if cancelled_refresh is not None:
                 cancelled_refresh.set()
             if schedule_retry:
+                # Payout-only invalidation can happen without a new tip
+                # observation. Advertise the queued refresh immediately so
+                # CTV maintenance yields until blockpoll claims this signal.
+                self._mark_tip_refresh_pending(generation)
                 self._schedule_tip_refresh_retry()
         return generation
 
@@ -5357,6 +5361,21 @@ class PrismCoordinator:
                 self._schedule_tip_refresh_retry()
                 raise TemplateRefreshBlocked(
                     "tip refresh snapshot was superseded before client job build"
+                )
+            try:
+                chain_view_untrusted = bool(
+                    getattr(self, "reorg_reconciler_enabled", True)
+                    and self.qbit_chain_view_untrusted()
+                )
+            except Exception as exc:
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "qbit chain trust check failed before sequential client job build"
+                ) from exc
+            if chain_view_untrusted:
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "qbit chain view became untrusted before sequential client job build"
                 )
         else:
             try:

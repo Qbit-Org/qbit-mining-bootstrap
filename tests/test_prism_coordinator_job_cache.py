@@ -440,7 +440,21 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(server._advance_payout_state_generation(), 1)
         self.assertEqual(cancellations, [])
+        self.assertFalse(server.tip_refresh_is_pending())
         self.assertFalse(server._tip_refresh_retry.is_set())
+
+    def test_payout_generation_retry_marks_tip_refresh_pending(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+
+        self.assertFalse(server.tip_refresh_is_pending())
+        self.assertEqual(server._advance_payout_state_generation(), 1)
+
+        self.assertTrue(server.tip_refresh_is_pending())
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertFalse(server.tip_refresh_is_pending())
 
     def test_escaped_stale_bundle_is_rejected_before_direct_delivery(self) -> None:
         server, _rpc = coordinator()

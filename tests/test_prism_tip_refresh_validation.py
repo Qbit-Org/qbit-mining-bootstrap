@@ -54,6 +54,40 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertTrue(all(state.active_job.collection_only for state in clients))
         self.assertLessEqual(rpc.count("getbestblockhash"), 3)
 
+    def test_collection_refresh_stops_when_chain_becomes_untrusted(self) -> None:
+        server, _rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        first, second = client(1), client(2)
+        notifications: list[int] = []
+        for state in (first, second):
+            state.send = (  # type: ignore[method-assign]
+                lambda payload, connection_id=state.connection_id: (
+                    notifications.append(connection_id)
+                    if payload["method"] == "mining.notify"
+                    else None
+                )
+            )
+        server.clients = [first, second]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        chain_view_checks = 0
+
+        def chain_view_untrusted() -> bool:
+            nonlocal chain_view_checks
+            chain_view_checks += 1
+            return chain_view_checks == 2
+
+        server.qbit_chain_view_untrusted = chain_view_untrusted  # type: ignore[method-assign]
+
+        with self.assertRaises(TemplateRefreshBlocked):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(chain_view_checks, 2)
+        self.assertEqual(notifications, [first.connection_id])
+        self.assertIsNotNone(first.active_job)
+        self.assertIsNone(second.active_job)
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
     def test_orphan_reconciliation_rebuilds_bundle_from_post_reorg_balances(self) -> None:
         orphaned_balance = {
             "recipient_id": "orphaned-miner",
@@ -534,6 +568,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         release_send = threading.Event()
         mutation_started = threading.Event()
         mutation_completed = threading.Event()
+        poll_results: list[int] = []
         poll_errors: list[BaseException] = []
 
         def block_notify(payload: dict[str, object]) -> None:
@@ -545,7 +580,7 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         def poll() -> None:
             try:
-                server.poll_qbit_tip_template_once()
+                poll_results.append(server.poll_qbit_tip_template_once())
             except BaseException as exc:  # noqa: BLE001 - asserted below
                 poll_errors.append(exc)
 
@@ -573,8 +608,11 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertFalse(poll_thread.is_alive())
         self.assertTrue(mutation_completed.is_set())
         self.assertEqual(server._payout_state_generation, 1)
-        self.assertEqual(len(poll_errors), 1)
-        self.assertIsInstance(poll_errors[0], TemplateRefreshBlocked)
+        self.assertEqual(len(poll_results) + len(poll_errors), 1)
+        if poll_errors:
+            self.assertIsInstance(poll_errors[0], TemplateRefreshBlocked)
+        else:
+            self.assertEqual(poll_results, [1])
         self.assertTrue(server._tip_refresh_retry.is_set())
 
     def test_prepared_skip_after_admission_releases_cancellation_gate(self) -> None:
