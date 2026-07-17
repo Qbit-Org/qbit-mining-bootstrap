@@ -4529,7 +4529,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertEqual(ledger.pending[0].share_id, "miner-a:" + "cc" * 32)
         self.assertEqual(server.worker_share_counts["miner-a"]["accepted"], 1)
-        server.stop_event.set()
+        server.request_shutdown()
         writer.join(timeout=2)
 
     def test_failed_commit_releases_duplicate_key_for_exact_retry(self) -> None:
@@ -4575,7 +4575,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
         self.assertEqual(len(healthy.pending), 1)
         self.assertEqual(server.worker_share_counts["miner-a"]["accepted"], 1)
-        server.stop_event.set()
+        server.request_shutdown()
         writer.join(timeout=2)
 
     def test_share_writer_retries_failed_append_until_it_lands(self) -> None:
@@ -4806,13 +4806,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                     raise RuntimeError("postgres unavailable")
 
             server.ledger = DownLedger()
-            server.stop_event.set()
             entries = []
             for tag in ("s1", "s2", "s3"):
                 entry = self._pending_append(tag)
                 entries.append(entry)
                 server.enqueue_share_append(entry)
 
+            server.request_shutdown()
             server.share_append_loop()
 
             # The compatibility ledger fails on the first row; the whole batch

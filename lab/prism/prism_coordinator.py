@@ -1501,6 +1501,10 @@ class CoordinatorShutdownController:
         with self.condition:
             return any(self.active_writers.get(component, 0) for component in components)
 
+    def writer_admission_closed(self) -> bool:
+        with self.condition:
+            return self.phase != "running"
+
     def wait_for_writer_quiescence(self) -> tuple[bool, float, dict[str, int]]:
         started = time.monotonic()
         deadline = started + self.writer_quiescence_timeout_seconds
@@ -8495,12 +8499,17 @@ class PrismCoordinator:
             try:
                 entry = queue_obj.get(timeout=0.2 if stopping else 1.0)
             except queue.Empty:
-                if stopping and not self._ensure_shutdown_controller().has_active_writer(
-                    {
-                        "share_submission",
-                        "share_persistence",
-                        "accepted_block_handling",
-                    }
+                controller = self._ensure_shutdown_controller()
+                if (
+                    stopping
+                    and controller.writer_admission_closed()
+                    and not controller.has_active_writer(
+                        {
+                            "share_submission",
+                            "share_persistence",
+                            "accepted_block_handling",
+                        }
+                    )
                 ):
                     return
                 continue
@@ -9473,7 +9482,7 @@ class PrismCoordinator:
                 candidate_bundle_path.unlink()
             except FileNotFoundError:
                 pass
-            self.stop_event.set()
+            self.request_shutdown()
             self._abandon_block_candidate(
                 PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
                 "final audit bundle coinbase does not match submitted coinbase",
@@ -9582,7 +9591,7 @@ class PrismCoordinator:
                         )
                     )
             if confirmed_count not in {0, 1}:
-                self.stop_event.set()
+                self.request_shutdown()
                 self._abandon_block_candidate(
                     PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                     f"ledger did not confirm accepted block {block_hash}",
@@ -9681,7 +9690,7 @@ class PrismCoordinator:
                 flush=True,
             )
             if should_stop:
-                self.stop_event.set()
+                self.request_shutdown()
             else:
                 # The public submitter wrapper performs this fanout only after
                 # its writer scope (including outbox finalization) exits. The

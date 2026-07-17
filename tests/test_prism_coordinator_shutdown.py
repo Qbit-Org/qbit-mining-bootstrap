@@ -201,6 +201,42 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         self.assertTrue(entry.committed.is_set())
         self.assertEqual(ledger.release_calls, 1)
 
+    def test_event_only_stop_cannot_strand_late_admitted_share(self) -> None:
+        class Ledger(RecordingLeaseLedger):
+            def append_batch(self, entries: object) -> list[object]:
+                return [SimpleNamespace(share_seq=1)]
+
+        server = coordinator(Ledger())
+        server.share_append_queue = queue.Queue(maxsize=2)
+        server.share_commit_batch_size = 1
+        server.share_commit_linger_seconds = 0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        entry = PendingShareAppend(
+            pending_share=SimpleNamespace(),
+            username="miner-a",
+            job_id="job-a",
+            block_hash_hex="aa" * 32,
+            collection_only=False,
+            credit_policy=None,
+        )
+
+        # Model a request that passed admission immediately before a legacy
+        # event-only stop. The writer must remain available until admission is
+        # actually closed, so the share cannot be stranded behind its exit.
+        server.stop_event.set()
+        writer_thread = threading.Thread(target=server.share_append_loop)
+        writer_thread.start()
+        time.sleep(0.25)
+        self.assertTrue(writer_thread.is_alive())
+
+        server.enqueue_share_append(entry)
+        self.assertTrue(entry.committed.wait(1))
+        server.request_shutdown(signal.SIGTERM)
+        writer_thread.join(1)
+
+        self.assertFalse(writer_thread.is_alive())
+        self.assertIsNotNone(entry.record)
+
     def test_blocked_writer_withholds_release_and_names_component(self) -> None:
         ledger = RecordingLeaseLedger()
         server = coordinator(ledger, timeout=0.03)
