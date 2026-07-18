@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import time
 import unittest
 
@@ -566,6 +567,60 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
             self.assertEqual(len(notifies), sent_before)
             self.assertEqual(server.current_tip_first_seen[0], next_tip)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_pinned_delivery_keeps_priority_when_payout_sources_detected_tip(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            next_tip = "bb" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+            server.fetch_qbit_tip_template_snapshot()
+            # Reconciliation may source payout metadata at the detected tip
+            # before submit authority flips; pinned published-tip delivery
+            # must keep the priority lane through the payout gate. Arm the
+            # gate's first-delivery reservation exactly as a fresh payout
+            # publication does, so a non-priority same-generation delivery
+            # would be rejected rather than admitted.
+            with server._job_cache_lock:
+                server._published_payout_state = dataclasses.replace(
+                    server._published_payout_state,
+                    source_tip_hash=next_tip,
+                )
+            gate = server._payout_state_delivery_gate
+            with gate._condition:
+                gate._priority_generation = int(server._payout_state_generation)
+
+            state.active_job = None
+            state.active_job_ids = set()
+            sent_before = len(notifies)
+            self.assertTrue(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before + 1)
+            self.assertEqual(notifies[-1], published_tip[0])
         finally:
             server.shutdown_tip_refresh_executor()
 

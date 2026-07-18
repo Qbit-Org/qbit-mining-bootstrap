@@ -10879,13 +10879,32 @@ class PrismCoordinator:
                     current_payout_generation,
                 )
             )
+        context_template = getattr(context, "template", None)
+        context_parent = (
+            str(context_template.get("previousblockhash", ""))
+            if isinstance(context_template, dict)
+            else ""
+        )
+        with self.lock:
+            published_authority = getattr(self, "current_tip_first_seen", None)
+            pinned_published_delivery = bool(
+                context_parent
+                and published_authority is not None
+                and context_parent == published_authority[0]
+                and self._published_tip_authoritative_locked(time.monotonic())
+            )
         priority_delivery = (
             not publication_blocked
             and context_payout_generation == current_payout_generation
             and (
                 published_tip is None
-                or str(context.template.get("previousblockhash", ""))
-                == published_tip
+                or context_parent == published_tip
+                # Reconciliation can source payout state at the detected tip
+                # before submit authority flips. Pinned published-tip work is
+                # still the currently creditable work, so it must keep the
+                # priority lane instead of tripping the gate's non-priority
+                # same-generation rejection for the whole unpublished window.
+                or pinned_published_delivery
             )
         )
         payout_gate_started = time.monotonic()
@@ -10934,9 +10953,9 @@ class PrismCoordinator:
                 else:
                     published_now = getattr(self, "current_tip_first_seen", None)
                     if (
-                        published_now is not None
-                        and str(context.template.get("previousblockhash", ""))
-                        != published_now[0]
+                        context_parent
+                        and published_now is not None
+                        and context_parent != published_now[0]
                         and self._published_tip_authoritative_locked(
                             time.monotonic()
                         )
