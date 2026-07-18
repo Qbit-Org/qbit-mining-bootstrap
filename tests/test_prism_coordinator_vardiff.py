@@ -1056,6 +1056,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_low_difficulty_shares_total 3", metrics)
         self.assertIn("qbit_prism_grace_credited_shares_total 6", metrics)
         self.assertIn("qbit_prism_stratum_active_connections 0", metrics)
+        self.assertIn("qbit_prism_stratum_connection_limit 384", metrics)
+        self.assertIn("qbit_prism_stratum_peak_active_connections 0", metrics)
+        self.assertIn("qbit_prism_stratum_pending_initial_jobs 0", metrics)
+        self.assertIn("qbit_prism_stratum_pending_initial_job_limit 128", metrics)
+        self.assertIn("qbit_prism_stratum_current_tip_job_coverage 1.0", metrics)
+        self.assertIn("qbit_prism_stratum_handler_threads 0", metrics)
+        self.assertIn("qbit_prism_job_delivery_queue_depth 0", metrics)
+        self.assertIn("qbit_prism_job_delivery_active_workers 0", metrics)
         self.assertIn(
             'qbit_prism_stratum_connection_limit_rejections_total{scope="global"} 2',
             metrics,
@@ -3102,6 +3110,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaisesRegex(SystemExit, "PRISM_STRATUM_MAX_CONNECTIONS"):
+                validate_prism_production_gate()
+
+        with patch.dict(
+            os.environ,
+            {**base, "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS",
+            ):
+                validate_prism_production_gate()
+
+        with patch.dict(
+            os.environ,
+            {**base, "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
+            ):
                 validate_prism_production_gate()
 
         with patch.dict(
@@ -6658,6 +6688,7 @@ class PrismListenerProfileTests(unittest.TestCase):
         server = coordinator()
         state = client()
         state.share_difficulty = Decimal("1")
+        state.difficulty_generation = 7
         state.send = lambda payload: None  # type: ignore[method-assign]
         server.maybe_send_job = lambda client, *, clean_jobs: False  # type: ignore[method-assign]
 
@@ -6665,6 +6696,7 @@ class PrismListenerProfileTests(unittest.TestCase):
 
         self.assertIsNone(state.pending_share_difficulty)
         self.assertEqual(state.share_difficulty, Decimal("1"))
+        self.assertEqual(state.difficulty_generation, 7)
 
     def test_suggest_difficulty_yields_to_password_d_option(self) -> None:
         server = coordinator()
@@ -6780,8 +6812,13 @@ class PrismListenerProfileTests(unittest.TestCase):
         server, state, _ = self.authorize_server_and_client()
         send_job_calls: list[bool] = []
 
-        def counting_send_job(client: object, *, clean_jobs: bool) -> bool:
+        def counting_send_job(current: ClientState, *, clean_jobs: bool) -> bool:
             send_job_calls.append(clean_jobs)
+            current.active_job = SimpleNamespace(
+                template={"previousblockhash": "aa" * 32},
+                payout_state_generation=0,
+            )
+            server.current_tip_first_seen = ("aa" * 32, None)
             return True
 
         server.maybe_send_job = counting_send_job  # type: ignore[method-assign]
