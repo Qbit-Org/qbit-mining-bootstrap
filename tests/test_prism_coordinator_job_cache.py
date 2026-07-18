@@ -1770,6 +1770,61 @@ class JobBundleCacheTests(unittest.TestCase):
             JobBuildSuperseded,
         )
 
+    def test_cancelled_ready_does_not_block_collection_promotion(self) -> None:
+        for placement in ("active", "retiring"):
+            with self.subTest(placement=placement):
+                server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+                artifacts = server.store_template_artifacts(dict(rpc.template))
+                assert artifacts is not None
+                payout_generation = server._payout_state_generation
+
+                def request_for(
+                    mode: str,
+                    identity: WorkerIdentity | None,
+                ) -> object:
+                    return server._new_job_build_request(
+                        artifacts,
+                        identity,
+                        mode=mode,
+                        payout_state_generation=payout_generation,
+                        cache_key=server._job_bundle_key(
+                            artifacts,
+                            mode=mode,
+                            payout_state_generation=payout_generation,
+                            worker=identity,
+                        ),
+                    )
+
+                ready = request_for("ready", None)
+                collection = request_for(
+                    "collection",
+                    worker("tq1collection", "tq1collection.rig"),
+                )
+                self.assertTrue(  # type: ignore[union-attr]
+                    ready.cancellation.cancel("superseded")
+                )
+                ready_flight = SimpleNamespace(request=ready)
+                if placement == "active":
+                    server._job_build_active = ready_flight
+                    server._job_build_retiring = None
+                else:
+                    server._job_build_active = None
+                    server._job_build_retiring = ready_flight
+                server._job_build_pending = collection
+                armed: list[object] = []
+                server._start_job_build_locked = (  # type: ignore[method-assign]
+                    lambda request: SimpleNamespace(request=request, future=None)
+                )
+                server._arm_job_build_locked = armed.append  # type: ignore[method-assign]
+
+                server._promote_pending_job_build_locked()
+
+                self.assertIsNone(server._job_build_pending)
+                assert server._job_build_active is not None
+                self.assertIs(server._job_build_active.request, collection)
+                self.assertIs(server._job_build_retiring, ready_flight)
+                self.assertEqual(armed, [server._job_build_active])
+
     def test_independent_collection_workers_do_not_supersede_each_other(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
         recorded = install_fake_bundle_builder(server)
@@ -2333,6 +2388,84 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(shutdown_thread.is_alive())
         self.assertEqual(shutdown_errors, [])
         self.assertIsInstance(promise.exception(timeout=1), JobBuildSuperseded)
+
+    def test_control_cancel_during_serialization_is_supersession(self) -> None:
+        server, rpc = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        helper_started = threading.Event()
+        helper_processes: list[subprocess.Popen[str]] = []
+        real_popen = subprocess.Popen
+
+        def capture_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+            process = real_popen(*args, **kwargs)  # type: ignore[arg-type]
+            helper_processes.append(process)
+            helper_started.set()
+            return process
+
+        def fill_helper_pipe(*_args: object, **kwargs: object) -> object:
+            build_request = kwargs["build_request"]
+            return server.build_audit_bundle(
+                shares=[],
+                found_block={
+                    "block_height": 10,
+                    "coinbase_value_sats": 50_00000000,
+                    "network_difficulty": 1,
+                    "anchor_job_issued_at_ms": 1_700_000_000_000,
+                },
+                prior_balances=[
+                    {
+                        "miner_id": "pipe-filler",
+                        "balance_sats": 1,
+                        "padding": "x" * (4 * 1024 * 1024),
+                    }
+                ],
+                coinbase_script_sig_suffix_hex="00",
+                cancellation=build_request.cancellation,  # type: ignore[union-attr]
+            )
+
+        server.build_shared_job_bundle = fill_helper_pipe  # type: ignore[method-assign]
+        errors: list[BaseException] = []
+
+        def build() -> None:
+            try:
+                server.shared_job_bundle(
+                    artifacts,
+                    mode="ready",
+                    retry_superseded=False,
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            side_effect=capture_popen,
+        ):
+            build_thread = threading.Thread(target=build)
+            build_thread.start()
+            self.assertTrue(helper_started.wait(5))
+            with server._job_cache_lock:
+                controls = list(server._active_job_bundle_builds.values())
+            self.assertEqual(len(controls), 1)
+            controls[0].cancel_event.set()
+            build_thread.join(2)
+            if build_thread.is_alive():
+                for process in helper_processes:
+                    if process.poll() is None:
+                        process.kill()
+                build_thread.join(5)
+
+        self.assertFalse(build_thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], JobBuildSuperseded)
+        self.assertEqual(server.shared_bundle_build_counts["superseded"], 1)
+        self.assertEqual(server.shared_bundle_build_counts["failed"], 0)
+        self.assertEqual(server.tip_refresh_superseded_results, 1)
 
     def test_full_helper_input_pipe_obeys_builder_timeout(self) -> None:
         server, _rpc = coordinator()

@@ -1992,7 +1992,7 @@ class _PayoutStatePublicationBlocked(TemplateRefreshBlocked):
     """Job construction is waiting for a prepared payout publication."""
 
 
-class _JobBundleBuildSuperseded(TemplateRefreshBlocked):
+class _JobBundleBuildSuperseded(JobBuildSuperseded):
     """A newer tip or payout generation canceled this deterministic build."""
 
 
@@ -3444,9 +3444,13 @@ class PrismCoordinator:
         first: _JobBuildRequest,
         second: _JobBuildRequest,
     ) -> bool:
-        """Ready work cannot be displaced by a collection-mode retry."""
+        """Live ready work cannot be displaced by a collection-mode retry."""
 
-        return first.mode == "ready" and second.mode == "collection"
+        return (
+            first.mode == "ready"
+            and second.mode == "collection"
+            and not first.cancellation.is_set()
+        )
 
     @staticmethod
     def _defer_collection_job_build_locked(
@@ -3557,7 +3561,7 @@ class PrismCoordinator:
                 )
                 self.job_build_cancellation_seconds["sum"] += elapsed
                 self.job_build_cancellation_seconds["count"] += 1
-            coordination_cancelled = (
+            coordination_cancelled = isinstance(error, JobBuildSuperseded) or (
                 request.cancellation.is_set()
                 and request.cancellation.reason != "timeout"
             )
