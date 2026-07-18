@@ -395,6 +395,23 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                 published_tip[0],
             )
 
+            # Delivery-side currency accepts the pinned published snapshot
+            # even though the detected-tip globals have moved on, so initial
+            # delivery does not defer for the construction window.
+            self.assertFalse(server._template_artifacts_are_current(artifacts))
+            self.assertTrue(server._issuance_artifacts_current(artifacts))
+
+            # A pruned bundle cache (payout mutation, LRU pressure) must not
+            # strand pinned issuance either: published-parent work stays
+            # buildable and cacheable while its authority holds.
+            with server._job_cache_lock:
+                server._job_bundle_cache.clear()
+            rebuilt = server.build_job_for_client(state, clean_jobs=False)
+            self.assertEqual(
+                str(rebuilt.template["previousblockhash"]),
+                published_tip[0],
+            )
+
             # Once the published authority lapses, issuance falls through to
             # the live template, mirroring the submit-path RPC fallback.
             server.current_tip_observed_monotonic = (

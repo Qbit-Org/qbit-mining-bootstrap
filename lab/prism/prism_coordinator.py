@@ -4588,6 +4588,34 @@ class PrismCoordinator:
         published = getattr(self, "current_tip_first_seen", None)
         return published[0] if published is not None else None
 
+    def _artifacts_buildable_locked(
+        self,
+        artifacts: CachedTemplateArtifacts,
+    ) -> bool:
+        """Whether work for these artifacts may still be built and cached.
+
+        The newest detected tip covers replacement construction. Exactly the
+        published snapshot additionally stays buildable while the published
+        tip retains share-classification authority, so pinned direct issuance
+        can rebuild published work (for example after a payout-generation
+        prune) instead of classifying itself superseded for the whole
+        unpublished window. Anything else -- including other templates for
+        the published parent -- is superseded construction and must stop.
+        """
+        newest = self._newest_observed_tip_locked()
+        if newest is None or artifacts.previousblockhash == newest:
+            return True
+        published = getattr(self, "current_tip_first_seen", None)
+        published_snapshot = getattr(self, "tip_template_snapshot", None)
+        return bool(
+            published is not None
+            and published_snapshot is not None
+            and published_snapshot.bestblockhash == published[0]
+            and artifacts.previousblockhash == published[0]
+            and published_snapshot.template_fingerprint == artifacts.fingerprint
+            and self._published_tip_authoritative_locked(time.monotonic())
+        )
+
     def _cache_job_bundle_if_current(
         self,
         built: CachedJobBundle,
@@ -4596,12 +4624,9 @@ class PrismCoordinator:
         """Cache only current state; report whether payout state stayed valid."""
         with self._job_cache_lock:
             with self.lock:
-                observed_tip = self._newest_observed_tip_locked()
+                buildable = self._artifacts_buildable_locked(artifacts)
             published_artifact = self._published_payout_state.artifact
-            if (
-                observed_tip is not None
-                and observed_tip != artifacts.previousblockhash
-            ):
+            if not buildable:
                 return False
             if (
                 built.payout_state_generation != self._payout_state_generation
@@ -4730,11 +4755,8 @@ class PrismCoordinator:
                 if not retry_superseded:
                     raise
                 with self.lock:
-                    observed_tip = self._newest_observed_tip_locked()
-                if (
-                    observed_tip is not None
-                    and observed_tip != artifacts.previousblockhash
-                ):
+                    buildable = self._artifacts_buildable_locked(artifacts)
+                if not buildable:
                     raise
                 with self._job_cache_lock:
                     current = self._template_artifacts
@@ -4751,11 +4773,8 @@ class PrismCoordinator:
                 with self._job_build_scheduler_lock:
                     self.job_build_scheduler_counts["obsolete_results"] += 1
                 with self.lock:
-                    observed_tip = self._newest_observed_tip_locked()
-                if (
-                    observed_tip is not None
-                    and observed_tip != artifacts.previousblockhash
-                ):
+                    buildable = self._artifacts_buildable_locked(artifacts)
+                if not buildable:
                     with self._tip_refresh_metrics_lock:
                         self.tip_refresh_superseded_results += 1
                     raise JobBuildSuperseded(
@@ -5953,7 +5972,7 @@ class PrismCoordinator:
                         request.worker,
                         cancelled=lambda: (
                             self._initial_request_cancelled(request)
-                            or not self._template_artifacts_are_current(artifacts)
+                            or not self._issuance_artifacts_current(artifacts)
                         ),
                     )
                     live_tip = str(self.rpc.call("getbestblockhash"))
@@ -6036,6 +6055,31 @@ class PrismCoordinator:
                 )
             )
 
+    def _issuance_artifacts_current(self, artifacts: CachedTemplateArtifacts) -> bool:
+        """Issuance-side currency for direct job delivery.
+
+        Current means either the live template view (the newest stored
+        artifacts) or exactly the published snapshot while the published tip
+        still owns share classification. During a detected-but-unpublished
+        refresh, pinned published-snapshot work must stay deliverable; judging
+        it against the detected-tip globals would defer every direct issuance
+        for the entire construction window that publication is deliberately
+        decoupled from.
+        """
+        if self._template_artifacts_are_current(artifacts):
+            return True
+        with self.lock:
+            published = getattr(self, "current_tip_first_seen", None)
+            published_snapshot = getattr(self, "tip_template_snapshot", None)
+            return bool(
+                published is not None
+                and published_snapshot is not None
+                and published_snapshot.bestblockhash == published[0]
+                and artifacts.previousblockhash == published[0]
+                and published_snapshot.template_fingerprint == artifacts.fingerprint
+                and self._published_tip_authoritative_locked(time.monotonic())
+            )
+
     def _acquire_client_job_lock(
         self,
         client: ClientState,
@@ -6105,7 +6149,7 @@ class PrismCoordinator:
         try:
             if cancelled():
                 return False
-            if not self._template_artifacts_are_current(artifacts):
+            if not self._issuance_artifacts_current(artifacts):
                 return None
             self._ensure_job_cache_state()
             gate_started = time.monotonic()
@@ -6124,7 +6168,7 @@ class PrismCoordinator:
                     payout_current = (
                         bundle.payout_state_generation == self._payout_state_generation
                     )
-                if not payout_current or not self._template_artifacts_are_current(artifacts):
+                if not payout_current or not self._issuance_artifacts_current(artifacts):
                     return None
                 with self.lock:
                     if not self._initial_request_current_locked(request):
