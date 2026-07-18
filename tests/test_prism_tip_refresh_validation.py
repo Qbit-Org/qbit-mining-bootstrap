@@ -11,6 +11,7 @@ from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 
 from lab.prism.prism_coordinator import (
+    ShutdownInProgress,
     TemplateRefreshBlocked,
     TipRefreshValidationToken,
     _FanoutCancellation,
@@ -1116,6 +1117,41 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertIsNone(
             getattr(server, "last_successful_template_refresh_monotonic", None)
         )
+
+    def test_shutdown_during_live_fanout_trust_check_is_not_reclassified(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        state = client(1)
+        server.clients = [state]  # type: ignore[assignment]
+        notification_started = threading.Event()
+        release_notification = threading.Event()
+
+        def block_notification(payload: dict[str, object]) -> None:
+            if payload["method"] != "mining.notify":
+                return
+            notification_started.set()
+            self.assertTrue(release_notification.wait(5))
+
+        def shutdown_during_reconciliation(**_kwargs: object) -> bool:
+            server.request_shutdown()
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+
+        state.send = block_notification  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            shutdown_during_reconciliation
+        )
+
+        try:
+            with self.assertRaises(ShutdownInProgress):
+                server.poll_qbit_tip_template_once()
+            self.assertTrue(notification_started.is_set())
+            self.assertFalse(server._tip_refresh_retry.is_set())
+        finally:
+            release_notification.set()
+            server.shutdown_tip_refresh_executor()
 
     def test_prevalidation_rpc_failure_schedules_immediate_retry(self) -> None:
         server, rpc = coordinator()
