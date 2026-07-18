@@ -22,6 +22,7 @@ from lab.prism import direct_stratum
 from lab.prism.share_ledger import PendingShare, SingleWriterShareLedger
 from lab.prism.prism_coordinator import (
     CachedJobBundle,
+    CachedTemplateArtifacts,
     ClientState,
     DEFAULT_TESTNET_USERNAME_FALLBACK_ADDRESS,
     MAX_ACTIVE_PRISM_JOBS_PER_CLIENT,
@@ -545,6 +546,104 @@ def prism_context(
     )
 
 
+def prepare_idle_client(
+    server: PrismCoordinator,
+    state: ClientState,
+    *,
+    connection_id: int = 1,
+    difficulty: Decimal = Decimal("16"),
+    tip: str = "00" * 32,
+) -> None:
+    if not hasattr(server, "jobs"):
+        server.jobs = {}
+    state.connection_id = connection_id
+    state.extranonce1_hex = f"{connection_id:08x}"
+    state.username = f"miner-{connection_id}"
+    state.worker = worker_identity(state.username)
+    job_id = f"job-{connection_id}"
+    state.active_job = prism_context(
+        job_id,
+        tip,
+        worker=state.worker,
+        difficulty=difficulty,
+    )
+    state.active_job_ids = {job_id}
+    state.share_difficulty = difficulty
+    state.pending_share_difficulty = None
+    state.vardiff_window_started_monotonic = time.monotonic() - 2
+    state.vardiff_window_accepted = 0
+    state.vardiff_window_submitted = 0
+    state.vardiff_window_work = Decimal("0")
+    server.clients.add(state)
+    server.jobs[job_id] = state.active_job
+
+
+def install_idle_job_cache(
+    server: PrismCoordinator,
+    *,
+    tip: str = "00" * 32,
+) -> CachedJobBundle:
+    server._pool_ready_latched = True
+    server.job_bundle_cache_seconds = 60.0
+    server.job_counter = 0
+    server.share_weights_by_username = {}
+    server.default_share_weight = 1
+    server._ensure_job_cache_state()
+    template = gbt_template(tip)
+    fingerprint = qbit_template_fingerprint(template)
+    artifacts = CachedTemplateArtifacts(
+        template=template,
+        fingerprint=fingerprint,
+        previousblockhash=tip,
+        transaction_hexes=(),
+        witness_merkle_leaves_hex=(),
+        network_difficulty=1,
+        fetched_monotonic=time.monotonic(),
+        generation=1,
+    )
+    qbit_target = direct_stratum.difficulty_target(Decimal("1024"))
+    base_job = direct_stratum.DirectQbitStratumJob(
+        job_id="prism-template-base",
+        previousblockhash_display=tip,
+        prevhash=tip,
+        coinb1="",
+        coinb2="",
+        full_coinbase_prefix="",
+        full_coinbase_suffix="",
+        merkle_branch=(),
+        transaction_hexes=(),
+        version="20000000",
+        nbits="207fffff",
+        ntime="6553f100",
+        qbit_target=qbit_target,
+        share_target=qbit_target,
+        share_difficulty=Decimal("1"),
+        extranonce1_hex="ffffffff",
+        extranonce2_size=8,
+        clean_jobs=True,
+    )
+    bundle = CachedJobBundle(
+        key=(fingerprint, "ready", 0),
+        template=template,
+        template_fingerprint=fingerprint,
+        coinbase_manifest={},
+        shares_json=[],
+        prior_balances=[],
+        found_block={"network_difficulty": 1},
+        collection_only=False,
+        issued_at_ms=12345,
+        base_job=base_job,
+        built_monotonic=time.monotonic(),
+        template_generation=1,
+        payout_state_generation=0,
+    )
+    with server._job_cache_lock:
+        server._template_artifacts = artifacts
+        server._job_bundle_cache.clear()
+        server._job_bundle_cache[bundle.key] = bundle
+    return bundle
+
+
 def verified_block_bundle(coinbase_tx_hex: str = "c0ffee") -> dict[str, object]:
     return {
         "found_block": {"coinbase_value_sats": 50_00000000},
@@ -795,37 +894,39 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(set(server.jobs), {"old-job"})
         self.assertEqual(advertised, [])  # no set_difficulty / notify advertised for the skipped build
 
-    def test_idle_vardiff_sweep_steps_down_zero_share_window(self) -> None:
+    def test_idle_vardiff_success_sends_paired_job_and_resets_window(self) -> None:
         server = coordinator()
         state = client()
-        state.worker = worker_identity()
-        state.active_job = prism_context("job-1", "00" * 32, worker=state.worker)
-        state.share_difficulty = Decimal("16")
-        state.vardiff_window_started_monotonic = time.monotonic() - 2
-        server.clients = {state}
-        sent: dict[str, object] = {}
+        prepare_idle_client(server, state)
+        install_idle_job_cache(server)
+        sent: list[dict[str, object]] = []
+        delivered = threading.Event()
+        window_started = state.vardiff_window_started_monotonic
 
-        def fake_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
-            sent.update(
-                {
-                    "client": client,
-                    "clean_jobs": clean_jobs,
-                    "difficulty": client.pending_share_difficulty,
-                }
-            )
-            return True
+        def record(payload: dict[str, object]) -> None:
+            sent.append(payload)
+            if payload.get("method") == "mining.notify":
+                delivered.set()
 
-        server.maybe_send_job = fake_send_job  # type: ignore[method-assign]
+        state.send = record  # type: ignore[method-assign]
 
-        retargeted = server.vardiff_idle_sweep_once()
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        self.assertTrue(delivered.wait(timeout=1))
+        server.shutdown_vardiff_idle_executor()
 
-        self.assertEqual(retargeted, 1)
         self.assertEqual(server.idle_retarget_count, 1)
-        self.assertEqual(sent["client"], state)
-        self.assertTrue(sent["clean_jobs"])
-        self.assertEqual(sent["difficulty"], Decimal("4"))
-        self.assertEqual(state.pending_share_difficulty, Decimal("4"))
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertEqual(sent[0]["params"], [4.0])
+        self.assertTrue(sent[1]["params"][8])
+        self.assertEqual(state.share_difficulty, Decimal("4"))
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertGreater(state.vardiff_window_started_monotonic, window_started)
+        self.assertEqual(state.vardiff_window_accepted, 0)
         self.assertEqual(state.vardiff_window_submitted, 0)
+        self.assertEqual(state.vardiff_window_work, Decimal("0"))
 
     def test_idle_vardiff_sweep_skips_submitted_reject_storm_window(self) -> None:
         server = coordinator()
@@ -848,103 +949,344 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.pending_share_difficulty, None)
         self.assertEqual(state.vardiff_window_submitted, 3)
 
-    def test_idle_vardiff_sweep_aborts_step_down_when_share_accepted_mid_retarget(self) -> None:
-        # The sweep snapshots an idle window, then computes the retarget outside
-        # the lock. If a concurrent handle_submit accepts a share in that gap, the
-        # require_idle commit re-check must abort the speculative step-down rather
-        # than down-diffing a client that just resumed submitting.
+    def test_idle_vardiff_share_after_snapshot_is_not_stepped_down(self) -> None:
+        server = coordinator()
+        blockers = [client(), client()]
+        for connection_id, blocker in enumerate(blockers, start=1):
+            prepare_idle_client(server, blocker, connection_id=connection_id)
+        install_idle_job_cache(server)
+        workers_started = threading.Barrier(3)
+        release_workers = threading.Event()
+
+        def block_delivery(payload: dict[str, object]) -> None:
+            if payload.get("method") == "mining.set_difficulty":
+                workers_started.wait(timeout=1)
+                release_workers.wait(timeout=1)
+
+        for blocker in blockers:
+            blocker.send = block_delivery  # type: ignore[method-assign]
+
+        target = client()
+        target.connection_id = 3
+        sent: list[dict[str, object]] = []
+        target.send = sent.append  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.vardiff_idle_sweep_once(), 2)
+            workers_started.wait(timeout=1)
+            prepare_idle_client(server, target, connection_id=3)
+            self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+
+            # The task is queued from an idle snapshot. A later submit changes
+            # that exact window before any worker can commit the step-down.
+            server.note_vardiff_submitted_share(target)
+        finally:
+            release_workers.set()
+            server.shutdown_vardiff_idle_executor()
+
+        self.assertEqual(sent, [])
+        self.assertIsNone(target.pending_share_difficulty)
+        self.assertEqual(target.share_difficulty, Decimal("16"))
+        self.assertEqual(target.vardiff_window_submitted, 1)
+        self.assertGreaterEqual(server.vardiff_idle_skip_counts["not_idle"], 1)
+
+    def test_idle_vardiff_failure_restores_pending_and_idle_window(self) -> None:
         server = coordinator()
         state = client()
-        state.worker = worker_identity()
-        state.active_job = prism_context("job-1", "00" * 32, worker=state.worker)
-        state.share_difficulty = Decimal("16")
-        state.vardiff_window_started_monotonic = time.monotonic() - 2
-        server.clients = {state}
-
-        def fail_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
-            raise AssertionError("a client that resumed submitting must not idle-retarget")
-
-        server.maybe_send_job = fail_send_job  # type: ignore[method-assign]
-
-        real_calc = vardiff.calculate_next_difficulty
-
-        def racing_calc(**kwargs: object) -> Decimal:
-            # Simulate a share accepted on the fresh window between the idle
-            # snapshot and the step-down commit.
-            state.vardiff_window_accepted = 1
-            return real_calc(**kwargs)
-
-        with patch.object(vardiff, "calculate_next_difficulty", side_effect=racing_calc):
-            retargeted = server.vardiff_idle_sweep_once()
-
-        self.assertEqual(retargeted, 0)
-        self.assertIsNone(state.pending_share_difficulty)
-        # The accept path owns the window now; the sweep must not have reset it.
-        self.assertEqual(state.vardiff_window_accepted, 1)
-
-    def test_idle_vardiff_sweep_disconnects_send_failure_and_rolls_back_pending_difficulty(self) -> None:
-        server = coordinator()
-        state = client()
-        state.worker = worker_identity()
-        state.active_job = prism_context("job-1", "00" * 32, worker=state.worker)
-        state.share_difficulty = Decimal("16")
-        state.vardiff_window_started_monotonic = time.monotonic() - 2
-        server.clients = {state}
+        prepare_idle_client(server, state)
+        install_idle_job_cache(server)
+        window_state = (
+            state.vardiff_window_started_monotonic,
+            state.vardiff_window_accepted,
+            state.vardiff_window_submitted,
+            state.vardiff_window_work,
+        )
         disconnected: list[ClientState] = []
+        failure_finished = threading.Event()
 
-        def failing_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
-            self.assertEqual(client.pending_share_difficulty, Decimal("4"))
+        def failing_send(_payload: dict[str, object]) -> None:
+            self.assertEqual(state.pending_share_difficulty, Decimal("4"))
             raise OSError("socket send failed")
 
         def fake_disconnect(client: ClientState) -> None:
             disconnected.append(client)
             server.clients.discard(client)
+            failure_finished.set()
 
-        server.maybe_send_job = failing_send_job  # type: ignore[method-assign]
+        state.send = failing_send  # type: ignore[method-assign]
         server.disconnect_client = fake_disconnect  # type: ignore[method-assign]
 
-        retargeted = server.vardiff_idle_sweep_once()
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        self.assertTrue(failure_finished.wait(timeout=1))
+        server.shutdown_vardiff_idle_executor()
 
-        self.assertEqual(retargeted, 0)
         self.assertEqual(disconnected, [state])
         self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(state.share_difficulty, Decimal("16"))
+        self.assertEqual(
+            (
+                state.vardiff_window_started_monotonic,
+                state.vardiff_window_accepted,
+                state.vardiff_window_submitted,
+                state.vardiff_window_work,
+            ),
+            window_state,
+        )
+        self.assertEqual(server.vardiff_idle_task_failures, 1)
 
-    def test_idle_vardiff_sweep_skipped_send_does_not_restart_idle_window_clock(self) -> None:
-        # A step-down whose job build/send is skipped (maybe_send_job False)
-        # rolls back the pending difficulty; the idle window clock must roll
-        # back too, so the next sweep retries immediately instead of waiting
-        # out another full retarget interval with the miner still over-diffed.
+    def test_repeated_idle_sweeps_do_not_enqueue_duplicate_connection_work(self) -> None:
         server = coordinator()
         state = client()
-        state.worker = worker_identity()
-        state.active_job = prism_context("job-1", "00" * 32, worker=state.worker)
-        state.share_difficulty = Decimal("16")
-        window_started = time.monotonic() - 2
-        state.vardiff_window_started_monotonic = window_started
-        server.clients = {state}
+        prepare_idle_client(server, state)
+        install_idle_job_cache(server)
+        delivery_started = threading.Event()
+        release_delivery = threading.Event()
+        sent: list[dict[str, object]] = []
 
-        def skipped_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
-            return False
+        def blocking_send(payload: dict[str, object]) -> None:
+            if payload.get("method") == "mining.set_difficulty":
+                delivery_started.set()
+                release_delivery.wait(timeout=1)
+            sent.append(payload)
 
-        server.maybe_send_job = skipped_send_job  # type: ignore[method-assign]
+        state.send = blocking_send  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+            self.assertTrue(delivery_started.wait(timeout=1))
+            self.assertEqual(server.vardiff_idle_sweep_once(), 0)
+            with server._vardiff_idle_lock:
+                self.assertEqual(len(server._vardiff_idle_pending), 1)
+        finally:
+            release_delivery.set()
+            server.shutdown_vardiff_idle_executor()
 
-        self.assertEqual(server.vardiff_idle_sweep_once(), 0)
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertGreaterEqual(
+            server.vardiff_idle_skip_counts["superseded"]
+            + server.vardiff_idle_skip_counts["not_idle"],
+            1,
+        )
+
+    def test_idle_sweep_skips_busy_client_lock_and_returns_promptly(self) -> None:
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state)
+        install_idle_job_cache(server)
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_client_lock() -> None:
+            state.job_update_lock.acquire()
+            try:
+                lock_held.set()
+                release_lock.wait(timeout=1)
+            finally:
+                state.job_update_lock.release()
+
+        holder = threading.Thread(target=hold_client_lock)
+        holder.start()
+        self.assertTrue(lock_held.wait(timeout=1))
+        started = time.monotonic()
+        try:
+            self.assertEqual(server.vardiff_idle_sweep_once(), 0)
+        finally:
+            elapsed = time.monotonic() - started
+            release_lock.set()
+            holder.join(timeout=1)
+            server.shutdown_vardiff_idle_executor()
+
+        self.assertLess(elapsed, 0.25)
+        self.assertEqual(server.vardiff_idle_skip_counts["busy"], 1)
+
+    def test_stuck_bundle_builder_does_not_stale_idle_sweep_heartbeat(self) -> None:
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state)
+        server._ensure_job_cache_state()
+        build_lock_held = threading.Event()
+        release_build = threading.Event()
+
+        def hold_build_lock() -> None:
+            with server._job_build_lock:
+                build_lock_held.set()
+                release_build.wait(timeout=1)
+
+        builder = threading.Thread(target=hold_build_lock)
+        builder.start()
+        self.assertTrue(build_lock_held.wait(timeout=1))
+        server._record_heartbeat("vardiff_idle_sweep")
+        heartbeat_before = server._heartbeats["vardiff_idle_sweep"]
+        sweep_done = threading.Event()
+
+        def run_sweep() -> None:
+            server.vardiff_idle_sweep_once()
+            sweep_done.set()
+
+        sweeper = threading.Thread(target=run_sweep)
+        sweeper.start()
+        completed = sweep_done.wait(timeout=0.25)
+        release_build.set()
+        builder.join(timeout=1)
+        sweeper.join(timeout=1)
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertTrue(completed)
+        self.assertGreater(server._heartbeats["vardiff_idle_sweep"], heartbeat_before)
+        self.assertEqual(server.vardiff_idle_skip_counts["cache_miss"], 1)
+
+    def test_idle_sweep_cache_miss_never_builds_synchronously(self) -> None:
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state)
+        server._ensure_job_cache_state()
+        window_started = state.vardiff_window_started_monotonic
+        build_started = threading.Event()
+        release_build = threading.Event()
+
+        def never_finishes(*_args: object, **_kwargs: object) -> object:
+            build_started.set()
+            release_build.wait(timeout=1)
+            raise AssertionError("idle sweep attempted a bundle build")
+
+        server.build_shared_job_bundle = never_finishes  # type: ignore[method-assign]
+        sweep_done = threading.Event()
+
+        def run_sweep() -> None:
+            server.vardiff_idle_sweep_once()
+            sweep_done.set()
+
+        sweeper = threading.Thread(target=run_sweep)
+        sweeper.start()
+        completed = sweep_done.wait(timeout=0.25)
+        release_build.set()
+        sweeper.join(timeout=1)
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertTrue(completed)
+        self.assertFalse(build_started.is_set())
+        self.assertEqual(server.vardiff_idle_skip_counts["cache_miss"], 1)
         self.assertIsNone(state.pending_share_difficulty)
         self.assertEqual(state.vardiff_window_started_monotonic, window_started)
+        self.assertEqual(state.vardiff_window_accepted, 0)
+        self.assertEqual(state.vardiff_window_submitted, 0)
+        self.assertEqual(state.vardiff_window_work, Decimal("0"))
 
-        sent: dict[str, object] = {}
+    def test_disconnect_while_idle_retarget_pending_prevents_delivery(self) -> None:
+        server = coordinator()
+        blockers = [client(), client()]
+        for connection_id, blocker in enumerate(blockers, start=1):
+            prepare_idle_client(server, blocker, connection_id=connection_id)
+        install_idle_job_cache(server)
+        workers_started = threading.Barrier(3)
+        release_workers = threading.Event()
 
-        def working_send_job(client: ClientState, *, clean_jobs: bool) -> bool:
-            sent["difficulty"] = client.pending_share_difficulty
-            return True
+        def block_delivery(payload: dict[str, object]) -> None:
+            if payload.get("method") == "mining.set_difficulty":
+                workers_started.wait(timeout=1)
+                release_workers.wait(timeout=1)
 
-        server.maybe_send_job = working_send_job  # type: ignore[method-assign]
+        for blocker in blockers:
+            blocker.send = block_delivery  # type: ignore[method-assign]
 
-        # The very next sweep can step down; without the clock rollback the
-        # restarted window would gate this behind another full interval.
-        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
-        self.assertEqual(sent["difficulty"], Decimal("4"))
-        self.assertEqual(state.pending_share_difficulty, Decimal("4"))
+        target = client()
+        target_sent: list[dict[str, object]] = []
+        target.send = target_sent.append  # type: ignore[method-assign]
+        target.close = lambda: None  # type: ignore[method-assign]
+        disconnected_skip = threading.Event()
+        record_skip = server._record_vardiff_idle_skip
+
+        def record_and_signal(reason: str) -> None:
+            record_skip(reason)
+            if reason == "disconnected":
+                disconnected_skip.set()
+
+        server._record_vardiff_idle_skip = record_and_signal  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.vardiff_idle_sweep_once(), 2)
+            workers_started.wait(timeout=1)
+            prepare_idle_client(server, target, connection_id=3)
+            self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+            server.disconnect_client(target)
+        finally:
+            release_workers.set()
+        try:
+            self.assertTrue(disconnected_skip.wait(timeout=1))
+        finally:
+            server.shutdown_vardiff_idle_executor()
+
+        self.assertEqual(target_sent, [])
+        self.assertTrue(target.closing)
+        self.assertNotIn(target, server.clients)
+        self.assertGreaterEqual(server.vardiff_idle_skip_counts["disconnected"], 1)
+
+    def test_hundreds_of_busy_and_dead_clients_cannot_stall_idle_sweep(self) -> None:
+        server = coordinator()
+
+        class BusyLock:
+            def acquire(self, blocking: bool = True) -> bool:
+                self.assert_nonblocking = blocking
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("unacquired busy lock released")
+
+        for connection_id in range(1, 201):
+            state = client()
+            prepare_idle_client(server, state, connection_id=connection_id)
+            state.job_update_lock = BusyLock()  # type: ignore[assignment]
+        for connection_id in range(201, 401):
+            state = client()
+            prepare_idle_client(server, state, connection_id=connection_id)
+            state.closing = True
+
+        server.vardiff_idle_sweep_seconds = 0.5
+        started = time.monotonic()
+        self.assertEqual(server.vardiff_idle_sweep_once(), 0)
+        elapsed = time.monotonic() - started
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertLess(elapsed, server.vardiff_idle_sweep_seconds)
+        self.assertEqual(server.vardiff_idle_clients_inspected, 400)
+        self.assertEqual(server.vardiff_idle_skip_counts["busy"], 200)
+        self.assertEqual(server.vardiff_idle_skip_counts["disconnected"], 200)
+
+    def test_idle_retarget_queue_is_globally_bounded(self) -> None:
+        server = coordinator()
+        states = [client() for _ in range(9)]
+        for connection_id, state in enumerate(states, start=1):
+            prepare_idle_client(server, state, connection_id=connection_id)
+        install_idle_job_cache(server)
+        release_workers = threading.Event()
+        two_workers_started = threading.Event()
+        started_lock = threading.Lock()
+        started_count = 0
+
+        def block_delivery(payload: dict[str, object]) -> None:
+            nonlocal started_count
+            if payload.get("method") != "mining.set_difficulty":
+                return
+            with started_lock:
+                started_count += 1
+                if started_count == 2:
+                    two_workers_started.set()
+            release_workers.wait(timeout=1)
+
+        for state in states:
+            state.send = block_delivery  # type: ignore[method-assign]
+
+        try:
+            self.assertEqual(server.vardiff_idle_sweep_once(), 8)
+            self.assertTrue(two_workers_started.wait(timeout=1))
+            with server._vardiff_idle_lock:
+                self.assertEqual(len(server._vardiff_idle_pending), 8)
+                self.assertEqual(server.vardiff_idle_inflight, 2)
+                self.assertEqual(server.vardiff_idle_queue_depth, 6)
+            self.assertEqual(server.vardiff_idle_skip_counts["queue_full"], 1)
+        finally:
+            release_workers.set()
+            server.shutdown_vardiff_idle_executor()
 
     def test_maybe_send_job_isolates_build_failure_and_keeps_client_connected(self) -> None:
         server = coordinator()
@@ -1054,6 +1396,15 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.connection_limit_rejection_counts = {"global": 2, "username": 3}
         server.accept_resource_exhaustion_count = 4
         server.connection_setup_failure_count = 5
+        server._ensure_vardiff_idle_state()
+        with server._vardiff_idle_lock:
+            server.vardiff_idle_clients_inspected = 8
+            server.vardiff_idle_skip_counts["busy"] = 2
+            server.vardiff_idle_queue_depth = 1
+            server.vardiff_idle_inflight = 2
+            server.vardiff_idle_task_failures = 1
+        server._observe_vardiff_idle_seconds("sweep", 0.005)
+        server._observe_vardiff_idle_seconds("task", 0.01)
 
         metrics = server.metrics_payload()
 
@@ -1087,6 +1438,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_tip_refresh_jobs_total 4", metrics)
         self.assertIn("qbit_prism_post_accept_refresh_failures_total 5", metrics)
         self.assertIn("qbit_prism_vardiff_idle_retargets_total 7", metrics)
+        self.assertIn("qbit_prism_vardiff_idle_clients_inspected_total 8", metrics)
+        self.assertIn('qbit_prism_vardiff_idle_skips_total{reason="busy"} 2', metrics)
+        self.assertIn("qbit_prism_vardiff_idle_queue_depth 1", metrics)
+        self.assertIn("qbit_prism_vardiff_idle_inflight 2", metrics)
+        self.assertIn("qbit_prism_vardiff_idle_task_failures_total 1", metrics)
+        self.assertIn("qbit_prism_vardiff_idle_sweep_seconds_count 1", metrics)
+        self.assertIn("qbit_prism_vardiff_idle_retarget_task_seconds_count 1", metrics)
         self.assertIn("qbit_prism_stale_share_percent 20", metrics)
         self.assertIn("qbit_prism_coinbase_weight_headroom_bytes 1999750", metrics)
         self.assertIn("qbit_prism_vardiff_enabled 1", metrics)
