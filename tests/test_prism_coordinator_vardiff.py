@@ -1495,6 +1495,41 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.vardiff_window_submitted, 0)
         self.assertEqual(state.vardiff_window_work, Decimal("0"))
 
+    def test_idle_retarget_delivers_fresh_bundle_when_cache_is_disabled(
+        self,
+    ) -> None:
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state)
+        bundle = install_idle_job_cache(server)
+        server.job_bundle_cache_seconds = 0.0
+        with server._job_cache_lock:
+            server._job_bundle_cache.clear()
+        built = threading.Event()
+        sent: list[dict[str, object]] = []
+
+        def build_uncached(_request: object) -> CachedJobBundle:
+            built.set()
+            return bundle
+
+        server._build_idle_job_bundle = build_uncached  # type: ignore[method-assign]
+        state.send = sent.append  # type: ignore[method-assign]
+
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertTrue(built.is_set())
+        self.assertEqual(server.vardiff_idle_skip_counts["cache_miss"], 1)
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertEqual(server.idle_retarget_count, 1)
+        self.assertEqual(state.share_difficulty, Decimal("4"))
+        self.assertIsNone(state.pending_share_difficulty)
+        with server._job_cache_lock:
+            self.assertEqual(server._job_bundle_cache, {})
+
     def test_idle_preparation_oserror_keeps_client_connected(self) -> None:
         for failure_phase in ("bundle", "reorg"):
             with self.subTest(failure_phase=failure_phase):

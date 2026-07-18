@@ -11663,6 +11663,7 @@ class PrismCoordinator:
         tip_refresh_observation_sequence: int | None = None,
         prepared_bundle: CachedJobBundle | None = None,
         commit_guard: Callable[[], bool] | None = None,
+        prepared_bundle_allow_uncached: bool = False,
     ) -> bool:
         if not client.subscribed or not client.authorized or client.worker is None:
             return False
@@ -11681,6 +11682,8 @@ class PrismCoordinator:
             raise ValueError("tip refresh snapshot and observation sequence must be paired")
         if prepared_bundle is not None and guarded_refresh:
             raise ValueError("prepared idle bundles cannot be combined with tip refresh guards")
+        if prepared_bundle_allow_uncached and prepared_bundle is None:
+            raise ValueError("uncached prepared delivery requires a prepared bundle")
         if prepared_bundle is not None:
             pass
         elif guarded_refresh:
@@ -11938,7 +11941,11 @@ class PrismCoordinator:
                 # race makes the idle task a no-op instead of delivering stale
                 # work.
                 with self._job_cache_lock:
-                    if not self._idle_bundle_current_locked(client, prepared_bundle):
+                    if not self._idle_bundle_current_locked(
+                        client,
+                        prepared_bundle,
+                        allow_uncached=prepared_bundle_allow_uncached,
+                    ):
                         return False
                     with self.lock:
                         if not commit_context_locked():
@@ -13687,6 +13694,8 @@ class PrismCoordinator:
         self,
         client: ClientState,
         bundle: CachedJobBundle,
+        *,
+        allow_uncached: bool = False,
     ) -> bool:
         """Check one exact issuance observation. Caller holds ``_job_cache_lock``.
 
@@ -13742,6 +13751,19 @@ class PrismCoordinator:
             payout_artifact_generation=bundle.payout_artifact_generation,
             worker=worker,
         )
+        ttl = float(
+            getattr(
+                self,
+                "job_bundle_cache_seconds",
+                DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS,
+            )
+        )
+        if ttl <= 0:
+            # A zero TTL deliberately disables global bundle retention. The
+            # dedicated worker may still deliver the exact bundle it just
+            # built after every live template/payout/client guard above has
+            # passed; the cache-only sweep never opts into this exception.
+            return allow_uncached and bundle.key == key
         cached = self._job_bundle_cache.get(key)
         if cached is None:
             return False
@@ -13761,14 +13783,7 @@ class PrismCoordinator:
             and bundle.collection_identity == cached.collection_identity
         ):
             return False
-        ttl = float(
-            getattr(
-                self,
-                "job_bundle_cache_seconds",
-                DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS,
-            )
-        )
-        return ttl > 0 and time.monotonic() - cached.built_monotonic <= ttl
+        return time.monotonic() - cached.built_monotonic <= ttl
 
     def _idle_job_issuance_artifacts_locked(
         self,
@@ -13966,7 +13981,11 @@ class PrismCoordinator:
                     self._record_vardiff_idle_skip(reason)
                     return
                 with self._job_cache_lock:
-                    bundle_current = self._idle_bundle_current_locked(client, bundle)
+                    bundle_current = self._idle_bundle_current_locked(
+                        client,
+                        bundle,
+                        allow_uncached=True,
+                    )
                 if not bundle_current:
                     self._record_vardiff_idle_skip("superseded")
                     return
@@ -13988,6 +14007,7 @@ class PrismCoordinator:
                     expected_worker=request.worker,
                     expected_active_job=request.active_job,
                     expected_window_started=request.window_started_monotonic,
+                    prepared_bundle_allow_uncached=True,
                 )
             finally:
                 client.job_update_lock.release()
@@ -14003,7 +14023,11 @@ class PrismCoordinator:
                 self._record_vardiff_idle_skip(reason)
                 return
             with self._job_cache_lock:
-                bundle_current = self._idle_bundle_current_locked(client, bundle)
+                bundle_current = self._idle_bundle_current_locked(
+                    client,
+                    bundle,
+                    allow_uncached=True,
+                )
             if not bundle_current:
                 self._record_vardiff_idle_skip("superseded")
         except OSError:
@@ -14248,6 +14272,7 @@ class PrismCoordinator:
         expected_worker: WorkerIdentity | None = None,
         expected_active_job: PrismJobContext | None = None,
         expected_window_started: float | None = None,
+        prepared_bundle_allow_uncached: bool = False,
     ) -> bool:
         config = self.client_vardiff_config(client)
         if not config.enabled:
@@ -14389,6 +14414,9 @@ class PrismCoordinator:
                     raise_on_build_failure=True,
                     prepared_bundle=prepared_bundle,
                     commit_guard=idle_commit_guard,
+                    prepared_bundle_allow_uncached=(
+                        prepared_bundle_allow_uncached
+                    ),
                 )
             else:
                 sent = bool(
