@@ -158,6 +158,9 @@ class ServeBindsBeforeRecoveryTest(unittest.TestCase):
         server.audit_port = 0
         server.blockwait_enabled = False
         server.vardiff_idle_sweep_seconds = 0.0
+        server.stratum_initial_job_timeout_seconds = 0.0
+        server.hot_path_log_enabled = False
+        server.tip_template_snapshot = None
         server.ctv_broadcaster_enabled = False
         server.watchdog_enabled = False
         server.stop_event = threading.Event()
@@ -166,7 +169,9 @@ class ServeBindsBeforeRecoveryTest(unittest.TestCase):
         server.validate_live_chain_identity = lambda: None  # type: ignore[method-assign]
         server.validate_live_template_and_fee_policy = lambda: None  # type: ignore[method-assign]
         server.prism_payout_policy = lambda: {}  # type: ignore[method-assign]
+        server.prewarm_startup_jobs = lambda: None  # type: ignore[method-assign]
         server.replay_recovered_shares = lambda: 0  # type: ignore[method-assign]
+        server.shutdown = lambda *, reason="graceful": True  # type: ignore[method-assign]
 
         observed: dict[str, bool] = {}
 
