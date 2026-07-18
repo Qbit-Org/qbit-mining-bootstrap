@@ -113,8 +113,10 @@ class CtvFanoutBroadcastDaemon:
 
         Rows whose stored status already matches the derived status are not
         rewritten, and rows that are provably still coinbase-immature are not
-        probed at all; a pass that consequently wrote nothing renews the writer
-        lease explicitly instead.
+        probed at all. Because fenced writes are what refresh the writer
+        lease, a chunk that probed rows without writing renews the lease at
+        its boundary, and a pass that made no fenced write at all renews once
+        at the end.
         """
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -129,7 +131,8 @@ class CtvFanoutBroadcastDaemon:
         updated_count = 0
         failed_count = 0
         yielded_to_tip_refresh = False
-        wrote_ledger = False
+        lease_refreshed = False
+        probes_since_lease_refresh = 0
         tip_height: int | None = None
 
         def record_progress() -> None:
@@ -143,6 +146,21 @@ class CtvFanoutBroadcastDaemon:
             if tip_height is None:
                 tip_height = int(self.broadcaster.tip_height())
             return tip_height
+
+        def note_fenced_write() -> None:
+            # Every fenced ledger write refreshes the writer lease as a side
+            # effect, so pending probe work no longer needs a renewal.
+            nonlocal lease_refreshed, probes_since_lease_refresh
+            lease_refreshed = True
+            probes_since_lease_refresh = 0
+
+        def renew_lease() -> None:
+            nonlocal lease_refreshed, probes_since_lease_refresh
+            lease_refreshed = True
+            probes_since_lease_refresh = 0
+            renew_writer_lease = getattr(self.ledger, "renew_writer_lease", None)
+            if renew_writer_lease is not None:
+                renew_writer_lease()
 
         for chunk_start in range(0, len(rows), chunk_size):
             if tip_refresh_pending is not None and tip_refresh_pending():
@@ -182,9 +200,10 @@ class CtvFanoutBroadcastDaemon:
                         continue
                 artifact = artifact_from_status_row(row)
                 attempt = self.broadcaster.broadcast(artifact, self.fee_sats)
+                probes_since_lease_refresh += 1
                 if attempt.submitted:
                     submitted_count += 1
-                    wrote_ledger = True
+                    note_fenced_write()
                     self._journal_attempt(attempt, attempt_status="submitted")
                     # record_ctv_fanout_broadcast_attempt moves the durable row to
                     # broadcast_submitted, so do not double-update here.
@@ -193,7 +212,7 @@ class CtvFanoutBroadcastDaemon:
 
                 if attempt.fee_sats is not None:
                     attempt_status = "planned" if attempt.package_msg == "error" else "rejected"
-                    wrote_ledger = True
+                    note_fenced_write()
                     self._journal_attempt(attempt, attempt_status=attempt_status)
                     failed_count += 1
                     record_progress()
@@ -202,7 +221,7 @@ class CtvFanoutBroadcastDaemon:
                 next_status = LEDGER_STATUS_BY_BROADCASTER_STATUS.get(attempt.status)
                 if next_status is not None:
                     if next_status != stored_status:
-                        wrote_ledger = True
+                        note_fenced_write()
                         self.ledger.update_ctv_fanout_status(
                             fanout_txid=attempt.fanout_txid,
                             settlement_status=next_status,
@@ -211,10 +230,19 @@ class CtvFanoutBroadcastDaemon:
                     record_progress()
                     continue
 
-                wrote_ledger = True
+                note_fenced_write()
                 self._journal_attempt(attempt, attempt_status="failed")
                 failed_count += 1
                 record_progress()
+
+            if probes_since_lease_refresh:
+                # Each row probe is several qbitd RPCs, so a long stretch of
+                # rows whose derived status matched the stored one could
+                # otherwise outlast the lease TTL with no fenced write to
+                # refresh it. Renew at the chunk boundary to bound the
+                # write-free window to one chunk, matching the per-row refresh
+                # cadence the removed no-op rewrites used to provide.
+                renew_lease()
 
             if chunk_callback is not None:
                 assert chunk_started is not None
@@ -225,7 +253,7 @@ class CtvFanoutBroadcastDaemon:
                     )
                 )
 
-        if not wrote_ledger:
+        if not lease_refreshed:
             # Fenced writes are the only thing that refreshes the writer
             # lease, and the no-op status rewrites this pass used to make were
             # an otherwise-idle daemon's only fenced writes. Renew explicitly
@@ -233,9 +261,7 @@ class CtvFanoutBroadcastDaemon:
             # daemon still fails fast. Yielded passes renew too: consecutive
             # yields must not let the lease lapse, and the single lease-row
             # update is negligible next to the per-row work a yield defers.
-            renew_writer_lease = getattr(self.ledger, "renew_writer_lease", None)
-            if renew_writer_lease is not None:
-                renew_writer_lease()
+            renew_lease()
 
         return CtvFanoutDaemonResult(
             scanned_count=scanned_count,

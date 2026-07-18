@@ -296,7 +296,57 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
         self.assertEqual(broadcaster.fees, [0, 0])  # probes still happen
         self.assertEqual(ledger.updates, [])
         self.assertEqual(ledger.attempts, [])
-        self.assertEqual(ledger.lease_renewals, 1)
+        # Default chunk_size=1: each probed write-free chunk renews at its
+        # boundary, so the pass-end renewal is not needed.
+        self.assertEqual(ledger.lease_renewals, 2)
+
+    def test_long_unchanged_probe_batches_renew_lease_at_chunk_boundaries(self) -> None:
+        # A full batch of in-mempool rows whose derived status matches the
+        # stored one makes no fenced write; the lease must still be refreshed
+        # at least once per probed chunk so slow RPCs cannot outlast the TTL.
+        txids = [f"{value:02x}" * 32 for value in range(1, 5)]
+        rows = []
+        for txid in txids:
+            row = pending_row(txid)
+            row["settlement_status"] = "broadcast_submitted"
+            rows.append(row)
+        ledger = FakeLedger(rows)
+        broadcaster = FakeBroadcaster(
+            {txid: BroadcastAttempt(txid, BROADCAST, submitted=False) for txid in txids},
+        )
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once(chunk_size=2)
+
+        self.assertEqual(result.scanned_count, 4)
+        self.assertEqual(result.updated_count, 0)
+        self.assertEqual(len(broadcaster.fees), 4)
+        self.assertEqual(ledger.updates, [])
+        self.assertEqual(ledger.lease_renewals, 2)  # one per probed write-free chunk
+
+    def test_fenced_write_resets_pending_boundary_renewal(self) -> None:
+        unchanged_txid = "aa" * 32
+        transition_txid = "bb" * 32
+        unchanged = pending_row(unchanged_txid)
+        unchanged["settlement_status"] = "broadcast_submitted"
+        ledger = FakeLedger([unchanged, pending_row(transition_txid)])
+        broadcaster = FakeBroadcaster(
+            {
+                unchanged_txid: BroadcastAttempt(unchanged_txid, BROADCAST, submitted=False),
+                transition_txid: BroadcastAttempt(transition_txid, CONFIRMED, submitted=False),
+            },
+        )
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once(chunk_size=2)
+
+        self.assertEqual(result.updated_count, 1)
+        self.assertEqual(
+            ledger.updates,
+            [{"fanout_txid": transition_txid, "settlement_status": "confirmed"}],
+        )
+        # The transition's fenced write refreshed the lease after the
+        # unchanged row's probe, so neither the boundary nor the pass end
+        # needs an explicit renewal.
+        self.assertEqual(ledger.lease_renewals, 0)
 
     def test_empty_scan_renews_lease_without_probes(self) -> None:
         ledger = FakeLedger([])
