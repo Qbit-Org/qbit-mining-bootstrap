@@ -500,7 +500,7 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
         # then trim the context-only points after smoothing.
         lookback_seconds = (window_seconds // bucket_seconds) * bucket_seconds
         now_epoch = int(datetime.now(timezone.utc).timestamp())
-        min_epoch = (now_epoch - range_seconds) // bucket_seconds * bucket_seconds
+        min_epoch = hashrate_series_min_epoch(now_epoch, range_seconds, bucket_seconds)
     points = coordinator.ledger.dashboard_hashrate_series(
         subject_type=subject_type,
         subject_id=subject_id,
@@ -1155,6 +1155,19 @@ def hashrate_ths_from_difficulty(total_difficulty: int | str | Decimal, seconds:
     if difficulty <= 0:
         return "0"
     return decimal_string(difficulty * HASHES_PER_QBIT_SCALED_DIFFICULTY / Decimal(seconds) / TERAHASH)
+
+
+def hashrate_series_min_epoch(now_epoch: int, range_seconds: int, bucket_seconds: int) -> int:
+    """First bucket epoch whose full span lies inside the bounded range.
+
+    A bucket straddling the range start is trimmed from the response: the
+    lookback-widened ledger query would aggregate pre-range shares into its raw
+    fields (and the unwidened query clipped it short), so neither raw reading
+    describes a fully covered bucket. Its shares still feed the trailing
+    windows of the kept points.
+    """
+    range_start_epoch = now_epoch - range_seconds
+    return -(-range_start_epoch // bucket_seconds) * bucket_seconds
 
 
 def smooth_hashrate_series_points(

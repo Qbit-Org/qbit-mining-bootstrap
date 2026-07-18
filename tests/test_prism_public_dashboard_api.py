@@ -861,6 +861,15 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(points[0]["accepted_share_difficulty"], "1200")
         self.assert_hashrate_ths(points[0]["hashrate_ths"], 1800, 1800)
 
+    def test_hashrate_series_min_epoch_trims_straddling_bucket(self) -> None:
+        # Range start aligned to the bucket grid: that bucket is fully in range
+        # and is the first one kept.
+        self.assertEqual(public_api.hashrate_series_min_epoch(1000, 700, 300), 300)
+        # Unaligned range start (350) falls inside bucket [300, 600): that
+        # straddling bucket would mix pre-range shares into its raw fields, so
+        # the first kept bucket is the next fully covered one.
+        self.assertEqual(public_api.hashrate_series_min_epoch(1050, 700, 300), 600)
+
     def test_smooth_hashrate_series_points_drops_malformed_points(self) -> None:
         # An unparseable point can be neither windowed nor range-checked, so it
         # is dropped rather than passed through raw (which would leak pre-range
