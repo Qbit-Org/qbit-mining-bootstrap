@@ -9591,8 +9591,9 @@ class PrismCoordinator:
             "coinbase_script_sig_suffix_hex": coinbase_script_sig_suffix_hex,
             "witness_merkle_leaves_hex": witness_merkle_leaves_hex or [],
         }
+        job_build_phase_local = getattr(self, "_job_build_phase_local", None)
         record_phase_metrics = bool(
-            getattr(self._job_build_phase_local, "tip_refresh_metrics", False)
+            getattr(job_build_phase_local, "tip_refresh_metrics", False)
         )
         if summary_only:
             artifact_started = time.monotonic()
@@ -9677,7 +9678,7 @@ class PrismCoordinator:
                     close_fds=True,
                 )
                 build_control = getattr(
-                    self._job_build_phase_local,
+                    job_build_phase_local,
                     "bundle_build_control",
                     None,
                 )
