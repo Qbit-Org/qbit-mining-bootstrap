@@ -36,6 +36,7 @@ from lab.prism.prism_coordinator import (
     PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
     PRISM_REJECTION_LOW_DIFFICULTY,
     PendingShareAppend,
+    PayoutStateArtifact,
     PrismBlockCandidate,
     PRISM_REJECTION_POOL_CLOSED,
     PRISM_REJECTION_REASON_IDS,
@@ -609,6 +610,7 @@ def install_idle_job_cache(
         payout_artifact_generation=0,
         worker=None,
     )
+    payout_artifact_sha256 = "aa" * 32
     qbit_target = direct_stratum.difficulty_target(Decimal("1024"))
     base_job = direct_stratum.DirectQbitStratumJob(
         job_id="prism-template-base",
@@ -644,9 +646,22 @@ def install_idle_job_cache(
         built_monotonic=time.monotonic(),
         template_generation=1,
         payout_state_generation=0,
+        build_key=SimpleNamespace(
+            payout_artifact_sha256=payout_artifact_sha256,
+        ),
     )
     with server._job_cache_lock:
         server._template_artifacts = artifacts
+        server._published_payout_state = dataclass_replace(
+            server._published_payout_state,
+            artifact=PayoutStateArtifact(
+                generation=server._payout_state_generation,
+                source_generation=0,
+                prior_balances_json="[]",
+                prior_balances_sha256=payout_artifact_sha256,
+                prepared_monotonic=time.monotonic(),
+            ),
+        )
         server._job_bundle_cache.clear()
         server._job_bundle_cache[bundle.key] = bundle
     return bundle
@@ -1412,6 +1427,53 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.vardiff_window_accepted, 0)
         self.assertEqual(state.vardiff_window_submitted, 0)
         self.assertEqual(state.vardiff_window_work, Decimal("0"))
+
+    def test_idle_preparation_oserror_keeps_client_connected(self) -> None:
+        for failure_phase in ("bundle", "reorg"):
+            with self.subTest(failure_phase=failure_phase):
+                server = coordinator()
+                state = client()
+                prepare_idle_client(server, state)
+                install_idle_job_cache(server)
+                disconnected: list[ClientState] = []
+                window_started = state.vardiff_window_started_monotonic
+
+                def fail_bundle(_request: object) -> CachedJobBundle:
+                    raise OSError("qbit RPC transport unavailable")
+
+                def fail_reorg() -> bool:
+                    raise OSError("qbit trust RPC transport unavailable")
+
+                def unexpected_send(payload: dict[str, object]) -> None:
+                    self.fail(f"unexpected idle delivery: {payload}")
+
+                def record_disconnect(client_state: ClientState) -> None:
+                    disconnected.append(client_state)
+
+                if failure_phase == "bundle":
+                    server._build_idle_job_bundle = (  # type: ignore[method-assign]
+                        fail_bundle
+                    )
+                else:
+                    server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+                        fail_reorg
+                    )
+                state.send = unexpected_send  # type: ignore[method-assign]
+                server.disconnect_client = record_disconnect  # type: ignore[method-assign]
+
+                self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+                server.shutdown_vardiff_idle_executor()
+
+                self.assertEqual(disconnected, [])
+                self.assertIn(state, server.clients)
+                self.assertFalse(state.closing)
+                self.assertEqual(server.vardiff_idle_task_failures, 1)
+                self.assertIsNone(state.pending_share_difficulty)
+                self.assertEqual(state.share_difficulty, Decimal("16"))
+                self.assertEqual(
+                    state.vardiff_window_started_monotonic,
+                    window_started,
+                )
 
     def test_disconnect_while_idle_retarget_pending_prevents_delivery(self) -> None:
         server = coordinator()

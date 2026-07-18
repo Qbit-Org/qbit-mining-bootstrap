@@ -13698,6 +13698,14 @@ class PrismCoordinator:
         artifacts = self._template_artifacts
         if artifacts is None or self._payout_state_publication_blocked:
             return False
+        payout_artifact = self._published_payout_state.artifact
+        if (
+            bundle.build_key is None
+            or payout_artifact is None
+            or bundle.build_key.payout_artifact_sha256
+            != payout_artifact.prior_balances_sha256
+        ):
+            return False
         observed_tip = getattr(self, "current_tip_first_seen", None)
         if observed_tip is not None and observed_tip[0] != artifacts.previousblockhash:
             return False
@@ -13880,6 +13888,7 @@ class PrismCoordinator:
             )
             self.vardiff_idle_inflight += 1
         client = request.client
+        delivery_attempted = False
         try:
             with self.lock:
                 reason = self._idle_request_skip_reason_locked(request)
@@ -13921,6 +13930,11 @@ class PrismCoordinator:
                 if not bundle_current:
                     self._record_vardiff_idle_skip("superseded")
                     return
+                # Everything above this point is coordinator preparation. An
+                # OSError there belongs to qbit RPC/ledger I/O, not the miner
+                # socket. Only retire the connection after entering the paired
+                # client delivery path below.
+                delivery_attempted = True
                 retargeted = self._retarget_client_locked(
                     client,
                     current_difficulty=request.current_difficulty,
@@ -13955,7 +13969,15 @@ class PrismCoordinator:
         except OSError:
             with self._vardiff_idle_lock:
                 self.vardiff_idle_task_failures += 1
-            self.disconnect_client(client)
+            if delivery_attempted:
+                self.disconnect_client(client)
+                return
+            print(
+                "prism coordinator: idle vardiff retarget preparation failed; "
+                "keeping client connected",
+                flush=True,
+            )
+            traceback.print_exc()
         except Exception:
             with self._vardiff_idle_lock:
                 self.vardiff_idle_task_failures += 1
