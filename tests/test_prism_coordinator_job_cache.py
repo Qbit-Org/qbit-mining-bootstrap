@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import queue
 import socket
+import sys
 import threading
 import time
 import unittest
@@ -11,11 +13,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism.prism_coordinator import (
     ClientState,
+    JobBuildSuperseded,
     MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     PRISM_REJECTION_REASON_IDS,
@@ -23,6 +27,8 @@ from lab.prism.prism_coordinator import (
     ShutdownInProgress,
     TemplateRefreshBlocked,
     WorkerIdentity,
+    canonical_json_sha256,
+    canonical_json_text,
     default_prism_coinbase_tag_hex,
     qbit_template_fingerprint,
 )
@@ -355,6 +361,58 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         self.assertIs(contexts[0].shares_json, contexts[1].shares_json)
 
+    def test_latest_wins_scheduler_preserves_synchronous_builder_output(self) -> None:
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        identity = worker()
+        cache_key = server._job_bundle_key(
+            artifacts,
+            mode="ready",
+            payout_state_generation=0,
+            worker=identity,
+        )
+
+        with patch("lab.prism.prism_coordinator.now_ms", return_value=1_700_000_001_000):
+            direct_request = server._new_job_build_request(
+                artifacts,
+                identity,
+                mode="ready",
+                payout_state_generation=0,
+                cache_key=cache_key,
+            )
+            direct = server.build_shared_job_bundle(
+                artifacts,
+                identity,
+                mode="ready",
+                payout_state_generation=0,
+                key=cache_key,
+                build_request=direct_request,
+            )
+            scheduled_request = server._new_job_build_request(
+                artifacts,
+                identity,
+                mode="ready",
+                payout_state_generation=0,
+                cache_key=cache_key,
+            )
+            scheduled = server._request_job_build(scheduled_request).result(5)
+
+        server.shutdown_job_build_executor()
+        self.assertEqual(recorded["calls"], 2)
+        self.assertEqual(scheduled.key, direct.key)
+        self.assertEqual(scheduled.template, direct.template)
+        self.assertEqual(scheduled.template_fingerprint, direct.template_fingerprint)
+        self.assertEqual(scheduled.coinbase_manifest, direct.coinbase_manifest)
+        self.assertEqual(scheduled.shares_json, direct.shares_json)
+        self.assertEqual(scheduled.prior_balances, direct.prior_balances)
+        self.assertEqual(scheduled.found_block, direct.found_block)
+        self.assertEqual(scheduled.collection_only, direct.collection_only)
+        self.assertEqual(scheduled.issued_at_ms, direct.issued_at_ms)
+        self.assertEqual(scheduled.base_job, direct.base_job)
+        self.assertEqual(scheduled.build_key, direct.build_key)
+
     def test_stamped_job_reassembles_coinbase_with_client_extranonce(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
@@ -475,26 +533,27 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(bundle.payout_state_generation, 1)
         self.assertIs(cached, bundle)
 
-    def test_readiness_latch_during_build_lock_wait_reselects_ready_mode(self) -> None:
+    def test_readiness_latch_during_preparation_admission_reselects_ready_mode(self) -> None:
         ledger = FakeLedger(miners=["solo"])
         server, rpc = coordinator(ledger=ledger)
         recorded = install_fake_bundle_builder(server)
         artifacts = server.store_template_artifacts(dict(rpc.template))
         self.assertIsNotNone(artifacts)
         assert artifacts is not None
-        first_mode_resolved = threading.Event()
-        original_job_bundle_mode = server._job_bundle_mode
-        mode_calls = 0
+        first_lookup_entered = threading.Event()
+        release_first_lookup = threading.Event()
+        original_lookup = server._lookup_job_bundle
+        lookup_calls = 0
 
-        def record_mode_resolution(requested_mode: str | None) -> str:
-            nonlocal mode_calls
-            resolved = original_job_bundle_mode(requested_mode)
-            mode_calls += 1
-            if mode_calls == 1:
-                first_mode_resolved.set()
-            return resolved
+        def block_first_lookup(key: tuple[object, ...]) -> object:
+            nonlocal lookup_calls
+            lookup_calls += 1
+            if lookup_calls == 1:
+                first_lookup_entered.set()
+                self.assertTrue(release_first_lookup.wait(2.0))
+            return original_lookup(key)
 
-        server._job_bundle_mode = record_mode_resolution  # type: ignore[method-assign]
+        server._lookup_job_bundle = block_first_lookup  # type: ignore[method-assign]
         bundles: list[object] = []
         errors: list[BaseException] = []
 
@@ -504,11 +563,11 @@ class JobBundleCacheTests(unittest.TestCase):
             except BaseException as exc:  # pragma: no cover - assertion reports it
                 errors.append(exc)
 
-        with server._job_build_lock:
-            build_thread = threading.Thread(target=build_bundle)
-            build_thread.start()
-            self.assertTrue(first_mode_resolved.wait(2.0))
-            ledger.miners = ["miner-a", "miner-b", "miner-c"]
+        build_thread = threading.Thread(target=build_bundle)
+        build_thread.start()
+        self.assertTrue(first_lookup_entered.wait(2.0))
+        ledger.miners = ["miner-a", "miner-b", "miner-c"]
+        release_first_lookup.set()
 
         build_thread.join(2.0)
 
@@ -1037,6 +1096,376 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(recorded["calls"], 1)
 
+    def test_observed_tip_change_rejects_stale_cached_bundle_delivery(self) -> None:
+        old_tip = "11" * 32
+        new_tip = "22" * 32
+        server, rpc = coordinator(template=base_template(prevhash=old_tip))
+        install_fake_bundle_builder(server)
+        state = client(1)
+        sent: list[dict[str, object]] = []
+        state.send = sent.append  # type: ignore[method-assign]
+        server.clients = {state}
+        server.observe_tip_first_seen(old_tip, observation_sequence=1)
+
+        self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(len(sent), 2)
+        sent.clear()
+
+        rpc.tip = new_tip
+        server.observe_tip_first_seen(new_tip, observation_sequence=2)
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(sent, [])
+
+    def test_ready_ledger_snapshot_holds_payout_mutation_lock(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        entered_snapshot = threading.Event()
+        release_snapshot = threading.Event()
+        original_snapshot = server.ledger.snapshot_at_job_issue
+
+        def blocked_snapshot(*args: object, **kwargs: object) -> object:
+            entered_snapshot.set()
+            self.assertTrue(release_snapshot.wait(2))
+            return original_snapshot(*args, **kwargs)
+
+        server.ledger.snapshot_at_job_issue = blocked_snapshot  # type: ignore[method-assign]
+        errors: list[BaseException] = []
+        build_thread = threading.Thread(
+            target=lambda: self._capture_error(
+                errors,
+                lambda: server.shared_job_bundle(artifacts, mode="ready"),
+            )
+        )
+        build_thread.start()
+        try:
+            self.assertTrue(entered_snapshot.wait(2))
+            mutation_acquired = server._payout_state_prepare_lock.acquire(
+                blocking=False
+            )
+            if mutation_acquired:
+                server._payout_state_prepare_lock.release()
+            self.assertFalse(mutation_acquired)
+        finally:
+            release_snapshot.set()
+        build_thread.join(2)
+
+        self.assertFalse(build_thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_ready_build_identity_separates_clock_only_generations(self) -> None:
+        server, rpc = coordinator()
+        first = server.store_template_artifacts(dict(rpc.template))
+        second_template = dict(rpc.template)
+        second_template["curtime"] = int(second_template["curtime"]) + 1
+        second = server.store_template_artifacts(second_template)
+        assert first is not None and second is not None
+        self.assertEqual(first.fingerprint, second.fingerprint)
+        self.assertNotEqual(first.generation, second.generation)
+        payout_generation = server._payout_state_generation
+
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=[1_700_000_000_000, 1_700_000_001_000],
+        ):
+            first_request = server._new_job_build_request(
+                first,
+                None,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    first,
+                    mode="ready",
+                    payout_state_generation=payout_generation,
+                    worker=None,
+                ),
+            )
+            second_request = server._new_job_build_request(
+                second,
+                None,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    second,
+                    mode="ready",
+                    payout_state_generation=payout_generation,
+                    worker=None,
+                ),
+            )
+
+        self.assertNotEqual(
+            first_request.equivalence_key,
+            second_request.equivalence_key,
+        )
+        self.assertNotEqual(
+            first_request.key.issued_at_ms,
+            second_request.key.issued_at_ms,
+        )
+
+    def test_precomputed_payout_artifact_matches_inline_output_exactly(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        with patch("lab.prism.prism_coordinator.now_ms", return_value=1_700_000_123_000):
+            inline = server.shared_job_bundle(artifacts, mode="ready")
+            with server._job_cache_lock:
+                server._job_bundle_cache.clear()
+            server._prepare_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            prepared = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertEqual(prepared.base_job, inline.base_job)
+        self.assertEqual(prepared.coinbase_manifest, inline.coinbase_manifest)
+        self.assertEqual(prepared.shares_json, inline.shares_json)
+        self.assertEqual(prepared.prior_balances, inline.prior_balances)
+        self.assertEqual(prepared.found_block, inline.found_block)
+        self.assertGreater(prepared.payout_artifact_generation, 0)
+
+    def test_valid_precomputed_artifact_skips_tip_path_ledger_snapshot(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        assert snapshot.template_artifacts is not None
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            snapshot.template_artifacts.network_difficulty,
+        )
+        server.ledger.snapshot_calls = 0
+
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
+
+        self.assertFalse(bundle.collection_only)
+        self.assertGreater(bundle.payout_artifact_generation, 0)
+        self.assertEqual(server.ledger.snapshot_calls, 0)
+
+    def test_mismatched_precomputed_artifact_falls_back_to_inline_snapshot(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._current_payout_state_artifact()
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            published = server._published_payout_state
+            assert published.artifact is not None
+            changed_balances = [{"miner_id": "miner-z", "balance_sats": 1}]
+            server._published_payout_state = dataclass_replace(
+                published,
+                artifact=dataclass_replace(
+                    published.artifact,
+                    prior_balances_json=canonical_json_text(changed_balances),
+                    prior_balances_sha256=canonical_json_sha256(changed_balances),
+                ),
+            )
+
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+        self.assertIsNone(server._payout_ledger_artifact)
+        server.ledger.snapshot_calls = 0
+
+        bundle = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertEqual(bundle.payout_artifact_generation, 0)
+        self.assertEqual(server.ledger.snapshot_calls, 1)
+
+    def test_new_tip_cancels_blocked_old_bundle_without_publication(self) -> None:
+        old_tip = "11" * 32
+        new_tip = "22" * 32
+        server, rpc = coordinator(template=base_template(prevhash=old_tip))
+        recorded = install_fake_bundle_builder(server)
+        original_builder = server.build_audit_bundle
+        build_started = threading.Event()
+
+        def cancelable_builder(**kwargs: object) -> dict[str, object]:
+            control = server._job_build_phase_local.bundle_build_control
+            build_started.set()
+            self.assertTrue(control.cancel_event.wait(2))
+            return original_builder(**kwargs)
+
+        server.build_audit_bundle = cancelable_builder  # type: ignore[method-assign]
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.observe_tip_first_seen(old_tip, observation_sequence=1)
+        errors: list[BaseException] = []
+        thread = threading.Thread(
+            target=lambda: self._capture_error(
+                errors,
+                lambda: server.shared_job_bundle(artifacts, mode="ready"),
+            )
+        )
+        thread.start()
+        self.assertTrue(build_started.wait(2))
+
+        server.observe_tip_first_seen(new_tip, observation_sequence=2)
+        thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+        self.assertEqual(recorded["calls"], 1)
+        self.assertEqual(server._active_job_bundle_builds, {})
+        self.assertEqual(server.tip_refresh_build_inflight, 0)
+        self.assertFalse(any(
+            entry.template_fingerprint == artifacts.fingerprint
+            for entry in server._job_bundle_cache.values()
+        ))
+        self.assertEqual(server.tip_refresh_superseded_results, 1)
+
+    def test_builder_crash_and_timeout_fail_closed_then_recover(self) -> None:
+        server, _rpc = coordinator()
+        server.prism_ctv_settlement_config = lambda **_kwargs: None  # type: ignore[method-assign]
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        build_kwargs = {
+            "shares": [],
+            "found_block": {
+                "block_height": 10,
+                "coinbase_value_sats": 50_00000000,
+                "network_difficulty": 1,
+                "anchor_job_issued_at_ms": 1_700_000_000_000,
+            },
+            "prior_balances": [],
+            "coinbase_script_sig_suffix_hex": "00",
+        }
+
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[sys.executable, "-c", "raise SystemExit(7)"],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                server.build_audit_bundle(**build_kwargs)
+
+        server.bundle_build_timeout_seconds = 0.01
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[
+                sys.executable,
+                "-c",
+                "import time; time.sleep(5)",
+            ],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                server.build_audit_bundle(**build_kwargs)
+
+        server.bundle_build_timeout_seconds = 1.0
+        recovery_script = (
+            "import json,sys; json.load(sys.stdin); "
+            "json.dump({'recovered': True}, sys.stdout)"
+        )
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[sys.executable, "-c", recovery_script],
+        ):
+            recovered = server.build_audit_bundle(**build_kwargs)
+        self.assertEqual(recovered, {"recovered": True})
+
+    def test_audit_builder_child_does_not_inherit_open_socket(self) -> None:
+        server, _rpc = coordinator()
+        server.prism_ctv_settlement_config = lambda **_kwargs: None  # type: ignore[method-assign]
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        probe_script = (
+            "import json,os,sys; json.load(sys.stdin); fd=int(sys.argv[1]); "
+            "inherited=True; "
+            "\ntry: os.fstat(fd)"
+            "\nexcept OSError: inherited=False"
+            "\njson.dump({'inherited_socket': inherited}, sys.stdout)"
+        )
+        with socket.socket() as parent_socket:
+            parent_socket.set_inheritable(True)
+            with patch(
+                "lab.prism.prism_coordinator.prism_tool_command",
+                return_value=[
+                    sys.executable,
+                    "-c",
+                    probe_script,
+                    str(parent_socket.fileno()),
+                ],
+            ):
+                result = server.build_audit_bundle(
+                    shares=[],
+                    found_block={
+                        "block_height": 10,
+                        "coinbase_value_sats": 50_00000000,
+                        "network_difficulty": 1,
+                        "anchor_job_issued_at_ms": 1_700_000_000_000,
+                    },
+                    prior_balances=[],
+                    coinbase_script_sig_suffix_hex="00",
+                )
+        self.assertEqual(result, {"inherited_socket": False})
+
+    def test_repeated_superseded_builds_leave_state_bounded(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        original_builder = server.build_audit_bundle
+        starts: queue.Queue[None] = queue.Queue()
+
+        def cancelable_builder(**kwargs: object) -> dict[str, object]:
+            control = server._job_build_phase_local.bundle_build_control
+            starts.put(None)
+            self.assertTrue(control.cancel_event.wait(2))
+            return original_builder(**kwargs)
+
+        server.build_audit_bundle = cancelable_builder  # type: ignore[method-assign]
+        current_tip = str(rpc.tip)
+        server.observe_tip_first_seen(current_tip, observation_sequence=1)
+        errors: list[BaseException] = []
+        for index in range(8):
+            rpc.template = base_template(height=10 + index, prevhash=current_tip)
+            artifacts = server.store_template_artifacts(dict(rpc.template))
+            assert artifacts is not None
+            thread = threading.Thread(
+                target=lambda current=artifacts: self._capture_error(
+                    errors,
+                    lambda: server.shared_job_bundle(current, mode="ready"),
+                )
+            )
+            thread.start()
+            starts.get(timeout=2)
+            current_tip = f"{index + 2:064x}"
+            rpc.tip = current_tip
+            server.observe_tip_first_seen(
+                current_tip,
+                observation_sequence=index + 2,
+            )
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(len(errors), 8)
+        self.assertTrue(all(isinstance(exc, TemplateRefreshBlocked) for exc in errors))
+        self.assertEqual(server._active_job_bundle_builds, {})
+        self.assertEqual(server.tip_refresh_build_inflight, 0)
+        self.assertEqual(server.tip_refresh_build_queue_depth, 0)
+        self.assertLessEqual(
+            len(server._job_bundle_cache),
+            MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
+        )
+        self.assertEqual(server.tip_refresh_superseded_results, 8)
+
+    @staticmethod
+    def _capture_error(
+        errors: list[BaseException],
+        operation: object,
+    ) -> None:
+        try:
+            operation()  # type: ignore[operator]
+        except BaseException as exc:  # noqa: BLE001 - test thread handoff
+            errors.append(exc)
+
     def test_ready_tip_refresh_builds_once_and_stamps_every_client(self) -> None:
         server, _ = coordinator()
         recorded = install_fake_bundle_builder(server)
@@ -1193,6 +1622,85 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertNotIn(
             (artifacts.fingerprint, "test", 0),
             server._job_bundle_cache,
+        )
+
+    def test_job_bundle_cache_preserves_coordinator_lock_order(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(base_template())
+        assert artifacts is not None
+        bundle = server.shared_job_bundle(artifacts, mode="ready")
+        observed_cache_lock = ObservedRLock()
+        server._job_cache_lock = observed_cache_lock  # type: ignore[assignment]
+        errors: list[BaseException] = []
+
+        def cache_bundle() -> None:
+            try:
+                server._cache_job_bundle_if_current(bundle, artifacts)
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        observed_cache_lock.acquire()
+        observed_cache_lock.observe_acquires = True
+        cache_thread = threading.Thread(target=cache_bundle)
+        coordinator_lock_acquired = False
+        try:
+            cache_thread.start()
+            self.assertTrue(observed_cache_lock.acquire_attempted.wait(5))
+            coordinator_lock_acquired = server.lock.acquire(timeout=0.25)
+            if coordinator_lock_acquired:
+                server.lock.release()
+        finally:
+            observed_cache_lock.release()
+            cache_thread.join(5)
+
+        self.assertTrue(coordinator_lock_acquired)
+        self.assertFalse(cache_thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_active_gap_replaces_older_pending_job_build(self) -> None:
+        server, rpc = coordinator()
+        first = server.store_template_artifacts(dict(rpc.template))
+        second_template = dict(rpc.template)
+        second_template["curtime"] = int(second_template["curtime"]) + 1
+        second = server.store_template_artifacts(second_template)
+        assert first is not None and second is not None
+        payout_generation = server._payout_state_generation
+
+        def request_for(artifacts: object) -> object:
+            return server._new_job_build_request(
+                artifacts,  # type: ignore[arg-type]
+                None,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    artifacts,  # type: ignore[arg-type]
+                    mode="ready",
+                    payout_state_generation=payout_generation,
+                    worker=None,
+                ),
+            )
+
+        pending = request_for(first)
+        newest = request_for(second)
+        server._job_build_active = None
+        server._job_build_retiring = SimpleNamespace(request=pending)
+        server._job_build_pending = pending
+        server._start_job_build_locked = (  # type: ignore[method-assign]
+            lambda request: SimpleNamespace(request=request, future=None)
+        )
+        server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
+
+        promise = server._request_job_build(newest)  # type: ignore[arg-type]
+
+        self.assertIs(promise, newest.promise)  # type: ignore[union-attr]
+        self.assertIsNone(server._job_build_pending)
+        assert server._job_build_active is not None
+        self.assertIs(server._job_build_active.request, newest)
+        self.assertTrue(pending.promise.done())  # type: ignore[union-attr]
+        self.assertIsInstance(
+            pending.promise.exception(),  # type: ignore[union-attr]
+            JobBuildSuperseded,
         )
 
     def test_supersession_retry_wakes_blockpoll_without_full_interval(self) -> None:
@@ -2106,6 +2614,8 @@ class JobBuildMetricsTests(unittest.TestCase):
         server.build_job_for_client(client(1), clean_jobs=True)
         server.build_job_for_client(client(2), clean_jobs=True)
         server.observe_job_build_elapsed(0.3, {"bundle": 0.2, "stamp": 0.01})
+        server._observe_tip_refresh_build_phase("payout_state_derivation", 0.25)
+        server._record_tip_refresh_ipc_bytes("input", 123)
 
         metrics = server.metrics_payload()
 
@@ -2115,6 +2625,16 @@ class JobBuildMetricsTests(unittest.TestCase):
         self.assertIn('qbit_prism_job_cache_hits_total{cache="bundle"} 1', metrics)
         self.assertIn('qbit_prism_job_cache_misses_total{cache="bundle"} 1', metrics)
         self.assertIn('qbit_prism_job_build_phase_seconds_total{phase="bundle"} 0.2', metrics)
+        self.assertIn(
+            'qbit_prism_tip_refresh_bundle_phase_seconds_count{phase="payout_state_derivation"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_tip_refresh_builder_ipc_bytes_total{direction="input"} 123',
+            metrics,
+        )
+        self.assertIn("qbit_prism_tip_refresh_bundle_queue_depth 0", metrics)
+        self.assertIn("qbit_prism_tip_refresh_bundle_inflight 0", metrics)
         self.assertIn("qbit_prism_connected_clients 0", metrics)
 
     def test_metrics_split_payout_preparation_publication_and_delivery(self) -> None:

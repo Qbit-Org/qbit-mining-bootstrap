@@ -1888,40 +1888,75 @@ WITH rows AS (
       AND accepted_at <= {anchor}
 )"""
         else:
-            # Only the most-recent shares whose cumulative difficulty covers
-            # window_weight -- a superset of the reward window the audit bundle
-            # selects. compute_prism_window re-sorts by share_seq DESC and stops
-            # at 8x network difficulty, dropping anything older, so a superset
-            # yields the identical counted window and digest. Bounding the walk
-            # here keeps the job-build ledger phase O(window), not O(ledger
-            # history), and stops it growing without bound as the ledger grows.
+            # Find the bounded reward window in indexed pages, then apply one
+            # exact cumulative cutoff over only those pages. The previous
+            # recursive query fetched one row per recursive step; at production
+            # window sizes that meant 100k+ lateral index probes. Paging keeps
+            # the scan O(window), not O(history), while returning the identical
+            # final crossing row and therefore byte-identical audit input.
             rows_cte = f"""
-WITH RECURSIVE eligible AS (
-    (
-        SELECT ledger.*, ledger.share_difficulty::numeric AS cumulative_difficulty
-        FROM qbit_share_ledger ledger
-        WHERE ledger.accepted
-          AND ledger.job_issued_at <= {anchor}
-          AND ledger.accepted_at <= {anchor}
-        ORDER BY ledger.share_seq DESC
-        LIMIT 1
-    )
+WITH RECURSIVE pages AS (
+    SELECT page.min_share_seq,
+           page.page_weight,
+           page.page_weight AS cumulative_weight
+    FROM LATERAL (
+        SELECT min(page_rows.share_seq) AS min_share_seq,
+               COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+        FROM (
+            SELECT ledger.share_seq, ledger.share_difficulty
+            FROM qbit_share_ledger ledger
+            WHERE ledger.accepted
+              AND ledger.job_issued_at <= {anchor}
+              AND ledger.accepted_at <= {anchor}
+            ORDER BY ledger.share_seq DESC
+            LIMIT 4096
+        ) page_rows
+    ) page
     UNION ALL
-    SELECT next_ledger.*, eligible.cumulative_difficulty + next_ledger.share_difficulty
-    FROM eligible
+    SELECT page.min_share_seq,
+           page.page_weight,
+           pages.cumulative_weight + page.page_weight
+    FROM pages
     CROSS JOIN LATERAL (
-        SELECT ledger.*
-        FROM qbit_share_ledger ledger
-        WHERE ledger.accepted
-          AND ledger.job_issued_at <= {anchor}
-          AND ledger.accepted_at <= {anchor}
-          AND ledger.share_seq < eligible.share_seq
-        ORDER BY ledger.share_seq DESC
-        LIMIT 1
-    ) next_ledger
-    WHERE eligible.cumulative_difficulty < {int(window_weight)}::numeric
+        SELECT min(page_rows.share_seq) AS min_share_seq,
+               COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+        FROM (
+            SELECT ledger.share_seq, ledger.share_difficulty
+            FROM qbit_share_ledger ledger
+            WHERE ledger.accepted
+              AND ledger.job_issued_at <= {anchor}
+              AND ledger.accepted_at <= {anchor}
+              AND ledger.share_seq < pages.min_share_seq
+            ORDER BY ledger.share_seq DESC
+            LIMIT 4096
+        ) page_rows
+    ) page
+    WHERE pages.cumulative_weight < {int(window_weight)}::numeric
+      AND pages.min_share_seq IS NOT NULL
 ),
-rows AS (SELECT * FROM eligible)"""
+page_cutoff AS (
+    SELECT min(min_share_seq) AS min_share_seq
+    FROM pages
+    WHERE min_share_seq IS NOT NULL
+),
+ranked AS (
+    SELECT ledger.*,
+           sum(ledger.share_difficulty) OVER (
+               ORDER BY ledger.share_seq DESC
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+           )::numeric AS cumulative_difficulty
+    FROM qbit_share_ledger ledger
+    CROSS JOIN page_cutoff
+    WHERE ledger.accepted
+      AND ledger.job_issued_at <= {anchor}
+      AND ledger.accepted_at <= {anchor}
+      AND ledger.share_seq >= page_cutoff.min_share_seq
+),
+rows AS (
+    SELECT *
+    FROM ranked
+    WHERE cumulative_difficulty - share_difficulty < {int(window_weight)}::numeric
+)"""
         sql = rows_cte + """
 SELECT COALESCE(json_agg(json_build_object(
     'share_seq', share_seq,
@@ -5913,6 +5948,51 @@ SELECT COALESCE(
             and holder_epoch == self._writer_epoch
             and result.get("lease_expires_at") is not None
         )
+
+    def renew_writer_lease(self) -> dict[str, int | str]:
+        """Refresh this writer's lease without touching any ledger rows.
+
+        The lease is normally refreshed as a side effect of every fenced
+        write. A daemon pass that produced no writes calls this instead, so an
+        otherwise-idle writer's lease does not sit expired. Raises when the
+        exact ``(writer_id, writer_epoch, writer_session_token)`` no longer
+        holds the lease, matching the fenced-write failure mode so a fenced-out
+        writer still fails fast.
+        """
+        payload = {
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    RETURNING qbit_ledger_writer_lease.writer_id
+)
+SELECT CASE
+    WHEN (SELECT count(*) FROM lease) = 0 THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object(
+            'backend', 'postgres-psql',
+            'renewed_count', (SELECT count(*) FROM lease)
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return {"backend": str(result["backend"]), "renewed_count": int(result["renewed_count"])}
 
     def release_writer_lease(self) -> bool:
         """Expire this writer's lease so a same-identity replacement can take

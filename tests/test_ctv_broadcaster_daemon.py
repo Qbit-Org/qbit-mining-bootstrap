@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from lab.prism.ctv_broadcaster import (
+    AWAITING_MATURITY,
     BROADCAST,
     BROADCASTABLE,
     CONFIRMED,
@@ -25,6 +26,7 @@ from lab.prism.ctv_broadcaster_daemon import (
 )
 from lab.prism.run_ctv_broadcaster_daemon import env_positive_int, make_daemon_from_env
 from lab.prism.prism_coordinator import JsonRpc
+from lab.prism.share_ledger import SingleWriterShareLedger
 
 
 def pending_row(fanout_txid: str = "aa" * 32) -> dict[str, object]:
@@ -40,14 +42,25 @@ def pending_row(fanout_txid: str = "aa" * 32) -> dict[str, object]:
     }
 
 
+def awaiting_maturity_row(fanout_txid: str = "aa" * 32) -> dict[str, object]:
+    row = pending_row(fanout_txid)
+    row["settlement_status"] = "awaiting_maturity"
+    return row
+
+
 class FakeLedger:
     def __init__(self, rows: list[dict[str, object]]) -> None:
         self.rows = rows
         self.updates: list[dict[str, object]] = []
         self.attempts: list[dict[str, object]] = []
+        self.lease_renewals = 0
 
     def pending_ctv_fanout_statuses(self, *, limit: int = 100) -> list[dict[str, object]]:
         return self.rows[:limit]
+
+    def renew_writer_lease(self) -> dict[str, int | str]:
+        self.lease_renewals += 1
+        return {"backend": "fake", "renewed_count": 1}
 
     def update_ctv_fanout_status(self, *, fanout_txid: str, settlement_status: str) -> dict[str, int | str]:
         self.updates.append({"fanout_txid": fanout_txid, "settlement_status": settlement_status})
@@ -77,14 +90,23 @@ class FakeLedger:
 
 
 class FakeBroadcaster:
-    def __init__(self, attempts: dict[str, BroadcastAttempt]) -> None:
+    def __init__(self, attempts: dict[str, BroadcastAttempt], *, tip: int | None = None) -> None:
         self.attempts = attempts
         self.fees: list[int] = []
+        self.maturity = 1000
+        self.tip = tip
+        self.tip_probes = 0
 
     def broadcast(self, artifact: object, fee_sats: int) -> BroadcastAttempt:
         self.fees.append(fee_sats)
         fanout_txid = getattr(artifact, "fanout_txid")
         return self.attempts[fanout_txid]
+
+    def tip_height(self) -> int:
+        self.tip_probes += 1
+        if self.tip is None:
+            raise AssertionError("unexpected chain-tip probe")
+        return self.tip
 
 
 class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
@@ -208,6 +230,174 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
         self.assertEqual(result.failed_count, 0)
         self.assertEqual(ledger.attempts, [])
         self.assertEqual(broadcaster.fees, [])
+
+    def test_immature_rows_skip_probes_and_writes_and_renew_lease(self) -> None:
+        txids = [f"{value:02x}" * 32 for value in (1, 2, 3)]
+        ledger = FakeLedger([awaiting_maturity_row(txid) for txid in txids])
+        broadcaster = FakeBroadcaster({}, tip=1099)  # rows mature at 100 + 1000
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once()
+
+        self.assertEqual(
+            result,
+            CtvFanoutDaemonResult(
+                scanned_count=3,
+                submitted_count=0,
+                updated_count=0,
+                failed_count=0,
+            ),
+        )
+        self.assertEqual(broadcaster.fees, [])  # no per-row settlement probes
+        self.assertEqual(broadcaster.tip_probes, 1)  # one tip probe for the pass
+        self.assertEqual(ledger.updates, [])
+        self.assertEqual(ledger.attempts, [])
+        self.assertEqual(ledger.lease_renewals, 1)
+
+    def test_height_mature_row_is_probed_and_real_transition_persists(self) -> None:
+        fanout_txid = "aa" * 32
+        ledger = FakeLedger([awaiting_maturity_row(fanout_txid)])
+        broadcaster = FakeBroadcaster(
+            {fanout_txid: BroadcastAttempt(fanout_txid, BROADCAST, submitted=False)},
+            tip=1100,
+        )
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once()
+
+        self.assertEqual(result.updated_count, 1)
+        self.assertEqual(broadcaster.fees, [0])
+        self.assertEqual(
+            ledger.updates,
+            [{"fanout_txid": fanout_txid, "settlement_status": "broadcast_submitted"}],
+        )
+        self.assertEqual(ledger.lease_renewals, 0)
+
+    def test_unchanged_derived_status_skips_ledger_write(self) -> None:
+        in_mempool_txid = "aa" * 32
+        still_immature_txid = "bb" * 32
+        in_mempool = pending_row(in_mempool_txid)
+        in_mempool["settlement_status"] = "broadcast_submitted"
+        ledger = FakeLedger([in_mempool, awaiting_maturity_row(still_immature_txid)])
+        broadcaster = FakeBroadcaster(
+            {
+                in_mempool_txid: BroadcastAttempt(in_mempool_txid, BROADCAST, submitted=False),
+                still_immature_txid: BroadcastAttempt(
+                    still_immature_txid, AWAITING_MATURITY, submitted=False
+                ),
+            },
+            # Height-mature by the pass-level tip, so both rows take the full
+            # probe path; the probe then re-derives each row's stored status.
+            tip=1100,
+        )
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once()
+
+        self.assertEqual(result.scanned_count, 2)
+        self.assertEqual(result.updated_count, 0)
+        self.assertEqual(broadcaster.fees, [0, 0])  # probes still happen
+        self.assertEqual(ledger.updates, [])
+        self.assertEqual(ledger.attempts, [])
+        # Each unchanged probe renews the lease in place of the write it no
+        # longer makes, so the pass-end renewal is not needed.
+        self.assertEqual(ledger.lease_renewals, 2)
+
+    def test_long_unchanged_probe_batches_renew_lease_per_probed_row(self) -> None:
+        # A full batch of in-mempool rows whose derived status matches the
+        # stored one makes no fenced write; each probe must refresh the lease
+        # in the write's place so slow RPCs cannot outlast the TTL mid-chunk.
+        txids = [f"{value:02x}" * 32 for value in range(1, 5)]
+        rows = []
+        for txid in txids:
+            row = pending_row(txid)
+            row["settlement_status"] = "broadcast_submitted"
+            rows.append(row)
+        ledger = FakeLedger(rows)
+        broadcaster = FakeBroadcaster(
+            {txid: BroadcastAttempt(txid, BROADCAST, submitted=False) for txid in txids},
+        )
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once(chunk_size=2)
+
+        self.assertEqual(result.scanned_count, 4)
+        self.assertEqual(result.updated_count, 0)
+        self.assertEqual(len(broadcaster.fees), 4)
+        self.assertEqual(ledger.updates, [])
+        self.assertEqual(ledger.lease_renewals, 4)  # one per unchanged probe
+
+    def test_transition_write_needs_no_extra_renewal(self) -> None:
+        unchanged_txid = "aa" * 32
+        transition_txid = "bb" * 32
+        unchanged = pending_row(unchanged_txid)
+        unchanged["settlement_status"] = "broadcast_submitted"
+        ledger = FakeLedger([unchanged, pending_row(transition_txid)])
+        broadcaster = FakeBroadcaster(
+            {
+                unchanged_txid: BroadcastAttempt(unchanged_txid, BROADCAST, submitted=False),
+                transition_txid: BroadcastAttempt(transition_txid, CONFIRMED, submitted=False),
+            },
+        )
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once(chunk_size=2)
+
+        self.assertEqual(result.updated_count, 1)
+        self.assertEqual(
+            ledger.updates,
+            [{"fanout_txid": transition_txid, "settlement_status": "confirmed"}],
+        )
+        # Only the unchanged probe renews; the transition row's fenced write
+        # refreshes the lease itself and the pass end adds nothing.
+        self.assertEqual(ledger.lease_renewals, 1)
+
+    def test_empty_scan_renews_lease_without_probes(self) -> None:
+        ledger = FakeLedger([])
+        broadcaster = FakeBroadcaster({})
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once()
+
+        self.assertEqual(result.scanned_count, 0)
+        self.assertEqual(broadcaster.tip_probes, 0)
+        self.assertEqual(ledger.lease_renewals, 1)
+
+    def test_yielded_pass_without_writes_still_renews_lease(self) -> None:
+        ledger = FakeLedger([pending_row()])
+        daemon = CtvFanoutBroadcastDaemon(ledger, FakeBroadcaster({}), fee_sats=0)
+
+        result = daemon.run_once(tip_refresh_pending=lambda: True)
+
+        self.assertTrue(result.yielded_to_tip_refresh)
+        self.assertEqual(result.scanned_count, 0)
+        self.assertEqual(ledger.lease_renewals, 1)
+
+    def test_mid_pass_yield_after_immature_skips_still_renews_lease(self) -> None:
+        # Repeated tip-refresh yields across write-free passes must not let
+        # the writer lease lapse now that immature rows skip their no-op
+        # (lease-refreshing) status rewrites.
+        txids = ["aa" * 32, "bb" * 32]
+        ledger = FakeLedger([awaiting_maturity_row(txid) for txid in txids])
+        broadcaster = FakeBroadcaster({}, tip=1099)
+        refresh_pending = False
+
+        def flag_refresh() -> None:
+            nonlocal refresh_pending
+            refresh_pending = True
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once(
+            chunk_size=1,
+            progress_callback=flag_refresh,
+            tip_refresh_pending=lambda: refresh_pending,
+        )
+
+        self.assertTrue(result.yielded_to_tip_refresh)
+        self.assertEqual(result.scanned_count, 1)
+        self.assertEqual(ledger.updates, [])
+        self.assertEqual(ledger.attempts, [])
+        self.assertEqual(ledger.lease_renewals, 1)
+
+    def test_ledger_without_lease_renewal_support_is_tolerated(self) -> None:
+        result = CtvFanoutBroadcastDaemon(
+            SingleWriterShareLedger(), FakeBroadcaster({}), fee_sats=0
+        ).run_once()
+
+        self.assertEqual(result.scanned_count, 0)
 
     def test_progress_callback_covers_skipped_due_updated_submitted_and_failed_rows(self) -> None:
         skipped_txid = "10" * 32

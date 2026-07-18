@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 
 from lab.prism.prism_coordinator import (
@@ -98,6 +99,47 @@ class RepresentativeIndependentRefreshTests(unittest.TestCase):
 
     def test_target_disconnect_after_ready_construction_before_fanout(self) -> None:
         self._run_ready_disconnect_race("before_fanout")
+
+    def test_reselected_poll_start_target_keeps_expected_job_snapshot(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        stable = client(1)
+        reselected = client(2)
+        server.clients = {stable, reselected}
+        original_fetch = server.fetch_qbit_tip_template_snapshot
+
+        def make_target_temporarily_ineligible() -> object:
+            snapshot = original_fetch()
+            reselected.authorized = False
+            return snapshot
+
+        def restore_target(_tip_hash: str) -> bool:
+            reselected.authorized = True
+            return True
+
+        captured_expected: dict[object, object] = {}
+
+        def capture_fanout(
+            clients: list[object],
+            *_args: object,
+            expected_active_jobs: dict[object, object],
+            **_kwargs: object,
+        ) -> tuple[int, float, float, int]:
+            captured_expected.update(expected_active_jobs)
+            delivered = time.monotonic()
+            return len(clients), delivered, delivered, 0
+
+        server.fetch_qbit_tip_template_snapshot = make_target_temporarily_ineligible  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_tip = restore_target  # type: ignore[method-assign]
+        server._fanout_prepared_tip_refresh = capture_fanout  # type: ignore[method-assign]
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 2)
+        self.assertIn(stable, captured_expected)
+        self.assertIn(reselected, captured_expected)
 
     def test_ready_bundle_builds_without_clients_or_worker_identity(self) -> None:
         server, _rpc = coordinator()

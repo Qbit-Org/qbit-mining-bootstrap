@@ -31,7 +31,7 @@ import urllib.request
 import uuid
 from types import SimpleNamespace
 from dataclasses import dataclass, field, replace as dataclass_replace
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Context, Decimal, InvalidOperation, ROUND_CEILING, getcontext, localcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -78,13 +78,17 @@ TESTNET_QBIT_CHAINS = {"testnet", "testnet3", "testnet4", "signet"}
 DEFAULT_PRISM_BLOCKPOLL_SECONDS = 2.0
 DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS = 5.0
 DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS = 10.0
+DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS = 60.0
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
 DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS = 20.0
-DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS = 0
+DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS = 384
 DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME = 0
+DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS = 128
+DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS = 30.0
+DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS = 30.0
 DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS = 1.0
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES = 4_096
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
@@ -99,6 +103,9 @@ DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
 DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
 DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
+DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS = 60.0
+DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS = 0.25
+PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
@@ -158,6 +165,16 @@ PRISM_CTV_BROADCASTER_SECONDS_BUCKETS = (
 PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS = (1, 2, 5, 10, 25, 50, 100)
 PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
+PRISM_TIP_REFRESH_BUILD_PHASES = (
+    "ledger_snapshot",
+    "payout_state_derivation",
+    "ctv_manifest_construction",
+    "coinbase_bundle_construction",
+    "signing_verification",
+    "serialization_copy",
+    "singleflight_wait",
+)
+PRISM_BUILDER_PHASE_METRICS_PREFIX = "qbit-prism-build-phase-metrics "
 PRISM_PAYOUT_DELIVERY_GENERATIONS = ("current", "stale", "future")
 DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES = 8
 PRISM_JOB_BUILD_PHASES = (
@@ -165,7 +182,15 @@ PRISM_JOB_BUILD_PHASES = (
     "template",
     "merkle",
     "ledger",
+    "payout_artifact",
+    "payout",
+    "ctv",
+    "input_serialization",
+    "worker",
+    "output_serialization",
+    "assembly",
     "bundle",
+    "preparation_wait",
     "executor_queue",
     "client_lock",
     "payout_gate",
@@ -180,6 +205,9 @@ PRISM_TIP_REFRESH_CANCELLATION_STAGES = (
     "client_lock",
     "payout_gate",
 )
+PRISM_DELIVERY_PRIORITY_INITIAL = 0
+PRISM_DELIVERY_PRIORITY_NEW_TIP = 1
+PRISM_DELIVERY_PRIORITY_SAME_TIP = 2
 PRISM_EVICTED_JOB_CLASSES = ("same_tip", "stale_grace")
 PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = ("accepted_same_tip", "credited_stale_grace")
 PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection",)
@@ -462,6 +490,26 @@ def validate_prism_production_gate() -> None:
     if env_optional("PRISM_LEDGER_WRITER_SESSION_TOKEN") is not None:
         raise SystemExit("production mode requires managed ledger session tokens; unset PRISM_LEDGER_WRITER_SESSION_TOKEN")
 
+    if env_nonnegative_int(
+        "PRISM_STRATUM_MAX_CONNECTIONS",
+        DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+    ) <= 0:
+        raise SystemExit(
+            "production mode requires a positive PRISM_STRATUM_MAX_CONNECTIONS"
+        )
+    env_positive_int(
+        "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
+        DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
+    )
+    if env_nonnegative_float(
+        "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS",
+        DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS,
+    ) <= 0:
+        raise SystemExit(
+            "production mode requires a positive "
+            "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS"
+        )
+
     require_production_env("QBIT_RPC_USER")
     qbit_rpc_password = require_production_env("QBIT_RPC_PASSWORD")
     if qbit_rpc_password == "change-this":
@@ -725,6 +773,14 @@ def qbit_template_fingerprint(template: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def canonical_json_text(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(canonical_json_text(value).encode()).hexdigest()
+
+
 class JsonRpc:
     def __init__(self, *, host: str, port: int, user: str, password: str):
         self.host = host
@@ -856,6 +912,10 @@ class PrismJobContext:
     template_fingerprint: str | None = None
     template_generation: int = 0
     payout_state_generation: int = 0
+    payout_artifact_generation: int = 0
+    connection_id: int = 0
+    authorization_generation: int = 0
+    difficulty_generation: int = 0
 
 
 @dataclass
@@ -951,6 +1011,50 @@ class RetainedCollectionRefresh:
 
 
 @dataclass(frozen=True)
+class PayoutStateArtifact:
+    """Immutable ledger-backed inputs published with one payout generation."""
+
+    generation: int
+    source_generation: int
+    prior_balances_json: str = field(repr=False)
+    prior_balances_sha256: str
+    prepared_monotonic: float
+
+    def prior_balances(self) -> list[dict[str, object]]:
+        value = json.loads(self.prior_balances_json)
+        if not isinstance(value, list):
+            raise RuntimeError("published payout artifact is not a balance list")
+        return value
+
+
+@dataclass(frozen=True)
+class JobBuildKey:
+    """Every immutable input that can affect one constructed mining job."""
+
+    best_tip_hash: str
+    previous_block_hash: str
+    template_fingerprint: str
+    template_generation: int
+    payout_state_generation: int
+    payout_artifact_sha256: str
+    mode: str
+    collection_identity: tuple[str, str] | None
+    block_height: int
+    coinbase_value_sats: int
+    network_difficulty: int
+    issued_at_ms: int
+    payout_policy_sha256: str
+    ctv_settlement_sha256: str | None
+    witness_merkle_sha256: str
+    transaction_set_sha256: str
+    coinbase_suffix_hex: str
+    signing_key_sha256: str
+    ledger_signing_key_sha256: str
+    numeric_context_sha256: str
+    share_snapshot_sha256: str = ""
+
+
+@dataclass(frozen=True)
 class CachedJobBundle:
     """One heavy job build (ledger snapshot + signed manifest + base job)
     shared across every client on the same template.
@@ -974,10 +1078,12 @@ class CachedJobBundle:
     built_monotonic: float
     template_generation: int = 0
     payout_state_generation: int = 0
+    payout_artifact_generation: int = 0
     # Collection coinbases commit a synthetic share to this exact payout
     # identity. Ready bundles have no worker-specific inputs and keep this
     # unset, which makes accidental cross-worker stamping fail closed.
     collection_identity: tuple[str, str] | None = None
+    build_key: JobBuildKey | None = None
 
 
 @dataclass(frozen=True)
@@ -1004,6 +1110,7 @@ class TipRefreshValidationToken:
     template_generation: int
     payout_state_generation: int
     observation_sequence: int
+    build_key: JobBuildKey
     snapshot: QbitTipTemplateSnapshot = field(repr=False)
 
 
@@ -1017,6 +1124,11 @@ class PayoutStateCandidate:
     cause: str
     invalidated_monotonic: float
     prepared_monotonic: float
+    ledger_artifact: PayoutLedgerArtifact | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -1027,6 +1139,20 @@ class PublishedPayoutState:
     source_generation: int
     source_tip_hash: str | None
     published_monotonic: float
+    artifact: PayoutStateArtifact | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class PayoutLedgerArtifact:
+    """Immutable ledger input prepared independently of a qbit template."""
+
+    generation: int
+    payout_state_generation: int
+    network_difficulty: int
+    accepted_share_count: int
+    shares_json: tuple[dict[str, object], ...] = field(repr=False)
+    prior_balances: tuple[dict[str, object], ...] = field(repr=False)
+    prepared_monotonic: float
 
 
 @dataclass
@@ -1045,6 +1171,138 @@ class _PayoutDeliveryAdmission:
         if not self.admitted:
             raise RuntimeError("payout delivery completed without admission")
         self.delivered = True
+
+
+@dataclass(eq=False)
+class PendingInitialJob:
+    client: ClientState
+    authorization_generation: int
+    worker: WorkerIdentity
+    requested_monotonic: float
+    deadline_monotonic: float | None
+    connection_id: int | None = None
+    difficulty_generation: int | None = None
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    future: Future[bool] | None = None
+    predecessor: Future[bool] | None = None
+
+
+class _DeliveryQueueFull(RuntimeError):
+    """The bounded delivery executor cannot admit another task."""
+
+
+class _JobBuildCancelled(RuntimeError):
+    """A bundle waiter became obsolete before it acquired preparation."""
+
+
+class _BoundedPriorityExecutor:
+    """Small Future-compatible executor with bounded, priority-ordered work."""
+
+    def __init__(self, *, max_workers: int, max_queue_size: int) -> None:
+        self.max_workers = max_workers
+        self.max_queue_size = max_queue_size
+        self._queue: queue.PriorityQueue[tuple[object, ...]] = queue.PriorityQueue(
+            maxsize=max_queue_size
+        )
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._active_workers = 0
+        self._shutdown = False
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"prism-job-delivery-{index + 1}",
+                daemon=True,
+            )
+            for index in range(max_workers)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def submit(
+        self,
+        function: Callable[..., Any],
+        /,
+        *args: object,
+        priority: int = PRISM_DELIVERY_PRIORITY_SAME_TIP,
+        **kwargs: object,
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("delivery executor is shut down")
+            self._sequence += 1
+            item = (
+                int(priority),
+                self._sequence,
+                future,
+                function,
+                args,
+                kwargs,
+            )
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full as exc:
+                raise _DeliveryQueueFull("delivery executor queue is full") from exc
+        return future
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            _, _, future, function, args, kwargs = item
+            if function is None:
+                self._queue.task_done()
+                return
+            assert isinstance(future, Future)
+            if not future.set_running_or_notify_cancel():
+                self._queue.task_done()
+                continue
+            with self._lock:
+                self._active_workers += 1
+            try:
+                result = function(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+            finally:
+                with self._lock:
+                    self._active_workers -= 1
+                self._queue.task_done()
+
+    def stats(self) -> tuple[int, int]:
+        with self._lock:
+            return self._queue.qsize(), self._active_workers
+
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
+        with self._lock:
+            if self._shutdown:
+                threads = list(self._threads)
+                already_shutdown = True
+            else:
+                self._shutdown = True
+                threads = list(self._threads)
+                already_shutdown = False
+        if already_shutdown:
+            if wait:
+                for thread in threads:
+                    thread.join()
+            return
+        if cancel_futures:
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                future = item[2]
+                if isinstance(future, Future):
+                    future.cancel()
+                self._queue.task_done()
+        for index in range(len(threads)):
+            self._queue.put((math.inf, index, None, None, (), {}))
+        if wait:
+            for thread in threads:
+                thread.join()
 
 
 class _FanoutCancellation:
@@ -1088,6 +1346,16 @@ class _FanoutCancellation:
         with self._condition:
             while self._active_deliveries:
                 self._condition.wait()
+
+
+@dataclass
+class _JobBundleBuildControl:
+    key: tuple[object, ...]
+    previousblockhash: str
+    payout_state_generation: int
+    payout_artifact_generation: int
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    process: subprocess.Popen[str] | None = None
 
 
 class _PayoutStateDeliveryGate:
@@ -1266,6 +1534,14 @@ class _PayoutStateDeliveryGate:
             yield
 
 
+@dataclass
+class _SharedBundlePreparationFlight:
+    event: threading.Event = field(default_factory=threading.Event)
+    result: CachedJobBundle | None = None
+    error: BaseException | None = None
+    waiters: int = 0
+
+
 @dataclass(eq=False)
 class ClientState:
     sock: socket.socket
@@ -1274,6 +1550,9 @@ class ClientState:
     extranonce1_hex: str
     subscribed: bool = False
     authorized: bool = False
+    authorization_generation: int = 0
+    difficulty_generation: int = 0
+    authorized_monotonic: float | None = None
     username: str = ""
     worker: WorkerIdentity | None = None
     version_mask: int = 0
@@ -1316,6 +1595,7 @@ class ClientState:
     # common maybe_send_job path while retaining the same serialization scope.
     job_update_lock: threading.RLock = field(default_factory=threading.RLock)
     send_lock: threading.Lock = field(default_factory=threading.Lock)
+    handler_thread_registered: bool = False
 
     def send(self, payload: dict[str, object]) -> None:
         data = json.dumps(payload).encode() + b"\n"
@@ -1613,8 +1893,98 @@ class TemplateRefreshBlocked(RuntimeError):
     """A live template was fetched, but safe work could not be issued."""
 
 
+class TemplateRefreshSuperseded(TemplateRefreshBlocked):
+    """Concurrent tip/payout progress invalidated this refresh attempt.
+
+    Raised only for coordination races that a scheduled retry resolves on its
+    own: the tip advanced mid-refresh, the payout-state generation moved, or a
+    newer observation superseded the prepared work. Unlike its parent, this
+    subclass never arms the template-refresh failure budget -- a genuine
+    RPC/build/trust failure must raise plain TemplateRefreshBlocked so
+    sustained unhealthiness still takes the budgeted restart path.
+    """
+
+
+class JobBuildCancelled(TemplateRefreshBlocked):
+    """An immutable build was cancelled or timed out."""
+
+
+class JobBuildSuperseded(JobBuildCancelled, TemplateRefreshSuperseded):
+    """A coordination race cooperatively cancelled immutable construction."""
+
+
+class _JobBuildCancellation:
+    def __init__(self, *, timeout_seconds: float) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self.started_monotonic = time.monotonic()
+        self.deadline_monotonic = self.started_monotonic + timeout_seconds
+        self.cancelled_monotonic: float | None = None
+        self.reason: str | None = None
+
+    def cancel(self, reason: str) -> bool:
+        with self._lock:
+            if self._event.is_set():
+                return False
+            self.reason = reason
+            self.cancelled_monotonic = time.monotonic()
+            self._event.set()
+            return True
+
+    def is_set(self) -> bool:
+        if self._event.is_set():
+            return True
+        if time.monotonic() >= self.deadline_monotonic:
+            self.cancel("timeout")
+            return True
+        return False
+
+    def raise_if_cancelled(self, phase: str) -> None:
+        if self.is_set():
+            reason = self.reason or "cancelled"
+            if reason == "timeout":
+                raise JobBuildCancelled(
+                    f"job build timeout at {phase}; immediate retry scheduled"
+                )
+            raise JobBuildSuperseded(
+                f"job build {reason} at {phase}; immediate retry scheduled"
+            )
+
+
+@dataclass
+class _JobBuildRequest:
+    key: JobBuildKey
+    cache_key: tuple[object, ...]
+    equivalence_key: tuple[object, ...]
+    artifacts: CachedTemplateArtifacts
+    template_json: str
+    transaction_hexes: tuple[str, ...]
+    witness_merkle_leaves_hex: tuple[str, ...]
+    worker: WorkerIdentity | None
+    mode: str
+    payout_artifact: PayoutStateArtifact
+    payout_ledger_artifact: PayoutLedgerArtifact | None
+    payout_policy_json: str
+    ctv_settlement_json: str | None
+    decimal_context: Context = field(repr=False)
+    cancellation: _JobBuildCancellation
+    promise: Future[CachedJobBundle] = field(default_factory=Future)
+    requested_monotonic: float = field(default_factory=time.monotonic)
+    superseded_monotonic: float | None = None
+
+
+@dataclass(eq=False)
+class _JobBuildFlight:
+    request: _JobBuildRequest
+    future: Future[CachedJobBundle] | None = None
+
+
 class _PayoutStatePublicationBlocked(TemplateRefreshBlocked):
     """Job construction is waiting for a prepared payout publication."""
+
+
+class _JobBundleBuildSuperseded(TemplateRefreshBlocked):
+    """A newer tip or payout generation canceled this deterministic build."""
 
 
 class CollectionIdentityUnavailable(TemplateRefreshBlocked):
@@ -1623,6 +1993,15 @@ class CollectionIdentityUnavailable(TemplateRefreshBlocked):
 
 class _JobBuildFailed(RuntimeError):
     """Internal signal used to distinguish a skipped build from a no-op."""
+
+
+class _BundlePreparationSuperseded(TemplateRefreshSuperseded):
+    """The exact work identity lost to a newer tip/template observation.
+
+    Subclasses TemplateRefreshSuperseded: losing the shared-bundle build race
+    to a newer tip/template observation is coordination churn, so it escapes
+    the poll without arming the template-refresh failure budget.
+    """
 
 
 def parse_worker_username(username: str) -> tuple[str, str | None]:
@@ -1693,6 +2072,14 @@ class PrismCoordinator:
                 "PRISM_TIP_REFRESH_MAX_WORKERS cannot exceed "
                 f"{DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS}"
             )
+        self.job_build_timeout_seconds = env_positive_float(
+            "PRISM_JOB_BUILD_TIMEOUT_SECONDS",
+            DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS,
+        )
+        self.job_build_cancel_grace_seconds = env_nonnegative_float(
+            "PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS",
+            DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS,
+        )
         self.vardiff_idle_sweep_seconds = env_nonnegative_float(
             "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS",
             DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS,
@@ -1709,6 +2096,10 @@ class PrismCoordinator:
         self.job_bundle_cache_seconds = env_nonnegative_float(
             "PRISM_JOB_BUNDLE_CACHE_SECONDS",
             DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS,
+        )
+        self.bundle_build_timeout_seconds = env_positive_float(
+            "PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS",
+            DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
         )
         self.template_cache_seconds = env_nonnegative_float(
             "PRISM_TEMPLATE_CACHE_SECONDS",
@@ -1737,9 +2128,9 @@ class PrismCoordinator:
             "PRISM_STRATUM_SEND_TIMEOUT_SECONDS",
             DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS,
         )
-        # Zero preserves the historical unlimited behavior. Operators can set
-        # positive admission limits after sizing them for their miner/proxy
-        # topology instead of inheriting an arbitrary coordinator default.
+        # Zero remains an explicit unlimited option for focused local/regtest
+        # use. Deployments default to a conservative ceiling above PRISM's
+        # normal 200-250 connection population.
         self.stratum_max_connections = env_nonnegative_int(
             "PRISM_STRATUM_MAX_CONNECTIONS",
             DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
@@ -1747,6 +2138,26 @@ class PrismCoordinator:
         self.stratum_max_connections_per_username = env_nonnegative_int(
             "PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME",
             DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME,
+        )
+        self.stratum_max_pending_initial_jobs = env_positive_int(
+            "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
+            DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
+        )
+        if (
+            self.stratum_max_connections > 0
+            and self.stratum_max_pending_initial_jobs > self.stratum_max_connections
+        ):
+            raise SystemExit(
+                "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS cannot exceed "
+                "PRISM_STRATUM_MAX_CONNECTIONS"
+            )
+        self.stratum_initial_job_timeout_seconds = env_nonnegative_float(
+            "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS",
+            DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS,
+        )
+        self.mining_health_startup_grace_seconds = env_nonnegative_float(
+            "PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS",
+            DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,
         )
         validate_same_tip_job_retention_limits(
             retention_seconds=self.same_tip_job_retention_seconds,
@@ -1886,8 +2297,18 @@ class PrismCoordinator:
         self.lock = threading.RLock()
         self.clients: set[ClientState] = set()
         self.connection_limit_rejection_counts = {"global": 0, "username": 0}
+        self.peak_active_connection_count = 0
+        self.handler_thread_count = 0
         self.accept_resource_exhaustion_count = 0
         self.connection_setup_failure_count = 0
+        self.pending_initial_jobs: dict[ClientState, PendingInitialJob] = {}
+        self.initial_job_queue_rejection_count = 0
+        self.initial_job_timeout_count = 0
+        self.initial_job_cancelled_count = 0
+        self.initial_job_coalesced_count = 0
+        self.last_initial_job_delivery_monotonic: float | None = None
+        self._mining_overload_started_monotonic: float | None = None
+        self._mining_delivery_failure_started_monotonic: float | None = None
         self._p2mr_address_cache_lock = threading.Lock()
         self._p2mr_address_cache: OrderedDict[
             str, tuple[float, tuple[str, str]]
@@ -2019,7 +2440,7 @@ class PrismCoordinator:
         self.tip_template_snapshot: QbitTipTemplateSnapshot | None = None
         self._tip_refresh_lock = threading.Lock()
         self._tip_refresh_executor_lock = threading.Lock()
-        self._tip_refresh_executor: ThreadPoolExecutor | None = None
+        self._tip_refresh_executor: _BoundedPriorityExecutor | None = None
         self._tip_refresh_executor_shutdown = False
         self._tip_refresh_pending_event = threading.Event()
         self._tip_refresh_pending_counter = 0
@@ -2394,8 +2815,35 @@ class PrismCoordinator:
     def _ensure_job_cache_state(self) -> None:
         if not hasattr(self, "_job_cache_lock"):
             self._job_cache_lock = threading.Lock()
+        if not hasattr(self, "_active_job_bundle_builds"):
+            self._active_job_bundle_builds: dict[
+                tuple[object, ...], _JobBundleBuildControl
+            ] = {}
         if not hasattr(self, "_job_build_lock"):
+            # Compatibility seam for embedders/tests. Expensive construction is
+            # coordinated by the bounded latest-wins scheduler below, not held
+            # under this lock.
             self._job_build_lock = threading.Lock()
+        if not hasattr(self, "_job_build_scheduler_lock"):
+            self._job_build_scheduler_lock = threading.RLock()
+        if not hasattr(self, "_job_build_executor"):
+            self._job_build_executor: ThreadPoolExecutor | None = None
+        if not hasattr(self, "_job_build_executor_shutdown"):
+            self._job_build_executor_shutdown = False
+        if not hasattr(self, "_job_build_active"):
+            self._job_build_active: _JobBuildFlight | None = None
+        if not hasattr(self, "_job_build_retiring"):
+            self._job_build_retiring: _JobBuildFlight | None = None
+        if not hasattr(self, "_job_build_pending"):
+            self._job_build_pending: _JobBuildRequest | None = None
+        if not hasattr(self, "_job_build_issued_at_ms"):
+            self._job_build_issued_at_ms: OrderedDict[int, int] = OrderedDict()
+        if not hasattr(self, "job_build_timeout_seconds"):
+            self.job_build_timeout_seconds = DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS
+        if not hasattr(self, "job_build_cancel_grace_seconds"):
+            self.job_build_cancel_grace_seconds = (
+                DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS
+            )
         if not hasattr(self, "_template_artifacts"):
             self._template_artifacts: CachedTemplateArtifacts | None = None
         if not hasattr(self, "_template_artifact_generation"):
@@ -2427,6 +2875,20 @@ class PrismCoordinator:
                 source_tip_hash=None,
                 published_monotonic=time.monotonic(),
             )
+        if not hasattr(self, "_payout_ledger_artifact"):
+            self._payout_ledger_artifact: PayoutLedgerArtifact | None = None
+        if not hasattr(self, "_payout_ledger_artifact_generation"):
+            self._payout_ledger_artifact_generation = 0
+        if not hasattr(self, "_payout_artifact_executor_lock"):
+            self._payout_artifact_executor_lock = threading.Lock()
+        if not hasattr(self, "_payout_artifact_executor"):
+            self._payout_artifact_executor: ThreadPoolExecutor | None = None
+        if not hasattr(self, "_payout_artifact_future"):
+            self._payout_artifact_future: Future[None] | None = None
+        if not hasattr(self, "_payout_artifact_requested"):
+            self._payout_artifact_requested: tuple[int, int] | None = None
+        if not hasattr(self, "_payout_artifact_executor_shutdown"):
+            self._payout_artifact_executor_shutdown = False
         if not hasattr(self, "_payout_state_delivery_gate"):
             # Orders reconciliation mutations against final job-delivery
             # admission while preserving parallel sends to different miners.
@@ -2477,6 +2939,33 @@ class PrismCoordinator:
             self.job_build_count = 0
         if not hasattr(self, "job_build_phase_seconds"):
             self.job_build_phase_seconds = {phase: 0.0 for phase in PRISM_JOB_BUILD_PHASES}
+        if not hasattr(self, "job_build_scheduler_counts"):
+            self.job_build_scheduler_counts = {
+                "requests": 0,
+                "starts": 0,
+                "completions": 0,
+                "supersessions": 0,
+                "obsolete_results": 0,
+            }
+        if not hasattr(self, "job_build_cancellation_seconds"):
+            self.job_build_cancellation_seconds = {
+                "sum": 0.0,
+                "count": 0,
+            }
+        if not hasattr(self, "job_build_replacement_start_seconds"):
+            self.job_build_replacement_start_seconds = {
+                "sum": 0.0,
+                "count": 0,
+            }
+        if not hasattr(self, "job_build_worker_counts"):
+            self.job_build_worker_counts = {
+                "starts": 0,
+                "terminations": 0,
+                "crashes": 0,
+                "restarts": 0,
+            }
+        if not hasattr(self, "_job_build_worker_restart_pending"):
+            self._job_build_worker_restart_pending = False
         if not hasattr(self, "_health_snapshot"):
             self._health_snapshot: dict[str, object] | None = None
         if not hasattr(self, "_health_snapshot_monotonic"):
@@ -2485,6 +2974,29 @@ class PrismCoordinator:
             self._health_refresh_loop_running = False
         if not hasattr(self, "health_snapshot_refresh_failure_count"):
             self.health_snapshot_refresh_failure_count = 0
+        if not hasattr(self, "_bundle_preparation_lock"):
+            self._bundle_preparation_lock = threading.Lock()
+        if not hasattr(self, "_bundle_preparation_flights"):
+            self._bundle_preparation_flights: dict[
+                tuple[object, ...], _SharedBundlePreparationFlight
+            ] = {}
+        if not hasattr(self, "shared_bundle_build_counts"):
+            self.shared_bundle_build_counts = {
+                outcome: 0
+                for outcome in ("started", "completed", "superseded", "failed")
+            }
+        if not hasattr(self, "shared_bundle_preparation_seconds_sum"):
+            self.shared_bundle_preparation_seconds_sum = 0.0
+        if not hasattr(self, "shared_bundle_preparation_count"):
+            self.shared_bundle_preparation_count = 0
+        if not hasattr(self, "shared_bundle_preparation_waiters"):
+            self.shared_bundle_preparation_waiters = 0
+        if not hasattr(self, "_prepared_ready_bundle"):
+            self._prepared_ready_bundle: CachedJobBundle | None = None
+        if not hasattr(self, "_prepared_ready_snapshot"):
+            self._prepared_ready_snapshot: QbitTipTemplateSnapshot | None = None
+        if not hasattr(self, "job_preparation_pending"):
+            self.job_preparation_pending = False
 
     def _job_build_phases(self) -> dict[str, float]:
         """Per-thread scratch dict of phase timings for the current build."""
@@ -2495,16 +3007,579 @@ class PrismCoordinator:
             self._job_build_phase_local.phases = phases
         return phases
 
+    def _cancel_obsolete_job_bundle_builds(
+        self,
+        *,
+        current_tip: str | None = None,
+        payout_state_generation: int | None = None,
+    ) -> None:
+        """Cancel only builds proven obsolete by a newer exact generation."""
+        self._ensure_job_cache_state()
+        processes: list[subprocess.Popen[str]] = []
+        with self._job_cache_lock:
+            for control in self._active_job_bundle_builds.values():
+                obsolete = (
+                    current_tip is not None
+                    and control.previousblockhash != current_tip
+                ) or (
+                    payout_state_generation is not None
+                    and control.payout_state_generation
+                    != int(payout_state_generation)
+                )
+                if not obsolete or control.cancel_event.is_set():
+                    continue
+                control.cancel_event.set()
+                if control.process is not None:
+                    processes.append(control.process)
+        for process in processes:
+            if process.poll() is not None:
+                continue
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
+    def _register_job_bundle_process(
+        self,
+        control: _JobBundleBuildControl,
+        process: subprocess.Popen[str],
+    ) -> None:
+        terminate = False
+        with self._job_cache_lock:
+            if (
+                self._active_job_bundle_builds.get(control.key) is not control
+                or control.cancel_event.is_set()
+            ):
+                terminate = True
+            else:
+                control.process = process
+        if terminate and process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
+    def _build_payout_ledger_artifact(
+        self,
+        expected_payout_state_generation: int,
+        artifact_payout_state_generation: int,
+        network_difficulty: int,
+    ) -> PayoutLedgerArtifact | None:
+        """Build a stable ledger snapshot without publishing it.
+
+        Accepted-share counts fence both sides of the snapshot. If a writer
+        commits concurrently, this attempt is discarded rather than publishing
+        an artifact with an ambiguous cutoff; the normal inline path remains
+        the fail-closed fallback.
+        """
+        self._ensure_job_cache_state()
+        ledger_started = time.monotonic()
+        try:
+            accepted_before, _ = self.accepted_share_stats()
+            with self._payout_state_prepare_lock:
+                with self._job_cache_lock:
+                    if (
+                        expected_payout_state_generation
+                        != self._payout_state_generation
+                    ):
+                        return None
+                snapshot_window_weight = (
+                    PRISM_REWARD_WINDOW_MULTIPLIER
+                    * PRISM_SNAPSHOT_WINDOW_MARGIN
+                    * int(network_difficulty)
+                )
+                records = list(
+                    self.ledger.snapshot_at_job_issue(
+                        now_ms(),
+                        window_weight=snapshot_window_weight,
+                    )
+                )
+                prior_balances = self.ledger.current_prior_balances()
+            accepted_after, _ = self.accepted_share_stats()
+        except Exception:
+            # Artifact preparation is speculative. The synchronous bundle path
+            # still owns errors when current work actually requires a snapshot.
+            return None
+        finally:
+            self._observe_tip_refresh_build_phase(
+                "ledger_snapshot",
+                time.monotonic() - ledger_started,
+            )
+        if accepted_before != accepted_after or not records:
+            return None
+        copy_started = time.monotonic()
+        shares_json = tuple(record.to_prism_json() for record in records)
+        frozen_balances = tuple(prior_balances)
+        self._observe_tip_refresh_build_phase(
+            "serialization_copy",
+            time.monotonic() - copy_started,
+        )
+        return PayoutLedgerArtifact(
+            generation=0,
+            payout_state_generation=artifact_payout_state_generation,
+            network_difficulty=int(network_difficulty),
+            accepted_share_count=accepted_after,
+            shares_json=shares_json,
+            prior_balances=frozen_balances,
+            prepared_monotonic=time.monotonic(),
+        )
+
+    def _prepare_payout_ledger_artifact(
+        self,
+        payout_state_generation: int,
+        network_difficulty: int,
+    ) -> None:
+        """Prepare and atomically publish an artifact for a current generation."""
+        artifact = self._build_payout_ledger_artifact(
+            payout_state_generation,
+            payout_state_generation,
+            network_difficulty,
+        )
+        if artifact is None:
+            return
+        with self._job_cache_lock:
+            if payout_state_generation != self._payout_state_generation:
+                return
+            self._payout_ledger_artifact_generation += 1
+            self._payout_ledger_artifact = dataclass_replace(
+                artifact,
+                generation=self._payout_ledger_artifact_generation,
+            )
+
+    def _payout_artifact_preparation_loop(self) -> None:
+        while True:
+            with self._payout_artifact_executor_lock:
+                request = self._payout_artifact_requested
+                self._payout_artifact_requested = None
+                if request is None:
+                    self._payout_artifact_future = None
+                    return
+            self._prepare_payout_ledger_artifact(*request)
+
+    def _schedule_payout_ledger_artifact_preparation(
+        self,
+        payout_state_generation: int,
+        network_difficulty: int,
+    ) -> None:
+        """Latest-generation-wins scheduling with one worker and one slot."""
+        self._ensure_job_cache_state()
+        with self._payout_artifact_executor_lock:
+            if self._payout_artifact_executor_shutdown:
+                return
+            self._payout_artifact_requested = (
+                int(payout_state_generation),
+                int(network_difficulty),
+            )
+            if self._payout_artifact_future is not None:
+                return
+            executor = self._payout_artifact_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="prism-payout-artifact",
+                )
+                self._payout_artifact_executor = executor
+            self._payout_artifact_future = executor.submit(
+                self._payout_artifact_preparation_loop
+            )
+
+    def _usable_payout_ledger_artifact(
+        self,
+        payout_state_generation: int,
+        network_difficulty: int,
+    ) -> PayoutLedgerArtifact | None:
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            artifact = self._payout_ledger_artifact
+            published_artifact = self._published_payout_state.artifact
+        if (
+            artifact is None
+            or artifact.payout_state_generation != payout_state_generation
+            or artifact.network_difficulty != int(network_difficulty)
+        ):
+            return None
+        if published_artifact is None:
+            try:
+                published_artifact = self._current_payout_state_artifact()
+            except Exception:
+                return None
+        try:
+            accepted_share_count, _ = self.accepted_share_stats()
+        except Exception:
+            return None
+        if accepted_share_count != artifact.accepted_share_count:
+            return None
+        balances_sha256 = canonical_json_sha256(artifact.prior_balances)
+        with self._job_cache_lock:
+            if (
+                self._payout_ledger_artifact is not artifact
+                or self._payout_state_generation != payout_state_generation
+                or self._published_payout_state.artifact is not published_artifact
+            ):
+                return None
+            if balances_sha256 != published_artifact.prior_balances_sha256:
+                # A candidate can carry a ledger snapshot prepared before its
+                # payout state is published. Never keep retrying that stale
+                # shortcut; the synchronous path will take a fresh snapshot.
+                self._payout_ledger_artifact = None
+                return None
+            return artifact
+
+    def shutdown_payout_artifact_executor(self) -> None:
+        self._ensure_job_cache_state()
+        with self._payout_artifact_executor_lock:
+            executor = self._payout_artifact_executor
+            self._payout_artifact_executor = None
+            self._payout_artifact_executor_shutdown = True
+            self._payout_artifact_requested = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def _job_build_checkpoint(
+        self,
+        phase: str,
+        cancellation: _JobBuildCancellation,
+    ) -> None:
+        """Cooperative boundary around coordinator and isolated-worker phases."""
+
+        cancellation.raise_if_cancelled(phase)
+
     def _record_job_cache_event(self, kind: str, *, hit: bool) -> None:
         self._ensure_job_cache_state()
         with self._job_cache_lock:
             counts = self.job_cache_hit_counts if hit else self.job_cache_miss_counts
             counts[kind] = int(counts.get(kind, 0)) + 1
 
+    def _prepare_payout_state_artifact(
+        self,
+        *,
+        generation: int,
+        source_generation: int,
+        cancellation: _JobBuildCancellation | None = None,
+    ) -> PayoutStateArtifact:
+        """Snapshot carry-forward balances once for a payout generation."""
+
+        started = time.monotonic()
+        if cancellation is not None:
+            cancellation.raise_if_cancelled("payout artifact read")
+        with self._payout_state_prepare_lock:
+            balances = self.ledger.current_prior_balances()
+        if cancellation is not None:
+            cancellation.raise_if_cancelled("payout artifact serialization")
+        balances_json = canonical_json_text(balances)
+        artifact = PayoutStateArtifact(
+            generation=generation,
+            source_generation=source_generation,
+            prior_balances_json=balances_json,
+            prior_balances_sha256=hashlib.sha256(balances_json.encode()).hexdigest(),
+            prepared_monotonic=time.monotonic(),
+        )
+        phases = self._job_build_phases()
+        phases["payout_artifact"] = phases.get("payout_artifact", 0.0) + (
+            time.monotonic() - started
+        )
+        return artifact
+
+    def _current_payout_state_artifact(
+        self,
+        cancellation: _JobBuildCancellation | None = None,
+    ) -> PayoutStateArtifact:
+        """Return the immutable artifact published for the current generation."""
+
+        self._ensure_job_cache_state()
+        while True:
+            with self._job_cache_lock:
+                if self._payout_state_publication_blocked:
+                    raise _PayoutStatePublicationBlocked(
+                        "payout state invalidation is pending publication"
+                    )
+                published = self._published_payout_state
+                if (
+                    published.generation == self._payout_state_generation
+                    and published.artifact is not None
+                    and published.artifact.generation == published.generation
+                ):
+                    return published.artifact
+                generation = self._payout_state_generation
+                source_generation = published.source_generation
+            artifact = self._prepare_payout_state_artifact(
+                generation=generation,
+                source_generation=source_generation,
+                cancellation=cancellation,
+            )
+            with self._job_cache_lock:
+                published = self._published_payout_state
+                if (
+                    self._payout_state_publication_blocked
+                    or self._payout_state_generation != generation
+                    or published.source_generation != source_generation
+                ):
+                    if cancellation is not None:
+                        cancellation.raise_if_cancelled(
+                            "payout artifact publication race"
+                        )
+                    continue
+                self._published_payout_state = dataclass_replace(
+                    published,
+                    artifact=artifact,
+                )
+                return artifact
+
+    def _job_build_executor_locked(self) -> ThreadPoolExecutor:
+        if self._job_build_executor_shutdown:
+            raise RuntimeError("job build executor is shut down")
+        executor = self._job_build_executor
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=PRISM_JOB_BUILD_EXECUTOR_WORKERS,
+                thread_name_prefix="prism-job-build",
+            )
+            self._job_build_executor = executor
+        return executor
+
+    def _start_job_build_locked(self, request: _JobBuildRequest) -> _JobBuildFlight:
+        executor = self._job_build_executor_locked()
+        flight = _JobBuildFlight(request=request)
+        self.job_build_scheduler_counts["starts"] += 1
+        self.shared_bundle_build_counts["started"] += 1
+        if request.superseded_monotonic is not None:
+            elapsed = max(0.0, time.monotonic() - request.superseded_monotonic)
+            self.job_build_replacement_start_seconds["sum"] += elapsed
+            self.job_build_replacement_start_seconds["count"] += 1
+        future = executor.submit(self._execute_job_build_request, request)
+        flight.future = future
+        return flight
+
+    def _arm_job_build_locked(self, flight: _JobBuildFlight) -> None:
+        future = flight.future
+        assert future is not None
+        future.add_done_callback(
+            lambda completed, build_flight=flight: self._job_build_done(
+                build_flight,
+                completed,
+            )
+        )
+
+    def _execute_job_build_request(
+        self,
+        request: _JobBuildRequest,
+    ) -> CachedJobBundle:
+        request.cancellation.raise_if_cancelled("start")
+        control = _JobBundleBuildControl(
+            key=request.equivalence_key,
+            previousblockhash=request.key.previous_block_hash,
+            payout_state_generation=request.key.payout_state_generation,
+            payout_artifact_generation=(
+                request.payout_ledger_artifact.generation
+                if request.payout_ledger_artifact is not None
+                else 0
+            ),
+        )
+        with self._job_cache_lock:
+            self._active_job_bundle_builds[control.key] = control
+        previous_control = getattr(
+            self._job_build_phase_local,
+            "bundle_build_control",
+            None,
+        )
+        self._job_build_phase_local.bundle_build_control = control
+        try:
+            with localcontext(request.decimal_context):
+                return self.build_shared_job_bundle(
+                    request.artifacts,
+                    request.worker,
+                    mode=request.mode,
+                    payout_state_generation=request.key.payout_state_generation,
+                    payout_artifact=request.payout_ledger_artifact,
+                    key=request.cache_key,
+                    build_request=request,
+                )
+        finally:
+            self._job_build_phase_local.bundle_build_control = previous_control
+            with self._job_cache_lock:
+                if self._active_job_bundle_builds.get(control.key) is control:
+                    self._active_job_bundle_builds.pop(control.key, None)
+                control.process = None
+
+    def _promote_pending_job_build_locked(self) -> None:
+        pending = self._job_build_pending
+        if pending is None:
+            return
+        if self._job_build_active is not None:
+            if self._job_build_retiring is not None:
+                return
+            active = self._job_build_active
+            active.request.cancellation.cancel("superseded")
+            self._job_build_retiring = active
+            self._job_build_active = None
+        self._job_build_pending = None
+        flight = self._start_job_build_locked(pending)
+        self._job_build_active = flight
+        self._arm_job_build_locked(flight)
+
+    def _job_build_done(
+        self,
+        flight: _JobBuildFlight,
+        future: Future[CachedJobBundle],
+    ) -> None:
+        request = flight.request
+        result: CachedJobBundle | None = None
+        error: BaseException | None = None
+        try:
+            result = future.result()
+            if request.cancellation.is_set():
+                if request.cancellation.reason == "timeout":
+                    error = JobBuildCancelled(
+                        "job build completed after its timeout"
+                    )
+                else:
+                    error = JobBuildSuperseded(
+                        "obsolete job build completed after cancellation"
+                    )
+        except BaseException as exc:  # noqa: BLE001 - delivered to all waiters
+            error = exc
+        with self._job_build_scheduler_lock:
+            self.job_build_scheduler_counts["completions"] += 1
+            self.shared_bundle_preparation_count += 1
+            self.shared_bundle_preparation_seconds_sum += max(
+                0.0,
+                time.monotonic() - request.cancellation.started_monotonic,
+            )
+            if request.cancellation.cancelled_monotonic is not None:
+                elapsed = max(
+                    0.0,
+                    time.monotonic() - request.cancellation.cancelled_monotonic,
+                )
+                self.job_build_cancellation_seconds["sum"] += elapsed
+                self.job_build_cancellation_seconds["count"] += 1
+            coordination_cancelled = (
+                request.cancellation.is_set()
+                and request.cancellation.reason != "timeout"
+            )
+            if error is not None and coordination_cancelled:
+                self.job_build_scheduler_counts["obsolete_results"] += 1
+                self.shared_bundle_build_counts["superseded"] += 1
+                with self._tip_refresh_metrics_lock:
+                    self.tip_refresh_superseded_results += 1
+            elif error is not None:
+                self.shared_bundle_build_counts["failed"] += 1
+            else:
+                self.shared_bundle_build_counts["completed"] += 1
+            if self._job_build_active is flight:
+                self._job_build_active = None
+            if self._job_build_retiring is flight:
+                self._job_build_retiring = None
+            self._promote_pending_job_build_locked()
+        if not request.promise.done():
+            if error is not None:
+                request.promise.set_exception(error)
+            else:
+                assert result is not None
+                request.promise.set_result(result)
+
+    def _request_job_build(self, request: _JobBuildRequest) -> Future[CachedJobBundle]:
+        self._ensure_job_cache_state()
+        with self._job_build_scheduler_lock:
+            self.job_build_scheduler_counts["requests"] += 1
+            active = self._job_build_active
+            if (
+                active is not None
+                and not active.request.cancellation.is_set()
+                and active.request.equivalence_key == request.equivalence_key
+            ):
+                return active.request.promise
+            pending = self._job_build_pending
+            if (
+                pending is not None
+                and not pending.cancellation.is_set()
+                and pending.equivalence_key == request.equivalence_key
+            ):
+                return pending.promise
+            if active is None:
+                if pending is not None:
+                    pending.cancellation.cancel("superseded while pending")
+                    if not pending.promise.done():
+                        pending.promise.set_exception(
+                            JobBuildSuperseded("pending job build was superseded")
+                        )
+                    self._job_build_pending = None
+                    self.job_build_scheduler_counts["supersessions"] += 1
+                flight = self._start_job_build_locked(request)
+                self._job_build_active = flight
+                self._arm_job_build_locked(flight)
+                return request.promise
+
+            now = time.monotonic()
+            if active.request.cancellation.cancel("superseded"):
+                active.request.superseded_monotonic = now
+                self.job_build_scheduler_counts["supersessions"] += 1
+            request.superseded_monotonic = now
+            if self._job_build_retiring is None:
+                self._job_build_retiring = active
+                flight = self._start_job_build_locked(request)
+                self._job_build_active = flight
+                self._arm_job_build_locked(flight)
+                return request.promise
+
+            previous_pending = self._job_build_pending
+            if previous_pending is not None:
+                previous_pending.cancellation.cancel("superseded while pending")
+                if not previous_pending.promise.done():
+                    previous_pending.promise.set_exception(
+                        JobBuildSuperseded("pending job build was superseded")
+                    )
+                self.job_build_scheduler_counts["supersessions"] += 1
+            self._job_build_pending = request
+            return request.promise
+
+    def _cancel_obsolete_job_builds(self, reason: str) -> None:
+        self._ensure_job_cache_state()
+        with self._job_build_scheduler_lock:
+            active = self._job_build_active
+            if active is not None and active.request.cancellation.cancel(reason):
+                active.request.superseded_monotonic = time.monotonic()
+                self.job_build_scheduler_counts["supersessions"] += 1
+            pending = self._job_build_pending
+            if pending is not None:
+                pending.cancellation.cancel(reason)
+                if not pending.promise.done():
+                    pending.promise.set_exception(
+                        JobBuildSuperseded(f"pending job build {reason}")
+                    )
+                self._job_build_pending = None
+                self.job_build_scheduler_counts["supersessions"] += 1
+
+    def shutdown_job_build_executor(self) -> None:
+        self._ensure_job_cache_state()
+        with self._job_build_scheduler_lock:
+            for flight in (self._job_build_active, self._job_build_retiring):
+                if flight is not None:
+                    flight.request.cancellation.cancel("shutdown")
+            pending = self._job_build_pending
+            if pending is not None:
+                pending.cancellation.cancel("shutdown")
+                if not pending.promise.done():
+                    pending.promise.set_exception(
+                        JobBuildSuperseded("pending job build cancelled by shutdown")
+                    )
+            self._job_build_pending = None
+            executor = self._job_build_executor
+            self._job_build_executor = None
+            self._job_build_executor_shutdown = True
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
     def _job_bundle_payout_state_current(self, bundle: CachedJobBundle) -> bool:
         self._ensure_job_cache_state()
         with self._job_cache_lock:
-            return bundle.payout_state_generation == self._payout_state_generation
+            artifact = self._published_payout_state.artifact
+            return bool(
+                bundle.payout_state_generation == self._payout_state_generation
+                and bundle.build_key is not None
+                and artifact is not None
+                and bundle.build_key.payout_artifact_sha256
+                == artifact.prior_balances_sha256
+            )
 
     def _observe_payout_state_seconds(
         self,
@@ -2632,11 +3707,23 @@ class PrismCoordinator:
             invalidated,
         )
 
-    @staticmethod
     def _prepared_payout_state_candidate(
+        self,
         captured: tuple[int, int, str | None, str, float],
     ) -> PayoutStateCandidate:
         base_generation, source_generation, source_tip, cause, invalidated = captured
+        ledger_artifact: PayoutLedgerArtifact | None = None
+        with self._job_cache_lock:
+            template_artifacts = self._template_artifacts
+        if (
+            template_artifacts is not None
+            and getattr(self, "_pool_ready_latched", False)
+        ):
+            ledger_artifact = self._build_payout_ledger_artifact(
+                base_generation,
+                base_generation + 1,
+                template_artifacts.network_difficulty,
+            )
         return PayoutStateCandidate(
             base_generation=base_generation,
             source_generation=source_generation,
@@ -2644,6 +3731,7 @@ class PrismCoordinator:
             cause=cause,
             invalidated_monotonic=invalidated,
             prepared_monotonic=time.monotonic(),
+            ledger_artifact=ledger_artifact,
         )
 
     def _current_payout_state_candidate(self) -> PayoutStateCandidate:
@@ -2715,6 +3803,10 @@ class PrismCoordinator:
         # cross the boundary while the ledger has newer unpublished state.
         if not self._payout_state_delivery_gate.block_delivery(mark_blocked):
             return
+        # Construction cancellation is independent of fanout activation. An
+        # obsolete builder may still be in its ledger or subprocess phase and
+        # must be preempted before a replacement request is submitted.
+        self._cancel_obsolete_job_builds("payout generation superseded")
         with self._job_cache_lock:
             next_payout_generation = self._payout_state_generation + 1
         with self.lock:
@@ -2729,6 +3821,13 @@ class PrismCoordinator:
         assert pending_source is not None
         self._mark_tip_refresh_pending(next_payout_generation)
         self._schedule_tip_refresh_retry()
+
+    def _payout_state_publication_fenced(self) -> bool:
+        """Report whether delivery is still blocked awaiting a publication."""
+
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            return self._payout_state_publication_blocked
 
     def _payout_source_requires_publication(
         self,
@@ -2763,6 +3862,25 @@ class PrismCoordinator:
                 ):
                     self._record_discarded_payout_candidate()
                     return None
+        try:
+            artifact = self._prepare_payout_state_artifact(
+                generation=candidate.base_generation + 1,
+                source_generation=candidate.source_generation,
+            )
+        except Exception:
+            # The delivery/cache fence remains closed. A later reconciliation
+            # retry can prepare and publish the artifact; no generation lacking
+            # immutable payout inputs is ever exposed to builders.
+            self._schedule_tip_refresh_retry()
+            raise
+        with self._job_cache_lock:
+            with self.lock:
+                if (
+                    candidate.source_generation != self._payout_state_source[0]
+                    or candidate.base_generation != self._payout_state_generation
+                ):
+                    self._record_discarded_payout_candidate()
+                    return None
         with self._payout_state_delivery_gate.publication():
             # publication() has already drained admitted old sends. Start the
             # critical-section timer only now; drain latency is delivery wait,
@@ -2778,11 +3896,25 @@ class PrismCoordinator:
                     ):
                         self._payout_state_generation += 1
                         published_generation = self._payout_state_generation
+                        prepared_artifact = candidate.ledger_artifact
+                        if (
+                            prepared_artifact is not None
+                            and prepared_artifact.payout_state_generation
+                            == published_generation
+                        ):
+                            self._payout_ledger_artifact_generation += 1
+                            self._payout_ledger_artifact = dataclass_replace(
+                                prepared_artifact,
+                                generation=self._payout_ledger_artifact_generation,
+                            )
+                        else:
+                            self._payout_ledger_artifact = None
                         self._published_payout_state = PublishedPayoutState(
                             generation=published_generation,
                             source_generation=candidate.source_generation,
                             source_tip_hash=candidate.source_tip_hash,
                             published_monotonic=publish_started,
+                            artifact=artifact,
                         )
                         self._payout_state_publication_blocked = False
                         self._job_bundle_cache.clear()
@@ -2817,11 +3949,30 @@ class PrismCoordinator:
         if published_generation is None:
             self._record_discarded_payout_candidate()
             return None
+        self._cancel_obsolete_job_bundle_builds(
+            payout_state_generation=published_generation
+        )
         if active_to_cancel is not None:
             active_to_cancel.cancel()
+        self._cancel_obsolete_job_builds("payout generation published")
         if schedule_retry:
             self._mark_tip_refresh_pending(published_generation)
             self._schedule_tip_refresh_retry()
+        with self._job_cache_lock:
+            current_artifacts = self._template_artifacts
+        published_artifact_usable = (
+            self._usable_payout_ledger_artifact(
+                published_generation,
+                current_artifacts.network_difficulty,
+            )
+            if current_artifacts is not None
+            else None
+        )
+        if current_artifacts is not None and published_artifact_usable is None:
+            self._schedule_payout_ledger_artifact_preparation(
+                published_generation,
+                current_artifacts.network_difficulty,
+            )
         return published_generation
 
     def _record_first_payout_delivery(
@@ -2841,6 +3992,10 @@ class PrismCoordinator:
 
     def _advance_payout_state_generation(self) -> int:
         """Publish a payout-only invalidation with no expensive gate work."""
+        # No production caller remains: direct-block finalization publishes
+        # through submit_block_candidate's reserve/publish path instead. Tests
+        # keep using this as the smallest complete reserve -> block -> publish
+        # invalidation cycle.
         self._ensure_job_cache_state()
         self._reserve_payout_state_source("payout_only")
         prepared_started = time.monotonic()
@@ -2855,7 +4010,7 @@ class PrismCoordinator:
             )
         generation = self._publish_current_payout_state_with_retry_budget()
         if generation is None:
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "payout-only invalidation was superseded; immediate retry scheduled"
             )
         return generation
@@ -2949,18 +4104,22 @@ class PrismCoordinator:
         self,
         artifacts: CachedTemplateArtifacts,
     ) -> bool:
+        changed = False
         with self._job_cache_lock:
             previous = self._template_artifacts
             if previous is not None and artifacts.generation < previous.generation:
                 return False
             self._template_artifacts = artifacts
             if previous is not None and previous.fingerprint != artifacts.fingerprint:
+                changed = True
                 self._job_bundle_cache = OrderedDict(
                     (key, entry)
                     for key, entry in self._job_bundle_cache.items()
                     if entry.template_fingerprint == artifacts.fingerprint
                 )
-            return True
+        if changed:
+            self._cancel_obsolete_job_builds("template fingerprint superseded")
+        return True
 
     def store_template_artifacts(
         self,
@@ -2996,7 +4155,19 @@ class PrismCoordinator:
         now = time.monotonic()
         with self._job_cache_lock:
             cached = self._template_artifacts
-        if cached is not None and ttl > 0 and now - cached.fetched_monotonic <= ttl:
+        with self.lock:
+            observed_tip = getattr(self, "current_tip_first_seen", None)
+        cached_tip_current = (
+            observed_tip is None
+            or cached is None
+            or cached.previousblockhash == observed_tip[0]
+        )
+        if (
+            cached is not None
+            and cached_tip_current
+            and ttl > 0
+            and now - cached.fetched_monotonic <= ttl
+        ):
             self._record_job_cache_event("template", hit=True)
             return cached
         self._record_job_cache_event("template", hit=False)
@@ -3034,13 +4205,16 @@ class PrismCoordinator:
         *,
         mode: str,
         payout_state_generation: int,
+        payout_artifact_generation: int = 0,
         worker: WorkerIdentity | None,
     ) -> tuple[object, ...]:
         if mode == "ready":
             return (
                 artifacts.fingerprint,
+                artifacts.previousblockhash,
                 "ready",
                 payout_state_generation,
+                payout_artifact_generation,
             )
         if mode != "collection":
             raise ValueError(f"unknown PRISM job-bundle mode: {mode}")
@@ -3050,9 +4224,11 @@ class PrismCoordinator:
             )
         return (
             artifacts.fingerprint,
+            artifacts.previousblockhash,
             "collection",
             artifacts.generation,
             payout_state_generation,
+            payout_artifact_generation,
             *self._collection_bundle_identity(worker),
         )
 
@@ -3103,6 +4279,13 @@ class PrismCoordinator:
         TTL.
         """
         if cached is None:
+            return False
+        with self.lock:
+            observed_tip = getattr(self, "current_tip_first_seen", None)
+        if (
+            observed_tip is not None
+            and observed_tip[0] != artifacts.previousblockhash
+        ):
             return False
         with self._job_cache_lock:
             if self._payout_state_publication_blocked:
@@ -3163,7 +4346,186 @@ class PrismCoordinator:
             template=artifacts.template,
             base_job=base_job,
             template_generation=artifacts.generation,
+            build_key=(
+                dataclass_replace(
+                    cached.build_key,
+                    best_tip_hash=artifacts.previousblockhash,
+                    previous_block_hash=artifacts.previousblockhash,
+                    template_generation=artifacts.generation,
+                    block_height=int(artifacts.template["height"]),
+                    coinbase_value_sats=int(artifacts.template["coinbasevalue"]),
+                )
+                if cached.build_key is not None
+                else None
+            ),
         )
+
+    def _new_job_build_request(
+        self,
+        artifacts: CachedTemplateArtifacts,
+        worker: WorkerIdentity | None,
+        *,
+        mode: str,
+        payout_state_generation: int,
+        cache_key: tuple[object, ...],
+        payout_ledger_artifact: PayoutLedgerArtifact | None = None,
+    ) -> _JobBuildRequest:
+        cancellation = _JobBuildCancellation(
+            timeout_seconds=max(
+                0.001,
+                float(
+                    getattr(
+                        self,
+                        "job_build_timeout_seconds",
+                        DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS,
+                    )
+                ),
+            )
+        )
+        cancellation.raise_if_cancelled("immutable snapshot")
+        payout_artifact = self._current_payout_state_artifact(cancellation)
+        if payout_artifact.generation != payout_state_generation:
+            raise JobBuildSuperseded(
+                "payout artifact generation changed before build request"
+            )
+
+        phases = self._job_build_phases()
+        payout_started = time.monotonic()
+        payout_policy_json = canonical_json_text(self.prism_payout_policy())
+        phases["payout"] = phases.get("payout", 0.0) + (
+            time.monotonic() - payout_started
+        )
+        cancellation.raise_if_cancelled("payout policy")
+        ctv_started = time.monotonic()
+        ctv_settlement = self.prism_ctv_settlement_config(
+            block_height=int(artifacts.template["height"]),
+            parent_hash=artifacts.previousblockhash,
+        )
+        ctv_settlement_json = (
+            canonical_json_text(ctv_settlement)
+            if ctv_settlement is not None
+            else None
+        )
+        phases["ctv"] = phases.get("ctv", 0.0) + (
+            time.monotonic() - ctv_started
+        )
+        cancellation.raise_if_cancelled("CTV configuration")
+
+        suffix_hex = self.coinbase_script_sig_suffix_hex(
+            PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
+            "00" * self.extranonce2_size,
+        )
+        collection_identity = (
+            self._collection_bundle_identity(worker)
+            if mode == "collection" and worker is not None
+            else None
+        )
+        decimal_context = getcontext().copy()
+        numeric_context_sha256 = canonical_json_sha256(
+            {
+                "precision": decimal_context.prec,
+                "rounding": decimal_context.rounding,
+                "minimum_exponent": decimal_context.Emin,
+                "maximum_exponent": decimal_context.Emax,
+                "capitals": decimal_context.capitals,
+                "clamp": decimal_context.clamp,
+            }
+        )
+        with self._job_cache_lock:
+            issued_at_ms = self._job_build_issued_at_ms.get(artifacts.generation)
+            if issued_at_ms is None:
+                issued_at_ms = now_ms()
+                self._job_build_issued_at_ms[artifacts.generation] = issued_at_ms
+                while len(self._job_build_issued_at_ms) > 128:
+                    self._job_build_issued_at_ms.popitem(last=False)
+        build_key = JobBuildKey(
+            best_tip_hash=artifacts.previousblockhash,
+            previous_block_hash=artifacts.previousblockhash,
+            template_fingerprint=artifacts.fingerprint,
+            template_generation=artifacts.generation,
+            payout_state_generation=payout_state_generation,
+            payout_artifact_sha256=payout_artifact.prior_balances_sha256,
+            mode=mode,
+            collection_identity=collection_identity,
+            block_height=int(artifacts.template["height"]),
+            coinbase_value_sats=int(artifacts.template["coinbasevalue"]),
+            network_difficulty=int(artifacts.network_difficulty),
+            issued_at_ms=issued_at_ms,
+            payout_policy_sha256=hashlib.sha256(
+                payout_policy_json.encode()
+            ).hexdigest(),
+            ctv_settlement_sha256=(
+                hashlib.sha256(ctv_settlement_json.encode()).hexdigest()
+                if ctv_settlement_json is not None
+                else None
+            ),
+            witness_merkle_sha256=canonical_json_sha256(
+                artifacts.witness_merkle_leaves_hex
+            ),
+            transaction_set_sha256=canonical_json_sha256(
+                artifacts.transaction_hexes
+            ),
+            coinbase_suffix_hex=suffix_hex,
+            signing_key_sha256=hashlib.sha256(
+                str(getattr(self, "signing_seed_hex", "")).encode()
+            ).hexdigest(),
+            ledger_signing_key_sha256=hashlib.sha256(
+                str(
+                    getattr(
+                        self,
+                        "ledger_attestation_signing_seed_hex",
+                        "",
+                    )
+                ).encode()
+            ).hexdigest(),
+            numeric_context_sha256=numeric_context_sha256,
+        )
+        immutable_identity: tuple[object, ...] = (
+            cache_key,
+            artifacts.generation,
+            issued_at_ms,
+            payout_artifact.prior_balances_sha256,
+            build_key.payout_policy_sha256,
+            build_key.ctv_settlement_sha256,
+            build_key.witness_merkle_sha256,
+            build_key.transaction_set_sha256,
+            build_key.coinbase_suffix_hex,
+            build_key.signing_key_sha256,
+            build_key.ledger_signing_key_sha256,
+            build_key.numeric_context_sha256,
+        )
+        return _JobBuildRequest(
+            key=build_key,
+            cache_key=cache_key,
+            equivalence_key=immutable_identity,
+            artifacts=artifacts,
+            template_json=canonical_json_text(artifacts.template),
+            transaction_hexes=artifacts.transaction_hexes,
+            witness_merkle_leaves_hex=artifacts.witness_merkle_leaves_hex,
+            worker=worker,
+            mode=mode,
+            payout_artifact=payout_artifact,
+            payout_ledger_artifact=payout_ledger_artifact,
+            payout_policy_json=payout_policy_json,
+            ctv_settlement_json=ctv_settlement_json,
+            decimal_context=decimal_context,
+            cancellation=cancellation,
+        )
+
+    def _newest_observed_tip_locked(self) -> str | None:
+        """Newest live-tip observation, ahead of published submit authority.
+
+        Detection and publication are split: a winning refresh builds for a
+        detected tip while the previous tip remains published. Build-pipeline
+        supersession checks must compare against this detection view, or a
+        replacement build for a freshly detected tip would classify itself as
+        obsolete before it could ever be published.
+        """
+        detected = getattr(self, "latest_detected_tip", None)
+        if detected is not None:
+            return detected[0]
+        published = getattr(self, "current_tip_first_seen", None)
+        return published[0] if published is not None else None
 
     def _cache_job_bundle_if_current(
         self,
@@ -3172,7 +4534,21 @@ class PrismCoordinator:
     ) -> bool:
         """Cache only current state; report whether payout state stayed valid."""
         with self._job_cache_lock:
-            if built.payout_state_generation != self._payout_state_generation:
+            with self.lock:
+                observed_tip = self._newest_observed_tip_locked()
+            published_artifact = self._published_payout_state.artifact
+            if (
+                observed_tip is not None
+                and observed_tip != artifacts.previousblockhash
+            ):
+                return False
+            if (
+                built.payout_state_generation != self._payout_state_generation
+                or built.build_key is None
+                or published_artifact is None
+                or built.build_key.payout_artifact_sha256
+                != published_artifact.prior_balances_sha256
+            ):
                 return False
             current = self._template_artifacts
             if (
@@ -3180,9 +4556,7 @@ class PrismCoordinator:
                 or current.fingerprint != artifacts.fingerprint
                 or current.generation != artifacts.generation
             ):
-                # Snapshot-owned artifacts remain usable even if a newer
-                # template won the global cache race; just do not retain them.
-                return True
+                return False
             self._job_bundle_cache[built.key] = built
             self._job_bundle_cache.move_to_end(built.key)
             while len(self._job_bundle_cache) > MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES:
@@ -3196,17 +4570,17 @@ class PrismCoordinator:
         worker: WorkerIdentity | None = None,
         *,
         mode: str | None = None,
+        cancelled: Callable[[], bool] | None = None,
+        retry_superseded: bool = True,
     ) -> CachedJobBundle:
-        """Return the cached heavy build for this template, building at most once.
+        """Return one immutable heavy build through a work-identity flight.
 
-        Concurrent callers needing the same missing entry single-flight behind
-        the build lock: the first one pays for the ledger snapshot and the
-        signed audit bundle, the rest reuse it. Mode is resolved before cache
-        lookup and again immediately before a build after lock admission:
-        ready work has no representative input, while collection work requires
-        and is isolated by its payout identity.
+        Equivalent callers share one future. A newer key cancels the current
+        build and starts immediately in the bounded replacement slot; only the
+        latest pending request is retained during repeated supersession.
         """
         self._ensure_job_cache_state()
+        self._ensure_tip_refresh_state()
         while True:
             resolved_mode = self._job_bundle_mode(mode)
             if resolved_mode == "collection" and worker is None:
@@ -3215,10 +4589,22 @@ class PrismCoordinator:
                 )
             with self._job_cache_lock:
                 payout_state_generation = self._payout_state_generation
+            payout_artifact = (
+                self._usable_payout_ledger_artifact(
+                    payout_state_generation,
+                    artifacts.network_difficulty,
+                )
+                if resolved_mode == "ready"
+                else None
+            )
+            payout_artifact_generation = (
+                payout_artifact.generation if payout_artifact is not None else 0
+            )
             key = self._job_bundle_key(
                 artifacts,
                 mode=resolved_mode,
                 payout_state_generation=payout_state_generation,
+                payout_artifact_generation=payout_artifact_generation,
                 worker=worker,
             )
             cached = self._lookup_job_bundle(key)
@@ -3226,35 +4612,132 @@ class PrismCoordinator:
                 self._record_job_cache_event("bundle", hit=True)
                 assert cached is not None
                 return self._bind_cached_bundle_to_artifacts(cached, artifacts)
-            with self._job_build_lock:
-                with self._job_cache_lock:
-                    locked_payout_state_generation = self._payout_state_generation
-                if locked_payout_state_generation != payout_state_generation:
-                    continue
-                cached = self._lookup_job_bundle(key)
-                if self._job_bundle_entry_usable(cached, artifacts):
-                    self._record_job_cache_event("bundle", hit=True)
-                    assert cached is not None
-                    return self._bind_cached_bundle_to_artifacts(cached, artifacts)
-                # Readiness can latch while this caller waits behind another
-                # expensive build. Re-select the mode and its cache key instead
-                # of issuing collection-only work after the pool became ready.
-                if self._job_bundle_mode(mode) != resolved_mode:
-                    continue
-                self._record_job_cache_event("bundle", hit=False)
-                built = self.build_shared_job_bundle(
+            if self._job_bundle_mode(mode) != resolved_mode:
+                continue
+            self._record_job_cache_event("bundle", hit=False)
+            try:
+                request = self._new_job_build_request(
                     artifacts,
                     worker,
                     mode=resolved_mode,
                     payout_state_generation=payout_state_generation,
-                    key=key,
+                    cache_key=key,
+                    payout_ledger_artifact=payout_artifact,
                 )
-                # A reconciliation may have committed while this expensive
-                # build was running. Never cache or return its stale signed
-                # payout snapshot; retry against the new generation instead.
-                if not self._cache_job_bundle_if_current(built, artifacts):
+                # Preserve the historical readiness handoff without holding a
+                # lock across construction: only admission and the final mode
+                # re-selection are serialized here.
+                with self._job_build_lock:
+                    if self._job_bundle_mode(mode) != resolved_mode:
+                        request.cancellation.cancel("worker mode superseded")
+                        continue
+                    if cancelled is not None and cancelled():
+                        raise _JobBuildCancelled(
+                            "job bundle request was cancelled before preparation"
+                        )
+                    promise = self._request_job_build(request)
+                wait_deadline = time.monotonic() + max(
+                    0.001,
+                    float(self.job_build_timeout_seconds)
+                    + float(self.job_build_cancel_grace_seconds)
+                    + 1.0,
+                )
+                while True:
+                    if cancelled is not None and cancelled():
+                        raise _JobBuildCancelled(
+                            "job bundle waiter was cancelled during preparation"
+                        )
+                    try:
+                        built = promise.result(
+                            timeout=min(
+                                0.1,
+                                max(0.001, wait_deadline - time.monotonic()),
+                            )
+                        )
+                        break
+                    except TimeoutError:
+                        if time.monotonic() >= wait_deadline:
+                            raise
+            except TimeoutError as exc:
+                request.cancellation.cancel("timeout")
+                self._schedule_tip_refresh_retry()
+                raise JobBuildCancelled(
+                    "job build timed out; immediate retry scheduled"
+                ) from exc
+            except JobBuildCancelled:
+                self._schedule_tip_refresh_retry()
+                if not retry_superseded:
+                    raise
+                with self.lock:
+                    observed_tip = self._newest_observed_tip_locked()
+                if (
+                    observed_tip is not None
+                    and observed_tip != artifacts.previousblockhash
+                ):
+                    raise
+                with self._job_cache_lock:
+                    current = self._template_artifacts
+                    payout_current = (
+                        payout_state_generation == self._payout_state_generation
+                    )
+                if current is artifacts and payout_current:
                     continue
-                return built
+                if current is artifacts:
+                    continue
+                raise
+            built = self._bind_cached_bundle_to_artifacts(built, artifacts)
+            if not self._cache_job_bundle_if_current(built, artifacts):
+                with self._job_build_scheduler_lock:
+                    self.job_build_scheduler_counts["obsolete_results"] += 1
+                with self.lock:
+                    observed_tip = self._newest_observed_tip_locked()
+                if (
+                    observed_tip is not None
+                    and observed_tip != artifacts.previousblockhash
+                ):
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_superseded_results += 1
+                    raise JobBuildSuperseded(
+                        "observed tip changed before cache publication"
+                    )
+                with self._job_cache_lock:
+                    payout_current = (
+                        built.payout_state_generation
+                        == self._payout_state_generation
+                    )
+                with self.lock:
+                    published_snapshot = getattr(
+                        self,
+                        "tip_template_snapshot",
+                        None,
+                    )
+                    published_artifacts = (
+                        published_snapshot.template_artifacts
+                        if published_snapshot is not None
+                        else None
+                    )
+                if (
+                    payout_current
+                    and built.template is artifacts.template
+                    and built.template_generation == artifacts.generation
+                    and (
+                        not retry_superseded
+                        or published_artifacts is artifacts
+                    )
+                ):
+                    # Snapshot-owned work may outlive an unrelated global
+                    # cache fill. Return it only to its refresh validator or
+                    # retained collection delivery; never retain it globally.
+                    return built
+                if retry_superseded:
+                    with self._job_cache_lock:
+                        current = self._template_artifacts
+                    if current is artifacts:
+                        continue
+                raise JobBuildSuperseded(
+                    "job build key changed before cache publication"
+                )
+            return built
 
     def build_shared_job_bundle(
         self,
@@ -3263,95 +4746,195 @@ class PrismCoordinator:
         *,
         mode: str | None = None,
         payout_state_generation: int | None = None,
+        payout_artifact: PayoutLedgerArtifact | None = None,
         key: tuple[object, ...] | None = None,
+        build_request: _JobBuildRequest | None = None,
     ) -> CachedJobBundle:
         phases = self._job_build_phases()
-        template = artifacts.template
         resolved_mode = self._job_bundle_mode(mode)
         if resolved_mode == "collection" and worker is None:
             raise CollectionIdentityUnavailable(
                 "collection-mode worker identity is temporarily unavailable"
             )
-        started = time.monotonic()
-        with self._payout_state_prepare_lock:
-            with self._job_cache_lock:
-                publication_blocked = self._payout_state_publication_blocked
-            if publication_blocked:
-                raise _PayoutStatePublicationBlocked(
-                    "payout state invalidation is pending publication"
-                )
+        with self._job_cache_lock:
+            publication_blocked = self._payout_state_publication_blocked
             if payout_state_generation is None:
-                with self._job_cache_lock:
-                    payout_state_generation = self._payout_state_generation
-            if key is None:
-                key = self._job_bundle_key(
-                    artifacts,
-                    mode=resolved_mode,
-                    payout_state_generation=payout_state_generation,
-                    worker=worker,
-                )
-            issued_at_ms = now_ms()
-            # Bound the snapshot to a superset of the 8x reward window rather
-            # than the whole accepted history: same audit bundle and digest,
-            # but the ledger phase no longer scales with total ledger size.
-            snapshot_window_weight = (
-                PRISM_REWARD_WINDOW_MULTIPLIER
-                * PRISM_SNAPSHOT_WINDOW_MARGIN
-                * int(artifacts.network_difficulty)
+                payout_state_generation = self._payout_state_generation
+        if publication_blocked:
+            raise _PayoutStatePublicationBlocked(
+                "payout state invalidation is pending publication"
             )
-            shares: list[dict[str, object]] = (
-                [
-                    record.to_prism_json()
-                    for record in self.ledger.snapshot_at_job_issue(
-                        issued_at_ms, window_weight=snapshot_window_weight
-                    )
-                ]
-                if resolved_mode == "ready"
-                else []
-            )
-            prior_balances = self.ledger.current_prior_balances()
-        phases["ledger"] = phases.get("ledger", 0.0) + (time.monotonic() - started)
-        started = time.monotonic()
-        placeholder_suffix_hex = self.coinbase_script_sig_suffix_hex(
-            PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
-            "00" * self.extranonce2_size,
-        )
-        collection_identity: tuple[str, str] | None = None
-        if resolved_mode == "ready":
-            if not shares:
-                raise RuntimeError(
-                    "ready-pool ledger snapshot contained no payout shares"
-                )
-            bundle = self.build_audit_bundle(
-                shares=shares,
-                found_block={
-                    "block_height": int(template["height"]),
-                    "coinbase_value_sats": int(template["coinbasevalue"]),
-                    "network_difficulty": artifacts.network_difficulty,
-                    "anchor_job_issued_at_ms": issued_at_ms,
-                },
-                prior_balances=prior_balances,
-                coinbase_script_sig_suffix_hex=placeholder_suffix_hex,
-                witness_merkle_leaves_hex=list(artifacts.witness_merkle_leaves_hex),
-                ctv_fee_parent_hash=str(template["previousblockhash"]),
-                summary_only=True,
-            )
-            collection_only = False
-        else:
-            assert worker is not None
-            bundle = self.build_collection_bundle(
-                template=template,
-                transaction_hexes=artifacts.transaction_hexes,
+        if key is None:
+            key = self._job_bundle_key(
+                artifacts,
+                mode=resolved_mode,
+                payout_state_generation=payout_state_generation,
+                payout_artifact_generation=(
+                    payout_artifact.generation
+                    if payout_artifact is not None
+                    else 0
+                ),
                 worker=worker,
-                network_difficulty=artifacts.network_difficulty,
-                issued_at_ms=issued_at_ms,
-                suffix_hex=placeholder_suffix_hex,
-                summary_only=True,
             )
+        if build_request is None:
+            build_request = self._new_job_build_request(
+                artifacts,
+                worker,
+                mode=resolved_mode,
+                payout_state_generation=payout_state_generation,
+                cache_key=key,
+                payout_ledger_artifact=payout_artifact,
+            )
+        else:
+            payout_artifact = build_request.payout_ledger_artifact
+        cancellation = build_request.cancellation
+        self._job_build_checkpoint("ledger_snapshot", cancellation)
+        template_value = json.loads(build_request.template_json)
+        if not isinstance(template_value, dict):
+            raise RuntimeError("immutable job template is not an object")
+        template: dict[str, Any] = template_value
+        issued_at_ms = build_request.key.issued_at_ms
+        started = time.monotonic()
+        snapshot_window_weight = (
+            PRISM_REWARD_WINDOW_MULTIPLIER
+            * PRISM_SNAPSHOT_WINDOW_MARGIN
+            * int(build_request.key.network_difficulty)
+        )
+        if payout_artifact is not None:
+            if (
+                self._usable_payout_ledger_artifact(
+                    payout_state_generation,
+                    build_request.key.network_difficulty,
+                )
+                is not payout_artifact
+            ):
+                raise JobBuildSuperseded(
+                    "precomputed payout artifact changed before construction"
+                )
+            prior_balances = list(payout_artifact.prior_balances)
+            if (
+                canonical_json_sha256(prior_balances)
+                != build_request.key.payout_artifact_sha256
+            ):
+                raise JobBuildSuperseded(
+                    "precomputed payout artifact does not match payout generation"
+                )
+            shares = list(payout_artifact.shares_json)
+        else:
+            with self._payout_state_prepare_lock:
+                with self._job_cache_lock:
+                    published_artifact = self._published_payout_state.artifact
+                    if self._payout_state_publication_blocked:
+                        raise _PayoutStatePublicationBlocked(
+                            "payout state invalidation is pending publication"
+                        )
+                    if (
+                        payout_state_generation != self._payout_state_generation
+                        or published_artifact is None
+                        or published_artifact.prior_balances_sha256
+                        != build_request.key.payout_artifact_sha256
+                    ):
+                        raise JobBuildSuperseded(
+                            "payout generation changed before ledger snapshot"
+                        )
+                records = (
+                    self.ledger.snapshot_at_job_issue(
+                        issued_at_ms,
+                        window_weight=snapshot_window_weight,
+                    )
+                    if resolved_mode == "ready"
+                    else []
+                )
+                prior_balances = build_request.payout_artifact.prior_balances()
+            self._job_build_checkpoint("ledger_snapshot_complete", cancellation)
             shares = []
-            collection_only = True
-            collection_identity = self._collection_bundle_identity(worker)
+            for index, record in enumerate(records):
+                if index % 256 == 0:
+                    self._job_build_checkpoint(
+                        "ledger_snapshot_conversion",
+                        cancellation,
+                    )
+                shares.append(record.to_prism_json())
+        ledger_elapsed = time.monotonic() - started
+        phases["ledger"] = phases.get("ledger", 0.0) + ledger_elapsed
+        if resolved_mode == "ready":
+            self._observe_tip_refresh_build_phase(
+                "ledger_snapshot",
+                ledger_elapsed,
+            )
+        share_snapshot_sha256 = canonical_json_sha256(shares)
+        final_build_key = dataclass_replace(
+            build_request.key,
+            share_snapshot_sha256=share_snapshot_sha256,
+        )
+        self._job_build_checkpoint("payout_derivation", cancellation)
+        started = time.monotonic()
+        placeholder_suffix_hex = final_build_key.coinbase_suffix_hex
+        collection_identity: tuple[str, str] | None = None
+        previous_metrics_scope = bool(
+            getattr(self._job_build_phase_local, "tip_refresh_metrics", False)
+        )
+        self._job_build_phase_local.tip_refresh_metrics = resolved_mode == "ready"
+        try:
+            if resolved_mode == "ready":
+                if not shares:
+                    raise RuntimeError(
+                        "ready-pool ledger snapshot contained no payout shares"
+                    )
+                self._job_build_checkpoint("ctv_manifest", cancellation)
+                self._job_build_checkpoint("signing_verification", cancellation)
+                bundle = self.build_audit_bundle(
+                    shares=shares,
+                    found_block={
+                        "block_height": int(template["height"]),
+                        "coinbase_value_sats": int(template["coinbasevalue"]),
+                        "network_difficulty": artifacts.network_difficulty,
+                        "anchor_job_issued_at_ms": issued_at_ms,
+                    },
+                    prior_balances=prior_balances,
+                    coinbase_script_sig_suffix_hex=placeholder_suffix_hex,
+                    witness_merkle_leaves_hex=list(
+                        build_request.witness_merkle_leaves_hex
+                    ),
+                    ctv_fee_parent_hash=str(template["previousblockhash"]),
+                    summary_only=True,
+                    payout_policy=json.loads(build_request.payout_policy_json),
+                    ctv_settlement=(
+                        json.loads(build_request.ctv_settlement_json)
+                        if build_request.ctv_settlement_json is not None
+                        else None
+                    ),
+                    cancellation=cancellation,
+                )
+                collection_only = False
+            else:
+                assert worker is not None
+                self._job_build_checkpoint("ctv_manifest", cancellation)
+                self._job_build_checkpoint("signing_verification", cancellation)
+                bundle = self.build_collection_bundle(
+                    template=template,
+                    transaction_hexes=build_request.transaction_hexes,
+                    worker=worker,
+                    network_difficulty=final_build_key.network_difficulty,
+                    issued_at_ms=issued_at_ms,
+                    suffix_hex=placeholder_suffix_hex,
+                    summary_only=True,
+                    payout_policy=json.loads(build_request.payout_policy_json),
+                    ctv_settlement=(
+                        json.loads(build_request.ctv_settlement_json)
+                        if build_request.ctv_settlement_json is not None
+                        else None
+                    ),
+                    cancellation=cancellation,
+                )
+                shares = []
+                collection_only = True
+                collection_identity = self._collection_bundle_identity(worker)
+        finally:
+            self._job_build_phase_local.tip_refresh_metrics = previous_metrics_scope
         manifest = bundle["signed_coinbase_manifest"]["manifest"]
+        self._job_build_checkpoint("bundle_assembly", cancellation)
+        assembly_started = time.monotonic()
         base_job = direct_stratum.make_job_from_builder_manifest(
             job_id="prism-template-base",
             template=template,
@@ -3360,12 +4943,20 @@ class PrismCoordinator:
             extranonce2_size=self.extranonce2_size,
             desired_share_difficulty=self.share_difficulty,
             clean_jobs=True,
-            transaction_hexes=artifacts.transaction_hexes,
+            transaction_hexes=build_request.transaction_hexes,
         )
+        phases["assembly"] = phases.get("assembly", 0.0) + (
+            time.monotonic() - assembly_started
+        )
+        self._job_build_checkpoint("serialization", cancellation)
+        self._job_build_checkpoint("bundle_publication", cancellation)
         phases["bundle"] = phases.get("bundle", 0.0) + (time.monotonic() - started)
         return CachedJobBundle(
             key=key,
-            template=template,
+            # Construction consumed the detached canonical template above;
+            # publication retains the exact snapshot-owned object identity used
+            # by the existing validation token.
+            template=artifacts.template,
             template_fingerprint=artifacts.fingerprint,
             # Only this manifest is needed to bind later clock-only template
             # observations.  Retaining the returned logical bundle duplicated
@@ -3380,7 +4971,11 @@ class PrismCoordinator:
             built_monotonic=time.monotonic(),
             template_generation=artifacts.generation,
             payout_state_generation=payout_state_generation,
+            payout_artifact_generation=(
+                payout_artifact.generation if payout_artifact is not None else 0
+            ),
             collection_identity=collection_identity,
+            build_key=final_build_key,
         )
 
     def stamp_job_for_client(
@@ -3428,6 +5023,14 @@ class PrismCoordinator:
             template_fingerprint=cached.template_fingerprint,
             template_generation=cached.template_generation,
             payout_state_generation=cached.payout_state_generation,
+            payout_artifact_generation=cached.payout_artifact_generation,
+            connection_id=client.connection_id,
+            authorization_generation=int(
+                getattr(client, "authorization_generation", 0)
+            ),
+            difficulty_generation=int(
+                getattr(client, "difficulty_generation", 0)
+            ),
         )
 
     def accepted_share_stats(self) -> tuple[int, int]:
@@ -3531,13 +5134,74 @@ class PrismCoordinator:
         if not hasattr(self, "worker_rejection_counts"):
             self.worker_rejection_counts = {}
 
+    def _ensure_initial_job_state(self) -> None:
+        if not hasattr(self, "pending_initial_jobs"):
+            self.pending_initial_jobs: dict[ClientState, PendingInitialJob] = {}
+        if not hasattr(self, "stratum_max_pending_initial_jobs"):
+            self.stratum_max_pending_initial_jobs = (
+                DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS
+            )
+        if not hasattr(self, "stratum_initial_job_timeout_seconds"):
+            self.stratum_initial_job_timeout_seconds = (
+                DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS
+            )
+        if not hasattr(self, "initial_job_queue_rejection_count"):
+            self.initial_job_queue_rejection_count = 0
+        if not hasattr(self, "initial_job_timeout_count"):
+            self.initial_job_timeout_count = 0
+        if not hasattr(self, "initial_job_cancelled_count"):
+            self.initial_job_cancelled_count = 0
+        if not hasattr(self, "initial_job_coalesced_count"):
+            self.initial_job_coalesced_count = 0
+        if not hasattr(self, "initial_job_sent_count"):
+            self.initial_job_sent_count = 0
+        if not hasattr(self, "initial_job_failed_count"):
+            self.initial_job_failed_count = 0
+        if not hasattr(self, "initial_job_superseded_count"):
+            self.initial_job_superseded_count = 0
+        if not hasattr(self, "initial_job_delivery_latency_seconds_sum"):
+            self.initial_job_delivery_latency_seconds_sum = 0.0
+        if not hasattr(self, "initial_job_delivery_latency_count"):
+            self.initial_job_delivery_latency_count = 0
+        if not hasattr(self, "last_initial_job_delivery_monotonic"):
+            self.last_initial_job_delivery_monotonic = None
+        if not hasattr(self, "handler_thread_count"):
+            self.handler_thread_count = 0
+        if not hasattr(self, "peak_active_connection_count"):
+            self.peak_active_connection_count = len(getattr(self, "clients", ()))
+        if not hasattr(self, "_mining_overload_started_monotonic"):
+            self._mining_overload_started_monotonic = None
+        if not hasattr(self, "_mining_delivery_failure_started_monotonic"):
+            self._mining_delivery_failure_started_monotonic = None
+
+    def delivery_queue_limit(self) -> int:
+        pending_limit = int(
+            getattr(
+                self,
+                "stratum_max_pending_initial_jobs",
+                DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
+            )
+        )
+        connection_limit = int(
+            getattr(
+                self,
+                "stratum_max_connections",
+                DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+            )
+        )
+        return max(
+            int(getattr(self, "tip_refresh_max_workers", DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS)),
+            pending_limit,
+            connection_limit if connection_limit > 0 else pending_limit,
+        )
+
     def _ensure_tip_refresh_state(self) -> None:
         if not hasattr(self, "_tip_refresh_lock"):
             self._tip_refresh_lock = threading.Lock()
         if not hasattr(self, "_tip_refresh_executor_lock"):
             self._tip_refresh_executor_lock = threading.Lock()
         if not hasattr(self, "_tip_refresh_executor"):
-            self._tip_refresh_executor: ThreadPoolExecutor | None = None
+            self._tip_refresh_executor: _BoundedPriorityExecutor | None = None
         if not hasattr(self, "_tip_refresh_executor_shutdown"):
             self._tip_refresh_executor_shutdown = False
         if not hasattr(self, "tip_refresh_max_workers"):
@@ -3553,6 +5217,17 @@ class PrismCoordinator:
                 }
                 for name in ("refresh", "bundle_build", "first_delivery", "last_delivery")
             }
+        if not hasattr(self, "tip_refresh_build_phase_histograms"):
+            self.tip_refresh_build_phase_histograms = {
+                phase: {
+                    "buckets": {
+                        bucket: 0 for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS
+                    },
+                    "sum": 0.0,
+                    "count": 0,
+                }
+                for phase in PRISM_TIP_REFRESH_BUILD_PHASES
+            }
         if not hasattr(self, "tip_refresh_client_counts"):
             self.tip_refresh_client_counts = {
                 result: 0 for result in PRISM_TIP_REFRESH_RESULTS
@@ -3563,6 +5238,20 @@ class PrismCoordinator:
             }
         if not hasattr(self, "tip_refresh_inflight"):
             self.tip_refresh_inflight = 0
+        if not hasattr(self, "tip_refresh_build_inflight"):
+            self.tip_refresh_build_inflight = 0
+        if not hasattr(self, "tip_refresh_build_queue_depth"):
+            self.tip_refresh_build_queue_depth = 0
+        if not hasattr(self, "tip_refresh_singleflight_hits"):
+            self.tip_refresh_singleflight_hits = 0
+        if not hasattr(self, "tip_refresh_superseded_results"):
+            self.tip_refresh_superseded_results = 0
+        if not hasattr(self, "tip_refresh_worker_failures"):
+            self.tip_refresh_worker_failures = 0
+        if not hasattr(self, "tip_refresh_worker_restarts"):
+            self.tip_refresh_worker_restarts = 0
+        if not hasattr(self, "tip_refresh_ipc_bytes"):
+            self.tip_refresh_ipc_bytes = {"input": 0, "output": 0}
         if not hasattr(self, "_tip_refresh_pending_event"):
             self._tip_refresh_pending_event = threading.Event()
         if not hasattr(self, "_tip_refresh_pending_counter"):
@@ -3814,6 +5503,33 @@ class PrismCoordinator:
                 if elapsed_seconds <= bucket:
                     buckets[bucket] = int(buckets.get(bucket, 0)) + 1
 
+    def _observe_tip_refresh_build_phase(
+        self,
+        phase: str,
+        elapsed_seconds: float,
+    ) -> None:
+        if phase not in PRISM_TIP_REFRESH_BUILD_PHASES:
+            raise ValueError(f"unknown tip refresh build phase: {phase}")
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_metrics_lock:
+            histogram = self.tip_refresh_build_phase_histograms[phase]
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + max(
+                0.0, elapsed_seconds
+            )
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
+    def _record_tip_refresh_ipc_bytes(self, direction: str, byte_count: int) -> None:
+        if direction not in {"input", "output"}:
+            raise ValueError(f"unknown tip refresh IPC direction: {direction}")
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_metrics_lock:
+            self.tip_refresh_ipc_bytes[direction] += max(0, int(byte_count))
+
     def _record_tip_refresh_client_result(self, result: str) -> None:
         if result not in PRISM_TIP_REFRESH_RESULTS:
             raise ValueError(f"unknown tip refresh result: {result}")
@@ -3838,22 +5554,29 @@ class PrismCoordinator:
         with self._tip_refresh_metrics_lock:
             self.tip_refresh_inflight = max(0, self.tip_refresh_inflight - 1)
 
-    def tip_refresh_executor(self) -> ThreadPoolExecutor:
+    def tip_refresh_executor(self) -> _BoundedPriorityExecutor:
         self._ensure_tip_refresh_state()
         with self._tip_refresh_executor_lock:
             if self._tip_refresh_executor_shutdown:
                 raise RuntimeError("tip refresh executor is shut down")
             executor = self._tip_refresh_executor
             if executor is None:
-                executor = ThreadPoolExecutor(
+                executor = _BoundedPriorityExecutor(
                     max_workers=self.tip_refresh_max_workers,
-                    thread_name_prefix="prism-tip-refresh",
+                    max_queue_size=self.delivery_queue_limit(),
                 )
                 self._tip_refresh_executor = executor
             return executor
 
     def shutdown_tip_refresh_executor(self) -> None:
         self._ensure_tip_refresh_state()
+        with self.lock:
+            self._ensure_initial_job_state()
+            for request in tuple(self.pending_initial_jobs.values()):
+                request.cancelled.set()
+                if request.future is not None:
+                    request.future.cancel()
+            self.pending_initial_jobs.clear()
         with self._tip_refresh_executor_lock:
             executor = self._tip_refresh_executor
             self._tip_refresh_executor = None
@@ -3863,6 +5586,537 @@ class PrismCoordinator:
             # socket send. Drain them before serve returns and the writer lease
             # is released; queued workers are cancelled without starting.
             executor.shutdown(wait=True, cancel_futures=True)
+        self.shutdown_job_build_executor()
+        self.shutdown_payout_artifact_executor()
+
+    def _initial_request_current_locked(self, request: PendingInitialJob) -> bool:
+        client = request.client
+        return (
+            self.pending_initial_jobs.get(client) is request
+            and client in self.clients
+            and (
+                request.connection_id is None
+                or client.connection_id == request.connection_id
+            )
+            and client.authorized
+            and client.subscribed
+            and client.worker == request.worker
+            and int(getattr(client, "authorization_generation", 0))
+            == request.authorization_generation
+            and (
+                request.difficulty_generation is None
+                or int(getattr(client, "difficulty_generation", 0))
+                == request.difficulty_generation
+            )
+            and not request.cancelled.is_set()
+        )
+
+    def _initial_request_cancelled(self, request: PendingInitialJob) -> bool:
+        if request.cancelled.is_set() or self.stop_event.is_set():
+            return True
+        with self.lock:
+            self._ensure_initial_job_state()
+            return not self._initial_request_current_locked(request)
+
+    def _cancel_pending_initial_job_locked(
+        self,
+        client: ClientState,
+        *,
+        count: bool,
+    ) -> PendingInitialJob | None:
+        self._ensure_initial_job_state()
+        request = self.pending_initial_jobs.pop(client, None)
+        if request is None:
+            return None
+        request.cancelled.set()
+        if request.future is not None:
+            request.future.cancel()
+        if count:
+            self.initial_job_cancelled_count += 1
+        return request
+
+    def _client_has_current_tip_job_locked(self, client: ClientState) -> bool:
+        context = client.active_job
+        if context is None:
+            return False
+        payout_generation = int(getattr(self, "_payout_state_generation", 0))
+        if int(getattr(context, "payout_state_generation", payout_generation)) != payout_generation:
+            return False
+        current_tip = self._current_published_tip_hash_locked()
+        if current_tip is None:
+            # An active job is not proof that tip observation is alive. Keep
+            # coverage fail-closed until blockpoll/blockwait has published the
+            # tip that makes the job current.
+            return False
+        snapshot = getattr(self, "tip_template_snapshot", None)
+        if snapshot is None:
+            # Focused embedders may only publish the observed tip. Production
+            # startup and blockpoll publish a full snapshot, in which case the
+            # exact template identity checks below are mandatory.
+            return str(context.template.get("previousblockhash", "")) == current_tip
+        if snapshot.bestblockhash != current_tip or snapshot.template_artifacts is None:
+            return False
+        return bool(
+            str(context.template.get("previousblockhash", "")) == current_tip
+            and getattr(context, "template_fingerprint", None)
+            == snapshot.template_fingerprint
+            and int(getattr(context, "template_generation", 0))
+            == snapshot.template_generation
+            and context.template is snapshot.template_artifacts.template
+            and int(getattr(context, "connection_id", client.connection_id))
+            == client.connection_id
+            and int(getattr(context, "authorization_generation", 0))
+            == int(getattr(client, "authorization_generation", 0))
+            and int(getattr(context, "difficulty_generation", 0))
+            == int(getattr(client, "difficulty_generation", 0))
+        )
+
+    def note_initial_job_delivered(
+        self,
+        client: ClientState,
+        *,
+        validated_current: bool = False,
+    ) -> None:
+        with self.lock:
+            self._ensure_initial_job_state()
+            if not validated_current and not self._client_has_current_tip_job_locked(client):
+                return
+            request = self.pending_initial_jobs.pop(client, None)
+            if request is not None:
+                request.cancelled.set()
+                if request.future is not None:
+                    request.future.cancel()
+                delivered = time.monotonic()
+                self.initial_job_sent_count += 1
+                self.initial_job_delivery_latency_seconds_sum += max(
+                    0.0, delivered - request.requested_monotonic
+                )
+                self.initial_job_delivery_latency_count += 1
+                self.last_initial_job_delivery_monotonic = delivered
+
+    def schedule_initial_job(self, client: ClientState) -> bool:
+        """Coalesce and enqueue one first-job request without blocking its handler."""
+        # Focused tests and embedders replace maybe_send_job on the instance as
+        # a synchronous seam. Preserve it without affecting the production
+        # class path, which always uses the bounded executor below.
+        if "maybe_send_job" in self.__dict__:
+            return bool(self.maybe_send_job(client, clean_jobs=True))
+
+        now = time.monotonic()
+        reject = False
+        deferred = False
+        superseded_future: Future[bool] | None = None
+        with self.lock:
+            self._ensure_initial_job_state()
+            if (
+                not client.subscribed
+                or not client.authorized
+                or client.worker is None
+                or getattr(client, "closing", False)
+            ):
+                return True
+            generation = int(getattr(client, "authorization_generation", 0))
+            difficulty_generation = int(
+                getattr(client, "difficulty_generation", 0)
+            )
+            existing = self.pending_initial_jobs.get(client)
+            if (
+                existing is not None
+                and existing.connection_id == client.connection_id
+                and existing.authorization_generation == generation
+                and existing.difficulty_generation == difficulty_generation
+                and existing.worker == client.worker
+            ):
+                self.initial_job_coalesced_count += 1
+                return True
+            if existing is not None:
+                existing.cancelled.set()
+                superseded_future = existing.future
+                self.initial_job_cancelled_count += 1
+                self.initial_job_superseded_count += 1
+            if self._client_has_current_tip_job_locked(client):
+                if existing is not None:
+                    self.pending_initial_jobs.pop(client, None)
+                    if superseded_future is not None:
+                        superseded_future.cancel()
+                return True
+            if (
+                existing is None
+                and len(self.pending_initial_jobs)
+                >= self.stratum_max_pending_initial_jobs
+            ):
+                self.initial_job_queue_rejection_count += 1
+                reject = True
+                request = None
+            else:
+                timeout = float(self.stratum_initial_job_timeout_seconds)
+                predecessor = None
+                if existing is not None:
+                    for candidate in (existing.future, existing.predecessor):
+                        if candidate is not None and not candidate.done():
+                            predecessor = candidate
+                            break
+                request = PendingInitialJob(
+                    client=client,
+                    connection_id=client.connection_id,
+                    authorization_generation=generation,
+                    difficulty_generation=difficulty_generation,
+                    worker=client.worker,
+                    requested_monotonic=now,
+                    deadline_monotonic=now + timeout if timeout > 0 else None,
+                    predecessor=predecessor,
+                )
+                self.pending_initial_jobs[client] = request
+                deferred = predecessor is not None
+        if superseded_future is not None:
+            # Install the replacement before cancellation callbacks can run;
+            # the predecessor callback then hands off exactly one client slot
+            # instead of mistaking the obsolete request for a terminal failure.
+            superseded_future.cancel()
+        if reject or request is None:
+            self.disconnect_client(client)
+            return False
+        if deferred:
+            return True
+
+        return self._submit_initial_job_request(request)
+
+    def request_initial_job_delivery(self, client: ClientState) -> bool:
+        """Compatibility name for the single bounded initial-job pipeline."""
+        return self.schedule_initial_job(client)
+
+    def cancel_initial_job_delivery(self, client: ClientState) -> None:
+        with self.lock:
+            self._ensure_initial_job_state()
+            self._cancel_pending_initial_job_locked(client, count=True)
+
+    def _submit_initial_job_request(self, request: PendingInitialJob) -> bool:
+        client = request.client
+        try:
+            future = self._submit_delivery_task(
+                self.tip_refresh_executor(),
+                self._run_initial_job,
+                request,
+                priority=PRISM_DELIVERY_PRIORITY_INITIAL,
+            )
+        except (_DeliveryQueueFull, RuntimeError):
+            with self.lock:
+                if self.pending_initial_jobs.get(client) is request:
+                    self.pending_initial_jobs.pop(client, None)
+                    request.cancelled.set()
+                    self.initial_job_queue_rejection_count += 1
+            self.disconnect_client(client)
+            return False
+        with self.lock:
+            if self.pending_initial_jobs.get(client) is request:
+                request.future = future
+            else:
+                future.cancel()
+        future.add_done_callback(
+            lambda completed: self._initial_job_future_finished(request, completed)
+        )
+        return True
+
+    def _initial_job_future_finished(
+        self,
+        request: PendingInitialJob,
+        future: Future[bool],
+    ) -> None:
+        """Release failed first-job requests instead of stranding capacity."""
+        delivered = False
+        if not future.cancelled():
+            try:
+                delivered = bool(future.result())
+            except Exception:
+                with self.lock:
+                    self.job_build_failure_count = int(
+                        getattr(self, "job_build_failure_count", 0)
+                    ) + 1
+                print(
+                    "prism coordinator: initial job task failed "
+                    f"connection={request.client.connection_id}",
+                    flush=True,
+                )
+                traceback.print_exc()
+
+        disconnect = False
+        replacement: PendingInitialJob | None = None
+        with self.lock:
+            self._ensure_initial_job_state()
+            current = self.pending_initial_jobs.get(request.client)
+            if current is not request:
+                if (
+                    current is not None
+                    and current.future is None
+                    and current.predecessor is future
+                ):
+                    current.predecessor = None
+                    replacement = current
+            elif delivered and self._client_has_current_tip_job_locked(request.client):
+                self.pending_initial_jobs.pop(request.client, None)
+                request.cancelled.set()
+                self.last_initial_job_delivery_monotonic = time.monotonic()
+            elif current is request:
+                self.pending_initial_jobs.pop(request.client, None)
+                request.cancelled.set()
+                self.initial_job_failed_count += 1
+                disconnect = True
+        if replacement is not None:
+            self._submit_initial_job_request(replacement)
+        if disconnect:
+            self.disconnect_client(request.client)
+
+    def _run_initial_job(self, request: PendingInitialJob) -> bool:
+        """Prepare outside client locks, then atomically stamp and send current work."""
+        retry_delay = 0.05
+        last_failure_log_monotonic: float | None = None
+
+        def retry_later() -> bool:
+            nonlocal retry_delay
+            request.cancelled.wait(retry_delay)
+            retry_delay = min(1.0, retry_delay * 2)
+            return not self._initial_request_cancelled(request)
+
+        try:
+            while not self._initial_request_cancelled(request):
+                try:
+                    if not self.ensure_reorg_reconciled_for_current_tip():
+                        if not retry_later():
+                            return False
+                        continue
+                    artifacts = self.current_template_artifacts()
+                    if self._initial_request_cancelled(request):
+                        return False
+                    bundle = self.shared_job_bundle(
+                        artifacts,
+                        request.worker,
+                        cancelled=lambda: (
+                            self._initial_request_cancelled(request)
+                            or not self._template_artifacts_are_current(artifacts)
+                        ),
+                    )
+                    live_tip = str(self.rpc.call("getbestblockhash"))
+                    if artifacts.previousblockhash != live_tip:
+                        with self._job_cache_lock:
+                            if self._template_artifacts is artifacts:
+                                self._template_artifacts = None
+                        if not retry_later():
+                            return False
+                        continue
+                except _JobBuildCancelled:
+                    if self._initial_request_cancelled(request):
+                        return False
+                    if not retry_later():
+                        return False
+                    continue
+                except TemplateRefreshBlocked:
+                    if self._initial_request_cancelled(request):
+                        return False
+                    if not retry_later():
+                        return False
+                    continue
+                except Exception:
+                    with self.lock:
+                        self.job_build_failure_count = int(
+                            getattr(self, "job_build_failure_count", 0)
+                        ) + 1
+                    now = time.monotonic()
+                    if (
+                        last_failure_log_monotonic is None
+                        or now - last_failure_log_monotonic >= 5.0
+                    ):
+                        last_failure_log_monotonic = now
+                        print(
+                            "prism coordinator: initial job preparation failed "
+                            f"connection={request.client.connection_id}; retrying",
+                            flush=True,
+                        )
+                        traceback.print_exc()
+                    if not retry_later():
+                        return False
+                    continue
+                delivered = self._deliver_initial_bundle(request, artifacts, bundle)
+                if delivered is None:
+                    if not retry_later():
+                        return False
+                    continue
+                return delivered
+            return False
+        except OSError:
+            self.disconnect_client(request.client)
+            return False
+
+    def _template_artifacts_are_current(self, artifacts: CachedTemplateArtifacts) -> bool:
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            current = self._template_artifacts
+            return (
+                current is artifacts
+                or (
+                    current is not None
+                    and current.fingerprint == artifacts.fingerprint
+                    and current.generation == artifacts.generation
+                )
+            )
+
+    def _acquire_client_job_lock(
+        self,
+        client: ClientState,
+        cancelled: Callable[[], bool],
+    ) -> bool:
+        while not cancelled():
+            if client.job_update_lock.acquire(timeout=0.1):
+                return True
+        return False
+
+    @contextmanager
+    def _cancellable_client_job_lock(
+        self,
+        client: ClientState,
+        cancelled: Callable[[], bool],
+    ) -> Iterator[bool]:
+        acquired = self._acquire_client_job_lock(client, cancelled)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                client.job_update_lock.release()
+
+    def _payout_delivery(
+        self,
+        cancelled: Callable[[], bool],
+        *,
+        generation: int,
+    ) -> Any:
+        """Use cancellable admission while retaining focused gate test seams."""
+        gate = self._payout_state_delivery_gate
+        delivery_cancelable = getattr(gate, "delivery_cancelable", None)
+        if callable(delivery_cancelable):
+            return delivery_cancelable(
+                cancelled,
+                generation=generation,
+                priority=True,
+            )
+        delivery = gate.delivery
+        try:
+            return delivery(cancelled)
+        except TypeError:
+            return delivery()
+
+    @staticmethod
+    def _submit_delivery_task(
+        executor: object,
+        function: Callable[..., Any],
+        *args: object,
+        priority: int,
+    ) -> Future[Any]:
+        submit = getattr(executor, "submit")
+        if isinstance(executor, _BoundedPriorityExecutor):
+            return submit(function, *args, priority=priority)
+        return submit(function, *args)
+
+    def _deliver_initial_bundle(
+        self,
+        request: PendingInitialJob,
+        artifacts: CachedTemplateArtifacts,
+        bundle: CachedJobBundle,
+    ) -> bool | None:
+        client = request.client
+        cancelled = lambda: self._initial_request_cancelled(request)
+        if not self._acquire_client_job_lock(client, cancelled):
+            return False
+        try:
+            if cancelled():
+                return False
+            if not self._template_artifacts_are_current(artifacts):
+                return None
+            self._ensure_job_cache_state()
+            gate_started = time.monotonic()
+            with self._payout_delivery(
+                cancelled,
+                generation=bundle.payout_state_generation,
+            ) as admitted:
+                self._observe_payout_gate_admission(
+                    admitted,
+                    generation=bundle.payout_state_generation,
+                    fallback_wait_seconds=time.monotonic() - gate_started,
+                )
+                if not admitted or cancelled():
+                    return False
+                with self._job_cache_lock:
+                    payout_current = (
+                        bundle.payout_state_generation == self._payout_state_generation
+                    )
+                if not payout_current or not self._template_artifacts_are_current(artifacts):
+                    return None
+                with self.lock:
+                    if not self._initial_request_current_locked(request):
+                        return False
+                    context = self.stamp_job_for_client(
+                        client,
+                        bundle,
+                        clean_jobs=True,
+                    )
+                    client.active_job = context
+                    for job_id in tuple(client.active_job_ids):
+                        self.bury_evicted_job(client, job_id, prune=False)
+                        self.jobs.pop(job_id, None)
+                    client.active_job_ids.clear()
+                    self.prune_evicted_job_graveyard(force=False)
+                    self.jobs[context.job.job_id] = context
+                    client.active_job_ids.add(context.job.job_id)
+                    self.prune_client_active_jobs(client)
+
+                send_started = time.monotonic()
+                self.send_job_update(client, context.job)
+                mark_delivered = getattr(admitted, "mark_delivered", None)
+                if callable(mark_delivered):
+                    mark_delivered()
+                self.apply_job_difficulty(client, context.job)
+                self.note_tip_work_delivered(
+                    client,
+                    str(context.template["previousblockhash"]),
+                )
+                self._record_first_payout_delivery(
+                    bundle.payout_state_generation,
+                    time.monotonic(),
+                )
+                self.note_initial_job_delivered(client, validated_current=True)
+                return True
+        finally:
+            client.job_update_lock.release()
+
+    def sweep_initial_job_timeouts(self, *, now: float | None = None) -> int:
+        now = time.monotonic() if now is None else now
+        timed_out: list[PendingInitialJob] = []
+        with self.lock:
+            self._ensure_initial_job_state()
+            expired = [
+                request
+                for request in self.pending_initial_jobs.values()
+                if request.deadline_monotonic is not None
+                and request.deadline_monotonic <= now
+            ]
+            for request in expired:
+                if self.pending_initial_jobs.get(request.client) is not request:
+                    continue
+                self.pending_initial_jobs.pop(request.client, None)
+                request.cancelled.set()
+                if request.future is not None:
+                    request.future.cancel()
+                # Commit teardown while this request still owns the pending
+                # slot. A concurrent reauthorization will observe closing and
+                # cannot install a replacement between expiry and disconnect.
+                request.client.closing = True
+                self.initial_job_timeout_count += 1
+                timed_out.append(request)
+        for request in timed_out:
+            self.disconnect_client(request.client)
+        return len(timed_out)
+
+    def initial_job_timeout_loop(self) -> None:
+        while not self.stop_event.wait(1.0):
+            self.sweep_initial_job_timeouts()
 
     def _record_heartbeat(self, name: str) -> None:
         self._ensure_watchdog_state()
@@ -4147,6 +6401,14 @@ class PrismCoordinator:
         # chance to re-enter the submit queue.
         if not self._run_startup_writer_replay(self.replay_pending_block_candidates):
             return
+        prepared = self.prewarm_startup_jobs()
+        print(
+            "prism coordinator: startup job preparation "
+            f"status={'complete' if prepared is not None else 'deferred'} "
+            f"mode={'ready' if prepared is not None else 'collection'} "
+            f"tip={self.tip_template_snapshot.bestblockhash if self.tip_template_snapshot else 'unknown'}",
+            flush=True,
+        )
         with ExitStack() as listener_stack:
             listeners: list[tuple[socket.socket, StratumListenerProfile]] = []
             for profile in self.listener_profiles:
@@ -4178,6 +6440,14 @@ class PrismCoordinator:
                     daemon=True,
                 )
                 vardiff_idle_sweep_thread.start()
+            initial_job_timeout_thread: threading.Thread | None = None
+            if self.stratum_initial_job_timeout_seconds > 0:
+                initial_job_timeout_thread = threading.Thread(
+                    target=self.initial_job_timeout_loop,
+                    name="prism-initial-job-timeouts",
+                    daemon=True,
+                )
+                initial_job_timeout_thread.start()
             self._record_heartbeat("block_submitter")
             block_submitter_thread = threading.Thread(
                 target=self.block_submit_loop,
@@ -4192,6 +6462,8 @@ class PrismCoordinator:
                 drain_threads.append((blockwait_thread, 1.0))
             if vardiff_idle_sweep_thread is not None:
                 drain_threads.append((vardiff_idle_sweep_thread, 1.0))
+            if initial_job_timeout_thread is not None:
+                drain_threads.append((initial_job_timeout_thread, 1.0))
             # Replay any shares stranded on disk by a prior ledger-outage
             # shutdown before serving, so no acked share is lost across restart.
             if not self._run_startup_writer_replay(
@@ -4334,6 +6606,11 @@ class PrismCoordinator:
                         share_difficulty=self.client_startup_difficulty(profile),
                     )
                     self.clients.add(client)
+                    self._ensure_initial_job_state()
+                    self.peak_active_connection_count = max(
+                        self.peak_active_connection_count,
+                        len(self.clients),
+                    )
             if client is None:
                 try:
                     sock.close()
@@ -4350,12 +6627,22 @@ class PrismCoordinator:
                 sock.settimeout(None)
                 self.apply_stratum_send_timeout(sock)
                 thread = threading.Thread(target=self.handle_client, args=(client,), daemon=True)
+                with self.lock:
+                    client.handler_thread_registered = True
+                    self.handler_thread_count += 1
                 thread.start()
             except (OSError, RuntimeError) as exc:
                 # Admission is atomic with the global count. Undo it if socket
                 # setup or thread creation fails before a handler owns cleanup,
                 # then keep this listener alive for the next connection.
                 try:
+                    with self.lock:
+                        if client.handler_thread_registered:
+                            client.handler_thread_registered = False
+                            self.handler_thread_count = max(
+                                0,
+                                self.handler_thread_count - 1,
+                            )
                     self.disconnect_client(client)
                 except Exception:
                     print(
@@ -4549,6 +6836,18 @@ class PrismCoordinator:
                 # nested reconciliation enters the writer gate. That is an
                 # intentional shutdown stop, not a template-health failure.
                 return
+            except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked) as exc:
+                # Coordination-blocked attempts neither record into nor fire
+                # the failure budget. A clock armed by an earlier budgeted
+                # failure must wait for the next budgeted failure (or be
+                # cleared by the next completed refresh): exiting here would
+                # let a transient blip plus ordinary payout/tip churn restart
+                # a process whose qbitd RPC is healthy. The retry is already
+                # scheduled by the raise site.
+                print(
+                    f"prism coordinator: tip/template refresh superseded; retrying: {exc}",
+                    flush=True,
+                )
             except Exception:
                 print("prism coordinator: qbit tip/template poll failed", flush=True)
                 traceback.print_exc()
@@ -4786,7 +7085,11 @@ class PrismCoordinator:
         artifacts = self._tip_refresh_artifacts(snapshot)
         build_started = time.monotonic()
         try:
-            bundle = self.shared_job_bundle(artifacts, mode="ready")
+            bundle = self.shared_job_bundle(
+                artifacts,
+                mode="ready",
+                retry_superseded=False,
+            )
         except TemplateRefreshBlocked:
             raise
         except Exception as exc:
@@ -4817,6 +7120,83 @@ class PrismCoordinator:
             )
         return bundle
 
+    def prewarm_current_tip_ready_bundle(self) -> CachedJobBundle | None:
+        """Publish one exact current-tip ready bundle before Stratum accepts."""
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            self.job_preparation_pending = True
+        try:
+            observation_sequence = self._reserve_tip_observation_sequence()
+            snapshot = self.fetch_qbit_tip_template_snapshot()
+            try:
+                reconciled = self.ensure_reorg_reconciled_for_tip(
+                    snapshot.bestblockhash
+                )
+            except Exception as exc:
+                raise TemplateRefreshBlocked(
+                    "startup reorg reconciliation failed before job preparation"
+                ) from exc
+            if not reconciled:
+                raise TemplateRefreshBlocked(
+                    "startup chain view remained untrusted during job preparation"
+                )
+
+            ready = self.pool_readiness_latched()
+            bundle: CachedJobBundle | None = None
+            if ready:
+                bundle = self.shared_job_bundle(
+                    self._tip_refresh_artifacts(snapshot),
+                    None,
+                )
+                if bundle.collection_only:
+                    raise TemplateRefreshBlocked(
+                        "startup ready preparation produced collection work"
+                    )
+                if bundle.payout_state_generation != int(
+                    getattr(self, "_payout_state_generation", 0)
+                ):
+                    raise TemplateRefreshSuperseded(
+                        "payout state changed during startup job preparation"
+                    )
+
+            if str(self.rpc.call("getbestblockhash")) != snapshot.bestblockhash:
+                raise TemplateRefreshSuperseded(
+                    "qbit tip changed during startup job preparation"
+                )
+            if not self.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=observation_sequence,
+                publish_refresh_observation=True,
+                published_snapshot=snapshot,
+            ):
+                raise TemplateRefreshSuperseded(
+                    "startup job preparation was superseded before publication"
+                )
+            with self._job_cache_lock:
+                self._prepared_ready_snapshot = snapshot if bundle is not None else None
+                self._prepared_ready_bundle = bundle
+            self.last_successful_template_refresh_monotonic = time.monotonic()
+            return bundle
+        finally:
+            with self._job_cache_lock:
+                self.job_preparation_pending = False
+
+    def prewarm_startup_jobs(self) -> CachedJobBundle | None:
+        """Best-effort startup prewarm; transient blocking defers to blockpoll."""
+        try:
+            return self.prewarm_current_tip_ready_bundle()
+        except TemplateRefreshBlocked as exc:
+            # Startup prewarming is an optimization. A transient reconciliation,
+            # payout-generation, or tip race must not prevent Stratum listeners
+            # from opening; blockpoll and the bounded initial-job queue retry it.
+            self._schedule_tip_refresh_retry()
+            print(
+                "prism coordinator: startup job preparation deferred "
+                f"reason={exc}",
+                flush=True,
+            )
+            return None
+
     def _tip_refresh_token_current_locked(
         self,
         token: TipRefreshValidationToken,
@@ -4841,6 +7221,7 @@ class PrismCoordinator:
         bundle: CachedJobBundle,
         snapshot: QbitTipTemplateSnapshot,
     ) -> bool:
+        published = getattr(self, "_published_payout_state", None)
         return bool(
             token.snapshot is snapshot
             and token.tip_hash == snapshot.bestblockhash
@@ -4849,8 +7230,20 @@ class PrismCoordinator:
             and bundle.template_fingerprint == token.template_fingerprint
             and bundle.template_generation == token.template_generation
             and bundle.payout_state_generation == token.payout_state_generation
+            and bundle.build_key is token.build_key
+            and token.build_key.best_tip_hash == snapshot.bestblockhash
+            and token.build_key.previous_block_hash == snapshot.previousblockhash
+            and token.build_key.template_fingerprint
+            == snapshot.template_fingerprint
+            and token.build_key.template_generation == snapshot.template_generation
+            and token.build_key.payout_state_generation
+            == token.payout_state_generation
             and token.payout_state_generation
             == int(getattr(self, "_payout_state_generation", 0))
+            and published is not None
+            and published.artifact is not None
+            and token.build_key.payout_artifact_sha256
+            == published.artifact.prior_balances_sha256
             and snapshot.template_artifacts is not None
             and bundle.template is snapshot.template_artifacts.template
             and not self._detected_tip_supersedes_locked(
@@ -4889,6 +7282,12 @@ class PrismCoordinator:
             bundle.template is not artifacts.template
             or bundle.template_fingerprint != artifacts.fingerprint
             or bundle.template_generation != artifacts.generation
+            or bundle.build_key is None
+            or bundle.build_key.best_tip_hash != snapshot.bestblockhash
+            or bundle.build_key.previous_block_hash != snapshot.previousblockhash
+            or bundle.build_key.template_fingerprint != artifacts.fingerprint
+            or bundle.build_key.template_generation != artifacts.generation
+            or bundle.build_key.mode != "ready"
         ):
             raise TemplateRefreshBlocked(
                 "prepared refresh bundle changed before final validation"
@@ -4902,7 +7301,7 @@ class PrismCoordinator:
             ) from exc
         if current_tip != snapshot.bestblockhash:
             self._schedule_tip_refresh_retry()
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "qbit tip changed before prepared fanout "
                 f"expected={snapshot.bestblockhash} current={current_tip}"
             )
@@ -4927,6 +7326,7 @@ class PrismCoordinator:
             template_generation=artifacts.generation,
             payout_state_generation=bundle.payout_state_generation,
             observation_sequence=observation_sequence,
+            build_key=bundle.build_key,
             snapshot=snapshot,
         )
         with self.lock:
@@ -4936,7 +7336,7 @@ class PrismCoordinator:
                 snapshot,
             ):
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "prepared refresh was superseded before tip publication"
                 )
         return token
@@ -4951,7 +7351,7 @@ class PrismCoordinator:
         with self.lock:
             if not self._tip_refresh_token_current_locked(token, bundle, snapshot):
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "prepared refresh was superseded before cancellation registration"
                 )
             active = self._active_tip_refresh
@@ -4980,7 +7380,7 @@ class PrismCoordinator:
         ) as payout_admitted:
             if not payout_admitted:
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "prepared refresh was superseded before atomic publication"
                 )
             # Match payout publication's cache -> coordinator lock order. A
@@ -5001,7 +7401,7 @@ class PrismCoordinator:
                         )
                     ):
                         self._schedule_tip_refresh_retry()
-                        raise TemplateRefreshBlocked(
+                        raise TemplateRefreshSuperseded(
                             "prepared refresh was superseded before atomic publication"
                         )
 
@@ -5030,9 +7430,12 @@ class PrismCoordinator:
                     self.tip_template_snapshot = snapshot
                     self.tip_refresh_divergence_started_monotonic = None
                     if tip_changed:
-                        # Retained collection work and graveyard classification
-                        # both belong to the previously published tip.
+                        # Retained collection work, the retained ready bundle,
+                        # and graveyard classification all belong to the
+                        # previously published tip.
                         self._retained_collection_refresh = None
+                        self._prepared_ready_bundle = None
+                        self._prepared_ready_snapshot = None
                         self.prune_evicted_job_graveyard(now=now, force=True)
 
                     if not self._tip_refresh_token_current_locked(
@@ -5097,6 +7500,15 @@ class PrismCoordinator:
         started = worker_started if submitted_monotonic is None else submitted_monotonic
         phases = self._job_build_phases()
         phases.clear()
+        cancelled = lambda: (
+            self._prepared_tip_refresh_obsolete(
+                validation_token,
+                bundle,
+                snapshot,
+                cancel_event,
+            )
+            or getattr(client, "closing", False)
+        )
         phases["executor_queue"] = max(0.0, worker_started - started)
         client_lock_started = worker_started
         client_lock_acquired = False
@@ -5110,12 +7522,7 @@ class PrismCoordinator:
                         or getattr(client, "closing", False)
                     ):
                         return RefreshResult("disconnected")
-                if self._prepared_tip_refresh_obsolete(
-                    validation_token,
-                    bundle,
-                    snapshot,
-                    cancel_event,
-                ):
+                if cancelled():
                     phases["client_lock"] = max(
                         0.0,
                         time.monotonic() - client_lock_started,
@@ -5134,12 +7541,7 @@ class PrismCoordinator:
                 0.0,
                 time.monotonic() - client_lock_started,
             )
-            if self._prepared_tip_refresh_obsolete(
-                validation_token,
-                bundle,
-                snapshot,
-                cancel_event,
-            ):
+            if cancelled():
                 self._record_tip_refresh_cancellation("client_lock")
                 return RefreshResult("skipped")
             with self.lock:
@@ -5161,12 +7563,7 @@ class PrismCoordinator:
             self._ensure_job_cache_state()
             payout_gate_started = time.monotonic()
             with self._payout_state_delivery_gate.delivery_cancelable(
-                lambda: self._prepared_tip_refresh_obsolete(
-                    validation_token,
-                    bundle,
-                    snapshot,
-                    cancel_event,
-                ),
+                cancelled,
                 generation=bundle.payout_state_generation,
                 priority=True,
             ) as payout_admitted:
@@ -5179,12 +7576,7 @@ class PrismCoordinator:
                     generation=bundle.payout_state_generation,
                     fallback_wait_seconds=phases["payout_gate"],
                 )
-                if not payout_admitted or self._prepared_tip_refresh_obsolete(
-                    validation_token,
-                    bundle,
-                    snapshot,
-                    cancel_event,
-                ):
+                if not payout_admitted or cancelled():
                     self._record_tip_refresh_cancellation("payout_gate")
                     return RefreshResult("skipped")
                 fanout_admitted = (
@@ -5263,6 +7655,7 @@ class PrismCoordinator:
                         client,
                         str(context.template["previousblockhash"]),
                     )
+                    self.note_initial_job_delivered(client, validated_current=True)
                     delivered_monotonic = time.monotonic()
                     self._record_first_payout_delivery(
                         context.payout_state_generation,
@@ -5367,7 +7760,15 @@ class PrismCoordinator:
                 except StopIteration:
                     return
                 submitted = time.monotonic()
-                future = executor.submit(
+                active_job = expected_active_jobs.get(client)
+                if active_job is None:
+                    priority = PRISM_DELIVERY_PRIORITY_INITIAL
+                elif self.client_tip_changed_for_snapshot(client, snapshot):
+                    priority = PRISM_DELIVERY_PRIORITY_NEW_TIP
+                else:
+                    priority = PRISM_DELIVERY_PRIORITY_SAME_TIP
+                future = self._submit_delivery_task(
+                    executor,
                     self.send_prepared_job,
                     client,
                     bundle,
@@ -5377,6 +7778,7 @@ class PrismCoordinator:
                     expected_active_jobs.get(client),
                     cancel_event,
                     submitted,
+                    priority=priority,
                 )
                 self._tip_refresh_future_started()
                 future.add_done_callback(self._tip_refresh_future_finished)
@@ -5516,7 +7918,7 @@ class PrismCoordinator:
                 )
             if not token_current:
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "prepared refresh was superseded during fanout; immediate retry scheduled"
                 )
             try:
@@ -5530,7 +7932,7 @@ class PrismCoordinator:
             if post_fanout_tip != snapshot.bestblockhash:
                 cancel_event.set()
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "qbit tip changed during prepared fanout; immediate retry scheduled "
                     f"expected={snapshot.bestblockhash} current={post_fanout_tip}"
                 )
@@ -5562,7 +7964,7 @@ class PrismCoordinator:
             if not token_current:
                 cancel_event.set()
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "prepared refresh payout state changed during post-fanout "
                     "validation; immediate retry scheduled"
                 )
@@ -5572,17 +7974,20 @@ class PrismCoordinator:
 
     def poll_qbit_tip_template_once(self, *, heartbeat_name: str = "qbit_blockpoll") -> int:
         self._ensure_tip_refresh_state()
+        self._ensure_job_cache_state()
         refresh_started = time.monotonic()
-        while not self._tip_refresh_lock.acquire(timeout=1.0):
-            self._record_heartbeat(heartbeat_name)
-            if self.stop_event.is_set():
-                return 0
-            self._probe_tip_while_refresh_waiting()
+        publication_lock_acquired = False
         observation_sequence = 0
         pending_signal_token: int | None = None
         try:
             observation_sequence = self._reserve_tip_observation_sequence()
             pending_signal_token = self._claim_tip_refresh_pending()
+            with self.lock:
+                poll_start_clients = tuple(
+                    client
+                    for client in self.clients
+                    if self.client_can_receive_jobs(client)
+                )
             # The interval poller has no push notification to mark priority for
             # it. Probe the cheap best-tip RPC before fetching and deriving the
             # template so CTV maintenance can yield as soon as a changed tip is
@@ -5727,6 +8132,20 @@ class PrismCoordinator:
                 # both token ownership and payout/detected-tip currentness, so
                 # a later producer cannot be cleared accidentally.
                 pending_signal_token = self._claim_tip_refresh_pending()
+            with self.lock:
+                selected_clients_list = list(clients)
+                selected_client_set = set(clients)
+                for client in poll_start_clients:
+                    if client in selected_client_set:
+                        continue
+                    if snapshot_changed or self.client_needs_tip_template_refresh(
+                        client,
+                        snapshot,
+                    ):
+                        selected_clients_list.append(client)
+                        selected_client_set.add(client)
+                        expected_active_jobs[client] = client.active_job
+                selected_clients = tuple(selected_clients_list)
             use_prepared_fanout = bool(
                 clients
                 and getattr(self, "_pool_ready_latched", False)
@@ -5761,7 +8180,7 @@ class PrismCoordinator:
                     # newer bundle for only that old subset; retry so selection
                     # and the signed payout snapshot advance together.
                     self._schedule_tip_refresh_retry()
-                    raise TemplateRefreshBlocked(
+                    raise TemplateRefreshSuperseded(
                         "payout state changed after refresh client selection; "
                         "immediate retry scheduled"
                     )
@@ -5770,6 +8189,49 @@ class PrismCoordinator:
                 snapshot,
                 observation_sequence,
             )
+            # Construction is complete. Acquire the short publication lane
+            # only for final validation, snapshot publication, and current
+            # client selection. Other observations and replacement builds can
+            # progress while an obsolete builder is still unwinding.
+            while not self._tip_refresh_lock.acquire(
+                timeout=PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS
+            ):
+                self._record_heartbeat(heartbeat_name)
+                if self.stop_event.is_set():
+                    return 0
+                self._probe_tip_while_refresh_waiting()
+                self._raise_if_tip_refresh_superseded(
+                    snapshot,
+                    observation_sequence,
+                )
+            publication_lock_acquired = True
+            with self._job_cache_lock:
+                current_payout_generation = self._payout_state_generation
+                current_payout_artifact = self._published_payout_state.artifact
+            if (
+                current_payout_generation
+                != payout_generation_after_reconciliation
+                or (
+                    bundle is not None
+                    and (
+                        current_payout_artifact is None
+                        or bundle.build_key is None
+                        or bundle.build_key.payout_artifact_sha256
+                        != current_payout_artifact.prior_balances_sha256
+                    )
+                )
+            ):
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "complete build key changed before refresh publication"
+                )
+
+            # A ready-pool pass must build and validate its immutable shared
+            # bundle before publishing submit authority. Otherwise a cache,
+            # derivation, or final chain-validation failure can invalidate
+            # retained work without a deliverable replacement. Sequential /
+            # collection work has no shared preparation stage, so it commits
+            # here immediately before its worker-specific builds.
             if use_prepared_fanout:
                 assert bundle is not None
                 # Acquire infrastructure before publishing authority. Once the
@@ -5796,21 +8258,14 @@ class PrismCoordinator:
                     snapshot,
                     parent_hash=prepared_parent_hash,
                 )
-
-            # A ready-pool pass must build and validate its immutable shared
-            # bundle before publishing submit authority. Otherwise a cache,
-            # derivation, or final chain-validation failure can invalidate
-            # retained work without a deliverable replacement. Sequential /
-            # collection work has no shared preparation stage, so it commits
-            # here immediately before its worker-specific builds.
-            if not use_prepared_fanout:
+            else:
                 if not self.observe_tip_first_seen(
                     snapshot.bestblockhash,
                     observation_sequence=observation_sequence,
                     publish_refresh_observation=True,
                     published_snapshot=snapshot,
                 ):
-                    raise TemplateRefreshBlocked(
+                    raise TemplateRefreshSuperseded(
                         "tip/template poll was superseded by a newer tip observation"
                     )
                 self.prune_evicted_job_graveyard(force=False)
@@ -5822,13 +8277,61 @@ class PrismCoordinator:
                         or int(getattr(self, "current_tip_observation_sequence", 0))
                         != observation_sequence
                     ):
-                        raise TemplateRefreshBlocked(
+                        raise TemplateRefreshSuperseded(
                             "tip/template poll was superseded before snapshot publication"
                         )
                     if self.tip_template_snapshot is not snapshot:
                         raise TemplateRefreshBlocked(
                             "tip/template snapshot was not atomically published"
                         )
+
+            dropped_client_results: list[str] = []
+            with self.lock:
+                # Revalidate the originally selected targets at publication.
+                # New connections keep their own pending/retained wake; this
+                # pass must not consume work that appeared after construction.
+                # Preserve the pre-build expected job pointer so an intervening
+                # authorize/Vardiff delivery is never overwritten.
+                current_clients: list[ClientState] = []
+                for client in selected_clients:
+                    if client not in self.clients:
+                        dropped_client_results.append("disconnected")
+                    elif not self.client_can_receive_jobs(client):
+                        dropped_client_results.append("skipped")
+                    elif not self.client_needs_tip_template_refresh(client, snapshot):
+                        dropped_client_results.append("skipped")
+                    else:
+                        current_clients.append(client)
+                clients = current_clients
+
+            for result in dropped_client_results:
+                self._record_tip_refresh_client_result(result)
+
+            if bundle is not None and not bundle.collection_only:
+                with self._job_cache_lock:
+                    if (
+                        bundle.payout_state_generation
+                        == self._payout_state_generation
+                    ):
+                        self._prepared_ready_snapshot = snapshot
+                        self._prepared_ready_bundle = bundle
+
+            if (
+                not use_prepared_fanout
+                and clients
+                and getattr(self, "_pool_ready_latched", False)
+            ):
+                # Publication already committed through the sequential path,
+                # so a ready-pool target that appeared after build selection
+                # has no shared bundle to receive. Leave the pending marker
+                # armed and let the immediate retry build for it.
+                self._mark_tip_refresh_pending(observation_sequence)
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "current clients appeared after build selection; retry scheduled"
+                )
+            self._tip_refresh_lock.release()
+            publication_lock_acquired = False
 
             if not ready_mode:
                 with self.lock:
@@ -5935,7 +8438,7 @@ class PrismCoordinator:
                         ) from exc
                     if post_fanout_tip != snapshot.bestblockhash:
                         self._schedule_tip_refresh_retry()
-                        raise TemplateRefreshBlocked(
+                        raise TemplateRefreshSuperseded(
                             "qbit tip changed during sequential refresh; "
                             "immediate retry scheduled "
                             f"expected={snapshot.bestblockhash} current={post_fanout_tip}"
@@ -5944,7 +8447,7 @@ class PrismCoordinator:
                         payout_generation_after_reconciliation
                     ):
                         self._schedule_tip_refresh_retry()
-                        raise TemplateRefreshBlocked(
+                        raise TemplateRefreshSuperseded(
                             "payout state changed during sequential refresh; "
                             "immediate retry scheduled"
                         )
@@ -5975,18 +8478,31 @@ class PrismCoordinator:
                 # guard. Preserve its pending token and retry immediately.
                 pending_signal_token = None
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "tip or payout state changed before refresh completion; "
                     "immediate retry scheduled"
                 )
             self.last_successful_template_refresh_monotonic = time.monotonic()
             self.template_refresh_failure_started_monotonic = None
             return refreshed
+        except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked):
+            # Coordination-blocked refreshes -- a superseded tip, a pending
+            # payout publication fence, a refresh raced by payout mutation --
+            # are churn between healthy components, not qbitd unhealthiness.
+            # They must not arm the restart budget: sustained payout churn
+            # would otherwise self-terminate a process whose RPC is fine, and
+            # each restart re-triggers the same churn. Re-raise so callers
+            # still schedule their immediate retry. Plain TemplateRefreshBlocked
+            # stays budgeted below: it also wraps genuine failures (job builds
+            # failing, malformed template artifacts, untrusted chain views)
+            # whose persistence must still take the budgeted restart path.
+            raise
         except Exception:
             self._record_template_refresh_failure(time.monotonic())
             raise
         finally:
-            self._tip_refresh_lock.release()
+            if publication_lock_acquired:
+                self._tip_refresh_lock.release()
             self._observe_tip_refresh_seconds(
                 "refresh",
                 time.monotonic() - refresh_started,
@@ -6031,7 +8547,7 @@ class PrismCoordinator:
             )
         if superseded:
             self._schedule_tip_refresh_retry()
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "tip/template poll was superseded by a newer tip observation "
                 "before refresh preparation"
             )
@@ -6134,6 +8650,12 @@ class PrismCoordinator:
 
         if active_to_cancel is not None:
             active_to_cancel.cancel()
+        if detection_changed:
+            # In-flight constructions for older parents can no longer win;
+            # stop them at detection so replacement preparation starts
+            # immediately, well before publication moves submit authority.
+            self._cancel_obsolete_job_bundle_builds(current_tip=tip_hash)
+            self._cancel_obsolete_job_builds("chain tip superseded")
         if should_mark_pending:
             self._mark_tip_refresh_pending(observation_sequence)
             self._schedule_tip_refresh_retry()
@@ -6256,6 +8778,13 @@ class PrismCoordinator:
             # the actual chain parent removes multi-tip-behind entries while
             # the independently configured grace lifetime protects one-back.
             self.prune_evicted_job_graveyard(now=now, force=True)
+        if tip_changed:
+            # A retained ready bundle belongs to the previously published tip
+            # and can never satisfy the consumer's published-snapshot identity
+            # check again; release it as soon as authority moves.
+            with self._job_cache_lock:
+                self._prepared_ready_bundle = None
+                self._prepared_ready_snapshot = None
         return True
 
     def _fetch_tip_parent_hash(self, tip_hash: str) -> str | None:
@@ -6780,7 +9309,7 @@ class PrismCoordinator:
         bestblockhash = str(self.rpc.call("getbestblockhash"))
         if bestblockhash != previousblockhash:
             self._schedule_tip_refresh_retry()
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "qbit tip changed while fetching block template "
                 f"template_parent={previousblockhash} current={bestblockhash}"
             )
@@ -6813,7 +9342,7 @@ class PrismCoordinator:
             return True
         current_tip = str(self.rpc.call("getbestblockhash"))
         if expected_tip_hash is not None and current_tip != expected_tip_hash:
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "qbit tip changed while prepared work was queued "
                 f"expected={expected_tip_hash} current={current_tip}"
             )
@@ -7451,15 +9980,27 @@ class PrismCoordinator:
                 pass
             finally:
                 self.disconnect_client(client)
+                with self.lock:
+                    self._ensure_initial_job_state()
+                    if getattr(client, "handler_thread_registered", False):
+                        client.handler_thread_registered = False
+                        self.handler_thread_count = max(
+                            0,
+                            self.handler_thread_count - 1,
+                        )
 
     def disconnect_client(self, client: ClientState) -> None:
         # Retire admission and fanout eligibility without waiting behind job
         # delivery. Only the first caller owns socket close and final cleanup.
         with self.lock:
-            if getattr(client, "closing", False):
+            # The timeout sweeper marks closing while leaving membership in
+            # place as its atomic handoff token. Whichever disconnect caller
+            # first removes that membership owns socket close and cleanup.
+            if getattr(client, "closing", False) and client not in self.clients:
                 return
             client.closing = True
             self.clients.discard(client)
+            self._cancel_pending_initial_job_locked(client, count=True)
 
         # Do not take send_lock here: shutdown must interrupt an in-flight
         # sendall as well as the handler's blocking reader.
@@ -7479,6 +10020,9 @@ class PrismCoordinator:
                         self.evicted_jobs_by_connection.get(client.connection_id, ())
                     ):
                         self._remove_evicted_job_locked(job_id)
+                    client.authorized = False
+                    client.worker = None
+                    client.username = ""
             self._retain_current_collection_refresh_if_unrepresented()
 
     def handle_request(self, client: ClientState, request: dict[str, object]) -> None:
@@ -7524,13 +10068,18 @@ class PrismCoordinator:
                     [[], client.extranonce1_hex, self.extranonce2_size],
                 )
                 self._note_collection_identity_available(client)
-                self.maybe_send_job(client, clean_jobs=True)
+                needs_initial_job = client.authorized
+            if needs_initial_job:
+                self.request_initial_job_delivery(client)
             return
         if method == "mining.authorize":
+            username = str(params[0]) if params else ""
+            password = str(params[1]) if len(params) > 1 and params[1] is not None else ""
+            # Address validation may use RPC; it is unrelated to client job
+            # state and therefore stays outside the job-update lock.
+            worker = self.resolve_worker(username)
             with client.job_update_lock:
-                username = str(params[0]) if params else ""
-                password = str(params[1]) if len(params) > 1 and params[1] is not None else ""
-                worker = self.resolve_worker(username)
+                was_authorized = client.authorized
                 if not self.reserve_client_username(client, worker):
                     raise StratumError(
                         20,
@@ -7548,16 +10097,27 @@ class PrismCoordinator:
                     parse_stratum_password_options(password)
                 )
                 target = self.apply_client_difficulty_requests(client)
-                difficulty_job_delivered = False
                 if target is not None:
-                    difficulty_job_delivered = self.advertise_client_difficulty(client, target)
+                    current = client.pending_share_difficulty or client.share_difficulty
+                    if target != current:
+                        if not was_authorized:
+                            client.share_difficulty = target
+                            client.pending_share_difficulty = None
+                        else:
+                            client.pending_share_difficulty = target
+                        client.difficulty_generation = int(
+                            getattr(client, "difficulty_generation", 0)
+                        ) + 1
+                client.authorization_generation = int(
+                    getattr(client, "authorization_generation", 0)
+                ) + 1
                 client.authorized = True
+                client.authorized_monotonic = time.monotonic()
                 self.send_result(client, request_id, True)
                 self._note_collection_identity_available(client)
-                # On a re-authorize whose new options already advertised a fresh
-                # difficulty/job pair, do not send a second back-to-back pair.
-                if not difficulty_job_delivered:
-                    self.maybe_send_job(client, clean_jobs=True)
+            # Exactly one coalesced delivery represents this authorization,
+            # including a password-derived difficulty change.
+            self.request_initial_job_delivery(client)
             return
         if method == "mining.extranonce.subscribe":
             self.send_result(client, request_id, True)
@@ -7791,7 +10351,7 @@ class PrismCoordinator:
                 )
             if not refresh_current:
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "tip refresh snapshot was superseded before client job build"
                 )
             try:
@@ -7913,7 +10473,7 @@ class PrismCoordinator:
             if not payout_admitted:
                 self._schedule_tip_refresh_retry()
                 if guarded_refresh:
-                    raise TemplateRefreshBlocked(
+                    raise TemplateRefreshSuperseded(
                         "payout state changed during client job build"
                     )
                 return False
@@ -7928,7 +10488,7 @@ class PrismCoordinator:
                         tip_refresh_observation_sequence,
                     ):
                         self._schedule_tip_refresh_retry()
-                        raise TemplateRefreshBlocked(
+                        raise TemplateRefreshSuperseded(
                             "tip refresh snapshot was superseded during client job build"
                         )
                     artifacts = tip_refresh_snapshot.template_artifacts
@@ -7961,6 +10521,10 @@ class PrismCoordinator:
                 delivered_monotonic,
             )
             self._consume_retained_collection_refresh(context)
+            self.note_initial_job_delivered(
+                client,
+                validated_current=guarded_refresh,
+            )
             phases["send"] = delivered_monotonic - phase_started
             elapsed = time.monotonic() - started
             self.observe_job_build_elapsed(elapsed, phases)
@@ -8107,20 +10671,57 @@ class PrismCoordinator:
         client: ClientState,
         target: Decimal,
     ) -> bool:
+        applied_directly = False
+        schedule_initial = False
         with self.lock:
             current = client.pending_share_difficulty or client.share_difficulty
             if target == current:
                 return False
-            if not (client.subscribed and client.authorized):
+            if not (client.subscribed and client.authorized) or (
+                client.active_job is None and "maybe_send_job" not in self.__dict__
+            ):
                 client.share_difficulty = target
-                return False
-            prior_pending = client.pending_share_difficulty
-            client.pending_share_difficulty = target
+                client.pending_share_difficulty = None
+                client.difficulty_generation = int(
+                    getattr(client, "difficulty_generation", 0)
+                ) + 1
+                applied_directly = True
+                schedule_initial = bool(
+                    client.subscribed
+                    and client.authorized
+                    and client.worker is not None
+                )
+            else:
+                prior_pending = client.pending_share_difficulty
+                prior_generation = int(
+                    getattr(client, "difficulty_generation", 0)
+                )
+                advertised_generation = prior_generation + 1
+                client.pending_share_difficulty = target
+                client.difficulty_generation = advertised_generation
+        if applied_directly:
+            if schedule_initial:
+                # A pending first-job request captured the previous difficulty
+                # generation. Replace it atomically so its cancellation callback
+                # hands the client slot to current work instead of disconnecting.
+                self.request_initial_job_delivery(client)
+            return False
+        with self.lock:
+            self._ensure_initial_job_state()
+            initial_pending = client in self.pending_initial_jobs
+        if initial_pending:
+            self.request_initial_job_delivery(client)
+            return False
         if not self.stop_event.is_set() and self.maybe_send_job(client, clean_jobs=True):
             return True
         with self.lock:
-            if client.pending_share_difficulty == target:
+            if (
+                client.pending_share_difficulty == target
+                and int(getattr(client, "difficulty_generation", 0))
+                == advertised_generation
+            ):
                 client.pending_share_difficulty = prior_pending
+                client.difficulty_generation = prior_generation
         return False
 
     def normalized_prior_balances(self, balances: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -8236,7 +10837,12 @@ class PrismCoordinator:
         issued_at_ms: int,
         suffix_hex: str,
         summary_only: bool = False,
+        payout_policy: dict[str, object] | None = None,
+        ctv_settlement: dict[str, object] | None = None,
+        cancellation: _JobBuildCancellation | None = None,
     ) -> dict[str, Any]:
+        if cancellation is not None:
+            cancellation.raise_if_cancelled("collection payout derivation")
         share = {
             "share_seq": 1,
             "share_id": "bootstrap-share",
@@ -8264,6 +10870,9 @@ class PrismCoordinator:
             witness_merkle_leaves_hex=direct_stratum.witness_merkle_leaves_hex(transaction_hexes),
             ctv_fee_parent_hash=str(template["previousblockhash"]),
             summary_only=summary_only,
+            payout_policy=payout_policy,
+            ctv_settlement=ctv_settlement,
+            cancellation=cancellation,
         )
 
     def build_audit_bundle(
@@ -8277,19 +10886,70 @@ class PrismCoordinator:
         ctv_fee_parent_hash: str | None = None,
         canonical_output_path: Path | None = None,
         summary_only: bool = False,
+        payout_policy: dict[str, object] | None = None,
+        ctv_settlement: dict[str, object] | None = None,
+        cancellation: _JobBuildCancellation | None = None,
     ) -> dict[str, Any]:
-        payload = {
-            "shares": shares,
+        self._ensure_job_cache_state()
+        self._ensure_tip_refresh_state()
+        if cancellation is not None:
+            self._job_build_checkpoint("serialization", cancellation)
+        payload: dict[str, object] = {
             "found_block": found_block,
             "prior_balances": prior_balances,
-            "payout_policy": self.prism_payout_policy(),
+            "payout_policy": (
+                self.prism_payout_policy()
+                if payout_policy is None
+                else payout_policy
+            ),
             "coinbase_script_sig_suffix_hex": coinbase_script_sig_suffix_hex,
             "witness_merkle_leaves_hex": witness_merkle_leaves_hex or [],
         }
-        ctv_settlement = self.prism_ctv_settlement_config(
-            block_height=int(found_block["block_height"]),
-            parent_hash=ctv_fee_parent_hash,
+        job_build_phase_local = getattr(self, "_job_build_phase_local", None)
+        record_phase_metrics = bool(
+            getattr(job_build_phase_local, "tip_refresh_metrics", False)
         )
+        if summary_only:
+            artifact_started = time.monotonic()
+            identity_indexes: dict[tuple[str, str, str], int] = {}
+            identities: list[tuple[str, str, str]] = []
+            compact_shares: list[tuple[object, ...]] = []
+            for share in shares:
+                identity = (
+                    str(share["miner_id"]),
+                    str(share["order_key"]),
+                    str(share["p2mr_program_hex"]),
+                )
+                identity_index = identity_indexes.get(identity)
+                if identity_index is None:
+                    identity_index = len(identities)
+                    identity_indexes[identity] = identity_index
+                    identities.append(identity)
+                compact_shares.append(
+                    (
+                        share["share_seq"],
+                        share["share_id"],
+                        identity_index,
+                        share["share_difficulty"],
+                        share["job_issued_at_ms"],
+                        share["accepted_at_ms"],
+                        share.get("credit_policy"),
+                    )
+                )
+            payload["compact_share_identities"] = identities
+            payload["compact_shares"] = compact_shares
+            if record_phase_metrics:
+                self._observe_tip_refresh_build_phase(
+                    "serialization_copy",
+                    time.monotonic() - artifact_started,
+                )
+        else:
+            payload["shares"] = shares
+        if ctv_settlement is None and payout_policy is None:
+            ctv_settlement = self.prism_ctv_settlement_config(
+                block_height=int(found_block["block_height"]),
+                parent_hash=ctv_fee_parent_hash,
+            )
         if ctv_settlement is not None:
             payload["ctv_settlement"] = ctv_settlement
         if canonical_output_path is not None and summary_only:
@@ -8303,6 +10963,8 @@ class PrismCoordinator:
             self.ledger_attestation_signing_seed_hex,
         ]
         command.append("--job-summary-output" if summary_only else "--canonical-output")
+        if record_phase_metrics:
+            command.append("--phase-metrics")
         if canonical_output_path is not None:
             canonical_output_path.parent.mkdir(parents=True, exist_ok=True)
         succeeded = False
@@ -8328,12 +10990,45 @@ class PrismCoordinator:
                     stderr=stderr,
                     text=True,
                     encoding="utf-8",
+                    close_fds=True,
                 )
+                build_control = getattr(
+                    job_build_phase_local,
+                    "bundle_build_control",
+                    None,
+                )
+                if isinstance(build_control, _JobBundleBuildControl):
+                    self._register_job_bundle_process(build_control, process)
+                with self._job_build_scheduler_lock:
+                    if self._job_build_worker_restart_pending:
+                        self.job_build_worker_counts["restarts"] += 1
+                        self._job_build_worker_restart_pending = False
+                    self.job_build_worker_counts["starts"] += 1
                 assert process.stdin is not None
+                input_byte_count = 0
+
+                class _CancelableInput:
+                    def __init__(self, stream: Any) -> None:
+                        self.stream = stream
+
+                    def write(self, value: str) -> int:
+                        nonlocal input_byte_count
+                        if cancellation is not None:
+                            cancellation.raise_if_cancelled(
+                                "builder input serialization"
+                            )
+                        input_byte_count += len(value)
+                        return int(self.stream.write(value))
+
+                serialization_started = time.monotonic()
                 try:
                     # iterencode writes bounded fragments to the child instead
                     # of allocating a second full JSON representation in Python.
-                    json.dump(payload, process.stdin, separators=(",", ":"))
+                    json.dump(
+                        payload,
+                        _CancelableInput(process.stdin),
+                        separators=(",", ":"),
+                    )
                 except BrokenPipeError:
                     # Prefer the builder's diagnostic below.
                     pass
@@ -8342,22 +11037,165 @@ class PrismCoordinator:
                     process.wait()
                     raise
                 finally:
+                    phases = self._job_build_phases()
+                    phases["input_serialization"] = phases.get(
+                        "input_serialization",
+                        0.0,
+                    ) + (time.monotonic() - serialization_started)
                     try:
                         process.stdin.close()
                     except BrokenPipeError:
                         pass
-                returncode = process.wait()
+                if record_phase_metrics:
+                    self._observe_tip_refresh_build_phase(
+                        "serialization_copy",
+                        time.monotonic() - serialization_started,
+                    )
+                    self._record_tip_refresh_ipc_bytes("input", input_byte_count)
+                worker_started = time.monotonic()
+                worker_deadline = worker_started + float(
+                    getattr(
+                        self,
+                        "bundle_build_timeout_seconds",
+                        DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
+                    )
+                )
+                terminated = False
+                returncode: int | None = None
+                if cancellation is None and not hasattr(process, "poll"):
+                    returncode = process.wait()
+                else:
+                    while returncode is None:
+                        returncode = process.poll()
+                        if returncode is not None:
+                            break
+                        cancelled_by_control = (
+                            isinstance(build_control, _JobBundleBuildControl)
+                            and build_control.cancel_event.is_set()
+                        )
+                        cancelled_by_request = (
+                            cancellation is not None and cancellation.is_set()
+                        )
+                        if cancelled_by_control or cancelled_by_request:
+                            terminated = True
+                            process.terminate()
+                            try:
+                                returncode = process.wait(
+                                    timeout=max(
+                                        0.0,
+                                        float(
+                                            getattr(
+                                                self,
+                                                "job_build_cancel_grace_seconds",
+                                                DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS,
+                                            )
+                                        ),
+                                    )
+                                )
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                returncode = process.wait()
+                            with self._job_build_scheduler_lock:
+                                self.job_build_worker_counts["terminations"] += 1
+                                self._job_build_worker_restart_pending = True
+                            break
+                        if time.monotonic() >= worker_deadline:
+                            process.kill()
+                            returncode = process.wait()
+                            with self._tip_refresh_metrics_lock:
+                                self.tip_refresh_worker_failures += 1
+                            raise RuntimeError(
+                                "qbit-prism-build-audit-bundle timed out"
+                            )
+                        time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
+                phases["worker"] = phases.get("worker", 0.0) + (
+                    time.monotonic() - worker_started
+                )
+                if terminated and cancellation is not None:
+                    if cancellation.is_set():
+                        cancellation.raise_if_cancelled("builder worker")
+                if (
+                    terminated
+                    and isinstance(build_control, _JobBundleBuildControl)
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder subprocess was canceled after supersession"
+                    )
                 stderr.seek(0)
                 error_text = stderr.read()
                 if returncode != 0:
+                    with self._job_build_scheduler_lock:
+                        self.job_build_worker_counts["crashes"] += 1
+                        self._job_build_worker_restart_pending = True
+                    if record_phase_metrics:
+                        with self._tip_refresh_metrics_lock:
+                            self.tip_refresh_worker_failures += 1
                     raise RuntimeError(
                         f"qbit-prism-build-audit-bundle failed: {error_text}"
                     )
+                if (
+                    isinstance(build_control, _JobBundleBuildControl)
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder result completed after supersession"
+                    )
                 output.flush()
+                output_size = os.fstat(output.fileno()).st_size
+                if record_phase_metrics:
+                    self._record_tip_refresh_ipc_bytes("output", output_size)
+                    for line in error_text.splitlines():
+                        if not line.startswith(PRISM_BUILDER_PHASE_METRICS_PREFIX):
+                            continue
+                        raw_metrics = line.removeprefix(
+                            PRISM_BUILDER_PHASE_METRICS_PREFIX
+                        )
+                        try:
+                            metrics = json.loads(raw_metrics)
+                            phase_seconds = metrics.get("phases_seconds", {})
+                            if isinstance(phase_seconds, dict):
+                                for phase in (
+                                    "payout_state_derivation",
+                                    "ctv_manifest_construction",
+                                    "coinbase_bundle_construction",
+                                    "signing_verification",
+                                ):
+                                    elapsed = phase_seconds.get(phase)
+                                    if isinstance(elapsed, (int, float)):
+                                        self._observe_tip_refresh_build_phase(
+                                            phase,
+                                            float(elapsed),
+                                        )
+                            rust_serialization = sum(
+                                float(metrics.get(name, 0.0))
+                                for name in (
+                                    "input_deserialization_seconds",
+                                    "output_serialization_seconds",
+                                )
+                            )
+                            self._observe_tip_refresh_build_phase(
+                                "serialization_copy",
+                                rust_serialization,
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            # Metrics are diagnostic only. A malformed timing
+                            # line must never invalidate an otherwise valid
+                            # signed bundle.
+                            pass
                 if canonical_output_path is not None:
                     os.fsync(output.fileno())
                 output.seek(0)
+                output_started = time.monotonic()
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled("builder output serialization")
                 bundle = json.load(output)
+                phases["output_serialization"] = phases.get(
+                    "output_serialization",
+                    0.0,
+                ) + (time.monotonic() - output_started)
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled("builder verification")
             succeeded = True
             return bundle
         finally:
@@ -9779,6 +12617,9 @@ class PrismCoordinator:
                     worker=worker,
                 )
                 return False
+            self._cancel_obsolete_job_builds("direct PRISM block accepted")
+            self._mark_tip_refresh_pending(block_hash)
+            self._schedule_tip_refresh_retry()
         # Capture the current source as soon as the candidate is known active.
         # The direct-block source itself is reserved only after durable ledger
         # confirmation: a failed audit/RPC preparation therefore cannot leave
@@ -9867,6 +12708,7 @@ class PrismCoordinator:
             direct_payout_source: (
                 tuple[int, int, str | None, str, float] | None
             ) = None
+            payout_publication_covered = False
             with self._payout_state_prepare_lock:
                 try:
                     persistence = self.ledger.persist_accepted_block(
@@ -9906,7 +12748,37 @@ class PrismCoordinator:
                             time.monotonic() - payout_preparation_started,
                         ),
                     )
-                if confirmed_count in {0, 1}:
+                if (
+                    confirmed_count == 0
+                    and not self._payout_state_publication_fenced()
+                    and not self._payout_source_requires_publication()
+                ):
+                    # This replay confirmed nothing new, delivery is not
+                    # fenced, and no reserved source awaits publication: the
+                    # published payout state already covers this candidate.
+                    # Reserving and republishing anyway would bump the payout
+                    # generation, wipe the job-bundle cache, and abort every
+                    # in-flight template refresh for identical payout state —
+                    # livelocking job delivery while the candidate replays.
+                    # qbit_confirm_pool_block reports 0 for an
+                    # already-confirmed block once the active tip moved past
+                    # its height (the sustained replay state); while the block
+                    # is still the tip it reports 1, indistinguishable from a
+                    # freshly flipped row, so that replay must keep
+                    # publishing. A prior attempt that confirmed rows but
+                    # failed before publishing always leaves its source
+                    # reserved (or fenced as direct_block_uncertain), so it
+                    # never takes this branch and still publishes below. The
+                    # fence check keeps the remaining exception tail healing:
+                    # an attempt that force-blocked delivery after a
+                    # superseding source had already published, then failed
+                    # before republishing, leaves delivery blocked with a
+                    # covered source, and only the republish below clears it.
+                    # A restart cannot leak stale state through here either: a
+                    # fresh process builds every bundle from ledger reads that
+                    # already include the confirmed rows.
+                    payout_publication_covered = True
+                elif confirmed_count in {0, 1}:
                     direct_payout_source = (
                         self._reserve_payout_state_source_if_current(
                             direct_source_preparation_token,
@@ -9916,10 +12788,11 @@ class PrismCoordinator:
                         )
                     )
                     # Confirmation activates carry-forward rows. A zero count
-                    # is an idempotent replay, but the direct-tip source still
-                    # has to cross publication unless a newer source superseded
-                    # it. Persistence and confirmation stayed outside the
-                    # delivery barrier in either case.
+                    # reaching this branch is a replay whose source was left
+                    # unpublished, so the direct-tip source still has to cross
+                    # publication unless a newer source superseded it.
+                    # Persistence and confirmation stayed outside the delivery
+                    # barrier in either case.
                     if direct_payout_source is None:
                         self._record_discarded_payout_candidate()
                     else:
@@ -9957,10 +12830,10 @@ class PrismCoordinator:
                 if payout_candidate is not None
                 else None
             )
-            if published is None and getattr(
-                self,
-                "reorg_reconciler_enabled",
-                True,
+            if (
+                published is None
+                and not payout_publication_covered
+                and getattr(self, "reorg_reconciler_enabled", True)
             ):
                 with self.lock:
                     latest_tip = self._payout_state_source[1]
@@ -9972,10 +12845,10 @@ class PrismCoordinator:
                 reconciled_generation = summary.get("published_generation")
                 if isinstance(reconciled_generation, int):
                     published = reconciled_generation
-            if published is None and not getattr(
-                self,
-                "reorg_reconciler_enabled",
-                True,
+            if (
+                published is None
+                and not payout_publication_covered
+                and not getattr(self, "reorg_reconciler_enabled", True)
             ):
                 # Collection-only tests disable reorg reconciliation; publish
                 # their current in-memory source without the production
@@ -10225,10 +13098,234 @@ class PrismCoordinator:
     def ready_miner_count(self) -> int:
         return self.accepted_share_stats()[1]
 
+    def mining_delivery_snapshot(self, *, now: float | None = None) -> dict[str, object]:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self._ensure_initial_job_state()
+            active = len(self.clients)
+            current_tip = self._current_published_tip_hash_locked()
+            published_snapshot = getattr(self, "tip_template_snapshot", None)
+            subscribed = sum(1 for client in self.clients if client.subscribed)
+            authorized_clients = [
+                client
+                for client in self.clients
+                if client.subscribed and client.authorized and client.worker is not None
+            ]
+            authorized = len(authorized_clients)
+            current = sum(
+                1
+                for client in authorized_clients
+                if self._client_has_current_tip_job_locked(client)
+            )
+            oldest_missing_age = max(
+                (
+                    now - client.authorized_monotonic
+                    for client in authorized_clients
+                    if not self._client_has_current_tip_job_locked(client)
+                    and client.authorized_monotonic is not None
+                ),
+                default=0.0,
+            )
+            pending_requests = list(self.pending_initial_jobs.values())
+            pending = len(pending_requests)
+            oldest_age = max(
+                (now - request.requested_monotonic for request in pending_requests),
+                default=0.0,
+            )
+            connection_limit = int(
+                getattr(
+                    self,
+                    "stratum_max_connections",
+                    DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+                )
+            )
+            pending_limit = int(self.stratum_max_pending_initial_jobs)
+            coverage = current / authorized if authorized else 1.0
+            cap_saturated = connection_limit > 0 and active >= connection_limit
+            pending_saturated = pending >= pending_limit
+            # A reconnect incident is operationally significant well before
+            # nearly every miner is missing work. Treat any sustained loss of
+            # at least five percent of current-job coverage as degraded.
+            poor_coverage = authorized > 0 and coverage < 0.95
+            if poor_coverage:
+                if self._mining_delivery_failure_started_monotonic is None:
+                    self._mining_delivery_failure_started_monotonic = now
+            else:
+                self._mining_delivery_failure_started_monotonic = None
+            delivery_failure_age = (
+                max(0.0, now - self._mining_delivery_failure_started_monotonic)
+                if self._mining_delivery_failure_started_monotonic is not None
+                else 0.0
+            )
+            overload_now = pending_saturated or (cap_saturated and poor_coverage)
+            if overload_now:
+                if self._mining_overload_started_monotonic is None:
+                    self._mining_overload_started_monotonic = now
+            else:
+                self._mining_overload_started_monotonic = None
+            overload_age = (
+                max(0.0, now - self._mining_overload_started_monotonic)
+                if self._mining_overload_started_monotonic is not None
+                else 0.0
+            )
+            last_delivery = self.last_initial_job_delivery_monotonic
+            timeout = float(self.stratum_initial_job_timeout_seconds)
+            timeout_disconnects = self.initial_job_timeout_count
+            queue_rejections = self.initial_job_queue_rejection_count
+            cancelled = self.initial_job_cancelled_count
+            coalesced = self.initial_job_coalesced_count
+            peak = self.peak_active_connection_count
+            handlers = self.handler_thread_count
+
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            prepared_bundle = self._prepared_ready_bundle
+            prepared_snapshot = self._prepared_ready_snapshot
+            preparation_pending = bool(self.job_preparation_pending)
+            payout_generation = int(self._payout_state_generation)
+        prepared_current = bool(
+            prepared_bundle is not None
+            and prepared_snapshot is published_snapshot
+            and published_snapshot is not None
+            and current_tip is not None
+            and published_snapshot.bestblockhash == current_tip
+            and published_snapshot.template_artifacts is not None
+            and not prepared_bundle.collection_only
+            and prepared_bundle.template
+            is published_snapshot.template_artifacts.template
+            and prepared_bundle.template_fingerprint
+            == published_snapshot.template_fingerprint
+            and prepared_bundle.template_generation
+            == published_snapshot.template_generation
+            and prepared_bundle.payout_state_generation == payout_generation
+        )
+
+        deadline = timeout if timeout > 0 else None
+        startup_age = max(0.0, now - getattr(self, "started_monotonic", now))
+        startup_grace = float(
+            getattr(
+                self,
+                "mining_health_startup_grace_seconds",
+                DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,
+            )
+        )
+        in_startup_grace = startup_age < startup_grace
+        no_delivery_progress = bool(
+            deadline is not None
+            and poor_coverage
+            and (
+                delivery_failure_age >= deadline
+                or oldest_missing_age >= deadline
+                or (
+                    pending > 0
+                    and (
+                        (last_delivery is None and oldest_age >= deadline)
+                        or (
+                            last_delivery is not None
+                            and now - last_delivery >= deadline
+                        )
+                    )
+                )
+            )
+        )
+        stale_unknown = int(
+            getattr(self, "rejection_counts_by_reason", {}).get(
+                PRISM_REJECTION_STALE_JOB,
+                0,
+            )
+        ) + int(
+            getattr(self, "rejection_counts_by_reason", {}).get(
+                PRISM_REJECTION_UNKNOWN_JOB,
+                0,
+            )
+        )
+        submitted = int(getattr(self, "submitted_share_count", 0))
+        reject_storm = (
+            poor_coverage
+            and submitted > 0
+            and stale_unknown / submitted >= 0.95
+        )
+        persistent_overload = deadline is not None and overload_age >= deadline
+        unhealthy_reasons: list[str] = []
+        if not in_startup_grace:
+            if poor_coverage and no_delivery_progress:
+                unhealthy_reasons.append("initial-delivery-stalled")
+            if pending_saturated and persistent_overload:
+                unhealthy_reasons.append("pending-initial-jobs-saturated")
+            if cap_saturated and poor_coverage and persistent_overload:
+                unhealthy_reasons.append("connection-capacity-saturated")
+            if reject_storm:
+                unhealthy_reasons.append("stale-unknown-rejection-storm")
+        mining_ready = not unhealthy_reasons
+        executor = getattr(self, "_tip_refresh_executor", None)
+        queue_depth, active_workers = executor.stats() if executor is not None else (0, 0)
+        return {
+            "mining_ready": mining_ready,
+            "mining_delivery_healthy": mining_ready,
+            "mining_health_startup_grace": in_startup_grace,
+            "active_connections": active,
+            "connection_capacity": connection_limit,
+            "peak_active_connections": peak,
+            "subscribed_connections": subscribed,
+            "authorized_connections": authorized,
+            "pending_initial_jobs": pending,
+            "pending_initial_job_capacity": pending_limit,
+            "oldest_pending_initial_job_age_seconds": round(oldest_age, 3),
+            "clients_with_current_tip_jobs": current,
+            "current_tip_job_coverage": round(coverage, 6),
+            "connection_capacity_saturated": cap_saturated,
+            "pending_initial_jobs_saturated": pending_saturated,
+            "initial_delivery_stalled": no_delivery_progress,
+            "overload": bool(overload_now or reject_storm),
+            "overload_age_seconds": round(overload_age, 3),
+            "unhealthy_reasons": unhealthy_reasons,
+            "initial_job_queue_rejections": queue_rejections,
+            "initial_job_timeout_disconnects": timeout_disconnects,
+            "initial_job_cancelled_tasks": cancelled,
+            "initial_job_coalesced_tasks": coalesced,
+            "handler_threads": handlers,
+            "delivery_executor_queue_depth": queue_depth,
+            "delivery_executor_active_workers": active_workers,
+            # Compatibility aliases and preparation visibility introduced by
+            # the prewarm work. These retain the original bounded-pipeline
+            # names above for existing dashboards.
+            "subscribed_clients": subscribed,
+            "authorized_clients": authorized,
+            "clients_with_no_active_job": sum(
+                1 for client in authorized_clients if client.active_job is None
+            ),
+            "clients_without_current_tip_job": authorized - current,
+            "clients_with_current_tip_job": current,
+            "clients_pending_initial_job": pending,
+            "current_tip_job_coverage_ratio": coverage,
+            "oldest_initial_job_pending_seconds": round(
+                max(oldest_age, oldest_missing_age), 3
+            ),
+            "job_preparation_pending": preparation_pending,
+            "current_observed_tip": current_tip,
+            "prepared_bundle_current": prepared_current,
+            "prepared_bundle_tip": (
+                prepared_snapshot.bestblockhash
+                if prepared_snapshot is not None
+                else None
+            ),
+            "prepared_bundle_template_generation": (
+                prepared_bundle.template_generation
+                if prepared_bundle is not None
+                else None
+            ),
+            "prepared_bundle_payout_generation": (
+                prepared_bundle.payout_state_generation
+                if prepared_bundle is not None
+                else None
+            ),
+        }
+
     def health_payload(self) -> dict[str, object]:
         accepted_share_count, ready_miner_count = self.accepted_share_stats()
+        mining = self.mining_delivery_snapshot()
         return {
-            "ok": True,
+            "ok": bool(mining["mining_ready"]),
             "schema": "qbit.prism.audit-health.v1",
             "ledger_backend": self.ledger.backend_name,
             "accepted_share_count": accepted_share_count,
@@ -10236,6 +13333,7 @@ class PrismCoordinator:
             "accepted_block": self.accepted_block_count > 0,
             "accepted_block_count": self.accepted_block_count,
             "max_blocks": self.max_blocks,
+            **mining,
         }
 
     def refresh_health_snapshot(self) -> dict[str, object]:
@@ -10267,7 +13365,8 @@ class PrismCoordinator:
             if not loop_running:
                 # No refresher (tests, or audit HTTP without serve()): compute
                 # inline like the legacy endpoint did.
-                return 200, self.refresh_health_snapshot()
+                payload = self.refresh_health_snapshot()
+                return (200 if payload.get("ok") else 503), payload
             return 503, {
                 "ok": False,
                 "schema": "qbit.prism.audit-health.v1",
@@ -10284,7 +13383,7 @@ class PrismCoordinator:
             }
         payload = dict(snapshot)
         payload["snapshot_age_seconds"] = round(age_seconds, 3)
-        return 200, payload
+        return (200 if payload.get("ok") else 503), payload
 
     def health_snapshot_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -10352,9 +13451,27 @@ class PrismCoordinator:
             "recent_payouts": self.ledger.recipient_payout_history(recipient_id=recipient_id),
         }
 
+    @staticmethod
+    def process_resource_metrics() -> tuple[int, int]:
+        """Return cheap Linux RSS/descriptor gauges without extra processes."""
+        rss_bytes = -1
+        open_descriptors = -1
+        try:
+            statm = Path("/proc/self/statm").read_text(encoding="ascii").split()
+            rss_bytes = int(statm[1]) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            open_descriptors = len(tuple(Path("/proc/self/fd").iterdir()))
+        except OSError:
+            pass
+        return rss_bytes, open_descriptors
+
     def metrics_payload(self) -> str:
         ledger_metrics = self.ledger.metrics()
         audit_metrics = self.audit_artifact_metrics()
+        mining_metrics = self.mining_delivery_snapshot()
+        process_rss_bytes, process_open_fds = self.process_resource_metrics()
         accepted_share_count = self.accepted_share_stats()[0]
         elapsed = max(0.001, time.monotonic() - self.started_monotonic)
         shares_per_second = accepted_share_count / elapsed
@@ -10442,6 +13559,58 @@ class PrismCoordinator:
             "# HELP qbit_prism_stratum_active_connections Active admitted Stratum connections across all listeners.",
             "# TYPE qbit_prism_stratum_active_connections gauge",
             f"qbit_prism_stratum_active_connections {active_connection_count}",
+            "# HELP qbit_prism_stratum_connection_limit Configured global Stratum connection ceiling; zero means unlimited.",
+            "# TYPE qbit_prism_stratum_connection_limit gauge",
+            f"qbit_prism_stratum_connection_limit {mining_metrics['connection_capacity']}",
+            "# HELP qbit_prism_stratum_peak_active_connections Peak admitted Stratum connections since process start.",
+            "# TYPE qbit_prism_stratum_peak_active_connections gauge",
+            f"qbit_prism_stratum_peak_active_connections {mining_metrics['peak_active_connections']}",
+            "# HELP qbit_prism_stratum_subscribed_connections Active subscribed Stratum connections.",
+            "# TYPE qbit_prism_stratum_subscribed_connections gauge",
+            f"qbit_prism_stratum_subscribed_connections {mining_metrics['subscribed_connections']}",
+            "# HELP qbit_prism_stratum_authorized_connections Active subscribed and authorized Stratum connections.",
+            "# TYPE qbit_prism_stratum_authorized_connections gauge",
+            f"qbit_prism_stratum_authorized_connections {mining_metrics['authorized_connections']}",
+            "# HELP qbit_prism_stratum_pending_initial_jobs Authorized clients awaiting their first usable current-tip job.",
+            "# TYPE qbit_prism_stratum_pending_initial_jobs gauge",
+            f"qbit_prism_stratum_pending_initial_jobs {mining_metrics['pending_initial_jobs']}",
+            "# HELP qbit_prism_stratum_pending_initial_job_limit Configured bound for clients awaiting their first usable job.",
+            "# TYPE qbit_prism_stratum_pending_initial_job_limit gauge",
+            f"qbit_prism_stratum_pending_initial_job_limit {mining_metrics['pending_initial_job_capacity']}",
+            "# HELP qbit_prism_stratum_oldest_pending_initial_job_seconds Age of the oldest pending first-job request.",
+            "# TYPE qbit_prism_stratum_oldest_pending_initial_job_seconds gauge",
+            f"qbit_prism_stratum_oldest_pending_initial_job_seconds {mining_metrics['oldest_pending_initial_job_age_seconds']}",
+            "# HELP qbit_prism_stratum_initial_job_queue_rejections_total Sessions closed because bounded first-job delivery was full.",
+            "# TYPE qbit_prism_stratum_initial_job_queue_rejections_total counter",
+            f"qbit_prism_stratum_initial_job_queue_rejections_total {mining_metrics['initial_job_queue_rejections']}",
+            "# HELP qbit_prism_stratum_initial_job_timeouts_total Sessions disconnected after first-job delivery timed out.",
+            "# TYPE qbit_prism_stratum_initial_job_timeouts_total counter",
+            f"qbit_prism_stratum_initial_job_timeouts_total {mining_metrics['initial_job_timeout_disconnects']}",
+            "# HELP qbit_prism_stratum_initial_job_tasks_total First-job tasks canceled or coalesced before duplicate work.",
+            "# TYPE qbit_prism_stratum_initial_job_tasks_total counter",
+            f'qbit_prism_stratum_initial_job_tasks_total{{result="cancelled"}} {mining_metrics["initial_job_cancelled_tasks"]}',
+            f'qbit_prism_stratum_initial_job_tasks_total{{result="coalesced"}} {mining_metrics["initial_job_coalesced_tasks"]}',
+            "# HELP qbit_prism_stratum_clients_with_current_tip_jobs Authorized clients holding usable current-tip work.",
+            "# TYPE qbit_prism_stratum_clients_with_current_tip_jobs gauge",
+            f"qbit_prism_stratum_clients_with_current_tip_jobs {mining_metrics['clients_with_current_tip_jobs']}",
+            "# HELP qbit_prism_stratum_current_tip_job_coverage Ratio of authorized clients holding current-tip work.",
+            "# TYPE qbit_prism_stratum_current_tip_job_coverage gauge",
+            f"qbit_prism_stratum_current_tip_job_coverage {mining_metrics['current_tip_job_coverage']}",
+            "# HELP qbit_prism_stratum_handler_threads Active per-connection Stratum handler threads.",
+            "# TYPE qbit_prism_stratum_handler_threads gauge",
+            f"qbit_prism_stratum_handler_threads {mining_metrics['handler_threads']}",
+            "# HELP qbit_prism_job_delivery_queue_depth Current bounded delivery executor queue depth.",
+            "# TYPE qbit_prism_job_delivery_queue_depth gauge",
+            f"qbit_prism_job_delivery_queue_depth {mining_metrics['delivery_executor_queue_depth']}",
+            "# HELP qbit_prism_job_delivery_active_workers Delivery executor workers currently running tasks.",
+            "# TYPE qbit_prism_job_delivery_active_workers gauge",
+            f"qbit_prism_job_delivery_active_workers {mining_metrics['delivery_executor_active_workers']}",
+            "# HELP qbit_prism_process_resident_memory_bytes Current process RSS bytes, or -1 when unavailable.",
+            "# TYPE qbit_prism_process_resident_memory_bytes gauge",
+            f"qbit_prism_process_resident_memory_bytes {process_rss_bytes}",
+            "# HELP qbit_prism_process_open_file_descriptors Current process open descriptor count, or -1 when unavailable.",
+            "# TYPE qbit_prism_process_open_file_descriptors gauge",
+            f"qbit_prism_process_open_file_descriptors {process_open_fds}",
             "# HELP qbit_prism_stratum_connection_limit_rejections_total Stratum connections rejected by an explicitly configured admission limit.",
             "# TYPE qbit_prism_stratum_connection_limit_rejections_total counter",
             *[
@@ -10649,6 +13818,7 @@ class PrismCoordinator:
         lines.extend(self.job_build_metrics_lines())
         lines.extend(self.tip_refresh_metrics_lines())
         lines.extend(self.payout_state_metrics_lines())
+        lines.extend(self.initial_delivery_metrics_lines())
         return "\n".join(lines) + "\n"
 
     def shutdown_metrics_lines(self) -> list[str]:
@@ -10804,6 +13974,76 @@ class PrismCoordinator:
             f"{chunk_rows_name}_count {chunk_count}",
         ]
 
+    def initial_delivery_metrics_lines(self) -> list[str]:
+        self._ensure_initial_job_state()
+        mining = self.mining_delivery_snapshot()
+        with self.lock:
+            counts = {
+                "sent": self.initial_job_sent_count,
+                "cancelled": self.initial_job_cancelled_count,
+                "coalesced": self.initial_job_coalesced_count,
+                "failed": self.initial_job_failed_count,
+                "superseded": self.initial_job_superseded_count,
+            }
+            latency_sum = self.initial_job_delivery_latency_seconds_sum
+            latency_count = self.initial_job_delivery_latency_count
+        executor = getattr(self, "_tip_refresh_executor", None)
+        _queued, slots = executor.stats() if executor is not None else (0, 0)
+        with self._bundle_preparation_lock:
+            build_counts = dict(self.shared_bundle_build_counts)
+            preparation_sum = self.shared_bundle_preparation_seconds_sum
+            preparation_count = self.shared_bundle_preparation_count
+            waiters = self.shared_bundle_preparation_waiters
+        return [
+            "# HELP qbit_prism_stratum_subscribed_clients Subscribed Stratum clients.",
+            "# TYPE qbit_prism_stratum_subscribed_clients gauge",
+            f'qbit_prism_stratum_subscribed_clients {mining["subscribed_clients"]}',
+            "# HELP qbit_prism_stratum_authorized_clients Subscribed and authorized Stratum clients.",
+            "# TYPE qbit_prism_stratum_authorized_clients gauge",
+            f'qbit_prism_stratum_authorized_clients {mining["authorized_clients"]}',
+            "# HELP qbit_prism_clients_without_current_tip_job Authorized clients without usable current-tip work.",
+            "# TYPE qbit_prism_clients_without_current_tip_job gauge",
+            f'qbit_prism_clients_without_current_tip_job {mining["clients_without_current_tip_job"]}',
+            "# HELP qbit_prism_clients_with_no_active_job Authorized clients with no active job at all.",
+            "# TYPE qbit_prism_clients_with_no_active_job gauge",
+            f'qbit_prism_clients_with_no_active_job {mining["clients_with_no_active_job"]}',
+            "# HELP qbit_prism_clients_with_current_tip_job Authorized clients with usable current-tip work.",
+            "# TYPE qbit_prism_clients_with_current_tip_job gauge",
+            f'qbit_prism_clients_with_current_tip_job {mining["clients_with_current_tip_job"]}',
+            "# HELP qbit_prism_current_tip_job_coverage_ratio Fraction of authorized clients with current-tip work.",
+            "# TYPE qbit_prism_current_tip_job_coverage_ratio gauge",
+            f'qbit_prism_current_tip_job_coverage_ratio {float(mining["current_tip_job_coverage_ratio"]):.12g}',
+            "# HELP qbit_prism_initial_job_deliveries_pending Coalesced initial deliveries queued or running.",
+            "# TYPE qbit_prism_initial_job_deliveries_pending gauge",
+            f'qbit_prism_initial_job_deliveries_pending {mining["clients_pending_initial_job"]}',
+            "# HELP qbit_prism_initial_job_delivery_tasks_inflight Bounded shared delivery slots currently occupied.",
+            "# TYPE qbit_prism_initial_job_delivery_tasks_inflight gauge",
+            f"qbit_prism_initial_job_delivery_tasks_inflight {slots}",
+            "# HELP qbit_prism_initial_job_delivery_seconds Authorization-to-current-job latency.",
+            "# TYPE qbit_prism_initial_job_delivery_seconds summary",
+            f"qbit_prism_initial_job_delivery_seconds_sum {latency_sum:.6f}",
+            f"qbit_prism_initial_job_delivery_seconds_count {latency_count}",
+            "# HELP qbit_prism_initial_job_requests_total Initial delivery outcomes.",
+            "# TYPE qbit_prism_initial_job_requests_total counter",
+            *[
+                f'qbit_prism_initial_job_requests_total{{result="{result}"}} {count}'
+                for result, count in sorted(counts.items())
+            ],
+            "# HELP qbit_prism_shared_bundle_preparation_seconds Heavy shared bundle preparation wall time.",
+            "# TYPE qbit_prism_shared_bundle_preparation_seconds summary",
+            f"qbit_prism_shared_bundle_preparation_seconds_sum {preparation_sum:.6f}",
+            f"qbit_prism_shared_bundle_preparation_seconds_count {preparation_count}",
+            "# HELP qbit_prism_shared_bundle_preparation_waiters Callers waiting on the keyed shared preparation flight.",
+            "# TYPE qbit_prism_shared_bundle_preparation_waiters gauge",
+            f"qbit_prism_shared_bundle_preparation_waiters {waiters}",
+            "# HELP qbit_prism_shared_bundle_builds_total Shared bundle builds by terminal outcome.",
+            "# TYPE qbit_prism_shared_bundle_builds_total counter",
+            *[
+                f'qbit_prism_shared_bundle_builds_total{{result="{result}"}} {count}'
+                for result, count in sorted(build_counts.items())
+            ],
+        ]
+
     def tip_refresh_metrics_lines(self) -> list[str]:
         self._ensure_tip_refresh_state()
         with self._tip_refresh_executor_lock:
@@ -10821,9 +14061,24 @@ class PrismCoordinator:
                 }
                 for name, histogram in self.tip_refresh_histograms.items()
             }
+            phase_histograms = {
+                phase: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
+                }
+                for phase, histogram in self.tip_refresh_build_phase_histograms.items()
+            }
             client_counts = dict(self.tip_refresh_client_counts)
             cancellation_counts = dict(self.tip_refresh_cancellation_counts)
             inflight = self.tip_refresh_inflight
+            build_inflight = self.tip_refresh_build_inflight
+            build_queue_depth = self.tip_refresh_build_queue_depth
+            singleflight_hits = self.tip_refresh_singleflight_hits
+            superseded_results = self.tip_refresh_superseded_results
+            worker_failures = self.tip_refresh_worker_failures
+            worker_restarts = self.tip_refresh_worker_restarts
+            ipc_bytes = dict(self.tip_refresh_ipc_bytes)
 
         metric_names = {
             "refresh": "qbit_prism_tip_refresh_seconds",
@@ -10855,6 +14110,28 @@ class PrismCoordinator:
                     f'{metric_name}_count {histogram["count"]}',
                 ]
             )
+        phase_metric_name = "qbit_prism_tip_refresh_bundle_phase_seconds"
+        lines.extend(
+            [
+                "# HELP qbit_prism_tip_refresh_bundle_phase_seconds Shared bundle-build phase wall time.",
+                "# TYPE qbit_prism_tip_refresh_bundle_phase_seconds histogram",
+            ]
+        )
+        for phase in PRISM_TIP_REFRESH_BUILD_PHASES:
+            histogram = phase_histograms[phase]
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            lines.extend(
+                [
+                    *[
+                        f'{phase_metric_name}_bucket{{phase="{phase}",le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+                        for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS
+                    ],
+                    f'{phase_metric_name}_bucket{{phase="{phase}",le="+Inf"}} {histogram["count"]}',
+                    f'{phase_metric_name}_sum{{phase="{phase}"}} {float(histogram["sum"]):.6f}',
+                    f'{phase_metric_name}_count{{phase="{phase}"}} {histogram["count"]}',
+                ]
+            )
         lines.extend(
             [
                 "# HELP qbit_prism_tip_refresh_clients_total Client outcomes from tip/template refresh passes.",
@@ -10875,6 +14152,30 @@ class PrismCoordinator:
                 "# HELP qbit_prism_tip_refresh_executor_workers Configured persistent refresh executor workers, or zero before creation.",
                 "# TYPE qbit_prism_tip_refresh_executor_workers gauge",
                 f"qbit_prism_tip_refresh_executor_workers {executor_workers}",
+                "# HELP qbit_prism_tip_refresh_bundle_inflight Shared bundle builds currently running.",
+                "# TYPE qbit_prism_tip_refresh_bundle_inflight gauge",
+                f"qbit_prism_tip_refresh_bundle_inflight {build_inflight}",
+                "# HELP qbit_prism_tip_refresh_bundle_queue_depth Shared bundle callers waiting on bounded build admission or an identical single-flight.",
+                "# TYPE qbit_prism_tip_refresh_bundle_queue_depth gauge",
+                f"qbit_prism_tip_refresh_bundle_queue_depth {build_queue_depth}",
+                "# HELP qbit_prism_tip_refresh_bundle_singleflight_hits_total Shared bundle callers coalesced behind an identical build.",
+                "# TYPE qbit_prism_tip_refresh_bundle_singleflight_hits_total counter",
+                f"qbit_prism_tip_refresh_bundle_singleflight_hits_total {singleflight_hits}",
+                "# HELP qbit_prism_tip_refresh_bundle_superseded_results_total Completed or canceled shared bundles discarded after supersession.",
+                "# TYPE qbit_prism_tip_refresh_bundle_superseded_results_total counter",
+                f"qbit_prism_tip_refresh_bundle_superseded_results_total {superseded_results}",
+                "# HELP qbit_prism_tip_refresh_builder_worker_failures_total Audit-builder subprocess failures.",
+                "# TYPE qbit_prism_tip_refresh_builder_worker_failures_total counter",
+                f"qbit_prism_tip_refresh_builder_worker_failures_total {worker_failures}",
+                "# HELP qbit_prism_tip_refresh_builder_worker_restarts_total Long-lived builder worker restarts; zero for the inline subprocess design.",
+                "# TYPE qbit_prism_tip_refresh_builder_worker_restarts_total counter",
+                f"qbit_prism_tip_refresh_builder_worker_restarts_total {worker_restarts}",
+                "# HELP qbit_prism_tip_refresh_builder_ipc_bytes_total Bytes copied across audit-builder subprocess IPC.",
+                "# TYPE qbit_prism_tip_refresh_builder_ipc_bytes_total counter",
+                *[
+                    f'qbit_prism_tip_refresh_builder_ipc_bytes_total{{direction="{direction}"}} {int(ipc_bytes.get(direction, 0))}'
+                    for direction in ("input", "output")
+                ],
             ]
         )
         return lines
@@ -10889,6 +14190,13 @@ class PrismCoordinator:
             hit_counts = dict(self.job_cache_hit_counts)
             miss_counts = dict(self.job_cache_miss_counts)
             health_refresh_failures = self.health_snapshot_refresh_failure_count
+        with self._job_build_scheduler_lock:
+            scheduler_counts = dict(self.job_build_scheduler_counts)
+            cancellation_seconds = dict(self.job_build_cancellation_seconds)
+            replacement_seconds = dict(self.job_build_replacement_start_seconds)
+            worker_counts = dict(self.job_build_worker_counts)
+            active_builds = int(self._job_build_active is not None)
+            pending_builds = int(self._job_build_pending is not None)
         lock = getattr(self, "lock", None)
         if lock is not None:
             with lock:
@@ -10932,6 +14240,41 @@ class PrismCoordinator:
                 "# HELP qbit_prism_connected_clients Currently connected Stratum clients.",
                 "# TYPE qbit_prism_connected_clients gauge",
                 f"qbit_prism_connected_clients {connected_clients}",
+                "# HELP qbit_prism_job_build_requests_total Immutable job build requests admitted to the latest-wins scheduler.",
+                "# TYPE qbit_prism_job_build_requests_total counter",
+                f'qbit_prism_job_build_requests_total {int(scheduler_counts.get("requests", 0))}',
+                "# HELP qbit_prism_job_build_starts_total Immutable job builds started by the bounded executor.",
+                "# TYPE qbit_prism_job_build_starts_total counter",
+                f'qbit_prism_job_build_starts_total {int(scheduler_counts.get("starts", 0))}',
+                "# HELP qbit_prism_job_build_completions_total Immutable job build executions completed.",
+                "# TYPE qbit_prism_job_build_completions_total counter",
+                f'qbit_prism_job_build_completions_total {int(scheduler_counts.get("completions", 0))}',
+                "# HELP qbit_prism_job_build_supersessions_total Active or pending builds replaced by a newer immutable key.",
+                "# TYPE qbit_prism_job_build_supersessions_total counter",
+                f'qbit_prism_job_build_supersessions_total {int(scheduler_counts.get("supersessions", 0))}',
+                "# HELP qbit_prism_job_build_obsolete_results_total Obsolete build results discarded before cache or delivery.",
+                "# TYPE qbit_prism_job_build_obsolete_results_total counter",
+                f'qbit_prism_job_build_obsolete_results_total {int(scheduler_counts.get("obsolete_results", 0))}',
+                "# HELP qbit_prism_job_build_active Current latest-generation build executions.",
+                "# TYPE qbit_prism_job_build_active gauge",
+                f"qbit_prism_job_build_active {active_builds}",
+                "# HELP qbit_prism_job_build_pending Newest build request waiting for a bounded executor slot.",
+                "# TYPE qbit_prism_job_build_pending gauge",
+                f"qbit_prism_job_build_pending {pending_builds}",
+                "# HELP qbit_prism_job_build_cancellation_seconds Cancellation signal to obsolete execution completion.",
+                "# TYPE qbit_prism_job_build_cancellation_seconds summary",
+                f'qbit_prism_job_build_cancellation_seconds_sum {float(cancellation_seconds.get("sum", 0.0)):.6f}',
+                f'qbit_prism_job_build_cancellation_seconds_count {int(cancellation_seconds.get("count", 0))}',
+                "# HELP qbit_prism_job_build_replacement_start_seconds Supersession signal to replacement build start.",
+                "# TYPE qbit_prism_job_build_replacement_start_seconds summary",
+                f'qbit_prism_job_build_replacement_start_seconds_sum {float(replacement_seconds.get("sum", 0.0)):.6f}',
+                f'qbit_prism_job_build_replacement_start_seconds_count {int(replacement_seconds.get("count", 0))}',
+                "# HELP qbit_prism_job_build_worker_events_total Pure builder subprocess lifecycle events.",
+                "# TYPE qbit_prism_job_build_worker_events_total counter",
+                *[
+                    f'qbit_prism_job_build_worker_events_total{{event="{event}"}} {int(worker_counts.get(event, 0))}'
+                    for event in ("starts", "terminations", "crashes", "restarts")
+                ],
             ]
         )
         return lines

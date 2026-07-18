@@ -835,6 +835,37 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         self.assertFalse(ledger.release_writer_lease())
 
+    def test_renew_writer_lease_refreshes_only_held_identity(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease(), {"backend": "postgres-psql", "renewed_count": 1}],
+            writer_id="writer-a",
+            writer_epoch=7,
+        )
+
+        self.assertEqual(
+            ledger.renew_writer_lease(),
+            {"backend": "postgres-psql", "renewed_count": 1},
+        )
+
+        query = ledger.lease_queries[-1]
+        self.assertIn("UPDATE qbit_ledger_writer_lease", query)
+        self.assertIn(
+            "lease_expires_at = clock_timestamp() + make_interval(secs => 60.0)",
+            query,
+        )
+        self.assertIn("qbit_ledger_writer_lease.singleton", query)
+        self.assertIn("writer_session_token = data->>'writer_session_token'", query)
+        self.assertIn("writer-a", query)
+        self.assertNotIn("qbit_ctv_fanout_artifacts", query)
+
+    def test_renew_writer_lease_raises_when_fenced_out(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease(), {"error": "writer lease is not active"}]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "writer lease is not active"):
+            ledger.renew_writer_lease()
+
     def test_block_state_functions_refresh_configured_lease_after_sql_function(self) -> None:
         cases = (
             (

@@ -43,10 +43,14 @@ from lab.prism.prism_coordinator import (
     QbitTipTemplateSnapshot,
     StratumError,
     StratumListenerProfile,
+    JobBuildCancelled,
     TemplateRefreshBlocked,
+    TemplateRefreshSuperseded,
     PrismCoordinator,
     WorkerIdentity,
     _FanoutCancellation,
+    _PayoutStatePublicationBlocked,
+    _JobBuildCancellation,
     default_prism_coinbase_tag_hex,
     default_prism_username_fallback_address,
     load_prism_highdiff_listener,
@@ -89,7 +93,8 @@ def fake_audit_bundle_popen(
             self.stdout = kwargs["stdout"]
             self.stderr = kwargs["stderr"]
 
-        def wait(self) -> int:
+        def wait(self, timeout: float | None = None) -> int:
+            captured["timeout"] = timeout
             captured["payload"] = json.loads("".join(self.stdin.parts))
             self.stdout.write(output_text)
             self.stderr.write(stderr_text)
@@ -1056,6 +1061,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_low_difficulty_shares_total 3", metrics)
         self.assertIn("qbit_prism_grace_credited_shares_total 6", metrics)
         self.assertIn("qbit_prism_stratum_active_connections 0", metrics)
+        self.assertIn("qbit_prism_stratum_connection_limit 384", metrics)
+        self.assertIn("qbit_prism_stratum_peak_active_connections 0", metrics)
+        self.assertIn("qbit_prism_stratum_pending_initial_jobs 0", metrics)
+        self.assertIn("qbit_prism_stratum_pending_initial_job_limit 128", metrics)
+        self.assertIn("qbit_prism_stratum_current_tip_job_coverage 1.0", metrics)
+        self.assertIn("qbit_prism_stratum_handler_threads 0", metrics)
+        self.assertIn("qbit_prism_job_delivery_queue_depth 0", metrics)
+        self.assertIn("qbit_prism_job_delivery_active_workers 0", metrics)
         self.assertIn(
             'qbit_prism_stratum_connection_limit_rejections_total{scope="global"} 2',
             metrics,
@@ -2050,25 +2063,117 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.ledger_attestation_signing_seed_hex = "43" * 32
 
         captured: dict[str, object] = {}
-        with tempfile.TemporaryDirectory() as tmp, patch(
-            "lab.prism.prism_coordinator.subprocess.Popen",
-            fake_audit_bundle_popen(
-                captured,
-                output_text='{"partial":',
-                returncode=9,
-                stderr_text="synthetic builder failure",
-            ),
-        ):
+        with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "candidate.audit.json"
-            with self.assertRaisesRegex(RuntimeError, "synthetic builder failure"):
-                server.build_audit_bundle(
+            with patch(
+                "lab.prism.prism_coordinator.subprocess.Popen",
+                fake_audit_bundle_popen(
+                    captured,
+                    output_text='{"partial":',
+                    returncode=9,
+                    stderr_text="synthetic builder failure",
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic builder failure"):
+                    server.build_audit_bundle(
+                        shares=[],
+                        found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                        prior_balances=[],
+                        coinbase_script_sig_suffix_hex="00",
+                        canonical_output_path=output_path,
+                    )
+            self.assertFalse(output_path.exists())
+            self.assertEqual(server.job_build_worker_counts["crashes"], 1)
+
+            with patch(
+                "lab.prism.prism_coordinator.subprocess.Popen",
+                fake_audit_bundle_popen(captured),
+            ):
+                recovered = server.build_audit_bundle(
                     shares=[],
                     found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
                     prior_balances=[],
                     coinbase_script_sig_suffix_hex="00",
-                    canonical_output_path=output_path,
                 )
-            self.assertFalse(output_path.exists())
+
+            self.assertEqual(recovered, {"ok": True})
+            self.assertEqual(server.job_build_worker_counts["restarts"], 1)
+
+    def test_build_audit_bundle_recovers_after_cancelled_worker_timeout(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        cancellation = _JobBuildCancellation(timeout_seconds=60)
+        process_calls = 0
+
+        class FakeStdin:
+            def write(self, value: str) -> int:
+                return len(value)
+
+            def close(self) -> None:
+                return None
+
+        class HungThenHealthyPopen:
+            def __init__(self, _cmd: list[str], **kwargs: object) -> None:
+                nonlocal process_calls
+                process_calls += 1
+                self.healthy = process_calls == 2
+                self.stdin = FakeStdin()
+                self.stdout = kwargs["stdout"]
+                self.stderr = kwargs["stderr"]
+                self.returncode: int | None = None
+                self.output_written = False
+
+            def poll(self) -> int | None:
+                if self.returncode is not None:
+                    return self.returncode
+                if self.healthy:
+                    if not self.output_written:
+                        self.stdout.write('{"ok":true}')  # type: ignore[union-attr]
+                        self.output_written = True
+                    self.returncode = 0
+                    return 0
+                cancellation.cancel("timeout")
+                return None
+
+            def terminate(self) -> None:
+                self.returncode = -15
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                assert self.returncode is not None
+                return self.returncode
+
+        build_kwargs = {
+            "shares": [],
+            "found_block": {
+                "block_height": 10,
+                "coinbase_value_sats": 50_00000000,
+            },
+            "prior_balances": [],
+            "coinbase_script_sig_suffix_hex": "00",
+        }
+        with patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            HungThenHealthyPopen,
+        ):
+            with self.assertRaisesRegex(JobBuildCancelled, "timeout"):
+                server.build_audit_bundle(
+                    **build_kwargs,
+                    cancellation=cancellation,
+                )
+            recovered = server.build_audit_bundle(
+                **build_kwargs,
+                cancellation=_JobBuildCancellation(timeout_seconds=60),
+            )
+
+        self.assertEqual(recovered, {"ok": True})
+        self.assertEqual(process_calls, 2)
+        self.assertEqual(server.job_build_worker_counts["terminations"], 1)
+        self.assertEqual(server.job_build_worker_counts["restarts"], 1)
 
     def test_build_audit_bundle_does_not_unlink_preexisting_output_path(self) -> None:
         server = coordinator()
@@ -2466,6 +2571,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.jobs, {"old-job": old_context})
         self.assertEqual(state.active_job_ids, {"old-job"})
         self.assertEqual(sent, [])
+        # Tip observation is recorded as a detection before expensive template
+        # construction so obsolete builders can be cancelled immediately, but
+        # submit authority is published only alongside a coherent snapshot.
+        # The incoherent template never enters the artifact cache, client job
+        # maps, or the published tip state.
+        self.assertEqual(server.latest_detected_tip[0], old_tip)
         self.assertIsNone(server.current_tip_first_seen)
         self.assertIsNone(server._template_artifacts)
 
@@ -3108,6 +3219,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
+            {**base, "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS",
+            ):
+                validate_prism_production_gate()
+
+        with patch.dict(
+            os.environ,
+            {**base, "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
+            ):
+                validate_prism_production_gate()
+
+        with patch.dict(
+            os.environ,
             {**base, "QBIT_CHAIN": "mainnet", "PRISM_STRATUM_STALE_GRACE_SECONDS": "3"},
             clear=True,
         ):
@@ -3352,6 +3485,198 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(server.template_refresh_failure_expired(500.0))
         self.assertFalse(hasattr(server, "template_refresh_failure_started_monotonic"))
 
+    def test_coordination_blocked_refresh_does_not_start_failure_budget(self) -> None:
+        for blocked_error in (
+            TemplateRefreshSuperseded("qbit tip changed during sequential refresh"),
+            _PayoutStatePublicationBlocked("payout state invalidation is pending publication"),
+        ):
+            with self.subTest(blocked=type(blocked_error).__name__):
+                server = coordinator()
+                server.template_refresh_failure_exit_seconds = 10.0
+                server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+                server.rpc = TipRpc("11" * 32)
+
+                def raise_blocked(error: Exception = blocked_error) -> QbitTipTemplateSnapshot:
+                    raise error
+
+                server.fetch_qbit_tip_template_snapshot = raise_blocked  # type: ignore[method-assign]
+                with self.assertRaises(type(blocked_error)):
+                    server.poll_qbit_tip_template_once()
+
+                self.assertIsNone(
+                    getattr(server, "template_refresh_failure_started_monotonic", None)
+                )
+                self.assertFalse(server.template_refresh_failure_expired(10_000.0))
+
+    def test_non_coordination_blocked_refresh_still_starts_failure_budget(self) -> None:
+        # Plain TemplateRefreshBlocked also wraps genuine failures (malformed
+        # template artifacts, job builds failing, untrusted chain views); only
+        # the TemplateRefreshSuperseded/payout-fence subclasses are exempt.
+        server = coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.rpc = TipRpc("11" * 32)
+
+        def raise_blocked() -> QbitTipTemplateSnapshot:
+            raise TemplateRefreshBlocked(
+                "unable to derive exact artifacts for observed qbit template"
+            )
+
+        server.fetch_qbit_tip_template_snapshot = raise_blocked  # type: ignore[method-assign]
+        with (
+            patch("lab.prism.prism_coordinator.time.monotonic", return_value=100.0),
+            self.assertRaises(TemplateRefreshBlocked),
+        ):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(server.template_refresh_failure_started_monotonic, 100.0)
+        self.assertTrue(server.template_refresh_failure_expired(110.0))
+
+    def test_sustained_blocked_refresh_storm_never_exhausts_failure_budget(self) -> None:
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.rpc = TipRpc("11" * 32)
+        clock = {"now": 100.0}
+        blocked_polls = 0
+
+        def blocked_fetch() -> QbitTipTemplateSnapshot:
+            nonlocal blocked_polls
+            blocked_polls += 1
+            clock["now"] += 6.0
+            if blocked_polls >= 4:
+                server.stop_event.set()
+            if blocked_polls % 2:
+                raise TemplateRefreshSuperseded(
+                    "qbit tip changed during sequential refresh; immediate retry scheduled"
+                )
+            raise _PayoutStatePublicationBlocked(
+                "payout state invalidation is pending publication"
+            )
+
+        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+        ):
+            server.blockpoll_loop()
+
+        self.assertEqual(blocked_polls, 4)
+        self.assertGreater(clock["now"] - 100.0, server.template_refresh_failure_exit_seconds)
+        exit_process.assert_not_called()
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+
+    def test_armed_budget_is_not_fired_by_coordination_blocked_refresh(self) -> None:
+        # A transient budgeted failure armed the clock, qbitd recovered, and
+        # only coordination churn follows. Blocked attempts must not trip the
+        # armed budget in blockpoll_loop: the exit is reserved for the next
+        # budgeted failure, and the clock clears on the next completed refresh.
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server.template_refresh_failure_started_monotonic = 100.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.rpc = TipRpc("11" * 32)
+        clock = {"now": 100.0}
+        blocked_polls = 0
+
+        def blocked_fetch() -> QbitTipTemplateSnapshot:
+            nonlocal blocked_polls
+            blocked_polls += 1
+            clock["now"] += 6.0
+            if blocked_polls >= 4:
+                server.stop_event.set()
+            raise TemplateRefreshSuperseded(
+                "qbit tip changed during sequential refresh; immediate retry scheduled"
+            )
+
+        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+        ):
+            server.blockpoll_loop()
+
+        self.assertEqual(blocked_polls, 4)
+        self.assertGreater(
+            clock["now"],
+            server.template_refresh_failure_started_monotonic
+            + server.template_refresh_failure_exit_seconds,
+        )
+        exit_process.assert_not_called()
+        self.assertEqual(server.template_refresh_failure_started_monotonic, 100.0)
+
+    def test_rpc_outage_arms_and_exhausts_failure_budget(self) -> None:
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        clock = {"now": 100.0}
+
+        class OutageRpc:
+            def call(self, method: str, params: list[object] | None = None, **_kwargs: object) -> object:
+                clock["now"] += 6.0
+                raise ConnectionError("qbitd unreachable")
+
+        server.rpc = OutageRpc()
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+            self.assertRaises(SystemExit),
+        ):
+            server.blockpoll_loop()
+
+        exit_process.assert_called_once_with(1)
+        self.assertIsNotNone(server.template_refresh_failure_started_monotonic)
+
+    def test_persistent_blocked_template_derivation_arms_and_exhausts_failure_budget(self) -> None:
+        # Top-of-poll RPCs stay healthy, but every refresh fails with plain
+        # TemplateRefreshBlocked (e.g. malformed template artifacts, all job
+        # builds failing). A fresh process must still arm the budget from its
+        # first such failure and take the budgeted restart path.
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.rpc = TipRpc("11" * 32)
+        clock = {"now": 100.0}
+
+        def blocked_fetch() -> QbitTipTemplateSnapshot:
+            clock["now"] += 6.0
+            raise TemplateRefreshBlocked(
+                "unable to derive exact artifacts for observed qbit template"
+            )
+
+        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+            self.assertRaises(SystemExit),
+        ):
+            server.blockpoll_loop()
+
+        exit_process.assert_called_once_with(1)
+        self.assertIsNotNone(server.template_refresh_failure_started_monotonic)
+
     def test_healthy_noop_template_poll_resets_refresh_failure_clock(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
@@ -3471,6 +3796,70 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         exit_process.assert_called_once_with(1)
         self.assertEqual(server.job_build_failure_count, 1)
         self.assertEqual(server.last_successful_template_refresh_monotonic, 100.0)
+
+    def test_guarded_sequential_build_supersession_does_not_arm_failure_budget(self) -> None:
+        # Non-ready/collection mode: the sequential loop's guarded client
+        # build detects a superseded snapshot inside maybe_send_job. That is
+        # coordination churn, not template unhealthiness -- the real raise
+        # site must carry TemplateRefreshSuperseded so sustained pre-ready
+        # churn neither arms nor fires the budget.
+        old_tip = "00" * 32
+        new_tip = "33" * 32
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        state = client()
+        state.username = "miner-a"
+        state.worker = worker_identity()
+        state.active_job = prism_context("old-job", old_tip, worker=state.worker)
+        state.active_job_ids = {"old-job"}
+        server.clients = {state}
+        server.jobs = {"old-job": state.active_job}
+        server.tip_template_snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=old_tip,
+            previousblockhash=old_tip,
+            template_fingerprint=qbit_template_fingerprint(state.active_job.template),
+        )
+        snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=new_tip,
+            previousblockhash=new_tip,
+            template_fingerprint="44" * 32,
+        )
+        server.rpc = TipRpc(new_tip)
+        clock = {"now": 100.0}
+        fetches = 0
+
+        def fetch_snapshot() -> QbitTipTemplateSnapshot:
+            nonlocal fetches
+            fetches += 1
+            clock["now"] += 6.0
+            if fetches >= 4:
+                server.stop_event.set()
+            return snapshot
+
+        server.fetch_qbit_tip_template_snapshot = fetch_snapshot  # type: ignore[method-assign]
+        # The guarded pre-build currency check loses the race on every pass.
+        server._tip_refresh_snapshot_current_locked = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: False
+        )
+
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+        ):
+            server.blockpoll_loop()
+
+        self.assertEqual(fetches, 4)
+        self.assertGreater(clock["now"] - 100.0, server.template_refresh_failure_exit_seconds)
+        exit_process.assert_not_called()
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
 
     def test_transient_template_refresh_failure_recovers_on_healthy_noop(self) -> None:
         server = coordinator()
@@ -5541,13 +5930,118 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(server._payout_state_publication_blocked)
         self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
 
-    def test_idempotent_direct_block_confirmation_publishes_reserved_source(self) -> None:
+    def test_idempotent_direct_block_replay_skips_publication(self) -> None:
         server, state, ledger = submit_coordinator()
         server._ensure_job_cache_state()
+        server.max_blocks = 2
+        server.stop_after_block = False
         block_hash = "d0" * 32
-        ledger.confirm_accepted_block = (  # type: ignore[method-assign]
-            lambda **_kwargs: {"backend": "fake", "confirmed_count": 0}
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.rpc = rpc
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+            self.assertEqual(server._payout_state_generation, 1)
+            self.assertEqual(
+                server._published_payout_state.source_tip_hash,
+                block_hash,
+            )
+            self.assertEqual(server._payout_state_source[0], 1)
+
+            # Replay the durable candidate after its block landed, its
+            # confirmation committed, and the network built on top of it.
+            # qbit_confirm_pool_block reports confirmed_count=0 for an
+            # already-confirmed block whose height no longer matches the
+            # active tip — the sustained replay state of the post-block
+            # livelock. The published payout state already covers the
+            # candidate, so the replay must not reserve a source, bump the
+            # generation, wipe the job-bundle cache, or schedule refresh
+            # churn.
+            child_tip = "d7" * 32
+
+            class AncestorReplayRpc:
+                def call(self, method: str, params: object = None) -> object:
+                    if method == "getbestblockhash":
+                        return child_tip
+                    if method == "getblockheader":
+                        if params != [block_hash]:
+                            raise AssertionError(params)
+                        return {"height": 10, "confirmations": 2}
+                    if method == "getblockcount":
+                        return 11
+                    if method == "submitblock":
+                        raise AssertionError(
+                            "active ancestor must not be resubmitted"
+                        )
+                    raise RuntimeError(method)
+
+            server.rpc = AncestorReplayRpc()
+            ledger.confirm_accepted_block = (  # type: ignore[method-assign]
+                lambda **_kwargs: {"backend": "fake", "confirmed_count": 0}
+            )
+            retry_calls = 0
+
+            def count_retry() -> None:
+                nonlocal retry_calls
+                retry_calls += 1
+
+            server._schedule_tip_refresh_retry = count_retry  # type: ignore[method-assign]
+            cache_key = ("sentinel",)
+            server._job_bundle_cache[cache_key] = object()
+            discarded_before = server.payout_state_candidates_discarded
+            pending_marks_before = server._tip_refresh_pending_counter
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._published_payout_state.source_generation, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, block_hash)
+        self.assertEqual(server._payout_state_source[0], 1)
+        self.assertIn(cache_key, server._job_bundle_cache)
+        self.assertEqual(retry_calls, 0)
+        self.assertEqual(
+            server._tip_refresh_pending_counter,
+            pending_marks_before,
         )
+        self.assertEqual(
+            server.payout_state_candidates_discarded,
+            discarded_before,
+        )
+        self.assertFalse(server._payout_state_publication_blocked)
+        self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
+
+    def test_leaked_publication_fence_replay_republishes(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.max_blocks = 2
+        server.stop_after_block = False
+        block_hash = "d8" * 32
         with tempfile.TemporaryDirectory() as tempdir:
             server.audit_dir = Path(tempdir)
             server.evidence_path = Path(tempdir) / "evidence.json"
@@ -5569,13 +6063,59 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 block_hex="00",
             )
 
-            accepted = server.submit_block_candidate(
-                block_candidate(server, state, submission)
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+            self.assertEqual(server._payout_state_generation, 1)
+
+            # Simulate the exception tail a replay must heal: a prior attempt
+            # force-blocked delivery while its source generation already
+            # matched the published source, then failed before republishing.
+            # The leaked fence blocks every job build until a publication
+            # lands, so a confirmed_count=0 replay must not take the covered
+            # skip here.
+            server._block_payout_state_publication(force=True)
+            self.assertTrue(server._payout_state_publication_blocked)
+            self.assertEqual(
+                server._payout_state_source[0],
+                server._published_payout_state.source_generation,
+            )
+            child_tip = "d9" * 32
+
+            class AncestorReplayRpc:
+                def call(self, method: str, params: object = None) -> object:
+                    if method == "getbestblockhash":
+                        return child_tip
+                    if method == "getblockheader":
+                        if params != [block_hash]:
+                            raise AssertionError(params)
+                        return {"height": 10, "confirmations": 2}
+                    if method == "getblockcount":
+                        return 11
+                    if method == "submitblock":
+                        raise AssertionError(
+                            "active ancestor must not be resubmitted"
+                        )
+                    raise RuntimeError(method)
+
+            server.rpc = AncestorReplayRpc()
+            ledger.confirm_accepted_block = (  # type: ignore[method-assign]
+                lambda **_kwargs: {"backend": "fake", "confirmed_count": 0}
             )
 
-        self.assertTrue(accepted)
-        self.assertEqual(server._payout_state_generation, 1)
-        self.assertEqual(server._published_payout_state.source_tip_hash, block_hash)
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+
+        self.assertEqual(server._payout_state_generation, 2)
+        self.assertEqual(server._published_payout_state.source_generation, 2)
+        self.assertEqual(server._payout_state_source[0], 2)
+        self.assertFalse(server._payout_state_publication_blocked)
+        self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
 
     def test_direct_block_disabled_reconciler_bounds_publish_supersession(self) -> None:
         server, state, ledger = submit_coordinator()
@@ -6671,6 +7211,7 @@ class PrismListenerProfileTests(unittest.TestCase):
         server = coordinator()
         state = client()
         state.share_difficulty = Decimal("1")
+        state.difficulty_generation = 7
         state.send = lambda payload: None  # type: ignore[method-assign]
         server.maybe_send_job = lambda client, *, clean_jobs: False  # type: ignore[method-assign]
 
@@ -6678,6 +7219,7 @@ class PrismListenerProfileTests(unittest.TestCase):
 
         self.assertIsNone(state.pending_share_difficulty)
         self.assertEqual(state.share_difficulty, Decimal("1"))
+        self.assertEqual(state.difficulty_generation, 7)
 
     def test_suggest_difficulty_yields_to_password_d_option(self) -> None:
         server = coordinator()
@@ -6793,8 +7335,13 @@ class PrismListenerProfileTests(unittest.TestCase):
         server, state, _ = self.authorize_server_and_client()
         send_job_calls: list[bool] = []
 
-        def counting_send_job(client: object, *, clean_jobs: bool) -> bool:
+        def counting_send_job(current: ClientState, *, clean_jobs: bool) -> bool:
             send_job_calls.append(clean_jobs)
+            current.active_job = SimpleNamespace(
+                template={"previousblockhash": "aa" * 32},
+                payout_state_generation=0,
+            )
+            server.current_tip_first_seen = ("aa" * 32, None)
             return True
 
         server.maybe_send_job = counting_send_job  # type: ignore[method-assign]
