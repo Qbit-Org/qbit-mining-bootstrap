@@ -219,40 +219,17 @@ class PrismCtvRefreshPriorityTests(unittest.TestCase):
         self.assertEqual(server.current_tip_observation_sequence, 1)
         self.assertFalse(server._tip_refresh_pending())
 
-    def test_new_tip_observation_marks_priority_before_parent_lookup(self) -> None:
+    def test_new_tip_detection_marks_priority_without_parent_lookup(self) -> None:
         server = coordinator()
-        parent_lookup_entered = threading.Event()
-        release_parent_lookup = threading.Event()
-        observation_finished = threading.Event()
-        errors: list[BaseException] = []
+        server._fetch_tip_parent_hash = (  # type: ignore[method-assign]
+            lambda _tip: self.fail("tip detection must not fetch parent metadata")
+        )
 
-        def fetch_parent(_tip_hash: str) -> str:
-            parent_lookup_entered.set()
-            if not release_parent_lookup.wait(timeout=2.0):
-                raise AssertionError("test did not release parent lookup")
-            return OLD_TIP
+        self.assertTrue(server.observe_tip_for_refresh(NEW_TIP))
 
-        server._fetch_tip_parent_hash = fetch_parent  # type: ignore[method-assign]
-
-        def observe_tip() -> None:
-            try:
-                server.observe_tip_first_seen(NEW_TIP)
-            except BaseException as exc:  # pragma: no cover - asserted below
-                errors.append(exc)
-            finally:
-                observation_finished.set()
-
-        observation_thread = threading.Thread(target=observe_tip)
-        observation_thread.start()
-        self.assertTrue(parent_lookup_entered.wait(timeout=2.0))
-
+        self.assertEqual(server.latest_detected_tip[0], NEW_TIP)
+        self.assertEqual(server.current_tip_first_seen[0], OLD_TIP)
         self.assertTrue(server._tip_refresh_pending())
-        self.assertFalse(observation_finished.is_set())
-        release_parent_lookup.set()
-        observation_thread.join(timeout=2.0)
-
-        self.assertFalse(observation_thread.is_alive())
-        self.assertEqual(errors, [])
 
     def test_yield_and_chunk_metrics_are_unlabeled_and_bounded(self) -> None:
         server = coordinator()

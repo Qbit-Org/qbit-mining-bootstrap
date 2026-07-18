@@ -11,6 +11,7 @@ from lab.prism.prism_coordinator import (
     CachedTemplateArtifacts,
     CollectionIdentityUnavailable,
     StratumError,
+    TemplateRefreshBlocked,
     WorkerIdentity,
 )
 from tests.test_prism_coordinator_job_cache import (
@@ -240,43 +241,58 @@ class RepresentativeIndependentRefreshTests(unittest.TestCase):
             except BaseException as exc:  # pragma: no cover - asserted below
                 poll_errors.append(exc)
 
-        poll_thread = threading.Thread(target=poll_same_tip)
-        poll_thread.start()
-        authorized = client(2)
-        sent: list[dict[str, object]] = []
-        authorized.send = sent.append  # type: ignore[method-assign]
         try:
-            self.assertTrue(publication_window.wait(5.0))
-            with server.lock:
-                server.clients.add(authorized)
-            server._note_collection_identity_available(authorized)
+            poll_thread = threading.Thread(target=poll_same_tip)
+            poll_thread.start()
+            authorized = client(2)
+            sent: list[dict[str, object]] = []
+            authorized.send = sent.append  # type: ignore[method-assign]
+            try:
+                self.assertTrue(publication_window.wait(5.0))
+                with server.lock:
+                    server.clients.add(authorized)
+                server._note_collection_identity_available(authorized)
 
+                self.assertTrue(server.tip_refresh_is_pending())
+                self.assertTrue(server._tip_refresh_retry.is_set())
+                self.assertTrue(server.maybe_send_job(authorized, clean_jobs=True))
+                self.assertEqual(rpc.count("getblocktemplate"), 2)
+                self.assertEqual(recorded["calls"], 1)
+                self.assertIsNotNone(authorized.active_job)
+                with server.lock:
+                    published_snapshot = server.tip_template_snapshot
+                assert (
+                    authorized.active_job is not None
+                    and published_snapshot is not None
+                    and published_snapshot.template_artifacts is not None
+                )
+                self.assertIs(
+                    authorized.active_job.template,
+                    published_snapshot.template_artifacts.template,
+                )
+            finally:
+                release_publication.set()
+                poll_thread.join(5.0)
+
+            self.assertFalse(poll_thread.is_alive())
+            self.assertEqual(poll_results, [])
+            self.assertEqual(len(poll_errors), 1)
+            self.assertIsInstance(poll_errors[0], TemplateRefreshBlocked)
+            # Authorization minted a newer wake token while this poll owned
+            # the previous state. The first poll must not clear that work.
             self.assertTrue(server.tip_refresh_is_pending())
             self.assertTrue(server._tip_refresh_retry.is_set())
-            self.assertTrue(server.maybe_send_job(authorized, clean_jobs=True))
-            self.assertEqual(rpc.count("getblocktemplate"), 2)
-            self.assertEqual(recorded["calls"], 1)
+            self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+            self.assertFalse(server.tip_refresh_is_pending())
+            self.assertIsNone(server._retained_collection_refresh)
+            self.assertEqual(
+                [payload["method"] for payload in sent],
+                ["mining.set_difficulty", "mining.notify"],
+            )
+            self.assertIsNotNone(authorized.active_job)
         finally:
             release_publication.set()
-            poll_thread.join(5.0)
             server.shutdown_tip_refresh_executor()
-
-        self.assertFalse(poll_thread.is_alive())
-        self.assertEqual(poll_errors, [])
-        self.assertEqual(poll_results, [0])
-        self.assertFalse(server.tip_refresh_is_pending())
-        self.assertTrue(server._tip_refresh_retry.is_set())
-        self.assertIsNone(server._retained_collection_refresh)
-        self.assertEqual(
-            [payload["method"] for payload in sent],
-            ["mining.set_difficulty", "mining.notify"],
-        )
-        self.assertIsNotNone(authorized.active_job)
-        assert authorized.active_job is not None and retained is not None
-        self.assertIs(
-            authorized.active_job.template,
-            retained.snapshot.template_artifacts.template,
-        )
 
     def test_ready_latch_discards_retained_collection_marker(self) -> None:
         ledger = FakeLedger(miners=["solo"])

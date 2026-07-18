@@ -2479,20 +2479,22 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             template_fingerprint="22" * 32,
         )
         server.rpc = TipRpc(old_tip)
+        self.assertTrue(server.observe_tip_first_seen(old_tip))
 
         def overtake_poll() -> QbitTipTemplateSnapshot:
-            self.assertTrue(server.observe_tip_first_seen(new_tip))
+            self.assertTrue(server.observe_tip_for_refresh(new_tip))
             return old_snapshot
 
         server.fetch_qbit_tip_template_snapshot = overtake_poll  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(
             TemplateRefreshBlocked,
-            "superseded by a newer tip observation",
+            "tip/template poll was superseded during template fetch",
         ):
             server.poll_qbit_tip_template_once()
 
-        self.assertEqual(server.current_tip_first_seen[0], new_tip)
+        self.assertEqual(server.latest_detected_tip[0], new_tip)
+        self.assertEqual(server.current_tip_first_seen[0], old_tip)
         self.assertIsNone(server.tip_template_snapshot)
 
     def test_same_tip_template_refresh_sends_non_clean_job_and_keeps_old_job_submittable(self) -> None:
@@ -6317,6 +6319,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         server.blockpoll_seconds = 1.0
         known_tips: list[str] = []
         refresh_attempts: list[str] = []
+        detected_tips: list[str] = []
 
         def blockwait_once(known_tip: str) -> str:
             known_tips.append(known_tip)
@@ -6336,7 +6339,16 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         server.poll_qbit_tip_template_once = (  # type: ignore[method-assign]
             poll_qbit_tip_template_once
         )
-        server.observe_tip_first_seen = lambda _tip: None  # type: ignore[method-assign]
+
+        def observe_tip_for_refresh(tip_hash: str, **_kwargs: object) -> bool:
+            detected_tips.append(tip_hash)
+            return True
+
+        def reject_premature_publication(*_args: object, **_kwargs: object) -> bool:
+            raise AssertionError("blockwait must not publish submit authority")
+
+        server.observe_tip_for_refresh = observe_tip_for_refresh  # type: ignore[method-assign]
+        server.observe_tip_first_seen = reject_premature_publication  # type: ignore[method-assign]
 
         with patch("builtins.print"), patch(
             "lab.prism.prism_coordinator.traceback.print_exc"
@@ -6349,6 +6361,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
 
         self.assertEqual(known_tips, [tip_a, tip_a, tip_b])
         self.assertEqual(refresh_attempts, ["qbit_blockwait", "qbit_blockwait"])
+        self.assertEqual(detected_tips, [tip_a, tip_b, tip_b])
 
     def test_blockwait_unsupported_removes_watchdog_heartbeat(self) -> None:
         server = coordinator()
