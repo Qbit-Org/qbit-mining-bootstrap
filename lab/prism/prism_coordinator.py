@@ -2029,6 +2029,7 @@ class _JobBuildRequest:
     ctv_settlement_json: str | None
     decimal_context: Context = field(repr=False)
     cancellation: _JobBuildCancellation
+    idle_retarget: bool = False
     promise: Future[CachedJobBundle] = field(default_factory=Future)
     requested_monotonic: float = field(default_factory=time.monotonic)
     superseded_monotonic: float | None = None
@@ -3721,6 +3722,20 @@ class PrismCoordinator:
     def _request_job_build(self, request: _JobBuildRequest) -> Future[CachedJobBundle]:
         self._ensure_job_cache_state()
         with self._job_build_scheduler_lock:
+            if getattr(request, "idle_retarget", False):
+                with self.lock:
+                    defer_idle = self._vardiff_idle_tip_divergence_locked()
+                if defer_idle:
+                    request.cancellation.cancel(
+                        "idle retarget deferred during unpublished tip refresh"
+                    )
+                    if not request.promise.done():
+                        request.promise.set_exception(
+                            JobBuildSuperseded(
+                                "idle retarget deferred during unpublished tip refresh"
+                            )
+                        )
+                    return request.promise
             self.job_build_scheduler_counts["requests"] += 1
             active = self._job_build_active
             retiring = self._job_build_retiring
@@ -5437,6 +5452,7 @@ class PrismCoordinator:
         payout_state_generation: int,
         cache_key: tuple[object, ...],
         payout_ledger_artifact: PayoutLedgerArtifact | None = None,
+        idle_retarget: bool = False,
     ) -> _JobBuildRequest:
         cancellation = _JobBuildCancellation(
             timeout_seconds=max(
@@ -5591,6 +5607,7 @@ class PrismCoordinator:
             ctv_settlement_json=ctv_settlement_json,
             decimal_context=decimal_context,
             cancellation=cancellation,
+            idle_retarget=idle_retarget,
         )
 
     def _newest_observed_tip_locked(self) -> str | None:
@@ -5697,6 +5714,7 @@ class PrismCoordinator:
         mode: str | None = None,
         cancelled: Callable[[], bool] | None = None,
         retry_superseded: bool = True,
+        idle_retarget: bool = False,
     ) -> CachedJobBundle:
         """Return one immutable heavy build through a work-identity flight.
 
@@ -5748,6 +5766,7 @@ class PrismCoordinator:
                     payout_state_generation=payout_state_generation,
                     cache_key=key,
                     payout_ledger_artifact=payout_artifact,
+                    idle_retarget=idle_retarget,
                 )
                 # Preserve the historical readiness handoff without holding a
                 # lock across construction: only admission and the final mode
@@ -13860,17 +13879,37 @@ class PrismCoordinator:
         request: _IdleRetargetRequest,
     ) -> CachedJobBundle:
         """Build on the dedicated idle executor without holding a client lock."""
+        with self.lock:
+            if self._vardiff_idle_tip_divergence_locked():
+                raise JobBuildSuperseded(
+                    "idle retarget deferred during unpublished tip refresh"
+                )
         artifacts = (
             self._retained_collection_artifacts()
             or self.job_issuance_template_artifacts()
         )
-        return self.shared_job_bundle(artifacts, request.worker)
+        return self.shared_job_bundle(
+            artifacts,
+            request.worker,
+            idle_retarget=True,
+        )
+
+    def _vardiff_idle_tip_divergence_locked(self) -> bool:
+        """Whether detected tip work still lacks published submit authority."""
+        published = getattr(self, "current_tip_first_seen", None)
+        latest_detected = getattr(self, "latest_detected_tip", None)
+        return bool(
+            latest_detected is not None
+            and (published is None or latest_detected[0] != published[0])
+        )
 
     def _idle_request_skip_reason_locked(
         self,
         request: _IdleRetargetRequest,
     ) -> str | None:
         client = request.client
+        if self._vardiff_idle_tip_divergence_locked():
+            return "superseded"
         if (
             client not in self.clients
             or getattr(client, "closing", False)
@@ -14030,6 +14069,8 @@ class PrismCoordinator:
                 )
             if not bundle_current:
                 self._record_vardiff_idle_skip("superseded")
+        except JobBuildSuperseded:
+            self._record_vardiff_idle_skip("superseded")
         except OSError:
             with self._vardiff_idle_lock:
                 self.vardiff_idle_task_failures += 1
@@ -14131,7 +14172,10 @@ class PrismCoordinator:
             for client in clients:
                 self._record_heartbeat("vardiff_idle_sweep")
                 with self.lock:
-                    if (
+                    if self._vardiff_idle_tip_divergence_locked():
+                        reason = "superseded"
+                        request = None
+                    elif (
                         client not in self.clients
                         or not self.client_can_receive_jobs(client)
                     ):

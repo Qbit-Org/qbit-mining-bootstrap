@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import Future
 from dataclasses import replace as dataclass_replace
 from decimal import Decimal
 from pathlib import Path
@@ -1156,7 +1157,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.vardiff_window_started_monotonic, window_started)
         self.assertGreaterEqual(server.vardiff_idle_skip_counts["superseded"], 1)
 
-    def test_idle_retarget_uses_published_snapshot_during_unpublished_refresh(
+    def test_idle_retarget_defers_detected_payout_source_during_tip_divergence(
         self,
     ) -> None:
         old_tip = "00" * 32
@@ -1164,7 +1165,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server = coordinator()
         state = client()
         prepare_idle_client(server, state, tip=old_tip)
-        published_bundle = install_idle_job_cache(server, tip=old_tip)
+        install_idle_job_cache(server, tip=old_tip)
         with server._job_cache_lock:
             published_artifacts = server._template_artifacts
         assert published_artifacts is not None
@@ -1193,35 +1194,119 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         with server._job_cache_lock:
             server._template_artifacts = detected_artifacts
-        selected: list[CachedTemplateArtifacts] = []
+            server._published_payout_state = dataclass_replace(
+                server._published_payout_state,
+                source_tip_hash=new_tip,
+            )
+        window_state = (
+            state.vardiff_window_started_monotonic,
+            state.vardiff_window_accepted,
+            state.vardiff_window_submitted,
+            state.vardiff_window_work,
+        )
         sent: list[dict[str, object]] = []
 
-        def select_published_bundle(
-            artifacts: CachedTemplateArtifacts,
-            _worker: WorkerIdentity,
-        ) -> CachedJobBundle:
-            selected.append(artifacts)
-            return published_bundle
-
-        server.shared_job_bundle = select_published_bundle  # type: ignore[method-assign]
+        server._build_idle_job_bundle = lambda _request: self.fail(  # type: ignore[method-assign]
+            "idle divergence entered the shared build scheduler"
+        )
         state.send = sent.append  # type: ignore[method-assign]
 
-        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        self.assertEqual(server.vardiff_idle_sweep_once(), 0)
         server.shutdown_vardiff_idle_executor()
 
-        self.assertEqual(selected, [published_artifacts])
-        self.assertEqual(
-            [payload["method"] for payload in sent],
-            ["mining.set_difficulty", "mining.notify"],
-        )
-        self.assertIsNotNone(state.active_job)
-        self.assertIs(state.active_job.template, published_artifacts.template)
-        self.assertEqual(
-            state.active_job.template["previousblockhash"],
-            old_tip,
-        )
-        self.assertEqual(state.share_difficulty, Decimal("4"))
+        self.assertEqual(sent, [])
+        self.assertEqual(state.share_difficulty, Decimal("16"))
         self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(
+            (
+                state.vardiff_window_started_monotonic,
+                state.vardiff_window_accepted,
+                state.vardiff_window_submitted,
+                state.vardiff_window_work,
+            ),
+            window_state,
+        )
+        self.assertEqual(server.vardiff_idle_skip_counts["superseded"], 1)
+
+    def test_replacement_tip_build_survives_repeated_idle_sweeps(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state, tip=old_tip)
+        install_idle_job_cache(server, tip=old_tip)
+        with server._job_cache_lock:
+            published_artifacts = server._template_artifacts
+        assert published_artifacts is not None
+        detected_template = gbt_template(new_tip, height=11)
+        detected_artifacts = CachedTemplateArtifacts(
+            template=detected_template,
+            fingerprint=qbit_template_fingerprint(detected_template),
+            previousblockhash=new_tip,
+            transaction_hexes=(),
+            witness_merkle_leaves_hex=(),
+            network_difficulty=1,
+            fetched_monotonic=time.monotonic(),
+            generation=2,
+        )
+        now = time.monotonic()
+        server.current_tip_first_seen = (old_tip, now)
+        server.current_tip_observed_monotonic = now
+        server.latest_detected_tip = (new_tip, 2)
+        server.tip_refresh_divergence_started_monotonic = now
+        server.tip_template_snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=old_tip,
+            previousblockhash=old_tip,
+            template_fingerprint=published_artifacts.fingerprint,
+            template_generation=published_artifacts.generation,
+            template_artifacts=published_artifacts,
+        )
+        with server._job_cache_lock:
+            server._template_artifacts = detected_artifacts
+        server._ensure_job_cache_state()
+        replacement_cancellation = _JobBuildCancellation(timeout_seconds=60.0)
+        replacement_request = SimpleNamespace(
+            artifacts=detected_artifacts,
+            cancellation=replacement_cancellation,
+        )
+        replacement_flight = SimpleNamespace(request=replacement_request)
+        with server._job_build_scheduler_lock:
+            server._job_build_active = replacement_flight
+        build_called = threading.Event()
+        window_started = state.vardiff_window_started_monotonic
+
+        def unexpected_idle_build(_request: object) -> CachedJobBundle:
+            build_called.set()
+            raise AssertionError("idle sweep displaced the replacement build")
+
+        server._build_idle_job_bundle = unexpected_idle_build  # type: ignore[method-assign]
+
+        for _sweep in range(4):
+            self.assertEqual(server.vardiff_idle_sweep_once(), 0)
+
+        # Close the race where a worker passed its first divergence check just
+        # before detection. Scheduler admission must reject that idle request
+        # without superseding the active replacement build.
+        racing_idle_cancellation = _JobBuildCancellation(timeout_seconds=60.0)
+        racing_idle_request = SimpleNamespace(
+            idle_retarget=True,
+            cancellation=racing_idle_cancellation,
+            promise=Future(),
+        )
+        racing_idle_promise = server._request_job_build(racing_idle_request)  # type: ignore[arg-type]
+        with self.assertRaises(JobBuildCancelled):
+            racing_idle_promise.result()
+
+        with server._job_build_scheduler_lock:
+            self.assertIs(server._job_build_active, replacement_flight)
+        self.assertFalse(replacement_cancellation.is_set())
+        self.assertTrue(racing_idle_cancellation.is_set())
+        self.assertFalse(build_called.is_set())
+        self.assertEqual(state.vardiff_window_started_monotonic, window_started)
+        self.assertEqual(server.vardiff_idle_skip_counts["superseded"], 4)
+        with server._job_build_scheduler_lock:
+            server._job_build_active = None
+        server.shutdown_vardiff_idle_executor()
 
     def test_idle_cached_collection_bundle_refreshes_readiness(self) -> None:
         server = coordinator()
