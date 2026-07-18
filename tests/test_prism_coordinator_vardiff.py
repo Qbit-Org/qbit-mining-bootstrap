@@ -602,6 +602,13 @@ def install_idle_job_cache(
         fetched_monotonic=time.monotonic(),
         generation=1,
     )
+    key = server._job_bundle_key(
+        artifacts,
+        mode="ready",
+        payout_state_generation=server._payout_state_generation,
+        payout_artifact_generation=0,
+        worker=None,
+    )
     qbit_target = direct_stratum.difficulty_target(Decimal("1024"))
     base_job = direct_stratum.DirectQbitStratumJob(
         job_id="prism-template-base",
@@ -624,7 +631,7 @@ def install_idle_job_cache(
         clean_jobs=True,
     )
     bundle = CachedJobBundle(
-        key=(fingerprint, "ready", 0),
+        key=key,
         template=template,
         template_fingerprint=fingerprint,
         coinbase_manifest={},
@@ -1147,6 +1154,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 artifacts,
                 mode="collection",
                 payout_state_generation=server._payout_state_generation,
+                payout_artifact_generation=0,
                 worker=state.worker,
             )
             collection_bundle = dataclass_replace(
@@ -1186,6 +1194,61 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         self.assertIsNotNone(state.active_job)
         self.assertFalse(state.active_job.collection_only)
+
+    def test_idle_cached_ready_bundle_rebinds_same_tip_observation(self) -> None:
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state)
+        cached = install_idle_job_cache(server)
+        updated_template = dict(cached.template)
+        updated_template["curtime"] = int(updated_template["curtime"]) + 30
+        current = server.store_template_artifacts(updated_template, generation=2)
+        assert current is not None
+        delivered = threading.Event()
+        rebound = threading.Event()
+        sent: list[dict[str, object]] = []
+
+        def bind_current_observation(
+            bundle: CachedJobBundle,
+            artifacts: CachedTemplateArtifacts,
+        ) -> CachedJobBundle:
+            rebound.set()
+            return dataclass_replace(
+                bundle,
+                template=artifacts.template,
+                base_job=dataclass_replace(
+                    bundle.base_job,
+                    ntime=f'{artifacts.template["curtime"]:08x}',
+                ),
+                template_generation=artifacts.generation,
+            )
+
+        def record(payload: dict[str, object]) -> None:
+            sent.append(payload)
+            if payload.get("method") == "mining.notify":
+                delivered.set()
+
+        state.send = record  # type: ignore[method-assign]
+        server._bind_cached_bundle_to_artifacts = (  # type: ignore[method-assign]
+            bind_current_observation
+        )
+
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        self.assertTrue(delivered.wait(timeout=1))
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertIsNotNone(state.active_job)
+        self.assertTrue(rebound.is_set())
+        self.assertIs(state.active_job.template, current.template)
+        self.assertEqual(state.active_job.template_generation, current.generation)
+        expected_ntime = f'{updated_template["curtime"]:08x}'
+        self.assertEqual(state.active_job.job.ntime, expected_ntime)
+        notify = next(
+            payload
+            for payload in sent
+            if payload.get("method") == "mining.notify"
+        )
+        self.assertEqual(notify["params"][7], expected_ntime)
 
     def test_repeated_idle_sweeps_do_not_enqueue_duplicate_connection_work(self) -> None:
         server = coordinator()

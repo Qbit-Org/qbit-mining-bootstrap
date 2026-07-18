@@ -13688,7 +13688,13 @@ class PrismCoordinator:
         client: ClientState,
         bundle: CachedJobBundle,
     ) -> bool:
-        """Check one exact cache entry. Caller holds ``_job_cache_lock``."""
+        """Check one exact current observation. Caller holds ``_job_cache_lock``.
+
+        Ready bundles can reuse an older same-tip heavy cache entry, but the
+        prepared copy must be rebound to the current template artifacts before
+        delivery. Accept that copy only when it still shares the immutable
+        heavy payload with the cache entry from which it was derived.
+        """
         artifacts = self._template_artifacts
         if artifacts is None or self._payout_state_publication_blocked:
             return False
@@ -13711,21 +13717,39 @@ class PrismCoordinator:
         mode = "ready" if getattr(self, "_pool_ready_latched", False) else "collection"
         if bundle.collection_only != (mode == "collection"):
             return False
-        if bundle.collection_only and (
+        if (
             bundle.template is not artifacts.template
             or bundle.template_generation != artifacts.generation
         ):
-            # The signed collection share includes template ntime. Ready
-            # bundles may retain a prior clock-only observation of the same
-            # exact tip/fingerprint; collection bundles may not.
+            # Collection manifests sign the template ntime, while ready
+            # bundles can cheaply rebind their base job. Either way, the
+            # object stamped for delivery must represent this observation.
             return False
         key = self._job_bundle_key(
             artifacts,
             mode=mode,
             payout_state_generation=self._payout_state_generation,
+            payout_artifact_generation=bundle.payout_artifact_generation,
             worker=worker,
         )
-        if self._job_bundle_cache.get(key) is not bundle:
+        cached = self._job_bundle_cache.get(key)
+        if cached is None:
+            return False
+        if cached is not bundle and not (
+            bundle.key == cached.key
+            and bundle.coinbase_manifest is cached.coinbase_manifest
+            and bundle.shares_json is cached.shares_json
+            and bundle.prior_balances is cached.prior_balances
+            and bundle.found_block is cached.found_block
+            and bundle.collection_only == cached.collection_only
+            and bundle.issued_at_ms == cached.issued_at_ms
+            and bundle.built_monotonic == cached.built_monotonic
+            and bundle.payout_state_generation
+            == cached.payout_state_generation
+            and bundle.payout_artifact_generation
+            == cached.payout_artifact_generation
+            and bundle.collection_identity == cached.collection_identity
+        ):
             return False
         ttl = float(
             getattr(
@@ -13734,7 +13758,7 @@ class PrismCoordinator:
                 DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS,
             )
         )
-        return ttl > 0 and time.monotonic() - bundle.built_monotonic <= ttl
+        return ttl > 0 and time.monotonic() - cached.built_monotonic <= ttl
 
     def _cached_idle_job_bundle(self, client: ClientState) -> CachedJobBundle | None:
         """Return only an exact current cached bundle; never build or query."""
@@ -13745,10 +13769,22 @@ class PrismCoordinator:
             if artifacts is None or worker is None:
                 return None
             mode = "ready" if getattr(self, "_pool_ready_latched", False) else "collection"
+            payout_artifact = getattr(self, "_payout_ledger_artifact", None)
+            payout_artifact_generation = (
+                payout_artifact.generation
+                if mode == "ready"
+                and payout_artifact is not None
+                and payout_artifact.payout_state_generation
+                == self._payout_state_generation
+                and payout_artifact.network_difficulty
+                == artifacts.network_difficulty
+                else 0
+            )
             key = self._job_bundle_key(
                 artifacts,
                 mode=mode,
                 payout_state_generation=self._payout_state_generation,
+                payout_artifact_generation=payout_artifact_generation,
                 worker=worker,
             )
             bundle = self._job_bundle_cache.get(key)
@@ -13855,17 +13891,16 @@ class PrismCoordinator:
             # cached collection bundle cannot be delivered after the pool is
             # ready for normal payout work.
             self.pool_readiness_latched()
-            if bundle is not None:
-                with self._job_cache_lock:
-                    if not self._idle_bundle_current_locked(client, bundle):
-                        bundle = None
-            if bundle is None:
-                bundle = self._build_idle_job_bundle(request)
-                with self.lock:
-                    reason = self._idle_request_skip_reason_locked(request)
-                if reason is not None:
-                    self._record_vardiff_idle_skip(reason)
-                    return
+            # Canonicalize the sweep's cache-only snapshot on the dedicated
+            # worker. shared_job_bundle() selects the current payout-artifact
+            # key and rebinds a ready heavy bundle to the latest same-tip
+            # template observation; a miss may build here, never on the sweep.
+            bundle = self._build_idle_job_bundle(request)
+            with self.lock:
+                reason = self._idle_request_skip_reason_locked(request)
+            if reason is not None:
+                self._record_vardiff_idle_skip(reason)
+                return
             # Prepared bundles bypass _maybe_send_job_locked's normal build
             # admission, so preserve its live reorg/headers/IBD trust guard on
             # the dedicated worker before taking the client lock or sending.
