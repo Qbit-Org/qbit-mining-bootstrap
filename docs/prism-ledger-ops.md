@@ -271,6 +271,26 @@ pooled client when psycopg is importable and a `postgres://` DSN is available
 requires it, and `0` forces the subprocess fallback. The coordinator startup
 line reports the active backend as `ledger_execution=`.
 
+Tip refresh work is bounded below the liveness watchdog. The defaults are 90s
+for an entire refresh, 60s for `qbit-prism-build-audit-bundle`, 30s for a
+PostgreSQL operation, 10s for a qbit RPC, 5s for refresh-lock admission, and
+2s for client job-lock admission. The builder is terminated, then killed and
+reaped after a 2s grace if it exceeds its deadline. Configure these with
+`PRISM_TIP_REFRESH_TIMEOUT_SECONDS`,
+`PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS`,
+`PRISM_POSTGRES_OPERATION_TIMEOUT_SECONDS`,
+`PRISM_QBIT_RPC_TIMEOUT_SECONDS`, `PRISM_TIP_REFRESH_LOCK_TIMEOUT_SECONDS`,
+`PRISM_CLIENT_JOB_LOCK_TIMEOUT_SECONDS`, and
+`PRISM_AUDIT_BUNDLE_TERMINATE_GRACE_SECONDS`.
+
+On a watchdog fatal shutdown, writer admission closes before a best-effort
+lease release bounded by `PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS`
+(default 5s). Failure or timeout leaves the exact writer session fenced by the
+existing lease and the process still exits non-zero; it never resumes work.
+The audit health payload exposes `qbit_blockpoll` phase/generation state, and
+the Prometheus endpoint exports phase duration, timeout, supersession, and
+watchdog lease-release counters.
+
 Readiness and health counters (`accepted_share_stats`) are maintained
 incrementally by the single lease-holding writer and reconciled against the
 database once per `PRISM_ACCEPTED_STATS_CACHE_SECONDS` (default 60) instead of

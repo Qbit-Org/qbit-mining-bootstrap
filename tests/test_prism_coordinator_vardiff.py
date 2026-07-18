@@ -8,6 +8,8 @@ import json
 import os
 import queue
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -44,6 +46,7 @@ from lab.prism.prism_coordinator import (
     StratumError,
     StratumListenerProfile,
     TemplateRefreshBlocked,
+    TipRefreshPhaseTimeout,
     PrismCoordinator,
     WorkerIdentity,
     _FanoutCancellation,
@@ -71,32 +74,81 @@ def fake_audit_bundle_popen(
     returncode: int = 0,
     stderr_text: str = "",
 ) -> type:
-    class FakeStdin:
-        def __init__(self) -> None:
-            self.parts: list[str] = []
-
-        def write(self, value: str) -> int:
-            self.parts.append(value)
-            return len(value)
-
-        def close(self) -> None:
-            return None
-
     class FakePopen:
         def __init__(self, cmd: list[str], **kwargs: object) -> None:
             captured["cmd"] = cmd
-            self.stdin = FakeStdin()
+            self.stdin = kwargs["stdin"]
             self.stdout = kwargs["stdout"]
             self.stderr = kwargs["stderr"]
+            self.pid = 12345
+            self.returncode: int | None = None
 
-        def wait(self, timeout: float | None = None) -> int:
-            captured["timeout"] = timeout
-            captured["payload"] = json.loads("".join(self.stdin.parts))
+        def communicate(
+            self,
+            input: str | None = None,
+            timeout: float | None = None,
+        ) -> tuple[None, None]:
+            del timeout
+            if input is not None:
+                payload_text = input
+            else:
+                self.stdin.seek(0)
+                payload_text = self.stdin.read()
+            captured["payload"] = json.loads(payload_text)
             self.stdout.write(output_text)
             self.stderr.write(stderr_text)
-            return returncode
+            self.returncode = returncode
+            return None, None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            if self.returncode is None:
+                self.returncode = returncode
+            return self.returncode
 
     return FakePopen
+
+
+def synthetic_manifest_coinbase_hex(suffix_hex: str) -> str:
+    script_sig = "03aabbcc" + suffix_hex
+    script_sig_bytes = bytes.fromhex(script_sig)
+    output = (50_00000000).to_bytes(8, "little").hex() + "0151"
+    return (
+        "01000000"
+        + "01"
+        + "00" * 32
+        + "ffffffff"
+        + direct_stratum.compact_size(len(script_sig_bytes)).hex()
+        + script_sig
+        + "ffffffff"
+        + "01"
+        + output
+        + "00000000"
+    )
+
+
+def install_manifest_bundle_builder(server: PrismCoordinator) -> None:
+    def build(**kwargs: object) -> dict[str, object]:
+        suffix_hex = str(kwargs["coinbase_script_sig_suffix_hex"])
+        return {
+            "found_block": dict(kwargs["found_block"]),  # type: ignore[arg-type]
+            "signed_coinbase_manifest": {
+                "manifest": {
+                    "coinbase_tx_hex": synthetic_manifest_coinbase_hex(suffix_hex),
+                }
+            },
+        }
+
+    server.build_audit_bundle = build  # type: ignore[method-assign]
 
 
 def tx_output(value_sats: int, script_hex: str) -> str:
@@ -577,6 +629,8 @@ def coordinator() -> PrismCoordinator:
         retarget_tolerance=Decimal("0"),
     )
     server.share_difficulty = Decimal("0.000000001")
+    server.default_share_weight = 1
+    server.share_weights_by_username = {}
     server.lock = threading.RLock()
     server.stop_event = threading.Event()
     server.clients = set()
@@ -611,6 +665,7 @@ def coordinator() -> PrismCoordinator:
     server.blockwait_timeout_seconds = 5.0
     server.vardiff_idle_sweep_seconds = 15.0
     server.job_build_failure_count = 0
+    server.job_counter = 0
     server.tip_refresh_job_count = 0
     server.post_accept_refresh_failure_count = 0
     server.reorg_reconciler_enabled = False
@@ -2079,6 +2134,54 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 )
             self.assertFalse(output_path.exists())
 
+    def test_hung_audit_bundle_builder_is_terminated_and_reaped(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        server.bundle_build_timeout_seconds = 0.1
+        server.audit_bundle_terminate_grace_seconds = 0.1
+        processes: list[subprocess.Popen[str]] = []
+        real_popen = subprocess.Popen
+
+        def record_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+            process = real_popen(*args, **kwargs)  # type: ignore[arg-type]
+            processes.append(process)
+            return process
+
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+            ],
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            side_effect=record_popen,
+        ):
+            output_path = Path(tmp) / "timed-out.audit.json"
+            with self.assertRaises(TipRefreshPhaseTimeout) as raised:
+                server.build_audit_bundle(
+                    shares=[],
+                    found_block={
+                        "block_height": 10,
+                        "coinbase_value_sats": 50_00000000,
+                    },
+                    prior_balances=[],
+                    coinbase_script_sig_suffix_hex="00",
+                    canonical_output_path=output_path,
+                )
+
+            self.assertEqual(raised.exception.phase, "bundle_builder")
+            self.assertFalse(output_path.exists())
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+        self.assertIsInstance(processes[0].wait(timeout=0.1), int)
+        self.assertIsNone(server.blockpoll_state_snapshot()["active_helper_pid"])
+
     def test_build_audit_bundle_does_not_unlink_preexisting_output_path(self) -> None:
         server = coordinator()
         server.signing_seed_hex = "42" * 32
@@ -2385,29 +2488,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             template_fingerprint=qbit_template_fingerprint(old_context.template),
         )
         server.rpc = TipTemplateRpc(tip=new_tip, template=gbt_template(new_tip, height=11))
-
-        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
-            self.assertIs(client, state)
-            return prism_context(
-                "fresh-job",
-                new_tip,
-                worker=worker,
-                difficulty=client.pending_share_difficulty or client.share_difficulty,
-                clean_jobs=clean_jobs,
-            )
-
-        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
+        install_manifest_bundle_builder(server)
 
         refreshed = server.poll_qbit_tip_template_once()
+        fresh_job_id = state.active_job.job.job_id
 
         self.assertEqual(refreshed, 1)
         self.assertEqual(server.tip_refresh_job_count, 1)
         self.assertIn(state, server.clients)
         self.assertNotIn("old-job", server.jobs)
-        self.assertEqual(state.active_job_ids, {"fresh-job"})
-        self.assertIn("fresh-job", server.jobs)
+        self.assertEqual(state.active_job_ids, {fresh_job_id})
+        self.assertIn(fresh_job_id, server.jobs)
         self.assertEqual([payload["method"] for payload in sent], ["mining.set_difficulty", "mining.notify"])
-        self.assertEqual(sent[1]["params"][0], "fresh-job")
+        self.assertEqual(sent[1]["params"][0], fresh_job_id)
         self.assertTrue(sent[1]["params"][8])
 
         with self.assertRaises(StratumError) as raised:
@@ -2433,12 +2526,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         ):
             should_close = server.handle_submit(
                 state,
-                ["miner-a", "fresh-job", "00" * 8, "00000001", "00000002"],
+                ["miner-a", fresh_job_id, "00" * 8, "00000001", "00000002"],
             )
 
         self.assertFalse(should_close)
         self.assertEqual(len(ledger.pending), 1)
-        self.assertEqual(ledger.pending[0].job_id, "fresh-job")
+        self.assertEqual(ledger.pending[0].job_id, fresh_job_id)
         self.assertIn(state, server.clients)
 
     def test_tip_refresh_rpc_race_blocks_mismatched_tip_template_snapshot(self) -> None:
@@ -2535,33 +2628,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         refreshed_template = gbt_template(tip, height=10, coinbasevalue=50_00000001)
         server.rpc = TipTemplateRpc(tip=tip, template=refreshed_template)
-
-        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
-            self.assertIs(client, state)
-            self.assertFalse(clean_jobs)
-            fresh_context = prism_context(
-                "fresh-job",
-                tip,
-                worker=worker,
-                difficulty=client.pending_share_difficulty or client.share_difficulty,
-                clean_jobs=clean_jobs,
-            )
-            fresh_context.template["coinbasevalue"] = refreshed_template["coinbasevalue"]
-            fresh_context.template_fingerprint = qbit_template_fingerprint(fresh_context.template)
-            return fresh_context
-
-        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
+        install_manifest_bundle_builder(server)
 
         refreshed = server.poll_qbit_tip_template_once()
+        fresh_job_id = state.active_job.job.job_id
 
         self.assertEqual(refreshed, 1)
         self.assertEqual(server.tip_refresh_job_count, 1)
         self.assertIn(state, server.clients)
         self.assertIn("old-job", server.jobs)
-        self.assertIn("fresh-job", server.jobs)
-        self.assertEqual(state.active_job_ids, {"old-job", "fresh-job"})
+        self.assertIn(fresh_job_id, server.jobs)
+        self.assertEqual(state.active_job_ids, {"old-job", fresh_job_id})
         self.assertEqual([payload["method"] for payload in sent], ["mining.set_difficulty", "mining.notify"])
-        self.assertEqual(sent[1]["params"][0], "fresh-job")
+        self.assertEqual(sent[1]["params"][0], fresh_job_id)
         self.assertFalse(sent[1]["params"][8])
         self.assertIn("qbit_prism_active_job_contexts 2", server.metrics_payload())
 
@@ -2598,6 +2677,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         state.worker = worker
         state.share_difficulty = Decimal("1")
         state.pending_share_difficulty = Decimal("8")
+        state.minimum_advertised_difficulty = Decimal("8")
         sent: list[dict[str, object]] = []
         state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
         server.clients = {state}
@@ -2611,29 +2691,23 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             template_fingerprint=qbit_template_fingerprint(old_context.template),
         )
         server.rpc = TipTemplateRpc(tip=new_tip, template=gbt_template(new_tip, height=11))
-
-        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
-            return prism_context(
-                "fresh-vardiff-job",
-                new_tip,
-                worker=worker,
-                difficulty=server.desired_client_share_difficulty(client),
-                clean_jobs=clean_jobs,
-            )
-
-        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
+        install_manifest_bundle_builder(server)
 
         refreshed = server.poll_qbit_tip_template_once()
+        fresh_job_id = state.active_job.job.job_id
 
         self.assertEqual(refreshed, 1)
         self.assertEqual(sent[0]["method"], "mining.set_difficulty")
-        self.assertEqual(sent[0]["params"], [8.0])
+        advertised_difficulty = sent[0]["params"][0]
         self.assertEqual(sent[1]["method"], "mining.notify")
-        self.assertEqual(sent[1]["params"][0], "fresh-vardiff-job")
+        self.assertEqual(sent[1]["params"][0], fresh_job_id)
         self.assertTrue(sent[1]["params"][8])
-        self.assertEqual(state.share_difficulty, Decimal("8"))
+        self.assertEqual(float(state.share_difficulty), advertised_difficulty)
         self.assertIsNone(state.pending_share_difficulty)
-        self.assertEqual(server.jobs["fresh-vardiff-job"].job.share_difficulty, Decimal("8"))
+        self.assertEqual(
+            server.jobs[fresh_job_id].job.share_difficulty,
+            state.share_difficulty,
+        )
 
     def test_tip_refresh_build_failure_keeps_client_connected_and_old_job_registered(self) -> None:
         old_tip = "00" * 32
@@ -2658,12 +2732,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         server.rpc = TipTemplateRpc(tip=new_tip, template=gbt_template(new_tip, height=11))
 
-        def failing_build(client: ClientState, *, clean_jobs: bool) -> object:
+        def failing_build(**_kwargs: object) -> dict[str, object]:
             raise RuntimeError("transient getblocktemplate failure")
 
-        server.build_job_for_client = failing_build  # type: ignore[method-assign]
+        server.build_audit_bundle = failing_build  # type: ignore[method-assign]
 
-        with self.assertRaisesRegex(TemplateRefreshBlocked, "no refreshed work was issued"):
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "bundle build failed"):
             server.poll_qbit_tip_template_once()
 
         self.assertEqual(server.job_build_failure_count, 1)
@@ -2712,25 +2786,16 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         server.rpc = TipTemplateRpc(tip=new_tip, template=gbt_template(new_tip, height=11))
 
-        def mixed_build(state: ClientState, *, clean_jobs: bool) -> object:
-            if state is build_failed:
-                raise RuntimeError("template build unavailable")
-            return prism_context(
-                "disconnected-fresh-job",
-                new_tip,
-                worker=state.worker,
-                clean_jobs=clean_jobs,
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("template build unavailable")
             )
+        )
 
-        disconnected_clients: list[ClientState] = []
-        server.build_job_for_client = mixed_build  # type: ignore[method-assign]
-        server.disconnect_client = disconnected_clients.append  # type: ignore[method-assign]
-
-        with self.assertRaisesRegex(TemplateRefreshBlocked, "no refreshed work was issued"):
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "bundle build failed"):
             server.poll_qbit_tip_template_once()
 
         self.assertEqual(server.job_build_failure_count, 1)
-        self.assertEqual(disconnected_clients, [disconnected])
         self.assertIn(build_failed, server.clients)
 
     def test_tip_reconciliation_quarantines_disconnected_block_before_refresh_job(self) -> None:
@@ -2775,12 +2840,22 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             block_hashes={10: "bb" * 32},
         )
 
-        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
+        def build_fresh_job(**kwargs: object) -> dict[str, object]:
             self.assertIn(("inactive", pool_block_hash, 10), ledger.events)
-            ledger.events.append(("build", client.connection_id))
-            return prism_context("fresh-job", new_tip, worker=worker, clean_jobs=clean_jobs)
+            ledger.events.append(("build", state.connection_id))
+            suffix_hex = str(kwargs["coinbase_script_sig_suffix_hex"])
+            return {
+                "found_block": dict(kwargs["found_block"]),  # type: ignore[arg-type]
+                "signed_coinbase_manifest": {
+                    "manifest": {
+                        "coinbase_tx_hex": synthetic_manifest_coinbase_hex(
+                            suffix_hex
+                        )
+                    }
+                },
+            }
 
-        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
+        server.build_audit_bundle = build_fresh_job  # type: ignore[method-assign]
 
         refreshed = server.poll_qbit_tip_template_once()
 
@@ -2791,7 +2866,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         self.assertEqual(server.reorg_inactive_block_count, 1)
         self.assertEqual(ledger.rows[0]["chain_state"], "inactive")
-        self.assertEqual(sent[1]["params"][0], "fresh-job")
+        self.assertEqual(sent[1]["params"][0], state.active_job.job.job_id)
 
     def test_reconciliation_quarantines_confirmed_block_above_shortened_tip(self) -> None:
         pool_block_hash = "af" * 32
@@ -3478,14 +3553,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             previousblockhash=old_tip,
             template_fingerprint=qbit_template_fingerprint(state.active_job.template),
         )
+        refresh_template = gbt_template(new_tip, height=11)
+        artifacts = server.store_template_artifacts(refresh_template)
+        assert artifacts is not None
         snapshot = QbitTipTemplateSnapshot(
             bestblockhash=new_tip,
             previousblockhash=new_tip,
-            template_fingerprint="44" * 32,
+            template_fingerprint=artifacts.fingerprint,
+            template_generation=artifacts.generation,
+            template_artifacts=artifacts,
         )
         server.rpc = TipRpc(new_tip)
         server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
-        server.build_job_for_client = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
             RuntimeError("template build unavailable")
         )
 
@@ -3519,8 +3599,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             return 0
 
         server.poll_qbit_tip_template_once = fail_then_noop  # type: ignore[method-assign]
+        clock_values = iter([105.0, 106.0])
         with (
-            patch("lab.prism.prism_coordinator.time.monotonic", side_effect=[105.0, 106.0]),
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: next(clock_values, 106.0),
+            ),
             patch("lab.prism.prism_coordinator.traceback.print_exc"),
         ):
             server.blockpoll_loop()
@@ -6014,24 +6098,27 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             template_fingerprint=qbit_template_fingerprint(old_context.template),
         )
 
-        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
-            self.assertIs(client, state)
-            return prism_context(
-                "fresh-job",
-                block_hash,
-                worker=state.worker,
-                difficulty=server.desired_client_share_difficulty(client),
-                clean_jobs=clean_jobs,
-            )
-
-        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
-
         with tempfile.TemporaryDirectory() as tempdir:
             server.audit_dir = Path(tempdir)
             server.evidence_path = Path(tempdir) / "evidence.json"
             server.ledger_writer_public_key_hex = "aa" * 32
             server.rpc = SubmitAcceptingTemplateRpc(old_tip=old_tip, block_hash=block_hash, ledger=ledger)
-            server.build_audit_bundle = lambda **_kwargs: verified_block_bundle()  # type: ignore[method-assign]
+            def build_bundle(**kwargs: object) -> dict[str, object]:
+                if not kwargs.get("summary_only"):
+                    return verified_block_bundle()
+                suffix_hex = str(kwargs["coinbase_script_sig_suffix_hex"])
+                return {
+                    "found_block": dict(kwargs["found_block"]),  # type: ignore[arg-type]
+                    "signed_coinbase_manifest": {
+                        "manifest": {
+                            "coinbase_tx_hex": synthetic_manifest_coinbase_hex(
+                                suffix_hex
+                            )
+                        }
+                    },
+                }
+
+            server.build_audit_bundle = build_bundle  # type: ignore[method-assign]
             server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
             submission = SimpleNamespace(
                 header_hex="aa" * 80,
@@ -6061,14 +6148,15 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(sent[0], {"id": "submit-1", "result": True, "error": None})
         self.assertEqual([payload.get("method") for payload in sent[1:]], ["mining.set_difficulty", "mining.notify"])
-        self.assertEqual(sent[2]["params"][0], "fresh-job")
+        fresh_job_id = state.active_job.job.job_id
+        self.assertEqual(sent[2]["params"][0], fresh_job_id)
         self.assertTrue(sent[2]["params"][8])
         self.assertEqual(server.tip_refresh_job_count, 1)
         self.assertEqual(server.post_accept_refresh_failure_count, 0)
         self.assertEqual(server.accepted_block_count, 1)
         self.assertNotIn("job-1", server.jobs)
-        self.assertIn("fresh-job", server.jobs)
-        self.assertEqual(state.active_job_ids, {"fresh-job"})
+        self.assertIn(fresh_job_id, server.jobs)
+        self.assertEqual(state.active_job_ids, {fresh_job_id})
         self.assertIn(state, server.clients)
         server.stale_grace_seconds = 0
 
@@ -6092,11 +6180,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         ):
             should_close = server.handle_submit(
                 state,
-                ["miner-a", "fresh-job", "00" * 8, "00000001", "00000002"],
+                ["miner-a", fresh_job_id, "00" * 8, "00000001", "00000002"],
             )
 
         self.assertFalse(should_close)
-        self.assertEqual(ledger.pending[-1].job_id, "fresh-job")
+        self.assertEqual(ledger.pending[-1].job_id, fresh_job_id)
 
     def test_post_accept_refresh_failure_does_not_fail_accepted_direct_block(self) -> None:
         old_tip = "00" * 32
@@ -6180,27 +6268,32 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.clients = {state}
         state.share_difficulty = Decimal("1")
         state.pending_share_difficulty = Decimal("8")
+        state.minimum_advertised_difficulty = Decimal("8")
         state.vardiff_window_started_monotonic = time.monotonic()
         sent: list[dict[str, object]] = []
         state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
-
-        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
-            return prism_context(
-                "fresh-vardiff-job",
-                block_hash,
-                worker=state.worker,
-                difficulty=server.desired_client_share_difficulty(client),
-                clean_jobs=clean_jobs,
-            )
-
-        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
 
         with tempfile.TemporaryDirectory() as tempdir:
             server.audit_dir = Path(tempdir)
             server.evidence_path = Path(tempdir) / "evidence.json"
             server.ledger_writer_public_key_hex = "aa" * 32
             server.rpc = SubmitAcceptingTemplateRpc(old_tip=old_tip, block_hash=block_hash, ledger=ledger)
-            server.build_audit_bundle = lambda **_kwargs: verified_block_bundle()  # type: ignore[method-assign]
+            def build_bundle(**kwargs: object) -> dict[str, object]:
+                if not kwargs.get("summary_only"):
+                    return verified_block_bundle()
+                suffix_hex = str(kwargs["coinbase_script_sig_suffix_hex"])
+                return {
+                    "found_block": dict(kwargs["found_block"]),  # type: ignore[arg-type]
+                    "signed_coinbase_manifest": {
+                        "manifest": {
+                            "coinbase_tx_hex": synthetic_manifest_coinbase_hex(
+                                suffix_hex
+                            )
+                        }
+                    },
+                }
+
+            server.build_audit_bundle = build_bundle  # type: ignore[method-assign]
             server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
             submission = SimpleNamespace(
                 header_hex="aa" * 80,
@@ -6227,11 +6320,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(sent[0], {"id": "submit-1", "result": True, "error": None})
         self.assertEqual(sent[1]["method"], "mining.set_difficulty")
-        self.assertEqual(sent[1]["params"], [8.0])
+        advertised_difficulty = sent[1]["params"][0]
         self.assertEqual(sent[2]["method"], "mining.notify")
-        self.assertEqual(sent[2]["params"][0], "fresh-vardiff-job")
+        self.assertEqual(sent[2]["params"][0], state.active_job.job.job_id)
         self.assertTrue(sent[2]["params"][8])
-        self.assertEqual(state.share_difficulty, Decimal("8"))
+        self.assertEqual(float(state.share_difficulty), advertised_difficulty)
         self.assertIsNone(state.pending_share_difficulty)
         self.assertEqual(state.vardiff_window_submitted, 1)
         self.assertEqual(state.vardiff_window_accepted, 1)

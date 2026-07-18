@@ -31,6 +31,7 @@ DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
 DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
 DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
 VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
+DEFAULT_POSTGRES_OPERATION_TIMEOUT_SECONDS = 30.0
 
 
 def validate_credit_policy(credit_policy: str | None) -> str | None:
@@ -1134,12 +1135,19 @@ class _NativePostgresClient:
     that raises is discarded so the next acquisition reconnects.
     """
 
-    def __init__(self, conninfo: str, *, pool_size: int):
+    def __init__(
+        self,
+        conninfo: str,
+        *,
+        pool_size: int,
+        operation_timeout_seconds: float,
+    ):
         import psycopg  # deferred: the subprocess backend must work without it
 
         self._psycopg = psycopg
         self._conninfo = conninfo
         self._pool_size = max(1, int(pool_size))
+        self._operation_timeout_seconds = float(operation_timeout_seconds)
         self._slots = BoundedSemaphore(self._pool_size)
         self._idle: list[Any] = []
         self._idle_lock = Lock()
@@ -1150,12 +1158,19 @@ class _NativePostgresClient:
         return self._pool_size
 
     def _connect(self) -> Any:
-        return self._psycopg.connect(self._conninfo, autocommit=True)
+        timeout_ms = max(1, int(self._operation_timeout_seconds * 1000))
+        return self._psycopg.connect(
+            self._conninfo,
+            autocommit=True,
+            connect_timeout=max(1, math.ceil(self._operation_timeout_seconds)),
+            options=f"-c statement_timeout={timeout_ms} -c lock_timeout={timeout_ms}",
+        )
 
     @contextmanager
     def connection(self) -> Iterator[Any]:
         """Borrow a pooled connection; discard it if the caller raises."""
-        self._slots.acquire()
+        if not self._slots.acquire(timeout=self._operation_timeout_seconds):
+            raise TimeoutError("postgres connection pool admission timed out")
         conn = None
         try:
             with self._idle_lock:
@@ -1260,6 +1275,7 @@ class PsqlShareLedger:
         lease_retry_max_sleep_seconds: float = 15.0,
         lease_ttl_seconds: float = 60.0,
         read_concurrency: int = 4,
+        operation_timeout_seconds: float = DEFAULT_POSTGRES_OPERATION_TIMEOUT_SECONDS,
         accepted_stats_cache_seconds: float = 60.0,
         audit_body_dir: str | Path | None = None,
         audit_bundle_canonicalizer: Callable[[dict[str, Any]], bytes] | None = None,
@@ -1281,6 +1297,9 @@ class PsqlShareLedger:
         read_concurrency = int(read_concurrency)
         if read_concurrency <= 0:
             raise ValueError("read_concurrency must be positive")
+        operation_timeout_seconds = float(operation_timeout_seconds)
+        if not math.isfinite(operation_timeout_seconds) or operation_timeout_seconds <= 0:
+            raise ValueError("operation_timeout_seconds must be finite and positive")
         self._command = shlex.split(psql_command)
         if not self._command:
             raise ValueError("psql_command must not be empty")
@@ -1299,6 +1318,7 @@ class PsqlShareLedger:
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
         self._lock = Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
+        self._operation_timeout_seconds = operation_timeout_seconds
         self._audit_body_dir = Path(audit_body_dir) if audit_body_dir else None
         self._audit_bundle_canonicalizer = audit_bundle_canonicalizer
         audit_share_segment_size = int(audit_share_segment_size)
@@ -1324,6 +1344,7 @@ class PsqlShareLedger:
             native_client_mode,
             database_url,
             read_concurrency=read_concurrency,
+            operation_timeout_seconds=operation_timeout_seconds,
         )
         if initialize_schema:
             path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
@@ -1336,6 +1357,7 @@ class PsqlShareLedger:
         database_url: str | None,
         *,
         read_concurrency: int,
+        operation_timeout_seconds: float,
     ) -> _NativePostgresClient | None:
         mode = (native_client_mode or "auto").strip().lower()
         if mode in {"0", "false", "no", "off", "psql"}:
@@ -1354,7 +1376,11 @@ class PsqlShareLedger:
         try:
             # One pooled connection per concurrent reader plus one for the
             # serialized write path (the coordinator's share writer thread).
-            return _NativePostgresClient(conninfo, pool_size=read_concurrency + 1)
+            return _NativePostgresClient(
+                conninfo,
+                pool_size=read_concurrency + 1,
+                operation_timeout_seconds=operation_timeout_seconds,
+            )
         except ImportError:
             if required:
                 raise ValueError(
@@ -1379,6 +1405,22 @@ class PsqlShareLedger:
     @property
     def backend_name(self) -> str:
         return "postgres-psql"
+
+    @contextmanager
+    def _bounded_operation_lock(self, lock: Any, *, name: str) -> Iterator[None]:
+        timeout_seconds = float(
+            getattr(
+                self,
+                "_operation_timeout_seconds",
+                DEFAULT_POSTGRES_OPERATION_TIMEOUT_SECONDS,
+            )
+        )
+        if not lock.acquire(timeout=timeout_seconds):
+            raise TimeoutError(f"postgres {name} lock admission timed out")
+        try:
+            yield
+        finally:
+            lock.release()
 
     def append(self, pending: PendingShare) -> AcceptedShareRecord:
         if pending.share_difficulty <= 0:
@@ -1485,7 +1527,7 @@ END;
         # Serialize the single writer through its durable commit and cache note.
         # Stats reconciliation uses a separate read connection plus a share-seq
         # watermark, so it never acquires this writer lock.
-        with self._lock:
+        with self._bounded_operation_lock(self._lock, name="writer"):
             result = self._run_json(sql)
             if "error" in result:
                 raise RuntimeError(str(result["error"]))
@@ -1716,7 +1758,7 @@ SELECT CASE
     )
 END;
 """
-        with self._lock:
+        with self._bounded_operation_lock(self._lock, name="writer"):
             result = self._run_json(sql)
             if "error" in result:
                 raise RuntimeError(str(result["error"]))
@@ -1975,7 +2017,7 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY share_seq ASC), '[]'::json)
 FROM rows;
 """
-        with self._lock:
+        with self._bounded_operation_lock(self._lock, name="snapshot"):
             return [
                 self._record_from_json(item)
                 for item in self._run_retry_safe_read_json(sql)
@@ -2043,7 +2085,7 @@ WHERE accepted;
         stats_lock = getattr(self, "_stats_lock", None)
         if refresh_lock is None or stats_lock is None:
             return self._query_accepted_share_stats()[0]
-        with refresh_lock:
+        with self._bounded_operation_lock(refresh_lock, name="stats-refresh"):
             ttl = getattr(self, "_accepted_stats_cache_seconds", 0.0)
             if ttl > 0:
                 now = time.monotonic()
@@ -2140,7 +2182,7 @@ SELECT COALESCE(json_agg(json_build_object(
 FROM qbit_current_owed_balances()
 WHERE owed_balance_sats > 0;
 """
-        with self._lock:
+        with self._bounded_operation_lock(self._lock, name="owed-balances"):
             balances = self._run_retry_safe_read_json(sql)
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
@@ -2156,7 +2198,7 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM qbit_current_carry_forward_balances();
 """
-        with self._lock:
+        with self._bounded_operation_lock(self._lock, name="prior-balances"):
             balances = self._run_retry_safe_read_json(sql)
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
@@ -2249,7 +2291,7 @@ FROM qbit_audit_share_window(
     {int(network_difficulty)}::numeric
 );
 """
-        with self._lock:
+        with self._bounded_operation_lock(self._lock, name="audit-window"):
             rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             for key in (
@@ -5742,7 +5784,7 @@ WHERE chain_state IN ('confirmed', 'inactive')
   AND maturity_state = 'immature'
 ;
 """
-        with self._lock:
+        with self._bounded_operation_lock(self._lock, name="reorg-watch"):
             rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["block_height"] = int(row["block_height"])
@@ -5828,11 +5870,11 @@ END;
             return int(self._run_retry_safe_read_json(sql)["count"])
 
     def _run_fenced_json(self, sql: str) -> Any:
-        with self._lock:
+        with self._bounded_operation_lock(self._lock, name="writer"):
             return self._run_json(sql)
 
     def _run_read_json(self, sql: str) -> Any:
-        with self._read_semaphore:
+        with self._bounded_operation_lock(self._read_semaphore, name="reader"):
             return self._run_retry_safe_read_json(sql)
 
     def _run_retry_safe_read_json(self, sql: str) -> Any:
@@ -6002,6 +6044,13 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
         self._run_sql(sql)
 
     def _run_sql(self, sql: str) -> str:
+        operation_timeout_seconds = float(
+            getattr(
+                self,
+                "_operation_timeout_seconds",
+                DEFAULT_POSTGRES_OPERATION_TIMEOUT_SECONDS,
+            )
+        )
         cmd = [
             *self._command,
             "--no-psqlrc",
@@ -6011,14 +6060,26 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             "--no-align",
             "--quiet",
         ]
-        completed = subprocess.run(
-            cmd,
-            input=sql,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+        process_env = os.environ.copy()
+        process_env.setdefault(
+            "PGCONNECT_TIMEOUT",
+            str(max(1, math.ceil(operation_timeout_seconds))),
         )
+        try:
+            completed = subprocess.run(
+                cmd,
+                input=sql,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=operation_timeout_seconds,
+                env=process_env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                "psql operation exceeded configured timeout"
+            ) from exc
         if completed.returncode != 0:
             raise RuntimeError(
                 "psql command failed "
