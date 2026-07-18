@@ -81,6 +81,13 @@ def artifact_from_status_row(row: dict[str, object]) -> FanoutArtifact:
     )
 
 
+def _coinbase_height_from_row(row: dict[str, object]) -> int | None:
+    try:
+        return int(row["block_height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 class CtvFanoutBroadcastDaemon:
     def __init__(self, ledger: CtvFanoutLedger, broadcaster: CtvFanoutBroadcaster, *, fee_sats: int) -> None:
         if fee_sats < 0:
@@ -103,6 +110,13 @@ class CtvFanoutBroadcastDaemon:
         The ledger query returns materialized rows and each ledger mutation is a
         complete operation. Consequently no ledger transaction or lock remains
         held while the pending-refresh callback runs between chunks.
+
+        Rows whose stored status already matches the derived status are not
+        rewritten, and rows that are provably still coinbase-immature are not
+        probed at all. Because fenced writes are what refresh the writer
+        lease, a probe that derived an unchanged status renews the lease in
+        place of the write it used to make, and a pass with no fenced refresh
+        at all renews once at the end.
         """
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -117,10 +131,27 @@ class CtvFanoutBroadcastDaemon:
         updated_count = 0
         failed_count = 0
         yielded_to_tip_refresh = False
+        lease_refreshed = False
+        tip_height: int | None = None
 
         def record_progress() -> None:
             if progress_callback is not None:
                 progress_callback()
+
+        def active_tip_height() -> int:
+            # One chain-tip probe per pass stands in for the per-row
+            # settlement probes of rows that are provably still immature.
+            nonlocal tip_height
+            if tip_height is None:
+                tip_height = int(self.broadcaster.tip_height())
+            return tip_height
+
+        def renew_lease() -> None:
+            nonlocal lease_refreshed
+            lease_refreshed = True
+            renew_writer_lease = getattr(self.ledger, "renew_writer_lease", None)
+            if renew_writer_lease is not None:
+                renew_writer_lease()
 
         for chunk_start in range(0, len(rows), chunk_size):
             if tip_refresh_pending is not None and tip_refresh_pending():
@@ -133,7 +164,8 @@ class CtvFanoutBroadcastDaemon:
             for row in chunk:
                 scanned_count += 1
                 chunk_processed_count += 1
-                if str(row.get("settlement_status") or row.get("status") or "") in {
+                stored_status = str(row.get("settlement_status") or row.get("status") or "")
+                if stored_status in {
                     "confirmed",
                     "reorged",
                     "failed",
@@ -143,10 +175,25 @@ class CtvFanoutBroadcastDaemon:
                 if not broadcast_attempt_due(row.get("next_broadcast_attempt_at")):
                     record_progress()
                     continue
+                if stored_status == "awaiting_maturity":
+                    coinbase_height = _coinbase_height_from_row(row)
+                    if (
+                        coinbase_height is not None
+                        and active_tip_height() < coinbase_height + self.broadcaster.maturity
+                    ):
+                        # While the funding coinbase is height-immature the
+                        # settlement probe can only re-derive awaiting_maturity
+                        # (a fanout spending an immature coinbase cannot be on
+                        # chain, and a reorged coinbase stays awaiting_maturity
+                        # until height-mature), so skip the per-row qbitd RPCs
+                        # and the identical status rewrite.
+                        record_progress()
+                        continue
                 artifact = artifact_from_status_row(row)
                 attempt = self.broadcaster.broadcast(artifact, self.fee_sats)
                 if attempt.submitted:
                     submitted_count += 1
+                    lease_refreshed = True
                     self._journal_attempt(attempt, attempt_status="submitted")
                     # record_ctv_fanout_broadcast_attempt moves the durable row to
                     # broadcast_submitted, so do not double-update here.
@@ -155,6 +202,7 @@ class CtvFanoutBroadcastDaemon:
 
                 if attempt.fee_sats is not None:
                     attempt_status = "planned" if attempt.package_msg == "error" else "rejected"
+                    lease_refreshed = True
                     self._journal_attempt(attempt, attempt_status=attempt_status)
                     failed_count += 1
                     record_progress()
@@ -162,14 +210,25 @@ class CtvFanoutBroadcastDaemon:
 
                 next_status = LEDGER_STATUS_BY_BROADCASTER_STATUS.get(attempt.status)
                 if next_status is not None:
-                    self.ledger.update_ctv_fanout_status(
-                        fanout_txid=attempt.fanout_txid,
-                        settlement_status=next_status,
-                    )
-                    updated_count += 1
+                    if next_status != stored_status:
+                        lease_refreshed = True
+                        self.ledger.update_ctv_fanout_status(
+                            fanout_txid=attempt.fanout_txid,
+                            settlement_status=next_status,
+                        )
+                        updated_count += 1
+                    else:
+                        # The probe was several qbitd RPCs but derived an
+                        # unchanged status, so no fenced write refreshes the
+                        # lease here anymore; renew in the write's place so a
+                        # stretch of slow unchanged probes cannot outlast the
+                        # lease TTL. This keeps the per-row refresh cadence
+                        # the removed no-op rewrites used to provide.
+                        renew_lease()
                     record_progress()
                     continue
 
+                lease_refreshed = True
                 self._journal_attempt(attempt, attempt_status="failed")
                 failed_count += 1
                 record_progress()
@@ -182,6 +241,16 @@ class CtvFanoutBroadcastDaemon:
                         elapsed_seconds=max(0.0, monotonic() - chunk_started),
                     )
                 )
+
+        if not lease_refreshed:
+            # Fenced writes are the only thing that refreshes the writer
+            # lease, and the no-op status rewrites this pass used to make were
+            # an otherwise-idle daemon's only fenced writes. Renew explicitly
+            # so the lease does not sit expired while idle and a fenced-out
+            # daemon still fails fast. Yielded passes renew too: consecutive
+            # yields must not let the lease lapse, and the single lease-row
+            # update is negligible next to the per-row work a yield defers.
+            renew_lease()
 
         return CtvFanoutDaemonResult(
             scanned_count=scanned_count,

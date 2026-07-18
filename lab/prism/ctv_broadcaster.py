@@ -180,6 +180,11 @@ class CtvFanoutBroadcaster:
     def _tip_height(self) -> int:
         return int(self._rpc("getblockchaininfo")["blocks"])
 
+    def tip_height(self) -> int:
+        """Active-chain tip height, for callers that gate work on coinbase
+        maturity without paying for a full per-artifact settlement probe."""
+        return self._tip_height()
+
     def _in_mempool(self, txid: str) -> bool:
         return txid in set(self._rpc("getrawmempool"))
 
