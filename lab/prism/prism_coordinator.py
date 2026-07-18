@@ -4246,6 +4246,13 @@ class PrismCoordinator:
         """
         if cached is None:
             return False
+        with self.lock:
+            observed_tip = getattr(self, "current_tip_first_seen", None)
+        if (
+            observed_tip is not None
+            and observed_tip[0] != artifacts.previousblockhash
+        ):
+            return False
         with self._job_cache_lock:
             if self._payout_state_publication_blocked:
                 return False

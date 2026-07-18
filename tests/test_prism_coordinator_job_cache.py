@@ -1093,6 +1093,114 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(recorded["calls"], 1)
 
+    def test_observed_tip_change_rejects_stale_cached_bundle_delivery(self) -> None:
+        old_tip = "11" * 32
+        new_tip = "22" * 32
+        server, rpc = coordinator(template=base_template(prevhash=old_tip))
+        install_fake_bundle_builder(server)
+        state = client(1)
+        sent: list[dict[str, object]] = []
+        state.send = sent.append  # type: ignore[method-assign]
+        server.clients = {state}
+        server.observe_tip_first_seen(old_tip, observation_sequence=1)
+
+        self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(len(sent), 2)
+        sent.clear()
+
+        rpc.tip = new_tip
+        server.observe_tip_first_seen(new_tip, observation_sequence=2)
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(sent, [])
+
+    def test_ready_ledger_snapshot_holds_payout_mutation_lock(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        entered_snapshot = threading.Event()
+        release_snapshot = threading.Event()
+        original_snapshot = server.ledger.snapshot_at_job_issue
+
+        def blocked_snapshot(*args: object, **kwargs: object) -> object:
+            entered_snapshot.set()
+            self.assertTrue(release_snapshot.wait(2))
+            return original_snapshot(*args, **kwargs)
+
+        server.ledger.snapshot_at_job_issue = blocked_snapshot  # type: ignore[method-assign]
+        errors: list[BaseException] = []
+        build_thread = threading.Thread(
+            target=lambda: self._capture_error(
+                errors,
+                lambda: server.shared_job_bundle(artifacts, mode="ready"),
+            )
+        )
+        build_thread.start()
+        try:
+            self.assertTrue(entered_snapshot.wait(2))
+            mutation_acquired = server._payout_state_prepare_lock.acquire(
+                blocking=False
+            )
+            if mutation_acquired:
+                server._payout_state_prepare_lock.release()
+            self.assertFalse(mutation_acquired)
+        finally:
+            release_snapshot.set()
+        build_thread.join(2)
+
+        self.assertFalse(build_thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_ready_build_identity_separates_clock_only_generations(self) -> None:
+        server, rpc = coordinator()
+        first = server.store_template_artifacts(dict(rpc.template))
+        second_template = dict(rpc.template)
+        second_template["curtime"] = int(second_template["curtime"]) + 1
+        second = server.store_template_artifacts(second_template)
+        assert first is not None and second is not None
+        self.assertEqual(first.fingerprint, second.fingerprint)
+        self.assertNotEqual(first.generation, second.generation)
+        payout_generation = server._payout_state_generation
+
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=[1_700_000_000_000, 1_700_000_001_000],
+        ):
+            first_request = server._new_job_build_request(
+                first,
+                None,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    first,
+                    mode="ready",
+                    payout_state_generation=payout_generation,
+                    worker=None,
+                ),
+            )
+            second_request = server._new_job_build_request(
+                second,
+                None,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    second,
+                    mode="ready",
+                    payout_state_generation=payout_generation,
+                    worker=None,
+                ),
+            )
+
+        self.assertNotEqual(
+            first_request.equivalence_key,
+            second_request.equivalence_key,
+        )
+        self.assertNotEqual(
+            first_request.key.issued_at_ms,
+            second_request.key.issued_at_ms,
+        )
+
     def test_precomputed_payout_artifact_matches_inline_output_exactly(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
