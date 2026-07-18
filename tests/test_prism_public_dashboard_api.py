@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -85,6 +86,10 @@ class FakeRpc:
         if method == "getnetworkinfo":
             return {"connections": 8, **self.network_info}
         raise AssertionError(f"unexpected RPC method {method}")
+
+
+def _bucket_timestamp(epoch: int) -> str:
+    return public_api.iso_datetime(datetime.fromtimestamp(epoch, timezone.utc))
 
 
 class FakePublicLedger:
@@ -345,17 +350,22 @@ class FakePublicLedger:
         subject_id: str | None,
         range_id: str,
         bucket: str,
+        lookback_seconds: int = 0,
     ) -> list[dict[str, object]]:
+        self.last_hashrate_series_lookback = lookback_seconds
         if bucket == "5m":
+            # Recent bucket epochs (with a gap between them) so the points sit
+            # inside every bounded range after lookback trimming.
+            aligned_epoch = int(time.time()) // 300 * 300
             return [
                 {
-                    "timestamp": "2026-06-26T20:00:00Z",
+                    "timestamp": _bucket_timestamp(aligned_epoch - 600),
                     "hashrate_ths": public_api.hashrate_ths_from_difficulty(600, 300),
                     "accepted_share_count": 2,
                     "accepted_share_difficulty": "600",
                 },
                 {
-                    "timestamp": "2026-06-26T20:10:00Z",
+                    "timestamp": _bucket_timestamp(aligned_epoch),
                     "hashrate_ths": public_api.hashrate_ths_from_difficulty(1200, 300),
                     "accepted_share_count": 1,
                     "accepted_share_difficulty": "1200",
@@ -460,6 +470,36 @@ class FakePublicLedger:
                 "maturity_state": "immature",
                 "created_at": "2026-06-26 19:45:00+00",
                 "found_at": "2026-06-26 19:40:00+00",
+            },
+        ]
+
+
+class RangeBoundaryPublicLedger(FakePublicLedger):
+    """Serves one bucket just before the 1w range boundary and one inside it."""
+
+    def dashboard_hashrate_series(
+        self,
+        *,
+        subject_type: str,
+        subject_id: str | None,
+        range_id: str,
+        bucket: str,
+        lookback_seconds: int = 0,
+    ) -> list[dict[str, object]]:
+        self.last_hashrate_series_lookback = lookback_seconds
+        cutoff_epoch = (int(time.time()) - 7 * 86400) // 300 * 300
+        return [
+            {
+                "timestamp": _bucket_timestamp(cutoff_epoch - 300),
+                "hashrate_ths": public_api.hashrate_ths_from_difficulty(600, 300),
+                "accepted_share_count": 1,
+                "accepted_share_difficulty": "600",
+            },
+            {
+                "timestamp": _bucket_timestamp(cutoff_epoch + 1200),
+                "hashrate_ths": public_api.hashrate_ths_from_difficulty(1200, 300),
+                "accepted_share_count": 1,
+                "accepted_share_difficulty": "1200",
             },
         ]
 
@@ -795,6 +835,31 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         points = series["points"]
         self.assert_hashrate_ths(points[0]["hashrate_ths"], 600, 300)
         self.assert_hashrate_ths(points[1]["hashrate_ths"], 1200, 300)
+
+    def test_hashrate_series_fetches_lookback_and_trims_pre_range_points(self) -> None:
+        ledger = RangeBoundaryPublicLedger()
+        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m"
+            with urllib.request.urlopen(url, timeout=5) as response:
+                series = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        # The ledger is asked for one extra smoothing window of history so the
+        # first in-range windows average over real pre-range buckets.
+        self.assertEqual(ledger.last_hashrate_series_lookback, 1800)
+        points = series["points"]
+        # The pre-range context bucket feeds the trailing window but is dropped
+        # from the response instead of charting an artificial ramp-up.
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0]["accepted_share_difficulty"], "1200")
+        self.assert_hashrate_ths(points[0]["hashrate_ths"], 1800, 1800)
 
     def test_smooth_hashrate_series_points_leaves_malformed_points_unchanged(self) -> None:
         points = [
