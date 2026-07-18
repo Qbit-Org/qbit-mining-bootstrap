@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace as dataclass_replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -1175,7 +1176,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server = coordinator()
         state = client()
         prepare_idle_client(server, state)
-        server._ensure_job_cache_state()
+        bundle = install_idle_job_cache(server)
+        with server._job_cache_lock:
+            server._job_bundle_cache.clear()
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.build_shared_job_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: bundle
+        )
         build_lock_held = threading.Event()
         release_build = threading.Event()
 
@@ -1207,39 +1214,59 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertGreater(server._heartbeats["vardiff_idle_sweep"], heartbeat_before)
         self.assertEqual(server.vardiff_idle_skip_counts["cache_miss"], 1)
 
-    def test_idle_sweep_cache_miss_never_builds_synchronously(self) -> None:
+    def test_idle_sweep_cache_miss_builds_only_on_bounded_worker(self) -> None:
         server = coordinator()
         state = client()
         prepare_idle_client(server, state)
-        server._ensure_job_cache_state()
-        window_started = state.vardiff_window_started_monotonic
+        bundle = install_idle_job_cache(server)
+        server.job_bundle_cache_seconds = 10.0
+        expired_bundle = dataclass_replace(
+            bundle,
+            built_monotonic=time.monotonic() - 11.0,
+        )
+        with server._job_cache_lock:
+            server._job_bundle_cache[bundle.key] = expired_bundle
         build_started = threading.Event()
         release_build = threading.Event()
+        build_thread_ids: list[int] = []
+        sent: list[dict[str, object]] = []
 
-        def never_finishes(*_args: object, **_kwargs: object) -> object:
+        def blocked_build(
+            *_args: object,
+            **_kwargs: object,
+        ) -> CachedJobBundle:
+            build_thread_ids.append(threading.get_ident())
             build_started.set()
-            release_build.wait(timeout=1)
-            raise AssertionError("idle sweep attempted a bundle build")
+            if not release_build.wait(timeout=1):
+                raise AssertionError("idle retarget bundle build was not released")
+            return bundle
 
-        server.build_shared_job_bundle = never_finishes  # type: ignore[method-assign]
-        sweep_done = threading.Event()
+        state.send = sent.append  # type: ignore[method-assign]
+        server.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
+        sweep_thread_id = threading.get_ident()
+        started = time.monotonic()
+        try:
+            self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+            elapsed = time.monotonic() - started
+            self.assertTrue(build_started.wait(timeout=0.25))
+            self.assertLess(elapsed, 0.25)
+            self.assertEqual(server.vardiff_idle_sweep_once(), 0)
+            self.assertEqual(len(build_thread_ids), 1)
+            self.assertNotEqual(build_thread_ids[0], sweep_thread_id)
+            with server._vardiff_idle_lock:
+                self.assertEqual(len(server._vardiff_idle_pending), 1)
+        finally:
+            release_build.set()
+            server.shutdown_vardiff_idle_executor()
 
-        def run_sweep() -> None:
-            server.vardiff_idle_sweep_once()
-            sweep_done.set()
-
-        sweeper = threading.Thread(target=run_sweep)
-        sweeper.start()
-        completed = sweep_done.wait(timeout=0.25)
-        release_build.set()
-        sweeper.join(timeout=1)
-        server.shutdown_vardiff_idle_executor()
-
-        self.assertTrue(completed)
-        self.assertFalse(build_started.is_set())
         self.assertEqual(server.vardiff_idle_skip_counts["cache_miss"], 1)
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertEqual(server.idle_retarget_count, 1)
         self.assertIsNone(state.pending_share_difficulty)
-        self.assertEqual(state.vardiff_window_started_monotonic, window_started)
+        self.assertEqual(state.share_difficulty, Decimal("4"))
         self.assertEqual(state.vardiff_window_accepted, 0)
         self.assertEqual(state.vardiff_window_submitted, 0)
         self.assertEqual(state.vardiff_window_work, Decimal("0"))

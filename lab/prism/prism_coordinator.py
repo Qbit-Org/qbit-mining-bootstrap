@@ -13754,6 +13754,17 @@ class PrismCoordinator:
                 return None
             return bundle
 
+    def _build_idle_job_bundle(
+        self,
+        request: _IdleRetargetRequest,
+    ) -> CachedJobBundle:
+        """Build on the dedicated idle executor without holding a client lock."""
+        artifacts = (
+            self._retained_collection_artifacts()
+            or self.current_template_artifacts()
+        )
+        return self.shared_job_bundle(artifacts, request.worker)
+
     def _idle_request_skip_reason_locked(
         self,
         request: _IdleRetargetRequest,
@@ -13817,7 +13828,7 @@ class PrismCoordinator:
     def _run_idle_retarget_task(
         self,
         request: _IdleRetargetRequest,
-        bundle: CachedJobBundle,
+        bundle: CachedJobBundle | None,
         queued_monotonic: float,
     ) -> None:
         key = (request.client, request.connection_id)
@@ -13837,6 +13848,13 @@ class PrismCoordinator:
             if reason is not None:
                 self._record_vardiff_idle_skip(reason)
                 return
+            if bundle is None:
+                bundle = self._build_idle_job_bundle(request)
+                with self.lock:
+                    reason = self._idle_request_skip_reason_locked(request)
+                if reason is not None:
+                    self._record_vardiff_idle_skip(reason)
+                    return
             if not client.job_update_lock.acquire(blocking=False):
                 self._record_vardiff_idle_skip("busy")
                 return
@@ -13895,7 +13913,7 @@ class PrismCoordinator:
     def _enqueue_idle_retarget(
         self,
         request: _IdleRetargetRequest,
-        bundle: CachedJobBundle,
+        bundle: CachedJobBundle | None,
     ) -> str | None:
         self._ensure_vardiff_idle_state()
         key = (request.client, request.connection_id)
@@ -14043,8 +14061,10 @@ class PrismCoordinator:
                     continue
                 bundle = self._cached_idle_job_bundle(client)
                 if bundle is None:
+                    # The sweep itself stays cache-only. A missing/expired
+                    # bundle is rebuilt only by the dedicated bounded worker,
+                    # so the client still makes eventual vardiff progress.
                     self._record_vardiff_idle_skip("cache_miss")
-                    continue
                 reason = self._enqueue_idle_retarget(request, bundle)
                 if reason is not None:
                     self._record_vardiff_idle_skip(reason)
