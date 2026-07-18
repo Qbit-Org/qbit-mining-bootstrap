@@ -1156,6 +1156,73 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.vardiff_window_started_monotonic, window_started)
         self.assertGreaterEqual(server.vardiff_idle_skip_counts["superseded"], 1)
 
+    def test_idle_retarget_uses_published_snapshot_during_unpublished_refresh(
+        self,
+    ) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state, tip=old_tip)
+        published_bundle = install_idle_job_cache(server, tip=old_tip)
+        with server._job_cache_lock:
+            published_artifacts = server._template_artifacts
+        assert published_artifacts is not None
+        detected_template = gbt_template(new_tip, height=11)
+        detected_artifacts = CachedTemplateArtifacts(
+            template=detected_template,
+            fingerprint=qbit_template_fingerprint(detected_template),
+            previousblockhash=new_tip,
+            transaction_hexes=(),
+            witness_merkle_leaves_hex=(),
+            network_difficulty=1,
+            fetched_monotonic=time.monotonic(),
+            generation=2,
+        )
+        now = time.monotonic()
+        server.current_tip_first_seen = (old_tip, now)
+        server.current_tip_observed_monotonic = now
+        server.latest_detected_tip = (new_tip, 2)
+        server.tip_refresh_divergence_started_monotonic = now
+        server.tip_template_snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=old_tip,
+            previousblockhash=old_tip,
+            template_fingerprint=published_artifacts.fingerprint,
+            template_generation=published_artifacts.generation,
+            template_artifacts=published_artifacts,
+        )
+        with server._job_cache_lock:
+            server._template_artifacts = detected_artifacts
+        selected: list[CachedTemplateArtifacts] = []
+        sent: list[dict[str, object]] = []
+
+        def select_published_bundle(
+            artifacts: CachedTemplateArtifacts,
+            _worker: WorkerIdentity,
+        ) -> CachedJobBundle:
+            selected.append(artifacts)
+            return published_bundle
+
+        server.shared_job_bundle = select_published_bundle  # type: ignore[method-assign]
+        state.send = sent.append  # type: ignore[method-assign]
+
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertEqual(selected, [published_artifacts])
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertIsNotNone(state.active_job)
+        self.assertIs(state.active_job.template, published_artifacts.template)
+        self.assertEqual(
+            state.active_job.template["previousblockhash"],
+            old_tip,
+        )
+        self.assertEqual(state.share_difficulty, Decimal("4"))
+        self.assertIsNone(state.pending_share_difficulty)
+
     def test_idle_cached_collection_bundle_refreshes_readiness(self) -> None:
         server = coordinator()
         state = client()

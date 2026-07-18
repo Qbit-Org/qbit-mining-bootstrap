@@ -13688,14 +13688,16 @@ class PrismCoordinator:
         client: ClientState,
         bundle: CachedJobBundle,
     ) -> bool:
-        """Check one exact current observation. Caller holds ``_job_cache_lock``.
+        """Check one exact issuance observation. Caller holds ``_job_cache_lock``.
 
         Ready bundles can reuse an older same-tip heavy cache entry, but the
         prepared copy must be rebound to the current template artifacts before
-        delivery. Accept that copy only when it still shares the immutable
-        heavy payload with the cache entry from which it was derived.
+        delivery. During a detected-but-unpublished refresh, issuance stays
+        pinned to the published snapshot. Accept that copy only when it still
+        shares the immutable heavy payload with the cache entry from which it
+        was derived.
         """
-        artifacts = self._template_artifacts
+        artifacts = self._idle_job_issuance_artifacts_locked()
         if artifacts is None or self._payout_state_publication_blocked:
             return False
         payout_artifact = self._published_payout_state.artifact
@@ -13768,11 +13770,49 @@ class PrismCoordinator:
         )
         return ttl > 0 and time.monotonic() - cached.built_monotonic <= ttl
 
+    def _idle_job_issuance_artifacts_locked(
+        self,
+    ) -> CachedTemplateArtifacts | None:
+        """Cache-only counterpart of ``job_issuance_template_artifacts``.
+
+        The idle sweep and its final delivery guard cannot fetch a template.
+        They must still honor the published-snapshot pin used by every other
+        direct issuance path while a replacement tip is detected but has not
+        yet been published.
+        """
+        artifacts = self._template_artifacts
+        with self.lock:
+            published = getattr(self, "current_tip_first_seen", None)
+            latest_detected = getattr(self, "latest_detected_tip", None)
+            published_snapshot = getattr(self, "tip_template_snapshot", None)
+            pinned = bool(
+                published is not None
+                and published_snapshot is not None
+                and published_snapshot.bestblockhash == published[0]
+                and published_snapshot.template_artifacts is not None
+                and self._published_tip_authoritative_locked(time.monotonic())
+                and (
+                    (
+                        latest_detected is not None
+                        and latest_detected[0] != published[0]
+                    )
+                    or (
+                        artifacts is not None
+                        and artifacts.previousblockhash != published[0]
+                    )
+                )
+            )
+        if pinned:
+            assert published_snapshot is not None
+            assert published_snapshot.template_artifacts is not None
+            return published_snapshot.template_artifacts
+        return artifacts
+
     def _cached_idle_job_bundle(self, client: ClientState) -> CachedJobBundle | None:
-        """Return only an exact current cached bundle; never build or query."""
+        """Return only an exact issuance bundle; never build or query."""
         self._ensure_job_cache_state()
         with self._job_cache_lock:
-            artifacts = self._template_artifacts
+            artifacts = self._idle_job_issuance_artifacts_locked()
             worker = client.worker
             if artifacts is None or worker is None:
                 return None
@@ -13807,7 +13847,7 @@ class PrismCoordinator:
         """Build on the dedicated idle executor without holding a client lock."""
         artifacts = (
             self._retained_collection_artifacts()
-            or self.current_template_artifacts()
+            or self.job_issuance_template_artifacts()
         )
         return self.shared_job_bundle(artifacts, request.worker)
 
