@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import socket
@@ -50,7 +51,13 @@ from lab.prism.prism_coordinator import (
 )
 
 EXTRANONCE2_SIZE = 8
-MINER_PROGRAMS = ("aa" * 32, "bb" * 32)
+
+
+def benchmark_miner_programs(count: int) -> tuple[str, ...]:
+    return tuple(
+        hashlib.sha256(f"bench-miner-{index}".encode()).hexdigest()
+        for index in range(count)
+    )
 
 
 def sanitize_environment() -> None:
@@ -76,16 +83,22 @@ class InjectedLatencies:
 class BenchLedger:
     backend_name = "bench"
 
-    def __init__(self, share_count: int, latencies: InjectedLatencies) -> None:
+    def __init__(
+        self,
+        share_count: int,
+        miner_count: int,
+        latencies: InjectedLatencies,
+    ) -> None:
         self.latencies = latencies
+        self.miner_programs = benchmark_miner_programs(miner_count)
         now = int(time.time() * 1000)
         self.shares_json = [
             {
                 "share_seq": index + 1,
                 "share_id": f"bench-share-{index + 1}",
-                "miner_id": f"bench-miner-{index % len(MINER_PROGRAMS)}",
-                "order_key": f"bench-miner-{index % len(MINER_PROGRAMS)}",
-                "p2mr_program_hex": MINER_PROGRAMS[index % len(MINER_PROGRAMS)],
+                "miner_id": f"bench-miner-{index % miner_count}",
+                "order_key": f"bench-miner-{index % miner_count:06d}",
+                "p2mr_program_hex": self.miner_programs[index % miner_count],
                 "share_difficulty": 16384,
                 "network_difficulty": 226646186,
                 "template_height": 9,
@@ -110,7 +123,7 @@ class BenchLedger:
         time.sleep(self.latencies.stats_seconds)
         return {
             "accepted_share_count": len(self.shares_json),
-            "distinct_miner_count": len(MINER_PROGRAMS),
+            "distinct_miner_count": len(self.miner_programs),
         }
 
     def all_shares(self) -> list[object]:
@@ -208,7 +221,7 @@ def build_coordinator(args: argparse.Namespace, latencies: InjectedLatencies) ->
     server = PrismCoordinator.__new__(PrismCoordinator)
     template = base_template(height=1000)
     rpc = BenchRpc(template, latencies)
-    ledger = BenchLedger(args.shares, latencies)
+    ledger = BenchLedger(args.shares, args.miners, latencies)
     server.rpc = rpc
     server.ledger = ledger
     server.qbit_chain = "testnet4"
@@ -296,7 +309,12 @@ def build_coordinator(args: argparse.Namespace, latencies: InjectedLatencies) ->
 
 
 class BenchClientPool:
-    def __init__(self, server: PrismCoordinator, count: int) -> None:
+    def __init__(
+        self,
+        server: PrismCoordinator,
+        count: int,
+        miner_programs: tuple[str, ...],
+    ) -> None:
         self.server = server
         self.clients: list[ClientState] = []
         self.drains: list[threading.Thread] = []
@@ -305,10 +323,11 @@ class BenchClientPool:
             left, right = socket.socketpair()
             drain = threading.Thread(target=self._drain, args=(right,), daemon=True)
             drain.start()
-            program = MINER_PROGRAMS[index % len(MINER_PROGRAMS)]
+            miner_index = index % len(miner_programs)
+            program = miner_programs[miner_index]
             worker = WorkerIdentity(
-                username=f"bench-miner-{index % len(MINER_PROGRAMS)}.rig{index}",
-                payout_address=f"bench-miner-{index % len(MINER_PROGRAMS)}",
+                username=f"bench-miner-{miner_index}.rig{index}",
+                payout_address=f"bench-miner-{miner_index}",
                 worker_name=f"rig{index}",
                 script_pubkey_hex="5220" + program,
                 p2mr_program_hex=program,
@@ -369,13 +388,33 @@ def summarize(samples: list[float]) -> dict[str, object]:
     }
 
 
+def summarize_histogram(histogram: dict[str, object]) -> dict[str, object]:
+    count = int(histogram["count"])
+    total = float(histogram["sum"])
+    return {
+        "n": count,
+        "average": round(total / count, 4) if count else float("nan"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("cached", "uncached"), default="cached")
     parser.add_argument("--clients", type=int, default=50)
     parser.add_argument("--tip-flips", type=int, default=10)
     parser.add_argument("--shares", type=int, default=21_868, help="synthetic share window size")
+    parser.add_argument("--miners", type=int, default=2, help="distinct payout identities")
+    parser.add_argument(
+        "--ctv-settlement",
+        action="store_true",
+        help="route eligible payouts through a realistic CTV fanout manifest",
+    )
     parser.add_argument("--real-builder", action="store_true", help="run the real qbit-prism bundle builder subprocess")
+    parser.add_argument(
+        "--precompute-payout-artifact",
+        action="store_true",
+        help="prepare the immutable ledger artifact before timed tip refreshes",
+    )
     parser.add_argument("--fake-builder-delay", type=float, default=1.0, help="simulated bundle builder seconds when not using --real-builder")
     parser.add_argument("--gbt-latency", type=float, default=0.017)
     parser.add_argument("--snapshot-latency", type=float, default=0.44)
@@ -389,8 +428,16 @@ def main() -> int:
     parser.add_argument("--reorg-ttl", type=float, default=5.0)
     parser.add_argument("--output-json", type=str, default="")
     args = parser.parse_args()
+    if args.miners <= 0:
+        parser.error("--miners must be positive")
 
     sanitize_environment()
+    if args.ctv_settlement:
+        os.environ["PRISM_CTV_SETTLEMENT_ENABLED"] = "1"
+        os.environ["PRISM_DIRECT_COINBASE_PAYOUT_FLOOR_BITS"] = str(50_00000000)
+        os.environ[
+            "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT"
+        ] = "1"
     latencies = InjectedLatencies(
         gbt_seconds=args.gbt_latency,
         snapshot_seconds=args.snapshot_latency,
@@ -400,7 +447,26 @@ def main() -> int:
         mark_mature_seconds=args.mark_mature_latency,
         rpc_small_seconds=args.rpc_small_latency,
     )
-    server, rpc, _ledger = build_coordinator(args, latencies)
+    server, rpc, ledger = build_coordinator(args, latencies)
+    if args.precompute_payout_artifact:
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        if artifacts is None:
+            raise RuntimeError("benchmark template artifact preparation failed")
+        # Model a running coordinator whose current tip and payout generation
+        # are already published before the timed refresh arrives.
+        server.observe_tip_first_seen(
+            str(rpc.template["previousblockhash"]),
+            observation_sequence=1,
+        )
+        if not server.ensure_reorg_reconciled_for_tip(rpc.template["previousblockhash"]):
+            raise RuntimeError("benchmark payout reconciliation failed")
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        # The benchmark's timed path models an already-published artifact, not
+        # overlap with the speculative publisher worker that prepared it.
+        server.shutdown_payout_artifact_executor()
 
     samples: list[float] = []
     phase_totals: dict[str, float] = {}
@@ -414,7 +480,7 @@ def main() -> int:
 
     server.observe_job_build_elapsed = observing  # type: ignore[method-assign]
 
-    pool = BenchClientPool(server, args.clients)
+    pool = BenchClientPool(server, args.clients, ledger.miner_programs)
     flip_wall_times: list[float] = []
     try:
         # Coordinator job logs go to stderr so stdout stays a clean JSON report.
@@ -440,11 +506,29 @@ def main() -> int:
         "clients": args.clients,
         "tip_flips": args.tip_flips,
         "share_window": args.shares,
+        "miners": args.miners,
+        "ctv_settlement": bool(args.ctv_settlement),
         "real_builder": bool(args.real_builder),
+        "precomputed_payout_artifact": bool(args.precompute_payout_artifact),
         "injected_latencies": latencies.__dict__,
         "sent_job_elapsed_seconds": summarize(samples),
         "full_refresh_wall_seconds": summarize(flip_wall_times),
+        "tip_to_first_delivery_seconds": summarize_histogram(
+            server.tip_refresh_histograms["first_delivery"]
+        ),
+        "tip_to_last_delivery_seconds": summarize_histogram(
+            server.tip_refresh_histograms["last_delivery"]
+        ),
         "phase_totals_seconds": {k: round(v, 3) for k, v in sorted(phase_totals.items())},
+        "bundle_phase_totals_seconds": {
+            phase: round(float(histogram["sum"]), 4)
+            for phase, histogram in getattr(
+                server,
+                "tip_refresh_build_phase_histograms",
+                {},
+            ).items()
+        },
+        "builder_ipc_bytes": dict(getattr(server, "tip_refresh_ipc_bytes", {})),
         "cache_hits": dict(server.job_cache_hit_counts),
         "cache_misses": dict(server.job_cache_miss_counts),
         "getblocktemplate_calls": rpc.calls.get("getblocktemplate", 0),
