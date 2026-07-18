@@ -1992,6 +1992,144 @@ class JobBundleCacheTests(unittest.TestCase):
             )
         self.assertEqual(server.job_build_scheduler_counts["starts"], 3)
 
+    def test_collection_retries_do_not_supersede_ready_build(self) -> None:
+        server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        server._ensure_tip_refresh_state()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        identities = [
+            worker(f"tq1worker-{index}", f"tq1worker-{index}.rig")
+            for index in range(2)
+        ]
+        collection_entered = [threading.Event(), threading.Event()]
+        collection_cancelled = [threading.Event(), threading.Event()]
+        release_cancelled = threading.Event()
+        ready_entered = threading.Event()
+        release_ready = threading.Event()
+        stop_collections = threading.Event()
+        ready_requests: list[object] = []
+        collection_requests: list[object | None] = [None, None]
+        original_build = server.build_shared_job_bundle
+
+        def blocking_build(
+            build_artifacts: object,
+            identity: WorkerIdentity | None,
+            **kwargs: object,
+        ) -> object:
+            request = kwargs["build_request"]
+            if request.mode == "ready":  # type: ignore[union-attr]
+                ready_requests.append(request)
+                ready_entered.set()
+                self.assertTrue(release_ready.wait(5))
+            elif identity in identities:
+                index = identities.index(identity)
+                collection_requests[index] = request
+                collection_entered[index].set()
+                while not request.cancellation.is_set():  # type: ignore[union-attr]
+                    if release_cancelled.wait(0.01):
+                        raise AssertionError("collection build was not cancelled")
+                collection_cancelled[index].set()
+                release_cancelled.wait(5)
+                request.cancellation.raise_if_cancelled(  # type: ignore[union-attr]
+                    "test collection retry hold"
+                )
+            return original_build(
+                build_artifacts,  # type: ignore[arg-type]
+                identity,
+                **kwargs,
+            )
+
+        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        collection_results: list[list[object]] = [[], []]
+        collection_errors: list[list[BaseException]] = [[], []]
+        ready_results: list[object] = []
+        ready_errors: list[BaseException] = []
+
+        def build_collection(index: int) -> None:
+            try:
+                collection_results[index].append(
+                    server.shared_job_bundle(
+                        artifacts,
+                        identities[index],
+                        mode="collection",
+                        cancelled=stop_collections.is_set,
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                collection_errors[index].append(exc)
+
+        def build_ready() -> None:
+            try:
+                ready_results.append(
+                    server.shared_job_bundle(
+                        artifacts,
+                        mode="ready",
+                        retry_superseded=False,
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                ready_errors.append(exc)
+
+        collection_threads = [
+            threading.Thread(target=build_collection, args=(index,))
+            for index in range(2)
+        ]
+        ready_thread = threading.Thread(target=build_ready)
+        try:
+            collection_threads[0].start()
+            self.assertTrue(collection_entered[0].wait(5))
+            collection_threads[1].start()
+            self.assertTrue(collection_entered[1].wait(5))
+            ready_thread.start()
+            self.assertTrue(collection_cancelled[0].wait(5))
+            self.assertTrue(collection_cancelled[1].wait(5))
+            self.assertEqual(server.job_build_scheduler_counts["starts"], 2)
+
+            release_cancelled.set()
+            self.assertTrue(ready_entered.wait(5))
+            retry_deadline = time.monotonic() + 5
+            while (
+                server.job_build_scheduler_counts["requests"] < 5
+                and time.monotonic() < retry_deadline
+            ):
+                time.sleep(0.01)
+            self.assertGreaterEqual(
+                server.job_build_scheduler_counts["requests"],
+                5,
+            )
+            self.assertEqual(server.job_build_scheduler_counts["starts"], 3)
+            self.assertEqual(len(ready_requests), 1)
+            self.assertFalse(
+                ready_requests[0].cancellation.is_set()  # type: ignore[union-attr]
+            )
+
+            stop_collections.set()
+            for thread in collection_threads:
+                thread.join(2)
+            release_ready.set()
+            ready_thread.join(5)
+        finally:
+            stop_collections.set()
+            release_cancelled.set()
+            release_ready.set()
+            for thread in collection_threads:
+                if thread.ident is not None:
+                    thread.join(5)
+            if ready_thread.ident is not None:
+                ready_thread.join(5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in collection_threads))
+        self.assertFalse(ready_thread.is_alive())
+        self.assertEqual(collection_results, [[], []])
+        self.assertEqual([len(errors) for errors in collection_errors], [1, 1])
+        self.assertEqual(ready_errors, [])
+        self.assertEqual(len(ready_results), 1)
+        self.assertFalse(ready_results[0].collection_only)  # type: ignore[union-attr]
+        for request in collection_requests:
+            assert request is not None
+            self.assertTrue(request.cancellation.is_set())  # type: ignore[union-attr]
+
     def test_shutdown_cancels_builder_with_full_helper_input_pipe(self) -> None:
         server, rpc = coordinator()
         server.signing_seed_hex = "42" * 32

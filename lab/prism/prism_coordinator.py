@@ -3440,6 +3440,15 @@ class PrismCoordinator:
         )
 
     @staticmethod
+    def _ready_job_build_precedes_collection(
+        first: _JobBuildRequest,
+        second: _JobBuildRequest,
+    ) -> bool:
+        """Ready work cannot be displaced by a collection-mode retry."""
+
+        return first.mode == "ready" and second.mode == "collection"
+
+    @staticmethod
     def _defer_collection_job_build_locked(
         blocker: Future[CachedJobBundle],
     ) -> Future[CachedJobBundle]:
@@ -3466,6 +3475,11 @@ class PrismCoordinator:
             if self._job_build_retiring is not None:
                 return
             active = self._job_build_active
+            if self._ready_job_build_precedes_collection(
+                active.request,
+                pending,
+            ):
+                return
             if not self._collection_job_builds_are_independent(
                 active.request,
                 pending,
@@ -3543,20 +3557,38 @@ class PrismCoordinator:
         with self._job_build_scheduler_lock:
             self.job_build_scheduler_counts["requests"] += 1
             active = self._job_build_active
+            retiring = self._job_build_retiring
+            pending = self._job_build_pending
+            if request.mode == "collection":
+                possible_blockers = (
+                    pending,
+                    active.request if active is not None else None,
+                    retiring.request if retiring is not None else None,
+                )
+                for blocker in possible_blockers:
+                    if (
+                        blocker is not None
+                        and not blocker.cancellation.is_set()
+                        and self._ready_job_build_precedes_collection(
+                            blocker,
+                            request,
+                        )
+                    ):
+                        return self._defer_collection_job_build_locked(
+                            blocker.promise
+                        )
             if (
                 active is not None
                 and not active.request.cancellation.is_set()
                 and self._job_build_requests_can_share(active.request, request)
             ):
                 return active.request.promise
-            retiring = self._job_build_retiring
             if (
                 retiring is not None
                 and not retiring.request.cancellation.is_set()
                 and self._job_build_requests_can_share(retiring.request, request)
             ):
                 return retiring.request.promise
-            pending = self._job_build_pending
             if (
                 pending is not None
                 and not pending.cancellation.is_set()
