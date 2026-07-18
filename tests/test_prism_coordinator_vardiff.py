@@ -1134,6 +1134,59 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.vardiff_window_started_monotonic, window_started)
         self.assertGreaterEqual(server.vardiff_idle_skip_counts["superseded"], 1)
 
+    def test_idle_cached_collection_bundle_refreshes_readiness(self) -> None:
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state)
+        ready_bundle = install_idle_job_cache(server)
+        assert state.worker is not None
+        with server._job_cache_lock:
+            artifacts = server._template_artifacts
+            assert artifacts is not None
+            collection_key = server._job_bundle_key(
+                artifacts,
+                mode="collection",
+                payout_state_generation=server._payout_state_generation,
+                worker=state.worker,
+            )
+            collection_bundle = dataclass_replace(
+                ready_bundle,
+                key=collection_key,
+                collection_only=True,
+                collection_identity=(
+                    state.worker.payout_address,
+                    state.worker.p2mr_program_hex,
+                ),
+            )
+            server._job_bundle_cache.clear()
+            server._job_bundle_cache[collection_key] = collection_bundle
+        server._pool_ready_latched = False
+        server.min_ready_miners = 3
+        server.accepted_share_stats = lambda: (3, 3)  # type: ignore[method-assign]
+        rebuilt = threading.Event()
+        sent: list[dict[str, object]] = []
+
+        def build_ready(_request: object) -> CachedJobBundle:
+            rebuilt.set()
+            with server._job_cache_lock:
+                server._job_bundle_cache[ready_bundle.key] = ready_bundle
+            return ready_bundle
+
+        state.send = sent.append  # type: ignore[method-assign]
+        server._build_idle_job_bundle = build_ready  # type: ignore[method-assign]
+
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertTrue(server._pool_ready_latched)
+        self.assertTrue(rebuilt.is_set())
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertIsNotNone(state.active_job)
+        self.assertFalse(state.active_job.collection_only)
+
     def test_repeated_idle_sweeps_do_not_enqueue_duplicate_connection_work(self) -> None:
         server = coordinator()
         state = client()

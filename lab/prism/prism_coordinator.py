@@ -13850,6 +13850,15 @@ class PrismCoordinator:
             if reason is not None:
                 self._record_vardiff_idle_skip(reason)
                 return
+            # Readiness may have crossed in the ledger after the sweep's
+            # cache-only snapshot. Refresh it on this bounded worker so a
+            # cached collection bundle cannot be delivered after the pool is
+            # ready for normal payout work.
+            self.pool_readiness_latched()
+            if bundle is not None:
+                with self._job_cache_lock:
+                    if not self._idle_bundle_current_locked(client, bundle):
+                        bundle = None
             if bundle is None:
                 bundle = self._build_idle_job_bundle(request)
                 with self.lock:
