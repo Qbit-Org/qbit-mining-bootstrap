@@ -60,6 +60,8 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS": "17",
                 "PRISM_BLOCKWAIT_ENABLED": "0",
                 "PRISM_BLOCKWAIT_TIMEOUT_SECONDS": "13",
+                "PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS": "23",
+                "PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS": "29",
                 "PRISM_STRATUM_STALE_GRACE_SECONDS": "4",
                 "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS": "31",
                 "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION": "65",
@@ -151,6 +153,8 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_WATCHDOG_INTERVAL_SECONDS"], "15")
         self.assertEqual(env["PRISM_BLOCKWAIT_ENABLED"], "0")
         self.assertEqual(env["PRISM_BLOCKWAIT_TIMEOUT_SECONDS"], "13")
+        self.assertEqual(env["PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS"], "23")
+        self.assertEqual(env["PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS"], "29")
         self.assertEqual(env["PRISM_STRATUM_STALE_GRACE_SECONDS"], "4")
         self.assertEqual(env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS"], "31")
         self.assertEqual(
@@ -247,6 +251,17 @@ class PrismComposeProfileTests(unittest.TestCase):
         # stopped. Postgres should still come back after daemon/host restarts.
         self.assertEqual(self.config["services"]["prism-coordinator"].get("restart"), "on-failure")
         self.assertEqual(self.config["services"]["prism-postgres"].get("restart"), "unless-stopped")
+
+    def test_prism_healthcheck_propagates_http_503_failure(self) -> None:
+        healthcheck = self.config["services"]["prism-coordinator"]["healthcheck"]
+        command = " ".join(healthcheck["test"])
+
+        # urllib raises HTTPError for a 503, so the container command exits
+        # non-zero instead of treating any HTTP response as healthy.
+        self.assertIn("/healthz", command)
+        self.assertIn("urllib.request.urlopen", command)
+        self.assertEqual(healthcheck["start_period"], "15s")
+        self.assertEqual(healthcheck["retries"], 3)
 
     def test_prism_coordinator_descriptor_limit_is_configurable(self) -> None:
         nofile = self.config["services"]["prism-coordinator"]["ulimits"]["nofile"]

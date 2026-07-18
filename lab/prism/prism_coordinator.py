@@ -83,6 +83,8 @@ MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
 DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
+DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS = 15.0
+DEFAULT_PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS = 15.0
 DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS = 20.0
 DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS = 384
 DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME = 0
@@ -231,6 +233,13 @@ PRISM_TIP_REFRESH_CANCELLATION_STAGES = (
 PRISM_DELIVERY_PRIORITY_INITIAL = 0
 PRISM_DELIVERY_PRIORITY_NEW_TIP = 1
 PRISM_DELIVERY_PRIORITY_SAME_TIP = 2
+PRISM_PROGRESS_HEALTH_REASONS = (
+    "tip_poll_stale",
+    "refresh_pending_too_long",
+    "current_generation_not_published",
+    "current_generation_not_delivered",
+    "bundle_build_stuck",
+)
 PRISM_EVICTED_JOB_CLASSES = ("same_tip", "stale_grace")
 PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = ("accepted_same_tip", "credited_stale_grace")
 PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection",)
@@ -1618,6 +1627,13 @@ class ClientState:
     worker: WorkerIdentity | None = None
     version_mask: int = 0
     active_job: PrismJobContext | None = None
+    # active_job is registered before the potentially blocking socket write.
+    # These delivery-proof fields advance only after send_job_update succeeds.
+    _progress_delivered_context: PrismJobContext | None = None
+    _progress_delivered_template_fingerprint: str | None = None
+    _progress_delivered_template_generation: int = 0
+    _progress_delivered_payout_generation: int = -1
+    _progress_delivered_monotonic: float | None = None
     listener_name: str = "default"
     # Pristine difficulty policy of the accepting listener; never mutated.
     listener_vardiff_config: vardiff.VardiffConfig | None = None
@@ -2185,6 +2201,14 @@ class PrismCoordinator:
         self.health_refresh_seconds = env_positive_float(
             "PRISM_HEALTH_REFRESH_SECONDS",
             DEFAULT_PRISM_HEALTH_REFRESH_SECONDS,
+        )
+        self.health_pending_refresh_max_age_seconds = env_positive_float(
+            "PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS",
+            DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS,
+        )
+        self.health_tip_poll_max_age_seconds = env_positive_float(
+            "PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS",
+            DEFAULT_PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS,
         )
         self.stratum_send_timeout_seconds = env_nonnegative_float(
             "PRISM_STRATUM_SEND_TIMEOUT_SECONDS",
@@ -3107,6 +3131,46 @@ class PrismCoordinator:
             self._prepared_ready_snapshot: QbitTipTemplateSnapshot | None = None
         if not hasattr(self, "job_preparation_pending"):
             self.job_preparation_pending = False
+        if not hasattr(self, "_progress_health_lock"):
+            self._progress_health_lock = threading.Lock()
+        if not hasattr(self, "_progress_current_template_generation"):
+            self._progress_current_template_generation = 0
+        if not hasattr(self, "_progress_current_template_fingerprint"):
+            self._progress_current_template_fingerprint: str | None = None
+        if not hasattr(self, "_progress_current_payout_generation"):
+            self._progress_current_payout_generation = self._payout_state_generation
+        if not hasattr(self, "_progress_published_template_generation"):
+            self._progress_published_template_generation = 0
+        if not hasattr(self, "_progress_published_template_fingerprint"):
+            self._progress_published_template_fingerprint: str | None = None
+        if not hasattr(self, "_progress_published_payout_generation"):
+            self._progress_published_payout_generation = 0
+        if not hasattr(self, "_progress_has_published_work"):
+            self._progress_has_published_work = False
+        if not hasattr(self, "_progress_last_tip_poll_monotonic"):
+            self._progress_last_tip_poll_monotonic: float | None = None
+        if not hasattr(self, "_progress_last_delivery_template_generation"):
+            self._progress_last_delivery_template_generation = 0
+        if not hasattr(self, "_progress_last_delivery_template_fingerprint"):
+            self._progress_last_delivery_template_fingerprint: str | None = None
+        if not hasattr(self, "_progress_last_delivery_payout_generation"):
+            self._progress_last_delivery_payout_generation = 0
+        if not hasattr(self, "_progress_last_delivery_monotonic"):
+            self._progress_last_delivery_monotonic: float | None = None
+        if not hasattr(self, "_progress_pending_since_monotonic"):
+            self._progress_pending_since_monotonic: float | None = float(
+                getattr(self, "started_monotonic", time.monotonic())
+            )
+        if not hasattr(self, "_progress_refresh_signal_pending"):
+            self._progress_refresh_signal_pending = False
+        if not hasattr(self, "_progress_active_refresh_count"):
+            self._progress_active_refresh_count = 0
+        if not hasattr(self, "_progress_last_refresh_activity_monotonic"):
+            self._progress_last_refresh_activity_monotonic: float | None = None
+        if not hasattr(self, "_progress_bundle_build_counter"):
+            self._progress_bundle_build_counter = 0
+        if not hasattr(self, "_progress_bundle_builds"):
+            self._progress_bundle_builds: dict[int, float] = {}
 
     def _job_build_phases(self) -> dict[str, float]:
         """Per-thread scratch dict of phase timings for the current build."""
@@ -4747,6 +4811,12 @@ class PrismCoordinator:
         with self._job_cache_lock:
             next_payout_generation = self._payout_state_generation + 1
         with self.lock:
+            payout_invalidated_monotonic = self._payout_state_source[3]
+        self._record_progress_payout_generation(
+            next_payout_generation,
+            payout_invalidated_monotonic,
+        )
+        with self.lock:
             active = getattr(self, "_active_tip_refresh", None)
         if (
             active is not None
@@ -4947,6 +5017,10 @@ class PrismCoordinator:
             return None
         self._cancel_obsolete_job_bundle_builds(
             payout_state_generation=published_generation
+        )
+        self._record_progress_payout_generation(
+            published_generation,
+            candidate.invalidated_monotonic,
         )
         if active_to_cancel is not None:
             active_to_cancel.cancel()
@@ -7300,9 +7374,15 @@ class PrismCoordinator:
                     client,
                     str(context.template["previousblockhash"]),
                 )
+                delivered_monotonic = time.monotonic()
                 self._record_first_payout_delivery(
                     bundle.payout_state_generation,
-                    time.monotonic(),
+                    delivered_monotonic,
+                )
+                self._record_progress_delivery(
+                    client,
+                    context,
+                    delivered_monotonic,
                 )
                 self.note_initial_job_delivered(client, validated_current=True)
                 return True
@@ -8388,6 +8468,7 @@ class PrismCoordinator:
         """
         artifacts = self._tip_refresh_artifacts(snapshot)
         build_started = time.monotonic()
+        progress_build_token = self._progress_bundle_build_started()
         try:
             bundle = self.shared_job_bundle(
                 artifacts,
@@ -8401,6 +8482,7 @@ class PrismCoordinator:
                 self.job_build_failure_count += 1
             raise TemplateRefreshBlocked("prepared refresh bundle build failed") from exc
         finally:
+            self._progress_bundle_build_finished(progress_build_token)
             self._observe_tip_refresh_seconds(
                 "bundle_build",
                 time.monotonic() - build_started,
@@ -8432,6 +8514,7 @@ class PrismCoordinator:
         try:
             observation_sequence = self._reserve_tip_observation_sequence()
             snapshot = self.fetch_qbit_tip_template_snapshot()
+            self._record_progress_tip_poll(snapshot)
             try:
                 reconciled = self.ensure_reorg_reconciled_for_tip(
                     snapshot.bestblockhash
@@ -8448,10 +8531,14 @@ class PrismCoordinator:
             ready = self.pool_readiness_latched()
             bundle: CachedJobBundle | None = None
             if ready:
-                bundle = self.shared_job_bundle(
-                    self._tip_refresh_artifacts(snapshot),
-                    None,
-                )
+                progress_build_token = self._progress_bundle_build_started()
+                try:
+                    bundle = self.shared_job_bundle(
+                        self._tip_refresh_artifacts(snapshot),
+                        None,
+                    )
+                finally:
+                    self._progress_bundle_build_finished(progress_build_token)
                 if bundle.collection_only:
                     raise TemplateRefreshBlocked(
                         "startup ready preparation produced collection work"
@@ -8479,7 +8566,16 @@ class PrismCoordinator:
             with self._job_cache_lock:
                 self._prepared_ready_snapshot = snapshot if bundle is not None else None
                 self._prepared_ready_bundle = bundle
+            self._record_progress_publication(
+                snapshot,
+                (
+                    bundle.payout_state_generation
+                    if bundle is not None
+                    else int(getattr(self, "_payout_state_generation", 0))
+                ),
+            )
             self.last_successful_template_refresh_monotonic = time.monotonic()
+            self._record_progress_tip_poll(snapshot)
             return bundle
         finally:
             with self._job_cache_lock:
@@ -8970,6 +9066,11 @@ class PrismCoordinator:
                         context.payout_state_generation,
                         delivered_monotonic,
                     )
+                    self._record_progress_delivery(
+                        client,
+                        context,
+                        delivered_monotonic,
+                    )
                     if getattr(self, "hot_path_log_enabled", False):
                         print(
                             "prism coordinator: sent prepared job "
@@ -9286,6 +9387,7 @@ class PrismCoordinator:
         self._ensure_job_cache_state()
         refresh_started = time.monotonic()
         publication_lock_acquired = False
+        progress_refresh_active = False
         observation_sequence = 0
         pending_signal_token: int | None = None
         try:
@@ -9342,6 +9444,9 @@ class PrismCoordinator:
                     pending_signal_token,
                     observation_sequence,
                 )
+            self._record_progress_tip_poll(snapshot)
+            self._progress_refresh_started()
+            progress_refresh_active = True
             self.pool_readiness_latched()
             payout_generation_before_reconciliation = int(
                 getattr(self, "_payout_state_generation", 0)
@@ -9647,6 +9752,21 @@ class PrismCoordinator:
             self._tip_refresh_lock.release()
             publication_lock_acquired = False
 
+            with self.lock:
+                progress_eligible_client = any(
+                    self.client_can_receive_jobs(client)
+                    for client in self.clients
+                )
+            if use_prepared_fanout or not progress_eligible_client:
+                # Ready-mode work was prepared above. With no eligible clients,
+                # publishing the reconciled snapshot is sufficient; collection
+                # work with a live identity is not published until its worker-
+                # specific bundle is actually delivered below.
+                self._record_progress_publication(
+                    snapshot,
+                    payout_generation_after_reconciliation,
+                )
+
             if not ready_mode:
                 with self.lock:
                     eligible_collection_client = any(
@@ -9740,6 +9860,10 @@ class PrismCoordinator:
                             observation_sequence,
                             payout_generation_after_reconciliation,
                         )
+                        self._record_progress_publication(
+                            snapshot,
+                            payout_generation_after_reconciliation,
+                        )
 
                 if clients:
                     try:
@@ -9798,6 +9922,11 @@ class PrismCoordinator:
                 )
             self.last_successful_template_refresh_monotonic = time.monotonic()
             self.template_refresh_failure_started_monotonic = None
+            # A completed pass reconfirms that the coherent snapshot remained
+            # current through publication and fanout. Refresh the liveness
+            # stamp so a legitimately long, progressing pass does not become
+            # stale the instant its active marker is cleared.
+            self._record_progress_tip_poll(snapshot)
             return refreshed
         except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked):
             # Coordination-blocked refreshes -- a superseded tip, a pending
@@ -9817,6 +9946,8 @@ class PrismCoordinator:
         finally:
             if publication_lock_acquired:
                 self._tip_refresh_lock.release()
+            if progress_refresh_active:
+                self._progress_refresh_finished()
             self._observe_tip_refresh_seconds(
                 "refresh",
                 time.monotonic() - refresh_started,
@@ -9965,6 +10096,7 @@ class PrismCoordinator:
         if active_to_cancel is not None:
             active_to_cancel.cancel()
         if detection_changed:
+            self._progress_note_refresh_pending(now)
             # In-flight constructions for older parents can no longer win;
             # stop them at detection so replacement preparation starts
             # immediately, well before publication moves submit authority.
@@ -11195,9 +11327,17 @@ class PrismCoordinator:
         except Exception:
             return False
         if ready_miner_count >= getattr(self, "min_ready_miners", 3):
+            became_ready = False
             with self.lock:
-                self._pool_ready_latched = True
-                self._retained_collection_refresh = None
+                if not getattr(self, "_pool_ready_latched", False):
+                    self._pool_ready_latched = True
+                    self._retained_collection_refresh = None
+                    became_ready = True
+            if became_ready:
+                # Collection work becomes obsolete without changing the qbit
+                # template fingerprint or payout generation. Start the health
+                # deadline at the readiness transition itself.
+                self._progress_note_refresh_pending()
             return True
         return False
 
@@ -11983,6 +12123,11 @@ class PrismCoordinator:
                 context_payout_generation,
                 delivered_monotonic,
             )
+            self._record_progress_delivery(
+                client,
+                context,
+                delivered_monotonic,
+            )
             self._consume_retained_collection_refresh(context)
             self.note_initial_job_delivered(
                 client,
@@ -12278,7 +12423,11 @@ class PrismCoordinator:
             worker = client.worker
             if worker is None:
                 raise StratumError(20, "client is not authorized")
-            cached_bundle = self.shared_job_bundle(artifacts, worker)
+            progress_build_token = self._progress_bundle_build_started()
+            try:
+                cached_bundle = self.shared_job_bundle(artifacts, worker)
+            finally:
+                self._progress_bundle_build_finished(progress_build_token)
             current_worker = client.worker
             if not cached_bundle.collection_only or current_worker == worker:
                 break
@@ -15839,6 +15988,483 @@ class PrismCoordinator:
             expected_bytes=32,
         )
 
+    def _progress_now(self) -> float:
+        clock = getattr(self, "_progress_monotonic", None)
+        return float(clock() if callable(clock) else time.monotonic())
+
+    def _progress_note_refresh_pending(self, started_monotonic: float | None = None) -> None:
+        self._ensure_job_cache_state()
+        started = self._progress_now() if started_monotonic is None else started_monotonic
+        with self._progress_health_lock:
+            pending_since = self._progress_pending_since_monotonic
+            if pending_since is None or started < pending_since:
+                self._progress_pending_since_monotonic = started
+            self._progress_refresh_signal_pending = True
+
+    def _record_progress_tip_poll(
+        self,
+        snapshot: QbitTipTemplateSnapshot,
+        observed_monotonic: float | None = None,
+    ) -> None:
+        """Publish a coherent qbit tip/template observation to health state."""
+        self._ensure_job_cache_state()
+        observed = self._progress_now() if observed_monotonic is None else observed_monotonic
+        payout_generation = int(getattr(self, "_payout_state_generation", 0))
+        with self._progress_health_lock:
+            if snapshot.template_generation < self._progress_current_template_generation:
+                # A slower concurrent poll can finish after a newer coherent
+                # observation. It proves only that the obsolete generation was
+                # coherent, so it must not renew freshness for current work.
+                return
+            self._progress_current_template_generation = snapshot.template_generation
+            self._progress_current_template_fingerprint = snapshot.template_fingerprint
+            self._progress_current_payout_generation = max(
+                self._progress_current_payout_generation,
+                payout_generation,
+            )
+            self._progress_last_tip_poll_monotonic = observed
+            same_published_work = bool(
+                self._progress_has_published_work
+                and self._progress_published_template_fingerprint
+                == snapshot.template_fingerprint
+                and self._progress_published_payout_generation
+                == self._progress_current_payout_generation
+            )
+            if same_published_work:
+                # Observation generations order RPC races. When the semantic
+                # template fingerprint and payout generation are unchanged,
+                # already-issued work remains current and can be reconciled to
+                # the latest observation without a needless socket delivery.
+                self._progress_published_template_generation = (
+                    snapshot.template_generation
+                )
+            else:
+                pending_since = self._progress_pending_since_monotonic
+                if pending_since is None or observed < pending_since:
+                    self._progress_pending_since_monotonic = observed
+
+    def _record_progress_payout_generation(
+        self,
+        generation: int,
+        invalidated_monotonic: float | None = None,
+    ) -> None:
+        self._ensure_job_cache_state()
+        invalidated = (
+            self._progress_now()
+            if invalidated_monotonic is None
+            else invalidated_monotonic
+        )
+        with self._progress_health_lock:
+            if generation < self._progress_current_payout_generation:
+                return
+            self._progress_current_payout_generation = generation
+            if generation != self._progress_published_payout_generation:
+                pending_since = self._progress_pending_since_monotonic
+                if pending_since is None or invalidated < pending_since:
+                    self._progress_pending_since_monotonic = invalidated
+                self._progress_refresh_signal_pending = True
+
+    def _record_progress_publication(
+        self,
+        snapshot: QbitTipTemplateSnapshot,
+        payout_generation: int,
+    ) -> None:
+        """Record that current in-memory work is available for delivery."""
+        self._ensure_job_cache_state()
+        with self._progress_health_lock:
+            if (
+                snapshot.template_generation
+                < self._progress_published_template_generation
+                or payout_generation
+                < self._progress_published_payout_generation
+            ):
+                return
+            self._progress_published_template_generation = max(
+                self._progress_published_template_generation,
+                snapshot.template_generation,
+            )
+            self._progress_published_template_fingerprint = snapshot.template_fingerprint
+            self._progress_published_payout_generation = max(
+                self._progress_published_payout_generation,
+                payout_generation,
+            )
+            self._progress_has_published_work = True
+            if (
+                self._progress_current_template_fingerprint
+                == snapshot.template_fingerprint
+                and self._progress_current_payout_generation == payout_generation
+            ):
+                self._progress_refresh_signal_pending = False
+        self._progress_note_refresh_activity()
+        self._progress_reconcile_pending()
+
+    def _record_progress_delivery(
+        self,
+        client: ClientState,
+        context: PrismJobContext,
+        delivered_monotonic: float,
+    ) -> None:
+        """Record a completed current-generation socket delivery."""
+        self._ensure_job_cache_state()
+        fingerprint = getattr(context, "template_fingerprint", None)
+        if fingerprint is None:
+            fingerprint = qbit_template_fingerprint(context.template)
+        payout_generation = int(getattr(context, "payout_state_generation", 0))
+        with self.lock:
+            client._progress_delivered_context = context
+            client._progress_delivered_template_fingerprint = fingerprint
+            client._progress_delivered_template_generation = int(
+                getattr(context, "template_generation", 0)
+            )
+            client._progress_delivered_payout_generation = payout_generation
+            client._progress_delivered_monotonic = delivered_monotonic
+            ready_mode_required = bool(
+                getattr(self, "_pool_ready_latched", False)
+            )
+        recorded = False
+        with self._progress_health_lock:
+            if (
+                fingerprint == self._progress_current_template_fingerprint
+                and payout_generation == self._progress_current_payout_generation
+                and not (
+                    ready_mode_required
+                    and bool(getattr(context, "collection_only", False))
+                )
+            ):
+                self._progress_last_delivery_template_generation = int(
+                    getattr(context, "template_generation", 0)
+                )
+                self._progress_last_delivery_template_fingerprint = fingerprint
+                self._progress_last_delivery_payout_generation = payout_generation
+                self._progress_last_delivery_monotonic = delivered_monotonic
+                # A successful delivery is also definitive publication proof.
+                self._progress_published_template_generation = max(
+                    self._progress_published_template_generation,
+                    self._progress_current_template_generation,
+                )
+                self._progress_published_template_fingerprint = fingerprint
+                self._progress_published_payout_generation = max(
+                    self._progress_published_payout_generation,
+                    payout_generation,
+                )
+                self._progress_has_published_work = True
+                self._progress_refresh_signal_pending = False
+                recorded = True
+        if recorded:
+            self._progress_note_refresh_activity(delivered_monotonic)
+        self._progress_reconcile_pending(now=delivered_monotonic)
+
+    def _progress_refresh_started(self) -> None:
+        """Track a coherent poll pass while it continues making progress."""
+        self._ensure_job_cache_state()
+        started = self._progress_now()
+        with self._progress_health_lock:
+            self._progress_active_refresh_count += 1
+            self._progress_last_refresh_activity_monotonic = started
+
+    def _progress_note_refresh_activity(
+        self,
+        observed_monotonic: float | None = None,
+    ) -> None:
+        self._ensure_job_cache_state()
+        observed = (
+            self._progress_now()
+            if observed_monotonic is None
+            else observed_monotonic
+        )
+        with self._progress_health_lock:
+            if self._progress_active_refresh_count > 0:
+                last_activity = self._progress_last_refresh_activity_monotonic
+                if last_activity is None or observed > last_activity:
+                    self._progress_last_refresh_activity_monotonic = observed
+
+    def _progress_refresh_finished(self) -> None:
+        self._ensure_job_cache_state()
+        with self._progress_health_lock:
+            self._progress_active_refresh_count = max(
+                0,
+                self._progress_active_refresh_count - 1,
+            )
+
+    def _progress_bundle_build_started(self) -> int:
+        self._ensure_job_cache_state()
+        started = self._progress_now()
+        with self._progress_health_lock:
+            self._progress_bundle_build_counter += 1
+            token = self._progress_bundle_build_counter
+            self._progress_bundle_builds[token] = started
+            return token
+
+    def _progress_bundle_build_finished(self, token: int) -> None:
+        self._ensure_job_cache_state()
+        with self._progress_health_lock:
+            self._progress_bundle_builds.pop(token, None)
+
+    def _progress_eligible_client_counts(
+        self,
+        template_fingerprint: str | None,
+        payout_generation: int,
+    ) -> tuple[int, int]:
+        with self.lock:
+            eligible = [
+                client
+                for client in self.clients
+                if self.client_can_receive_jobs(client)
+            ]
+            delivered_work = [
+                client._progress_delivered_context
+                for client in eligible
+            ]
+            ready_mode_required = bool(
+                getattr(self, "_pool_ready_latched", False)
+            )
+        requiring_refresh = 0
+        for delivered_context in delivered_work:
+            delivered_fingerprint = None
+            delivered_payout_generation = -1
+            if delivered_context is not None:
+                delivered_fingerprint = getattr(
+                    delivered_context,
+                    "template_fingerprint",
+                    None,
+                )
+                if delivered_fingerprint is None:
+                    delivered_fingerprint = qbit_template_fingerprint(
+                        delivered_context.template
+                    )
+                delivered_payout_generation = int(
+                    getattr(delivered_context, "payout_state_generation", 0)
+                )
+            if (
+                delivered_fingerprint != template_fingerprint
+                or delivered_payout_generation != payout_generation
+                or (
+                    ready_mode_required
+                    and bool(
+                        getattr(delivered_context, "collection_only", False)
+                    )
+                )
+            ):
+                requiring_refresh += 1
+        return len(eligible), requiring_refresh
+
+    def _progress_reconcile_pending(self, *, now: float | None = None) -> None:
+        """Clear pending state exactly when publication/delivery is sufficient."""
+        self._ensure_job_cache_state()
+        current = self._progress_now() if now is None else now
+        with self._progress_health_lock:
+            state_key = (
+                self._progress_current_template_fingerprint,
+                self._progress_current_payout_generation,
+            )
+        _, requiring_refresh = self._progress_eligible_client_counts(
+            *state_key
+        )
+        with self._progress_health_lock:
+            if state_key != (
+                self._progress_current_template_fingerprint,
+                self._progress_current_payout_generation,
+            ):
+                return
+            published_current = bool(
+                self._progress_has_published_work
+                and self._progress_published_template_fingerprint == state_key[0]
+                and self._progress_published_payout_generation == state_key[1]
+            )
+            refresh_required = bool(
+                self._progress_refresh_signal_pending
+                or not published_current
+                or requiring_refresh > 0
+            )
+            if refresh_required:
+                if self._progress_pending_since_monotonic is None:
+                    self._progress_pending_since_monotonic = current
+            else:
+                self._progress_pending_since_monotonic = None
+
+    def progress_health_snapshot(self, *, now: float | None = None) -> dict[str, object]:
+        """Return a bounded, monotonic-only mining progress health snapshot."""
+        self._ensure_job_cache_state()
+        current = self._progress_now() if now is None else now
+        payout_generation = int(getattr(self, "_payout_state_generation", 0))
+        with self._progress_health_lock:
+            tracked_payout_generation = self._progress_current_payout_generation
+        if payout_generation > tracked_payout_generation:
+            self._record_progress_payout_generation(payout_generation, current)
+        self._progress_reconcile_pending(now=current)
+
+        with self._progress_health_lock:
+            template_fingerprint = self._progress_current_template_fingerprint
+            current_template_generation = self._progress_current_template_generation
+            current_payout_generation = self._progress_current_payout_generation
+            published_template_generation = self._progress_published_template_generation
+            published_template_fingerprint = (
+                self._progress_published_template_fingerprint
+            )
+            published_payout_generation = self._progress_published_payout_generation
+            has_published_work = self._progress_has_published_work
+            last_tip_poll = self._progress_last_tip_poll_monotonic
+            last_delivery_fingerprint = (
+                self._progress_last_delivery_template_fingerprint
+            )
+            last_delivery_payout_generation = (
+                self._progress_last_delivery_payout_generation
+            )
+            last_delivery_monotonic = self._progress_last_delivery_monotonic
+            pending_since = self._progress_pending_since_monotonic
+            refresh_signal_pending = self._progress_refresh_signal_pending
+            active_refresh_count = self._progress_active_refresh_count
+            last_refresh_activity = (
+                self._progress_last_refresh_activity_monotonic
+            )
+            bundle_build_starts = tuple(self._progress_bundle_builds.values())
+
+        eligible_count, requiring_refresh = self._progress_eligible_client_counts(
+            template_fingerprint,
+            current_payout_generation,
+        )
+        started = float(getattr(self, "started_monotonic", current))
+        tip_poll_reference = started if last_tip_poll is None else last_tip_poll
+        tip_poll_age = max(0.0, current - tip_poll_reference)
+        refresh_activity_age = (
+            None
+            if active_refresh_count <= 0 or last_refresh_activity is None
+            else max(0.0, current - last_refresh_activity)
+        )
+        pending_age = (
+            None if pending_since is None else max(0.0, current - pending_since)
+        )
+        oldest_bundle_age = (
+            0.0
+            if not bundle_build_starts
+            else max(0.0, current - min(bundle_build_starts))
+        )
+        published_current = bool(
+            has_published_work
+            and published_template_fingerprint == template_fingerprint
+            and published_payout_generation == current_payout_generation
+        )
+        delivered_current = bool(
+            template_fingerprint is not None
+            and last_delivery_fingerprint == template_fingerprint
+            and last_delivery_payout_generation == current_payout_generation
+        )
+        delivery_age = (
+            max(0.0, current - last_delivery_monotonic)
+            if delivered_current and last_delivery_monotonic is not None
+            else None
+        )
+        pending_deadline = float(
+            getattr(
+                self,
+                "health_pending_refresh_max_age_seconds",
+                DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS,
+            )
+        )
+        tip_poll_deadline = float(
+            getattr(
+                self,
+                "health_tip_poll_max_age_seconds",
+                DEFAULT_PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS,
+            )
+        )
+        bundle_build_deadline = float(
+            getattr(
+                self,
+                "bundle_build_timeout_seconds",
+                DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
+            )
+        )
+        reasons: list[str] = []
+        refresh_is_progressing = bool(
+            active_refresh_count > 0
+            and refresh_activity_age is not None
+            and refresh_activity_age <= tip_poll_deadline
+        )
+        if tip_poll_age > tip_poll_deadline and not refresh_is_progressing:
+            reasons.append("tip_poll_stale")
+        if oldest_bundle_age > bundle_build_deadline:
+            reasons.append("bundle_build_stuck")
+        if not has_published_work:
+            reasons.append("current_generation_not_published")
+        elif pending_age is not None and pending_age > pending_deadline:
+            reasons.append("refresh_pending_too_long")
+            if refresh_signal_pending or not published_current:
+                reasons.append("current_generation_not_published")
+            elif requiring_refresh > 0:
+                reasons.append("current_generation_not_delivered")
+        reasons = list(dict.fromkeys(reasons))
+
+        def rounded(value: float | None) -> float | None:
+            return None if value is None else round(value, 3)
+
+        return {
+            "ok": not reasons,
+            "reason": reasons[0] if reasons else None,
+            "reasons": reasons,
+            "pending_refresh": pending_since is not None,
+            "pending_refresh_age_seconds": rounded(pending_age),
+            "tip_poll_age_seconds": rounded(tip_poll_age),
+            "tip_refresh_in_progress": active_refresh_count > 0,
+            "tip_refresh_progress_age_seconds": rounded(refresh_activity_age),
+            "current_template_generation": current_template_generation,
+            "published_template_generation": published_template_generation,
+            "current_payout_generation": current_payout_generation,
+            "published_payout_generation": published_payout_generation,
+            "last_valid_delivery_age_seconds": rounded(delivery_age),
+            "eligible_client_count": eligible_count,
+            "eligible_clients_requiring_refresh": requiring_refresh,
+            "bundle_build_oldest_age_seconds": rounded(oldest_bundle_age),
+        }
+
+    @staticmethod
+    def _apply_progress_health(
+        payload: dict[str, object],
+        progress: dict[str, object],
+    ) -> dict[str, object]:
+        # A cached snapshot's top-level ``ok`` already includes the progress
+        # state from snapshot time. Recompute that half from the stable mining
+        # readiness field so a fresh in-memory progress overlay can both fail
+        # and recover immediately without hiding an independent mining fault.
+        base_ok = bool(payload.get("mining_ready", payload.get("ok")))
+        result = dict(payload)
+        result.update(progress)
+        result["ok"] = base_ok and bool(progress["ok"])
+        if progress["ok"]:
+            result.pop("reason", None)
+            result.pop("reasons", None)
+        return result
+
+    def progress_health_metrics_lines(self) -> list[str]:
+        progress = self.progress_health_snapshot()
+        pending_age = progress["pending_refresh_age_seconds"]
+        delivery_age = progress["last_valid_delivery_age_seconds"]
+        active_reasons = set(progress["reasons"])
+        return [
+            "# HELP qbit_prism_refresh_pending Whether current template or payout work still requires publication or delivery.",
+            "# TYPE qbit_prism_refresh_pending gauge",
+            f"qbit_prism_refresh_pending {1 if progress['pending_refresh'] else 0}",
+            "# HELP qbit_prism_refresh_pending_age_seconds Monotonic age of the oldest unresolved current-work refresh.",
+            "# TYPE qbit_prism_refresh_pending_age_seconds gauge",
+            f"qbit_prism_refresh_pending_age_seconds {float(pending_age or 0.0):.6f}",
+            "# HELP qbit_prism_tip_poll_age_seconds Monotonic age of the last coherent qbit tip/template poll.",
+            "# TYPE qbit_prism_tip_poll_age_seconds gauge",
+            f"qbit_prism_tip_poll_age_seconds {float(progress['tip_poll_age_seconds']):.6f}",
+            "# HELP qbit_prism_current_generation_delivery_age_seconds Monotonic age of the last valid current-generation delivery, or -1 when none exists.",
+            "# TYPE qbit_prism_current_generation_delivery_age_seconds gauge",
+            f"qbit_prism_current_generation_delivery_age_seconds {float(delivery_age) if delivery_age is not None else -1.0:.6f}",
+            "# HELP qbit_prism_bundle_build_oldest_age_seconds Monotonic age of the oldest active bundle build.",
+            "# TYPE qbit_prism_bundle_build_oldest_age_seconds gauge",
+            f"qbit_prism_bundle_build_oldest_age_seconds {float(progress['bundle_build_oldest_age_seconds']):.6f}",
+            "# HELP qbit_prism_health_state Current progress-health state by bounded reason.",
+            "# TYPE qbit_prism_health_state gauge",
+            f'qbit_prism_health_state{{reason="healthy"}} {1 if progress["ok"] else 0}',
+            *[
+                f'qbit_prism_health_state{{reason="{reason}"}} {1 if reason in active_reasons else 0}'
+                for reason in PRISM_PROGRESS_HEALTH_REASONS
+            ],
+        ]
+
     def ready_miner_count(self) -> int:
         return self.accepted_share_stats()[1]
 
@@ -16068,7 +16694,7 @@ class PrismCoordinator:
     def health_payload(self) -> dict[str, object]:
         accepted_share_count, ready_miner_count = self.accepted_share_stats()
         mining = self.mining_delivery_snapshot()
-        return {
+        payload = {
             "ok": bool(mining["mining_ready"]),
             "schema": "qbit.prism.audit-health.v1",
             "ledger_backend": self.ledger.backend_name,
@@ -16079,6 +16705,7 @@ class PrismCoordinator:
             "max_blocks": self.max_blocks,
             **mining,
         }
+        return self._apply_progress_health(payload, self.progress_health_snapshot())
 
     def refresh_health_snapshot(self) -> dict[str, object]:
         payload = self.health_payload()
@@ -16111,21 +16738,38 @@ class PrismCoordinator:
                 # inline like the legacy endpoint did.
                 payload = self.refresh_health_snapshot()
                 return (200 if payload.get("ok") else 503), payload
-            return 503, {
-                "ok": False,
-                "schema": "qbit.prism.audit-health.v1",
-                "error": "health snapshot is not available yet",
-            }
+            payload = self._apply_progress_health(
+                {
+                    "ok": False,
+                    "schema": "qbit.prism.audit-health.v1",
+                    "error": "health snapshot is not available yet",
+                },
+                self.progress_health_snapshot(),
+            )
+            payload["ok"] = False
+            return 503, payload
         age_seconds = time.monotonic() - snapshot_monotonic
         stale_after = max(3 * refresh_seconds, 15.0)
         if age_seconds > stale_after:
-            return 503, {
-                "ok": False,
-                "schema": "qbit.prism.audit-health.v1",
-                "error": "health snapshot is stale",
-                "snapshot_age_seconds": round(age_seconds, 3),
-            }
-        payload = dict(snapshot)
+            payload = self._apply_progress_health(
+                {
+                    "ok": False,
+                    "schema": "qbit.prism.audit-health.v1",
+                    "error": "health snapshot is stale",
+                    "snapshot_age_seconds": round(age_seconds, 3),
+                },
+                self.progress_health_snapshot(),
+            )
+            payload["ok"] = False
+            return 503, payload
+        # Ledger-backed fields stay cached, but progress state is an in-memory
+        # monotonic snapshot and must be overlaid on every request. Otherwise a
+        # cached ok=true response can mask a known failed refresh for another
+        # full cache cycle (the production incident this endpoint must expose).
+        payload = self._apply_progress_health(
+            snapshot,
+            self.progress_health_snapshot(),
+        )
         payload["snapshot_age_seconds"] = round(age_seconds, 3)
         return (200 if payload.get("ok") else 503), payload
 
@@ -16564,6 +17208,7 @@ class PrismCoordinator:
         lines.extend(self.tip_refresh_metrics_lines())
         lines.extend(self.payout_state_metrics_lines())
         lines.extend(self.initial_delivery_metrics_lines())
+        lines.extend(self.progress_health_metrics_lines())
         return "\n".join(lines) + "\n"
 
     def shutdown_metrics_lines(self) -> list[str]:

@@ -211,6 +211,20 @@ class FakeCoordinator:
         )
 
 
+class UnhealthyCoordinator(FakeCoordinator):
+    def cached_health_payload(self) -> tuple[int, dict[str, object]]:
+        return 503, {
+            "ok": False,
+            "schema": "qbit.prism.audit-health.v1",
+            "reason": "refresh_pending_too_long",
+            "reasons": [
+                "refresh_pending_too_long",
+                "current_generation_not_delivered",
+            ],
+            "pending_refresh_age_seconds": 16.0,
+        }
+
+
 class PrismAuditApiTests(unittest.TestCase):
     def setUp(self) -> None:
         handler = make_audit_handler(FakeCoordinator())  # type: ignore[arg-type]
@@ -257,6 +271,28 @@ class PrismAuditApiTests(unittest.TestCase):
         self.assertIn("qbit_prism_ctv_fanouts_pending 1", metrics)
         self.assertIn("qbit_prism_ctv_fanouts_broadcastable 1", metrics)
         self.assertIn("qbit_prism_ctv_fanouts_failed 0", metrics)
+
+    def test_unhealthy_progress_returns_http_503_and_bounded_reason(self) -> None:
+        handler = make_audit_handler(UnhealthyCoordinator())  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/healthz",
+                    timeout=5,
+                )
+            self.assertEqual(raised.exception.code, 503)
+            payload = json.loads(raised.exception.read())
+            raised.exception.close()
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["reason"], "refresh_pending_too_long")
+            self.assertNotIn("username", payload)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_audit_endpoints_serialize_rows_and_bundle(self) -> None:
         block_hash = "a" * 64

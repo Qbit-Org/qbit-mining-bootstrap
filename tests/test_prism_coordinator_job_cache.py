@@ -414,6 +414,14 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
         )
         self.assertGreater(bundle.issued_at_ms, int(artifact.snapshot_anchor_ms))
 
+def mark_progress_healthy(server: PrismCoordinator) -> None:
+    snapshot = server.fetch_qbit_tip_template_snapshot()
+    server._record_progress_tip_poll(snapshot)
+    server._record_progress_publication(
+        snapshot,
+        int(getattr(server, "_payout_state_generation", 0)),
+    )
+
 
 class JobBundleCacheTests(unittest.TestCase):
     def test_tip_template_snapshot_stays_coherent_across_tip_transition(self) -> None:
@@ -4094,6 +4102,7 @@ class HealthSnapshotTests(unittest.TestCase):
     def test_health_payload_uses_aggregate_stats_not_all_shares(self) -> None:
         ledger = FakeLedger()
         server, _ = coordinator(ledger=ledger)
+        mark_progress_healthy(server)
         payload = server.health_payload()
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["accepted_share_count"], 3)
@@ -4102,12 +4111,14 @@ class HealthSnapshotTests(unittest.TestCase):
 
     def test_cached_health_payload_computes_inline_without_refresher(self) -> None:
         server, _ = coordinator()
+        mark_progress_healthy(server)
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
 
     def test_cached_health_payload_serves_snapshot_and_flags_staleness(self) -> None:
         server, _ = coordinator()
+        mark_progress_healthy(server)
         server.refresh_health_snapshot()
         server._health_refresh_loop_running = True
 
