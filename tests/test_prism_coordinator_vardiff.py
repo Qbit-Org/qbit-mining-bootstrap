@@ -3471,6 +3471,50 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             getattr(server, "template_refresh_failure_started_monotonic", None)
         )
 
+    def test_armed_budget_is_not_fired_by_coordination_blocked_refresh(self) -> None:
+        # A transient budgeted failure armed the clock, qbitd recovered, and
+        # only coordination churn follows. Blocked attempts must not trip the
+        # armed budget in blockpoll_loop: the exit is reserved for the next
+        # budgeted failure, and the clock clears on the next completed refresh.
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server.template_refresh_failure_started_monotonic = 100.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.rpc = TipRpc("11" * 32)
+        clock = {"now": 100.0}
+        blocked_polls = 0
+
+        def blocked_fetch() -> QbitTipTemplateSnapshot:
+            nonlocal blocked_polls
+            blocked_polls += 1
+            clock["now"] += 6.0
+            if blocked_polls >= 4:
+                server.stop_event.set()
+            raise TemplateRefreshSuperseded(
+                "qbit tip changed during sequential refresh; immediate retry scheduled"
+            )
+
+        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+        ):
+            server.blockpoll_loop()
+
+        self.assertEqual(blocked_polls, 4)
+        self.assertGreater(
+            clock["now"],
+            server.template_refresh_failure_started_monotonic
+            + server.template_refresh_failure_exit_seconds,
+        )
+        exit_process.assert_not_called()
+        self.assertEqual(server.template_refresh_failure_started_monotonic, 100.0)
+
     def test_rpc_outage_arms_and_exhausts_failure_budget(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0

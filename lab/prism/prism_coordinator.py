@@ -6039,6 +6039,18 @@ class PrismCoordinator:
                 # nested reconciliation enters the writer gate. That is an
                 # intentional shutdown stop, not a template-health failure.
                 return
+            except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked) as exc:
+                # Coordination-blocked attempts neither record into nor fire
+                # the failure budget. A clock armed by an earlier budgeted
+                # failure must wait for the next budgeted failure (or be
+                # cleared by the next completed refresh): exiting here would
+                # let a transient blip plus ordinary payout/tip churn restart
+                # a process whose qbitd RPC is healthy. The retry is already
+                # scheduled by the raise site.
+                print(
+                    f"prism coordinator: tip/template refresh superseded; retrying: {exc}",
+                    flush=True,
+                )
             except Exception:
                 print("prism coordinator: qbit tip/template poll failed", flush=True)
                 traceback.print_exc()
