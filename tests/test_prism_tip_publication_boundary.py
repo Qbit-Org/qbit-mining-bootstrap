@@ -425,6 +425,133 @@ class TipPublicationBoundaryTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
+    def test_refresh_retry_reuses_cached_detected_tip_bundle(self) -> None:
+        server, rpc = coordinator()
+        builds = install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+
+            next_tip = "88" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    next_tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            first_bundle = server.prepare_tip_refresh_bundle(snapshot)
+            builds_after_first = int(builds["calls"])
+
+            # A transient final-validation or publication failure retries the
+            # same snapshot. The detected-tip bundle already in the cache must
+            # be reused while the previous tip is still published, not rebuilt
+            # from scratch for the rest of the divergence lease.
+            retry_bundle = server.prepare_tip_refresh_bundle(snapshot)
+            self.assertIs(retry_bundle, first_bundle)
+            self.assertEqual(int(builds["calls"]), builds_after_first)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_pinned_published_rebuild_recaches_for_repeat_issuance(self) -> None:
+        server, rpc = coordinator()
+        builds = install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            next_tip = "99" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+            server.fetch_qbit_tip_template_snapshot()
+
+            # Simulate cache pressure dropping the retained published bundle,
+            # then issue twice: the first pinned rebuild re-enters the cache
+            # so the second issuance is a hit instead of another heavy build.
+            with server._job_cache_lock:
+                server._job_bundle_cache.clear()
+            first = server.build_job_for_client(state, clean_jobs=False)
+            builds_after_first = int(builds["calls"])
+            second = server.build_job_for_client(state, clean_jobs=False)
+            self.assertEqual(int(builds["calls"]), builds_after_first)
+            self.assertEqual(
+                str(first.template["previousblockhash"]),
+                published_tip[0],
+            )
+            self.assertEqual(
+                str(second.template["previousblockhash"]),
+                published_tip[0],
+            )
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_poll_start_only_targets_still_get_prepared_publication(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        sent_notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                sent_notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            # A same-tip pass whose initial selection sees no work, while the
+            # poll-start merge finds a target that does need a refresh, must
+            # still take the prepared path: authority may not republish
+            # through the sequential branch with no deliverable bundle.
+            original_needs = server.client_needs_tip_template_refresh
+            calls = {"count": 0}
+
+            def needs_after_initial_selection(
+                target: object,
+                snapshot: object,
+            ) -> bool:
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    return False
+                return original_needs(target, snapshot)  # type: ignore[arg-type]
+
+            server.client_needs_tip_template_refresh = (  # type: ignore[method-assign]
+                needs_after_initial_selection
+            )
+            state.active_job = None
+            state.active_job_ids = set()
+
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            self.assertGreaterEqual(calls["count"], 2)
+            self.assertEqual(sent_notifies[-1], published_tip[0])
+            self.assertEqual(server.current_tip_first_seen[0], published_tip[0])
+            self.assertIsNone(server._active_tip_refresh)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
     def test_tip_flip_publication_clears_mismatched_parent_on_lookup_failure(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)

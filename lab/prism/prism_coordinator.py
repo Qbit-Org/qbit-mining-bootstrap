@@ -4341,12 +4341,13 @@ class PrismCoordinator:
         """
         if cached is None:
             return False
+        # Usability follows the same split-authority rule as construction: a
+        # cached bundle for the newest detected tip stays reusable across
+        # refresh retries while the previous tip is still published, and the
+        # published snapshot's own bundle stays servable for pinned issuance.
         with self.lock:
-            observed_tip = getattr(self, "current_tip_first_seen", None)
-        if (
-            observed_tip is not None
-            and observed_tip[0] != artifacts.previousblockhash
-        ):
+            parent_usable = self._artifacts_buildable_locked(artifacts)
+        if not parent_usable:
             return False
         with self._job_cache_lock:
             if self._payout_state_publication_blocked:
@@ -4605,6 +4606,13 @@ class PrismCoordinator:
         newest = self._newest_observed_tip_locked()
         if newest is None or artifacts.previousblockhash == newest:
             return True
+        return self._published_snapshot_artifacts_locked(artifacts)
+
+    def _published_snapshot_artifacts_locked(
+        self,
+        artifacts: CachedTemplateArtifacts,
+    ) -> bool:
+        """Whether these artifacts are exactly the still-authoritative published snapshot."""
         published = getattr(self, "current_tip_first_seen", None)
         published_snapshot = getattr(self, "tip_template_snapshot", None)
         return bool(
@@ -4625,6 +4633,9 @@ class PrismCoordinator:
         with self._job_cache_lock:
             with self.lock:
                 buildable = self._artifacts_buildable_locked(artifacts)
+                snapshot_pinned = self._published_snapshot_artifacts_locked(
+                    artifacts
+                )
             published_artifact = self._published_payout_state.artifact
             if not buildable:
                 return False
@@ -4637,11 +4648,16 @@ class PrismCoordinator:
             ):
                 return False
             current = self._template_artifacts
-            if (
-                current is None
-                or current.fingerprint != artifacts.fingerprint
-                or current.generation != artifacts.generation
-            ):
+            globally_current = (
+                current is not None
+                and current.fingerprint == artifacts.fingerprint
+                and current.generation == artifacts.generation
+            )
+            if not globally_current and not snapshot_pinned:
+                # Only the current template observation may win the cache
+                # race; the sole exception is a pinned rebuild of exactly the
+                # published snapshot, which repeated direct issuance would
+                # otherwise rebuild for the rest of the unpublished window.
                 return False
             self._job_bundle_cache[built.key] = built
             self._job_bundle_cache.move_to_end(built.key)
@@ -8352,8 +8368,13 @@ class PrismCoordinator:
                         selected_client_set.add(client)
                         expected_active_jobs[client] = client.active_job
                 selected_clients = tuple(selected_clients_list)
+            # Prepared-mode selection must cover every client this pass can
+            # end up serving. Revalidation only filters selected_clients, so
+            # deriving from the narrower initial list could publish authority
+            # through the sequential path with no shared bundle while
+            # poll-start targets still need prepared ready work.
             use_prepared_fanout = bool(
-                clients
+                selected_clients
                 and getattr(self, "_pool_ready_latched", False)
             )
             ready_mode = bool(getattr(self, "_pool_ready_latched", False))
@@ -8369,12 +8390,12 @@ class PrismCoordinator:
                 try:
                     bundle = self.prepare_tip_refresh_bundle(snapshot)
                 except _PayoutStatePublicationBlocked:
-                    for _client in clients:
+                    for _client in selected_clients:
                         self._record_tip_refresh_client_result("skipped")
                     self._schedule_tip_refresh_retry()
                     raise
                 except TemplateRefreshBlocked:
-                    for _client in clients:
+                    for _client in selected_clients:
                         self._record_tip_refresh_client_result("failed")
                     raise
                 if (
