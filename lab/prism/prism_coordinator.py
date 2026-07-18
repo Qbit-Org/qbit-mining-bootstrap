@@ -3179,7 +3179,17 @@ class PrismCoordinator:
                         raise RuntimeError(
                             "accepted block payout preview changed during retry"
                         )
-                    return self._materialize_prior_balance_preview(existing_preview)
+                    if (
+                        existing is not None
+                        and existing.published_generation is not None
+                    ):
+                        return self._materialize_prior_balance_preview(
+                            existing_preview
+                        )
+                    # A bounded publication loss retains the compact preview
+                    # locally while delivery remains fenced. Matching retries
+                    # must still cross the atomic publication boundary so they
+                    # install a generation and reopen admission.
 
             captured = self._capture_payout_state_source()
             reserved = self._reserve_payout_state_source_if_current(

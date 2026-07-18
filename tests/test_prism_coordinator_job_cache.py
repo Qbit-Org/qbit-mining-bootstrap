@@ -614,6 +614,49 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(server._invalidated_accepted_block_payout_previews, {})
         server._clear_accepted_block_payout_preview(parent_hash)
 
+    def test_unpublished_parent_preview_retries_and_reopens_delivery(self) -> None:
+        server, _rpc = coordinator()
+        server.payout_reconcile_supersession_retries = 2
+        parent_hash = "ac" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+
+        server._begin_accepted_block_payout_preview(parent_hash)
+        with patch.object(
+            server,
+            "_publish_payout_state_candidate",
+            return_value=None,
+        ) as publish_candidate:
+            self.assertEqual(
+                server._publish_accepted_block_payout_preview(parent_hash, preview),
+                preview,
+            )
+
+        transition = server._accepted_block_payout_previews[parent_hash]
+        self.assertEqual(publish_candidate.call_count, 3)
+        self.assertIsNotNone(transition.preview)
+        self.assertIsNone(transition.published_generation)
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertTrue(server._payout_state_publication_fenced())
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+
+        self.assertEqual(
+            server._publish_accepted_block_payout_preview(parent_hash, preview),
+            preview,
+        )
+
+        transition = server._accepted_block_payout_previews[parent_hash]
+        self.assertEqual(transition.published_generation, 1)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertFalse(server._payout_state_publication_fenced())
+        self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
+
     def test_withdrawn_landed_transition_blocks_active_descendant_fallback(
         self,
     ) -> None:
