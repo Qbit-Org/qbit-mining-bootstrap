@@ -115,6 +115,8 @@ DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS = 60.0
 DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS = 0.25
 PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
+PRISM_VARDIFF_IDLE_RETARGET_MAX_WORKERS = 2
+MAX_PENDING_VARDIFF_IDLE_RETARGETS = 8
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
 # Block candidates queue to a dedicated submitter thread so the miner's share
@@ -187,6 +189,15 @@ PRISM_TIP_REFRESH_BUILD_PHASES = (
     "singleflight_wait",
 )
 PRISM_BUILDER_PHASE_METRICS_PREFIX = "qbit-prism-build-phase-metrics "
+PRISM_VARDIFF_IDLE_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
+PRISM_VARDIFF_IDLE_SKIP_REASONS = (
+    "busy",
+    "disconnected",
+    "not_idle",
+    "cache_miss",
+    "queue_full",
+    "superseded",
+)
 PRISM_PAYOUT_DELIVERY_GENERATIONS = ("current", "stale", "future")
 DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES = 8
 PRISM_JOB_BUILD_PHASES = (
@@ -1115,6 +1126,19 @@ class _AcceptedBlockPayoutTransition:
 
 
 @dataclass(frozen=True)
+class _IdleRetargetRequest:
+    """Immutable idle-window identity captured by one bounded sweep."""
+
+    client: ClientState
+    connection_id: int
+    worker: WorkerIdentity
+    active_job: PrismJobContext
+    window_started_monotonic: float
+    current_difficulty: Decimal
+    elapsed_seconds: Decimal
+
+
+@dataclass(frozen=True)
 class EvictedJobEntry:
     context: PrismJobContext
     connection_id: int
@@ -2005,6 +2029,7 @@ class _JobBuildRequest:
     ctv_settlement_json: str | None
     decimal_context: Context = field(repr=False)
     cancellation: _JobBuildCancellation
+    idle_retarget: bool = False
     promise: Future[CachedJobBundle] = field(default_factory=Future)
     requested_monotonic: float = field(default_factory=time.monotonic)
     superseded_monotonic: float | None = None
@@ -2380,6 +2405,7 @@ class PrismCoordinator:
         self._pool_ready_latched = False
         self.grace_credited_share_count = 0
         self.idle_retarget_count = 0
+        self._ensure_vardiff_idle_state()
         self.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
         # Per-worker share accounting with a bounded label set; see
         # worker_metric_label for the admission rule.
@@ -3696,6 +3722,20 @@ class PrismCoordinator:
     def _request_job_build(self, request: _JobBuildRequest) -> Future[CachedJobBundle]:
         self._ensure_job_cache_state()
         with self._job_build_scheduler_lock:
+            if getattr(request, "idle_retarget", False):
+                with self.lock:
+                    defer_idle = self._vardiff_idle_tip_divergence_locked()
+                if defer_idle:
+                    request.cancellation.cancel(
+                        "idle retarget deferred during unpublished tip refresh"
+                    )
+                    if not request.promise.done():
+                        request.promise.set_exception(
+                            JobBuildSuperseded(
+                                "idle retarget deferred during unpublished tip refresh"
+                            )
+                        )
+                    return request.promise
             self.job_build_scheduler_counts["requests"] += 1
             active = self._job_build_active
             retiring = self._job_build_retiring
@@ -5412,6 +5452,7 @@ class PrismCoordinator:
         payout_state_generation: int,
         cache_key: tuple[object, ...],
         payout_ledger_artifact: PayoutLedgerArtifact | None = None,
+        idle_retarget: bool = False,
     ) -> _JobBuildRequest:
         cancellation = _JobBuildCancellation(
             timeout_seconds=max(
@@ -5566,6 +5607,7 @@ class PrismCoordinator:
             ctv_settlement_json=ctv_settlement_json,
             decimal_context=decimal_context,
             cancellation=cancellation,
+            idle_retarget=idle_retarget,
         )
 
     def _newest_observed_tip_locked(self) -> str | None:
@@ -5672,6 +5714,7 @@ class PrismCoordinator:
         mode: str | None = None,
         cancelled: Callable[[], bool] | None = None,
         retry_superseded: bool = True,
+        idle_retarget: bool = False,
     ) -> CachedJobBundle:
         """Return one immutable heavy build through a work-identity flight.
 
@@ -5723,6 +5766,7 @@ class PrismCoordinator:
                     payout_state_generation=payout_state_generation,
                     cache_key=key,
                     payout_ledger_artifact=payout_artifact,
+                    idle_retarget=idle_retarget,
                 )
                 # Preserve the historical readiness handoff without holding a
                 # lock across construction: only admission and the final mode
@@ -7199,7 +7243,10 @@ class PrismCoordinator:
         bundle: CachedJobBundle,
     ) -> bool | None:
         client = request.client
-        cancelled = lambda: self._initial_request_cancelled(request)
+
+        def cancelled() -> bool:
+            return self._initial_request_cancelled(request)
+
         if not self._acquire_client_job_lock(client, cancelled):
             return False
         try:
@@ -7244,7 +7291,6 @@ class PrismCoordinator:
                     client.active_job_ids.add(context.job.job_id)
                     self.prune_client_active_jobs(client)
 
-                send_started = time.monotonic()
                 self.send_job_update(client, context.job)
                 mark_delivered = getattr(admitted, "mark_delivered", None)
                 if callable(mark_delivered):
@@ -7528,6 +7574,7 @@ class PrismCoordinator:
         started = time.monotonic()
         for thread, timeout in threads or []:
             thread.join(timeout=timeout)
+        self.shutdown_vardiff_idle_executor()
         self.shutdown_tip_refresh_executor()
         elapsed = max(0.0, time.monotonic() - started)
         controller.finish_non_writer_drain(elapsed)
@@ -8762,15 +8809,15 @@ class PrismCoordinator:
         started = worker_started if submitted_monotonic is None else submitted_monotonic
         phases = self._job_build_phases()
         phases.clear()
-        cancelled = lambda: (
-            self._prepared_tip_refresh_obsolete(
+
+        def cancelled() -> bool:
+            return self._prepared_tip_refresh_obsolete(
                 validation_token,
                 bundle,
                 snapshot,
                 cancel_event,
-            )
-            or getattr(client, "closing", False)
-        )
+            ) or getattr(client, "closing", False)
+
         phases["executor_queue"] = max(0.0, worker_started - started)
         client_lock_started = worker_started
         client_lock_acquired = False
@@ -11633,6 +11680,9 @@ class PrismCoordinator:
         raise_on_build_failure: bool = False,
         tip_refresh_snapshot: QbitTipTemplateSnapshot | None = None,
         tip_refresh_observation_sequence: int | None = None,
+        prepared_bundle: CachedJobBundle | None = None,
+        commit_guard: Callable[[], bool] | None = None,
+        prepared_bundle_allow_uncached: bool = False,
     ) -> bool:
         if not client.subscribed or not client.authorized or client.worker is None:
             return False
@@ -11649,7 +11699,13 @@ class PrismCoordinator:
         guarded_refresh = tip_refresh_snapshot is not None
         if guarded_refresh != (tip_refresh_observation_sequence is not None):
             raise ValueError("tip refresh snapshot and observation sequence must be paired")
-        if guarded_refresh:
+        if prepared_bundle is not None and guarded_refresh:
+            raise ValueError("prepared idle bundles cannot be combined with tip refresh guards")
+        if prepared_bundle_allow_uncached and prepared_bundle is None:
+            raise ValueError("uncached prepared delivery requires a prepared bundle")
+        if prepared_bundle is not None:
+            pass
+        elif guarded_refresh:
             assert tip_refresh_snapshot is not None
             assert tip_refresh_observation_sequence is not None
             with self.lock:
@@ -11706,7 +11762,13 @@ class PrismCoordinator:
             and "build_job_for_client" not in self.__dict__
         )
         try:
-            if built_from_guarded_artifacts:
+            if prepared_bundle is not None:
+                context = self.stamp_job_for_client(
+                    client,
+                    prepared_bundle,
+                    clean_jobs=clean_jobs,
+                )
+            elif built_from_guarded_artifacts:
                 assert tip_refresh_snapshot is not None
                 assert tip_refresh_snapshot.template_artifacts is not None
                 context = self.build_job_for_client_from_artifacts(
@@ -11829,8 +11891,10 @@ class PrismCoordinator:
                         "payout state changed during client job build"
                     )
                 return False
-            with self.lock:
+            def commit_context_locked() -> bool:
                 if getattr(client, "closing", False):
+                    return False
+                if commit_guard is not None and not commit_guard():
                     return False
                 if guarded_refresh:
                     assert tip_refresh_snapshot is not None
@@ -11888,6 +11952,27 @@ class PrismCoordinator:
                 self.jobs[context.job.job_id] = context
                 client.active_job_ids.add(context.job.job_id)
                 self.prune_client_active_jobs(client)
+                return True
+
+            if prepared_bundle is not None:
+                # Exact cache identity and the client/window guard are one
+                # commit boundary. A tip or payout publication that wins this
+                # race makes the idle task a no-op instead of delivering stale
+                # work.
+                with self._job_cache_lock:
+                    if not self._idle_bundle_current_locked(
+                        client,
+                        prepared_bundle,
+                        allow_uncached=prepared_bundle_allow_uncached,
+                    ):
+                        return False
+                    with self.lock:
+                        if not commit_context_locked():
+                            return False
+            else:
+                with self.lock:
+                    if not commit_context_locked():
+                        return False
             phase_started = time.monotonic()
             self.send_job_update(client, context.job)
             payout_admitted.mark_delivered()
@@ -13565,14 +13650,510 @@ class PrismCoordinator:
             elapsed_seconds=elapsed_seconds,
         )
 
+    def _ensure_vardiff_idle_state(self) -> None:
+        if not hasattr(self, "_vardiff_idle_lock"):
+            self._vardiff_idle_lock = threading.Lock()
+        if not hasattr(self, "_vardiff_idle_executor"):
+            self._vardiff_idle_executor: ThreadPoolExecutor | None = None
+        if not hasattr(self, "_vardiff_idle_executor_shutdown"):
+            self._vardiff_idle_executor_shutdown = False
+        if not hasattr(self, "_vardiff_idle_pending"):
+            self._vardiff_idle_pending: set[tuple[ClientState, int]] = set()
+        if not hasattr(self, "vardiff_idle_queue_depth"):
+            self.vardiff_idle_queue_depth = 0
+        if not hasattr(self, "vardiff_idle_inflight"):
+            self.vardiff_idle_inflight = 0
+        if not hasattr(self, "vardiff_idle_clients_inspected"):
+            self.vardiff_idle_clients_inspected = 0
+        if not hasattr(self, "vardiff_idle_skip_counts"):
+            self.vardiff_idle_skip_counts = {
+                reason: 0 for reason in PRISM_VARDIFF_IDLE_SKIP_REASONS
+            }
+        if not hasattr(self, "vardiff_idle_task_failures"):
+            self.vardiff_idle_task_failures = 0
+        for attribute in (
+            "vardiff_idle_sweep_histogram",
+            "vardiff_idle_task_histogram",
+        ):
+            if not hasattr(self, attribute):
+                setattr(
+                    self,
+                    attribute,
+                    {
+                        "buckets": {
+                            bucket: 0
+                            for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS
+                        },
+                        "sum": 0.0,
+                        "count": 0,
+                    },
+                )
+
+    def _record_vardiff_idle_skip(self, reason: str) -> None:
+        if reason not in PRISM_VARDIFF_IDLE_SKIP_REASONS:
+            raise ValueError(f"unknown vardiff idle skip reason: {reason}")
+        self._ensure_vardiff_idle_state()
+        with self._vardiff_idle_lock:
+            self.vardiff_idle_skip_counts[reason] += 1
+
+    def _observe_vardiff_idle_seconds(self, name: str, elapsed_seconds: float) -> None:
+        self._ensure_vardiff_idle_state()
+        if name not in {"sweep", "task"}:
+            raise ValueError(f"unknown vardiff idle histogram: {name}")
+        with self._vardiff_idle_lock:
+            histogram = getattr(self, f"vardiff_idle_{name}_histogram")
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + elapsed_seconds
+            buckets = histogram["buckets"]
+            for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
+    def _idle_bundle_current_locked(
+        self,
+        client: ClientState,
+        bundle: CachedJobBundle,
+        *,
+        allow_uncached: bool = False,
+    ) -> bool:
+        """Check one exact issuance observation. Caller holds ``_job_cache_lock``.
+
+        Ready bundles can reuse an older same-tip heavy cache entry, but the
+        prepared copy must be rebound to the current template artifacts before
+        delivery. During a detected-but-unpublished refresh, issuance stays
+        pinned to the published snapshot. Accept that copy only when it still
+        shares the immutable heavy payload with the cache entry from which it
+        was derived.
+        """
+        artifacts = self._idle_job_issuance_artifacts_locked()
+        if artifacts is None or self._payout_state_publication_blocked:
+            return False
+        payout_artifact = self._published_payout_state.artifact
+        if (
+            bundle.build_key is None
+            or payout_artifact is None
+            or bundle.build_key.payout_artifact_sha256
+            != payout_artifact.prior_balances_sha256
+        ):
+            return False
+        observed_tip = getattr(self, "current_tip_first_seen", None)
+        if observed_tip is not None and observed_tip[0] != artifacts.previousblockhash:
+            return False
+        if (
+            bundle.template_fingerprint != artifacts.fingerprint
+            or bundle.payout_state_generation != self._payout_state_generation
+            or str(bundle.template.get("previousblockhash", ""))
+            != artifacts.previousblockhash
+        ):
+            return False
+        published_tip = self._published_payout_state.source_tip_hash
+        if published_tip is not None and published_tip != artifacts.previousblockhash:
+            return False
+        worker = client.worker
+        if worker is None:
+            return False
+        mode = "ready" if getattr(self, "_pool_ready_latched", False) else "collection"
+        if bundle.collection_only != (mode == "collection"):
+            return False
+        if (
+            bundle.template is not artifacts.template
+            or bundle.template_generation != artifacts.generation
+        ):
+            # Collection manifests sign the template ntime, while ready
+            # bundles can cheaply rebind their base job. Either way, the
+            # object stamped for delivery must represent this observation.
+            return False
+        key = self._job_bundle_key(
+            artifacts,
+            mode=mode,
+            payout_state_generation=self._payout_state_generation,
+            payout_artifact_generation=bundle.payout_artifact_generation,
+            worker=worker,
+        )
+        ttl = float(
+            getattr(
+                self,
+                "job_bundle_cache_seconds",
+                DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS,
+            )
+        )
+        if ttl <= 0:
+            # A zero TTL deliberately disables global bundle retention. The
+            # dedicated worker may still deliver the exact bundle it just
+            # built after every live template/payout/client guard above has
+            # passed; the cache-only sweep never opts into this exception.
+            return allow_uncached and bundle.key == key
+        cached = self._job_bundle_cache.get(key)
+        if cached is None:
+            return False
+        if cached is not bundle and not (
+            bundle.key == cached.key
+            and bundle.coinbase_manifest is cached.coinbase_manifest
+            and bundle.shares_json is cached.shares_json
+            and bundle.prior_balances is cached.prior_balances
+            and bundle.found_block is cached.found_block
+            and bundle.collection_only == cached.collection_only
+            and bundle.issued_at_ms == cached.issued_at_ms
+            and bundle.built_monotonic == cached.built_monotonic
+            and bundle.payout_state_generation
+            == cached.payout_state_generation
+            and bundle.payout_artifact_generation
+            == cached.payout_artifact_generation
+            and bundle.collection_identity == cached.collection_identity
+        ):
+            return False
+        return time.monotonic() - cached.built_monotonic <= ttl
+
+    def _idle_job_issuance_artifacts_locked(
+        self,
+    ) -> CachedTemplateArtifacts | None:
+        """Cache-only counterpart of ``job_issuance_template_artifacts``.
+
+        The idle sweep and its final delivery guard cannot fetch a template.
+        They must still honor the published-snapshot pin used by every other
+        direct issuance path while a replacement tip is detected but has not
+        yet been published.
+        """
+        artifacts = self._template_artifacts
+        with self.lock:
+            published = getattr(self, "current_tip_first_seen", None)
+            latest_detected = getattr(self, "latest_detected_tip", None)
+            published_snapshot = getattr(self, "tip_template_snapshot", None)
+            pinned = bool(
+                published is not None
+                and published_snapshot is not None
+                and published_snapshot.bestblockhash == published[0]
+                and published_snapshot.template_artifacts is not None
+                and self._published_tip_authoritative_locked(time.monotonic())
+                and (
+                    (
+                        latest_detected is not None
+                        and latest_detected[0] != published[0]
+                    )
+                    or (
+                        artifacts is not None
+                        and artifacts.previousblockhash != published[0]
+                    )
+                )
+            )
+        if pinned:
+            assert published_snapshot is not None
+            assert published_snapshot.template_artifacts is not None
+            return published_snapshot.template_artifacts
+        return artifacts
+
+    def _cached_idle_job_bundle(self, client: ClientState) -> CachedJobBundle | None:
+        """Return only an exact issuance bundle; never build or query."""
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            artifacts = self._idle_job_issuance_artifacts_locked()
+            worker = client.worker
+            if artifacts is None or worker is None:
+                return None
+            mode = "ready" if getattr(self, "_pool_ready_latched", False) else "collection"
+            payout_artifact = getattr(self, "_payout_ledger_artifact", None)
+            payout_artifact_generation = (
+                payout_artifact.generation
+                if mode == "ready"
+                and payout_artifact is not None
+                and payout_artifact.payout_state_generation
+                == self._payout_state_generation
+                and payout_artifact.network_difficulty
+                == artifacts.network_difficulty
+                else 0
+            )
+            key = self._job_bundle_key(
+                artifacts,
+                mode=mode,
+                payout_state_generation=self._payout_state_generation,
+                payout_artifact_generation=payout_artifact_generation,
+                worker=worker,
+            )
+            bundle = self._job_bundle_cache.get(key)
+            if bundle is None or not self._idle_bundle_current_locked(client, bundle):
+                return None
+            return bundle
+
+    def _build_idle_job_bundle(
+        self,
+        request: _IdleRetargetRequest,
+    ) -> CachedJobBundle:
+        """Build on the dedicated idle executor without holding a client lock."""
+        with self.lock:
+            if self._vardiff_idle_tip_divergence_locked():
+                raise JobBuildSuperseded(
+                    "idle retarget deferred during unpublished tip refresh"
+                )
+        artifacts = (
+            self._retained_collection_artifacts()
+            or self.job_issuance_template_artifacts()
+        )
+        return self.shared_job_bundle(
+            artifacts,
+            request.worker,
+            retry_superseded=False,
+            idle_retarget=True,
+        )
+
+    def _vardiff_idle_tip_divergence_locked(self) -> bool:
+        """Whether detected tip work still lacks published submit authority."""
+        published = getattr(self, "current_tip_first_seen", None)
+        latest_detected = getattr(self, "latest_detected_tip", None)
+        return bool(
+            latest_detected is not None
+            and (published is None or latest_detected[0] != published[0])
+        )
+
+    def _idle_request_skip_reason_locked(
+        self,
+        request: _IdleRetargetRequest,
+    ) -> str | None:
+        client = request.client
+        if self._vardiff_idle_tip_divergence_locked():
+            return "superseded"
+        if (
+            client not in self.clients
+            or getattr(client, "closing", False)
+            or not self.client_can_receive_jobs(client)
+        ):
+            return "disconnected"
+        if (
+            client.connection_id != request.connection_id
+            or client.worker != request.worker
+            or client.active_job is not request.active_job
+            or (client.pending_share_difficulty or client.share_difficulty)
+            != request.current_difficulty
+        ):
+            return "superseded"
+        if (
+            client.vardiff_window_started_monotonic
+            != request.window_started_monotonic
+            or client.vardiff_window_accepted != 0
+            or client.vardiff_window_submitted != 0
+        ):
+            return "not_idle"
+        return None
+
+    def _idle_request_pending(self, request: _IdleRetargetRequest) -> bool:
+        self._ensure_vardiff_idle_state()
+        with self._vardiff_idle_lock:
+            return (
+                request.client,
+                request.connection_id,
+            ) in self._vardiff_idle_pending
+
+    def _finish_idle_retarget_task(
+        self,
+        key: tuple[ClientState, int],
+        queued_monotonic: float,
+        *,
+        started: bool,
+    ) -> None:
+        self._ensure_vardiff_idle_state()
+        with self._vardiff_idle_lock:
+            if key not in self._vardiff_idle_pending:
+                return
+            self._vardiff_idle_pending.discard(key)
+            if started:
+                self.vardiff_idle_inflight = max(0, self.vardiff_idle_inflight - 1)
+            else:
+                self.vardiff_idle_queue_depth = max(
+                    0,
+                    self.vardiff_idle_queue_depth - 1,
+                )
+        self._observe_vardiff_idle_seconds(
+            "task",
+            max(0.0, time.monotonic() - queued_monotonic),
+        )
+
+    def _run_idle_retarget_task(
+        self,
+        request: _IdleRetargetRequest,
+        bundle: CachedJobBundle | None,
+        queued_monotonic: float,
+    ) -> None:
+        key = (request.client, request.connection_id)
+        self._ensure_vardiff_idle_state()
+        with self._vardiff_idle_lock:
+            if key not in self._vardiff_idle_pending:
+                return
+            self.vardiff_idle_queue_depth = max(
+                0,
+                self.vardiff_idle_queue_depth - 1,
+            )
+            self.vardiff_idle_inflight += 1
+        client = request.client
+        delivery_attempted = False
+        try:
+            with self.lock:
+                reason = self._idle_request_skip_reason_locked(request)
+            if reason is not None:
+                self._record_vardiff_idle_skip(reason)
+                return
+            # Readiness may have crossed in the ledger after the sweep's
+            # cache-only snapshot. Refresh it on this bounded worker so a
+            # cached collection bundle cannot be delivered after the pool is
+            # ready for normal payout work.
+            self.pool_readiness_latched()
+            # Canonicalize the sweep's cache-only snapshot on the dedicated
+            # worker. shared_job_bundle() selects the current payout-artifact
+            # key and rebinds a ready heavy bundle to the latest same-tip
+            # template observation; a miss may build here, never on the sweep.
+            bundle = self._build_idle_job_bundle(request)
+            with self.lock:
+                reason = self._idle_request_skip_reason_locked(request)
+            if reason is not None:
+                self._record_vardiff_idle_skip(reason)
+                return
+            # Prepared bundles bypass _maybe_send_job_locked's normal build
+            # admission, so preserve its live reorg/headers/IBD trust guard on
+            # the dedicated worker before taking the client lock or sending.
+            if not self.ensure_reorg_reconciled_for_current_tip():
+                self._record_vardiff_idle_skip("superseded")
+                return
+            if not client.job_update_lock.acquire(blocking=False):
+                self._record_vardiff_idle_skip("busy")
+                return
+            try:
+                with self.lock:
+                    reason = self._idle_request_skip_reason_locked(request)
+                if reason is not None:
+                    self._record_vardiff_idle_skip(reason)
+                    return
+                with self._job_cache_lock:
+                    bundle_current = self._idle_bundle_current_locked(
+                        client,
+                        bundle,
+                        allow_uncached=True,
+                    )
+                if not bundle_current:
+                    self._record_vardiff_idle_skip("superseded")
+                    return
+                # Everything above this point is coordinator preparation. An
+                # OSError there belongs to qbit RPC/ledger I/O, not the miner
+                # socket. Only retire the connection after entering the paired
+                # client delivery path below.
+                delivery_attempted = True
+                retargeted = self._retarget_client_locked(
+                    client,
+                    current_difficulty=request.current_difficulty,
+                    accepted_shares=0,
+                    submitted_shares=0,
+                    accepted_difficulty=Decimal("0"),
+                    elapsed_seconds=request.elapsed_seconds,
+                    require_idle=True,
+                    prepared_bundle=bundle,
+                    expected_connection_id=request.connection_id,
+                    expected_worker=request.worker,
+                    expected_active_job=request.active_job,
+                    expected_window_started=request.window_started_monotonic,
+                    prepared_bundle_allow_uncached=True,
+                )
+            finally:
+                client.job_update_lock.release()
+            if retargeted:
+                with self.lock:
+                    self.idle_retarget_count = int(
+                        getattr(self, "idle_retarget_count", 0)
+                    ) + 1
+                return
+            with self.lock:
+                reason = self._idle_request_skip_reason_locked(request)
+            if reason is not None:
+                self._record_vardiff_idle_skip(reason)
+                return
+            with self._job_cache_lock:
+                bundle_current = self._idle_bundle_current_locked(
+                    client,
+                    bundle,
+                    allow_uncached=True,
+                )
+            if not bundle_current:
+                self._record_vardiff_idle_skip("superseded")
+        except JobBuildSuperseded:
+            self._record_vardiff_idle_skip("superseded")
+        except OSError:
+            with self._vardiff_idle_lock:
+                self.vardiff_idle_task_failures += 1
+            if delivery_attempted:
+                self.disconnect_client(client)
+                return
+            print(
+                "prism coordinator: idle vardiff retarget preparation failed; "
+                "keeping client connected",
+                flush=True,
+            )
+            traceback.print_exc()
+        except Exception:
+            with self._vardiff_idle_lock:
+                self.vardiff_idle_task_failures += 1
+            print("prism coordinator: idle vardiff retarget task failed", flush=True)
+            traceback.print_exc()
+
+    def _enqueue_idle_retarget(
+        self,
+        request: _IdleRetargetRequest,
+        bundle: CachedJobBundle | None,
+    ) -> str | None:
+        self._ensure_vardiff_idle_state()
+        key = (request.client, request.connection_id)
+        queued_monotonic = time.monotonic()
+        with self._vardiff_idle_lock:
+            if self._vardiff_idle_executor_shutdown or key in self._vardiff_idle_pending:
+                return "superseded"
+            if len(self._vardiff_idle_pending) >= MAX_PENDING_VARDIFF_IDLE_RETARGETS:
+                return "queue_full"
+            executor = self._vardiff_idle_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=PRISM_VARDIFF_IDLE_RETARGET_MAX_WORKERS,
+                    thread_name_prefix="prism-vardiff-idle",
+                )
+                self._vardiff_idle_executor = executor
+            self._vardiff_idle_pending.add(key)
+            self.vardiff_idle_queue_depth += 1
+            try:
+                future = executor.submit(
+                    self._run_idle_retarget_task,
+                    request,
+                    bundle,
+                    queued_monotonic,
+                )
+            except RuntimeError:
+                self._vardiff_idle_pending.discard(key)
+                self.vardiff_idle_queue_depth = max(
+                    0,
+                    self.vardiff_idle_queue_depth - 1,
+                )
+                return "queue_full"
+
+        def finish_task(completed: Future[None]) -> None:
+            self._finish_idle_retarget_task(
+                key,
+                queued_monotonic,
+                started=not completed.cancelled(),
+            )
+
+        future.add_done_callback(finish_task)
+        return None
+
+    def shutdown_vardiff_idle_executor(self) -> None:
+        self._ensure_vardiff_idle_state()
+        with self._vardiff_idle_lock:
+            executor = self._vardiff_idle_executor
+            self._vardiff_idle_executor = None
+            self._vardiff_idle_executor_shutdown = True
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
     def vardiff_idle_sweep_loop(self) -> None:
         while not self.stop_event.wait(self.vardiff_idle_sweep_seconds):
             self._record_heartbeat("vardiff_idle_sweep")
             try:
-                retargeted = self.vardiff_idle_sweep_once()
-                if retargeted:
+                queued = self.vardiff_idle_sweep_once()
+                if queued:
                     print(
-                        f"prism coordinator: idle vardiff sweep retargeted {retargeted} client(s)",
+                        f"prism coordinator: idle vardiff sweep queued {queued} client(s)",
                         flush=True,
                     )
             except Exception:
@@ -13580,49 +14161,105 @@ class PrismCoordinator:
                 traceback.print_exc()
 
     def vardiff_idle_sweep_once(self) -> int:
+        sweep_started = time.monotonic()
         now = time.monotonic()
-        with self.lock:
-            clients = [
-                client
-                for client in self.clients
-                if self.client_can_receive_jobs(client)
-                and self.client_vardiff_config(client).enabled
-                and client.active_job is not None
-            ]
-        retargeted = 0
-        for client in clients:
+        queued = 0
+        try:
+            with self.lock:
+                clients = tuple(self.clients)
+            self._ensure_vardiff_idle_state()
+            with self._vardiff_idle_lock:
+                self.vardiff_idle_clients_inspected += len(clients)
+            for client in clients:
+                self._record_heartbeat("vardiff_idle_sweep")
+                with self.lock:
+                    if self._vardiff_idle_tip_divergence_locked():
+                        reason = "superseded"
+                        request = None
+                    elif (
+                        client not in self.clients
+                        or not self.client_can_receive_jobs(client)
+                    ):
+                        reason = "disconnected"
+                        request = None
+                    else:
+                        config = self.client_vardiff_config(client)
+                        active_job = client.active_job
+                        worker = client.worker
+                        if not config.enabled:
+                            continue
+                        if active_job is None or worker is None:
+                            reason = "superseded"
+                            request = None
+                        else:
+                            elapsed = Decimal(
+                                str(
+                                    max(
+                                        0.001,
+                                        now
+                                        - client.vardiff_window_started_monotonic,
+                                    )
+                                )
+                            )
+                            if (
+                                elapsed < config.retarget_interval_seconds
+                                or client.vardiff_window_accepted != 0
+                                or client.vardiff_window_submitted != 0
+                            ):
+                                reason = "not_idle"
+                                request = None
+                            else:
+                                reason = None
+                                request = _IdleRetargetRequest(
+                                    client=client,
+                                    connection_id=client.connection_id,
+                                    worker=worker,
+                                    active_job=active_job,
+                                    window_started_monotonic=(
+                                        client.vardiff_window_started_monotonic
+                                    ),
+                                    current_difficulty=(
+                                        client.pending_share_difficulty
+                                        or client.share_difficulty
+                                    ),
+                                    elapsed_seconds=elapsed,
+                                )
+                if reason is not None:
+                    self._record_vardiff_idle_skip(reason)
+                    continue
+                assert request is not None
+                if self._idle_request_pending(request):
+                    self._record_vardiff_idle_skip("superseded")
+                    continue
+                if not client.job_update_lock.acquire(blocking=False):
+                    self._record_vardiff_idle_skip("busy")
+                    continue
+                try:
+                    with self.lock:
+                        reason = self._idle_request_skip_reason_locked(request)
+                finally:
+                    client.job_update_lock.release()
+                if reason is not None:
+                    self._record_vardiff_idle_skip(reason)
+                    continue
+                bundle = self._cached_idle_job_bundle(client)
+                if bundle is None:
+                    # The sweep itself stays cache-only. A missing/expired
+                    # bundle is rebuilt only by the dedicated bounded worker,
+                    # so the client still makes eventual vardiff progress.
+                    self._record_vardiff_idle_skip("cache_miss")
+                reason = self._enqueue_idle_retarget(request, bundle)
+                if reason is not None:
+                    self._record_vardiff_idle_skip(reason)
+                    continue
+                queued += 1
+            return queued
+        finally:
             self._record_heartbeat("vardiff_idle_sweep")
-            config = self.client_vardiff_config(client)
-            with self.lock:
-                elapsed = Decimal(str(max(0.001, now - client.vardiff_window_started_monotonic)))
-                if elapsed < config.retarget_interval_seconds:
-                    continue
-                if client.vardiff_window_accepted != 0:
-                    continue
-                if client.vardiff_window_submitted != 0:
-                    continue
-                current_difficulty = client.pending_share_difficulty or client.share_difficulty
-            # Do not reset the window here. retarget_client(require_idle=True)
-            # resets it atomically with the step-down commit only if the client
-            # is still idle at that point; if a share is accepted meanwhile, the
-            # accept path owns the window and the speculative step-down aborts.
-            try:
-                if self.retarget_client(
-                    client,
-                    current_difficulty=current_difficulty,
-                    accepted_shares=0,
-                    submitted_shares=0,
-                    accepted_difficulty=Decimal("0"),
-                    elapsed_seconds=elapsed,
-                    require_idle=True,
-                ):
-                    retargeted += 1
-            except OSError:
-                self.disconnect_client(client)
-        if retargeted:
-            with self.lock:
-                self.idle_retarget_count += retargeted
-        return retargeted
+            self._observe_vardiff_idle_seconds(
+                "sweep",
+                max(0.0, time.monotonic() - sweep_started),
+            )
 
     def retarget_client(
         self,
@@ -13634,8 +14271,20 @@ class PrismCoordinator:
         accepted_difficulty: Decimal,
         elapsed_seconds: Decimal,
         require_idle: bool = False,
+        prepared_bundle: CachedJobBundle | None = None,
+        expected_connection_id: int | None = None,
+        expected_worker: WorkerIdentity | None = None,
+        expected_active_job: PrismJobContext | None = None,
+        expected_window_started: float | None = None,
     ) -> bool:
-        with client.job_update_lock:
+        acquired = client.job_update_lock.acquire(blocking=not require_idle)
+        if not acquired:
+            return False
+        try:
+            if require_idle and prepared_bundle is None:
+                prepared_bundle = self._cached_idle_job_bundle(client)
+                if prepared_bundle is None:
+                    return False
             return self._retarget_client_locked(
                 client,
                 current_difficulty=current_difficulty,
@@ -13644,7 +14293,14 @@ class PrismCoordinator:
                 accepted_difficulty=accepted_difficulty,
                 elapsed_seconds=elapsed_seconds,
                 require_idle=require_idle,
+                prepared_bundle=prepared_bundle,
+                expected_connection_id=expected_connection_id,
+                expected_worker=expected_worker,
+                expected_active_job=expected_active_job,
+                expected_window_started=expected_window_started,
             )
+        finally:
+            client.job_update_lock.release()
 
     def _retarget_client_locked(
         self,
@@ -13656,10 +14312,41 @@ class PrismCoordinator:
         accepted_difficulty: Decimal,
         elapsed_seconds: Decimal,
         require_idle: bool = False,
+        prepared_bundle: CachedJobBundle | None = None,
+        expected_connection_id: int | None = None,
+        expected_worker: WorkerIdentity | None = None,
+        expected_active_job: PrismJobContext | None = None,
+        expected_window_started: float | None = None,
+        prepared_bundle_allow_uncached: bool = False,
     ) -> bool:
         config = self.client_vardiff_config(client)
         if not config.enabled:
             return False
+        if require_idle:
+            if prepared_bundle is None:
+                return False
+            with self.lock:
+                if expected_connection_id is None:
+                    expected_connection_id = client.connection_id
+                if expected_worker is None:
+                    expected_worker = client.worker
+                if expected_active_job is None:
+                    expected_active_job = client.active_job
+                if expected_window_started is None:
+                    expected_window_started = client.vardiff_window_started_monotonic
+                if (
+                    client not in self.clients
+                    or getattr(client, "closing", False)
+                    or not self.client_can_receive_jobs(client)
+                    or client.connection_id != expected_connection_id
+                    or client.worker != expected_worker
+                    or client.active_job is not expected_active_job
+                    or client.vardiff_window_started_monotonic
+                    != expected_window_started
+                    or client.vardiff_window_accepted != 0
+                    or client.vardiff_window_submitted != 0
+                ):
+                    return False
         observed_difficulty = vardiff.observed_difficulty(
             accepted_difficulty=accepted_difficulty,
             elapsed_seconds=elapsed_seconds,
@@ -13693,65 +14380,114 @@ class PrismCoordinator:
             config.retarget_tolerance,
         ):
             return False
-        idle_window_started: float | None = None
+        idle_window_state: tuple[float, int, int, Decimal] | None = None
         idle_window_reset_at: float | None = None
         with self.lock:
             previous_difficulty = client.pending_share_difficulty or client.share_difficulty
             if previous_difficulty != current_difficulty:
                 return False
             if require_idle and (
-                client.vardiff_window_accepted != 0 or client.vardiff_window_submitted != 0
+                client not in self.clients
+                or getattr(client, "closing", False)
+                or not self.client_can_receive_jobs(client)
+                or client.connection_id != expected_connection_id
+                or client.worker != expected_worker
+                or client.active_job is not expected_active_job
+                or client.vardiff_window_started_monotonic
+                != expected_window_started
+                or client.vardiff_window_accepted != 0
+                or client.vardiff_window_submitted != 0
             ):
                 # A share landed since the idle snapshot; the accept path owns
                 # this window. Abort the speculative step-down rather than
                 # overriding a client that just resumed submitting.
                 return False
             if require_idle:
-                # Restart the window atomically with the step-down so a genuinely
-                # idle client only retargets once per interval, and only when the
-                # commit actually fires. The pre-reset clock is kept so a failed
-                # send below can un-restart it (counters are provably zero here,
-                # so restoring the clock alone reconstructs the window).
-                idle_window_started = client.vardiff_window_started_monotonic
-                idle_window_reset_at = time.monotonic()
-                client.vardiff_window_started_monotonic = idle_window_reset_at
-                client.vardiff_window_accepted = 0
-                client.vardiff_window_submitted = 0
-                client.vardiff_window_work = Decimal("0")
+                idle_window_state = (
+                    client.vardiff_window_started_monotonic,
+                    client.vardiff_window_accepted,
+                    client.vardiff_window_submitted,
+                    client.vardiff_window_work,
+                )
             prior_pending = client.pending_share_difficulty
             client.pending_share_difficulty = next_difficulty
-        # Advertise the new difficulty together with the new job, gated on a
-        # successful build: maybe_send_job sends mining.set_difficulty and
-        # mining.notify together, or nothing if the build is skipped. A skipped
-        # build then leaves the client on its existing job at its existing
-        # difficulty (a consistent pair) so it keeps producing accepted shares and
-        # the next one retargets again -- rather than advertising a difficulty for
-        # a job it never received, which (since retargets only fire on accepted
-        # shares) could wedge a client whose easier shares now miss the old target.
-        try:
-            if (
-                client.authorized
-                and client.subscribed
-                and not self.stop_event.is_set()
-                and self.maybe_send_job(client, clean_jobs=True)
-            ):
+        # Advertise the new difficulty only with its corresponding job. Idle
+        # retargets stamp an already-cached bundle; normal share-driven
+        # retargets retain the existing build path. Either path sends the pair
+        # together or restores the prior pending difficulty/window state.
+        def idle_commit_guard() -> bool:
+            nonlocal idle_window_reset_at
+            if not require_idle:
                 return True
-        except OSError:
+            if (
+                self.stop_event.is_set()
+                or client not in self.clients
+                or getattr(client, "closing", False)
+                or not self.client_can_receive_jobs(client)
+                or client.connection_id != expected_connection_id
+                or client.worker != expected_worker
+                or client.active_job is not expected_active_job
+                or client.vardiff_window_started_monotonic
+                != expected_window_started
+                or client.vardiff_window_accepted != 0
+                or client.vardiff_window_submitted != 0
+                or client.pending_share_difficulty != next_difficulty
+            ):
+                return False
+            idle_window_reset_at = time.monotonic()
+            client.vardiff_window_started_monotonic = idle_window_reset_at
+            client.vardiff_window_accepted = 0
+            client.vardiff_window_submitted = 0
+            client.vardiff_window_work = Decimal("0")
+            return True
+
+        def restore_speculative_retarget() -> None:
             with self.lock:
                 if client.pending_share_difficulty == next_difficulty:
                     client.pending_share_difficulty = prior_pending
-                self._restore_idle_window_clock(client, idle_window_started, idle_window_reset_at)
+                self._restore_idle_window_state(
+                    client,
+                    idle_window_state,
+                    idle_window_reset_at,
+                )
+
+        try:
+            if require_idle:
+                sent = self._maybe_send_job_locked(
+                    client,
+                    clean_jobs=True,
+                    raise_on_build_failure=True,
+                    prepared_bundle=prepared_bundle,
+                    commit_guard=idle_commit_guard,
+                    prepared_bundle_allow_uncached=(
+                        prepared_bundle_allow_uncached
+                    ),
+                )
+            else:
+                sent = bool(
+                    client.authorized
+                    and client.subscribed
+                    and not self.stop_event.is_set()
+                    and self.maybe_send_job(client, clean_jobs=True)
+                )
+            # A completed paired send is the commit point. Shutdown may race
+            # immediately afterward, but it cannot make already-delivered work
+            # speculative again.
+            if sent:
+                return True
+        except Exception:
+            # Cached stamping can surface _JobBuildFailed before delivery, and
+            # socket errors can surface during the paired send. Both must undo
+            # every speculative client mutation before the task reports failure.
+            restore_speculative_retarget()
             raise
-        with self.lock:
-            if client.pending_share_difficulty == next_difficulty:
-                client.pending_share_difficulty = prior_pending
-            self._restore_idle_window_clock(client, idle_window_started, idle_window_reset_at)
+        restore_speculative_retarget()
         return False
 
     @staticmethod
-    def _restore_idle_window_clock(
+    def _restore_idle_window_state(
         client: ClientState,
-        idle_window_started: float | None,
+        idle_window_state: tuple[float, int, int, Decimal] | None,
         idle_window_reset_at: float | None,
     ) -> None:
         """Un-restart the idle vardiff window after a step-down that never
@@ -13759,10 +14495,20 @@ class PrismCoordinator:
         immediately instead of waiting out another full retarget interval.
         Caller must hold self.lock. No-op unless this retarget did the reset
         and nothing else has restarted the window since."""
-        if idle_window_reset_at is None or idle_window_started is None:
+        if idle_window_reset_at is None or idle_window_state is None:
             return
-        if client.vardiff_window_started_monotonic == idle_window_reset_at:
-            client.vardiff_window_started_monotonic = idle_window_started
+        if (
+            client.vardiff_window_started_monotonic == idle_window_reset_at
+            and client.vardiff_window_accepted == 0
+            and client.vardiff_window_submitted == 0
+            and client.vardiff_window_work == 0
+        ):
+            (
+                client.vardiff_window_started_monotonic,
+                client.vardiff_window_accepted,
+                client.vardiff_window_submitted,
+                client.vardiff_window_work,
+            ) = idle_window_state
 
     def enqueue_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
         queue_obj = getattr(self, "block_candidate_queue", None)
@@ -15813,6 +16559,7 @@ class PrismCoordinator:
         ]
         lines.extend(self.shutdown_metrics_lines())
         lines.extend(self.ctv_fanout_broadcaster_metrics_lines())
+        lines.extend(self.vardiff_idle_metrics_lines())
         lines.extend(self.job_build_metrics_lines())
         lines.extend(self.tip_refresh_metrics_lines())
         lines.extend(self.payout_state_metrics_lines())
@@ -16042,6 +16789,71 @@ class PrismCoordinator:
             ],
         ]
 
+    def vardiff_idle_metrics_lines(self) -> list[str]:
+        self._ensure_vardiff_idle_state()
+        with self._vardiff_idle_lock:
+            sweep = {
+                "buckets": dict(self.vardiff_idle_sweep_histogram["buckets"]),
+                "sum": float(self.vardiff_idle_sweep_histogram["sum"]),
+                "count": int(self.vardiff_idle_sweep_histogram["count"]),
+            }
+            task = {
+                "buckets": dict(self.vardiff_idle_task_histogram["buckets"]),
+                "sum": float(self.vardiff_idle_task_histogram["sum"]),
+                "count": int(self.vardiff_idle_task_histogram["count"]),
+            }
+            inspected = self.vardiff_idle_clients_inspected
+            skip_counts = dict(self.vardiff_idle_skip_counts)
+            queue_depth = self.vardiff_idle_queue_depth
+            inflight = self.vardiff_idle_inflight
+            failures = self.vardiff_idle_task_failures
+
+        lines = [
+            "# HELP qbit_prism_vardiff_idle_clients_inspected_total Clients inspected by bounded vardiff idle sweeps.",
+            "# TYPE qbit_prism_vardiff_idle_clients_inspected_total counter",
+            f"qbit_prism_vardiff_idle_clients_inspected_total {inspected}",
+            "# HELP qbit_prism_vardiff_idle_skips_total Idle retargets skipped by a bounded reason.",
+            "# TYPE qbit_prism_vardiff_idle_skips_total counter",
+            *[
+                f'qbit_prism_vardiff_idle_skips_total{{reason="{reason}"}} {int(skip_counts.get(reason, 0))}'
+                for reason in PRISM_VARDIFF_IDLE_SKIP_REASONS
+            ],
+            "# HELP qbit_prism_vardiff_idle_queue_depth Cache-only idle retarget tasks waiting for a dedicated worker.",
+            "# TYPE qbit_prism_vardiff_idle_queue_depth gauge",
+            f"qbit_prism_vardiff_idle_queue_depth {queue_depth}",
+            "# HELP qbit_prism_vardiff_idle_inflight Cache-only idle retarget tasks currently running.",
+            "# TYPE qbit_prism_vardiff_idle_inflight gauge",
+            f"qbit_prism_vardiff_idle_inflight {inflight}",
+            "# HELP qbit_prism_vardiff_idle_task_failures_total Idle retarget tasks that failed during cached delivery.",
+            "# TYPE qbit_prism_vardiff_idle_task_failures_total counter",
+            f"qbit_prism_vardiff_idle_task_failures_total {failures}",
+        ]
+        for metric_name, description, histogram in (
+            (
+                "qbit_prism_vardiff_idle_sweep_seconds",
+                "Wall time of one bounded vardiff idle sweep.",
+                sweep,
+            ),
+            (
+                "qbit_prism_vardiff_idle_retarget_task_seconds",
+                "Queue plus execution latency for cache-only idle retarget tasks.",
+                task,
+            ),
+        ):
+            lines.extend(
+                [
+                    f"# HELP {metric_name} {description}",
+                    f"# TYPE {metric_name} histogram",
+                    *[
+                        f'{metric_name}_bucket{{le="{bucket:g}"}} {histogram["buckets"].get(bucket, 0)}'
+                        for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS
+                    ],
+                    f'{metric_name}_bucket{{le="+Inf"}} {histogram["count"]}',
+                    f'{metric_name}_sum {float(histogram["sum"]):.6f}',
+                    f'{metric_name}_count {histogram["count"]}',
+                ]
+            )
+        return lines
     def tip_refresh_metrics_lines(self) -> list[str]:
         self._ensure_tip_refresh_state()
         with self._tip_refresh_executor_lock:
