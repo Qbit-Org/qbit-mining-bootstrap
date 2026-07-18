@@ -1472,6 +1472,7 @@ class PrismCoordinator:
                 "PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS"
             )
         self.last_successful_template_refresh_monotonic: float | None = None
+        self.template_refresh_failure_started_monotonic: float | None = None
         self.reorg_reconcile_cache_seconds = env_nonnegative_float(
             "PRISM_REORG_RECONCILE_CACHE_SECONDS",
             DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
@@ -4070,8 +4071,22 @@ class PrismCoordinator:
         )
         if budget <= 0:
             return False
-        last_success = getattr(self, "last_successful_template_refresh_monotonic", None)
-        return last_success is not None and now - last_success >= budget
+        failure_started = getattr(self, "template_refresh_failure_started_monotonic", None)
+        return failure_started is not None and now - failure_started >= budget
+
+    def _record_template_refresh_failure(self, now: float) -> None:
+        budget = float(
+            getattr(
+                self,
+                "template_refresh_failure_exit_seconds",
+                DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
+            )
+        )
+        if (
+            budget > 0
+            and getattr(self, "template_refresh_failure_started_monotonic", None) is None
+        ):
+            self.template_refresh_failure_started_monotonic = now
 
     def blockwait_once(self, known_tip: str) -> str:
         """One waitfornewblock round: returns the tip after the wait.
@@ -5238,7 +5253,11 @@ class PrismCoordinator:
                     "immediate retry scheduled"
                 )
             self.last_successful_template_refresh_monotonic = time.monotonic()
+            self.template_refresh_failure_started_monotonic = None
             return refreshed
+        except Exception:
+            self._record_template_refresh_failure(time.monotonic())
+            raise
         finally:
             self._tip_refresh_lock.release()
             self._observe_tip_refresh_seconds(
