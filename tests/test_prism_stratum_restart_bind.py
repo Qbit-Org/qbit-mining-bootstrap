@@ -103,6 +103,24 @@ class OpenStratumListenersTest(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 5.0)
 
+    def test_bind_retry_aborts_on_shutdown_signal(self) -> None:
+        """A SIGTERM during the bind retry must stop the port contention
+        immediately instead of running out the retry window."""
+        port = free_port()
+        predecessor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        predecessor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        predecessor.bind(("127.0.0.1", port))
+        predecessor.listen(1)
+        self.addCleanup(predecessor.close)
+        server = make_coordinator([make_profile(port)], bind_retry_seconds=30.0)
+        server.stop_event = threading.Event()
+        server.stop_event.set()
+        started = time.monotonic()
+        with ExitStack() as stack:
+            with self.assertRaises(OSError):
+                server.open_stratum_listeners(stack)
+        self.assertLess(time.monotonic() - started, 2.0)
+
     def test_zero_retry_window_fails_fast(self) -> None:
         port = free_port()
         predecessor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -168,6 +186,29 @@ class ServeBindsBeforeRecoveryTest(unittest.TestCase):
         self.assertTrue(observed.get("listening_during_recovery"))
         # The listen port must be free again once serve() returns, so a
         # successor process can bind without waiting.
+        replacement = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(replacement.close)
+        replacement.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        replacement.bind(("127.0.0.1", port))
+
+    def test_shutdown_during_rpc_readiness_wait_releases_ports(self) -> None:
+        """A SIGTERM while serve() waits for qbit RPC must abort startup and
+        free the bound listen ports promptly, so a successor's bind retry
+        window is never starved by a dying predecessor."""
+        port = free_port()
+        server = make_coordinator([make_profile(port)], bind_retry_seconds=0.0)
+        server.stop_event = threading.Event()
+
+        def failing_rpc_call(*args: object, **kwargs: object) -> int:
+            raise ConnectionError("qbit not ready")
+
+        server.rpc = types.SimpleNamespace(call=failing_rpc_call)
+        stopper = threading.Timer(0.2, server.stop_event.set)
+        stopper.start()
+        self.addCleanup(stopper.cancel)
+        started = time.monotonic()
+        server.serve()
+        self.assertLess(time.monotonic() - started, 5.0)
         replacement = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.addCleanup(replacement.close)
         replacement.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -6382,6 +6382,11 @@ class PrismCoordinator:
                 except OSError as exc:
                     if exc.errno != errno.EADDRINUSE or time.monotonic() >= bind_deadline:
                         raise
+                    stop_event = getattr(self, "stop_event", None)
+                    if stop_event is not None and stop_event.is_set():
+                        # Shutting down mid-startup: stop contending for a
+                        # port this process will never serve.
+                        raise
                     if not warned:
                         print(
                             f"prism coordinator: {profile.name} listener port "
@@ -6412,7 +6417,13 @@ class PrismCoordinator:
                 self.rpc.call("getblockcount")
                 break
             except Exception:
-                time.sleep(1)
+                # A shutdown signal during the readiness wait must release the
+                # bound ports promptly, or a successor's bind retry window can
+                # expire against this process.
+                if self.stop_event.wait(1):
+                    return
+        if self.stop_event.is_set():
+            return
         self.validate_live_chain_identity()
         self.validate_live_template_and_fee_policy()
         self.prism_payout_policy()
@@ -6446,6 +6457,8 @@ class PrismCoordinator:
         # already bound above, so reconnecting miners wait in the accept
         # backlog through this recovery instead of being refused.
         if not self._run_startup_writer_replay(self.replay_pending_block_candidates):
+            return
+        if self.stop_event.is_set():
             return
         prepared = self.prewarm_startup_jobs()
         print(
