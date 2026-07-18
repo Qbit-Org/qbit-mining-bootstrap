@@ -3695,6 +3695,70 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.job_build_failure_count, 1)
         self.assertEqual(server.last_successful_template_refresh_monotonic, 100.0)
 
+    def test_guarded_sequential_build_supersession_does_not_arm_failure_budget(self) -> None:
+        # Non-ready/collection mode: the sequential loop's guarded client
+        # build detects a superseded snapshot inside maybe_send_job. That is
+        # coordination churn, not template unhealthiness -- the real raise
+        # site must carry TemplateRefreshSuperseded so sustained pre-ready
+        # churn neither arms nor fires the budget.
+        old_tip = "00" * 32
+        new_tip = "33" * 32
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        state = client()
+        state.username = "miner-a"
+        state.worker = worker_identity()
+        state.active_job = prism_context("old-job", old_tip, worker=state.worker)
+        state.active_job_ids = {"old-job"}
+        server.clients = {state}
+        server.jobs = {"old-job": state.active_job}
+        server.tip_template_snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=old_tip,
+            previousblockhash=old_tip,
+            template_fingerprint=qbit_template_fingerprint(state.active_job.template),
+        )
+        snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=new_tip,
+            previousblockhash=new_tip,
+            template_fingerprint="44" * 32,
+        )
+        server.rpc = TipRpc(new_tip)
+        clock = {"now": 100.0}
+        fetches = 0
+
+        def fetch_snapshot() -> QbitTipTemplateSnapshot:
+            nonlocal fetches
+            fetches += 1
+            clock["now"] += 6.0
+            if fetches >= 4:
+                server.stop_event.set()
+            return snapshot
+
+        server.fetch_qbit_tip_template_snapshot = fetch_snapshot  # type: ignore[method-assign]
+        # The guarded pre-build currency check loses the race on every pass.
+        server._tip_refresh_snapshot_current_locked = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: False
+        )
+
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+        ):
+            server.blockpoll_loop()
+
+        self.assertEqual(fetches, 4)
+        self.assertGreater(clock["now"] - 100.0, server.template_refresh_failure_exit_seconds)
+        exit_process.assert_not_called()
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+
     def test_transient_template_refresh_failure_recovers_on_healthy_noop(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0

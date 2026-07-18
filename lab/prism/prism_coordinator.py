@@ -6352,12 +6352,12 @@ class PrismCoordinator:
                 if bundle.payout_state_generation != int(
                     getattr(self, "_payout_state_generation", 0)
                 ):
-                    raise TemplateRefreshBlocked(
+                    raise TemplateRefreshSuperseded(
                         "payout state changed during startup job preparation"
                     )
 
             if str(self.rpc.call("getbestblockhash")) != snapshot.bestblockhash:
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "qbit tip changed during startup job preparation"
                 )
             if not self.observe_tip_first_seen(
@@ -6365,7 +6365,7 @@ class PrismCoordinator:
                 observation_sequence=observation_sequence,
                 publish_refresh_observation=True,
             ):
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "startup job preparation was superseded before publication"
                 )
             with self.lock:
@@ -9097,7 +9097,7 @@ class PrismCoordinator:
                 )
             if not refresh_current:
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "tip refresh snapshot was superseded before client job build"
                 )
             try:
@@ -9219,7 +9219,7 @@ class PrismCoordinator:
             if not payout_admitted:
                 self._schedule_tip_refresh_retry()
                 if guarded_refresh:
-                    raise TemplateRefreshBlocked(
+                    raise TemplateRefreshSuperseded(
                         "payout state changed during client job build"
                     )
                 return False
@@ -9234,7 +9234,7 @@ class PrismCoordinator:
                         tip_refresh_observation_sequence,
                     ):
                         self._schedule_tip_refresh_retry()
-                        raise TemplateRefreshBlocked(
+                        raise TemplateRefreshSuperseded(
                             "tip refresh snapshot was superseded during client job build"
                         )
                     artifacts = tip_refresh_snapshot.template_artifacts
