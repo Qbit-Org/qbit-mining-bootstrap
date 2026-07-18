@@ -101,11 +101,10 @@ DEFAULT_PRISM_STRATUM_BIND_RETRY_SECONDS = 10.0
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES = 4_096
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
 DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
-# How old the poller/blockwait-observed tip may be before mining.submit stops
-# trusting it and falls back to a live getbestblockhash per share. Healthy
-# coordinators re-observe the tip every blockpoll interval, so the fallback
-# only engages when tip observation is genuinely failing (fail-safe, never
-# fail-open on a frozen snapshot).
+# How old the refresh-published tip may be before mining.submit stops trusting
+# it and falls back to a live getbestblockhash per share. Healthy coordinators
+# republish/reconfirm it every blockpoll interval; a bounded divergence lease
+# separately covers replacement construction without failing open forever.
 DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS = 10.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS = 30.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
@@ -2371,15 +2370,22 @@ class PrismCoordinator:
         self.evicted_job_submit_counts = {
             outcome: 0 for outcome in PRISM_EVICTED_JOB_SUBMIT_OUTCOMES
         }
-        # (tip_hash, flip_monotonic_or_None) / (tip_hash, parent_hash) caches.
-        # The stamp is when the refresh path saw the tip CHANGE; None marks the
-        # startup baseline tip, which never opens the stale-grace window.
+        # Published share-validation authority. Detection is kept separately
+        # in latest_detected_tip so a waiter can cancel obsolete refresh work
+        # without invalidating jobs before their replacement is ready.
+        # The flip stamp is None for the startup baseline, which never opens
+        # the stale-grace window.
         self.current_tip_first_seen: tuple[str, float | None] | None = None
         self.current_tip_parent: tuple[str, str] | None = None
-        # When the poller/blockwait last confirmed the observed tip against
-        # qbit (including same-tip re-observations). Bounds how long
-        # mining.submit may classify against the observed tip before falling
-        # back to a live RPC read (see submit_stale_check_tip).
+        self.latest_detected_tip: tuple[str, int] | None = None
+        # Start of the current detected-vs-published divergence epoch. Unlike
+        # latest_detected_tip, this stamp is not renewed by B -> C -> D while
+        # published work is still on A; submit authority therefore has a
+        # bounded lease even during repeated refresh failures.
+        self.tip_refresh_divergence_started_monotonic: float | None = None
+        # When the refresh path last published or reconfirmed the authoritative
+        # tip. Bounds normal submit reuse when no replacement is actively
+        # pending (see submit_stale_check_tip).
         self.current_tip_observed_monotonic: float | None = None
         # Block candidates are landed by a dedicated submitter thread so a
         # winning share's ack (and every other client's) never waits on
@@ -3722,18 +3728,57 @@ class PrismCoordinator:
             self._job_build_pending = request
             return request.promise
 
-    def _cancel_obsolete_job_builds(self, reason: str) -> None:
+    def _cancel_obsolete_job_builds(
+        self,
+        reason: str,
+        *,
+        keep_published_snapshot: bool = False,
+    ) -> None:
         self._ensure_job_cache_state()
+        published_parent: str | None = None
+        published_fingerprint: str | None = None
+        if keep_published_snapshot:
+            # A per-client build for exactly the published snapshot is still
+            # valid, creditable work when a same-tip template bump sweeps old
+            # fingerprints. Detection-time sweeps deliberately do not use this:
+            # once a replacement tip is detected, even published-tip builds
+            # must vacate the single-flight lane for the replacement's work.
+            # Snapshot the identity outside the scheduler lock so the keep
+            # check stays lock-free below.
+            with self.lock:
+                published = getattr(self, "current_tip_first_seen", None)
+                snapshot = getattr(self, "tip_template_snapshot", None)
+                snapshot_tip = getattr(snapshot, "bestblockhash", None)
+                snapshot_fingerprint = getattr(
+                    snapshot, "template_fingerprint", None
+                )
+                if (
+                    published is not None
+                    and snapshot_tip == published[0]
+                    and snapshot_fingerprint is not None
+                    and self._published_tip_authoritative_locked(time.monotonic())
+                ):
+                    published_parent = published[0]
+                    published_fingerprint = snapshot_fingerprint
+
+        def keep(request: _JobBuildRequest) -> bool:
+            return bool(
+                published_fingerprint is not None
+                and request.artifacts.previousblockhash == published_parent
+                and request.artifacts.fingerprint == published_fingerprint
+            )
+
         with self._job_build_scheduler_lock:
             for flight in (self._job_build_active, self._job_build_retiring):
                 if (
                     flight is not None
+                    and not keep(flight.request)
                     and flight.request.cancellation.cancel(reason)
                 ):
                     flight.request.superseded_monotonic = time.monotonic()
                     self.job_build_scheduler_counts["supersessions"] += 1
             pending = self._job_build_pending
-            if pending is not None:
+            if pending is not None and not keep(pending):
                 pending.cancellation.cancel(reason)
                 if not pending.promise.done():
                     pending.promise.set_exception(
@@ -4305,13 +4350,28 @@ class PrismCoordinator:
             self._template_artifacts = artifacts
             if previous is not None and previous.fingerprint != artifacts.fingerprint:
                 changed = True
+                # Retain the published snapshot's bundles alongside the new
+                # fingerprint: until the replacement tip is published, direct
+                # issuance still serves published-snapshot work, and pruning
+                # it here would force those paths to defer for the whole
+                # detected-but-unpublished window. Publication moves the
+                # snapshot, so the next fingerprint change drops the old
+                # entries.
+                keep_fingerprints = {artifacts.fingerprint}
+                with self.lock:
+                    published_snapshot = getattr(self, "tip_template_snapshot", None)
+                if published_snapshot is not None:
+                    keep_fingerprints.add(published_snapshot.template_fingerprint)
                 self._job_bundle_cache = OrderedDict(
                     (key, entry)
                     for key, entry in self._job_bundle_cache.items()
-                    if entry.template_fingerprint == artifacts.fingerprint
+                    if entry.template_fingerprint in keep_fingerprints
                 )
         if changed:
-            self._cancel_obsolete_job_builds("template fingerprint superseded")
+            self._cancel_obsolete_job_builds(
+                "template fingerprint superseded",
+                keep_published_snapshot=True,
+            )
         return True
 
     def store_template_artifacts(
@@ -4341,6 +4401,59 @@ class PrismCoordinator:
         self._store_template_artifacts(artifacts)
         return artifacts
 
+    def job_issuance_template_artifacts(self) -> CachedTemplateArtifacts:
+        """Template artifacts for direct (non-refresh) job issuance.
+
+        While a detected replacement tip is still unpublished, share
+        classification remains anchored to the published tip. Direct issuance
+        paths (initial delivery retries, Vardiff retargets, reauthorization)
+        must therefore keep handing out published-snapshot work; issuing
+        detected-tip work early would have every one of its shares rejected
+        as stale until the refresh publishes. Once the published authority
+        lapses (divergence lease expired), issuance falls through to the live
+        template exactly like submit classification falls back to the live
+        RPC read.
+        """
+        self._ensure_tip_refresh_state()
+        with self.lock:
+            published = getattr(self, "current_tip_first_seen", None)
+            latest_detected = getattr(self, "latest_detected_tip", None)
+            published_snapshot = getattr(self, "tip_template_snapshot", None)
+            pinned = bool(
+                published is not None
+                and latest_detected is not None
+                and latest_detected[0] != published[0]
+                and published_snapshot is not None
+                and published_snapshot.bestblockhash == published[0]
+                and published_snapshot.template_artifacts is not None
+                and self._published_tip_authoritative_locked(time.monotonic())
+            )
+        if pinned:
+            assert published_snapshot is not None
+            assert published_snapshot.template_artifacts is not None
+            return published_snapshot.template_artifacts
+        artifacts = self.current_template_artifacts()
+        # The fetch above may itself be the first observation of a newer tip
+        # (a template-cache miss racing ahead of blockpoll/blockwait). The
+        # published tip still owns share classification, so serve its
+        # snapshot; the recorded detection has already armed the refresh.
+        with self.lock:
+            published = getattr(self, "current_tip_first_seen", None)
+            published_snapshot = getattr(self, "tip_template_snapshot", None)
+            repinned = bool(
+                published is not None
+                and artifacts.previousblockhash != published[0]
+                and published_snapshot is not None
+                and published_snapshot.bestblockhash == published[0]
+                and published_snapshot.template_artifacts is not None
+                and self._published_tip_authoritative_locked(time.monotonic())
+            )
+        if repinned:
+            assert published_snapshot is not None
+            assert published_snapshot.template_artifacts is not None
+            return published_snapshot.template_artifacts
+        return artifacts
+
     def current_template_artifacts(self) -> CachedTemplateArtifacts:
         """Return fresh template artifacts, fetching a template on cache miss."""
         self._ensure_job_cache_state()
@@ -4349,11 +4462,11 @@ class PrismCoordinator:
         with self._job_cache_lock:
             cached = self._template_artifacts
         with self.lock:
-            observed_tip = getattr(self, "current_tip_first_seen", None)
+            observed_tip = self._newest_observed_tip_locked()
         cached_tip_current = (
             observed_tip is None
             or cached is None
-            or cached.previousblockhash == observed_tip[0]
+            or cached.previousblockhash == observed_tip
         )
         if (
             cached is not None
@@ -4379,6 +4492,11 @@ class PrismCoordinator:
             generation=generation,
         )
         if self._store_template_artifacts(artifacts):
+            # A direct fetch can be the first reader to see qbit advance.
+            # Record it as a detection like every other live-tip observation,
+            # or the buildability gates would treat the newer parent as
+            # unknown while pinned issuance still waits on blockpoll.
+            self.observe_tip_for_refresh(artifacts.previousblockhash)
             return artifacts
         # A later fetch completed first. Build from that current observation,
         # never from the stale response that lost the cache-write race.
@@ -4386,6 +4504,7 @@ class PrismCoordinator:
             current = self._template_artifacts
         if current is None:
             raise RuntimeError("newer template artifacts disappeared after cache race")
+        self.observe_tip_for_refresh(current.previousblockhash)
         return current
 
     @staticmethod
@@ -4473,12 +4592,13 @@ class PrismCoordinator:
         """
         if cached is None:
             return False
+        # Usability follows the same split-authority rule as construction: a
+        # cached bundle for the newest detected tip stays reusable across
+        # refresh retries while the previous tip is still published, and the
+        # published snapshot's own bundle stays servable for pinned issuance.
         with self.lock:
-            observed_tip = getattr(self, "current_tip_first_seen", None)
-        if (
-            observed_tip is not None
-            and observed_tip[0] != artifacts.previousblockhash
-        ):
+            parent_usable = self._artifacts_buildable_locked(artifacts)
+        if not parent_usable:
             return False
         with self._job_cache_lock:
             if self._payout_state_publication_blocked:
@@ -4705,6 +4825,56 @@ class PrismCoordinator:
             cancellation=cancellation,
         )
 
+    def _newest_observed_tip_locked(self) -> str | None:
+        """Newest live-tip observation, ahead of published submit authority.
+
+        Detection and publication are split: a winning refresh builds for a
+        detected tip while the previous tip remains published. Build-pipeline
+        supersession checks must compare against this detection view, or a
+        replacement build for a freshly detected tip would classify itself as
+        obsolete before it could ever be published.
+        """
+        detected = getattr(self, "latest_detected_tip", None)
+        if detected is not None:
+            return detected[0]
+        published = getattr(self, "current_tip_first_seen", None)
+        return published[0] if published is not None else None
+
+    def _artifacts_buildable_locked(
+        self,
+        artifacts: CachedTemplateArtifacts,
+    ) -> bool:
+        """Whether work for these artifacts may still be built and cached.
+
+        The newest detected tip covers replacement construction. Exactly the
+        published snapshot additionally stays buildable while the published
+        tip retains share-classification authority, so pinned direct issuance
+        can rebuild published work (for example after a payout-generation
+        prune) instead of classifying itself superseded for the whole
+        unpublished window. Anything else -- including other templates for
+        the published parent -- is superseded construction and must stop.
+        """
+        newest = self._newest_observed_tip_locked()
+        if newest is None or artifacts.previousblockhash == newest:
+            return True
+        return self._published_snapshot_artifacts_locked(artifacts)
+
+    def _published_snapshot_artifacts_locked(
+        self,
+        artifacts: CachedTemplateArtifacts,
+    ) -> bool:
+        """Whether these artifacts are exactly the still-authoritative published snapshot."""
+        published = getattr(self, "current_tip_first_seen", None)
+        published_snapshot = getattr(self, "tip_template_snapshot", None)
+        return bool(
+            published is not None
+            and published_snapshot is not None
+            and published_snapshot.bestblockhash == published[0]
+            and artifacts.previousblockhash == published[0]
+            and published_snapshot.template_fingerprint == artifacts.fingerprint
+            and self._published_tip_authoritative_locked(time.monotonic())
+        )
+
     def _cache_job_bundle_if_current(
         self,
         built: CachedJobBundle,
@@ -4713,12 +4883,12 @@ class PrismCoordinator:
         """Cache only current state; report whether payout state stayed valid."""
         with self._job_cache_lock:
             with self.lock:
-                observed_tip = getattr(self, "current_tip_first_seen", None)
+                buildable = self._artifacts_buildable_locked(artifacts)
+                snapshot_pinned = self._published_snapshot_artifacts_locked(
+                    artifacts
+                )
             published_artifact = self._published_payout_state.artifact
-            if (
-                observed_tip is not None
-                and observed_tip[0] != artifacts.previousblockhash
-            ):
+            if not buildable:
                 return False
             if (
                 built.payout_state_generation != self._payout_state_generation
@@ -4729,15 +4899,20 @@ class PrismCoordinator:
             ):
                 return False
             current = self._template_artifacts
-            if (
-                current is None
-                or current.fingerprint != artifacts.fingerprint
-                or current.previousblockhash != artifacts.previousblockhash
-                or (
-                    built.collection_only
-                    and current.generation != artifacts.generation
+            globally_current = (
+                current is not None
+                and current.fingerprint == artifacts.fingerprint
+                and current.previousblockhash == artifacts.previousblockhash
+                and (
+                    not built.collection_only
+                    or current.generation == artifacts.generation
                 )
-            ):
+            )
+            if not globally_current and not snapshot_pinned:
+                # Only the current template observation may win the cache
+                # race; the sole exception is a pinned rebuild of exactly the
+                # published snapshot, which repeated direct issuance would
+                # otherwise rebuild for the rest of the unpublished window.
                 return False
             self._job_bundle_cache[built.key] = built
             self._job_bundle_cache.move_to_end(built.key)
@@ -4851,11 +5026,8 @@ class PrismCoordinator:
                 if not retry_superseded:
                     raise
                 with self.lock:
-                    observed_tip = getattr(self, "current_tip_first_seen", None)
-                if (
-                    observed_tip is not None
-                    and observed_tip[0] != artifacts.previousblockhash
-                ):
+                    buildable = self._artifacts_buildable_locked(artifacts)
+                if not buildable:
                     raise
                 with self._job_cache_lock:
                     current = self._template_artifacts
@@ -4872,11 +5044,8 @@ class PrismCoordinator:
                 with self._job_build_scheduler_lock:
                     self.job_build_scheduler_counts["obsolete_results"] += 1
                 with self.lock:
-                    observed_tip = getattr(self, "current_tip_first_seen", None)
-                if (
-                    observed_tip is not None
-                    and observed_tip[0] != artifacts.previousblockhash
-                ):
+                    buildable = self._artifacts_buildable_locked(artifacts)
+                if not buildable:
                     with self._tip_refresh_metrics_lock:
                         self.tip_refresh_superseded_results += 1
                     raise JobBuildSuperseded(
@@ -5449,6 +5618,10 @@ class PrismCoordinator:
             ] | None = None
         if not hasattr(self, "_retained_collection_refresh"):
             self._retained_collection_refresh: RetainedCollectionRefresh | None = None
+        if not hasattr(self, "latest_detected_tip"):
+            self.latest_detected_tip: tuple[str, int] | None = None
+        if not hasattr(self, "tip_refresh_divergence_started_monotonic"):
+            self.tip_refresh_divergence_started_monotonic: float | None = None
 
     def _retain_collection_refresh(
         self,
@@ -5632,6 +5805,7 @@ class PrismCoordinator:
         snapshot: QbitTipTemplateSnapshot,
         observation_sequence: int,
         payout_state_generation: int,
+        pending_signal_token: int | None = None,
     ) -> bool:
         """Atomically acknowledge pending work handled by a completed poll."""
         self._ensure_job_cache_state()
@@ -5651,7 +5825,14 @@ class PrismCoordinator:
                     snapshot,
                     observation_sequence,
                 )
-                if not payout_state_current or not refresh_current:
+                pending_owned = (
+                    self._tip_refresh_pending_token == pending_signal_token
+                )
+                if (
+                    not payout_state_current
+                    or not refresh_current
+                    or not pending_owned
+                ):
                     return False
                 self._tip_refresh_pending_token = None
                 self._tip_refresh_pending_event.clear()
@@ -5812,7 +5993,7 @@ class PrismCoordinator:
         payout_generation = int(getattr(self, "_payout_state_generation", 0))
         if int(getattr(context, "payout_state_generation", payout_generation)) != payout_generation:
             return False
-        current_tip = self._current_observed_tip_hash_locked()
+        current_tip = self._current_published_tip_hash_locked()
         if current_tip is None:
             # An active job is not proof that tip observation is alive. Keep
             # coverage fail-closed until blockpoll/blockwait has published the
@@ -6054,7 +6235,7 @@ class PrismCoordinator:
                         if not retry_later():
                             return False
                         continue
-                    artifacts = self.current_template_artifacts()
+                    artifacts = self.job_issuance_template_artifacts()
                     if self._initial_request_cancelled(request):
                         return False
                     bundle = self.shared_job_bundle(
@@ -6062,17 +6243,33 @@ class PrismCoordinator:
                         request.worker,
                         cancelled=lambda: (
                             self._initial_request_cancelled(request)
-                            or not self._template_artifacts_are_current(artifacts)
+                            or not self._issuance_artifacts_current(artifacts)
                         ),
                     )
                     live_tip = str(self.rpc.call("getbestblockhash"))
                     if artifacts.previousblockhash != live_tip:
-                        with self._job_cache_lock:
-                            if self._template_artifacts is artifacts:
-                                self._template_artifacts = None
-                        if not retry_later():
-                            return False
-                        continue
+                        # Feed the observation into detection like every other
+                        # live-tip reader; the refresh path owns publication.
+                        self.observe_tip_for_refresh(live_tip)
+                        with self.lock:
+                            published = getattr(self, "current_tip_first_seen", None)
+                            pinned_authoritative = bool(
+                                published is not None
+                                and artifacts.previousblockhash == published[0]
+                                and self._published_tip_authoritative_locked(
+                                    time.monotonic()
+                                )
+                            )
+                        if not pinned_authoritative:
+                            # Authority lapsed: submit classification is on the
+                            # live RPC read now, so published-tip work would be
+                            # rejected. Drop it and rebuild from live state.
+                            with self._job_cache_lock:
+                                if self._template_artifacts is artifacts:
+                                    self._template_artifacts = None
+                            if not retry_later():
+                                return False
+                            continue
                 except _JobBuildCancelled:
                     if self._initial_request_cancelled(request):
                         return False
@@ -6127,6 +6324,31 @@ class PrismCoordinator:
                     and current.fingerprint == artifacts.fingerprint
                     and current.generation == artifacts.generation
                 )
+            )
+
+    def _issuance_artifacts_current(self, artifacts: CachedTemplateArtifacts) -> bool:
+        """Issuance-side currency for direct job delivery.
+
+        Current means either the live template view (the newest stored
+        artifacts) or exactly the published snapshot while the published tip
+        still owns share classification. During a detected-but-unpublished
+        refresh, pinned published-snapshot work must stay deliverable; judging
+        it against the detected-tip globals would defer every direct issuance
+        for the entire construction window that publication is deliberately
+        decoupled from.
+        """
+        if self._template_artifacts_are_current(artifacts):
+            return True
+        with self.lock:
+            published = getattr(self, "current_tip_first_seen", None)
+            published_snapshot = getattr(self, "tip_template_snapshot", None)
+            return bool(
+                published is not None
+                and published_snapshot is not None
+                and published_snapshot.bestblockhash == published[0]
+                and artifacts.previousblockhash == published[0]
+                and published_snapshot.template_fingerprint == artifacts.fingerprint
+                and self._published_tip_authoritative_locked(time.monotonic())
             )
 
     def _acquire_client_job_lock(
@@ -6198,7 +6420,7 @@ class PrismCoordinator:
         try:
             if cancelled():
                 return False
-            if not self._template_artifacts_are_current(artifacts):
+            if not self._issuance_artifacts_current(artifacts):
                 return None
             self._ensure_job_cache_state()
             gate_started = time.monotonic()
@@ -6217,7 +6439,7 @@ class PrismCoordinator:
                     payout_current = (
                         bundle.payout_state_generation == self._payout_state_generation
                     )
-                if not payout_current or not self._template_artifacts_are_current(artifacts):
+                if not payout_current or not self._issuance_artifacts_current(artifacts):
                     return None
                 with self.lock:
                     if not self._initial_request_current_locked(request):
@@ -7180,13 +7402,15 @@ class PrismCoordinator:
             try:
                 if known_tip is None:
                     known_tip = str(self.rpc.call("getbestblockhash"))
-                    self.observe_tip_first_seen(known_tip)
+                    self.observe_tip_for_refresh(known_tip)
                 new_tip = self.blockwait_once(known_tip)
                 if new_tip == known_tip:
                     if self.stop_event.wait(0.25):
                         return
                     continue
-                self.observe_tip_first_seen(new_tip)
+                # Detection can supersede/cancel obsolete heavy work, but only
+                # the successful refresh path may publish submit authority.
+                self.observe_tip_for_refresh(new_tip)
                 refreshed = self.poll_qbit_tip_template_once(heartbeat_name="qbit_blockwait")
                 known_tip = new_tip
                 print(
@@ -7415,12 +7639,11 @@ class PrismCoordinator:
                 snapshot.bestblockhash,
                 observation_sequence=observation_sequence,
                 publish_refresh_observation=True,
+                published_snapshot=snapshot,
             ):
                 raise TemplateRefreshSuperseded(
                     "startup job preparation was superseded before publication"
                 )
-            with self.lock:
-                self.tip_template_snapshot = snapshot
             with self._job_cache_lock:
                 self._prepared_ready_snapshot = snapshot if bundle is not None else None
                 self._prepared_ready_bundle = bundle
@@ -7452,6 +7675,24 @@ class PrismCoordinator:
         bundle: CachedJobBundle,
         snapshot: QbitTipTemplateSnapshot,
     ) -> bool:
+        return bool(
+            self._tip_refresh_token_prepublication_current_locked(
+                token,
+                bundle,
+                snapshot,
+            )
+            and self._tip_refresh_snapshot_current_locked(
+                snapshot,
+                token.observation_sequence,
+            )
+        )
+
+    def _tip_refresh_token_prepublication_current_locked(
+        self,
+        token: TipRefreshValidationToken,
+        bundle: CachedJobBundle,
+        snapshot: QbitTipTemplateSnapshot,
+    ) -> bool:
         published = getattr(self, "_published_payout_state", None)
         return bool(
             token.snapshot is snapshot
@@ -7477,8 +7718,8 @@ class PrismCoordinator:
             == published.artifact.prior_balances_sha256
             and snapshot.template_artifacts is not None
             and bundle.template is snapshot.template_artifacts.template
-            and self._tip_refresh_snapshot_current_locked(
-                snapshot,
+            and not self._detected_tip_supersedes_locked(
+                snapshot.bestblockhash,
                 token.observation_sequence,
             )
         )
@@ -7495,6 +7736,10 @@ class PrismCoordinator:
             and current_tip[0] == snapshot.bestblockhash
             and int(getattr(self, "current_tip_observation_sequence", 0))
             == observation_sequence
+            and not self._detected_tip_supersedes_locked(
+                snapshot.bestblockhash,
+                observation_sequence,
+            )
         )
 
     def _validate_prepared_tip_refresh(
@@ -7503,7 +7748,7 @@ class PrismCoordinator:
         snapshot: QbitTipTemplateSnapshot,
         observation_sequence: int,
     ) -> TipRefreshValidationToken:
-        """Perform the O(1) final chain/trust guard and mint its token."""
+        """Validate prepared work before publishing submit authority."""
         artifacts = self._tip_refresh_artifacts(snapshot)
         if (
             bundle.template is not artifacts.template
@@ -7557,10 +7802,14 @@ class PrismCoordinator:
             snapshot=snapshot,
         )
         with self.lock:
-            if not self._tip_refresh_token_current_locked(token, bundle, snapshot):
+            if not self._tip_refresh_token_prepublication_current_locked(
+                token,
+                bundle,
+                snapshot,
+            ):
                 self._schedule_tip_refresh_retry()
                 raise TemplateRefreshSuperseded(
-                    "prepared refresh was superseded before fanout submission"
+                    "prepared refresh was superseded before tip publication"
                 )
         return token
 
@@ -7581,6 +7830,106 @@ class PrismCoordinator:
             if active is not None:
                 active[1].cancel()
             self._active_tip_refresh = (token, cancel_event)
+
+    def _publish_prepared_tip_refresh(
+        self,
+        token: TipRefreshValidationToken,
+        bundle: CachedJobBundle,
+        snapshot: QbitTipTemplateSnapshot,
+        *,
+        parent_hash: str | None,
+    ) -> _FanoutCancellation:
+        """Atomically publish prepared work and register its cancellation token."""
+        now = time.monotonic()
+        cancel_event = _FanoutCancellation()
+        # Admit a synchronization-only reader of this payout generation. Do
+        # not mark it delivered: the gate's priority reservation belongs to
+        # the first current-tip socket delivery, not this publication fence.
+        with self._payout_state_delivery_gate.delivery_cancelable(
+            lambda: False,
+            generation=token.payout_state_generation,
+            priority=True,
+        ) as payout_admitted:
+            if not payout_admitted:
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshSuperseded(
+                    "prepared refresh was superseded before atomic publication"
+                )
+            # Match payout publication's cache -> coordinator lock order. A
+            # payout fence can close admission after this reader entered, so
+            # recheck its blocked marker inside the same atomic section.
+            with self._job_cache_lock:
+                with self.lock:
+                    current_sequence = int(
+                        getattr(self, "current_tip_observation_sequence", 0)
+                    )
+                    if (
+                        self._payout_state_publication_blocked
+                        or current_sequence > token.observation_sequence
+                        or not self._tip_refresh_token_prepublication_current_locked(
+                            token,
+                            bundle,
+                            snapshot,
+                        )
+                    ):
+                        self._schedule_tip_refresh_retry()
+                        raise TemplateRefreshSuperseded(
+                            "prepared refresh was superseded before atomic publication"
+                        )
+
+                    first_seen = getattr(self, "current_tip_first_seen", None)
+                    tip_changed = (
+                        first_seen is not None and first_seen[0] != token.tip_hash
+                    )
+                    flip_stamp = (
+                        now
+                        if tip_changed
+                        else first_seen[1]
+                        if first_seen is not None
+                        else None
+                    )
+                    self.current_tip_first_seen = (
+                        token.tip_hash,
+                        flip_stamp,
+                    )
+                    self.current_tip_observation_sequence = token.observation_sequence
+                    self.current_tip_observed_monotonic = now
+                    if parent_hash is not None:
+                        self.current_tip_parent = (token.tip_hash, parent_hash)
+                    else:
+                        # The parent lookup is best-effort cleanup metadata. A
+                        # transient RPC failure during a same-tip republication
+                        # must not wipe the still-valid cached parent; only a
+                        # parent belonging to a different tip is stale here.
+                        prior_parent = getattr(self, "current_tip_parent", None)
+                        if prior_parent is None or prior_parent[0] != token.tip_hash:
+                            self.current_tip_parent = None
+                    self.tip_template_snapshot = snapshot
+                    self.tip_refresh_divergence_started_monotonic = None
+                    if tip_changed:
+                        # Retained collection work, the retained ready bundle,
+                        # and graveyard classification all belong to the
+                        # previously published tip.
+                        self._retained_collection_refresh = None
+                        self._prepared_ready_bundle = None
+                        self._prepared_ready_snapshot = None
+                        self.prune_evicted_job_graveyard(now=now, force=True)
+
+                    if not self._tip_refresh_token_current_locked(
+                        token,
+                        bundle,
+                        snapshot,
+                    ):
+                        # The payout admission and both coordinator locks
+                        # stabilize every field used by this predicate.
+                        raise TemplateRefreshBlocked(
+                            "prepared refresh publication did not produce a current token"
+                        )
+                    active = self._active_tip_refresh
+                    if active is not None:
+                        active[1].cancel()
+                    self._active_tip_refresh = (token, cancel_event)
+        return cancel_event
 
     def _clear_active_tip_refresh(
         self,
@@ -7816,27 +8165,32 @@ class PrismCoordinator:
         snapshot: QbitTipTemplateSnapshot,
         *,
         observation_sequence: int | None = None,
+        validation_token: TipRefreshValidationToken | None = None,
+        preactivated_cancel_event: _FanoutCancellation | None = None,
+        executor: ThreadPoolExecutor | None = None,
         expected_active_jobs: dict[ClientState, PrismJobContext | None] | None = None,
         heartbeat_name: str,
     ) -> tuple[int, float | None, float | None, int]:
-        executor = self.tip_refresh_executor()
-        cancel_event = _FanoutCancellation()
+        executor = executor or self.tip_refresh_executor()
+        cancel_event = preactivated_cancel_event or _FanoutCancellation()
         if observation_sequence is None:
             with self.lock:
                 observation_sequence = int(
                     getattr(self, "current_tip_observation_sequence", 0)
                 )
-        validation_token = self._validate_prepared_tip_refresh(
-            bundle,
-            snapshot,
-            observation_sequence,
-        )
-        self._activate_tip_refresh(
-            validation_token,
-            bundle,
-            snapshot,
-            cancel_event,
-        )
+        if validation_token is None:
+            validation_token = self._validate_prepared_tip_refresh(
+                bundle,
+                snapshot,
+                observation_sequence,
+            )
+        if preactivated_cancel_event is None:
+            self._activate_tip_refresh(
+                validation_token,
+                bundle,
+                snapshot,
+                cancel_event,
+            )
         futures: dict[Future[RefreshResult], ClientState] = {}
         submitted_at: dict[Future[RefreshResult], float] = {}
         queued_cancellations: set[Future[RefreshResult]] = set()
@@ -8116,22 +8470,46 @@ class PrismCoordinator:
             # template so CTV maintenance can yield as soon as a changed tip is
             # observed, rather than after reconciliation or bundle preparation.
             observed_best_tip = str(self.rpc.call("getbestblockhash"))
+            if not self.observe_tip_for_refresh(
+                observed_best_tip,
+                observation_sequence=observation_sequence,
+                mark_pending=False,
+            ):
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "tip/template poll was superseded before template fetch"
+                )
             with self.lock:
                 current_tip = getattr(self, "current_tip_first_seen", None)
-            if current_tip is None or current_tip[0] != observed_best_tip:
+            if current_tip is not None and current_tip[0] != observed_best_tip:
                 pending_signal_token = self._mark_tip_refresh_pending_for_poll(
                     pending_signal_token,
                     observation_sequence,
                 )
-                if not self.observe_tip_first_seen(
-                    observed_best_tip,
-                    observation_sequence=observation_sequence,
-                    publish_refresh_observation=False,
-                ):
-                    raise TemplateRefreshBlocked(
-                        "tip observation was superseded before template fetch"
-                    )
             snapshot = self.fetch_qbit_tip_template_snapshot()
+            if not self.observe_tip_for_refresh(
+                snapshot.bestblockhash,
+                observation_sequence=observation_sequence,
+                mark_pending=False,
+            ):
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshBlocked(
+                    "tip/template poll was superseded during template fetch"
+                )
+            with self.lock:
+                published_after_fetch = getattr(
+                    self,
+                    "current_tip_first_seen",
+                    None,
+                )
+            if (
+                published_after_fetch is not None
+                and published_after_fetch[0] != snapshot.bestblockhash
+            ):
+                pending_signal_token = self._mark_tip_refresh_pending_for_poll(
+                    pending_signal_token,
+                    observation_sequence,
+                )
             self.pool_readiness_latched()
             payout_generation_before_reconciliation = int(
                 getattr(self, "_payout_state_generation", 0)
@@ -8225,11 +8603,12 @@ class PrismCoordinator:
                         client: client.active_job
                         for client in clients
                     }
-                if clients:
-                    pending_signal_token = self._mark_tip_refresh_pending_for_poll(
-                        pending_signal_token,
-                        observation_sequence,
-                    )
+                # Reconciliation itself minted the payout-pending token and
+                # this pass has deliberately reselected clients from that new
+                # generation. Adopt exactly that token; completion still checks
+                # both token ownership and payout/detected-tip currentness, so
+                # a later producer cannot be cleared accidentally.
+                pending_signal_token = self._claim_tip_refresh_pending()
             with self.lock:
                 selected_clients_list = list(clients)
                 selected_client_set = set(clients)
@@ -8244,12 +8623,20 @@ class PrismCoordinator:
                         selected_client_set.add(client)
                         expected_active_jobs[client] = client.active_job
                 selected_clients = tuple(selected_clients_list)
+            # Prepared-mode selection must cover every client this pass can
+            # end up serving. Revalidation only filters selected_clients, so
+            # deriving from the narrower initial list could publish authority
+            # through the sequential path with no shared bundle while
+            # poll-start targets still need prepared ready work.
             use_prepared_fanout = bool(
-                clients
+                selected_clients
                 and getattr(self, "_pool_ready_latched", False)
             )
             ready_mode = bool(getattr(self, "_pool_ready_latched", False))
             bundle: CachedJobBundle | None = None
+            validation_token: TipRefreshValidationToken | None = None
+            preactivated_cancel_event: _FanoutCancellation | None = None
+            prepared_executor: ThreadPoolExecutor | None = None
             if use_prepared_fanout:
                 self._raise_if_tip_refresh_superseded(
                     snapshot,
@@ -8258,12 +8645,12 @@ class PrismCoordinator:
                 try:
                     bundle = self.prepare_tip_refresh_bundle(snapshot)
                 except _PayoutStatePublicationBlocked:
-                    for _client in clients:
+                    for _client in selected_clients:
                         self._record_tip_refresh_client_result("skipped")
                     self._schedule_tip_refresh_retry()
                     raise
                 except TemplateRefreshBlocked:
-                    for _client in clients:
+                    for _client in selected_clients:
                         self._record_tip_refresh_client_result("failed")
                     raise
                 if (
@@ -8280,8 +8667,12 @@ class PrismCoordinator:
                         "immediate retry scheduled"
                     )
 
+            self._raise_if_tip_refresh_superseded(
+                snapshot,
+                observation_sequence,
+            )
             # Construction is complete. Acquire the short publication lane
-            # only for final key validation, snapshot publication, and current
+            # only for final validation, snapshot publication, and current
             # client selection. Other observations and replacement builds can
             # progress while an obsolete builder is still unwinding.
             while not self._tip_refresh_lock.acquire(
@@ -8306,8 +8697,7 @@ class PrismCoordinator:
                     bundle is not None
                     and (
                         current_payout_artifact is None
-                        or
-                        bundle.build_key is None
+                        or bundle.build_key is None
                         or bundle.build_key.payout_artifact_sha256
                         != current_payout_artifact.prior_balances_sha256
                     )
@@ -8318,33 +8708,67 @@ class PrismCoordinator:
                     "complete build key changed before refresh publication"
                 )
 
-            # A ready-pool pass must validate and build its immutable shared
-            # bundle before committing the observed tip. Otherwise a cache or
-            # derivation failure can prune retained work without any replacement
-            # job ready to fan out. Sequential/collection work has no shared
-            # preparation stage, so it commits here immediately before builds.
-            if not self.observe_tip_first_seen(
-                snapshot.bestblockhash,
-                observation_sequence=observation_sequence,
-                publish_refresh_observation=True,
-            ):
-                raise TemplateRefreshSuperseded(
-                    "tip/template poll was superseded by a newer tip observation"
+            # A ready-pool pass must build and validate its immutable shared
+            # bundle before publishing submit authority. Otherwise a cache,
+            # derivation, or final chain-validation failure can invalidate
+            # retained work without a deliverable replacement. Sequential /
+            # collection work has no shared preparation stage, so it commits
+            # here immediately before its worker-specific builds.
+            if use_prepared_fanout:
+                assert bundle is not None
+                # Acquire infrastructure before publishing authority. Once the
+                # active token is installed, every subsequent fanout exit is
+                # covered by its cancellation/cleanup finally block.
+                prepared_executor = self.tip_refresh_executor()
+                # Parent metadata is cleanup-only, but fetch it before the
+                # final live/trust guard so validation remains the last RPC
+                # boundary before atomic publication.
+                try:
+                    prepared_parent_hash = self._fetch_tip_parent_hash(
+                        snapshot.bestblockhash
+                    )
+                except Exception:
+                    prepared_parent_hash = None
+                validation_token = self._validate_prepared_tip_refresh(
+                    bundle,
+                    snapshot,
+                    observation_sequence,
                 )
-            self.prune_evicted_job_graveyard(force=False)
-            dropped_client_results: list[str] = []
-            with self.lock:
-                current_tip = getattr(self, "current_tip_first_seen", None)
-                if (
-                    current_tip is None
-                    or current_tip[0] != snapshot.bestblockhash
-                    or int(getattr(self, "current_tip_observation_sequence", 0))
-                    != observation_sequence
+                preactivated_cancel_event = self._publish_prepared_tip_refresh(
+                    validation_token,
+                    bundle,
+                    snapshot,
+                    parent_hash=prepared_parent_hash,
+                )
+            else:
+                if not self.observe_tip_first_seen(
+                    snapshot.bestblockhash,
+                    observation_sequence=observation_sequence,
+                    publish_refresh_observation=True,
+                    published_snapshot=snapshot,
                 ):
                     raise TemplateRefreshSuperseded(
-                        "tip/template poll was superseded before snapshot publication"
+                        "tip/template poll was superseded by a newer tip observation"
                     )
-                self.tip_template_snapshot = snapshot
+                self.prune_evicted_job_graveyard(force=False)
+                with self.lock:
+                    current_tip = getattr(self, "current_tip_first_seen", None)
+                    if (
+                        current_tip is None
+                        or current_tip[0] != snapshot.bestblockhash
+                        or int(getattr(self, "current_tip_observation_sequence", 0))
+                        != observation_sequence
+                    ):
+                        raise TemplateRefreshSuperseded(
+                            "tip/template poll was superseded before snapshot publication"
+                        )
+                    if self.tip_template_snapshot is not snapshot:
+                        raise TemplateRefreshBlocked(
+                            "tip/template snapshot was not atomically published"
+                        )
+
+            dropped_client_results: list[str] = []
+            with self.lock:
                 # Revalidate the originally selected targets at publication.
                 # New connections keep their own pending/retained wake; this
                 # pass must not consume work that appeared after construction.
@@ -8374,11 +8798,15 @@ class PrismCoordinator:
                         self._prepared_ready_snapshot = snapshot
                         self._prepared_ready_bundle = bundle
 
-            use_prepared_fanout = bool(
-                clients
+            if (
+                not use_prepared_fanout
+                and clients
                 and getattr(self, "_pool_ready_latched", False)
-            )
-            if use_prepared_fanout and bundle is None:
+            ):
+                # Publication already committed through the sequential path,
+                # so a ready-pool target that appeared after build selection
+                # has no shared bundle to receive. Leave the pending marker
+                # armed and let the immediate retry build for it.
                 self._mark_tip_refresh_pending(observation_sequence)
                 self._schedule_tip_refresh_retry()
                 raise TemplateRefreshBlocked(
@@ -8412,6 +8840,9 @@ class PrismCoordinator:
                     bundle,
                     snapshot,
                     observation_sequence=observation_sequence,
+                    validation_token=validation_token,
+                    preactivated_cancel_event=preactivated_cancel_event,
+                    executor=prepared_executor,
                     expected_active_jobs=expected_active_jobs,
                     heartbeat_name=heartbeat_name,
                 )
@@ -8523,6 +8954,7 @@ class PrismCoordinator:
                 snapshot,
                 observation_sequence,
                 payout_generation_after_reconciliation,
+                pending_signal_token,
             ):
                 # A newer tip or payout mutation won after the last delivery
                 # guard. Preserve its pending token and retry immediately.
@@ -8559,7 +8991,7 @@ class PrismCoordinator:
             )
 
     def _probe_tip_while_refresh_waiting(self) -> None:
-        """Publish a changed live tip without entering the heavy refresh lane."""
+        """Detect a changed live tip without entering the heavy refresh lane."""
         observation_sequence = self._reserve_tip_observation_sequence()
         try:
             observed_tip = str(self.rpc.call("getbestblockhash"))
@@ -8567,14 +8999,21 @@ class PrismCoordinator:
             # The owning refresh still has to unwind or complete. Preserve its
             # pending state and let the next bounded lock wait probe again.
             return
-        with self.lock:
-            current_tip = getattr(self, "current_tip_first_seen", None)
-        if current_tip is None or current_tip[0] == observed_tip:
-            return
-        self.observe_tip_first_seen(
+        self.observe_tip_for_refresh(
             observed_tip,
             observation_sequence=observation_sequence,
-            publish_refresh_observation=False,
+        )
+
+    def _detected_tip_supersedes_locked(
+        self,
+        tip_hash: str,
+        observation_sequence: int,
+    ) -> bool:
+        latest = getattr(self, "latest_detected_tip", None)
+        return bool(
+            latest is not None
+            and latest[0] != tip_hash
+            and latest[1] > observation_sequence
         )
 
     def _raise_if_tip_refresh_superseded(
@@ -8584,15 +9023,11 @@ class PrismCoordinator:
     ) -> None:
         """Stop obsolete work before entering another expensive phase."""
         with self.lock:
-            current_tip = getattr(self, "current_tip_first_seen", None)
-            current_sequence = int(
-                getattr(self, "current_tip_observation_sequence", 0)
+            superseded = self._detected_tip_supersedes_locked(
+                snapshot.bestblockhash,
+                observation_sequence,
             )
-        if (
-            current_tip is not None
-            and current_tip[0] != snapshot.bestblockhash
-            and current_sequence > observation_sequence
-        ):
+        if superseded:
             self._schedule_tip_refresh_retry()
             raise TemplateRefreshSuperseded(
                 "tip/template poll was superseded by a newer tip observation "
@@ -8605,27 +9040,151 @@ class PrismCoordinator:
             self.tip_observation_sequence = sequence
             return sequence
 
+    def observe_tip_for_refresh(
+        self,
+        tip_hash: str,
+        *,
+        observation_sequence: int | None = None,
+        mark_pending: bool = True,
+    ) -> bool:
+        """Record tip detection without publishing share-validation authority.
+
+        A waiter outside ``_tip_refresh_lock`` must be able to cancel obsolete
+        bundle construction and fanout promptly. It must not update
+        ``current_tip_first_seen``: that value invalidates old jobs, so the
+        winning refresh publishes it only after replacement work is prepared
+        and validated.
+        """
+        if observation_sequence is None:
+            observation_sequence = self._reserve_tip_observation_sequence()
+        self._ensure_job_cache_state()
+        now = time.monotonic()
+        active_to_cancel: _FanoutCancellation | None = None
+        should_mark_pending = False
+        with self.lock:
+            latest = getattr(self, "latest_detected_tip", None)
+            if latest is not None and observation_sequence < latest[1]:
+                return latest[0] == tip_hash
+            published = getattr(self, "current_tip_first_seen", None)
+            prior_detected_hash = (
+                latest[0]
+                if latest is not None
+                else published[0]
+                if published is not None
+                else None
+            )
+            detection_changed = (
+                prior_detected_hash is not None
+                and prior_detected_hash != tip_hash
+            )
+            if (
+                detection_changed
+                and self._payout_state_source[1] != tip_hash
+            ):
+                # Supersede an in-progress immutable payout candidate as soon
+                # as the newer tip is detected, without publishing that tip as
+                # submit authority before replacement work is ready.
+                source_generation = self._payout_state_source[0] + 1
+                self._payout_state_source = (
+                    source_generation,
+                    tip_hash,
+                    "external_tip",
+                    now,
+                )
+            self.latest_detected_tip = (tip_hash, observation_sequence)
+            replacement_needed = published is None or published[0] != tip_hash
+            if published is not None and published[0] == tip_hash:
+                # A live observation has returned to (or reconfirmed) the
+                # published generation. This closes any unpublished divergence
+                # epoch without changing the published snapshot itself.
+                self.current_tip_observed_monotonic = now
+                self.tip_refresh_divergence_started_monotonic = None
+            elif (
+                published is not None
+                and getattr(
+                    self,
+                    "tip_refresh_divergence_started_monotonic",
+                    None,
+                )
+                is None
+            ):
+                # Anchor the lease to the first departure from the published
+                # tip. Further B -> C observations deliberately do not renew it.
+                self.tip_refresh_divergence_started_monotonic = now
+            pending_already = bool(
+                getattr(self, "_tip_refresh_pending_event", None)
+                and self._tip_refresh_pending_event.is_set()
+            )
+            active = getattr(self, "_active_tip_refresh", None)
+            if (
+                active is not None
+                and active[0].tip_hash != tip_hash
+                and active[0].observation_sequence < observation_sequence
+            ):
+                active_to_cancel = active[1]
+            should_mark_pending = bool(
+                mark_pending
+                and (
+                    detection_changed
+                    or (replacement_needed and not pending_already)
+                )
+            )
+
+        if active_to_cancel is not None:
+            active_to_cancel.cancel()
+        if detection_changed:
+            # In-flight constructions for older parents can no longer win;
+            # stop them at detection so replacement preparation starts
+            # immediately, well before publication moves submit authority.
+            self._cancel_obsolete_job_bundle_builds(current_tip=tip_hash)
+            self._cancel_obsolete_job_builds("chain tip superseded")
+        if should_mark_pending:
+            self._mark_tip_refresh_pending(observation_sequence)
+            self._schedule_tip_refresh_retry()
+        return True
+
     def observe_tip_first_seen(
         self,
         tip_hash: str,
         *,
         observation_sequence: int | None = None,
         publish_refresh_observation: bool = False,
+        published_snapshot: QbitTipTemplateSnapshot | None = None,
     ) -> bool:
+        """Publish a tip (and, when supplied, its coherent template snapshot).
+
+        Detection and publication are deliberately separate. Callers doing a
+        prepared refresh must finish bundle construction and final validation
+        before invoking this method.
+        """
+        if (
+            published_snapshot is not None
+            and published_snapshot.bestblockhash != tip_hash
+        ):
+            raise ValueError("published snapshot does not match tip hash")
         if observation_sequence is None:
             observation_sequence = self._reserve_tip_observation_sequence()
+        if not self.observe_tip_for_refresh(
+            tip_hash,
+            observation_sequence=observation_sequence,
+            mark_pending=False,
+        ):
+            return False
         now = time.monotonic()
-        active_to_cancel: _FanoutCancellation | None = None
-        tip_changed = False
         with self.lock:
             current_sequence = int(
                 getattr(self, "current_tip_observation_sequence", 0)
             )
-            if observation_sequence < current_sequence:
+            if (
+                observation_sequence < current_sequence
+                or self._detected_tip_supersedes_locked(
+                    tip_hash,
+                    observation_sequence,
+                )
+            ):
                 return False
             first_seen = getattr(self, "current_tip_first_seen", None)
             if first_seen is not None and first_seen[0] == tip_hash:
-                same_tip = True
                 # A same-tip re-observation proves the tip view is live; the
                 # freshness stamp bounds submit_stale_check_tip reuse.
                 self.current_tip_observed_monotonic = now
@@ -8639,93 +9198,75 @@ class PrismCoordinator:
                     active is None or active[0].tip_hash != tip_hash
                 ):
                     self.current_tip_observation_sequence = observation_sequence
-            else:
-                same_tip = False
-                tip_changed = first_seen is not None
-                active = getattr(self, "_active_tip_refresh", None)
-                if (
-                    active is not None
-                    and active[0].tip_hash != tip_hash
-                    and active[0].observation_sequence < observation_sequence
-                ):
-                    active_to_cancel = active[1]
-                # The first tip this process observes is a startup baseline,
-                # not a tip flip: a None stamp keeps stale grace closed.
-                self.current_tip_first_seen = (
-                    tip_hash,
-                    now if first_seen is not None else None,
-                )
-                # A retained collection snapshot is useful only for its exact
-                # tip. The new observation will install a replacement after
-                # reconciliation and publication if identity is still absent.
-                self._retained_collection_refresh = None
-                self.current_tip_observation_sequence = observation_sequence
-                self.current_tip_observed_monotonic = now
-                self.current_tip_parent = None
+                if published_snapshot is not None:
+                    self.tip_template_snapshot = published_snapshot
+                self.tip_refresh_divergence_started_monotonic = None
+                return True
 
-        if active_to_cancel is not None:
-            active_to_cancel.cancel()
-            self._mark_tip_refresh_pending(observation_sequence)
-            self._schedule_tip_refresh_retry()
-        if same_tip:
-            return True
-        if tip_changed:
-            self._cancel_obsolete_job_bundle_builds(current_tip=tip_hash)
-            self._cancel_obsolete_job_builds("chain tip superseded")
-            # Supersede payout preparation immediately. The preparer will
-            # discard its old immutable candidate before publication; this
-            # marker does not wait for its ledger/RPC work to finish.
-            self._ensure_job_cache_state()
-            with self.lock:
-                current = getattr(self, "current_tip_first_seen", None)
-                current_sequence = int(
-                    getattr(self, "current_tip_observation_sequence", 0)
-                )
-                if (
-                    current is not None
-                    and current[0] == tip_hash
-                    and current_sequence == observation_sequence
-                    and self._payout_state_source[1] != tip_hash
-                ):
-                    source_generation = self._payout_state_source[0] + 1
-                    self._payout_state_source = (
-                        source_generation,
-                        tip_hash,
-                        "external_tip",
-                        now,
-                    )
-            self._ensure_job_cache_state()
-            with self._job_cache_lock:
-                self._prepared_ready_bundle = None
-                self._prepared_ready_snapshot = None
-            self._mark_tip_refresh_pending(observation_sequence)
-            self._schedule_tip_refresh_retry()
-
-        # Parent lookup is best-effort cleanup metadata, so never hold the
-        # coordinator lock across RPC or fail tip observation when it is
-        # temporarily unavailable. Submit classification independently fetches
-        # and requires the parent before granting stale grace.
+        # Fetch optional cleanup metadata before the atomic publication. A slow
+        # parent RPC must not create a window where submits see the new tip but
+        # the winning refresh has not yet published its coherent snapshot.
         try:
             parent_hash = self._fetch_tip_parent_hash(tip_hash)
         except Exception:
             parent_hash = None
 
         with self.lock:
-            current = getattr(self, "current_tip_first_seen", None)
+            current_sequence = int(
+                getattr(self, "current_tip_observation_sequence", 0)
+            )
             if (
-                current is None
-                or current[0] != tip_hash
-                or int(getattr(self, "current_tip_observation_sequence", 0))
-                != observation_sequence
+                observation_sequence < current_sequence
+                or self._detected_tip_supersedes_locked(
+                    tip_hash,
+                    observation_sequence,
+                )
             ):
                 return False
-            if parent_hash is not None:
+            first_seen = getattr(self, "current_tip_first_seen", None)
+            if first_seen is not None and first_seen[0] == tip_hash:
+                self.current_tip_observed_monotonic = now
+                active = getattr(self, "_active_tip_refresh", None)
+                if publish_refresh_observation and (
+                    active is None or active[0].tip_hash != tip_hash
+                ):
+                    self.current_tip_observation_sequence = observation_sequence
+                if published_snapshot is not None:
+                    self.tip_template_snapshot = published_snapshot
+                self.tip_refresh_divergence_started_monotonic = None
+                return True
+
+            tip_changed = first_seen is not None
+            # The first tip this process publishes is a startup baseline, not
+            # a tip flip: a None stamp keeps stale grace closed.
+            self.current_tip_first_seen = (
+                tip_hash,
+                now if tip_changed else None,
+            )
+            self.current_tip_observation_sequence = observation_sequence
+            self.current_tip_observed_monotonic = now
+            if published_snapshot is not None:
+                self.tip_template_snapshot = published_snapshot
+            self.tip_refresh_divergence_started_monotonic = None
+            # Retained collection work is reusable throughout detection and
+            # preparation, but never after authority moves to a different tip.
+            self._retained_collection_refresh = None
+            if parent_hash is None:
+                self.current_tip_parent = None
+            else:
                 self.current_tip_parent = (tip_hash, parent_hash)
             # Reclassify formerly same-tip entries immediately. On mainnet the
             # zero stale-grace TTL removes them in this pass; on other chains
             # the actual chain parent removes multi-tip-behind entries while
             # the independently configured grace lifetime protects one-back.
             self.prune_evicted_job_graveyard(now=now, force=True)
+        if tip_changed:
+            # A retained ready bundle belongs to the previously published tip
+            # and can never satisfy the consumer's published-snapshot identity
+            # check again; release it as soon as authority moves.
+            with self._job_cache_lock:
+                self._prepared_ready_bundle = None
+                self._prepared_ready_snapshot = None
         return True
 
     def _fetch_tip_parent_hash(self, tip_hash: str) -> str | None:
@@ -8766,22 +9307,23 @@ class PrismCoordinator:
     def submit_stale_check_tip(self) -> str:
         """Best-known chain tip for per-share submit classification.
 
-        Prefers the tip the blockpoll/blockwait observers already confirmed
-        (refreshed at least every PRISM_BLOCKPOLL_SECONDS while healthy) so
-        mining.submit never blocks on a getbestblockhash RPC per share. This
-        also removes the submit-races-ahead-of-the-poller failure mode: a
+        Prefers the tip for which the refresh path already published coherent
+        work (reconfirmed at least every PRISM_BLOCKPOLL_SECONDS while healthy)
+        so mining.submit never blocks on a getbestblockhash RPC per share. This
+        also removes the submit-races-ahead-of-the-refresh failure mode: a
         submit-path RPC can observe a new tip seconds before jobs refresh, and
         with PRISM_STRATUM_STALE_GRACE_SECONDS=0 (mainnet-forced) that
         rejected every in-flight share on the old tip. Classifying against the
-        observed tip keeps shares valid exactly until the coordinator itself
-        sees the flip and refreshes work, and it is the same tip source the
+        published tip keeps shares valid until the coordinator has prepared,
+        validated, and published the flip, and it is the same tip source the
         stale-grace window and evicted-job classification are anchored to.
 
-        Fail-safe bound: the observed tip is only trusted while its freshness
-        stamp is younger than PRISM_SUBMIT_TIP_MAX_AGE_SECONDS. If tip
-        observation stalls (poller failing after a tip change, reconciliation
-        refusing a new tip), submits fall back to the live RPC read instead of
-        accepting shares against a frozen snapshot indefinitely.
+        During a detected-but-unpublished replacement, the published tip stays
+        authoritative beyond the ordinary freshness age so a large healthy
+        build cannot recreate the reject outage. That extension is bounded by
+        PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS and is anchored to the
+        first unpublished divergence; failed refreshes therefore still fall
+        back to the live RPC instead of accepting frozen work indefinitely.
         """
         max_age = float(
             getattr(
@@ -8792,19 +9334,60 @@ class PrismCoordinator:
         )
         if max_age > 0:
             with self.lock:
-                observed = getattr(self, "current_tip_first_seen", None)
-                observed_at = getattr(self, "current_tip_observed_monotonic", None)
                 # Keep the freshness decision and selected hash in the same
                 # critical section as tip observation. Otherwise a poller can
                 # publish a newer tip after these fields are copied but before
                 # this method returns the superseded hash.
-                if (
-                    observed is not None
-                    and observed_at is not None
-                    and time.monotonic() - observed_at <= max_age
-                ):
+                observed = getattr(self, "current_tip_first_seen", None)
+                if self._published_tip_authoritative_locked(time.monotonic()):
+                    assert observed is not None
                     return observed[0]
         return str(self.rpc.call("getbestblockhash"))
+
+    def _published_tip_authoritative_locked(self, now: float) -> bool:
+        """True while the published tip still owns share classification.
+
+        Either the ordinary freshness window (reconfirmed within
+        PRISM_SUBMIT_TIP_MAX_AGE_SECONDS) or the bounded detected-but-
+        unpublished replacement lease is open. Job issuance uses the same
+        predicate so work handed to miners is never classified against a
+        different tip than the one it was issued for.
+        """
+        max_age = float(
+            getattr(
+                self,
+                "submit_tip_max_age_seconds",
+                DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS,
+            )
+        )
+        if max_age <= 0:
+            return False
+        observed = getattr(self, "current_tip_first_seen", None)
+        if observed is None:
+            return False
+        observed_at = getattr(self, "current_tip_observed_monotonic", None)
+        if observed_at is not None and now - observed_at <= max_age:
+            return True
+        latest_detected = getattr(self, "latest_detected_tip", None)
+        divergence_started = getattr(
+            self,
+            "tip_refresh_divergence_started_monotonic",
+            None,
+        )
+        divergence_budget = float(
+            getattr(
+                self,
+                "template_refresh_failure_exit_seconds",
+                DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
+            )
+        )
+        return bool(
+            latest_detected is not None
+            and latest_detected[0] != observed[0]
+            and divergence_started is not None
+            and divergence_budget > 0
+            and now - divergence_started <= divergence_budget
+        )
 
     def stale_grace_deadline_open(
         self,
@@ -8819,10 +9402,10 @@ class PrismCoordinator:
         with self.lock:
             first_seen = getattr(self, "current_tip_first_seen", None)
             delivered = client.tip_work_delivered
-        # Only blockpoll/blockwait anchor current_tip_first_seen. If the refresh
-        # path has not observed this tip yet, the window is not open: self-healing
-        # from a lagging submit's tip read would extend grace arbitrarily past the
-        # real tip change. Fall through to a plain stale-job reject instead.
+        # Only successful refresh publication anchors current_tip_first_seen.
+        # If this tip is merely detected, the window is not open: self-healing
+        # from a lagging submit's RPC read would extend grace arbitrarily past
+        # the real publication boundary. Fall through to stale-job instead.
         if first_seen is None or first_seen[0] != current_tip:
             return False
         # A None stamp is the startup baseline (see observe_tip_first_seen): the
@@ -8925,13 +9508,13 @@ class PrismCoordinator:
             self.same_tip_job_retention_per_connection = (
                 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION
             )
-        current_tip = self._current_observed_tip_hash_locked()
+        current_tip = self._current_published_tip_hash_locked()
         if self.evicted_job_index_tip_hash != current_tip:
             rebuild_indexes = True
         if rebuild_indexes:
             self._rebuild_evicted_job_indexes_locked()
 
-    def _current_observed_tip_hash_locked(self) -> str | None:
+    def _current_published_tip_hash_locked(self) -> str | None:
         first_seen = getattr(self, "current_tip_first_seen", None)
         if first_seen is not None:
             return str(first_seen[0])
@@ -8941,7 +9524,7 @@ class PrismCoordinator:
         return None
 
     def _evicted_job_class_locked(self, entry: EvictedJobEntry) -> str:
-        current_tip = self._current_observed_tip_hash_locked()
+        current_tip = self._current_published_tip_hash_locked()
         if current_tip is None or entry.previousblockhash == current_tip:
             return "same_tip"
         return "stale_grace"
@@ -8982,7 +9565,7 @@ class PrismCoordinator:
         self.evicted_same_tip_job_ids = OrderedDict()
         for job_id, entry in self.evicted_job_graveyard.items():
             self._index_evicted_job_locked(job_id, entry)
-        self.evicted_job_index_tip_hash = self._current_observed_tip_hash_locked()
+        self.evicted_job_index_tip_hash = self._current_published_tip_hash_locked()
         self._enforce_evicted_same_tip_capacity_locked()
 
     def _enforce_evicted_same_tip_capacity_locked(
@@ -9010,7 +9593,7 @@ class PrismCoordinator:
         now: float,
         ttl: float,
     ) -> bool:
-        current_tip = self._current_observed_tip_hash_locked()
+        current_tip = self._current_published_tip_hash_locked()
         first_seen = getattr(self, "current_tip_first_seen", None)
         if (
             ttl <= 0
@@ -10364,13 +10947,57 @@ class PrismCoordinator:
                     current_payout_generation,
                 )
             )
+        context_template = getattr(context, "template", None)
+        context_parent = (
+            str(context_template.get("previousblockhash", ""))
+            if isinstance(context_template, dict)
+            else ""
+        )
+        with self.lock:
+            published_authority = getattr(self, "current_tip_first_seen", None)
+            published_authoritative = self._published_tip_authoritative_locked(
+                time.monotonic()
+            )
+            pinned_published_delivery = bool(
+                context_parent
+                and published_authority is not None
+                and context_parent == published_authority[0]
+                and published_authoritative
+            )
+        lapsed_live_validated = False
+        if (
+            not guarded_refresh
+            and context_parent
+            and published_authority is not None
+            and not published_authoritative
+        ):
+            # The published authority lapsed, so per-share classification has
+            # fallen back to the live RPC read. Mirror the initial-job path:
+            # revalidate against the live tip (outside every lock), record
+            # the observation for the refresh machinery, and drop work that
+            # would be stale on arrival.
+            try:
+                lapsed_live_tip = str(self.rpc.call("getbestblockhash"))
+            except Exception:
+                lapsed_live_tip = None
+            if lapsed_live_tip is not None:
+                self.observe_tip_for_refresh(lapsed_live_tip)
+                if context_parent != lapsed_live_tip:
+                    self._schedule_tip_refresh_retry()
+                    return False
+                lapsed_live_validated = True
         priority_delivery = (
             not publication_blocked
             and context_payout_generation == current_payout_generation
             and (
                 published_tip is None
-                or str(context.template.get("previousblockhash", ""))
-                == published_tip
+                or context_parent == published_tip
+                # Reconciliation can source payout state at the detected tip
+                # before submit authority flips. Pinned published-tip work is
+                # still the currently creditable work, so it must keep the
+                # priority lane instead of tripping the gate's non-priority
+                # same-generation rejection for the whole unpublished window.
+                or pinned_published_delivery
             )
         )
         payout_gate_started = time.monotonic()
@@ -10416,6 +11043,32 @@ class PrismCoordinator:
                         raise TemplateRefreshBlocked(
                             "client job build did not use the guarded refresh artifacts"
                         )
+                else:
+                    published_now = getattr(self, "current_tip_first_seen", None)
+                    if published_now is None:
+                        # Bootstrap: nothing published yet, so there is no
+                        # authority for this work to contradict.
+                        pass
+                    elif self._published_tip_authoritative_locked(
+                        time.monotonic()
+                    ):
+                        if context_parent and context_parent != published_now[0]:
+                            # Authority moved while this direct build waited
+                            # on the payout gate or client lock. Sending now
+                            # would advertise work that classifies stale-job
+                            # on arrival; skip and let the refresh fanout (or
+                            # the pending retry) deliver current work.
+                            self._schedule_tip_refresh_retry()
+                            return False
+                    elif context_parent and not lapsed_live_validated:
+                        # The lease lapsed during the wait and this context
+                        # never passed a live-tip revalidation: cached
+                        # observations may be blind to the tip mining.submit
+                        # now classifies against. Defer to a fresh pass whose
+                        # pre-wait live check settles it without holding the
+                        # coordinator lock across an RPC.
+                        self._schedule_tip_refresh_retry()
+                        return False
                 client.active_job = context
                 if clean_jobs:
                     for job_id in client.active_job_ids:
@@ -10710,7 +11363,7 @@ class PrismCoordinator:
         self._ensure_job_cache_state()
         artifacts = (
             self._retained_collection_artifacts()
-            or self.current_template_artifacts()
+            or self.job_issuance_template_artifacts()
         )
         return self.build_job_for_client_from_artifacts(
             client,
@@ -13082,7 +13735,7 @@ class PrismCoordinator:
         with self.lock:
             self._ensure_initial_job_state()
             active = len(self.clients)
-            current_tip = self._current_observed_tip_hash_locked()
+            current_tip = self._current_published_tip_hash_locked()
             published_snapshot = getattr(self, "tip_template_snapshot", None)
             subscribed = sum(1 for client in self.clients if client.subscribed)
             authorized_clients = [

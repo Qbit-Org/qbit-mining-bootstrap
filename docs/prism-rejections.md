@@ -28,6 +28,21 @@ The coordinator exposes these IDs in:
   classified.
 - Prometheus as `qbit_prism_rejections_total{reason_id="<id>"}`.
 
+For ready-pool refreshes, share validation follows the last qbit tip for which
+the refresh path has a coherent, final-validated replacement bundle ready to
+fan out.
+`waitfornewblock` is a refresh trigger, not a publication event, and submit
+handling does not race ahead by reading a merely detected tip while replacement
+work is still being built. This is especially important when stale grace is
+zero: miners keep receiving normal credit for the work the coordinator is still
+advertising until the prepared tip, snapshot, and cancellation token are
+published atomically. Direct issuance paths (initial delivery retries, Vardiff
+retargets, reauthorization) stay pinned to the published snapshot during that
+window for the same reason: work issued for a merely detected tip would have
+every share rejected until publication. Block candidates independently recheck
+qbit's live tip before `submitblock`, so an old-tip share accepted during
+preparation is never sent as a stale block.
+
 Stale-grace credited shares are accepted shares, not rejections. When
 `PRISM_STRATUM_STALE_GRACE_SECONDS` is non-zero, a same-connection share whose
 job parent is the parent of the current tip may be credited during that short
@@ -61,19 +76,22 @@ The existing broad counters remain for compatibility:
 ## Stale Classification Tip Source
 
 The per-share `stale-job` check in `mining.submit` compares the job's parent
-hash against the tip the blockpoll/blockwait observers already confirmed, not
+hash against the tip for which the refresh path published coherent work, not
 against a per-share `getbestblockhash` RPC. This removes the
-submit-races-ahead-of-the-poller failure mode: a submit-path RPC could observe
+submit-races-ahead-of-the-refresh failure mode: a submit-path RPC could observe
 a new tip seconds before jobs refreshed, and with
 `PRISM_STRATUM_STALE_GRACE_SECONDS=0` (mainnet-forced) that rejected every
 in-flight share on the old tip. The observed tip is also the anchor the
 stale-grace window and evicted-job classification already use, so all three
 now agree.
 
-Fail-safe bound: the observed tip is trusted only while it is younger than
-`PRISM_SUBMIT_TIP_MAX_AGE_SECONDS` (default 10). If tip observation stalls
-(poller failing after a tip change), submits fall back to the live RPC read
-instead of accepting shares against a frozen snapshot.
+Fail-safe bound: normally the published tip is trusted only while it is younger
+than `PRISM_SUBMIT_TIP_MAX_AGE_SECONDS` (default 10). A detected but unpublished
+replacement extends that authority through healthy bundle construction, bounded
+by `PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` and measured from the first
+divergence (later detected tips do not renew it). If refresh or reconciliation
+stalls beyond that budget, submits fall back to the live RPC read instead of
+accepting shares against a frozen snapshot.
 
 Rejections are counted, never logged per share or written to the ledger.
 Diagnose reject spikes from `qbit_prism_rejections_total`, the

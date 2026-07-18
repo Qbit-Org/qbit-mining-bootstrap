@@ -490,6 +490,54 @@ class SubmitTipCheckTests(unittest.TestCase):
         self.assertEqual(rpc.count("getbestblockhash"), 1)
         self.assertEqual(len(server.ledger.appended), 0)
 
+    def test_submit_keeps_published_tip_during_bounded_replacement_build(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.submit_tip_max_age_seconds = 10.0
+        server.template_refresh_failure_exit_seconds = 120.0
+        state = client(1)
+        context = register_job(server, state)
+        params = submit_params(state, context)
+        # The ordinary 10-second observation freshness has expired, but a new
+        # tip is only detected: replacement work has not been published yet.
+        observe_tip(server, OLD_TIP, age_seconds=11.0)
+        rpc.tip = NEW_TIP
+        self.assertTrue(server.observe_tip_for_refresh(NEW_TIP))
+        rpc.calls.clear()
+
+        server.handle_submit(state, params)
+
+        self.assertEqual(rpc.count("getbestblockhash"), 0)
+        self.assertEqual(len(server.ledger.appended), 1)
+        self.assertEqual(server.current_tip_first_seen[0], OLD_TIP)
+        self.assertEqual(server.latest_detected_tip[0], NEW_TIP)
+
+    def test_unpublished_divergence_lease_does_not_renew_and_expires(self) -> None:
+        server, rpc = coordinator()
+        server.submit_tip_max_age_seconds = 10.0
+        server.template_refresh_failure_exit_seconds = 120.0
+        observe_tip(server, OLD_TIP, age_seconds=11.0)
+        rpc.tip = NEW_TIP
+        self.assertTrue(server.observe_tip_for_refresh(NEW_TIP))
+        divergence_started = server.tip_refresh_divergence_started_monotonic
+        self.assertIsNotNone(divergence_started)
+
+        newest_tip = "44" * 32
+        rpc.tip = newest_tip
+        self.assertTrue(server.observe_tip_for_refresh(newest_tip))
+        self.assertEqual(
+            server.tip_refresh_divergence_started_monotonic,
+            divergence_started,
+        )
+        with server.lock:
+            server.tip_refresh_divergence_started_monotonic = (
+                time.monotonic() - 121.0
+            )
+        rpc.calls.clear()
+
+        self.assertEqual(server.submit_stale_check_tip(), newest_tip)
+        self.assertEqual(rpc.count("getbestblockhash"), 1)
+
     def test_submit_tip_max_age_zero_restores_per_share_rpc(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)

@@ -2847,7 +2847,7 @@ class JobBundleCacheTests(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(admitted_send_started.wait(5))
-            server.observe_tip_first_seen("33" * 32)
+            server.observe_tip_for_refresh("33" * 32)
             lock_acquired = queued.job_update_lock.acquire(timeout=0.1)
             self.assertTrue(lock_acquired)
             if lock_acquired:

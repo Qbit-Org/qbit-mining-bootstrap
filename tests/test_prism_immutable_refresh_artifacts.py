@@ -269,7 +269,7 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
             self.assertTrue(first_build_entered.wait(5))
             rpc.tip = tip_b
             rpc.template = template_b
-            self.assertTrue(server.observe_tip_first_seen(tip_b))
+            self.assertTrue(server.observe_tip_for_refresh(tip_b))
             # Model blockwait's already-observed winning refresh request. It
             # queues directly behind the old refresh lock and therefore needs
             # neither a sleep nor another periodic poll to run.

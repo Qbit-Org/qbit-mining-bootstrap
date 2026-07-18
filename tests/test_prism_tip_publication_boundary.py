@@ -1,0 +1,966 @@
+#!/usr/bin/env python3
+"""Regressions for detected-tip versus published-tip refresh authority."""
+
+from __future__ import annotations
+
+import dataclasses
+import time
+import types
+import unittest
+
+from lab.prism.prism_coordinator import (
+    TemplateRefreshBlocked,
+    _JobBuildCancellation,
+)
+from tests.test_prism_coordinator_job_cache import (
+    base_template,
+    client,
+    coordinator,
+    install_fake_bundle_builder,
+)
+
+
+class TipPublicationBoundaryTests(unittest.TestCase):
+    def test_final_validation_failure_keeps_previous_authority_and_snapshot(self) -> None:
+        server, rpc = coordinator()
+        builds = install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            published_snapshot = server.tip_template_snapshot
+            initial_builds = int(builds["calls"])
+
+            next_tip = "33" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            validation_reached = False
+
+            def fail_final_validation(*_args: object, **_kwargs: object) -> object:
+                nonlocal validation_reached
+                validation_reached = True
+                raise TemplateRefreshBlocked("forced final validation failure")
+
+            server._validate_prepared_tip_refresh = fail_final_validation  # type: ignore[method-assign]
+
+            with self.assertRaisesRegex(
+                TemplateRefreshBlocked,
+                "forced final validation failure",
+            ):
+                server.poll_qbit_tip_template_once()
+
+            self.assertTrue(validation_reached)
+            self.assertGreater(int(builds["calls"]), initial_builds)
+            self.assertEqual(server.current_tip_first_seen, published_tip)
+            self.assertIs(server.tip_template_snapshot, published_snapshot)
+            self.assertEqual(server.latest_detected_tip[0], next_tip)
+            self.assertIsNone(server._active_tip_refresh)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_newer_detection_before_atomic_activation_prevents_publication(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        sent_tips: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                sent_tips.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            published_snapshot = server.tip_template_snapshot
+            self.assertEqual(sent_tips, [rpc.tip])
+
+            candidate_tip = "44" * 32
+            rpc.tip = candidate_tip
+            rpc.template = base_template(height=11, prevhash=candidate_tip)
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    candidate_tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            bundle = server.prepare_tip_refresh_bundle(snapshot)
+            token = server._validate_prepared_tip_refresh(
+                bundle,
+                snapshot,
+                sequence,
+            )
+
+            winning_tip = "55" * 32
+            rpc.tip = winning_tip
+            rpc.template = base_template(height=12, prevhash=winning_tip)
+            self.assertTrue(server.observe_tip_for_refresh(winning_tip))
+
+            with self.assertRaisesRegex(
+                TemplateRefreshBlocked,
+                "superseded before atomic publication",
+            ):
+                server._publish_prepared_tip_refresh(
+                    token,
+                    bundle,
+                    snapshot,
+                    parent_hash=None,
+                )
+
+            self.assertEqual(server.current_tip_first_seen, published_tip)
+            self.assertIs(server.tip_template_snapshot, published_snapshot)
+            self.assertEqual(server.latest_detected_tip[0], winning_tip)
+            self.assertEqual(len(sent_tips), 1)
+            self.assertIsNone(server._active_tip_refresh)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_executor_failure_happens_before_prepared_publication(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            published_snapshot = server.tip_template_snapshot
+
+            next_tip = "66" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+
+            def fail_executor() -> object:
+                raise RuntimeError("executor unavailable")
+
+            server.tip_refresh_executor = fail_executor  # type: ignore[method-assign]
+            with self.assertRaisesRegex(RuntimeError, "executor unavailable"):
+                server.poll_qbit_tip_template_once()
+
+            self.assertEqual(server.current_tip_first_seen, published_tip)
+            self.assertIs(server.tip_template_snapshot, published_snapshot)
+            self.assertEqual(server.latest_detected_tip[0], next_tip)
+            self.assertIsNone(server._active_tip_refresh)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_payout_mutation_before_publication_keeps_previous_authority(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            published_snapshot = server.tip_template_snapshot
+
+            candidate_tip = "77" * 32
+            rpc.tip = candidate_tip
+            rpc.template = base_template(height=11, prevhash=candidate_tip)
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    candidate_tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            bundle = server.prepare_tip_refresh_bundle(snapshot)
+            token = server._validate_prepared_tip_refresh(
+                bundle,
+                snapshot,
+                sequence,
+            )
+            self.assertEqual(server._advance_payout_state_generation(), 1)
+
+            with self.assertRaisesRegex(
+                TemplateRefreshBlocked,
+                "superseded before atomic publication",
+            ):
+                server._publish_prepared_tip_refresh(
+                    token,
+                    bundle,
+                    snapshot,
+                    parent_hash=None,
+                )
+
+            self.assertEqual(server.current_tip_first_seen, published_tip)
+            self.assertIs(server.tip_template_snapshot, published_snapshot)
+            self.assertIsNone(server._active_tip_refresh)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_payout_publication_block_keeps_previous_authority(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            published_snapshot = server.tip_template_snapshot
+
+            candidate_tip = "88" * 32
+            rpc.tip = candidate_tip
+            rpc.template = base_template(height=11, prevhash=candidate_tip)
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    candidate_tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            bundle = server.prepare_tip_refresh_bundle(snapshot)
+            token = server._validate_prepared_tip_refresh(
+                bundle,
+                snapshot,
+                sequence,
+            )
+
+            server._block_payout_state_publication()
+            self.assertTrue(server._payout_state_publication_blocked)
+            with self.assertRaisesRegex(
+                TemplateRefreshBlocked,
+                "superseded before atomic publication",
+            ):
+                server._publish_prepared_tip_refresh(
+                    token,
+                    bundle,
+                    snapshot,
+                    parent_hash=None,
+                )
+
+            self.assertEqual(server.current_tip_first_seen, published_tip)
+            self.assertIs(server.tip_template_snapshot, published_snapshot)
+            self.assertIsNone(server._active_tip_refresh)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_tip_publication_preserves_first_payout_delivery_priority(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            server._reserve_payout_state_source("payout_only")
+            self.assertEqual(
+                server._publish_payout_state_candidate(
+                    server._current_payout_state_candidate()
+                ),
+                1,
+            )
+            self.assertEqual(
+                server._payout_state_delivery_gate._priority_generation,
+                1,
+            )
+
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    rpc.tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            bundle = server.prepare_tip_refresh_bundle(snapshot)
+            token = server._validate_prepared_tip_refresh(
+                bundle,
+                snapshot,
+                sequence,
+            )
+            cancellation = server._publish_prepared_tip_refresh(
+                token,
+                bundle,
+                snapshot,
+                parent_hash=None,
+            )
+            try:
+                self.assertEqual(
+                    server._payout_state_delivery_gate._priority_generation,
+                    1,
+                )
+                with server._payout_state_delivery_gate.delivery_cancelable(
+                    lambda: False,
+                    generation=1,
+                    priority=False,
+                ) as routine_admission:
+                    self.assertFalse(routine_admission)
+            finally:
+                server._clear_active_tip_refresh(token, cancellation)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_same_tip_republication_preserves_parent_on_lookup_failure(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+            cached_parent = (published_tip[0], "aa" * 32)
+            with server.lock:
+                server.current_tip_parent = cached_parent
+
+            sequence = server._reserve_tip_observation_sequence()
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            bundle = server.prepare_tip_refresh_bundle(snapshot)
+            token = server._validate_prepared_tip_refresh(bundle, snapshot, sequence)
+            cancellation = server._publish_prepared_tip_refresh(
+                token,
+                bundle,
+                snapshot,
+                parent_hash=None,
+            )
+            try:
+                # A transient parent lookup failure during a same-tip
+                # republication must not wipe the still-valid cached parent.
+                self.assertEqual(server.current_tip_parent, cached_parent)
+                self.assertEqual(server.current_tip_first_seen[0], published_tip[0])
+            finally:
+                server._clear_active_tip_refresh(token, cancellation)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_direct_issuance_pins_published_snapshot_during_unpublished_window(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            # Detect a replacement tip and let its template fetch install the
+            # new global artifacts, exactly like an in-flight refresh does
+            # before publication.
+            next_tip = "77" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    next_tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            server.fetch_qbit_tip_template_snapshot()
+            with server._job_cache_lock:
+                self.assertEqual(
+                    server._template_artifacts.previousblockhash,
+                    next_tip,
+                )
+
+            # Direct issuance stays pinned to the published snapshot while the
+            # published tip still owns share classification, so the issued job
+            # is immediately creditable.
+            artifacts = server.job_issuance_template_artifacts()
+            self.assertEqual(artifacts.previousblockhash, published_tip[0])
+            context = server.build_job_for_client(state, clean_jobs=False)
+            self.assertEqual(
+                str(context.template["previousblockhash"]),
+                published_tip[0],
+            )
+
+            # Delivery-side currency accepts the pinned published snapshot
+            # even though the detected-tip globals have moved on, so initial
+            # delivery does not defer for the construction window.
+            self.assertFalse(server._template_artifacts_are_current(artifacts))
+            self.assertTrue(server._issuance_artifacts_current(artifacts))
+
+            # A pruned bundle cache (payout mutation, LRU pressure) must not
+            # strand pinned issuance either: published-parent work stays
+            # buildable and cacheable while its authority holds.
+            with server._job_cache_lock:
+                server._job_bundle_cache.clear()
+            rebuilt = server.build_job_for_client(state, clean_jobs=False)
+            self.assertEqual(
+                str(rebuilt.template["previousblockhash"]),
+                published_tip[0],
+            )
+
+            # Once the published authority lapses, issuance falls through to
+            # the live template, mirroring the submit-path RPC fallback.
+            server.current_tip_observed_monotonic = (
+                time.monotonic()
+                - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
+                - 1.0
+            )
+            server.template_refresh_failure_exit_seconds = 0.0
+            lapsed = server.job_issuance_template_artifacts()
+            self.assertEqual(lapsed.previousblockhash, next_tip)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_refresh_retry_reuses_cached_detected_tip_bundle(self) -> None:
+        server, rpc = coordinator()
+        builds = install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+
+            next_tip = "88" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    next_tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            first_bundle = server.prepare_tip_refresh_bundle(snapshot)
+            builds_after_first = int(builds["calls"])
+
+            # A transient final-validation or publication failure retries the
+            # same snapshot. The detected-tip bundle already in the cache must
+            # be reused while the previous tip is still published, not rebuilt
+            # from scratch for the rest of the divergence lease.
+            retry_bundle = server.prepare_tip_refresh_bundle(snapshot)
+            self.assertIs(retry_bundle, first_bundle)
+            self.assertEqual(int(builds["calls"]), builds_after_first)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_pinned_published_rebuild_recaches_for_repeat_issuance(self) -> None:
+        server, rpc = coordinator()
+        builds = install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            next_tip = "99" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+            server.fetch_qbit_tip_template_snapshot()
+
+            # Simulate cache pressure dropping the retained published bundle,
+            # then issue twice: the first pinned rebuild re-enters the cache
+            # so the second issuance is a hit instead of another heavy build.
+            with server._job_cache_lock:
+                server._job_bundle_cache.clear()
+            first = server.build_job_for_client(state, clean_jobs=False)
+            builds_after_first = int(builds["calls"])
+            second = server.build_job_for_client(state, clean_jobs=False)
+            self.assertEqual(int(builds["calls"]), builds_after_first)
+            self.assertEqual(
+                str(first.template["previousblockhash"]),
+                published_tip[0],
+            )
+            self.assertEqual(
+                str(second.template["previousblockhash"]),
+                published_tip[0],
+            )
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_direct_send_skips_pinned_work_published_over_mid_flight(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            next_tip = "aa" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+            server.fetch_qbit_tip_template_snapshot()
+
+            # A Vardiff-style direct build selects pinned published work, then
+            # the prepared refresh publishes the replacement before the direct
+            # path reaches its install/send section.
+            original_build = server.build_job_for_client
+
+            def build_then_publish_replacement(
+                target: object,
+                *,
+                clean_jobs: bool,
+            ) -> object:
+                context = original_build(target, clean_jobs=clean_jobs)  # type: ignore[arg-type]
+                sequence = server._reserve_tip_observation_sequence()
+                snapshot = server.fetch_qbit_tip_template_snapshot()
+                bundle = server.prepare_tip_refresh_bundle(snapshot)
+                token = server._validate_prepared_tip_refresh(
+                    bundle,
+                    snapshot,
+                    sequence,
+                )
+                cancellation = server._publish_prepared_tip_refresh(
+                    token,
+                    bundle,
+                    snapshot,
+                    parent_hash=None,
+                )
+                server._clear_active_tip_refresh(token, cancellation)
+                return context
+
+            server.build_job_for_client = build_then_publish_replacement  # type: ignore[method-assign]
+            sent_before = len(notifies)
+
+            # The stale-on-arrival context must be skipped, not sent.
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before)
+            self.assertEqual(server.current_tip_first_seen[0], next_tip)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_direct_send_skips_pinned_work_after_lease_lapse(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+
+            next_tip = "dd" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+            server.fetch_qbit_tip_template_snapshot()
+
+            # The pinned published-tip build starts while authority holds,
+            # then the divergence lease lapses during the payout-gate wait.
+            original_build = server.build_job_for_client
+
+            def build_then_lapse(
+                target: object,
+                *,
+                clean_jobs: bool,
+            ) -> object:
+                context = original_build(target, clean_jobs=clean_jobs)  # type: ignore[arg-type]
+                server.current_tip_observed_monotonic = (
+                    time.monotonic()
+                    - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
+                    - 1.0
+                )
+                server.template_refresh_failure_exit_seconds = 0.0
+                return context
+
+            server.build_job_for_client = build_then_lapse  # type: ignore[method-assign]
+            sent_before = len(notifies)
+
+            # Submit classification has fallen back to the live view; the
+            # pinned published-parent job would be stale on arrival.
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_lapsed_direct_send_revalidates_against_live_tip(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            # The chain moves while the coordinator is blind (no blockpoll,
+            # no blockwait, template cache still fresh on the published tip),
+            # and the published authority lapses entirely.
+            next_tip = "ff" * 32
+            rpc.tip = next_tip
+            server.current_tip_observed_monotonic = (
+                time.monotonic()
+                - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
+                - 1.0
+            )
+            server.template_refresh_failure_exit_seconds = 0.0
+
+            state.active_job = None
+            state.active_job_ids = set()
+            sent_before = len(notifies)
+            # Submit classification is on the live RPC read now; advertising
+            # cached published-tip work would reject every share. The direct
+            # path revalidates against the live tip and records the detection.
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before)
+            self.assertEqual(server.latest_detected_tip[0], next_tip)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_mid_wait_lease_lapse_defers_unvalidated_direct_send(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+
+            # The chain moves while the coordinator is blind, and the lease
+            # lapses only while the send waits inside the payout gate — after
+            # the pre-wait authority check already passed.
+            next_tip = "ab" * 32
+            rpc.tip = next_tip
+            original_observe_admission = server._observe_payout_gate_admission
+
+            def lapse_during_gate(*args: object, **kwargs: object) -> None:
+                server.current_tip_observed_monotonic = (
+                    time.monotonic()
+                    - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
+                    - 1.0
+                )
+                server.template_refresh_failure_exit_seconds = 0.0
+                original_observe_admission(*args, **kwargs)
+
+            server._observe_payout_gate_admission = lapse_during_gate  # type: ignore[method-assign]
+
+            state.active_job = None
+            state.active_job_ids = set()
+            sent_before = len(notifies)
+            # The context never passed a live-tip revalidation, so the
+            # install boundary defers instead of trusting the blind cached
+            # observation; the fresh pass settles it against the live tip.
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_fingerprint_cancel_keeps_pinned_published_build(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_snapshot = server.tip_template_snapshot
+            assert published_snapshot is not None
+            pinned_artifacts = published_snapshot.template_artifacts
+            assert pinned_artifacts is not None
+
+            next_tip = "ee" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+
+            pinned_cancellation = _JobBuildCancellation(timeout_seconds=30.0)
+            pinned_flight = types.SimpleNamespace(
+                request=types.SimpleNamespace(
+                    artifacts=pinned_artifacts,
+                    cancellation=pinned_cancellation,
+                    superseded_monotonic=None,
+                )
+            )
+            with server._job_build_scheduler_lock:
+                server._job_build_active = pinned_flight  # type: ignore[assignment]
+            try:
+                # The detected-tip store prunes fingerprints and sweeps stale
+                # builds, but an in-flight build for exactly the published
+                # snapshot is still valid, creditable work and must survive.
+                server.fetch_qbit_tip_template_snapshot()
+                self.assertFalse(pinned_cancellation.is_set())
+            finally:
+                with server._job_build_scheduler_lock:
+                    server._job_build_active = None
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_issuance_fetch_racing_ahead_of_detection_repins_published(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            # qbit advances, but neither blockpoll nor blockwait has observed
+            # it yet; a template-cache miss makes direct issuance the first
+            # reader to see the new parent.
+            next_tip = "cc" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            with server._job_cache_lock:
+                server._template_artifacts = None
+
+            artifacts = server.job_issuance_template_artifacts()
+            # The fetch is recorded as a detection and issuance stays on the
+            # still-authoritative published snapshot instead of starving on
+            # work the buildability gates would reject.
+            self.assertEqual(artifacts.previousblockhash, published_tip[0])
+            self.assertEqual(server.latest_detected_tip[0], next_tip)
+            context = server.build_job_for_client(state, clean_jobs=False)
+            self.assertEqual(
+                str(context.template["previousblockhash"]),
+                published_tip[0],
+            )
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_pinned_delivery_keeps_priority_when_payout_sources_detected_tip(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            next_tip = "bb" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+            server.fetch_qbit_tip_template_snapshot()
+            # Reconciliation may source payout metadata at the detected tip
+            # before submit authority flips; pinned published-tip delivery
+            # must keep the priority lane through the payout gate. Arm the
+            # gate's first-delivery reservation exactly as a fresh payout
+            # publication does, so a non-priority same-generation delivery
+            # would be rejected rather than admitted.
+            with server._job_cache_lock:
+                server._published_payout_state = dataclasses.replace(
+                    server._published_payout_state,
+                    source_tip_hash=next_tip,
+                )
+            gate = server._payout_state_delivery_gate
+            with gate._condition:
+                gate._priority_generation = int(server._payout_state_generation)
+
+            state.active_job = None
+            state.active_job_ids = set()
+            sent_before = len(notifies)
+            self.assertTrue(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before + 1)
+            self.assertEqual(notifies[-1], published_tip[0])
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_poll_start_only_targets_still_get_prepared_publication(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        sent_notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                sent_notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            # A same-tip pass whose initial selection sees no work, while the
+            # poll-start merge finds a target that does need a refresh, must
+            # still take the prepared path: authority may not republish
+            # through the sequential branch with no deliverable bundle.
+            original_needs = server.client_needs_tip_template_refresh
+            calls = {"count": 0}
+
+            def needs_after_initial_selection(
+                target: object,
+                snapshot: object,
+            ) -> bool:
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    return False
+                return original_needs(target, snapshot)  # type: ignore[arg-type]
+
+            server.client_needs_tip_template_refresh = (  # type: ignore[method-assign]
+                needs_after_initial_selection
+            )
+            state.active_job = None
+            state.active_job_ids = set()
+
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            self.assertGreaterEqual(calls["count"], 2)
+            self.assertEqual(sent_notifies[-1], published_tip[0])
+            self.assertEqual(server.current_tip_first_seen[0], published_tip[0])
+            self.assertIsNone(server._active_tip_refresh)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_tip_flip_publication_clears_mismatched_parent_on_lookup_failure(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+            with server.lock:
+                server.current_tip_parent = (published_tip[0], "aa" * 32)
+
+            next_tip = "66" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    next_tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            bundle = server.prepare_tip_refresh_bundle(snapshot)
+            token = server._validate_prepared_tip_refresh(bundle, snapshot, sequence)
+            cancellation = server._publish_prepared_tip_refresh(
+                token,
+                bundle,
+                snapshot,
+                parent_hash=None,
+            )
+            try:
+                # The old tip's parent must never survive a flip; submit
+                # classification would otherwise trust stale lineage.
+                self.assertIsNone(server.current_tip_parent)
+                self.assertEqual(server.current_tip_first_seen[0], next_tip)
+            finally:
+                server._clear_active_tip_refresh(token, cancellation)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+
+if __name__ == "__main__":
+    unittest.main()
