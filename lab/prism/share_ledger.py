@@ -6027,6 +6027,51 @@ SELECT COALESCE(
             and result.get("lease_expires_at") is not None
         )
 
+    def renew_writer_lease(self) -> dict[str, int | str]:
+        """Refresh this writer's lease without touching any ledger rows.
+
+        The lease is normally refreshed as a side effect of every fenced
+        write. A daemon pass that produced no writes calls this instead, so an
+        otherwise-idle writer's lease does not sit expired. Raises when the
+        exact ``(writer_id, writer_epoch, writer_session_token)`` no longer
+        holds the lease, matching the fenced-write failure mode so a fenced-out
+        writer still fails fast.
+        """
+        payload = {
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    RETURNING qbit_ledger_writer_lease.writer_id
+)
+SELECT CASE
+    WHEN (SELECT count(*) FROM lease) = 0 THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object(
+            'backend', 'postgres-psql',
+            'renewed_count', (SELECT count(*) FROM lease)
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return {"backend": str(result["backend"]), "renewed_count": int(result["renewed_count"])}
+
     def release_writer_lease(self) -> bool:
         """Expire this writer's lease so a same-identity replacement can take
         over immediately instead of waiting out the lease TTL.
