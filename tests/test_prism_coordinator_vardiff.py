@@ -50,6 +50,7 @@ from lab.prism.prism_coordinator import (
     StratumError,
     StratumListenerProfile,
     JobBuildCancelled,
+    JobBuildSuperseded,
     TemplateRefreshBlocked,
     TemplateRefreshSuperseded,
     PrismCoordinator,
@@ -1305,6 +1306,88 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.vardiff_window_started_monotonic, window_started)
         self.assertEqual(server.vardiff_idle_skip_counts["superseded"], 4)
         with server._job_build_scheduler_lock:
+            server._job_build_active = None
+        server.shutdown_vardiff_idle_executor()
+
+    def test_idle_shared_build_does_not_retry_scheduler_divergence_race(
+        self,
+    ) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state, tip=old_tip)
+        install_idle_job_cache(server, tip=old_tip)
+        with server._job_cache_lock:
+            old_artifacts = server._template_artifacts
+            server._job_bundle_cache.clear()
+        assert old_artifacts is not None
+        now = time.monotonic()
+        server.current_tip_first_seen = (old_tip, now)
+        server.current_tip_observed_monotonic = now
+        server.latest_detected_tip = (old_tip, 1)
+        server.tip_template_snapshot = QbitTipTemplateSnapshot(
+            bestblockhash=old_tip,
+            previousblockhash=old_tip,
+            template_fingerprint=old_artifacts.fingerprint,
+            template_generation=old_artifacts.generation,
+            template_artifacts=old_artifacts,
+        )
+        server._ensure_job_cache_state()
+        replacement_cancellation = _JobBuildCancellation(timeout_seconds=60.0)
+        replacement_flight = SimpleNamespace(
+            request=SimpleNamespace(
+                artifacts=SimpleNamespace(previousblockhash=new_tip),
+                cancellation=replacement_cancellation,
+            )
+        )
+        with server._job_build_scheduler_lock:
+            server._job_build_active = replacement_flight
+        request_builds = 0
+        admission_attempts = 0
+        idle_cancellation: _JobBuildCancellation | None = None
+        original_request_job_build = server._request_job_build
+
+        def make_idle_request(
+            _artifacts: CachedTemplateArtifacts,
+            _worker: WorkerIdentity | None,
+            **kwargs: object,
+        ) -> object:
+            nonlocal request_builds, idle_cancellation
+            request_builds += 1
+            self.assertTrue(kwargs["idle_retarget"])
+            idle_cancellation = _JobBuildCancellation(timeout_seconds=60.0)
+            return SimpleNamespace(
+                idle_retarget=True,
+                cancellation=idle_cancellation,
+                promise=Future(),
+            )
+
+        def detect_before_admission(request: object) -> Future[CachedJobBundle]:
+            nonlocal admission_attempts
+            admission_attempts += 1
+            with server.lock:
+                server.latest_detected_tip = (new_tip, 2)
+                server.tip_refresh_divergence_started_monotonic = time.monotonic()
+            return original_request_job_build(request)  # type: ignore[arg-type]
+
+        server._new_job_build_request = make_idle_request  # type: ignore[method-assign]
+        server._request_job_build = detect_before_admission  # type: ignore[method-assign]
+        server._schedule_tip_refresh_retry = lambda: None  # type: ignore[method-assign]
+        assert state.worker is not None
+
+        with self.assertRaises(JobBuildSuperseded):
+            server._build_idle_job_bundle(SimpleNamespace(worker=state.worker))  # type: ignore[arg-type]
+
+        self.assertEqual(request_builds, 1)
+        self.assertEqual(admission_attempts, 1)
+        self.assertIs(server._template_artifacts, old_artifacts)
+        self.assertIsNotNone(idle_cancellation)
+        assert idle_cancellation is not None
+        self.assertTrue(idle_cancellation.is_set())
+        self.assertFalse(replacement_cancellation.is_set())
+        with server._job_build_scheduler_lock:
+            self.assertIs(server._job_build_active, replacement_flight)
             server._job_build_active = None
         server.shutdown_vardiff_idle_executor()
 

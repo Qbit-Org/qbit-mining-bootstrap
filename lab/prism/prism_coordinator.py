@@ -13891,6 +13891,7 @@ class PrismCoordinator:
         return self.shared_job_bundle(
             artifacts,
             request.worker,
+            retry_superseded=False,
             idle_retarget=True,
         )
 
