@@ -1829,6 +1829,18 @@ class TemplateRefreshBlocked(RuntimeError):
     """A live template was fetched, but safe work could not be issued."""
 
 
+class TemplateRefreshSuperseded(TemplateRefreshBlocked):
+    """Concurrent tip/payout progress invalidated this refresh attempt.
+
+    Raised only for coordination races that a scheduled retry resolves on its
+    own: the tip advanced mid-refresh, the payout-state generation moved, or a
+    newer observation superseded the prepared work. Unlike its parent, this
+    subclass never arms the template-refresh failure budget -- a genuine
+    RPC/build/trust failure must raise plain TemplateRefreshBlocked so
+    sustained unhealthiness still takes the budgeted restart path.
+    """
+
+
 class _PayoutStatePublicationBlocked(TemplateRefreshBlocked):
     """Job construction is waiting for a prepared payout publication."""
 
@@ -1845,8 +1857,13 @@ class _JobBuildFailed(RuntimeError):
     """Internal signal used to distinguish a skipped build from a no-op."""
 
 
-class _BundlePreparationSuperseded(TemplateRefreshBlocked):
-    """The exact work identity lost to a newer tip/template observation."""
+class _BundlePreparationSuperseded(TemplateRefreshSuperseded):
+    """The exact work identity lost to a newer tip/template observation.
+
+    Subclasses TemplateRefreshSuperseded: losing the shared-bundle build race
+    to a newer tip/template observation is coordination churn, so it escapes
+    the poll without arming the template-refresh failure budget.
+    """
 
 
 def parse_worker_username(username: str) -> tuple[str, str | None]:
@@ -3397,7 +3414,7 @@ class PrismCoordinator:
             )
         generation = self._publish_current_payout_state_with_retry_budget()
         if generation is None:
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "payout-only invalidation was superseded; immediate retry scheduled"
             )
         return generation
@@ -6429,7 +6446,7 @@ class PrismCoordinator:
             ) from exc
         if current_tip != snapshot.bestblockhash:
             self._schedule_tip_refresh_retry()
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "qbit tip changed before prepared fanout "
                 f"expected={snapshot.bestblockhash} current={current_tip}"
             )
@@ -6459,7 +6476,7 @@ class PrismCoordinator:
         with self.lock:
             if not self._tip_refresh_token_current_locked(token, bundle, snapshot):
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "prepared refresh was superseded before fanout submission"
                 )
         return token
@@ -6474,7 +6491,7 @@ class PrismCoordinator:
         with self.lock:
             if not self._tip_refresh_token_current_locked(token, bundle, snapshot):
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "prepared refresh was superseded before cancellation registration"
                 )
             active = self._active_tip_refresh
@@ -6941,7 +6958,7 @@ class PrismCoordinator:
                 )
             if not token_current:
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "prepared refresh was superseded during fanout; immediate retry scheduled"
                 )
             try:
@@ -6955,7 +6972,7 @@ class PrismCoordinator:
             if post_fanout_tip != snapshot.bestblockhash:
                 cancel_event.set()
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "qbit tip changed during prepared fanout; immediate retry scheduled "
                     f"expected={snapshot.bestblockhash} current={post_fanout_tip}"
                 )
@@ -6987,7 +7004,7 @@ class PrismCoordinator:
             if not token_current:
                 cancel_event.set()
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "prepared refresh payout state changed during post-fanout "
                     "validation; immediate retry scheduled"
                 )
@@ -7150,7 +7167,7 @@ class PrismCoordinator:
                     # newer bundle for only that old subset; retry so selection
                     # and the signed payout snapshot advance together.
                     self._schedule_tip_refresh_retry()
-                    raise TemplateRefreshBlocked(
+                    raise TemplateRefreshSuperseded(
                         "payout state changed after refresh client selection; "
                         "immediate retry scheduled"
                     )
@@ -7165,7 +7182,7 @@ class PrismCoordinator:
                 observation_sequence=observation_sequence,
                 publish_refresh_observation=True,
             ):
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "tip/template poll was superseded by a newer tip observation"
                 )
             self.prune_evicted_job_graveyard(force=False)
@@ -7177,7 +7194,7 @@ class PrismCoordinator:
                     or int(getattr(self, "current_tip_observation_sequence", 0))
                     != observation_sequence
                 ):
-                    raise TemplateRefreshBlocked(
+                    raise TemplateRefreshSuperseded(
                         "tip/template poll was superseded before snapshot publication"
                     )
                 self.tip_template_snapshot = snapshot
@@ -7292,7 +7309,7 @@ class PrismCoordinator:
                         ) from exc
                     if post_fanout_tip != snapshot.bestblockhash:
                         self._schedule_tip_refresh_retry()
-                        raise TemplateRefreshBlocked(
+                        raise TemplateRefreshSuperseded(
                             "qbit tip changed during sequential refresh; "
                             "immediate retry scheduled "
                             f"expected={snapshot.bestblockhash} current={post_fanout_tip}"
@@ -7301,7 +7318,7 @@ class PrismCoordinator:
                         payout_generation_after_reconciliation
                     ):
                         self._schedule_tip_refresh_retry()
-                        raise TemplateRefreshBlocked(
+                        raise TemplateRefreshSuperseded(
                             "payout state changed during sequential refresh; "
                             "immediate retry scheduled"
                         )
@@ -7331,22 +7348,24 @@ class PrismCoordinator:
                 # guard. Preserve its pending token and retry immediately.
                 pending_signal_token = None
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "tip or payout state changed before refresh completion; "
                     "immediate retry scheduled"
                 )
             self.last_successful_template_refresh_monotonic = time.monotonic()
             self.template_refresh_failure_started_monotonic = None
             return refreshed
-        except (TemplateRefreshBlocked, _PayoutStatePublicationBlocked):
+        except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked):
             # Coordination-blocked refreshes -- a superseded tip, a pending
             # payout publication fence, a refresh raced by payout mutation --
             # are churn between healthy components, not qbitd unhealthiness.
             # They must not arm the restart budget: sustained payout churn
             # would otherwise self-terminate a process whose RPC is fine, and
             # each restart re-triggers the same churn. Re-raise so callers
-            # still schedule their immediate retry; only real failures below
-            # start the exit clock.
+            # still schedule their immediate retry. Plain TemplateRefreshBlocked
+            # stays budgeted below: it also wraps genuine failures (job builds
+            # failing, malformed template artifacts, untrusted chain views)
+            # whose persistence must still take the budgeted restart path.
             raise
         except Exception:
             self._record_template_refresh_failure(time.monotonic())
@@ -7394,7 +7413,7 @@ class PrismCoordinator:
             and current_sequence > observation_sequence
         ):
             self._schedule_tip_refresh_retry()
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "tip/template poll was superseded by a newer tip observation "
                 "before refresh preparation"
             )
@@ -8024,7 +8043,7 @@ class PrismCoordinator:
         bestblockhash = str(self.rpc.call("getbestblockhash"))
         if bestblockhash != previousblockhash:
             self._schedule_tip_refresh_retry()
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "qbit tip changed while fetching block template "
                 f"template_parent={previousblockhash} current={bestblockhash}"
             )
@@ -8057,7 +8076,7 @@ class PrismCoordinator:
             return True
         current_tip = str(self.rpc.call("getbestblockhash"))
         if expected_tip_hash is not None and current_tip != expected_tip_hash:
-            raise TemplateRefreshBlocked(
+            raise TemplateRefreshSuperseded(
                 "qbit tip changed while prepared work was queued "
                 f"expected={expected_tip_hash} current={current_tip}"
             )

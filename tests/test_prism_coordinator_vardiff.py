@@ -44,6 +44,7 @@ from lab.prism.prism_coordinator import (
     StratumError,
     StratumListenerProfile,
     TemplateRefreshBlocked,
+    TemplateRefreshSuperseded,
     PrismCoordinator,
     WorkerIdentity,
     _FanoutCancellation,
@@ -3384,7 +3385,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
     def test_coordination_blocked_refresh_does_not_start_failure_budget(self) -> None:
         for blocked_error in (
-            TemplateRefreshBlocked("qbit tip changed during sequential refresh"),
+            TemplateRefreshSuperseded("qbit tip changed during sequential refresh"),
             _PayoutStatePublicationBlocked("payout state invalidation is pending publication"),
         ):
             with self.subTest(blocked=type(blocked_error).__name__):
@@ -3405,6 +3406,30 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 )
                 self.assertFalse(server.template_refresh_failure_expired(10_000.0))
 
+    def test_non_coordination_blocked_refresh_still_starts_failure_budget(self) -> None:
+        # Plain TemplateRefreshBlocked also wraps genuine failures (malformed
+        # template artifacts, job builds failing, untrusted chain views); only
+        # the TemplateRefreshSuperseded/payout-fence subclasses are exempt.
+        server = coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.rpc = TipRpc("11" * 32)
+
+        def raise_blocked() -> QbitTipTemplateSnapshot:
+            raise TemplateRefreshBlocked(
+                "unable to derive exact artifacts for observed qbit template"
+            )
+
+        server.fetch_qbit_tip_template_snapshot = raise_blocked  # type: ignore[method-assign]
+        with (
+            patch("lab.prism.prism_coordinator.time.monotonic", return_value=100.0),
+            self.assertRaises(TemplateRefreshBlocked),
+        ):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(server.template_refresh_failure_started_monotonic, 100.0)
+        self.assertTrue(server.template_refresh_failure_expired(110.0))
+
     def test_sustained_blocked_refresh_storm_never_exhausts_failure_budget(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
@@ -3420,6 +3445,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             clock["now"] += 6.0
             if blocked_polls >= 4:
                 server.stop_event.set()
+            if blocked_polls % 2:
+                raise TemplateRefreshSuperseded(
+                    "qbit tip changed during sequential refresh; immediate retry scheduled"
+                )
             raise _PayoutStatePublicationBlocked(
                 "payout state invalidation is pending publication"
             )
@@ -3455,6 +3484,39 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 raise ConnectionError("qbitd unreachable")
 
         server.rpc = OutageRpc()
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+            self.assertRaises(SystemExit),
+        ):
+            server.blockpoll_loop()
+
+        exit_process.assert_called_once_with(1)
+        self.assertIsNotNone(server.template_refresh_failure_started_monotonic)
+
+    def test_persistent_blocked_template_derivation_arms_and_exhausts_failure_budget(self) -> None:
+        # Top-of-poll RPCs stay healthy, but every refresh fails with plain
+        # TemplateRefreshBlocked (e.g. malformed template artifacts, all job
+        # builds failing). A fresh process must still arm the budget from its
+        # first such failure and take the budgeted restart path.
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.rpc = TipRpc("11" * 32)
+        clock = {"now": 100.0}
+
+        def blocked_fetch() -> QbitTipTemplateSnapshot:
+            clock["now"] += 6.0
+            raise TemplateRefreshBlocked(
+                "unable to derive exact artifacts for observed qbit template"
+            )
+
+        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
         with (
             patch(
                 "lab.prism.prism_coordinator.time.monotonic",
