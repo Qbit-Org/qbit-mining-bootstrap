@@ -10964,7 +10964,13 @@ class PrismCoordinator:
                 and context_parent == published_authority[0]
                 and published_authoritative
             )
-        if not guarded_refresh and context_parent and not published_authoritative:
+        lapsed_live_validated = False
+        if (
+            not guarded_refresh
+            and context_parent
+            and published_authority is not None
+            and not published_authoritative
+        ):
             # The published authority lapsed, so per-share classification has
             # fallen back to the live RPC read. Mirror the initial-job path:
             # revalidate against the live tip (outside every lock), record
@@ -10979,6 +10985,7 @@ class PrismCoordinator:
                 if context_parent != lapsed_live_tip:
                     self._schedule_tip_refresh_retry()
                     return False
+                lapsed_live_validated = True
         priority_delivery = (
             not publication_blocked
             and context_payout_generation == current_payout_generation
@@ -11037,29 +11044,29 @@ class PrismCoordinator:
                             "client job build did not use the guarded refresh artifacts"
                         )
                 else:
-                    if self._published_tip_authoritative_locked(time.monotonic()):
-                        published_now = getattr(
-                            self, "current_tip_first_seen", None
-                        )
-                        classify_reference = (
-                            published_now[0] if published_now is not None else None
-                        )
-                    else:
-                        # The lease lapsed while this build waited: submit
-                        # classification has fallen back to the live view, so
-                        # judge against the newest observation instead of the
-                        # stale published tip.
-                        classify_reference = self._newest_observed_tip_locked()
-                    if (
-                        context_parent
-                        and classify_reference is not None
-                        and context_parent != classify_reference
+                    published_now = getattr(self, "current_tip_first_seen", None)
+                    if published_now is None:
+                        # Bootstrap: nothing published yet, so there is no
+                        # authority for this work to contradict.
+                        pass
+                    elif self._published_tip_authoritative_locked(
+                        time.monotonic()
                     ):
-                        # Authority moved while this direct build waited on
-                        # the payout gate or client lock. Sending now would
-                        # advertise work that classifies stale-job on arrival;
-                        # skip and let the refresh fanout (or the pending
-                        # retry) deliver current work.
+                        if context_parent and context_parent != published_now[0]:
+                            # Authority moved while this direct build waited
+                            # on the payout gate or client lock. Sending now
+                            # would advertise work that classifies stale-job
+                            # on arrival; skip and let the refresh fanout (or
+                            # the pending retry) deliver current work.
+                            self._schedule_tip_refresh_retry()
+                            return False
+                    elif context_parent and not lapsed_live_validated:
+                        # The lease lapsed during the wait and this context
+                        # never passed a live-tip revalidation: cached
+                        # observations may be blind to the tip mining.submit
+                        # now classifies against. Defer to a fresh pass whose
+                        # pre-wait live check settles it without holding the
+                        # coordinator lock across an RPC.
                         self._schedule_tip_refresh_retry()
                         return False
                 client.active_job = context

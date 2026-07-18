@@ -680,6 +680,58 @@ class TipPublicationBoundaryTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
+    def test_mid_wait_lease_lapse_defers_unvalidated_direct_send(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+
+            # The chain moves while the coordinator is blind, and the lease
+            # lapses only while the send waits inside the payout gate — after
+            # the pre-wait authority check already passed.
+            next_tip = "ab" * 32
+            rpc.tip = next_tip
+            original_observe_admission = server._observe_payout_gate_admission
+
+            def lapse_during_gate(*args: object, **kwargs: object) -> None:
+                server.current_tip_observed_monotonic = (
+                    time.monotonic()
+                    - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
+                    - 1.0
+                )
+                server.template_refresh_failure_exit_seconds = 0.0
+                original_observe_admission(*args, **kwargs)
+
+            server._observe_payout_gate_admission = lapse_during_gate  # type: ignore[method-assign]
+
+            state.active_job = None
+            state.active_job_ids = set()
+            sent_before = len(notifies)
+            # The context never passed a live-tip revalidation, so the
+            # install boundary defers instead of trusting the blind cached
+            # observation; the fresh pass settles it against the live tip.
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
     def test_fingerprint_cancel_keeps_pinned_published_build(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
