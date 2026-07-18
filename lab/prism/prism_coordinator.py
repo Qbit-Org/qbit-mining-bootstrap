@@ -3185,19 +3185,39 @@ class PrismCoordinator:
         self._ensure_job_cache_state()
         with self._job_cache_lock:
             artifact = self._payout_ledger_artifact
+            published_artifact = self._published_payout_state.artifact
         if (
             artifact is None
             or artifact.payout_state_generation != payout_state_generation
             or artifact.network_difficulty != int(network_difficulty)
         ):
             return None
+        if published_artifact is None:
+            try:
+                published_artifact = self._current_payout_state_artifact()
+            except Exception:
+                return None
         try:
             accepted_share_count, _ = self.accepted_share_stats()
         except Exception:
             return None
         if accepted_share_count != artifact.accepted_share_count:
             return None
-        return artifact
+        balances_sha256 = canonical_json_sha256(artifact.prior_balances)
+        with self._job_cache_lock:
+            if (
+                self._payout_ledger_artifact is not artifact
+                or self._payout_state_generation != payout_state_generation
+                or self._published_payout_state.artifact is not published_artifact
+            ):
+                return None
+            if balances_sha256 != published_artifact.prior_balances_sha256:
+                # A candidate can carry a ledger snapshot prepared before its
+                # payout state is published. Never keep retrying that stale
+                # shortcut; the synchronous path will take a fresh snapshot.
+                self._payout_ledger_artifact = None
+                return None
+            return artifact
 
     def shutdown_payout_artifact_executor(self) -> None:
         self._ensure_job_cache_state()
@@ -3470,6 +3490,14 @@ class PrismCoordinator:
             ):
                 return pending.promise
             if active is None:
+                if pending is not None:
+                    pending.cancellation.cancel("superseded while pending")
+                    if not pending.promise.done():
+                        pending.promise.set_exception(
+                            JobBuildSuperseded("pending job build was superseded")
+                        )
+                    self._job_build_pending = None
+                    self.job_build_scheduler_counts["supersessions"] += 1
                 flight = self._start_job_build_locked(request)
                 self._job_build_active = flight
                 self._arm_job_build_locked(flight)
@@ -4484,36 +4512,36 @@ class PrismCoordinator:
         artifacts: CachedTemplateArtifacts,
     ) -> bool:
         """Cache only current state; report whether payout state stayed valid."""
-        with self.lock:
-            observed_tip = getattr(self, "current_tip_first_seen", None)
-            with self._job_cache_lock:
-                published_artifact = self._published_payout_state.artifact
-                if (
-                    observed_tip is not None
-                    and observed_tip[0] != artifacts.previousblockhash
-                ):
-                    return False
-                if (
-                    built.payout_state_generation != self._payout_state_generation
-                    or built.build_key is None
-                    or published_artifact is None
-                    or built.build_key.payout_artifact_sha256
-                    != published_artifact.prior_balances_sha256
-                ):
-                    return False
-                current = self._template_artifacts
-                if (
-                    current is None
-                    or current.fingerprint != artifacts.fingerprint
-                    or current.generation != artifacts.generation
-                ):
-                    return False
-                self._job_bundle_cache[built.key] = built
-                self._job_bundle_cache.move_to_end(built.key)
-                while len(self._job_bundle_cache) > MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES:
-                    oldest_key = next(iter(self._job_bundle_cache))
-                    self._job_bundle_cache.pop(oldest_key, None)
-                return True
+        with self._job_cache_lock:
+            with self.lock:
+                observed_tip = getattr(self, "current_tip_first_seen", None)
+            published_artifact = self._published_payout_state.artifact
+            if (
+                observed_tip is not None
+                and observed_tip[0] != artifacts.previousblockhash
+            ):
+                return False
+            if (
+                built.payout_state_generation != self._payout_state_generation
+                or built.build_key is None
+                or published_artifact is None
+                or built.build_key.payout_artifact_sha256
+                != published_artifact.prior_balances_sha256
+            ):
+                return False
+            current = self._template_artifacts
+            if (
+                current is None
+                or current.fingerprint != artifacts.fingerprint
+                or current.generation != artifacts.generation
+            ):
+                return False
+            self._job_bundle_cache[built.key] = built
+            self._job_bundle_cache.move_to_end(built.key)
+            while len(self._job_bundle_cache) > MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES:
+                oldest_key = next(iter(self._job_bundle_cache))
+                self._job_bundle_cache.pop(oldest_key, None)
+            return True
 
     def shared_job_bundle(
         self,
