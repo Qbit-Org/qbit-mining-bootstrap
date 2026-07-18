@@ -5539,22 +5539,22 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(server._payout_state_publication_blocked)
         self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
 
-    def test_idempotent_direct_block_confirmation_publishes_reserved_source(self) -> None:
+    def test_idempotent_direct_block_replay_skips_publication(self) -> None:
         server, state, ledger = submit_coordinator()
         server._ensure_job_cache_state()
+        server.max_blocks = 2
+        server.stop_after_block = False
         block_hash = "d0" * 32
-        ledger.confirm_accepted_block = (  # type: ignore[method-assign]
-            lambda **_kwargs: {"backend": "fake", "confirmed_count": 0}
-        )
         with tempfile.TemporaryDirectory() as tempdir:
             server.audit_dir = Path(tempdir)
             server.evidence_path = Path(tempdir) / "evidence.json"
             server.ledger_writer_public_key_hex = "aa" * 32
-            server.rpc = SubmitRpc(
+            rpc = SubmitRpc(
                 tip="00" * 32,
                 block_hash=block_hash,
                 ledger=ledger,
             )
+            server.rpc = rpc
             server.build_audit_bundle = (  # type: ignore[method-assign]
                 lambda **_kwargs: verified_block_bundle()
             )
@@ -5567,13 +5567,62 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 block_hex="00",
             )
 
-            accepted = server.submit_block_candidate(
-                block_candidate(server, state, submission)
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+            self.assertEqual(server._payout_state_generation, 1)
+            self.assertEqual(
+                server._published_payout_state.source_tip_hash,
+                block_hash,
+            )
+            self.assertEqual(server._payout_state_source[0], 1)
+
+            # Replay the durable candidate after its block landed and its
+            # confirmation committed: the candidate is the active tip and the
+            # ledger confirms nothing new. The published payout state already
+            # covers it, so the replay must not reserve a source, bump the
+            # generation, wipe the job-bundle cache, or schedule refresh
+            # churn (the post-block livelock).
+            rpc.tip = block_hash
+            ledger.confirm_accepted_block = (  # type: ignore[method-assign]
+                lambda **_kwargs: {"backend": "fake", "confirmed_count": 0}
+            )
+            retry_calls = 0
+
+            def count_retry() -> None:
+                nonlocal retry_calls
+                retry_calls += 1
+
+            server._schedule_tip_refresh_retry = count_retry  # type: ignore[method-assign]
+            cache_key = ("sentinel",)
+            server._job_bundle_cache[cache_key] = object()
+            discarded_before = server.payout_state_candidates_discarded
+            pending_marks_before = server._tip_refresh_pending_counter
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
             )
 
-        self.assertTrue(accepted)
         self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._published_payout_state.source_generation, 1)
         self.assertEqual(server._published_payout_state.source_tip_hash, block_hash)
+        self.assertEqual(server._payout_state_source[0], 1)
+        self.assertIn(cache_key, server._job_bundle_cache)
+        self.assertEqual(retry_calls, 0)
+        self.assertEqual(
+            server._tip_refresh_pending_counter,
+            pending_marks_before,
+        )
+        self.assertEqual(
+            server.payout_state_candidates_discarded,
+            discarded_before,
+        )
+        self.assertFalse(server._payout_state_publication_blocked)
+        self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
 
     def test_direct_block_disabled_reconciler_bounds_publish_supersession(self) -> None:
         server, state, ledger = submit_coordinator()

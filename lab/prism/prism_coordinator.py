@@ -2835,6 +2835,10 @@ class PrismCoordinator:
 
     def _advance_payout_state_generation(self) -> int:
         """Publish a payout-only invalidation with no expensive gate work."""
+        # No production caller remains: direct-block finalization publishes
+        # through submit_block_candidate's reserve/publish path instead. Tests
+        # keep using this as the smallest complete reserve -> block -> publish
+        # invalidation cycle.
         self._ensure_job_cache_state()
         self._reserve_payout_state_source("payout_only")
         prepared_started = time.monotonic()
@@ -9520,6 +9524,7 @@ class PrismCoordinator:
             direct_payout_source: (
                 tuple[int, int, str | None, str, float] | None
             ) = None
+            payout_publication_covered = False
             with self._payout_state_prepare_lock:
                 try:
                     persistence = self.ledger.persist_accepted_block(
@@ -9559,7 +9564,22 @@ class PrismCoordinator:
                             time.monotonic() - payout_preparation_started,
                         ),
                     )
-                if confirmed_count in {0, 1}:
+                if (
+                    confirmed_count == 0
+                    and not self._payout_source_requires_publication()
+                ):
+                    # This replay confirmed nothing new and no reserved source
+                    # awaits publication: the published payout state already
+                    # covers this candidate. Reserving and republishing anyway
+                    # would bump the payout generation, wipe the job-bundle
+                    # cache, and abort every in-flight template refresh for
+                    # identical payout state — livelocking job delivery while
+                    # the candidate replays. A prior attempt that confirmed
+                    # rows but failed before publishing always leaves its
+                    # source reserved (or fenced as direct_block_uncertain),
+                    # so it never takes this branch and still publishes below.
+                    payout_publication_covered = True
+                elif confirmed_count in {0, 1}:
                     direct_payout_source = (
                         self._reserve_payout_state_source_if_current(
                             direct_source_preparation_token,
@@ -9569,10 +9589,11 @@ class PrismCoordinator:
                         )
                     )
                     # Confirmation activates carry-forward rows. A zero count
-                    # is an idempotent replay, but the direct-tip source still
-                    # has to cross publication unless a newer source superseded
-                    # it. Persistence and confirmation stayed outside the
-                    # delivery barrier in either case.
+                    # reaching this branch is a replay whose source was left
+                    # unpublished, so the direct-tip source still has to cross
+                    # publication unless a newer source superseded it.
+                    # Persistence and confirmation stayed outside the delivery
+                    # barrier in either case.
                     if direct_payout_source is None:
                         self._record_discarded_payout_candidate()
                     else:
@@ -9610,10 +9631,10 @@ class PrismCoordinator:
                 if payout_candidate is not None
                 else None
             )
-            if published is None and getattr(
-                self,
-                "reorg_reconciler_enabled",
-                True,
+            if (
+                published is None
+                and not payout_publication_covered
+                and getattr(self, "reorg_reconciler_enabled", True)
             ):
                 with self.lock:
                     latest_tip = self._payout_state_source[1]
@@ -9625,10 +9646,10 @@ class PrismCoordinator:
                 reconciled_generation = summary.get("published_generation")
                 if isinstance(reconciled_generation, int):
                     published = reconciled_generation
-            if published is None and not getattr(
-                self,
-                "reorg_reconciler_enabled",
-                True,
+            if (
+                published is None
+                and not payout_publication_covered
+                and not getattr(self, "reorg_reconciler_enabled", True)
             ):
                 # Collection-only tests disable reorg reconciliation; publish
                 # their current in-memory source without the production
