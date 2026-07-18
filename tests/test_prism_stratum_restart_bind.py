@@ -105,7 +105,7 @@ class OpenStratumListenersTest(unittest.TestCase):
 
     def test_bind_retry_aborts_on_shutdown_signal(self) -> None:
         """A SIGTERM during the bind retry must stop the port contention
-        immediately instead of running out the retry window."""
+        immediately and gracefully instead of running out the retry window."""
         port = free_port()
         predecessor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         predecessor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -117,8 +117,7 @@ class OpenStratumListenersTest(unittest.TestCase):
         server.stop_event.set()
         started = time.monotonic()
         with ExitStack() as stack:
-            with self.assertRaises(OSError):
-                server.open_stratum_listeners(stack)
+            self.assertIsNone(server.open_stratum_listeners(stack))
         self.assertLess(time.monotonic() - started, 2.0)
 
     def test_zero_retry_window_fails_fast(self) -> None:

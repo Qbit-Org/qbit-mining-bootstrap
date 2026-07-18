@@ -6346,7 +6346,7 @@ class PrismCoordinator:
 
     def open_stratum_listeners(
         self, listener_stack: ExitStack
-    ) -> list[tuple[socket.socket, StratumListenerProfile]]:
+    ) -> list[tuple[socket.socket, StratumListenerProfile]] | None:
         """Bind and listen on every stratum listener profile.
 
         Called before the slow parts of startup (qbit readiness, policy
@@ -6355,7 +6355,8 @@ class PrismCoordinator:
         connection refused, which sends firmware into reconnect backoff or
         failover and costs hashrate. bind() retries EADDRINUSE for a bounded
         window because a predecessor process may still hold the port while
-        draining its shutdown.
+        draining its shutdown. Returns None when shutdown is requested during
+        the retry, so startup can abort gracefully.
         """
         backlog = int(
             getattr(self, "stratum_listen_backlog", DEFAULT_PRISM_STRATUM_LISTEN_BACKLOG)
@@ -6386,7 +6387,12 @@ class PrismCoordinator:
                     if stop_event is not None and stop_event.is_set():
                         # Shutting down mid-startup: stop contending for a
                         # port this process will never serve.
-                        raise
+                        print(
+                            f"prism coordinator: shutdown requested while waiting "
+                            f"to bind {profile.bind}:{profile.port}; aborting startup",
+                            flush=True,
+                        )
+                        return None
                     if not warned:
                         print(
                             f"prism coordinator: {profile.name} listener port "
@@ -6411,6 +6417,8 @@ class PrismCoordinator:
         # never bounces miners with connection refused. accept() still starts
         # only after block-work recovery below.
         listeners = self.open_stratum_listeners(listener_stack)
+        if listeners is None:
+            return
         deadline = time.time() + 60
         while time.time() < deadline:
             try:
