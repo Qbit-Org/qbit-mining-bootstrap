@@ -296,14 +296,14 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
         self.assertEqual(broadcaster.fees, [0, 0])  # probes still happen
         self.assertEqual(ledger.updates, [])
         self.assertEqual(ledger.attempts, [])
-        # Default chunk_size=1: each probed write-free chunk renews at its
-        # boundary, so the pass-end renewal is not needed.
+        # Each unchanged probe renews the lease in place of the write it no
+        # longer makes, so the pass-end renewal is not needed.
         self.assertEqual(ledger.lease_renewals, 2)
 
-    def test_long_unchanged_probe_batches_renew_lease_at_chunk_boundaries(self) -> None:
+    def test_long_unchanged_probe_batches_renew_lease_per_probed_row(self) -> None:
         # A full batch of in-mempool rows whose derived status matches the
-        # stored one makes no fenced write; the lease must still be refreshed
-        # at least once per probed chunk so slow RPCs cannot outlast the TTL.
+        # stored one makes no fenced write; each probe must refresh the lease
+        # in the write's place so slow RPCs cannot outlast the TTL mid-chunk.
         txids = [f"{value:02x}" * 32 for value in range(1, 5)]
         rows = []
         for txid in txids:
@@ -321,9 +321,9 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
         self.assertEqual(result.updated_count, 0)
         self.assertEqual(len(broadcaster.fees), 4)
         self.assertEqual(ledger.updates, [])
-        self.assertEqual(ledger.lease_renewals, 2)  # one per probed write-free chunk
+        self.assertEqual(ledger.lease_renewals, 4)  # one per unchanged probe
 
-    def test_fenced_write_resets_pending_boundary_renewal(self) -> None:
+    def test_transition_write_needs_no_extra_renewal(self) -> None:
         unchanged_txid = "aa" * 32
         transition_txid = "bb" * 32
         unchanged = pending_row(unchanged_txid)
@@ -343,10 +343,9 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
             ledger.updates,
             [{"fanout_txid": transition_txid, "settlement_status": "confirmed"}],
         )
-        # The transition's fenced write refreshed the lease after the
-        # unchanged row's probe, so neither the boundary nor the pass end
-        # needs an explicit renewal.
-        self.assertEqual(ledger.lease_renewals, 0)
+        # Only the unchanged probe renews; the transition row's fenced write
+        # refreshes the lease itself and the pass end adds nothing.
+        self.assertEqual(ledger.lease_renewals, 1)
 
     def test_empty_scan_renews_lease_without_probes(self) -> None:
         ledger = FakeLedger([])
