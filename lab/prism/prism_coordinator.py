@@ -2724,6 +2724,13 @@ class PrismCoordinator:
         self._mark_tip_refresh_pending(next_payout_generation)
         self._schedule_tip_refresh_retry()
 
+    def _payout_state_publication_fenced(self) -> bool:
+        """Report whether delivery is still blocked awaiting a publication."""
+
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            return self._payout_state_publication_blocked
+
     def _payout_source_requires_publication(
         self,
         candidate: PayoutStateCandidate | None = None,
@@ -9566,24 +9573,31 @@ class PrismCoordinator:
                     )
                 if (
                     confirmed_count == 0
+                    and not self._payout_state_publication_fenced()
                     and not self._payout_source_requires_publication()
                 ):
-                    # This replay confirmed nothing new and no reserved source
-                    # awaits publication: the published payout state already
-                    # covers this candidate. Reserving and republishing anyway
-                    # would bump the payout generation, wipe the job-bundle
-                    # cache, and abort every in-flight template refresh for
-                    # identical payout state — livelocking job delivery while
-                    # the candidate replays. qbit_confirm_pool_block reports 0
-                    # for an already-confirmed block once the active tip moved
-                    # past its height (the sustained replay state); while the
-                    # block is still the tip it reports 1, indistinguishable
-                    # from a freshly flipped row, so that replay must keep
+                    # This replay confirmed nothing new, delivery is not
+                    # fenced, and no reserved source awaits publication: the
+                    # published payout state already covers this candidate.
+                    # Reserving and republishing anyway would bump the payout
+                    # generation, wipe the job-bundle cache, and abort every
+                    # in-flight template refresh for identical payout state —
+                    # livelocking job delivery while the candidate replays.
+                    # qbit_confirm_pool_block reports 0 for an
+                    # already-confirmed block once the active tip moved past
+                    # its height (the sustained replay state); while the block
+                    # is still the tip it reports 1, indistinguishable from a
+                    # freshly flipped row, so that replay must keep
                     # publishing. A prior attempt that confirmed rows but
                     # failed before publishing always leaves its source
                     # reserved (or fenced as direct_block_uncertain), so it
-                    # never takes this branch and still publishes below. A
-                    # restart cannot leak stale state through here either: a
+                    # never takes this branch and still publishes below. The
+                    # fence check keeps the remaining exception tail healing:
+                    # an attempt that force-blocked delivery after a
+                    # superseding source had already published, then failed
+                    # before republishing, leaves delivery blocked with a
+                    # covered source, and only the republish below clears it.
+                    # A restart cannot leak stale state through here either: a
                     # fresh process builds every bundle from ledger reads that
                     # already include the confirmed rows.
                     payout_publication_covered = True

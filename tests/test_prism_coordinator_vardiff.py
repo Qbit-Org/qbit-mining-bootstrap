@@ -5645,6 +5645,87 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(server._payout_state_publication_blocked)
         self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
 
+    def test_leaked_publication_fence_replay_republishes(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.max_blocks = 2
+        server.stop_after_block = False
+        block_hash = "d8" * 32
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+            self.assertEqual(server._payout_state_generation, 1)
+
+            # Simulate the exception tail a replay must heal: a prior attempt
+            # force-blocked delivery while its source generation already
+            # matched the published source, then failed before republishing.
+            # The leaked fence blocks every job build until a publication
+            # lands, so a confirmed_count=0 replay must not take the covered
+            # skip here.
+            server._block_payout_state_publication(force=True)
+            self.assertTrue(server._payout_state_publication_blocked)
+            self.assertEqual(
+                server._payout_state_source[0],
+                server._published_payout_state.source_generation,
+            )
+            child_tip = "d9" * 32
+
+            class AncestorReplayRpc:
+                def call(self, method: str, params: object = None) -> object:
+                    if method == "getbestblockhash":
+                        return child_tip
+                    if method == "getblockheader":
+                        if params != [block_hash]:
+                            raise AssertionError(params)
+                        return {"height": 10, "confirmations": 2}
+                    if method == "getblockcount":
+                        return 11
+                    if method == "submitblock":
+                        raise AssertionError(
+                            "active ancestor must not be resubmitted"
+                        )
+                    raise RuntimeError(method)
+
+            server.rpc = AncestorReplayRpc()
+            ledger.confirm_accepted_block = (  # type: ignore[method-assign]
+                lambda **_kwargs: {"backend": "fake", "confirmed_count": 0}
+            )
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+
+        self.assertEqual(server._payout_state_generation, 2)
+        self.assertEqual(server._published_payout_state.source_generation, 2)
+        self.assertEqual(server._payout_state_source[0], 2)
+        self.assertFalse(server._payout_state_publication_blocked)
+        self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
+
     def test_direct_block_disabled_reconciler_bounds_publish_supersession(self) -> None:
         server, state, ledger = submit_coordinator()
         server._ensure_job_cache_state()
