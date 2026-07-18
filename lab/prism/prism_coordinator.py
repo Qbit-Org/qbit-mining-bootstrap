@@ -90,6 +90,14 @@ DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS = 128
 DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS = 30.0
 DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS = 30.0
 DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS = 1.0
+# Kernel accept backlog per stratum listener. Sized so a whole fleet
+# reconnecting inside a restart window parks in the backlog instead of being
+# SYN-dropped; the kernel caps the effective value at net.core.somaxconn.
+DEFAULT_PRISM_STRATUM_LISTEN_BACKLOG = 1024
+# How long bind() retries EADDRINUSE at startup, covering overlap with a
+# predecessor process that is still draining its shutdown while holding the
+# port. Zero fails fast (the historical behavior).
+DEFAULT_PRISM_STRATUM_BIND_RETRY_SECONDS = 10.0
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES = 4_096
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
 DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
@@ -2169,6 +2177,14 @@ class PrismCoordinator:
         self.stratum_accept_resource_exhaustion_backoff_seconds = env_positive_float(
             "PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS",
             DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS,
+        )
+        self.stratum_listen_backlog = env_positive_int(
+            "PRISM_STRATUM_LISTEN_BACKLOG",
+            DEFAULT_PRISM_STRATUM_LISTEN_BACKLOG,
+        )
+        self.stratum_bind_retry_seconds = env_nonnegative_float(
+            "PRISM_STRATUM_BIND_RETRY_SECONDS",
+            DEFAULT_PRISM_STRATUM_BIND_RETRY_SECONDS,
         )
         self.payout_address_cache_max_entries = env_nonnegative_int(
             "PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES",
@@ -6328,14 +6344,94 @@ class PrismCoordinator:
             outcome="complete",
         )
 
+    def open_stratum_listeners(
+        self, listener_stack: ExitStack
+    ) -> list[tuple[socket.socket, StratumListenerProfile]] | None:
+        """Bind and listen on every stratum listener profile.
+
+        Called before the slow parts of startup (qbit readiness, policy
+        validation, block-work recovery) so miners reconnecting through a
+        restart park in the kernel accept backlog instead of getting
+        connection refused, which sends firmware into reconnect backoff or
+        failover and costs hashrate. bind() retries EADDRINUSE for a bounded
+        window because a predecessor process may still hold the port while
+        draining its shutdown. Returns None when shutdown is requested during
+        the retry, so startup can abort gracefully.
+        """
+        backlog = int(
+            getattr(self, "stratum_listen_backlog", DEFAULT_PRISM_STRATUM_LISTEN_BACKLOG)
+        )
+        retry_seconds = float(
+            getattr(
+                self,
+                "stratum_bind_retry_seconds",
+                DEFAULT_PRISM_STRATUM_BIND_RETRY_SECONDS,
+            )
+        )
+        listeners: list[tuple[socket.socket, StratumListenerProfile]] = []
+        for profile in self.listener_profiles:
+            server = listener_stack.enter_context(
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            )
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bind_deadline = time.monotonic() + retry_seconds
+            warned = False
+            while True:
+                try:
+                    server.bind((profile.bind, profile.port))
+                    break
+                except OSError as exc:
+                    if exc.errno != errno.EADDRINUSE or time.monotonic() >= bind_deadline:
+                        raise
+                    stop_event = getattr(self, "stop_event", None)
+                    if stop_event is not None and stop_event.is_set():
+                        # Shutting down mid-startup: stop contending for a
+                        # port this process will never serve.
+                        print(
+                            f"prism coordinator: shutdown requested while waiting "
+                            f"to bind {profile.bind}:{profile.port}; aborting startup",
+                            flush=True,
+                        )
+                        return None
+                    if not warned:
+                        print(
+                            f"prism coordinator: {profile.name} listener port "
+                            f"{profile.bind}:{profile.port} is busy; retrying bind "
+                            f"for up to {retry_seconds:g}s",
+                            flush=True,
+                        )
+                        warned = True
+                    time.sleep(0.1)
+            server.listen(backlog)
+            server.settimeout(1)
+            listeners.append((server, profile))
+        return listeners
+
     def serve(self) -> None:
+        with ExitStack() as listener_stack:
+            self._serve_with_listener_stack(listener_stack)
+
+    def _serve_with_listener_stack(self, listener_stack: ExitStack) -> None:
+        # Listeners come up first: connections complete their TCP handshake in
+        # the kernel backlog while the rest of startup runs, so a fast restart
+        # never bounces miners with connection refused. accept() still starts
+        # only after block-work recovery below.
+        listeners = self.open_stratum_listeners(listener_stack)
+        if listeners is None:
+            return
         deadline = time.time() + 60
         while time.time() < deadline:
             try:
                 self.rpc.call("getblockcount")
                 break
             except Exception:
-                time.sleep(1)
+                # A shutdown signal during the readiness wait must release the
+                # bound ports promptly, or a successor's bind retry window can
+                # expire against this process.
+                if self.stop_event.wait(1):
+                    return
+        if self.stop_event.is_set():
+            return
         self.validate_live_chain_identity()
         self.validate_live_template_and_fee_policy()
         self.prism_payout_policy()
@@ -6363,10 +6459,14 @@ class PrismCoordinator:
             )
         if self.audit_bind and self.audit_port:
             self.start_audit_server()
-        # Recover block work before opening Stratum listeners.  New miners can
-        # only add wakeups after every previously committed candidate has had a
-        # chance to re-enter the submit queue.
+        # Recover block work before accepting Stratum connections.  New miners
+        # can only add wakeups after every previously committed candidate has
+        # had a chance to re-enter the submit queue.  The listener sockets are
+        # already bound above, so reconnecting miners wait in the accept
+        # backlog through this recovery instead of being refused.
         if not self._run_startup_writer_replay(self.replay_pending_block_candidates):
+            return
+        if self.stop_event.is_set():
             return
         prepared = self.prewarm_startup_jobs()
         print(
@@ -6376,117 +6476,113 @@ class PrismCoordinator:
             f"tip={self.tip_template_snapshot.bestblockhash if self.tip_template_snapshot else 'unknown'}",
             flush=True,
         )
-        with ExitStack() as listener_stack:
-            listeners: list[tuple[socket.socket, StratumListenerProfile]] = []
-            for profile in self.listener_profiles:
-                server = listener_stack.enter_context(
-                    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                )
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind((profile.bind, profile.port))
-                server.listen()
-                server.settimeout(1)
-                listeners.append((server, profile))
-            # Seed liveness before starting monitored loops so the watchdog
-            # never fires during startup.
-            for _, profile in listeners:
-                self._record_heartbeat(profile.heartbeat_name)
-            self._record_heartbeat("qbit_blockpoll")
-            blockpoll_thread = threading.Thread(target=self.blockpoll_loop, daemon=True)
-            blockpoll_thread.start()
-            blockwait_thread: threading.Thread | None = None
-            if self.blockwait_enabled:
-                self._record_heartbeat("qbit_blockwait")
-                blockwait_thread = threading.Thread(target=self.blockwait_loop, daemon=True)
-                blockwait_thread.start()
-            vardiff_idle_sweep_thread: threading.Thread | None = None
-            if self.vardiff_idle_sweep_seconds > 0:
-                self._record_heartbeat("vardiff_idle_sweep")
-                vardiff_idle_sweep_thread = threading.Thread(
-                    target=self.vardiff_idle_sweep_loop,
-                    daemon=True,
-                )
-                vardiff_idle_sweep_thread.start()
-            initial_job_timeout_thread: threading.Thread | None = None
-            if self.stratum_initial_job_timeout_seconds > 0:
-                initial_job_timeout_thread = threading.Thread(
-                    target=self.initial_job_timeout_loop,
-                    name="prism-initial-job-timeouts",
-                    daemon=True,
-                )
-                initial_job_timeout_thread.start()
-            self._record_heartbeat("block_submitter")
-            block_submitter_thread = threading.Thread(
-                target=self.block_submit_loop,
+        # Seed liveness before starting monitored loops so the watchdog
+        # never fires during startup.
+        for _, profile in listeners:
+            self._record_heartbeat(profile.heartbeat_name)
+        self._record_heartbeat("qbit_blockpoll")
+        blockpoll_thread = threading.Thread(target=self.blockpoll_loop, daemon=True)
+        blockpoll_thread.start()
+        blockwait_thread: threading.Thread | None = None
+        if self.blockwait_enabled:
+            self._record_heartbeat("qbit_blockwait")
+            blockwait_thread = threading.Thread(target=self.blockwait_loop, daemon=True)
+            blockwait_thread.start()
+        vardiff_idle_sweep_thread: threading.Thread | None = None
+        if self.vardiff_idle_sweep_seconds > 0:
+            self._record_heartbeat("vardiff_idle_sweep")
+            vardiff_idle_sweep_thread = threading.Thread(
+                target=self.vardiff_idle_sweep_loop,
                 daemon=True,
             )
-            block_submitter_thread.start()
-            drain_threads: list[tuple[threading.Thread, float]] = [
-                (blockpoll_thread, 1.0),
-                (block_submitter_thread, 1.0),
-            ]
-            if blockwait_thread is not None:
-                drain_threads.append((blockwait_thread, 1.0))
-            if vardiff_idle_sweep_thread is not None:
-                drain_threads.append((vardiff_idle_sweep_thread, 1.0))
-            if initial_job_timeout_thread is not None:
-                drain_threads.append((initial_job_timeout_thread, 1.0))
-            # Replay any shares stranded on disk by a prior ledger-outage
-            # shutdown before serving, so no acked share is lost across restart.
-            if not self._run_startup_writer_replay(
-                self.replay_recovered_shares,
-                drain_threads=drain_threads,
-            ):
-                return
-            self._record_heartbeat("share_writer")
-            self.share_writer_active = True
-            share_writer_thread = threading.Thread(
-                target=self.share_append_loop,
+            vardiff_idle_sweep_thread.start()
+        initial_job_timeout_thread: threading.Thread | None = None
+        if self.stratum_initial_job_timeout_seconds > 0:
+            initial_job_timeout_thread = threading.Thread(
+                target=self.initial_job_timeout_loop,
+                name="prism-initial-job-timeouts",
                 daemon=True,
             )
-            share_writer_thread.start()
-            drain_threads.append((share_writer_thread, 5.0))
-            ctv_broadcaster_thread: threading.Thread | None = None
-            if self.ctv_broadcaster_enabled:
-                self._record_heartbeat("ctv_fanout_broadcaster")
-                ctv_broadcaster_thread = threading.Thread(
-                    target=self.ctv_fanout_broadcaster_loop,
-                    daemon=True,
-                )
-                ctv_broadcaster_thread.start()
-                drain_threads.append((ctv_broadcaster_thread, 1.0))
-                print(
-                    "prism coordinator: CTV fanout broadcaster enabled "
-                    f"mode={'cpfp' if self.ctv_broadcaster_fee_sats > 0 else 'direct'} "
-                    f"fee_bits={self.ctv_broadcaster_fee_sats} "
-                    f"wallet={'configured' if self.ctv_broadcaster_wallet else 'none'} "
-                    f"interval={self.ctv_broadcaster_interval_seconds:g}s "
-                    f"limit={self.ctv_broadcaster_limit} "
-                    f"chunk_size={self.ctv_broadcaster_chunk_size}",
-                    flush=True,
-                )
-            if self.watchdog_enabled:
-                threading.Thread(target=self.watchdog_loop, daemon=True).start()
-                print(
-                    "prism coordinator: liveness watchdog enabled "
-                    f"timeout={self.watchdog_timeout_seconds:g}s "
-                    f"interval={self.watchdog_interval_seconds:g}s",
-                    flush=True,
-                )
-            for extra_server, extra_profile in listeners[1:]:
-                threading.Thread(
-                    target=self.accept_loop,
-                    args=(extra_server, extra_profile),
-                    daemon=True,
-                ).start()
-            try:
-                self.accept_loop(*listeners[0])
-            finally:
-                # The writer barrier and lease release intentionally precede
-                # joins and the tip-refresh executor drain: those may be stuck
-                # in unrelated client delivery or obsolete fanout work.
-                self.shutdown(reason="serve_exit")
-                self.drain_non_writer_components(drain_threads)
+            initial_job_timeout_thread.start()
+        self._record_heartbeat("block_submitter")
+        block_submitter_thread = threading.Thread(
+            target=self.block_submit_loop,
+            daemon=True,
+        )
+        block_submitter_thread.start()
+        drain_threads: list[tuple[threading.Thread, float]] = [
+            (blockpoll_thread, 1.0),
+            (block_submitter_thread, 1.0),
+        ]
+        if blockwait_thread is not None:
+            drain_threads.append((blockwait_thread, 1.0))
+        if vardiff_idle_sweep_thread is not None:
+            drain_threads.append((vardiff_idle_sweep_thread, 1.0))
+        if initial_job_timeout_thread is not None:
+            drain_threads.append((initial_job_timeout_thread, 1.0))
+        # Replay any shares stranded on disk by a prior ledger-outage
+        # shutdown before serving, so no acked share is lost across restart.
+        if not self._run_startup_writer_replay(
+            self.replay_recovered_shares,
+            drain_threads=drain_threads,
+        ):
+            return
+        self._record_heartbeat("share_writer")
+        self.share_writer_active = True
+        share_writer_thread = threading.Thread(
+            target=self.share_append_loop,
+            daemon=True,
+        )
+        share_writer_thread.start()
+        drain_threads.append((share_writer_thread, 5.0))
+        ctv_broadcaster_thread: threading.Thread | None = None
+        if self.ctv_broadcaster_enabled:
+            self._record_heartbeat("ctv_fanout_broadcaster")
+            ctv_broadcaster_thread = threading.Thread(
+                target=self.ctv_fanout_broadcaster_loop,
+                daemon=True,
+            )
+            ctv_broadcaster_thread.start()
+            drain_threads.append((ctv_broadcaster_thread, 1.0))
+            print(
+                "prism coordinator: CTV fanout broadcaster enabled "
+                f"mode={'cpfp' if self.ctv_broadcaster_fee_sats > 0 else 'direct'} "
+                f"fee_bits={self.ctv_broadcaster_fee_sats} "
+                f"wallet={'configured' if self.ctv_broadcaster_wallet else 'none'} "
+                f"interval={self.ctv_broadcaster_interval_seconds:g}s "
+                f"limit={self.ctv_broadcaster_limit} "
+                f"chunk_size={self.ctv_broadcaster_chunk_size}",
+                flush=True,
+            )
+        if self.watchdog_enabled:
+            threading.Thread(target=self.watchdog_loop, daemon=True).start()
+            print(
+                "prism coordinator: liveness watchdog enabled "
+                f"timeout={self.watchdog_timeout_seconds:g}s "
+                f"interval={self.watchdog_interval_seconds:g}s",
+                flush=True,
+            )
+        for extra_server, extra_profile in listeners[1:]:
+            threading.Thread(
+                target=self.accept_loop,
+                args=(extra_server, extra_profile),
+                daemon=True,
+            ).start()
+        try:
+            self.accept_loop(*listeners[0])
+        finally:
+            # Free the listen ports the moment accepting stops so a successor
+            # process can bind while the shutdown drain below runs.
+            for server, _ in listeners:
+                try:
+                    server.close()
+                except OSError:
+                    pass
+            # The writer barrier and lease release intentionally precede
+            # joins and the tip-refresh executor drain: those may be stuck
+            # in unrelated client delivery or obsolete fanout work.
+            self.shutdown(reason="serve_exit")
+            self.drain_non_writer_components(drain_threads)
 
     def _run_startup_writer_replay(
         self,
