@@ -14237,6 +14237,16 @@ class PrismCoordinator:
             client.vardiff_window_work = Decimal("0")
             return True
 
+        def restore_speculative_retarget() -> None:
+            with self.lock:
+                if client.pending_share_difficulty == next_difficulty:
+                    client.pending_share_difficulty = prior_pending
+                self._restore_idle_window_state(
+                    client,
+                    idle_window_state,
+                    idle_window_reset_at,
+                )
+
         try:
             if require_idle:
                 sent = self._maybe_send_job_locked(
@@ -14253,26 +14263,18 @@ class PrismCoordinator:
                     and not self.stop_event.is_set()
                     and self.maybe_send_job(client, clean_jobs=True)
                 )
-            if not self.stop_event.is_set() and sent:
+            # A completed paired send is the commit point. Shutdown may race
+            # immediately afterward, but it cannot make already-delivered work
+            # speculative again.
+            if sent:
                 return True
-        except OSError:
-            with self.lock:
-                if client.pending_share_difficulty == next_difficulty:
-                    client.pending_share_difficulty = prior_pending
-                self._restore_idle_window_state(
-                    client,
-                    idle_window_state,
-                    idle_window_reset_at,
-                )
+        except Exception:
+            # Cached stamping can surface _JobBuildFailed before delivery, and
+            # socket errors can surface during the paired send. Both must undo
+            # every speculative client mutation before the task reports failure.
+            restore_speculative_retarget()
             raise
-        with self.lock:
-            if client.pending_share_difficulty == next_difficulty:
-                client.pending_share_difficulty = prior_pending
-            self._restore_idle_window_state(
-                client,
-                idle_window_state,
-                idle_window_reset_at,
-            )
+        restore_speculative_retarget()
         return False
 
     @staticmethod

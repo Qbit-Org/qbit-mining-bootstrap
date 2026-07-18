@@ -928,6 +928,39 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.vardiff_window_submitted, 0)
         self.assertEqual(state.vardiff_window_work, Decimal("0"))
 
+    def test_idle_vardiff_shutdown_after_delivery_keeps_committed_window(self) -> None:
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state)
+        install_idle_job_cache(server)
+        sent: list[dict[str, object]] = []
+        delivered = threading.Event()
+        window_started = state.vardiff_window_started_monotonic
+
+        def stop_after_delivery(payload: dict[str, object]) -> None:
+            sent.append(payload)
+            if payload.get("method") == "mining.notify":
+                server.stop_event.set()
+                delivered.set()
+
+        state.send = stop_after_delivery  # type: ignore[method-assign]
+
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        self.assertTrue(delivered.wait(timeout=1))
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertEqual(server.idle_retarget_count, 1)
+        self.assertEqual(state.share_difficulty, Decimal("4"))
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertGreater(state.vardiff_window_started_monotonic, window_started)
+        self.assertEqual(state.vardiff_window_accepted, 0)
+        self.assertEqual(state.vardiff_window_submitted, 0)
+        self.assertEqual(state.vardiff_window_work, Decimal("0"))
+
     def test_idle_vardiff_sweep_skips_submitted_reject_storm_window(self) -> None:
         server = coordinator()
         state = client()
@@ -1031,6 +1064,44 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             ),
             window_state,
         )
+        self.assertEqual(server.vardiff_idle_task_failures, 1)
+
+    def test_idle_vardiff_stamp_failure_restores_speculative_state(self) -> None:
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state)
+        install_idle_job_cache(server)
+        window_state = (
+            state.vardiff_window_started_monotonic,
+            state.vardiff_window_accepted,
+            state.vardiff_window_submitted,
+            state.vardiff_window_work,
+        )
+
+        def fail_stamp(*_args: object, **_kwargs: object) -> None:
+            self.assertEqual(state.pending_share_difficulty, Decimal("4"))
+            raise RuntimeError("cached job stamping failed")
+
+        state.send = lambda payload: self.fail(  # type: ignore[method-assign]
+            f"unexpected delivery: {payload}"
+        )
+        server.stamp_job_for_client = fail_stamp  # type: ignore[method-assign]
+
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(state.share_difficulty, Decimal("16"))
+        self.assertEqual(
+            (
+                state.vardiff_window_started_monotonic,
+                state.vardiff_window_accepted,
+                state.vardiff_window_submitted,
+                state.vardiff_window_work,
+            ),
+            window_state,
+        )
+        self.assertEqual(server.job_build_failure_count, 1)
         self.assertEqual(server.vardiff_idle_task_failures, 1)
 
     def test_repeated_idle_sweeps_do_not_enqueue_duplicate_connection_work(self) -> None:
