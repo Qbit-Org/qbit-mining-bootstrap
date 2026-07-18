@@ -239,7 +239,7 @@ def build_coordinator(args: argparse.Namespace, latencies: InjectedLatencies) ->
     server.last_reorg_reconciled_trusted = False
     server.last_reorg_reconciled_monotonic = None
     server.latest_evidence = None
-    server.latest_bundle = None
+    server.latest_coinbase_size_bytes = None
     server.tip_template_snapshot = None
     server.extranonce2_size = EXTRANONCE2_SIZE
     server.coinbase_tag_hex = default_prism_coinbase_tag_hex()

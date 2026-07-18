@@ -207,7 +207,7 @@ def coordinator(*, ledger: object | None = None, template: dict[str, object] | N
     server.last_reorg_reconciled_trusted = False
     server.last_reorg_reconciled_monotonic = None
     server.latest_evidence = None
-    server.latest_bundle = None
+    server.latest_coinbase_size_bytes = None
     server.tip_template_snapshot = None
     server.extranonce2_size = EXTRANONCE2_SIZE
     server.coinbase_tag_hex = default_prism_coinbase_tag_hex()
@@ -319,7 +319,13 @@ class JobBundleCacheTests(unittest.TestCase):
         # split is byte-identical for every client.
         self.assertEqual(len({context.job.coinb1 for context in contexts}), 1)
         self.assertEqual(len({context.job.coinb2 for context in contexts}), 1)
-        self.assertIs(contexts[0].bundle, contexts[1].bundle)
+        self.assertTrue(all(not hasattr(context, "bundle") for context in contexts))
+        cached = next(iter(server._job_bundle_cache.values()))
+        self.assertFalse(hasattr(cached, "bundle"))
+        self.assertEqual(
+            cached.coinbase_manifest["coinbase_tx_hex"],
+            synthetic_manifest_coinbase_hex(recorded["suffixes"][0]),
+        )
         self.assertIs(contexts[0].shares_json, contexts[1].shares_json)
 
     def test_stamped_job_reassembles_coinbase_with_client_extranonce(self) -> None:
@@ -375,6 +381,27 @@ class JobBundleCacheTests(unittest.TestCase):
         server.build_job_for_client(client(2), clean_jobs=True)
 
         self.assertEqual(recorded["calls"], 2)
+
+    def test_bundle_cache_lookup_prunes_every_expired_snapshot(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(base_template())
+        assert artifacts is not None
+        current = server.shared_job_bundle(artifacts, worker())
+        expired_key = ("expired-template", "ready")
+        expired = dataclass_replace(
+            current,
+            key=expired_key,
+            template_fingerprint="expired-template",
+            built_monotonic=time.monotonic() - 60,
+        )
+        server._job_bundle_cache[expired_key] = expired
+
+        looked_up = server._lookup_job_bundle(current.key)
+
+        self.assertIs(looked_up, current)
+        self.assertNotIn(expired_key, server._job_bundle_cache)
+        self.assertEqual(list(server._job_bundle_cache.values()), [current])
 
     def test_zero_ttl_disables_bundle_cache(self) -> None:
         server, _ = coordinator()
@@ -811,8 +838,11 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertTrue(context_a1.collection_only)
         self.assertTrue(context_b.collection_only)
         self.assertEqual(recorded["calls"], 2)
-        self.assertIs(context_a1.bundle, context_a2.bundle)
-        self.assertIsNot(context_a1.bundle, context_b.bundle)
+        self.assertTrue(
+            all(not hasattr(context, "bundle") for context in (context_a1, context_a2, context_b))
+        )
+        self.assertIs(context_a1.shares_json, context_a2.shares_json)
+        self.assertIsNot(context_a1.shares_json, context_b.shares_json)
 
     def test_collection_bundle_cache_rebuilds_when_pool_becomes_ready(self) -> None:
         ledger = FakeLedger(miners=["solo"])
@@ -1039,9 +1069,13 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(refreshed, 250)
         self.assertEqual(recorded["calls"], 1)
+        cached = next(iter(server._job_bundle_cache.values()))
         self.assertEqual(
-            len({id(state.active_job.bundle) for state in clients}),
+            len({id(state.active_job.shares_json) for state in clients}),
             1,
+        )
+        self.assertTrue(
+            all(state.active_job.shares_json is cached.shares_json for state in clients)
         )
         self.assertEqual(reconciled, [rpc.tip])
         self.assertEqual(trust_checks, 2)
@@ -1091,7 +1125,7 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertTrue(rebuilt.collection_only)
         self.assertEqual(first.fingerprint, second.fingerprint)
         self.assertEqual(recorded["calls"], 2)
-        self.assertIsNot(rebuilt.bundle, original.bundle)
+        self.assertIsNot(rebuilt.coinbase_manifest, original.coinbase_manifest)
         self.assertIs(rebuilt.template, second.template)
         self.assertEqual(rebuilt.template_generation, second.generation)
 

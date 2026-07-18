@@ -281,6 +281,122 @@ fn canonicalize_cli_emits_verifier_hash_bytes() {
 }
 
 #[test]
+fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    let expected_bundle = build_audit_bundle(
+        fixture.shares,
+        fixture.found_block,
+        power_law_prior_balances(),
+        PayoutPolicy::day_one_default(),
+        &manifest_signing_key(),
+        &ledger_signing_key(),
+    )
+    .unwrap();
+    let mut input: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    input["prior_balances"] = serde_json::to_value(power_law_prior_balances()).unwrap();
+    let input_path = std::env::temp_dir().join(format!(
+        "qbit-prism-build-audit-bundle-canonical-input-{}.json",
+        std::process::id()
+    ));
+    fs::write(&input_path, serde_json::to_vec(&input).unwrap()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .arg("--canonical-output")
+        .output()
+        .unwrap();
+    let summary_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .arg("--job-summary-output")
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&input_path);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        canonical_audit_bundle_bytes(&expected_bundle).unwrap()
+    );
+    let emitted_bundle: AuditBundle = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(emitted_bundle, expected_bundle);
+
+    assert!(
+        summary_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&summary_output.stdout),
+        String::from_utf8_lossy(&summary_output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&summary_output.stdout).unwrap();
+    let summary_fields = summary.as_object().unwrap();
+    assert_eq!(
+        summary_fields
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["found_block", "signed_coinbase_manifest"]
+    );
+    assert_eq!(
+        summary,
+        serde_json::json!({
+            "found_block": &expected_bundle.found_block,
+            "signed_coinbase_manifest": &expected_bundle.signed_coinbase_manifest,
+        })
+    );
+    assert!(summary.get("shares").is_none());
+    assert!(summary.get("reward_manifest").is_none());
+
+    let report = verify_audit_bundle(&emitted_bundle, &ledger_public_key_hex()).unwrap();
+    assert_eq!(output.stdout.len(), 10_999);
+    assert_eq!(
+        hex::encode(Sha256::digest(&output.stdout)),
+        "65b11e1b7e2025472fad2e4cd6b555eaba5eab2a4903e17179ba792d58780a4b"
+    );
+    assert_eq!(
+        report.reward_manifest_sha256_hex,
+        "14feb3360ba2d97faadf178151ca7c09bbb6a6e59e6c39a079e7d97986357ae1"
+    );
+    assert_eq!(
+        report.payout_policy_manifest_sha256_hex,
+        "2db25eb6db270fb0e5ef9100158b2bfcca95ae6228717fb9779de47fbe11a668"
+    );
+    assert_eq!(
+        report.coinbase_manifest_sha256_hex,
+        "635e6133c760cbed7965b0475a273a82495141b4e3939a9908441baa532a0c39"
+    );
+    assert_eq!(
+        emitted_bundle.reward_manifest.share_slice_digest_hex,
+        "fc39e87eaedeb6cb6442afbdf060ddc81a93846acc3ffdb47cf202c408c6a9d3"
+    );
+    assert_eq!(
+        report.audit_commitment_root_hex,
+        "492c8e5f83049d3f6b04a175a531f130a8c52c2fa944b06741f442587f365d3a"
+    );
+    assert_eq!(report.onchain_output_count, 3);
+    assert_eq!(report.accrued_account_count, 3);
+}
+
+#[test]
 fn audit_clis_accept_compact_body_ref_bundle() {
     let fixture: Fixture = serde_json::from_str(include_str!(
         "../fixtures/power-law-accrual.prism-fixture.json"

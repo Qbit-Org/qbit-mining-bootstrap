@@ -845,7 +845,6 @@ class _P2mrAddressValidationFlight:
 class PrismJobContext:
     job: direct_stratum.DirectQbitStratumJob
     template: dict[str, Any]
-    bundle: dict[str, Any]
     shares_json: list[dict[str, object]]
     prior_balances: list[dict[str, object]]
     found_block: dict[str, object]
@@ -951,7 +950,7 @@ class RetainedCollectionRefresh:
 
 @dataclass(frozen=True)
 class CachedJobBundle:
-    """One heavy job build (ledger snapshot + signed audit bundle + base job)
+    """One heavy job build (ledger snapshot + signed manifest + base job)
     shared across every client on the same template.
 
     The base job is built with the extranonce1 placeholder; per-client jobs
@@ -963,7 +962,7 @@ class CachedJobBundle:
     key: tuple[object, ...]
     template: dict[str, Any]
     template_fingerprint: str
-    bundle: dict[str, Any]
+    coinbase_manifest: dict[str, Any]
     shares_json: list[dict[str, object]]
     prior_balances: list[dict[str, object]]
     found_block: dict[str, object]
@@ -1749,7 +1748,10 @@ class PrismCoordinator:
         self.reorg_reconcile_error_count = 0
         self.matured_payout_count = 0
         self.latest_evidence: dict[str, Any] | None = None
-        self.latest_bundle: dict[str, Any] | None = None
+        # The full accepted-block bundle is durable in the audit store.  Keeping
+        # it here only to derive one metric pinned the complete share window for
+        # the lifetime of the coordinator.
+        self.latest_coinbase_size_bytes: int | None = None
         self.tip_template_snapshot: QbitTipTemplateSnapshot | None = None
         self._tip_refresh_lock = threading.Lock()
         self._tip_refresh_executor_lock = threading.Lock()
@@ -2801,13 +2803,22 @@ class PrismCoordinator:
         key: tuple[object, ...],
     ) -> CachedJobBundle | None:
         ttl = getattr(self, "job_bundle_cache_seconds", DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS)
-        if ttl <= 0:
-            return None
         now = time.monotonic()
         with self._job_cache_lock:
-            cached = self._job_bundle_cache.get(key)
-            if cached is not None and now - cached.built_monotonic <= ttl:
-                return cached
+            if ttl <= 0:
+                self._job_bundle_cache.clear()
+                return None
+            # The entry-count cap is not a memory bound: one production entry
+            # can reference more than 100k shares.  Expired entries must release
+            # their snapshots instead of remaining resident until count eviction.
+            expired = [
+                cache_key
+                for cache_key, entry in self._job_bundle_cache.items()
+                if now - entry.built_monotonic > ttl
+            ]
+            for cache_key in expired:
+                self._job_bundle_cache.pop(cache_key, None)
+            return self._job_bundle_cache.get(key)
         return None
 
     def _job_bundle_entry_usable(
@@ -2869,7 +2880,7 @@ class PrismCoordinator:
             and cached.template_generation == artifacts.generation
         ):
             return cached
-        manifest = cached.bundle["signed_coinbase_manifest"]["manifest"]
+        manifest = cached.coinbase_manifest
         base_job = direct_stratum.make_job_from_builder_manifest(
             job_id="prism-template-base",
             template=artifacts.template,
@@ -2906,6 +2917,7 @@ class PrismCoordinator:
                 # template won the global cache race; just do not retain them.
                 return True
             self._job_bundle_cache[built.key] = built
+            self._job_bundle_cache.move_to_end(built.key)
             while len(self._job_bundle_cache) > MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES:
                 oldest_key = next(iter(self._job_bundle_cache))
                 self._job_bundle_cache.pop(oldest_key, None)
@@ -3055,6 +3067,7 @@ class PrismCoordinator:
                 coinbase_script_sig_suffix_hex=placeholder_suffix_hex,
                 witness_merkle_leaves_hex=list(artifacts.witness_merkle_leaves_hex),
                 ctv_fee_parent_hash=str(template["previousblockhash"]),
+                summary_only=True,
             )
             collection_only = False
         else:
@@ -3066,6 +3079,7 @@ class PrismCoordinator:
                 network_difficulty=artifacts.network_difficulty,
                 issued_at_ms=issued_at_ms,
                 suffix_hex=placeholder_suffix_hex,
+                summary_only=True,
             )
             shares = []
             collection_only = True
@@ -3086,7 +3100,10 @@ class PrismCoordinator:
             key=key,
             template=template,
             template_fingerprint=artifacts.fingerprint,
-            bundle=bundle,
+            # Only this manifest is needed to bind later clock-only template
+            # observations.  Retaining the returned logical bundle duplicated
+            # the entire shares tree already held in shares_json.
+            coinbase_manifest=manifest,
             shares_json=shares,
             prior_balances=prior_balances,
             found_block=bundle["found_block"],
@@ -3134,7 +3151,6 @@ class PrismCoordinator:
         return PrismJobContext(
             job=job,
             template=cached.template,
-            bundle=cached.bundle,
             shares_json=cached.shares_json,
             prior_balances=cached.prior_balances,
             found_block=cached.found_block,
@@ -7331,6 +7347,7 @@ class PrismCoordinator:
         network_difficulty: int,
         issued_at_ms: int,
         suffix_hex: str,
+        summary_only: bool = False,
     ) -> dict[str, Any]:
         share = {
             "share_seq": 1,
@@ -7358,6 +7375,7 @@ class PrismCoordinator:
             coinbase_script_sig_suffix_hex=suffix_hex,
             witness_merkle_leaves_hex=direct_stratum.witness_merkle_leaves_hex(transaction_hexes),
             ctv_fee_parent_hash=str(template["previousblockhash"]),
+            summary_only=summary_only,
         )
 
     def build_audit_bundle(
@@ -7369,6 +7387,8 @@ class PrismCoordinator:
         coinbase_script_sig_suffix_hex: str,
         witness_merkle_leaves_hex: list[str] | None = None,
         ctv_fee_parent_hash: str | None = None,
+        canonical_output_path: Path | None = None,
+        summary_only: bool = False,
     ) -> dict[str, Any]:
         payload = {
             "shares": shares,
@@ -7384,25 +7404,80 @@ class PrismCoordinator:
         )
         if ctv_settlement is not None:
             payload["ctv_settlement"] = ctv_settlement
-        completed = subprocess.run(
-            prism_tool_command("qbit-prism-build-audit-bundle")
-            + [
-                "--input",
-                "-",
-                "--signing-key-seed-hex",
-                self.signing_seed_hex,
-                "--ledger-signing-key-seed-hex",
-                self.ledger_attestation_signing_seed_hex,
-            ],
-            input=json.dumps(payload),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(f"qbit-prism-build-audit-bundle failed: {completed.stderr}")
-        return json.loads(completed.stdout)
+        if canonical_output_path is not None and summary_only:
+            raise ValueError("canonical output and job summary output are mutually exclusive")
+        command = prism_tool_command("qbit-prism-build-audit-bundle") + [
+            "--input",
+            "-",
+            "--signing-key-seed-hex",
+            self.signing_seed_hex,
+            "--ledger-signing-key-seed-hex",
+            self.ledger_attestation_signing_seed_hex,
+        ]
+        command.append("--job-summary-output" if summary_only else "--canonical-output")
+        if canonical_output_path is not None:
+            canonical_output_path.parent.mkdir(parents=True, exist_ok=True)
+        succeeded = False
+        created_output = False
+        try:
+            with ExitStack() as stack:
+                if canonical_output_path is None:
+                    output = stack.enter_context(
+                        tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+                    )
+                else:
+                    output = stack.enter_context(
+                        canonical_output_path.open("x+", encoding="utf-8")
+                    )
+                    created_output = True
+                stderr = stack.enter_context(
+                    tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+                )
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=output,
+                    stderr=stderr,
+                    text=True,
+                    encoding="utf-8",
+                )
+                assert process.stdin is not None
+                try:
+                    # iterencode writes bounded fragments to the child instead
+                    # of allocating a second full JSON representation in Python.
+                    json.dump(payload, process.stdin, separators=(",", ":"))
+                except BrokenPipeError:
+                    # Prefer the builder's diagnostic below.
+                    pass
+                except BaseException:
+                    process.kill()
+                    process.wait()
+                    raise
+                finally:
+                    try:
+                        process.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                returncode = process.wait()
+                stderr.seek(0)
+                error_text = stderr.read()
+                if returncode != 0:
+                    raise RuntimeError(
+                        f"qbit-prism-build-audit-bundle failed: {error_text}"
+                    )
+                output.flush()
+                if canonical_output_path is not None:
+                    os.fsync(output.fileno())
+                output.seek(0)
+                bundle = json.load(output)
+            succeeded = True
+            return bundle
+        finally:
+            if canonical_output_path is not None and created_output and not succeeded:
+                try:
+                    canonical_output_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def coinbase_script_sig_suffix_hex(self, extranonce1_hex: str, extranonce2_hex: str) -> str:
         extranonce1_hex = validate_hex(extranonce1_hex, name="extranonce1")
@@ -7764,7 +7839,6 @@ class PrismCoordinator:
                 ),
             ),
             template=template,
-            bundle={},
             shares_json=list(intent["shares_json"]),
             prior_balances=list(intent["prior_balances"]),
             found_block=dict(intent["found_block"]),
@@ -8769,6 +8843,9 @@ class PrismCoordinator:
         direct_source_preparation_token = self._capture_payout_state_source()[1]
         active_tip_height = int(self.rpc.call("getblockcount"))
         self._record_heartbeat("block_submitter")
+        candidate_bundle_path = self.temporary_audit_bundle_path(
+            block_hash=submission.block_hash_hex
+        )
         final_bundle = self.build_audit_bundle(
             shares=context.shares_json,
             found_block=context.found_block,
@@ -8784,9 +8861,34 @@ class PrismCoordinator:
                 getattr(context.job, "transaction_hexes", ())
             ),
             ctv_fee_parent_hash=str(context.template["previousblockhash"]),
+            canonical_output_path=candidate_bundle_path,
         )
-        final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
-        if final_manifest["coinbase_tx_hex"].lower() != submission.coinbase_tx_hex.lower():
+        # Tests and alternate builders may not implement the optional canonical
+        # output yet. Their Python-serialized fallback is valid verifier input,
+        # but it must not be labeled canonical during persistence: the ledger
+        # will canonicalize final_bundle itself on this compatibility path.
+        if not candidate_bundle_path.exists():
+            candidate_bundle_path = self.write_temporary_audit_bundle(
+                final_bundle,
+                block_hash=submission.block_hash_hex,
+            )
+        try:
+            final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
+            final_coinbase_tx_hex_raw = final_manifest["coinbase_tx_hex"]
+            if not isinstance(final_coinbase_tx_hex_raw, str):
+                raise ValueError("final audit bundle coinbase_tx_hex is not a string")
+            final_coinbase_tx_hex = final_coinbase_tx_hex_raw.lower()
+        except BaseException:
+            try:
+                candidate_bundle_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        if final_coinbase_tx_hex != submission.coinbase_tx_hex.lower():
+            try:
+                candidate_bundle_path.unlink()
+            except FileNotFoundError:
+                pass
             self.stop_event.set()
             self._abandon_block_candidate(
                 PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
@@ -8794,16 +8896,20 @@ class PrismCoordinator:
                 worker=worker,
             )
             return False
-        candidate_bundle_path = self.write_temporary_audit_bundle(
-            final_bundle,
-            block_hash=submission.block_hash_hex,
-        )
         try:
             report = self.verify_bundle(
                 candidate_bundle_path,
                 submission.coinbase_tx_hex,
                 self.trusted_ledger_writer_public_key_hex(final_bundle),
                 expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
+            )
+            # Existence alone does not prove that an alternate/older builder
+            # emitted canonical bytes. Only forward the verifier candidate to
+            # persistence when its exact bytes match the verifier's canonical
+            # digest; otherwise the ledger canonicalizes final_bundle itself.
+            persistence_canonical_bundle_path = self.verified_canonical_bundle_path(
+                candidate_bundle_path,
+                report,
             )
             self._record_heartbeat("block_submitter")
             # Finalization is exact-idempotent so an active-tip/active-ancestor
@@ -8822,6 +8928,7 @@ class PrismCoordinator:
                         parent_hash=str(context.template["previousblockhash"]),
                         final_bundle=final_bundle,
                         audit_report=report,
+                        canonical_bundle_path=persistence_canonical_bundle_path,
                     )
                     self._record_heartbeat("block_submitter")
                     confirmation = self.ledger.confirm_accepted_block(
@@ -8979,7 +9086,9 @@ class PrismCoordinator:
             self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
             with self.lock:
                 self.accepted_block_count += 1
-                self.latest_bundle = final_bundle
+                self.latest_coinbase_size_bytes = len(
+                    str(final_manifest["coinbase_tx_hex"])
+                ) // 2
                 self.latest_evidence = evidence
                 should_stop = self.stop_after_block or self.accepted_block_count >= self.max_blocks
             print(
@@ -9017,20 +9126,33 @@ class PrismCoordinator:
             active_tip_height=active_tip_height,
         )
 
-    def write_temporary_audit_bundle(self, bundle: dict[str, Any], *, block_hash: str) -> Path:
+    def temporary_audit_bundle_path(self, *, block_hash: str) -> Path:
         self.audit_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=self.audit_dir,
-            prefix=f".prism-live-audit-bundle-candidate-{block_hash}-",
-            suffix=".json.tmp",
-            delete=False,
-        ) as handle:
+        return self.audit_dir / (
+            f".prism-live-audit-bundle-candidate-{block_hash}-{uuid.uuid4().hex}.json.tmp"
+        )
+
+    @staticmethod
+    def verified_canonical_bundle_path(
+        candidate_bundle_path: Path,
+        report: dict[str, Any],
+    ) -> Path | None:
+        expected_sha256 = str(report["audit_bundle_sha256_hex"]).lower()
+        digest = hashlib.sha256()
+        with candidate_bundle_path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        if digest.hexdigest() != expected_sha256:
+            return None
+        return candidate_bundle_path
+
+    def write_temporary_audit_bundle(self, bundle: dict[str, Any], *, block_hash: str) -> Path:
+        path = self.temporary_audit_bundle_path(block_hash=block_hash)
+        with path.open("x", encoding="utf-8") as handle:
             json.dump(bundle, handle, separators=(",", ":"))
             handle.flush()
             os.fsync(handle.fileno())
-            return Path(handle.name)
+        return path
 
     def write_audit_bundle_envelope(
         self,
@@ -9329,9 +9451,9 @@ class PrismCoordinator:
             }
             worker_rejection_counts = dict(self.worker_rejection_counts)
         coinbase_weight_headroom = 2_000_000
-        if self.latest_bundle is not None:
-            coinbase_hex = self.latest_bundle["signed_coinbase_manifest"]["manifest"]["coinbase_tx_hex"]
-            coinbase_weight_headroom = 2_000_000 - (len(coinbase_hex) // 2)
+        latest_coinbase_size_bytes = getattr(self, "latest_coinbase_size_bytes", None)
+        if latest_coinbase_size_bytes is not None:
+            coinbase_weight_headroom = 2_000_000 - int(latest_coinbase_size_bytes)
         ctv_pending = 0
         ctv_broadcastable = 0
         ctv_failed = 0

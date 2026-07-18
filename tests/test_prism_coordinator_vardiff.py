@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import queue
@@ -61,6 +62,40 @@ from lab.prism.prism_coordinator import (
 )
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"
+
+
+def fake_audit_bundle_popen(
+    captured: dict[str, object],
+    *,
+    output_text: str = '{"ok":true}',
+    returncode: int = 0,
+    stderr_text: str = "",
+) -> type:
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.parts: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.parts.append(value)
+            return len(value)
+
+        def close(self) -> None:
+            return None
+
+    class FakePopen:
+        def __init__(self, cmd: list[str], **kwargs: object) -> None:
+            captured["cmd"] = cmd
+            self.stdin = FakeStdin()
+            self.stdout = kwargs["stdout"]
+            self.stderr = kwargs["stderr"]
+
+        def wait(self) -> int:
+            captured["payload"] = json.loads("".join(self.stdin.parts))
+            self.stdout.write(output_text)
+            self.stderr.write(stderr_text)
+            return returncode
+
+    return FakePopen
 
 
 def tx_output(value_sats: int, script_hex: str) -> str:
@@ -588,13 +623,7 @@ def coordinator() -> PrismCoordinator:
     server.accepted_block_count = 1
     server.started_monotonic = time.monotonic() - 10
     server.ledger = FakeLedger(shares=5)
-    server.latest_bundle = {
-        "signed_coinbase_manifest": {
-            "manifest": {
-                "coinbase_tx_hex": "00" * 250,
-            }
-        }
-    }
+    server.latest_coinbase_size_bytes = 250
     server.rpc = FakeRpc()
     server.qbit_chain = "regtest"
     server.blockpoll_seconds = 2.0
@@ -1874,11 +1903,6 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.ledger_attestation_signing_seed_hex = "43" * 32
         captured: dict[str, object] = {}
 
-        def fake_run(cmd: list[str], **kwargs: object) -> object:
-            captured["cmd"] = cmd
-            captured["payload"] = json.loads(str(kwargs["input"]))
-            return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
-
         with patch.dict(
             os.environ,
             {
@@ -1887,7 +1911,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 "PRISM_POOL_FEE_ADDRESS": "tq1fee",
             },
             clear=True,
-        ), patch("lab.prism.prism_coordinator.subprocess.run", side_effect=fake_run):
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(captured),
+        ):
             bundle = server.build_audit_bundle(
                 shares=[],
                 found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
@@ -1908,10 +1935,6 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.ledger_attestation_signing_seed_hex = "43" * 32
         captured: dict[str, object] = {}
 
-        def fake_run(cmd: list[str], **kwargs: object) -> object:
-            captured["payload"] = json.loads(str(kwargs["input"]))
-            return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
-
         with patch.dict(
             os.environ,
             {
@@ -1924,7 +1947,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS": "12000",
             },
             clear=True,
-        ), patch("lab.prism.prism_coordinator.subprocess.run", side_effect=fake_run):
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(captured),
+        ):
             bundle = server.build_audit_bundle(
                 shares=[],
                 found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
@@ -1949,6 +1975,122 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_build_audit_bundle_preserves_exact_canonical_output_file(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        canonical_bytes = b'{"ok":true,"nested":[1,2]}'
+        captured: dict[str, object] = {}
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(
+                captured,
+                output_text=canonical_bytes.decode("utf-8"),
+            ),
+        ):
+            output_path = Path(tmp) / "candidate.audit.json"
+            bundle = server.build_audit_bundle(
+                shares=[],
+                found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                canonical_output_path=output_path,
+            )
+
+            self.assertEqual(bundle, {"ok": True, "nested": [1, 2]})
+            self.assertEqual(output_path.read_bytes(), canonical_bytes)
+            self.assertIn("--canonical-output", captured["cmd"])
+            self.assertEqual(captured["payload"]["shares"], [])
+
+    def test_build_audit_bundle_summary_only_requests_and_parses_job_summary(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        summary = {
+            "found_block": {
+                "block_height": 10,
+                "coinbase_value_sats": 50_00000000,
+            },
+            "signed_coinbase_manifest": {
+                "manifest": {"coinbase_tx_hex": "c0ffee"},
+                "signature": {"signature_hex": "11" * 64},
+            },
+        }
+        captured: dict[str, object] = {}
+
+        with patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(
+                captured,
+                output_text=json.dumps(summary, separators=(",", ":")),
+            ),
+        ), patch.object(
+            Path,
+            "open",
+            side_effect=AssertionError("summary-only build must not open an output path"),
+        ):
+            bundle = server.build_audit_bundle(
+                shares=[],
+                found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                summary_only=True,
+            )
+
+        self.assertEqual(bundle, summary)
+        self.assertEqual(set(bundle), {"found_block", "signed_coinbase_manifest"})
+        self.assertIn("--job-summary-output", captured["cmd"])
+        self.assertNotIn("--canonical-output", captured["cmd"])
+
+    def test_build_audit_bundle_removes_partial_output_after_builder_failure(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(
+                captured,
+                output_text='{"partial":',
+                returncode=9,
+                stderr_text="synthetic builder failure",
+            ),
+        ):
+            output_path = Path(tmp) / "candidate.audit.json"
+            with self.assertRaisesRegex(RuntimeError, "synthetic builder failure"):
+                server.build_audit_bundle(
+                    shares=[],
+                    found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                    prior_balances=[],
+                    coinbase_script_sig_suffix_hex="00",
+                    canonical_output_path=output_path,
+                )
+            self.assertFalse(output_path.exists())
+
+    def test_build_audit_bundle_does_not_unlink_preexisting_output_path(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "lab.prism.prism_coordinator.subprocess.Popen"
+        ) as popen:
+            output_path = Path(tmp) / "preexisting-candidate.audit.json"
+            output_path.write_bytes(b"do-not-clobber")
+            with self.assertRaises(FileExistsError):
+                server.build_audit_bundle(
+                    shares=[],
+                    found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                    prior_balances=[],
+                    coinbase_script_sig_suffix_hex="00",
+                    canonical_output_path=output_path,
+                )
+
+            self.assertEqual(output_path.read_bytes(), b"do-not-clobber")
+            popen.assert_not_called()
 
     def test_prism_ctv_settlement_config_uses_legacy_unit_aliases(self) -> None:
         server = coordinator()
@@ -5056,28 +5198,66 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             witness_tx = synthetic_witness_transaction("44")
             server.jobs["job-1"].job.transaction_hexes = (witness_tx,)
             build_kwargs: list[dict[str, object]] = []
-
-            def fake_build_audit_bundle(**kwargs: object) -> dict[str, object]:
-                build_kwargs.append(kwargs)
-                return {
-                "found_block": {"coinbase_value_sats": 50_00000000},
-                "ledger_window_attestation": {"signature": {"public_key_hex": "aa" * 32}},
-                "payout_policy_manifest": {"accounts": []},
+            # Deliberately use insertion order that differs from this fixture's
+            # stand-in canonical serialization. The alternate builder creates
+            # the requested output but writes pretty, noncanonical JSON, so
+            # existence alone must not make the path eligible for persistence.
+            alternate_bundle = {
                 "signed_coinbase_manifest": {
                     "manifest": {
                         "coinbase_tx_hex": "c0ffee",
                         "payout_count": 1,
                     }
                 },
+                "payout_policy_manifest": {"accounts": []},
+                "ledger_window_attestation": {"signature": {"public_key_hex": "aa" * 32}},
+                "found_block": {"coinbase_value_sats": 50_00000000},
+            }
+            canonical_bytes = json.dumps(
+                alternate_bundle,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+
+            def fake_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+                build_kwargs.append(kwargs)
+                output_path = kwargs["canonical_output_path"]
+                assert isinstance(output_path, Path)
+                output_path.write_text(
+                    json.dumps(alternate_bundle, indent=2),
+                    encoding="utf-8",
+                )
+                return alternate_bundle
+
+            def fake_verify_bundle(bundle_path: Path, *_args: object, **_kwargs: object) -> dict[str, object]:
+                candidate_bytes = bundle_path.read_bytes()
+                self.assertEqual(json.loads(candidate_bytes), alternate_bundle)
+                self.assertNotEqual(candidate_bytes, canonical_bytes)
+                self.assertNotEqual(
+                    hashlib.sha256(candidate_bytes).hexdigest(),
+                    canonical_sha256,
+                )
+                return {
+                    "coinbase_txid": "11" * 32,
+                    "coinbase_manifest_sha256_hex": "22" * 32,
+                    "audit_bundle_sha256_hex": canonical_sha256,
+                    "coinbase_tx_hex": "c0ffee",
                 }
 
+            persist_accepted_block = ledger.persist_accepted_block
+
+            def persist_with_canonicalization(**kwargs: object) -> dict[str, object]:
+                self.assertIsNone(kwargs["canonical_bundle_path"])
+                self.assertEqual(kwargs["final_bundle"], alternate_bundle)
+                report = kwargs["audit_report"]
+                assert isinstance(report, dict)
+                self.assertEqual(report["audit_bundle_sha256_hex"], canonical_sha256)
+                return persist_accepted_block(**kwargs)
+
             server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
-            server.verify_bundle = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
-                "coinbase_txid": "11" * 32,
-                "coinbase_manifest_sha256_hex": "22" * 32,
-                "audit_bundle_sha256_hex": "33" * 32,
-                "coinbase_tx_hex": "c0ffee",
-            }
+            server.verify_bundle = fake_verify_bundle  # type: ignore[method-assign]
+            ledger.persist_accepted_block = persist_with_canonicalization  # type: ignore[method-assign]
             submission = SimpleNamespace(
                 coinbase_tx_hex="c0ffee",
                 block_hash_hex=block_hash,
@@ -5098,7 +5278,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertEqual(envelope["schema"], "qbit.prism.live-audit-bundle-envelope.v1")
             self.assertEqual(envelope["block_hash"], block_hash)
             self.assertEqual(envelope["block_height"], 10)
-            self.assertEqual(envelope["audit_bundle_sha256"], "33" * 32)
+            self.assertEqual(envelope["audit_bundle_sha256"], canonical_sha256)
             self.assertNotIn("signed_coinbase_manifest", envelope)
             self.assertEqual(server.latest_evidence["audit_bundle_path"], str(live_files[0]))
 
@@ -5114,6 +5294,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.persisted[0]["block_hash"], block_hash)
         self.assertEqual(ledger.persisted[0]["block_height"], 10)
         self.assertTrue(ledger.persisted[0]["submit_seen_at_persist"])
+        # This alternate test builder wrote noncanonical bytes to the requested
+        # path. The verified content is valid, but the path is never claimed as
+        # a byte-canonical artifact for ledger persistence.
+        self.assertIsNone(ledger.persisted[0]["canonical_bundle_path"])
         self.assertEqual(server._payout_state_generation, 1)
         self.assertEqual(server._job_bundle_cache, {})
         self.assertTrue(active_fanout.is_set())
@@ -5489,6 +5673,27 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.payout_state_candidates_discarded, 1)
         self.assertEqual(server.reorg_reconcile_skip_count, 1)
 
+    def test_verified_canonical_bundle_path_requires_exact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            candidate_path = Path(tempdir) / "candidate.json"
+            candidate_bytes = b'{"canonical":true}'
+            candidate_path.write_bytes(candidate_bytes)
+            canonical_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+
+            self.assertEqual(
+                PrismCoordinator.verified_canonical_bundle_path(
+                    candidate_path,
+                    {"audit_bundle_sha256_hex": canonical_sha256.upper()},
+                ),
+                candidate_path,
+            )
+            self.assertIsNone(
+                PrismCoordinator.verified_canonical_bundle_path(
+                    candidate_path,
+                    {"audit_bundle_sha256_hex": "00" * 32},
+                )
+            )
+
     def test_active_ancestor_candidate_resumes_full_finalization_without_resubmit(self) -> None:
         server, state, ledger = submit_coordinator()
         with tempfile.TemporaryDirectory() as tempdir:
@@ -5542,6 +5747,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
 
         self.assertEqual(ledger.persisted[0]["block_hash"], block_hash)
+        # This compatibility builder ignores canonical_output_path, so its
+        # Python fallback remains verifier-only.
+        self.assertIsNone(ledger.persisted[0]["canonical_bundle_path"])
         self.assertEqual(ledger.confirmed[0]["active_tip_height"], 11)
         self.assertEqual(ledger.confirmed[0]["block_hash"], block_hash)
         self.assertFalse(ledger.confirmed[0]["submit_seen_at_confirm"])
@@ -6988,7 +7196,7 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             key=("test",),
             template=gbt_template("00" * 32),
             template_fingerprint="fp",
-            bundle={},
+            coinbase_manifest={},
             shares_json=[],
             prior_balances=[],
             found_block={"network_difficulty": 1},

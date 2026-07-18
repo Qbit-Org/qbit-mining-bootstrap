@@ -248,7 +248,7 @@ def coordinator(
     server.last_reorg_reconciled_trusted = False
     server.last_reorg_reconciled_monotonic = None
     server.latest_evidence = None
-    server.latest_bundle = None
+    server.latest_coinbase_size_bytes = None
     server.tip_template_snapshot = None
     server.recent_share_keys = set()
     server.extranonce2_size = EXTRANONCE2_SIZE
