@@ -1245,6 +1245,8 @@ class PsqlShareLedger:
     SQL schema under `crates/qbit-prism/sql`.
     """
 
+    durable_payout_state = True
+
     def __init__(
         self,
         *,
@@ -1975,11 +1977,13 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY share_seq ASC), '[]'::json)
 FROM rows;
 """
-        with self._lock:
-            return [
-                self._record_from_json(item)
-                for item in self._run_retry_safe_read_json(sql)
-            ]
+        # Job construction is a retry-safe MVCC read. Use the independent read
+        # pool so an accepted block's fenced bulk write cannot stall replacement
+        # work behind the single-writer connection lock.
+        return [
+            self._record_from_json(item)
+            for item in self._run_read_json(sql)
+        ]
 
     def all_shares(self) -> list[AcceptedShareRecord]:
         sql = """
@@ -2142,6 +2146,51 @@ WHERE owed_balance_sats > 0;
 """
         with self._lock:
             balances = self._run_retry_safe_read_json(sql)
+        for balance in balances:
+            balance["balance_sats"] = int(balance["balance_sats"])
+        return balances
+
+    def prior_balances_after_pool_block(
+        self,
+        *,
+        block_hash: str,
+    ) -> list[dict[str, object]]:
+        """Return active carry balances as of one confirmed pool block."""
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        sql = f"""
+WITH target AS (
+    SELECT block_height
+    FROM qbit_pool_blocks
+    WHERE block_hash = {self._text_literal(block_hash)}
+      AND chain_state = 'confirmed'
+      AND maturity_state <> 'reversed'
+),
+balances AS (
+    SELECT
+        (array_agg(carry.miner_id ORDER BY carry.payout_order_key, carry.miner_id))[1] AS miner_id,
+        (array_agg(carry.payout_order_key ORDER BY carry.payout_order_key, carry.miner_id))[1] AS payout_order_key,
+        carry.p2mr_program,
+        SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric) AS balance_sats
+    FROM qbit_payout_carry_forward carry
+    JOIN qbit_pool_blocks block
+      ON block.block_hash = carry.block_hash
+    CROSS JOIN target
+    WHERE carry.maturity_state <> 'reversed'
+      AND block.chain_state = 'confirmed'
+      AND block.maturity_state <> 'reversed'
+      AND block.block_height <= target.block_height
+    GROUP BY carry.p2mr_program
+    HAVING SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric) <> 0
+)
+SELECT COALESCE(json_agg(json_build_object(
+    'recipient_id', miner_id,
+    'order_key', payout_order_key,
+    'p2mr_program_hex', encode(p2mr_program, 'hex'),
+    'balance_sats', balance_sats::text
+) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
+FROM balances;
+"""
+        balances = list(self._run_read_json(sql))
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
@@ -5727,6 +5776,35 @@ SELECT json_build_object(
             "backend": str(result["backend"]),
             "confirmed_count": int(result["confirmed_count"]),
         }
+
+    def pool_block_state(self, *, block_hash: str) -> dict[str, object] | None:
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        sql = f"""
+SELECT json_build_object(
+    'state', (
+        SELECT json_build_object(
+            'block_hash', block_hash,
+            'block_height', block_height,
+            'parent_hash', parent_hash,
+            'chain_state', chain_state,
+            'maturity_state', maturity_state
+        )
+        FROM qbit_pool_blocks
+        WHERE block_hash = {self._text_literal(block_hash)}
+    )
+);
+"""
+        with self._lock:
+            result = self._run_retry_safe_read_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError("pool block state query returned non-object JSON")
+        state = result.get("state")
+        if state is None:
+            return None
+        if not isinstance(state, dict):
+            raise RuntimeError("pool block state query returned non-object JSON")
+        state["block_height"] = int(state["block_height"])
+        return state
 
     def reorg_watch_blocks(self, *, active_tip_height: int) -> list[dict[str, object]]:
         sql = f"""

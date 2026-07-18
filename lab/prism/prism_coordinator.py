@@ -34,7 +34,7 @@ from dataclasses import dataclass, field, replace as dataclass_replace
 from decimal import Context, Decimal, InvalidOperation, ROUND_CEILING, getcontext, localcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Sequence
 
 import sys
 
@@ -126,6 +126,10 @@ MAX_PENDING_BLOCK_CANDIDATES = 32
 # waits for its batch's Postgres commit before receiving Stratum success, so
 # this is a latency-smoothing bound rather than a durable backlog.
 MAX_PENDING_SHARE_APPENDS = 4_096
+# A pending share commit normally clears the snapshot anchor floor within one
+# group-commit linger. Holding it longer than this is a wedged writer or a
+# leaked release path and is logged loudly (once per share).
+PRISM_PENDING_SHARE_COMMIT_WARN_SECONDS = 30.0
 DEFAULT_SHARE_COMMIT_BATCH_SIZE = 64
 DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS = 5.0
 DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS = 15.0
@@ -244,6 +248,7 @@ PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
 )
 DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS = 0.25
 DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
+DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS = 5.0
 # Credit policies recorded on accepted ledger rows. Normal shares carry no
 # policy; a policy marks a share that was credited by an explicit pool rule
 # (documented in docs/prism-rejections.md) so audits can distinguish them.
@@ -920,6 +925,7 @@ class PrismJobContext:
     template_fingerprint: str | None = None
     template_generation: int = 0
     payout_state_generation: int = 0
+    prospective_prior_balances: tuple[tuple[str, str, str, int], ...] | None = None
     payout_artifact_generation: int = 0
     connection_id: int = 0
     authorization_generation: int = 0
@@ -1091,7 +1097,21 @@ class CachedJobBundle:
     # identity. Ready bundles have no worker-specific inputs and keep this
     # unset, which makes accidental cross-worker stamping fail closed.
     collection_identity: tuple[str, str] | None = None
+    # Compact carry-forward state derived from the immutable job summary. It
+    # lets an accepted block publish child payout state without retaining the
+    # full audit bundle (and its duplicate shares tree) in every cached job.
+    prospective_prior_balances: tuple[tuple[str, str, str, int], ...] | None = None
     build_key: JobBuildKey | None = None
+
+
+@dataclass(frozen=True)
+class _AcceptedBlockPayoutTransition:
+    """Prospective balances for one durable candidate across its landing seam."""
+
+    block_height: int | None = None
+    landed: bool = False
+    preview: tuple[tuple[str, str, str, int], ...] | None = None
+    published_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1132,6 +1152,10 @@ class PayoutStateCandidate:
     cause: str
     invalidated_monotonic: float
     prepared_monotonic: float
+    accepted_block_hash: str | None = None
+    accepted_block_preview: tuple[tuple[str, str, str, int], ...] | None = None
+    accepted_block_withdrawal: bool = False
+    accepted_block_height: int | None = None
     ledger_artifact: PayoutLedgerArtifact | None = field(
         default=None,
         compare=False,
@@ -1161,6 +1185,11 @@ class PayoutLedgerArtifact:
     shares_json: tuple[dict[str, object], ...] = field(repr=False)
     prior_balances: tuple[dict[str, object], ...] = field(repr=False)
     prepared_monotonic: float
+    # The anchor the share snapshot was actually taken at. Bundles built from
+    # this artifact must declare it as anchor_job_issued_at_ms: an auditor
+    # replaying qbit_audit_share_window at the declared anchor must reproduce
+    # exactly these shares, which only holds at the snapshot's own anchor.
+    snapshot_anchor_ms: int | None = None
 
 
 @dataclass
@@ -2337,6 +2366,11 @@ class PrismCoordinator:
         self.connection_counter = 0
         self.job_counter = 0
         self.accepted_block_count = 0
+        # A durable outbox terminal update can fail after the accepted-block
+        # success tail has completed.  Same-process replay must not count or
+        # announce that hash twice; a fresh process intentionally starts with
+        # an empty set and reconstructs its process-local count from replay.
+        self._accounted_accepted_block_hashes: set[str] = set()
         self.started_monotonic = time.monotonic()
         self.submitted_share_count = 0
         self.stale_share_count = 0
@@ -2895,6 +2929,15 @@ class PrismCoordinator:
             self._payout_ledger_artifact: PayoutLedgerArtifact | None = None
         if not hasattr(self, "_payout_ledger_artifact_generation"):
             self._payout_ledger_artifact_generation = 0
+        if not hasattr(self, "_pending_share_commit_lock"):
+            self._pending_share_commit_lock = threading.Lock()
+        if not hasattr(self, "_pending_share_commit_floor"):
+            # Shares whose accepted_at_ms has been assigned but whose ledger
+            # row has not reached a terminal outcome in this process. Job and
+            # payout-artifact snapshot anchors clamp below every entry so a
+            # bundle's eligible-share set stays exactly reproducible from the
+            # durable ledger after those rows commit.
+            self._pending_share_commit_floor: dict[int, list[object]] = {}
         if not hasattr(self, "_payout_artifact_executor_lock"):
             self._payout_artifact_executor_lock = threading.Lock()
         if not hasattr(self, "_payout_artifact_executor"):
@@ -2909,6 +2952,31 @@ class PrismCoordinator:
             # Orders reconciliation mutations against final job-delivery
             # admission while preserving parallel sends to different miners.
             self._payout_state_delivery_gate = _PayoutStateDeliveryGate()
+        if not hasattr(self, "_payout_balance_mutation_lock"):
+            # Keep durable payout-balance transitions serialized even when their
+            # preparation intentionally runs outside the delivery gate.  The
+            # accepted-block path can hold this lock across expensive writes
+            # without preventing replacement jobs from reaching miners.
+            self._payout_balance_mutation_lock = threading.RLock()
+        if not hasattr(self, "_accepted_block_payout_preview_condition"):
+            self._accepted_block_payout_preview_condition = threading.Condition()
+        if not hasattr(self, "_accepted_block_payout_previews"):
+            # Durable replay registers an unlanded transition. Once its block
+            # is active, reconciliation is barred and child/descendant builders
+            # wait for or consume its verified prospective balance snapshot.
+            self._accepted_block_payout_previews: dict[
+                str, _AcceptedBlockPayoutTransition
+            ] = {}
+        if not hasattr(self, "_invalidated_accepted_block_payout_previews"):
+            # A landed transition can be withdrawn before durability catches
+            # up. Keep a height-bearing tombstone so a new exact/descendant
+            # build cannot fall through to database balances that omit it in
+            # the gap before durable retry re-registers the candidate.
+            self._invalidated_accepted_block_payout_previews: dict[
+                str, int | None
+            ] = {}
+        if not hasattr(self, "_accounted_accepted_block_hashes"):
+            self._accounted_accepted_block_hashes: set[str] = set()
         if not hasattr(self, "_payout_state_metrics_lock"):
             self._payout_state_metrics_lock = threading.Lock()
         if not hasattr(self, "payout_state_histograms"):
@@ -3104,9 +3172,10 @@ class PrismCoordinator:
                     * PRISM_SNAPSHOT_WINDOW_MARGIN
                     * int(network_difficulty)
                 )
+                snapshot_anchor_ms = self._job_snapshot_anchor_ms(now_ms())
                 records = list(
                     self.ledger.snapshot_at_job_issue(
-                        now_ms(),
+                        snapshot_anchor_ms,
                         window_weight=snapshot_window_weight,
                     )
                 )
@@ -3138,6 +3207,7 @@ class PrismCoordinator:
             shares_json=shares_json,
             prior_balances=frozen_balances,
             prepared_monotonic=time.monotonic(),
+            snapshot_anchor_ms=snapshot_anchor_ms,
         )
 
     def _prepare_payout_ledger_artifact(
@@ -3241,6 +3311,24 @@ class PrismCoordinator:
                 return None
             return artifact
 
+    def _schedule_current_payout_ledger_artifact_if_missing(self) -> None:
+        """Resume speculative preparation after a durable preview catches up."""
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            payout_state_generation = self._payout_state_generation
+            template_artifacts = self._template_artifacts
+        if template_artifacts is None:
+            return
+        if self._usable_payout_ledger_artifact(
+            payout_state_generation,
+            template_artifacts.network_difficulty,
+        ) is not None:
+            return
+        self._schedule_payout_ledger_artifact_preparation(
+            payout_state_generation,
+            template_artifacts.network_difficulty,
+        )
+
     def shutdown_payout_artifact_executor(self) -> None:
         self._ensure_job_cache_state()
         with self._payout_artifact_executor_lock:
@@ -3282,19 +3370,32 @@ class PrismCoordinator:
             balances = self.ledger.current_prior_balances()
         if cancellation is not None:
             cancellation.raise_if_cancelled("payout artifact serialization")
-        balances_json = canonical_json_text(balances)
-        artifact = PayoutStateArtifact(
+        artifact = self._payout_state_artifact_from_balances(
             generation=generation,
             source_generation=source_generation,
-            prior_balances_json=balances_json,
-            prior_balances_sha256=hashlib.sha256(balances_json.encode()).hexdigest(),
-            prepared_monotonic=time.monotonic(),
+            balances=balances,
         )
         phases = self._job_build_phases()
         phases["payout_artifact"] = phases.get("payout_artifact", 0.0) + (
             time.monotonic() - started
         )
         return artifact
+
+    def _payout_state_artifact_from_balances(
+        self,
+        *,
+        generation: int,
+        source_generation: int,
+        balances: list[dict[str, object]],
+    ) -> PayoutStateArtifact:
+        balances_json = canonical_json_text(balances)
+        return PayoutStateArtifact(
+            generation=generation,
+            source_generation=source_generation,
+            prior_balances_json=balances_json,
+            prior_balances_sha256=hashlib.sha256(balances_json.encode()).hexdigest(),
+            prepared_monotonic=time.monotonic(),
+        )
 
     def _current_payout_state_artifact(
         self,
@@ -3819,6 +3920,564 @@ class PrismCoordinator:
                 == artifact.prior_balances_sha256
             )
 
+    @contextmanager
+    def _payout_balance_mutation(self) -> Iterator[None]:
+        """Serialize durable balance changes without excluding delivery."""
+        self._ensure_job_cache_state()
+        with self._payout_balance_mutation_lock:
+            with self._accepted_block_payout_preview_condition:
+                landed_transition = any(
+                    transition.landed
+                    for transition in self._accepted_block_payout_previews.values()
+                )
+            if landed_transition:
+                raise TemplateRefreshBlocked(
+                    "accepted block payout confirmation is still pending"
+                )
+            yield
+
+    def _begin_accepted_block_payout_preview(
+        self,
+        block_hash: str,
+        *,
+        block_height: int | None = None,
+    ) -> None:
+        """Prevent child work from snapshotting pre-accept balances."""
+        self._ensure_job_cache_state()
+        key = block_hash.lower()
+        with self._accepted_block_payout_preview_condition:
+            self._invalidated_accepted_block_payout_previews.pop(key, None)
+            existing = self._accepted_block_payout_previews.get(key)
+            if existing is None:
+                self._accepted_block_payout_previews[key] = (
+                    _AcceptedBlockPayoutTransition(block_height=block_height)
+                )
+            elif (
+                block_height is not None
+                and existing.block_height is not None
+                and existing.block_height != block_height
+            ):
+                raise RuntimeError("accepted block payout transition height changed")
+            elif existing.block_height is None and block_height is not None:
+                self._accepted_block_payout_previews[key] = dataclass_replace(
+                    existing,
+                    block_height=block_height,
+                )
+
+    def _mark_accepted_block_payout_landed(
+        self,
+        block_hash: str,
+        *,
+        block_height: int,
+    ) -> None:
+        """Bar reconciliation after submitblock makes a candidate active."""
+        self._ensure_job_cache_state()
+        key = block_hash.lower()
+        with self._accepted_block_payout_preview_condition:
+            existing = self._accepted_block_payout_previews.get(
+                key,
+                _AcceptedBlockPayoutTransition(block_height=block_height),
+            )
+            if existing.block_height not in {None, block_height}:
+                raise RuntimeError("accepted block payout transition height changed")
+            self._accepted_block_payout_previews[key] = dataclass_replace(
+                existing,
+                block_height=block_height,
+                landed=True,
+            )
+            self._accepted_block_payout_preview_condition.notify_all()
+
+    def _publish_accepted_block_payout_preview(
+        self,
+        block_hash: str,
+        balances: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Publish the balances child work must observe after confirmation.
+
+        Canonicalization happens before the delivery boundary. The gate only
+        installs an immutable pointer and advances the generation, so no job
+        bound to the pre-accept balances can land after publication.
+        """
+        normalized = self.normalized_prior_balances(balances)
+        serialized = self._serialize_prior_balance_preview(normalized)
+        key = block_hash.lower()
+        with self._payout_balance_mutation_lock:
+            with self._accepted_block_payout_preview_condition:
+                existing = self._accepted_block_payout_previews.get(key)
+                existing_preview = existing.preview if existing is not None else None
+                if existing_preview is not None:
+                    if existing_preview != serialized:
+                        raise RuntimeError(
+                            "accepted block payout preview changed during retry"
+                        )
+                    if (
+                        existing is not None
+                        and existing.published_generation is not None
+                    ):
+                        return self._materialize_prior_balance_preview(
+                            existing_preview
+                        )
+                    # A bounded publication loss retains the compact preview
+                    # locally while delivery remains fenced. Matching retries
+                    # must still cross the atomic publication boundary so they
+                    # install a generation and reopen admission.
+
+            captured = self._capture_payout_state_source()
+            reserved = self._reserve_payout_state_source_if_current(
+                captured[1],
+                "accepted_block_preview",
+                tip_hash=key,
+                invalidated_monotonic=time.monotonic(),
+            )
+            if reserved is None:
+                candidate = self._current_payout_state_candidate()
+            else:
+                candidate = self._prepared_payout_state_candidate(reserved)
+            candidate = self._accepted_block_preview_candidate(
+                candidate,
+                block_hash=key,
+                preview=serialized,
+            )
+            # Close delivery admission before exposing the preview. The
+            # generation publication below performs the only atomic pointer
+            # swap and reopens admission; no preparation lock is involved.
+            self._block_payout_state_publication(force=True)
+            published = self._publish_payout_state_candidate(candidate)
+            if published is None:
+                max_retries = max(
+                    0,
+                    int(
+                        getattr(
+                            self,
+                            "payout_reconcile_supersession_retries",
+                            DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
+                        )
+                    ),
+                )
+                for _attempt in range(max_retries):
+                    candidate = self._accepted_block_preview_candidate(
+                        self._current_payout_state_candidate(),
+                        block_hash=key,
+                        preview=serialized,
+                    )
+                    published = self._publish_payout_state_candidate(candidate)
+                    if published is not None:
+                        break
+            if published is None:
+                self._block_payout_state_publication(force=True)
+                # Admission is now globally fenced, so retaining the compact
+                # preview locally is safe even though it did not win an atomic
+                # generation publication. Finalization may finish; the normal
+                # retry loop will publish the newest source before delivery
+                # resumes.
+                with self._accepted_block_payout_preview_condition:
+                    transition = self._accepted_block_payout_previews.get(
+                        key,
+                        _AcceptedBlockPayoutTransition(landed=True),
+                    )
+                    self._accepted_block_payout_previews[key] = dataclass_replace(
+                        transition,
+                        landed=True,
+                        preview=serialized,
+                        published_generation=None,
+                    )
+                    self._accepted_block_payout_preview_condition.notify_all()
+        return self._materialize_prior_balance_preview(serialized)
+
+    def _accepted_block_preview_candidate(
+        self,
+        candidate: PayoutStateCandidate,
+        *,
+        block_hash: str,
+        preview: tuple[tuple[str, str, str, int], ...],
+    ) -> PayoutStateCandidate:
+        """Bind a compact preview to its prepared artifact before gating."""
+        ledger_artifact = candidate.ledger_artifact
+        if ledger_artifact is not None:
+            # The artifact was prepared before accepted-block persistence, so
+            # replace only its balance view with the verified prospective
+            # state. This allocation must stay outside delivery publication.
+            ledger_artifact = dataclass_replace(
+                ledger_artifact,
+                prior_balances=tuple(
+                    self._materialize_prior_balance_preview(preview)
+                ),
+            )
+        return dataclass_replace(
+            candidate,
+            accepted_block_hash=block_hash,
+            accepted_block_preview=preview,
+            ledger_artifact=ledger_artifact,
+        )
+
+    @staticmethod
+    def _serialize_prior_balance_preview(
+        balances: list[dict[str, object]],
+    ) -> tuple[tuple[str, str, str, int], ...]:
+        return tuple(
+            (
+                str(balance["recipient_id"]),
+                str(balance["order_key"]),
+                str(balance["p2mr_program_hex"]),
+                int(balance["balance_sats"]),
+            )
+            for balance in balances
+        )
+
+    def _accepted_block_payout_preview_from_bundle(
+        self,
+        final_bundle: dict[str, Any],
+        *,
+        prior_balances: list[dict[str, object]] | None = None,
+    ) -> list[dict[str, object]]:
+        """Derive the confirmed carry-forward view from a verified bundle."""
+        manifest = final_bundle.get("payout_policy_manifest")
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("accounts"), list):
+            raise RuntimeError("accepted block payout manifest is missing accounts")
+        prior_identities: dict[str, tuple[str, str]] = {}
+        for balance in prior_balances or []:
+            program = str(balance.get("p2mr_program_hex", "")).lower()
+            identity = (
+                str(balance.get("order_key", "")),
+                str(balance.get("recipient_id", "")),
+            )
+            prior_identities[program] = min(
+                identity,
+                prior_identities.get(program, identity),
+            )
+        balances: list[dict[str, object]] = []
+        for account in manifest["accounts"]:
+            if not isinstance(account, dict):
+                continue
+            if str(account.get("account_type", "miner")) == "pool_fee":
+                continue
+            balance_sats = int(account.get("carry_forward_balance_sats", 0))
+            if balance_sats == 0:
+                continue
+            program = str(account.get("p2mr_program_hex", "")).lower()
+            account_identity = (
+                str(account.get("order_key", "")),
+                str(account.get("recipient_id", "")),
+            )
+            order_key, recipient_id = min(
+                account_identity,
+                prior_identities.get(program, account_identity),
+            )
+            balances.append(
+                {
+                    "recipient_id": recipient_id,
+                    "order_key": order_key,
+                    "p2mr_program_hex": program,
+                    "balance_sats": balance_sats,
+                }
+            )
+        return self.normalized_prior_balances(balances)
+
+    @staticmethod
+    def _materialize_prior_balance_preview(
+        preview: tuple[tuple[str, str, str, int], ...],
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "recipient_id": recipient_id,
+                "order_key": order_key,
+                "p2mr_program_hex": p2mr_program_hex,
+                "balance_sats": balance_sats,
+            }
+            for recipient_id, order_key, p2mr_program_hex, balance_sats in preview
+        ]
+
+    def _clear_accepted_block_payout_preview(
+        self,
+        block_hash: str,
+        *,
+        invalidate_published: bool = False,
+    ) -> None:
+        self._ensure_job_cache_state()
+        key = block_hash.lower()
+        with self._payout_balance_mutation_lock:
+            with self._accepted_block_payout_preview_condition:
+                existing = self._accepted_block_payout_previews.get(key)
+                if existing is None:
+                    if not invalidate_published:
+                        self._invalidated_accepted_block_payout_previews.pop(
+                            key,
+                            None,
+                        )
+                    self._accepted_block_payout_preview_condition.notify_all()
+                    return
+                if not invalidate_published:
+                    # Durable state now equals the published prospective view;
+                    # removing the override changes no logical payout state.
+                    self._accepted_block_payout_previews.pop(key, None)
+                    self._invalidated_accepted_block_payout_previews.pop(key, None)
+                    self._accepted_block_payout_preview_condition.notify_all()
+                    return
+                if existing.preview is None:
+                    # Nothing crossed a generation boundary. A landed
+                    # transition still becomes a tombstone so descendants
+                    # cannot fall through to an uncertain database snapshot.
+                    self._accepted_block_payout_previews.pop(key, None)
+                    if existing.landed:
+                        self._invalidated_accepted_block_payout_previews[key] = (
+                            existing.block_height
+                        )
+                    self._accepted_block_payout_preview_condition.notify_all()
+                    return
+
+            captured = self._capture_payout_state_source()
+            reserved = self._reserve_payout_state_source_if_current(
+                captured[1],
+                "accepted_block_preview_withdrawn",
+                tip_hash=captured[2],
+                invalidated_monotonic=time.monotonic(),
+            )
+            candidate = self._prepared_payout_state_candidate(
+                reserved if reserved is not None else self._capture_payout_state_source()
+            )
+            candidate = dataclass_replace(
+                candidate,
+                accepted_block_hash=key,
+                accepted_block_withdrawal=True,
+                accepted_block_height=existing.block_height,
+            )
+            self._block_payout_state_publication(force=True)
+            published = self._publish_payout_state_candidate(candidate)
+            if published is None:
+                max_retries = max(
+                    0,
+                    int(
+                        getattr(
+                            self,
+                            "payout_reconcile_supersession_retries",
+                            DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
+                        )
+                    ),
+                )
+                for _attempt in range(max_retries):
+                    candidate = dataclass_replace(
+                        self._current_payout_state_candidate(),
+                        accepted_block_hash=key,
+                        accepted_block_withdrawal=True,
+                        accepted_block_height=existing.block_height,
+                    )
+                    published = self._publish_payout_state_candidate(candidate)
+                    if published is not None:
+                        break
+            if published is None:
+                # Delivery remains fenced. Install the tombstone immediately
+                # so even local builders cannot fall through while the newest
+                # source waits for a retry publication.
+                with self._accepted_block_payout_preview_condition:
+                    self._accepted_block_payout_previews.pop(key, None)
+                    self._invalidated_accepted_block_payout_previews[key] = (
+                        existing.block_height
+                    )
+                    self._accepted_block_payout_preview_condition.notify_all()
+
+    def _accepted_block_payout_transition_landed(self, block_hash: str) -> bool:
+        self._ensure_job_cache_state()
+        with self._accepted_block_payout_preview_condition:
+            transition = self._accepted_block_payout_previews.get(block_hash.lower())
+            return transition is not None and transition.landed
+
+    def _accepted_block_payout_transition_for_parent(
+        self,
+        parent_hash: str,
+        *,
+        parent_height: int | None = None,
+    ) -> tuple[str, bool] | None:
+        """Select the highest active exact/ancestor payout transition.
+
+        The boolean result is true for an invalidated landed transition. The
+        caller decides whether to wait for a live preview or fail closed on its
+        tombstone.
+        """
+        self._ensure_job_cache_state()
+        key = parent_hash.lower()
+        with self._accepted_block_payout_preview_condition:
+            exact_transition = self._accepted_block_payout_previews.get(key)
+            exact_invalidated = (
+                key in self._invalidated_accepted_block_payout_previews
+            )
+            fail_closed_candidate_hashes = {
+                candidate_hash
+                for candidate_hash, transition in (
+                    self._accepted_block_payout_previews.items()
+                )
+                if transition.landed
+            }
+            fail_closed_candidate_hashes.update(
+                self._invalidated_accepted_block_payout_previews
+            )
+            ancestor_candidates = [
+                (candidate_hash, transition.block_height, False)
+                for candidate_hash, transition in self._accepted_block_payout_previews.items()
+                if exact_transition is None
+                and not exact_invalidated
+                and transition.block_height is not None
+                and parent_height is not None
+                and transition.block_height <= parent_height
+            ]
+            ancestor_candidates.extend(
+                (
+                    candidate_hash,
+                    candidate_height,
+                    True,
+                )
+                for candidate_hash, candidate_height in (
+                    self._invalidated_accepted_block_payout_previews.items()
+                )
+                if exact_transition is None
+                and not exact_invalidated
+                and candidate_height is not None
+                and parent_height is not None
+                and candidate_height <= parent_height
+            )
+        if exact_transition is not None or exact_invalidated:
+            return key, exact_invalidated
+        if not ancestor_candidates:
+            return None
+
+        active_ancestors: list[tuple[int, str, bool]] = []
+        try:
+            for (
+                candidate_hash,
+                candidate_height,
+                candidate_invalidated,
+            ) in ancestor_candidates:
+                assert candidate_height is not None
+                active_hash = str(
+                    self.rpc.call("getblockhash", [candidate_height])
+                ).lower()
+                if active_hash == candidate_hash:
+                    active_ancestors.append(
+                        (
+                            candidate_height,
+                            candidate_hash,
+                            candidate_invalidated,
+                        )
+                    )
+        except Exception as exc:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "could not validate an accepted payout preview on the active chain"
+            ) from exc
+        if not active_ancestors:
+            if any(
+                candidate_hash in fail_closed_candidate_hashes
+                for candidate_hash, _candidate_height, _invalidated in (
+                    ancestor_candidates
+                )
+            ):
+                # A prepared artifact published with an accepted preview carries
+                # that prospective balance view. If its block left the active
+                # chain between reconciliation and this build, falling through
+                # to the artifact would stamp unrelated work with those balances.
+                # Wait for withdrawal/reconciliation to publish a new payout
+                # generation instead of using either the artifact or live DB.
+                self._schedule_tip_refresh_retry()
+                raise _PayoutStatePublicationBlocked(
+                    "accepted payout transition is no longer active"
+                )
+            return None
+        _, selected_key, selected_invalidated = max(active_ancestors)
+        return selected_key, selected_invalidated
+
+    def _await_pending_parent_payout_preview(
+        self,
+        parent_hash: str,
+        *,
+        parent_height: int | None = None,
+    ) -> list[dict[str, object]] | None:
+        """Wait out a pending accepted-parent transition, returning its preview.
+
+        Returns None when no landed transition governs this parent, without
+        touching any confirmed payout input. Ordering this wait before every
+        confirmed read lets children of a pending parent block here instead of
+        taking (or caching) balances that omit their new parent.
+        """
+        selected = self._accepted_block_payout_transition_for_parent(
+            parent_hash,
+            parent_height=parent_height,
+        )
+        if selected is None:
+            return None
+        selected_key, selected_invalidated = selected
+        if selected_invalidated:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "accepted parent payout preview was withdrawn"
+            )
+
+        wait_seconds = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "accepted_block_payout_preview_wait_seconds",
+                    DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS,
+                )
+            ),
+        )
+        deadline = time.monotonic() + wait_seconds
+        timed_out = False
+        invalidated = False
+        with self._accepted_block_payout_preview_condition:
+            while selected_key in self._accepted_block_payout_previews:
+                transition = self._accepted_block_payout_previews[selected_key]
+                if transition.preview is not None:
+                    return self._materialize_prior_balance_preview(
+                        transition.preview
+                    )
+                if self.stop_event.is_set():
+                    raise RuntimeError(
+                        "coordinator stopped while accepted payout preview was pending"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                self._accepted_block_payout_preview_condition.wait(
+                    timeout=min(0.25, remaining)
+                )
+            invalidated = (
+                selected_key in self._invalidated_accepted_block_payout_previews
+            )
+        if invalidated:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "accepted parent payout preview was withdrawn"
+            )
+        if timed_out:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "accepted parent payout preview is not ready yet"
+            )
+        # The transition reached a terminal durable state while waiting; the
+        # caller's confirmed fallback now includes the parent.
+        return None
+
+    def _prior_balances_for_job_parent(
+        self,
+        parent_hash: str,
+        *,
+        parent_height: int | None = None,
+        fallback_balances: Sequence[dict[str, object]] | None = None,
+    ) -> list[dict[str, object]]:
+        """Return prospective balances, otherwise a prepared/ledger fallback."""
+        preview = self._await_pending_parent_payout_preview(
+            parent_hash,
+            parent_height=parent_height,
+        )
+        if preview is not None:
+            return preview
+        return (
+            list(fallback_balances)
+            if fallback_balances is not None
+            else self.ledger.current_prior_balances()
+        )
+
     def _observe_payout_state_seconds(
         self,
         name: str,
@@ -4101,10 +4760,26 @@ class PrismCoordinator:
                     self._record_discarded_payout_candidate()
                     return None
         try:
-            artifact = self._prepare_payout_state_artifact(
-                generation=candidate.base_generation + 1,
-                source_generation=candidate.source_generation,
-            )
+            if (
+                candidate.accepted_block_preview is not None
+                and not candidate.accepted_block_withdrawal
+            ):
+                # The preview IS the balance state this generation publishes.
+                # The durable ledger only catches up after persistence, so a
+                # ledger read here would cache pre-parent balances against the
+                # post-parent generation and outlive the transition override.
+                artifact = self._payout_state_artifact_from_balances(
+                    generation=candidate.base_generation + 1,
+                    source_generation=candidate.source_generation,
+                    balances=self._materialize_prior_balance_preview(
+                        candidate.accepted_block_preview
+                    ),
+                )
+            else:
+                artifact = self._prepare_payout_state_artifact(
+                    generation=candidate.base_generation + 1,
+                    source_generation=candidate.source_generation,
+                )
         except Exception:
             # The delivery/cache fence remains closed. A later reconciliation
             # retry can prepare and publish the artifact; no generation lacking
@@ -4132,8 +4807,51 @@ class PrismCoordinator:
                         and candidate.base_generation
                         == self._payout_state_generation
                     ):
-                        self._payout_state_generation += 1
-                        published_generation = self._payout_state_generation
+                        published_generation = self._payout_state_generation + 1
+                        if candidate.accepted_block_hash is not None:
+                            key = candidate.accepted_block_hash
+                            with self._accepted_block_payout_preview_condition:
+                                transition = self._accepted_block_payout_previews.get(
+                                    key,
+                                    _AcceptedBlockPayoutTransition(
+                                        block_height=candidate.accepted_block_height,
+                                        landed=True,
+                                    ),
+                                )
+                                if candidate.accepted_block_withdrawal:
+                                    self._accepted_block_payout_previews.pop(key, None)
+                                    self._invalidated_accepted_block_payout_previews[
+                                        key
+                                    ] = (
+                                        transition.block_height
+                                        if transition.block_height is not None
+                                        else candidate.accepted_block_height
+                                    )
+                                else:
+                                    existing_preview = transition.preview
+                                    if (
+                                        existing_preview is not None
+                                        and existing_preview
+                                        != candidate.accepted_block_preview
+                                    ):
+                                        raise RuntimeError(
+                                            "accepted block payout preview changed "
+                                            "during atomic publication"
+                                        )
+                                    self._invalidated_accepted_block_payout_previews.pop(
+                                        key,
+                                        None,
+                                    )
+                                    self._accepted_block_payout_previews[key] = (
+                                        dataclass_replace(
+                                            transition,
+                                            landed=True,
+                                            preview=candidate.accepted_block_preview,
+                                            published_generation=published_generation,
+                                        )
+                                    )
+                                self._accepted_block_payout_preview_condition.notify_all()
+                        self._payout_state_generation = published_generation
                         prepared_artifact = candidate.ledger_artifact
                         if (
                             prepared_artifact is not None
@@ -4206,7 +4924,19 @@ class PrismCoordinator:
             if current_artifacts is not None
             else None
         )
-        if current_artifacts is not None and published_artifact_usable is None:
+        accepted_preview_pending_durability = (
+            candidate.accepted_block_hash is not None
+            and not candidate.accepted_block_withdrawal
+        )
+        if (
+            current_artifacts is not None
+            and published_artifact_usable is None
+            and not accepted_preview_pending_durability
+        ):
+            # A background artifact built before accepted-block confirmation
+            # would carry the old database balances under the new payout
+            # generation. Child builders use the compact preview until the
+            # durable state catches up; artifact preparation resumes then.
             self._schedule_payout_ledger_artifact_preparation(
                 published_generation,
                 current_artifacts.network_difficulty,
@@ -4696,6 +5426,15 @@ class PrismCoordinator:
             )
         )
         cancellation.raise_if_cancelled("immutable snapshot")
+        # A pending accepted-parent transition owns the balances children must
+        # observe. Wait for its preview before acquiring any confirmed payout
+        # input so a child build cannot take -- or cache into the published
+        # artifact -- confirmed state that omits its new parent. The preview
+        # itself is re-resolved consistently during construction.
+        self._await_pending_parent_payout_preview(
+            artifacts.previousblockhash,
+            parent_height=int(artifacts.template["height"]) - 1,
+        )
         payout_artifact = self._current_payout_state_artifact(cancellation)
         if payout_artifact.generation != payout_state_generation:
             raise JobBuildSuperseded(
@@ -4747,7 +5486,11 @@ class PrismCoordinator:
         with self._job_cache_lock:
             issued_at_ms = self._job_build_issued_at_ms.get(artifacts.generation)
             if issued_at_ms is None:
-                issued_at_ms = now_ms()
+                # The issued time doubles as the audit window anchor, so it
+                # must not cover a stamped share whose commit is still in
+                # flight: the frozen anchor stays reproducible from the
+                # durable ledger for every rebuild of this generation.
+                issued_at_ms = self._job_snapshot_anchor_ms(now_ms())
                 self._job_build_issued_at_ms[artifacts.generation] = issued_at_ms
                 while len(self._job_build_issued_at_ms) > 128:
                     self._job_build_issued_at_ms.popitem(last=False)
@@ -5171,6 +5914,13 @@ class PrismCoordinator:
                     "precomputed payout artifact does not match payout generation"
                 )
             shares = list(payout_artifact.shares_json)
+            # The artifact binds the key above; the balances actually used may
+            # still be an accepted parent's prospective carry state.
+            prior_balances = self._prior_balances_for_job_parent(
+                str(template["previousblockhash"]),
+                parent_height=int(template["height"]) - 1,
+                fallback_balances=prior_balances,
+            )
         else:
             with self._payout_state_prepare_lock:
                 with self._job_cache_lock:
@@ -5196,7 +5946,14 @@ class PrismCoordinator:
                     if resolved_mode == "ready"
                     else []
                 )
-                prior_balances = build_request.payout_artifact.prior_balances()
+                # An accepted parent's prospective carry state supersedes the
+                # published artifact for children built on that parent; the
+                # published balances remain the fallback for ordinary tips.
+                prior_balances = self._prior_balances_for_job_parent(
+                    str(template["previousblockhash"]),
+                    parent_height=int(template["height"]) - 1,
+                    fallback_balances=build_request.payout_artifact.prior_balances(),
+                )
             self._job_build_checkpoint("ledger_snapshot_complete", cancellation)
             shares = []
             for index, record in enumerate(records):
@@ -5206,6 +5963,18 @@ class PrismCoordinator:
                         cancellation,
                     )
                 shares.append(record.to_prism_json())
+        # A reused artifact carries shares snapshotted at its own earlier
+        # anchor. The bundle must declare that anchor: replaying the audit
+        # window at this job's fresher anchor could include a share that was
+        # already durable at artifact build time but stamped after the
+        # artifact's clamped anchor, and the artifact's share set excludes it
+        # by construction.
+        bundle_anchor_ms = (
+            payout_artifact.snapshot_anchor_ms
+            if payout_artifact is not None
+            and payout_artifact.snapshot_anchor_ms is not None
+            else issued_at_ms
+        )
         ledger_elapsed = time.monotonic() - started
         phases["ledger"] = phases.get("ledger", 0.0) + ledger_elapsed
         if resolved_mode == "ready":
@@ -5240,7 +6009,7 @@ class PrismCoordinator:
                         "block_height": int(template["height"]),
                         "coinbase_value_sats": int(template["coinbasevalue"]),
                         "network_difficulty": artifacts.network_difficulty,
-                        "anchor_job_issued_at_ms": issued_at_ms,
+                        "anchor_job_issued_at_ms": bundle_anchor_ms,
                     },
                     prior_balances=prior_balances,
                     coinbase_script_sig_suffix_hex=placeholder_suffix_hex,
@@ -5284,6 +6053,20 @@ class PrismCoordinator:
         finally:
             self._job_build_phase_local.tip_refresh_metrics = previous_metrics_scope
         manifest = bundle["signed_coinbase_manifest"]["manifest"]
+        prospective_prior_balances: (
+            tuple[tuple[str, str, str, int], ...] | None
+        ) = None
+        payout_policy_manifest = bundle.get("payout_policy_manifest")
+        if isinstance(payout_policy_manifest, dict) and isinstance(
+            payout_policy_manifest.get("accounts"),
+            list,
+        ):
+            prospective_prior_balances = self._serialize_prior_balance_preview(
+                self._accepted_block_payout_preview_from_bundle(
+                    bundle,
+                    prior_balances=prior_balances,
+                )
+            )
         self._job_build_checkpoint("bundle_assembly", cancellation)
         assembly_started = time.monotonic()
         base_job = direct_stratum.make_job_from_builder_manifest(
@@ -5326,6 +6109,7 @@ class PrismCoordinator:
                 payout_artifact.generation if payout_artifact is not None else 0
             ),
             collection_identity=collection_identity,
+            prospective_prior_balances=prospective_prior_balances,
             build_key=final_build_key,
         )
 
@@ -5374,6 +6158,7 @@ class PrismCoordinator:
             template_fingerprint=cached.template_fingerprint,
             template_generation=cached.template_generation,
             payout_state_generation=cached.payout_state_generation,
+            prospective_prior_balances=cached.prospective_prior_balances,
             payout_artifact_generation=cached.payout_artifact_generation,
             connection_id=client.connection_id,
             authorization_generation=int(
@@ -10032,6 +10817,30 @@ class PrismCoordinator:
         _force_publish: bool = False,
         _source_reserved: bool = False,
     ) -> dict[str, object]:
+        """Serialize reconciliation against accepted-block finalization."""
+        self._ensure_job_cache_state()
+        with self._payout_balance_mutation_lock:
+            with self._accepted_block_payout_preview_condition:
+                if any(
+                    transition.landed
+                    for transition in self._accepted_block_payout_previews.values()
+                ):
+                    raise TemplateRefreshBlocked(
+                        "accepted block payout confirmation is still pending"
+                    )
+            return self._reconcile_prism_pool_blocks_once(
+                tip_hash=tip_hash,
+                _force_publish=_force_publish,
+                _source_reserved=_source_reserved,
+            )
+
+    def _reconcile_prism_pool_blocks_once(
+        self,
+        *,
+        tip_hash: str | None = None,
+        _force_publish: bool = False,
+        _source_reserved: bool = False,
+    ) -> dict[str, object]:
         summary: dict[str, object] = {
             "enabled": bool(getattr(self, "reorg_reconciler_enabled", True)),
             "untrusted": False,
@@ -12068,13 +12877,24 @@ class PrismCoordinator:
             # block_candidate_abandoned_counts; reject_stratum additionally counts
             # the miner-facing rejection (globally and per worker) so this rare
             # synchronous path is not missing from the rejection metrics.
-            candidate_intent = self.block_candidate_intent(candidate)
             persist_intent = getattr(self.ledger, "persist_block_candidate_intent", None)
             try:
+                candidate_intent = self.block_candidate_intent(candidate)
                 if callable(persist_intent):
                     persist_intent(candidate_intent)
+            except BaseException:
+                # No retry slot is safe until the pre-submit outbox boundary is
+                # durable. Let the miner retry this submission instead. Without
+                # a durable intent nothing can commit this stamped share, so
+                # stop holding the snapshot anchor floor under it.
+                self._finish_pending_share_commit(pending_share)
+                with self.lock:
+                    self.recent_share_keys.discard(share_key)
+                raise
+            try:
                 block_landed = self.submit_block_candidate(candidate)
             except BaseException:
+                self._retain_block_candidate_for_retry(candidate)
                 with self.lock:
                     self.recent_share_keys.discard(share_key)
                 raise
@@ -12086,15 +12906,27 @@ class PrismCoordinator:
                     # The durable outbox may still land and credit this block.
                     # Close without a Stratum result instead of issuing a false
                     # definitive rejection for an uncertain outcome.
+                    self._retain_block_candidate_for_retry(candidate)
                     with self.lock:
                         self.recent_share_keys.discard(share_key)
                     raise RuntimeError(
                         "block candidate outcome is pending durable retry"
                     )
                 if reason not in retryable_reasons:
+                    # This process will never credit the candidate share now:
+                    # release its snapshot anchor floor entry before the
+                    # terminal outbox update, whose failure would still leave
+                    # only restart replay (a fresh PendingShare) to credit it.
+                    self._finish_pending_share_commit(candidate.pending_share)
                     finish = getattr(self.ledger, "mark_block_candidate_abandoned", None)
                     if callable(finish):
                         finish(block_hash=submission.block_hash_hex, error=reason)
+                    # Once the durable outbox cannot replay this candidate,
+                    # its landed-transition tombstone no longer protects a
+                    # crash seam and would otherwise accumulate forever.
+                    self._clear_accepted_block_payout_preview(
+                        submission.block_hash_hex
+                    )
                 with self.lock:
                     self.recent_share_keys.discard(share_key)
                 self.reject_stratum(
@@ -12128,6 +12960,9 @@ class PrismCoordinator:
             if evicted_entry is not None:
                 self.note_evicted_job_submit(credit_policy)
         except BaseException:
+            # Idempotent with append_accepted_share's own release; also covers
+            # an intent serialization failure before the append started.
+            self._finish_pending_share_commit(pending_share)
             with self.lock:
                 self.recent_share_keys.discard(share_key)
             raise
@@ -12154,6 +12989,18 @@ class PrismCoordinator:
             "shares_json": context.shares_json,
             "prior_balances": context.prior_balances,
             "found_block": context.found_block,
+            "prospective_prior_balances": (
+                [
+                    list(row)
+                    for row in getattr(
+                        context,
+                        "prospective_prior_balances",
+                        (),
+                    )
+                ]
+                if getattr(context, "prospective_prior_balances", None) is not None
+                else None
+            ),
             "witness_merkle_leaves_hex": direct_stratum.witness_merkle_leaves_hex(
                 getattr(context.job, "transaction_hexes", ())
             ),
@@ -12211,6 +13058,14 @@ class PrismCoordinator:
                 p2mr_program_hex="",
             ),
             issued_at_ms=0,
+            prospective_prior_balances=(
+                tuple(
+                    (str(row[0]), str(row[1]), str(row[2]), int(row[3]))
+                    for row in intent["prospective_prior_balances"]
+                )
+                if isinstance(intent.get("prospective_prior_balances"), list)
+                else None
+            ),
         )
         return PrismBlockCandidate(
             context=context,
@@ -12222,6 +13077,69 @@ class PrismCoordinator:
             credit_share_on_accept=bool(intent.get("credit_share_on_accept", False)),
         )
 
+    def _ensure_pending_share_commit_state(self) -> None:
+        if not hasattr(self, "_pending_share_commit_lock"):
+            self._pending_share_commit_lock = threading.Lock()
+        if not hasattr(self, "_pending_share_commit_floor"):
+            self._pending_share_commit_floor = {}
+
+    def _finish_pending_share_commit(self, pending_share: PendingShare) -> None:
+        """Drop a share from the snapshot anchor floor.
+
+        Called once the share's ledger row reached a terminal outcome in this
+        process: durably committed, rejected back to the miner, recovered to
+        the on-disk replay file, or its block candidate terminally abandoned.
+        Idempotent, and a no-op for shares this process never registered
+        (intent/journal replays re-create PendingShare objects from JSON).
+        """
+        self._ensure_pending_share_commit_state()
+        with self._pending_share_commit_lock:
+            self._pending_share_commit_floor.pop(id(pending_share), None)
+
+    def _job_snapshot_anchor_ms(self, issued_at_ms: int) -> int:
+        """Clamp a share-snapshot anchor below every pending share commit.
+
+        The reward-window contract lets an auditor replay
+        qbit_audit_share_window(anchor) against the durable ledger and expect
+        exactly the shares the published bundle counted. A share whose
+        accepted_at_ms is already assigned but whose row has not committed yet
+        (group-commit queue, in-flight batch, or a block-candidate credit
+        linked after landing) would violate that: it is invisible to the MVCC
+        snapshot now but joins later replays at any anchor at or above its
+        accepted_at_ms. Anchoring strictly below every such share keeps the
+        issued snapshot reproducible without making job builds wait behind the
+        writer connection.
+        """
+        self._ensure_pending_share_commit_state()
+        stale_share_ids: list[str] = []
+        floor_ms: int | None = None
+        now_monotonic = time.monotonic()
+        with self._pending_share_commit_lock:
+            for entry in self._pending_share_commit_floor.values():
+                share = entry[0]
+                accepted_at_ms = int(share.accepted_at_ms)
+                if floor_ms is None or accepted_at_ms < floor_ms:
+                    floor_ms = accepted_at_ms
+                if (
+                    not entry[2]
+                    and now_monotonic - float(entry[1])
+                    > PRISM_PENDING_SHARE_COMMIT_WARN_SECONDS
+                ):
+                    entry[2] = True
+                    stale_share_ids.append(str(share.share_id))
+        for share_id in stale_share_ids:
+            # A long-held floor entry is a wedged writer or a leaked release
+            # path, not normal group-commit latency. The share-commit liveness
+            # watchdog owns recovery; this log makes the anchor clamp visible.
+            print(
+                "prism coordinator: pending share commit is holding the job "
+                f"snapshot anchor floor share_id={share_id}",
+                flush=True,
+            )
+        if floor_ms is None:
+            return issued_at_ms
+        return min(issued_at_ms, floor_ms - 1)
+
     def pending_share_from_submission(
         self,
         *,
@@ -12230,20 +13148,33 @@ class PrismCoordinator:
         ntime_hex: str,
         credit_policy: str | None = None,
     ) -> PendingShare:
-        return PendingShare(
-            share_id=f"{context.worker.username}:{submission.block_hash_hex}",
-            miner_id=context.worker.payout_address,
-            order_key=context.worker.payout_address,
-            p2mr_program_hex=context.worker.p2mr_program_hex,
-            share_difficulty=self.accepted_share_difficulty(context),
-            network_difficulty=max(1, int(context.found_block["network_difficulty"])),
-            template_height=int(context.template["height"]) - 1,
-            job_id=context.job.job_id,
-            job_issued_at_ms=context.issued_at_ms,
-            accepted_at_ms=now_ms(),
-            ntime=int(ntime_hex, 16),
-            credit_policy=credit_policy,
-        )
+        share_difficulty = self.accepted_share_difficulty(context)
+        self._ensure_pending_share_commit_state()
+        # Assign accepted_at_ms and register the commit-floor entry under one
+        # lock hold: a snapshot anchored between assignment and registration
+        # could otherwise anchor at or above this share and miss its later
+        # commit. Released via _finish_pending_share_commit.
+        with self._pending_share_commit_lock:
+            pending = PendingShare(
+                share_id=f"{context.worker.username}:{submission.block_hash_hex}",
+                miner_id=context.worker.payout_address,
+                order_key=context.worker.payout_address,
+                p2mr_program_hex=context.worker.p2mr_program_hex,
+                share_difficulty=share_difficulty,
+                network_difficulty=max(1, int(context.found_block["network_difficulty"])),
+                template_height=int(context.template["height"]) - 1,
+                job_id=context.job.job_id,
+                job_issued_at_ms=context.issued_at_ms,
+                accepted_at_ms=now_ms(),
+                ntime=int(ntime_hex, 16),
+                credit_policy=credit_policy,
+            )
+            self._pending_share_commit_floor[id(pending)] = [
+                pending,
+                time.monotonic(),
+                False,
+            ]
+        return pending
 
     @ledger_writer_operation("share_persistence")
     def append_accepted_share(
@@ -12265,10 +13196,17 @@ class PrismCoordinator:
             credit_policy=credit_policy,
             candidate_intent=candidate_intent,
         )
-        if getattr(self, "share_writer_active", False):
-            self.enqueue_share_append(entry, wait=True)
-        else:
-            self._append_share_entry(entry)
+        try:
+            if getattr(self, "share_writer_active", False):
+                self.enqueue_share_append(entry, wait=True)
+            else:
+                self._append_share_entry(entry)
+        finally:
+            # The append reached a terminal outcome for this process: durably
+            # committed, or surfaced an error the miner will retry with a fresh
+            # share. Either way the stamped share no longer holds the snapshot
+            # anchor floor. Idempotent with the group-commit writer's release.
+            self._finish_pending_share_commit(pending_share)
         # Only committed shares affect public accounting, vardiff, and the
         # response that handle_request sends immediately after this returns.
         self.note_worker_accepted_share(context.worker.username, credit_policy)
@@ -12398,6 +13336,7 @@ class PrismCoordinator:
             return False
         finally:
             for entry in batch:
+                self._finish_pending_share_commit(entry.pending_share)
                 entry.committed.set()
                 if entry.writer_token is not None:
                     entry.writer_token.finish()
@@ -12851,6 +13790,9 @@ class PrismCoordinator:
     @ledger_writer_operation("accepted_block_handling")
     def replay_pending_block_candidates(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
+        with self.lock:
+            if getattr(self, "_retry_block_candidate", None) is not None:
+                return 0
         pending_rows = getattr(self.ledger, "pending_block_candidate_rows", None)
         if callable(pending_rows):
             durable_rows = pending_rows(limit=MAX_PENDING_BLOCK_CANDIDATES)
@@ -12885,9 +13827,22 @@ class PrismCoordinator:
                 intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
                 if not durable_block_hash or intent_block_hash != durable_block_hash:
                     raise ValueError("durable block candidate row key does not match intent")
-                if self.enqueue_block_candidate(self.block_candidate_from_intent(intent)):
+                candidate = self.block_candidate_from_intent(intent)
+                # Startup replay runs before listeners start. Registering every
+                # durable hash here also closes the crash seam where submitblock
+                # landed but preview publication had not yet happened.
+                self._begin_accepted_block_payout_preview(
+                    durable_block_hash,
+                    block_height=int(intent["expected_height"]),
+                )
+                if self.enqueue_block_candidate(candidate):
                     queued += 1
             except Exception:
+                if durable_block_hash:
+                    self._clear_accepted_block_payout_preview(
+                        durable_block_hash,
+                        invalidate_published=True,
+                    )
                 print("prism coordinator: invalid durable block candidate intent", flush=True)
                 traceback.print_exc()
                 quarantine = getattr(self.ledger, "mark_block_candidate_abandoned", None)
@@ -12896,6 +13851,9 @@ class PrismCoordinator:
                         quarantined = quarantine(
                             block_hash=durable_block_hash,
                             error="invalid durable candidate intent",
+                        )
+                        self._clear_accepted_block_payout_preview(
+                            durable_block_hash
                         )
                         if quarantined:
                             self._clear_block_candidate_retry_state(durable_block_hash)
@@ -12924,16 +13882,26 @@ class PrismCoordinator:
                 return
 
     def submit_next_block_candidate(self, timeout: float | None = None) -> bool:
-        queue_obj = getattr(self, "block_candidate_queue", None)
-        if queue_obj is None:
-            return False
-        try:
-            if timeout is None:
-                candidate = queue_obj.get_nowait()
-            else:
-                candidate = queue_obj.get(timeout=timeout)
-        except queue.Empty:
-            return False
+        """Dequeue and land one block candidate; returns True when one ran.
+
+        The block-submitter loop calls this continuously; tests call it
+        directly to drain the queue deterministically.
+        """
+        with self.lock:
+            candidate = getattr(self, "_retry_block_candidate", None)
+            if candidate is not None:
+                self._retry_block_candidate = None
+        if candidate is None:
+            queue_obj = getattr(self, "block_candidate_queue", None)
+            if queue_obj is None:
+                return False
+            try:
+                if timeout is None:
+                    candidate = queue_obj.get_nowait()
+                else:
+                    candidate = queue_obj.get(timeout=timeout)
+            except queue.Empty:
+                return False
 
         outcome = getattr(self, "_block_candidate_outcome", None)
         if outcome is None:
@@ -12960,12 +13928,11 @@ class PrismCoordinator:
             )
         return ran
 
-    def _submit_next_block_candidate_writer(self, candidate: PrismBlockCandidate) -> bool:
-        """Land one dequeued block candidate; returns True when one ran.
-
-        The block-submitter loop calls this continuously; tests call it
-        directly to drain the queue deterministically.
-        """
+    def _submit_next_block_candidate_writer(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> bool:
+        """Land one dequeued block candidate inside writer admission."""
         accepted = False
         error = "candidate became stale or submission failed"
         outcome = getattr(self, "_block_candidate_outcome", None)
@@ -12991,19 +13958,42 @@ class PrismCoordinator:
         )
         if retryable:
             # Leave the outbox row pending. It will replay after a short pause
-            # or on process restart; turning an infrastructure outage into a
-            # terminal abandonment would recreate the loss this outbox avoids.
+            # or on process restart. Keep this parent ahead of queued children:
+            # a child built from its prospective balances cannot be validated
+            # against the database until the parent confirmation catches up.
             print(
                 "prism coordinator: retained block candidate for retry "
                 f"hash={block_hash} reason={abandon_reason or 'exception'}",
                 flush=True,
             )
-            with self.lock:
-                self.block_candidate_retry_count = int(
-                    getattr(self, "block_candidate_retry_count", 0)
-                ) + 1
+            self._retain_block_candidate_for_retry(candidate)
             self.stop_event.wait(self._next_block_candidate_retry_delay(block_hash))
             return True
+        if not accepted:
+            try:
+                self._reject_terminal_prepared_block_candidate(candidate)
+            except Exception:
+                # Persistence may have committed before a later RPC/transport
+                # failure. Do not terminally discard the outbox row until its
+                # prepared balance deltas have also reached a terminal state.
+                print(
+                    "prism coordinator: prepared block cleanup failed "
+                    f"hash={block_hash}",
+                    flush=True,
+                )
+                traceback.print_exc()
+                self._defer_block_candidate(
+                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                    "could not reject prepared state for terminal candidate",
+                    worker=candidate.client.username or None,
+                )
+                self._retain_block_candidate_for_retry(candidate)
+                self.stop_event.wait(self._next_block_candidate_retry_delay(block_hash))
+                return True
+        self._clear_accepted_block_payout_preview(
+            block_hash,
+            invalidate_published=not accepted,
+        )
         self._clear_block_candidate_retry_state(block_hash)
         finish_name = (
             "mark_block_candidate_submitted"
@@ -13017,6 +14007,11 @@ class PrismCoordinator:
                     finish(block_hash=block_hash)
                 else:
                     finish(block_hash=block_hash, error=error)
+                    # The invalidation tombstone is needed until the durable
+                    # outbox becomes terminal. A normal return (including an
+                    # already-terminal/missing row) means there is no pending
+                    # replay source left for this process to guard.
+                    self._clear_accepted_block_payout_preview(block_hash)
             except Exception:
                 # Keep the coordinator alive. If the terminal-state update
                 # failed, restart replay is exact-idempotent and will retry.
@@ -13026,9 +14021,63 @@ class PrismCoordinator:
                     flush=True,
                 )
                 traceback.print_exc()
+        elif not accepted:
+            # Compatibility ledgers without a durable candidate outbox have
+            # no restart replay source that could require the tombstone.
+            self._clear_accepted_block_payout_preview(block_hash)
+        # Terminal for this process either way: an accepted candidate credited
+        # its share during the success tail (a no-op release here), and an
+        # abandoned one can only be credited by restart replay, which stamps a
+        # fresh PendingShare. Stop holding the snapshot anchor floor.
+        self._finish_pending_share_commit(candidate.pending_share)
         if accepted:
             outcome.refresh_client = candidate.client
         return True
+
+    def _retain_block_candidate_for_retry(self, candidate: PrismBlockCandidate) -> None:
+        """Keep the oldest unresolved candidate ahead of queued descendants."""
+        candidate_height = int(candidate.context.template["height"])
+        candidate_hash = str(candidate.submission.block_hash_hex).lower()
+        with self.lock:
+            self.block_candidate_retry_count = int(
+                getattr(self, "block_candidate_retry_count", 0)
+            ) + 1
+            existing = getattr(self, "_retry_block_candidate", None)
+            if existing is None:
+                self._retry_block_candidate = candidate
+                return
+            existing_height = int(existing.context.template["height"])
+            existing_hash = str(existing.submission.block_hash_hex).lower()
+            if candidate_hash == existing_hash or candidate_height < existing_height:
+                # Replacing a descendant is safe because its durable outbox row
+                # will replay after this lower-height parent reaches a terminal
+                # state. Equal-height competitors preserve first-in ordering.
+                self._retry_block_candidate = candidate
+
+    def _reject_terminal_prepared_block_candidate(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> None:
+        """Reject durable prepared deltas before abandoning a stale candidate."""
+        state_reader = getattr(self.ledger, "pool_block_state", None)
+        if not callable(state_reader):
+            return
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        state = state_reader(block_hash=block_hash)
+        if state is None or str(state.get("chain_state", "")) != "prepared":
+            return
+        active_tip_height = int(self.rpc.call("getblockcount"))
+        result = self.reject_prepared_block(
+            block_hash=block_hash,
+            active_tip_height=active_tip_height,
+        )
+        if int(result.get("rejected_count", 0)) == 1:
+            return
+        state = state_reader(block_hash=block_hash)
+        if state is not None and str(state.get("chain_state", "")) == "prepared":
+            raise RuntimeError(
+                f"ledger did not reject prepared block candidate {block_hash}"
+            )
 
     def _next_block_candidate_retry_delay(self, block_hash: str) -> float:
         initial = max(
@@ -13126,6 +14175,575 @@ class PrismCoordinator:
             return None
         return height if confirmations > 0 else None
 
+    def _defer_for_pending_parent_payout_transition(
+        self,
+        *,
+        parent_hash: str,
+        parent_height: int,
+        worker: str | None,
+        active_candidate_hash: str | None = None,
+        active_candidate_height: int | None = None,
+    ) -> bool:
+        """Defer finalization while an active payout ancestor is not durable."""
+        if (active_candidate_hash is None) != (active_candidate_height is None):
+            raise ValueError("active candidate hash and height must be provided together")
+
+        def preserve_active_candidate_barrier() -> None:
+            if active_candidate_hash is None or active_candidate_height is None:
+                return
+            self._begin_accepted_block_payout_preview(
+                active_candidate_hash,
+                block_height=active_candidate_height,
+            )
+            self._mark_accepted_block_payout_landed(
+                active_candidate_hash,
+                block_height=active_candidate_height,
+            )
+
+        try:
+            pending_parent_transition = (
+                self._accepted_block_payout_transition_for_parent(
+                    parent_hash,
+                    parent_height=parent_height,
+                )
+            )
+        except TemplateRefreshBlocked as exc:
+            preserve_active_candidate_barrier()
+            self._abandon_block_candidate(
+                PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                f"could not validate pending ancestor payout state: {exc}",
+                worker=worker,
+            )
+            return True
+        if pending_parent_transition is None:
+            return False
+        preserve_active_candidate_barrier()
+        self._abandon_block_candidate(
+            PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+            "parent or ancestor payout confirmation is still pending",
+            worker=worker,
+        )
+        return True
+
+    def _land_and_confirm_block_candidate(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        current_tip: str,
+        already_active: bool,
+        worker: str | None,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+    ] | None:
+        """Land, verify, publish, persist, and confirm one candidate.
+
+        The balance serializer spans the last prior-state check through durable
+        confirmation. Reconciliation therefore cannot change the base beneath
+        the accepted coinbase, while ordinary job delivery remains unblocked.
+        """
+        context = candidate.context
+        submission = candidate.submission
+        expected_height = int(context.template["height"])
+        block_hash = str(submission.block_hash_hex).lower()
+        parent_hash = str(context.template["previousblockhash"])
+        self._ensure_job_cache_state()
+        durable_payout_state = bool(
+            getattr(self.ledger, "durable_payout_state", False)
+        )
+        with self._payout_balance_mutation_lock:
+            if self._defer_for_pending_parent_payout_transition(
+                parent_hash=parent_hash,
+                parent_height=expected_height - 1,
+                worker=worker,
+                active_candidate_hash=block_hash if already_active else None,
+                active_candidate_height=expected_height if already_active else None,
+            ):
+                return None
+            block_state: dict[str, object] | None = None
+            block_state_reader = getattr(self.ledger, "pool_block_state", None)
+            transition_already_landed = self._accepted_block_payout_transition_landed(
+                block_hash
+            )
+            reorg_reconciled: bool | None = None
+            if already_active and not transition_already_landed:
+                # A replayed active ancestor may coexist with balances from an
+                # orphaned pool block. Reconcile that global state before this
+                # transition becomes a landed barrier and before validating its
+                # payout base.
+                try:
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
+                except Exception:
+                    traceback.print_exc()
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                        "reorg reconciliation failed before block replay",
+                        worker=worker,
+                    )
+                    return None
+                if not reorg_reconciled:
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                        "reorg reconciliation reported an untrusted chain view",
+                        worker=worker,
+                    )
+                    return None
+            if already_active and callable(block_state_reader):
+                block_state = block_state_reader(block_hash=block_hash)
+            already_confirmed = bool(
+                block_state is not None
+                and str(block_state.get("chain_state", "")) == "confirmed"
+                and str(block_state.get("maturity_state", "")) != "reversed"
+            )
+            if already_confirmed:
+                # The outbox terminal update can fail after a fully durable
+                # confirmation. Do not replace later global balances with an
+                # ancestor-only preview during exact-idempotent replay.
+                self._clear_accepted_block_payout_preview(block_hash)
+                reorg_reconciled = True
+            elif already_active:
+                self._begin_accepted_block_payout_preview(
+                    block_hash,
+                    block_height=expected_height,
+                )
+                self._mark_accepted_block_payout_landed(
+                    block_hash,
+                    block_height=expected_height,
+                )
+                reorg_reconciled = True
+            elif transition_already_landed:
+                # A prior attempt reached submitblock while holding this
+                # serializer. External reconciliation is barred until it
+                # confirms or is withdrawn, so retry its durable steps directly.
+                reorg_reconciled = True
+            else:
+                try:
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
+                except Exception:
+                    traceback.print_exc()
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                        "reorg reconciliation failed before block submit",
+                        worker=worker,
+                    )
+                    return None
+            if not reorg_reconciled:
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                    "reorg reconciliation reported an untrusted chain view",
+                    worker=worker,
+                )
+                return None
+            if (
+                already_active
+                and not already_confirmed
+                and self._defer_for_pending_parent_payout_transition(
+                    parent_hash=parent_hash,
+                    parent_height=expected_height - 1,
+                    worker=worker,
+                )
+            ):
+                return None
+            if (
+                durable_payout_state
+                and not already_active
+                and not self.prior_balances_match_current(context.prior_balances)
+            ):
+                self._clear_accepted_block_payout_preview(
+                    block_hash,
+                    invalidate_published=True,
+                )
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_STALE_JOB,
+                    "prior balances changed since the job was issued",
+                    worker=worker,
+                )
+                return None
+            if not already_active:
+                before_height = int(self.rpc.call("getblockcount"))
+                if before_height + 1 != expected_height:
+                    self._clear_accepted_block_payout_preview(
+                        block_hash,
+                        invalidate_published=True,
+                    )
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_BLOCK_STALE,
+                        f"stale block height: template={expected_height} tip={before_height}",
+                        worker=worker,
+                    )
+                    return None
+                # Register before submitblock can expose this hash as the new
+                # tip. Child builders will wait for the verified preview rather
+                # than reading balances that omit their new parent.
+                self._begin_accepted_block_payout_preview(
+                    block_hash,
+                    block_height=expected_height,
+                )
+                # Treat the submit outcome as uncertain before entering RPC.
+                # If transport fails after qbitd accepted the block, this
+                # conservative barrier preserves the coinbase's payout base.
+                self._mark_accepted_block_payout_landed(
+                    block_hash,
+                    block_height=expected_height,
+                )
+                self._record_heartbeat("block_submitter")
+                result = self.rpc.call("submitblock", [submission.block_hex])
+                self._record_heartbeat("block_submitter")
+                if result not in (None, "duplicate"):
+                    self._clear_accepted_block_payout_preview(
+                        block_hash,
+                        invalidate_published=True,
+                    )
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                        f"submitblock rejected candidate: {result}",
+                        worker=worker,
+                    )
+                    return None
+                active_hash = str(
+                    self.rpc.call("getblockhash", [expected_height])
+                ).lower()
+                if active_hash != block_hash:
+                    self._clear_accepted_block_payout_preview(
+                        block_hash,
+                        invalidate_published=True,
+                    )
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                        f"submitted block is not active at height {expected_height}",
+                        worker=worker,
+                    )
+                    return None
+                self._cancel_obsolete_job_builds("direct PRISM block accepted")
+                self._mark_tip_refresh_pending(block_hash)
+                self._schedule_tip_refresh_retry()
+
+            preview: list[dict[str, object]] | None = None
+            issued_preview = getattr(context, "prospective_prior_balances", None)
+            if not already_confirmed and issued_preview is not None:
+                # The compact preview came from the immutable issued job
+                # summary. Publish it before rebuilding/canonicalizing the full
+                # audit bundle, without retaining that bundle's shares tree.
+                preview = self._materialize_prior_balance_preview(issued_preview)
+                if durable_payout_state and not self.prior_balances_match_current(
+                    context.prior_balances
+                ):
+                    self.request_shutdown()
+                    self._clear_accepted_block_payout_preview(
+                        block_hash,
+                        invalidate_published=True,
+                    )
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+                        "accepted block payout base changed before preview publication",
+                        worker=worker,
+                    )
+                    return None
+                self._publish_accepted_block_payout_preview(block_hash, preview)
+
+            self._record_heartbeat("block_submitter")
+            candidate_bundle_path = self.temporary_audit_bundle_path(
+                block_hash=submission.block_hash_hex
+            )
+            final_bundle = self.build_audit_bundle(
+                shares=context.shares_json,
+                found_block=context.found_block,
+                prior_balances=context.prior_balances,
+                coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
+                    candidate.extranonce1_hex,
+                    candidate.extranonce2_hex,
+                ),
+                witness_merkle_leaves_hex=list(
+                    getattr(context.job, "witness_merkle_leaves_hex", ())
+                )
+                or direct_stratum.witness_merkle_leaves_hex(
+                    getattr(context.job, "transaction_hexes", ())
+                ),
+                ctv_fee_parent_hash=parent_hash,
+                canonical_output_path=candidate_bundle_path,
+            )
+            # Compatibility builders used by tests and older integrations may
+            # ignore canonical_output_path. Persist their logical bundle via
+            # the normal canonicalization fallback without mislabeling bytes.
+            if not candidate_bundle_path.exists():
+                candidate_bundle_path = self.write_temporary_audit_bundle(
+                    final_bundle,
+                    block_hash=submission.block_hash_hex,
+                )
+            try:
+                final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
+                final_coinbase_tx_hex_raw = final_manifest["coinbase_tx_hex"]
+                if not isinstance(final_coinbase_tx_hex_raw, str):
+                    raise ValueError(
+                        "final audit bundle coinbase_tx_hex is not a string"
+                    )
+                final_coinbase_tx_hex = final_coinbase_tx_hex_raw.lower()
+            except BaseException:
+                try:
+                    candidate_bundle_path.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+            if final_coinbase_tx_hex != submission.coinbase_tx_hex.lower():
+                try:
+                    candidate_bundle_path.unlink()
+                except FileNotFoundError:
+                    pass
+                self.request_shutdown()
+                self._clear_accepted_block_payout_preview(
+                    block_hash,
+                    invalidate_published=True,
+                )
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
+                    "final audit bundle coinbase does not match submitted coinbase",
+                    worker=worker,
+                )
+                return None
+            payout_commit_started: float | None = None
+            payout_commit_source: int | None = None
+            try:
+                report = self.verify_bundle(
+                    candidate_bundle_path,
+                    submission.coinbase_tx_hex,
+                    self.trusted_ledger_writer_public_key_hex(final_bundle),
+                    expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
+                )
+                persistence_canonical_bundle_path = (
+                    self.verified_canonical_bundle_path(
+                        candidate_bundle_path,
+                        report,
+                    )
+                )
+                self._record_heartbeat("block_submitter")
+                verified_preview = self._accepted_block_payout_preview_from_bundle(
+                    final_bundle,
+                    prior_balances=context.prior_balances,
+                )
+                if not already_confirmed:
+                    if preview is None and durable_payout_state:
+                        live_prior_balances = self.normalized_prior_balances(
+                            self.ledger.current_prior_balances()
+                        )
+                        expected_prior_balances = self.normalized_prior_balances(
+                            context.prior_balances
+                        )
+                        if live_prior_balances != expected_prior_balances:
+                            self.request_shutdown()
+                            self._clear_accepted_block_payout_preview(
+                                block_hash,
+                                invalidate_published=True,
+                            )
+                            self._abandon_block_candidate(
+                                PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+                                "accepted block payout base changed before preview publication",
+                                worker=worker,
+                            )
+                            return None
+                    try:
+                        self._publish_accepted_block_payout_preview(
+                            block_hash,
+                            verified_preview,
+                        )
+                    except RuntimeError as exc:
+                        self.request_shutdown()
+                        self._clear_accepted_block_payout_preview(
+                            block_hash,
+                            invalidate_published=True,
+                        )
+                        self._abandon_block_candidate(
+                            PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
+                            "verified final payout preview does not match the "
+                            f"issued block job: {exc}",
+                            worker=worker,
+                        )
+                        return None
+                preview = verified_preview
+
+                # The verified preview is now the effective balance snapshot,
+                # so persistence can do canonicalization, body writes, copies,
+                # and bulk SQL without owning the delivery gate.
+                payout_commit_started = time.monotonic()
+                payout_commit_source = self._capture_payout_state_source()[1]
+                persistence = self.ledger.persist_accepted_block(
+                    block_hash=submission.block_hash_hex,
+                    block_height=expected_height,
+                    parent_hash=parent_hash,
+                    final_bundle=final_bundle,
+                    audit_report=report,
+                    canonical_bundle_path=persistence_canonical_bundle_path,
+                )
+                self._record_heartbeat("block_submitter")
+                active_hash = str(
+                    self.rpc.call("getblockhash", [expected_height])
+                ).lower()
+                if active_hash != block_hash:
+                    if already_confirmed:
+                        self._abandon_block_candidate(
+                            PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                            "accepted ancestor left the active chain during replay",
+                            worker=worker,
+                        )
+                        return None
+                    active_tip_height = int(self.rpc.call("getblockcount"))
+                    self.reject_prepared_block(
+                        block_hash=block_hash,
+                        active_tip_height=active_tip_height,
+                    )
+                    self._clear_accepted_block_payout_preview(
+                        block_hash,
+                        invalidate_published=True,
+                    )
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_BLOCK_STALE,
+                        "accepted block left the active chain before ledger confirmation",
+                        worker=worker,
+                    )
+                    return None
+                confirmation = self.ledger.confirm_accepted_block(
+                    block_hash=block_hash,
+                    # The ledger confirmation function matches this value
+                    # against the candidate row's own height. An accepted
+                    # ancestor can be finalized after newer blocks arrive.
+                    active_tip_height=expected_height,
+                )
+                confirmed_count = int(confirmation.get("confirmed_count", 0))
+                if confirmed_count not in {0, 1}:
+                    self.request_shutdown()
+                    self._clear_accepted_block_payout_preview(
+                        block_hash,
+                        invalidate_published=True,
+                    )
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+                        f"ledger did not confirm accepted block {block_hash}",
+                        worker=worker,
+                    )
+                    return None
+
+                if durable_payout_state:
+                    # Compare the durable active-chain view as of this block,
+                    # not the global latest view: an exact replay may finalize
+                    # ancestor A after later pool block B is already confirmed.
+                    # This also preserves the invariant across restart after a
+                    # prior post-confirm mismatch instead of silently accepting
+                    # the already-confirmed row on the next attempt.
+                    as_of_reader = getattr(
+                        self.ledger,
+                        "prior_balances_after_pool_block",
+                        None,
+                    )
+                    confirmed_balances = self.normalized_prior_balances(
+                        as_of_reader(block_hash=block_hash)
+                        if callable(as_of_reader)
+                        else self.ledger.current_prior_balances()
+                    )
+                    if confirmed_balances != preview:
+                        self.request_shutdown()
+                        self._clear_accepted_block_payout_preview(
+                            block_hash,
+                            invalidate_published=True,
+                        )
+                        self._abandon_block_candidate(
+                            PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+                            "confirmed payout balances do not match the published "
+                            f"preview for accepted block {block_hash}",
+                            worker=worker,
+                        )
+                        return None
+                # Durability caught up to the already-published logical state;
+                # clearing the parent override needs no second generation bump.
+                self._clear_accepted_block_payout_preview(block_hash)
+                self._schedule_current_payout_ledger_artifact_if_missing()
+                payout_publication_required = (
+                    self._payout_source_requires_publication()
+                )
+                payout_publication_fenced = (
+                    self._payout_state_publication_fenced()
+                )
+                if payout_publication_required or payout_publication_fenced:
+                    # A covered replay normally has no publication work. The
+                    # exception is a leaked delivery fence whose source already
+                    # published: force one republish so the replay heals it.
+                    covered_replay_fence = (
+                        payout_publication_fenced
+                        and not payout_publication_required
+                    )
+                    with self.lock:
+                        pending_cause = self._payout_state_source[2]
+                    # A bounded preview-publication loss already left the gate
+                    # fenced and its retry scheduled. Do not monopolize the
+                    # submitter with a second retry budget. Uncertain commits,
+                    # ordinary unfenced tip sources, and a covered replay's
+                    # leaked fence still reconcile now.
+                    publish_now = (
+                        covered_replay_fence
+                        or pending_cause == "direct_block_uncertain"
+                        or not payout_publication_fenced
+                    )
+                    published: int | None = None
+                    if publish_now and getattr(
+                        self,
+                        "reorg_reconciler_enabled",
+                        True,
+                    ):
+                        with self.lock:
+                            latest_tip = self._payout_state_source[1]
+                        summary = self.reconcile_prism_pool_blocks_once(
+                            tip_hash=latest_tip,
+                            _force_publish=True,
+                            _source_reserved=True,
+                        )
+                        reconciled_generation = summary.get("published_generation")
+                        if isinstance(reconciled_generation, int):
+                            published = reconciled_generation
+                    elif publish_now:
+                        published = (
+                            self._publish_current_payout_state_with_retry_budget()
+                        )
+                    if publish_now and published is None:
+                        # The block is durably confirmed; only the payout
+                        # publication lost its race. Aborting would keep the
+                        # outbox row pending and replay persist/confirm churn
+                        # for an already-final block. Keep delivery fenced and
+                        # let the scheduled tip refresh publish the newest
+                        # source; this candidate's durable work is complete.
+                        self._block_payout_state_publication()
+                        print(
+                            "prism coordinator: accepted block confirmed "
+                            "durably; payout publication deferred to the "
+                            f"scheduled refresh hash={block_hash}",
+                            flush=True,
+                        )
+                return final_bundle, report, persistence, confirmation
+            except Exception:
+                if payout_commit_started is not None and payout_commit_source is not None:
+                    # Persistence/confirmation can report failure after a
+                    # durable partial commit. Supersede every prepared source
+                    # and keep all delivery fenced until replay/reconciliation
+                    # proves the resulting ledger state.
+                    self._block_payout_state_publication(
+                        supersede_with=(
+                            payout_commit_source,
+                            block_hash,
+                            "direct_block_uncertain",
+                            payout_commit_started,
+                        )
+                    )
+                raise
+            finally:
+                if payout_commit_started is not None:
+                    self._observe_payout_state_seconds(
+                        "preparation",
+                        max(0.0, time.monotonic() - payout_commit_started),
+                    )
+                try:
+                    candidate_bundle_path.unlink()
+                except FileNotFoundError:
+                    pass
+
     @ledger_writer_operation("accepted_block_handling")
     def submit_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
         """Land one block candidate, then finalize its audit and payout state.
@@ -13147,18 +14765,26 @@ class PrismCoordinator:
         context = candidate.context
         submission = candidate.submission
         worker = candidate.client.username or None
+        expected_height = int(context.template["height"])
+        block_hash = str(submission.block_hash_hex).lower()
+        parent_hash = str(context.template["previousblockhash"])
+        self._ensure_job_cache_state()
         with self.lock:
-            pool_closed = self.accepted_block_count >= self.max_blocks
+            pool_closed = (
+                self.accepted_block_count >= self.max_blocks
+                and block_hash not in self._accounted_accepted_block_hashes
+            )
         if pool_closed:
+            self._clear_accepted_block_payout_preview(
+                block_hash,
+                invalidate_published=True,
+            )
             self._abandon_block_candidate(
                 PRISM_REJECTION_POOL_CLOSED,
                 "pool is no longer accepting blocks",
                 worker=worker,
             )
             return False
-        expected_height = int(context.template["height"])
-        block_hash = str(submission.block_hash_hex).lower()
-        parent_hash = str(context.template["previousblockhash"])
         current_tip = str(self.rpc.call("getbestblockhash"))
         landed_height: int | None = None
         if current_tip.lower() == block_hash:
@@ -13176,6 +14802,10 @@ class PrismCoordinator:
                 return False
         already_active = landed_height == expected_height
         if landed_height is not None and not already_active:
+            self._clear_accepted_block_payout_preview(
+                block_hash,
+                invalidate_published=True,
+            )
             self._abandon_block_candidate(
                 PRISM_REJECTION_BLOCK_STALE,
                 f"candidate active at unexpected height {landed_height}",
@@ -13189,382 +14819,118 @@ class PrismCoordinator:
                 flush=True,
             )
         elif parent_hash != current_tip:
+            self._clear_accepted_block_payout_preview(
+                block_hash,
+                invalidate_published=True,
+            )
             self._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
                 f"tip moved before submit: {current_tip}",
                 worker=worker,
             )
             return False
-        try:
-            reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
-        except Exception:
-            traceback.print_exc()
-            self._abandon_block_candidate(
-                PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                "reorg reconciliation failed before block submit",
-                worker=worker,
-            )
-            return False
-        if not reorg_reconciled and not already_active:
-            self._abandon_block_candidate(
-                PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                "reorg reconciliation reported an untrusted chain view",
-                worker=worker,
-            )
-            return False
-        if not already_active and not self.prior_balances_match_current(context.prior_balances):
-            self._abandon_block_candidate(
-                PRISM_REJECTION_STALE_JOB,
-                "prior balances changed since the job was issued",
-                worker=worker,
-            )
-            return False
-        if not already_active:
-            before_height = int(self.rpc.call("getblockcount"))
-            if before_height + 1 != expected_height:
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_BLOCK_STALE,
-                    f"stale block height: template={expected_height} tip={before_height}",
-                    worker=worker,
-                )
-                return False
-            # The accepted share and complete candidate are already durable.
-            # Submit before rebuilding/verifying the final audit bundle so disk,
-            # subprocess, and large-ledger latency cannot lose the tip race.
-            self._record_heartbeat("block_submitter")
-            result = self.rpc.call("submitblock", [submission.block_hex])
-            self._record_heartbeat("block_submitter")
-            if result not in (None, "duplicate"):
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                    f"submitblock rejected candidate: {result}",
-                    worker=worker,
-                )
-                return False
-            active_hash = str(self.rpc.call("getblockhash", [expected_height])).lower()
-            if active_hash != block_hash:
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                    f"submitted block is not active at height {expected_height}",
-                    worker=worker,
-                )
-                return False
-            self._cancel_obsolete_job_builds("direct PRISM block accepted")
-            self._mark_tip_refresh_pending(block_hash)
-            self._schedule_tip_refresh_retry()
-        # Capture the current source as soon as the candidate is known active.
-        # The direct-block source itself is reserved only after durable ledger
-        # confirmation: a failed audit/RPC preparation therefore cannot leave
-        # an orphaned publishable source. A newer source arriving during this
-        # expensive phase makes the conditional reservation below fail and
-        # explicitly supersedes this prepared result.
-        payout_source_tip = current_tip if already_active else block_hash
-        payout_preparation_started = time.monotonic()
-        direct_source_preparation_token = self._capture_payout_state_source()[1]
-        active_tip_height = int(self.rpc.call("getblockcount"))
-        self._record_heartbeat("block_submitter")
-        candidate_bundle_path = self.temporary_audit_bundle_path(
-            block_hash=submission.block_hash_hex
+        landed = self._land_and_confirm_block_candidate(
+            candidate,
+            current_tip=current_tip,
+            already_active=already_active,
+            worker=worker,
         )
-        final_bundle = self.build_audit_bundle(
-            shares=context.shares_json,
-            found_block=context.found_block,
-            prior_balances=context.prior_balances,
-            coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
-                candidate.extranonce1_hex,
-                candidate.extranonce2_hex,
-            ),
-            witness_merkle_leaves_hex=list(
-                getattr(context.job, "witness_merkle_leaves_hex", ())
-            )
-            or direct_stratum.witness_merkle_leaves_hex(
-                getattr(context.job, "transaction_hexes", ())
-            ),
-            ctv_fee_parent_hash=str(context.template["previousblockhash"]),
-            canonical_output_path=candidate_bundle_path,
-        )
-        # Tests and alternate builders may not implement the optional canonical
-        # output yet. Their Python-serialized fallback is valid verifier input,
-        # but it must not be labeled canonical during persistence: the ledger
-        # will canonicalize final_bundle itself on this compatibility path.
-        if not candidate_bundle_path.exists():
-            candidate_bundle_path = self.write_temporary_audit_bundle(
-                final_bundle,
-                block_hash=submission.block_hash_hex,
-            )
-        try:
-            final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
-            final_coinbase_tx_hex_raw = final_manifest["coinbase_tx_hex"]
-            if not isinstance(final_coinbase_tx_hex_raw, str):
-                raise ValueError("final audit bundle coinbase_tx_hex is not a string")
-            final_coinbase_tx_hex = final_coinbase_tx_hex_raw.lower()
-        except BaseException:
-            try:
-                candidate_bundle_path.unlink()
-            except FileNotFoundError:
-                pass
-            raise
-        if final_coinbase_tx_hex != submission.coinbase_tx_hex.lower():
-            try:
-                candidate_bundle_path.unlink()
-            except FileNotFoundError:
-                pass
-            self.request_shutdown()
-            self._abandon_block_candidate(
-                PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
-                "final audit bundle coinbase does not match submitted coinbase",
-                worker=worker,
-            )
+        if landed is None:
             return False
-        try:
-            report = self.verify_bundle(
-                candidate_bundle_path,
-                submission.coinbase_tx_hex,
-                self.trusted_ledger_writer_public_key_hex(final_bundle),
-                expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
-            )
-            # Existence alone does not prove that an alternate/older builder
-            # emitted canonical bytes. Only forward the verifier candidate to
-            # persistence when its exact bytes match the verifier's canonical
-            # digest; otherwise the ledger canonicalizes final_bundle itself.
-            persistence_canonical_bundle_path = self.verified_canonical_bundle_path(
-                candidate_bundle_path,
-                report,
-            )
-            self._record_heartbeat("block_submitter")
-            # Finalization is exact-idempotent so an active-tip/active-ancestor
-            # replay can safely repeat any step after a crash.
-            self._record_heartbeat("block_submitter")
-            self._ensure_job_cache_state()
-            payout_candidate: PayoutStateCandidate | None = None
-            direct_payout_source: (
-                tuple[int, int, str | None, str, float] | None
-            ) = None
-            payout_publication_covered = False
-            with self._payout_state_prepare_lock:
-                try:
-                    persistence = self.ledger.persist_accepted_block(
-                        block_hash=submission.block_hash_hex,
-                        block_height=expected_height,
-                        parent_hash=str(context.template["previousblockhash"]),
-                        final_bundle=final_bundle,
-                        audit_report=report,
-                        canonical_bundle_path=persistence_canonical_bundle_path,
-                    )
-                    self._record_heartbeat("block_submitter")
-                    confirmation = self.ledger.confirm_accepted_block(
-                        block_hash=block_hash,
-                        active_tip_height=active_tip_height,
-                    )
-                    confirmed_count = int(confirmation.get("confirmed_count", 0))
-                except Exception:
-                    # A database error may be reported after a durable partial
-                    # commit. Reserve the direct source if it is still current,
-                    # then fence delivery until reconciliation proves and
-                    # publishes the resulting ledger state. Audit/RPC failures
-                    # above this transaction never create such a source.
-                    self._block_payout_state_publication(
-                        supersede_with=(
-                            direct_source_preparation_token,
-                            payout_source_tip,
-                            "direct_block_uncertain",
-                            payout_preparation_started,
-                        )
-                    )
-                    raise
-                finally:
-                    self._observe_payout_state_seconds(
-                        "preparation",
-                        max(
-                            0.0,
-                            time.monotonic() - payout_preparation_started,
-                        ),
-                    )
-                if (
-                    confirmed_count == 0
-                    and not self._payout_state_publication_fenced()
-                    and not self._payout_source_requires_publication()
-                ):
-                    # This replay confirmed nothing new, delivery is not
-                    # fenced, and no reserved source awaits publication: the
-                    # published payout state already covers this candidate.
-                    # Reserving and republishing anyway would bump the payout
-                    # generation, wipe the job-bundle cache, and abort every
-                    # in-flight template refresh for identical payout state —
-                    # livelocking job delivery while the candidate replays.
-                    # qbit_confirm_pool_block reports 0 for an
-                    # already-confirmed block once the active tip moved past
-                    # its height (the sustained replay state); while the block
-                    # is still the tip it reports 1, indistinguishable from a
-                    # freshly flipped row, so that replay must keep
-                    # publishing. A prior attempt that confirmed rows but
-                    # failed before publishing always leaves its source
-                    # reserved (or fenced as direct_block_uncertain), so it
-                    # never takes this branch and still publishes below. The
-                    # fence check keeps the remaining exception tail healing:
-                    # an attempt that force-blocked delivery after a
-                    # superseding source had already published, then failed
-                    # before republishing, leaves delivery blocked with a
-                    # covered source, and only the republish below clears it.
-                    # A restart cannot leak stale state through here either: a
-                    # fresh process builds every bundle from ledger reads that
-                    # already include the confirmed rows.
-                    payout_publication_covered = True
-                elif confirmed_count in {0, 1}:
-                    direct_payout_source = (
-                        self._reserve_payout_state_source_if_current(
-                            direct_source_preparation_token,
-                            "direct_block",
-                            tip_hash=payout_source_tip,
-                            invalidated_monotonic=payout_preparation_started,
-                        )
-                    )
-                    # Confirmation activates carry-forward rows. A zero count
-                    # reaching this branch is a replay whose source was left
-                    # unpublished, so the direct-tip source still has to cross
-                    # publication unless a newer source superseded it.
-                    # Persistence and confirmation stayed outside the delivery
-                    # barrier in either case.
-                    if direct_payout_source is None:
-                        self._record_discarded_payout_candidate()
-                    else:
-                        payout_candidate = self._prepared_payout_state_candidate(
-                            direct_payout_source
-                        )
-                    # Confirmation may have changed ledger-backed payout state
-                    # even when a newer tip superseded the direct source. Close
-                    # cache construction and delivery admission before releasing
-                    # the snapshot lock; publication and its old-send drain run
-                    # below, outside this preparation section.
-                    self._block_payout_state_publication(force=True)
-                else:
-                    # An unexpected confirmation result is just as uncertain
-                    # as an exception after persistence: keep all delivery
-                    # fenced until reconciliation establishes the ledger state.
-                    self._block_payout_state_publication(
-                        supersede_with=(
-                            direct_source_preparation_token,
-                            payout_source_tip,
-                            "direct_block_uncertain",
-                            payout_preparation_started,
-                        )
-                    )
-            if confirmed_count not in {0, 1}:
-                self.request_shutdown()
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
-                    f"ledger did not confirm accepted block {block_hash}",
-                    worker=worker,
-                )
-                return False
-            published = (
-                self._publish_payout_state_candidate(payout_candidate)
-                if payout_candidate is not None
-                else None
-            )
-            if (
-                published is None
-                and not payout_publication_covered
-                and getattr(self, "reorg_reconciler_enabled", True)
-            ):
-                with self.lock:
-                    latest_tip = self._payout_state_source[1]
-                summary = self.reconcile_prism_pool_blocks_once(
-                    tip_hash=latest_tip,
-                    _force_publish=True,
-                    _source_reserved=True,
-                )
-                reconciled_generation = summary.get("published_generation")
-                if isinstance(reconciled_generation, int):
-                    published = reconciled_generation
-            if (
-                published is None
-                and not payout_publication_covered
-                and not getattr(self, "reorg_reconciler_enabled", True)
-            ):
-                # Collection-only tests disable reorg reconciliation; publish
-                # their current in-memory source without the production
-                # reconciler. In production, a bounded supersession result
-                # leaves the source unpublished so job builds remain fenced
-                # until the scheduled retry.
-                published = self._publish_current_payout_state_with_retry_budget(
-                    initial_attempted=direct_payout_source is not None,
-                )
-            ctv_persistence = None
-            ctv_manifest_set = final_bundle.get("ctv_fanout_manifest_set")
-            if isinstance(ctv_manifest_set, dict):
-                ctv_persistence = self.ledger.persist_ctv_fanout_manifest_set(
-                    block_hash=block_hash,
-                    manifest_set=ctv_manifest_set,
-                    manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
-                )
-            final_bundle_path = self.audit_dir / f"prism-live-audit-bundle-{expected_height}-{block_hash}.json"
-            self.write_audit_bundle_envelope(
-                final_bundle_path,
-                block_hash=block_hash,
-                block_height=expected_height,
-                report=report,
-                persistence=persistence,
-            )
-            self.prune_audit_artifacts(keep_live_path=final_bundle_path)
-            bundle_path = final_bundle_path
-            if candidate.credit_share_on_accept:
-                self.append_accepted_share(
-                    candidate.client,
-                    context,
-                    submission,
-                    candidate.pending_share,
-                    candidate_intent=self.block_candidate_intent(candidate),
-                )
-            # Aggregate counts only: materializing the whole share history
-            # (all_shares) here would scan the full ledger twice per block,
-            # and would grow without bound as the ledger grows.
-            evidence_share_count, evidence_distinct_miners = self.accepted_share_stats()
-            evidence = {
-                "schema": "qbit.prism.live-stratum-evidence.v1",
-                "block_hash": block_hash,
-                "block_height": expected_height,
-                "coinbase_tx_hex": submission.coinbase_tx_hex,
-                "audit_bundle_path": str(bundle_path),
-                "audit_report": report,
-                "ledger_backend": self.ledger.backend_name,
-                "persistence": persistence,
-                "confirmation": confirmation,
-                "ctv_persistence": ctv_persistence,
-                "accepted_share_count": evidence_share_count,
-                "distinct_miner_count": evidence_distinct_miners,
-                "job_share_count": len(context.shares_json),
-            }
-            self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
-            with self.lock:
-                self.accepted_block_count += 1
-                self.latest_coinbase_size_bytes = len(
-                    str(final_manifest["coinbase_tx_hex"])
-                ) // 2
-                self.latest_evidence = evidence
-                should_stop = self.stop_after_block or self.accepted_block_count >= self.max_blocks
-            print(
-                "prism coordinator: qbit accepted direct PRISM block "
-                f"height={expected_height} hash={block_hash}",
-                flush=True,
-            )
-            if should_stop:
-                self.request_shutdown()
-            else:
-                # The public submitter wrapper performs this fanout only after
-                # its writer scope (including outbox finalization) exits. The
-                # synchronous rare-share path consumes the same marker from
-                # handle_request after the submit result is sent.
-                candidate.client.post_accept_refresh_block = (
-                    expected_height,
-                    block_hash,
-                )
+        final_bundle, report, persistence, confirmation = landed
+        with self.lock:
+            already_accounted = block_hash in self._accounted_accepted_block_hashes
+        if already_accounted:
+            # The previous attempt completed every success side effect but its
+            # durable outbox terminal update failed. submit_next will retry that
+            # update after this exact-idempotent confirmation without double
+            # counting the block or replacing newer evidence/work.
             return True
-        finally:
-            try:
-                candidate_bundle_path.unlink()
-            except FileNotFoundError:
-                pass
+        ctv_persistence = None
+        ctv_manifest_set = final_bundle.get("ctv_fanout_manifest_set")
+        if isinstance(ctv_manifest_set, dict):
+            ctv_persistence = self.ledger.persist_ctv_fanout_manifest_set(
+                block_hash=block_hash,
+                manifest_set=ctv_manifest_set,
+                manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
+            )
+        final_bundle_path = (
+            self.audit_dir
+            / f"prism-live-audit-bundle-{expected_height}-{block_hash}.json"
+        )
+        self.write_audit_bundle_envelope(
+            final_bundle_path,
+            block_hash=block_hash,
+            block_height=expected_height,
+            report=report,
+            persistence=persistence,
+        )
+        self.prune_audit_artifacts(keep_live_path=final_bundle_path)
+        bundle_path = final_bundle_path
+        if candidate.credit_share_on_accept:
+            self.append_accepted_share(
+                candidate.client,
+                context,
+                submission,
+                candidate.pending_share,
+                candidate_intent=self.block_candidate_intent(candidate),
+            )
+        # Aggregate counts only: materializing the whole share history
+        # (all_shares) here would scan the full ledger twice per block,
+        # and would grow without bound as the ledger grows.
+        evidence_share_count, evidence_distinct_miners = self.accepted_share_stats()
+        evidence = {
+            "schema": "qbit.prism.live-stratum-evidence.v1",
+            "block_hash": block_hash,
+            "block_height": expected_height,
+            "coinbase_tx_hex": submission.coinbase_tx_hex,
+            "audit_bundle_path": str(bundle_path),
+            "audit_report": report,
+            "ledger_backend": self.ledger.backend_name,
+            "persistence": persistence,
+            "confirmation": confirmation,
+            "ctv_persistence": ctv_persistence,
+            "accepted_share_count": evidence_share_count,
+            "distinct_miner_count": evidence_distinct_miners,
+            "job_share_count": len(context.shares_json),
+        }
+        self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        with self.lock:
+            newly_accounted = block_hash not in self._accounted_accepted_block_hashes
+            if newly_accounted:
+                self._accounted_accepted_block_hashes.add(block_hash)
+                self.accepted_block_count += 1
+            self.latest_coinbase_size_bytes = len(
+                str(
+                    final_bundle["signed_coinbase_manifest"]["manifest"][
+                        "coinbase_tx_hex"
+                    ]
+                )
+            ) // 2
+            self.latest_evidence = evidence
+            should_stop = (
+                newly_accounted
+                and (self.stop_after_block or self.accepted_block_count >= self.max_blocks)
+            )
+        if not newly_accounted:
+            return True
+        print(
+            "prism coordinator: qbit accepted direct PRISM block "
+            f"height={expected_height} hash={block_hash}",
+            flush=True,
+        )
+        if should_stop:
+            self.request_shutdown()
+        else:
+            # The public submitter wrapper performs this fanout only after its
+            # writer scope (including outbox finalization) exits. The rare
+            # synchronous share path consumes the same marker after sending
+            # the Stratum result.
+            candidate.client.post_accept_refresh_block = (
+                expected_height,
+                block_hash,
+            )
+        return True
 
     @ledger_writer_operation("accepted_block_handling")
     def reject_prepared_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:

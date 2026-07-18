@@ -2,7 +2,7 @@ use qbit_pool_builder::{ManifestSigningKey, SignedPayoutManifest};
 use qbit_prism::{
     build_audit_bundle_with_coinbase_options, build_audit_bundle_with_ctv_settlement_options,
     profile_audit_build, AcceptedShare, AuditBundle, CarryForwardBalance, FanoutFeeRatePolicy,
-    FoundBlock, PayoutPolicy, SettlementModeConfig,
+    FoundBlock, PayoutPolicy, PayoutPolicyManifest, SettlementModeConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -51,6 +51,7 @@ struct CtvSettlementInput {
 struct JobBuildSummary<'a> {
     found_block: &'a FoundBlock,
     signed_coinbase_manifest: &'a SignedPayoutManifest,
+    payout_policy_manifest: &'a PayoutPolicyManifest,
 }
 
 #[derive(Serialize)]
@@ -203,6 +204,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             &JobBuildSummary {
                 found_block: &bundle.found_block,
                 signed_coinbase_manifest: &bundle.signed_coinbase_manifest,
+                payout_policy_manifest: &bundle.payout_policy_manifest,
             },
         )?;
     } else {

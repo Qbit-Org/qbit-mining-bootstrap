@@ -398,13 +398,18 @@ fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        vec!["found_block", "signed_coinbase_manifest"]
+        vec![
+            "found_block",
+            "payout_policy_manifest",
+            "signed_coinbase_manifest",
+        ]
     );
     assert_eq!(
         summary,
         serde_json::json!({
             "found_block": &expected_bundle.found_block,
             "signed_coinbase_manifest": &expected_bundle.signed_coinbase_manifest,
+            "payout_policy_manifest": &expected_bundle.payout_policy_manifest,
         })
     );
     assert!(summary.get("shares").is_none());
