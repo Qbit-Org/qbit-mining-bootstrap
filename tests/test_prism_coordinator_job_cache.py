@@ -1849,6 +1849,149 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertLessEqual(max_active_builds, 2)
         self.assertEqual(server.job_build_scheduler_counts["supersessions"], 0)
 
+    def test_collection_independence_requires_one_immutable_cohort(self) -> None:
+        server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        first = server.store_template_artifacts(dict(rpc.template))
+        assert first is not None
+        second_template = dict(rpc.template)
+        second_template["curtime"] = int(second_template["curtime"]) + 1
+        second = server.store_template_artifacts(second_template)
+        assert second is not None
+        payout_generation = server._payout_state_generation
+        first_worker = worker("tq1worker-1", "tq1worker-1.rig")
+        second_worker = worker("tq1worker-2", "tq1worker-2.rig")
+
+        def request_for(
+            build_artifacts: object,
+            identity: WorkerIdentity,
+        ) -> object:
+            return server._new_job_build_request(
+                build_artifacts,  # type: ignore[arg-type]
+                identity,
+                mode="collection",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    build_artifacts,  # type: ignore[arg-type]
+                    mode="collection",
+                    payout_state_generation=payout_generation,
+                    worker=identity,
+                ),
+            )
+
+        first_request = request_for(first, first_worker)
+        peer_request = request_for(first, second_worker)
+        newer_request = request_for(second, first_worker)
+
+        self.assertTrue(
+            server._collection_job_builds_are_independent(
+                first_request,  # type: ignore[arg-type]
+                peer_request,  # type: ignore[arg-type]
+            )
+        )
+        self.assertFalse(
+            server._collection_job_builds_are_independent(
+                first_request,  # type: ignore[arg-type]
+                newer_request,  # type: ignore[arg-type]
+            )
+        )
+
+    def test_ready_build_cancels_both_live_collection_flights(self) -> None:
+        server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        server._ensure_tip_refresh_state()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        identities = [
+            worker(f"tq1worker-{index}", f"tq1worker-{index}.rig")
+            for index in range(2)
+        ]
+        entered = [threading.Event(), threading.Event()]
+        cancellation_observed = [threading.Event(), threading.Event()]
+        release_cancelled = threading.Event()
+        original_build = server.build_shared_job_bundle
+
+        def blocking_build(
+            build_artifacts: object,
+            identity: WorkerIdentity | None,
+            **kwargs: object,
+        ) -> object:
+            request = kwargs["build_request"]
+            if identity in identities:
+                index = identities.index(identity)
+                entered[index].set()
+                while not request.cancellation.is_set():  # type: ignore[union-attr]
+                    if release_cancelled.wait(0.01):
+                        raise AssertionError("collection build was not cancelled")
+                cancellation_observed[index].set()
+                release_cancelled.wait(5)
+                request.cancellation.raise_if_cancelled(  # type: ignore[union-attr]
+                    "test collection hold"
+                )
+            return original_build(
+                build_artifacts,  # type: ignore[arg-type]
+                identity,
+                **kwargs,
+            )
+
+        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        payout_generation = server._payout_state_generation
+
+        def request_for(
+            mode: str,
+            identity: WorkerIdentity | None,
+        ) -> object:
+            return server._new_job_build_request(
+                artifacts,
+                identity,
+                mode=mode,
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    artifacts,
+                    mode=mode,
+                    payout_state_generation=payout_generation,
+                    worker=identity,
+                ),
+            )
+
+        collection_requests = [
+            request_for("collection", identity) for identity in identities
+        ]
+        collection_promises = []
+        ready_promise = None
+        try:
+            collection_promises.append(
+                server._request_job_build(collection_requests[0])  # type: ignore[arg-type]
+            )
+            self.assertTrue(entered[0].wait(5))
+            collection_promises.append(
+                server._request_job_build(collection_requests[1])  # type: ignore[arg-type]
+            )
+            self.assertTrue(entered[1].wait(5))
+
+            ready_request = request_for("ready", None)
+            ready_promise = server._request_job_build(  # type: ignore[arg-type]
+                ready_request
+            )
+            self.assertTrue(cancellation_observed[0].wait(5))
+            self.assertTrue(cancellation_observed[1].wait(5))
+            self.assertFalse(collection_promises[0].done())
+            self.assertFalse(collection_promises[1].done())
+            self.assertFalse(ready_promise.done())
+            self.assertEqual(server.job_build_scheduler_counts["starts"], 2)
+        finally:
+            release_cancelled.set()
+
+        assert ready_promise is not None
+        ready_bundle = ready_promise.result(timeout=5)
+        self.assertFalse(ready_bundle.collection_only)
+        for request, promise in zip(collection_requests, collection_promises):
+            self.assertTrue(request.cancellation.is_set())  # type: ignore[union-attr]
+            self.assertIsInstance(
+                promise.exception(timeout=5),
+                JobBuildSuperseded,
+            )
+        self.assertEqual(server.job_build_scheduler_counts["starts"], 3)
+
     def test_shutdown_cancels_builder_with_full_helper_input_pipe(self) -> None:
         server, rpc = coordinator()
         server.signing_seed_hex = "42" * 32

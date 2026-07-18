@@ -3416,9 +3416,15 @@ class PrismCoordinator:
         first: _JobBuildRequest,
         second: _JobBuildRequest,
     ) -> bool:
-        """Collection identities are peers, not newer global generations."""
+        """Distinct workers in one immutable collection cohort are peers."""
 
-        return first.mode == "collection" and second.mode == "collection"
+        return (
+            first.mode == "collection"
+            and second.mode == "collection"
+            and first.key.collection_identity != second.key.collection_identity
+            and dataclass_replace(first.key, collection_identity=None)
+            == dataclass_replace(second.key, collection_identity=None)
+        )
 
     @staticmethod
     def _job_build_requests_can_share(
@@ -3598,11 +3604,15 @@ class PrismCoordinator:
                 return self._defer_collection_job_build_locked(pending.promise)
 
             now = time.monotonic()
-            if active.request.cancellation.cancel("superseded"):
-                active.request.superseded_monotonic = now
-                self.job_build_scheduler_counts["supersessions"] += 1
+            for obsolete in (active, retiring):
+                if (
+                    obsolete is not None
+                    and obsolete.request.cancellation.cancel("superseded")
+                ):
+                    obsolete.request.superseded_monotonic = now
+                    self.job_build_scheduler_counts["supersessions"] += 1
             request.superseded_monotonic = now
-            if self._job_build_retiring is None:
+            if retiring is None:
                 self._job_build_retiring = active
                 flight = self._start_job_build_locked(request)
                 self._job_build_active = flight
