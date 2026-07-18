@@ -1209,38 +1209,35 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with server._job_cache_lock:
             server._job_bundle_cache.clear()
         state.send = lambda _payload: None  # type: ignore[method-assign]
-        server.build_shared_job_bundle = (  # type: ignore[method-assign]
-            lambda *_args, **_kwargs: bundle
-        )
-        build_lock_held = threading.Event()
+        build_started = threading.Event()
         release_build = threading.Event()
 
-        def hold_build_lock() -> None:
-            with server._job_build_lock:
-                build_lock_held.set()
-                release_build.wait(timeout=1)
+        def blocked_build(
+            *_args: object,
+            **_kwargs: object,
+        ) -> CachedJobBundle:
+            build_started.set()
+            if not release_build.wait(timeout=1):
+                raise AssertionError("idle retarget bundle build was not released")
+            return bundle
 
-        builder = threading.Thread(target=hold_build_lock)
-        builder.start()
-        self.assertTrue(build_lock_held.wait(timeout=1))
+        server.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
         server._record_heartbeat("vardiff_idle_sweep")
         heartbeat_before = server._heartbeats["vardiff_idle_sweep"]
-        sweep_done = threading.Event()
+        started = time.monotonic()
+        try:
+            self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+            elapsed = time.monotonic() - started
+            self.assertTrue(build_started.wait(timeout=0.25))
+            self.assertLess(elapsed, 0.25)
+            self.assertGreater(
+                server._heartbeats["vardiff_idle_sweep"],
+                heartbeat_before,
+            )
+        finally:
+            release_build.set()
+            server.shutdown_vardiff_idle_executor()
 
-        def run_sweep() -> None:
-            server.vardiff_idle_sweep_once()
-            sweep_done.set()
-
-        sweeper = threading.Thread(target=run_sweep)
-        sweeper.start()
-        completed = sweep_done.wait(timeout=0.25)
-        release_build.set()
-        builder.join(timeout=1)
-        sweeper.join(timeout=1)
-        server.shutdown_vardiff_idle_executor()
-
-        self.assertTrue(completed)
-        self.assertGreater(server._heartbeats["vardiff_idle_sweep"], heartbeat_before)
         self.assertEqual(server.vardiff_idle_skip_counts["cache_miss"], 1)
 
     def test_idle_sweep_cache_miss_builds_only_on_bounded_worker(self) -> None:

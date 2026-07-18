@@ -7224,7 +7224,10 @@ class PrismCoordinator:
         bundle: CachedJobBundle,
     ) -> bool | None:
         client = request.client
-        cancelled = lambda: self._initial_request_cancelled(request)
+
+        def cancelled() -> bool:
+            return self._initial_request_cancelled(request)
+
         if not self._acquire_client_job_lock(client, cancelled):
             return False
         try:
@@ -7269,7 +7272,6 @@ class PrismCoordinator:
                     client.active_job_ids.add(context.job.job_id)
                     self.prune_client_active_jobs(client)
 
-                send_started = time.monotonic()
                 self.send_job_update(client, context.job)
                 mark_delivered = getattr(admitted, "mark_delivered", None)
                 if callable(mark_delivered):
@@ -8788,15 +8790,15 @@ class PrismCoordinator:
         started = worker_started if submitted_monotonic is None else submitted_monotonic
         phases = self._job_build_phases()
         phases.clear()
-        cancelled = lambda: (
-            self._prepared_tip_refresh_obsolete(
+
+        def cancelled() -> bool:
+            return self._prepared_tip_refresh_obsolete(
                 validation_token,
                 bundle,
                 snapshot,
                 cancel_event,
-            )
-            or getattr(client, "closing", False)
-        )
+            ) or getattr(client, "closing", False)
+
         phases["executor_queue"] = max(0.0, worker_started - started)
         client_lock_started = worker_started
         client_lock_acquired = False
