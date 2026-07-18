@@ -10931,6 +10931,23 @@ class PrismCoordinator:
                         raise TemplateRefreshBlocked(
                             "client job build did not use the guarded refresh artifacts"
                         )
+                else:
+                    published_now = getattr(self, "current_tip_first_seen", None)
+                    if (
+                        published_now is not None
+                        and str(context.template.get("previousblockhash", ""))
+                        != published_now[0]
+                        and self._published_tip_authoritative_locked(
+                            time.monotonic()
+                        )
+                    ):
+                        # Publication moved while this direct build waited on
+                        # the payout gate or client lock. Sending now would
+                        # advertise work that classifies stale-job on arrival
+                        # under the new authority; skip and let the refresh
+                        # fanout (or the pending retry) deliver current work.
+                        self._schedule_tip_refresh_retry()
+                        return False
                 client.active_job = context
                 if clean_jobs:
                     for job_id in client.active_job_ids:

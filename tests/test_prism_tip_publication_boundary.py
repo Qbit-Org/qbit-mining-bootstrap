@@ -500,6 +500,75 @@ class TipPublicationBoundaryTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
+    def test_direct_send_skips_pinned_work_published_over_mid_flight(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            next_tip = "aa" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+            server.fetch_qbit_tip_template_snapshot()
+
+            # A Vardiff-style direct build selects pinned published work, then
+            # the prepared refresh publishes the replacement before the direct
+            # path reaches its install/send section.
+            original_build = server.build_job_for_client
+
+            def build_then_publish_replacement(
+                target: object,
+                *,
+                clean_jobs: bool,
+            ) -> object:
+                context = original_build(target, clean_jobs=clean_jobs)  # type: ignore[arg-type]
+                sequence = server._reserve_tip_observation_sequence()
+                snapshot = server.fetch_qbit_tip_template_snapshot()
+                bundle = server.prepare_tip_refresh_bundle(snapshot)
+                token = server._validate_prepared_tip_refresh(
+                    bundle,
+                    snapshot,
+                    sequence,
+                )
+                cancellation = server._publish_prepared_tip_refresh(
+                    token,
+                    bundle,
+                    snapshot,
+                    parent_hash=None,
+                )
+                server._clear_active_tip_refresh(token, cancellation)
+                return context
+
+            server.build_job_for_client = build_then_publish_replacement  # type: ignore[method-assign]
+            sent_before = len(notifies)
+
+            # The stale-on-arrival context must be skipped, not sent.
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before)
+            self.assertEqual(server.current_tip_first_seen[0], next_tip)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
     def test_poll_start_only_targets_still_get_prepared_publication(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
