@@ -3637,14 +3637,15 @@ class PrismCoordinator:
                     ):
                         self._job_build_pending = None
                         flight = self._start_job_build_locked(pending)
-                        self._job_build_active = flight
-                        self._arm_job_build_locked(flight)
                         if retiring is None:
-                            self._job_build_retiring = flight
                             replacement = self._start_job_build_locked(request)
+                            self._job_build_retiring = flight
                             self._job_build_active = replacement
+                            self._arm_job_build_locked(flight)
                             self._arm_job_build_locked(replacement)
                             return request.promise
+                        self._job_build_active = flight
+                        self._arm_job_build_locked(flight)
                         return self._defer_collection_job_build_locked(
                             flight.request.promise,
                             retiring.request.promise,

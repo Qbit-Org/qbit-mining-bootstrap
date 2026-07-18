@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import unittest
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal
@@ -1824,6 +1825,55 @@ class JobBundleCacheTests(unittest.TestCase):
                 self.assertIs(server._job_build_active.request, collection)
                 self.assertIs(server._job_build_retiring, ready_flight)
                 self.assertEqual(armed, [server._job_build_active])
+
+    def test_immediate_collection_completion_does_not_reoccupy_slot(self) -> None:
+        server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        payout_generation = server._payout_state_generation
+        identities = [
+            worker(f"tq1worker-{index}", f"tq1worker-{index}.rig")
+            for index in range(2)
+        ]
+
+        def request_for(identity: WorkerIdentity) -> object:
+            return server._new_job_build_request(
+                artifacts,
+                identity,
+                mode="collection",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    artifacts,
+                    mode="collection",
+                    payout_state_generation=payout_generation,
+                    worker=identity,
+                ),
+            )
+
+        pending = request_for(identities[0])
+        incoming = request_for(identities[1])
+        results: dict[int, object] = {}
+
+        def completed_flight(request: object) -> object:
+            result = SimpleNamespace(request=request)
+            results[id(request)] = result
+            future: Future[object] = Future()
+            future.set_result(result)
+            return SimpleNamespace(request=request, future=future)
+
+        server._job_build_pending = pending
+        server._start_job_build_locked = completed_flight  # type: ignore[method-assign]
+
+        promise = server._request_job_build(incoming)  # type: ignore[arg-type]
+
+        self.assertIs(promise.result(), results[id(incoming)])
+        self.assertIs(  # type: ignore[union-attr]
+            pending.promise.result(),
+            results[id(pending)],
+        )
+        self.assertIsNone(server._job_build_active)
+        self.assertIsNone(server._job_build_retiring)
+        self.assertIsNone(server._job_build_pending)
 
     def test_independent_collection_workers_do_not_supersede_each_other(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
