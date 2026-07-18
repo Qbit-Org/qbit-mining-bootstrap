@@ -3450,31 +3450,50 @@ class PrismCoordinator:
 
     @staticmethod
     def _defer_collection_job_build_locked(
-        blocker: Future[CachedJobBundle],
+        *blockers: Future[CachedJobBundle],
     ) -> Future[CachedJobBundle]:
-        """Wake a bounded overflow waiter after the queued collection build."""
+        """Wake a bounded collection waiter when any occupied slot exits."""
 
         deferred: Future[CachedJobBundle] = Future()
+        wake_lock = threading.Lock()
 
         def wake_for_retry(_completed: Future[CachedJobBundle]) -> None:
-            if not deferred.done():
-                deferred.set_exception(
-                    JobBuildSuperseded(
-                        "collection build capacity became available; retrying"
+            with wake_lock:
+                if not deferred.done():
+                    deferred.set_exception(
+                        JobBuildSuperseded(
+                            "collection build capacity became available; retrying"
+                        )
                     )
-                )
 
-        blocker.add_done_callback(wake_for_retry)
+        for blocker in blockers:
+            blocker.add_done_callback(wake_for_retry)
         return deferred
+
+    def _cancel_job_build_flight_locked(
+        self,
+        flight: _JobBuildFlight,
+        reason: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        if not flight.request.cancellation.cancel(reason):
+            return False
+        flight.request.superseded_monotonic = (
+            time.monotonic() if now is None else now
+        )
+        self.job_build_scheduler_counts["supersessions"] += 1
+        return True
 
     def _promote_pending_job_build_locked(self) -> None:
         pending = self._job_build_pending
         if pending is None:
             return
-        if self._job_build_active is not None:
-            if self._job_build_retiring is not None:
+        active = self._job_build_active
+        retiring = self._job_build_retiring
+        if active is not None:
+            if retiring is not None:
                 return
-            active = self._job_build_active
             if self._ready_job_build_precedes_collection(
                 active.request,
                 pending,
@@ -3484,9 +3503,20 @@ class PrismCoordinator:
                 active.request,
                 pending,
             ):
-                active.request.cancellation.cancel("superseded")
+                self._cancel_job_build_flight_locked(active, "superseded")
             self._job_build_retiring = active
             self._job_build_active = None
+        elif retiring is not None:
+            if self._ready_job_build_precedes_collection(
+                retiring.request,
+                pending,
+            ):
+                return
+            if not self._collection_job_builds_are_independent(
+                retiring.request,
+                pending,
+            ):
+                self._cancel_job_build_flight_locked(retiring, "superseded")
         self._job_build_pending = None
         flight = self._start_job_build_locked(pending)
         self._job_build_active = flight
@@ -3605,8 +3635,15 @@ class PrismCoordinator:
                         flight = self._start_job_build_locked(pending)
                         self._job_build_active = flight
                         self._arm_job_build_locked(flight)
+                        if retiring is None:
+                            self._job_build_retiring = flight
+                            replacement = self._start_job_build_locked(request)
+                            self._job_build_active = replacement
+                            self._arm_job_build_locked(replacement)
+                            return request.promise
                         return self._defer_collection_job_build_locked(
-                            pending.promise
+                            flight.request.promise,
+                            retiring.request.promise,
                         )
                     pending.cancellation.cancel("superseded while pending")
                     if not pending.promise.done():
@@ -3615,6 +3652,20 @@ class PrismCoordinator:
                         )
                     self._job_build_pending = None
                     self.job_build_scheduler_counts["supersessions"] += 1
+                if (
+                    retiring is not None
+                    and not self._collection_job_builds_are_independent(
+                        retiring.request,
+                        request,
+                    )
+                ):
+                    now = time.monotonic()
+                    if self._cancel_job_build_flight_locked(
+                        retiring,
+                        "superseded",
+                        now=now,
+                    ):
+                        request.superseded_monotonic = now
                 flight = self._start_job_build_locked(request)
                 self._job_build_active = flight
                 self._arm_job_build_locked(flight)
@@ -3633,16 +3684,20 @@ class PrismCoordinator:
                 if pending is None:
                     self._job_build_pending = request
                     return request.promise
-                return self._defer_collection_job_build_locked(pending.promise)
+                assert retiring is not None
+                return self._defer_collection_job_build_locked(
+                    active.request.promise,
+                    retiring.request.promise,
+                )
 
             now = time.monotonic()
             for obsolete in (active, retiring):
-                if (
-                    obsolete is not None
-                    and obsolete.request.cancellation.cancel("superseded")
-                ):
-                    obsolete.request.superseded_monotonic = now
-                    self.job_build_scheduler_counts["supersessions"] += 1
+                if obsolete is not None:
+                    self._cancel_job_build_flight_locked(
+                        obsolete,
+                        "superseded",
+                        now=now,
+                    )
             request.superseded_monotonic = now
             if retiring is None:
                 self._job_build_retiring = active

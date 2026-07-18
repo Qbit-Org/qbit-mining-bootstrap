@@ -1780,7 +1780,7 @@ class JobBundleCacheTests(unittest.TestCase):
             for index in range(4)
         ]
         entered = [threading.Event() for _identity in identities]
-        release = threading.Event()
+        releases = [threading.Event() for _identity in identities]
         original_build = server.build_shared_job_bundle
         active_builds = 0
         max_active_builds = 0
@@ -1798,7 +1798,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 max_active_builds = max(max_active_builds, active_builds)
             entered[index].set()
             try:
-                self.assertTrue(release.wait(5))
+                self.assertTrue(releases[index].wait(5))
                 return original_build(
                     build_artifacts,  # type: ignore[arg-type]
                     identity,
@@ -1834,11 +1834,25 @@ class JobBundleCacheTests(unittest.TestCase):
             threads[1].start()
             self.assertTrue(entered[1].wait(5))
             threads[2].start()
+            pending_deadline = time.monotonic() + 5
+            while time.monotonic() < pending_deadline:
+                with server._job_build_scheduler_lock:
+                    pending = server._job_build_pending
+                    if pending is not None and pending.worker == identities[2]:
+                        break
+                time.sleep(0.01)
+            else:
+                self.fail("third collection build was not queued")
             threads[3].start()
-            time.sleep(0.05)
             self.assertEqual(server.job_build_scheduler_counts["starts"], 2)
+            releases[0].set()
+            self.assertTrue(entered[2].wait(5))
+            releases[1].set()
+            self.assertTrue(entered[3].wait(5))
+            self.assertEqual(server.job_build_scheduler_counts["starts"], 4)
         finally:
-            release.set()
+            for release in releases:
+                release.set()
             for thread in threads:
                 thread.join(5)
 
@@ -1991,6 +2005,106 @@ class JobBundleCacheTests(unittest.TestCase):
                 JobBuildSuperseded,
             )
         self.assertEqual(server.job_build_scheduler_counts["starts"], 3)
+
+    def test_ready_build_cancels_retiring_only_collection_flight(self) -> None:
+        server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        server._ensure_tip_refresh_state()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        identities = [
+            worker(f"tq1worker-{index}", f"tq1worker-{index}.rig")
+            for index in range(2)
+        ]
+        entered = [threading.Event(), threading.Event()]
+        release_active = threading.Event()
+        retiring_cancelled = threading.Event()
+        release_retiring = threading.Event()
+        original_build = server.build_shared_job_bundle
+
+        def blocking_build(
+            build_artifacts: object,
+            identity: WorkerIdentity | None,
+            **kwargs: object,
+        ) -> object:
+            request = kwargs["build_request"]
+            if identity == identities[0]:
+                entered[0].set()
+                while not request.cancellation.is_set():  # type: ignore[union-attr]
+                    if release_retiring.wait(0.01):
+                        raise AssertionError("retiring build was not cancelled")
+                retiring_cancelled.set()
+                release_retiring.wait(5)
+                request.cancellation.raise_if_cancelled(  # type: ignore[union-attr]
+                    "test retiring-only hold"
+                )
+            elif identity == identities[1]:
+                entered[1].set()
+                self.assertTrue(release_active.wait(5))
+            return original_build(
+                build_artifacts,  # type: ignore[arg-type]
+                identity,
+                **kwargs,
+            )
+
+        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        payout_generation = server._payout_state_generation
+
+        def request_for(
+            mode: str,
+            identity: WorkerIdentity | None,
+        ) -> object:
+            return server._new_job_build_request(
+                artifacts,
+                identity,
+                mode=mode,
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    artifacts,
+                    mode=mode,
+                    payout_state_generation=payout_generation,
+                    worker=identity,
+                ),
+            )
+
+        first_request = request_for("collection", identities[0])
+        second_request = request_for("collection", identities[1])
+        first_promise = server._request_job_build(  # type: ignore[arg-type]
+            first_request
+        )
+        self.assertTrue(entered[0].wait(5))
+        second_promise = server._request_job_build(  # type: ignore[arg-type]
+            second_request
+        )
+        self.assertTrue(entered[1].wait(5))
+        try:
+            release_active.set()
+            second_bundle = second_promise.result(timeout=5)
+            self.assertTrue(second_bundle.collection_only)
+            with server._job_build_scheduler_lock:
+                self.assertIsNone(server._job_build_active)
+                assert server._job_build_retiring is not None
+                self.assertIs(
+                    server._job_build_retiring.request,
+                    first_request,
+                )
+
+            ready_request = request_for("ready", None)
+            ready_promise = server._request_job_build(  # type: ignore[arg-type]
+                ready_request
+            )
+            self.assertTrue(retiring_cancelled.wait(5))
+            ready_bundle = ready_promise.result(timeout=5)
+            self.assertFalse(ready_bundle.collection_only)
+            self.assertTrue(first_request.cancellation.is_set())  # type: ignore[union-attr]
+        finally:
+            release_active.set()
+            release_retiring.set()
+
+        self.assertIsInstance(
+            first_promise.exception(timeout=5),
+            JobBuildSuperseded,
+        )
 
     def test_collection_retries_do_not_supersede_ready_build(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
