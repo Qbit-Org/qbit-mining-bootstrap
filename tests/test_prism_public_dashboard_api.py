@@ -346,6 +346,21 @@ class FakePublicLedger:
         range_id: str,
         bucket: str,
     ) -> list[dict[str, object]]:
+        if bucket == "5m":
+            return [
+                {
+                    "timestamp": "2026-06-26T20:00:00Z",
+                    "hashrate_ths": public_api.hashrate_ths_from_difficulty(600, 300),
+                    "accepted_share_count": 2,
+                    "accepted_share_difficulty": "600",
+                },
+                {
+                    "timestamp": "2026-06-26T20:10:00Z",
+                    "hashrate_ths": public_api.hashrate_ths_from_difficulty(1200, 300),
+                    "accepted_share_count": 1,
+                    "accepted_share_difficulty": "1200",
+                },
+            ]
         return [
             {
                 "timestamp": "2026-06-26T20:00:00Z",
@@ -743,6 +758,57 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v1")
         self.assertEqual(series["subject"], {"type": "miner", "id": "miner-a"})
         self.assertEqual(series["bucket"], "1h")
+        # 1h buckets already exceed the default smoothing window, so ledger
+        # rates pass through untouched.
+        self.assertEqual(series["points"][0]["hashrate_ths"], "2.5")
+
+    def assert_hashrate_ths(self, actual: object, difficulty: int, seconds: int) -> None:
+        # Hashrate strings are Decimal-context dependent (direct_stratum pins
+        # prec=40 in the importing thread while HTTP handler threads use the
+        # default 28), so compare values with a tight relative tolerance
+        # instead of exact strings.
+        expected = (
+            Decimal(difficulty)
+            * public_api.HASHES_PER_QBIT_SCALED_DIFFICULTY
+            / Decimal(seconds)
+            / public_api.TERAHASH
+        )
+        self.assertLess(abs(Decimal(str(actual)) - expected), expected * Decimal("1e-25"))
+
+    def test_hashrate_series_smooths_5m_buckets_over_trailing_window(self) -> None:
+        series = self.get_json("/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m")
+
+        points = series["points"]
+        self.assertEqual(len(points), 2)
+        # Raw per-bucket fields are preserved; only the rate is windowed.
+        self.assertEqual([point["accepted_share_difficulty"] for point in points], ["600", "1200"])
+        self.assertEqual([point["accepted_share_count"] for point in points], [2, 1])
+        self.assert_hashrate_ths(points[0]["hashrate_ths"], 600, 1800)
+        # The second point's 30m window spans 20:00 and 20:10 with the empty
+        # 20:05 bucket counting as zero difficulty.
+        self.assert_hashrate_ths(points[1]["hashrate_ths"], 1800, 1800)
+
+    def test_hashrate_series_smoothing_disabled_by_env(self) -> None:
+        with patch.dict(os.environ, {"PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS": "0"}):
+            series = self.get_json("/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m")
+
+        points = series["points"]
+        self.assert_hashrate_ths(points[0]["hashrate_ths"], 600, 300)
+        self.assert_hashrate_ths(points[1]["hashrate_ths"], 1200, 300)
+
+    def test_smooth_hashrate_series_points_leaves_malformed_points_unchanged(self) -> None:
+        points = [
+            {
+                "timestamp": "not-a-timestamp",
+                "hashrate_ths": "2.5",
+                "accepted_share_count": 1,
+                "accepted_share_difficulty": "100",
+            }
+        ]
+        smoothed = public_api.smooth_hashrate_series_points(
+            points, bucket_seconds=300, window_seconds=1800
+        )
+        self.assertEqual(smoothed, points)
 
     def test_omitted_leaderboard_window_retains_exact_legacy_v1_keys(self) -> None:
         payload = self.get_json("/public/v1/leaderboard")
