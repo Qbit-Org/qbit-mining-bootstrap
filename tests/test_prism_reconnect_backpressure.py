@@ -47,11 +47,12 @@ class AcceptSequence:
         self.index = 0
 
     def accept(self) -> tuple[FakeSocket, tuple[str, int]]:
+        if self.index == len(self.sockets):
+            self.server.stop_event.set()
+            raise socket.timeout
         sock = self.sockets[self.index]
         address = ("127.0.0.1", self.port + self.index)
         self.index += 1
-        if self.index == len(self.sockets):
-            self.server.stop_event.set()
         return sock, address
 
 
