@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import socket
 import threading
 import time
 import unittest
@@ -169,9 +170,34 @@ def client(connection_id: int, identity: WorkerIdentity | None = None) -> Client
     state.active_job_ids = set()
     state.post_accept_refresh_block = None
     state.tip_work_delivered = None
+    state.closing = False
     state.job_update_lock = threading.RLock()
     state.send_lock = threading.Lock()
     return state
+
+
+class ObservedRLock:
+    """RLock test double that exposes a contending acquire without sleeps."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.observe_acquires = False
+        self.acquire_attempted = threading.Event()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if self.observe_acquires:
+            self.acquire_attempted.set()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> ObservedRLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
 
 
 def coordinator(*, ledger: object | None = None, template: dict[str, object] | None = None) -> tuple[PrismCoordinator, FakeRpc]:
@@ -1815,6 +1841,198 @@ class JobBundleCacheTests(unittest.TestCase):
                 state.active_job.template_fingerprint,
                 snapshot.template_fingerprint,
             )
+
+
+class ClientCleanupTests(unittest.TestCase):
+    def test_disconnect_retires_and_closes_before_job_lock_cleanup(self) -> None:
+        server, _ = coordinator()
+        state = client(1)
+        server.clients = {state}
+        socket_closed = threading.Event()
+        state.close = socket_closed.set  # type: ignore[method-assign]
+        state.job_update_lock.acquire()
+        disconnect = threading.Thread(target=server.disconnect_client, args=(state,))
+        try:
+            disconnect.start()
+            self.assertTrue(socket_closed.wait(5))
+            with server.lock:
+                self.assertNotIn(state, server.clients)
+                self.assertTrue(state.closing)
+            self.assertTrue(disconnect.is_alive())
+        finally:
+            state.job_update_lock.release()
+            disconnect.join(5)
+
+        self.assertFalse(disconnect.is_alive())
+
+    def test_disconnect_during_prepared_refresh_skips_without_job_state(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        observed_lock = ObservedRLock()
+        state.job_update_lock = observed_lock  # type: ignore[assignment]
+        server.clients = {state}
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        server.observe_tip_first_seen(snapshot.bestblockhash)
+        server.pool_readiness_latched()
+        server.tip_template_snapshot = snapshot
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
+        state.send = lambda _payload: self.fail(  # type: ignore[method-assign]
+            "disconnected client received prepared work"
+        )
+        socket_closed = threading.Event()
+        state.close = socket_closed.set  # type: ignore[method-assign]
+        results: list[tuple[int, float | None, float | None, int]] = []
+        errors: list[BaseException] = []
+
+        def refresh() -> None:
+            try:
+                results.append(
+                    server._fanout_prepared_tip_refresh(
+                        [state],
+                        bundle,
+                        snapshot,
+                        heartbeat_name="qbit_blockpoll",
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surface thread failures
+                errors.append(exc)
+
+        observed_lock.acquire()
+        observed_lock.observe_acquires = True
+        refresh_thread = threading.Thread(target=refresh)
+        disconnect_thread = threading.Thread(
+            target=server.disconnect_client,
+            args=(state,),
+        )
+        try:
+            refresh_thread.start()
+            self.assertTrue(observed_lock.acquire_attempted.wait(5))
+            disconnect_thread.start()
+            self.assertTrue(socket_closed.wait(5))
+            refresh_thread.join(5)
+            self.assertFalse(refresh_thread.is_alive())
+            self.assertTrue(disconnect_thread.is_alive())
+        finally:
+            observed_lock.release()
+            refresh_thread.join(5)
+            disconnect_thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(disconnect_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results[0][0], 0)
+        self.assertIsNone(state.active_job)
+        self.assertEqual(state.active_job_ids, set())
+        self.assertEqual(server.jobs, {})
+
+    def test_mass_disconnect_releases_active_connection_accounting(self) -> None:
+        server, _ = coordinator()
+        states = [client(index) for index in range(1, 129)]
+        for state in states:
+            state.close = lambda: None  # type: ignore[method-assign]
+        server.clients = set(states)
+
+        for state in states:
+            server.disconnect_client(state)
+
+        with server.lock:
+            self.assertEqual(len(server.clients), 0)
+        self.assertTrue(all(state.closing for state in states))
+
+    def test_concurrent_disconnect_is_idempotent_and_deadlock_free(self) -> None:
+        server, _ = coordinator()
+        state = client(1)
+        server.clients = {state}
+        close_count = 0
+        close_count_lock = threading.Lock()
+        caller_count = 16
+        start = threading.Barrier(caller_count + 1)
+        errors: list[BaseException] = []
+
+        def close() -> None:
+            nonlocal close_count
+            with close_count_lock:
+                close_count += 1
+
+        def disconnect() -> None:
+            try:
+                start.wait()
+                server.disconnect_client(state)
+            except BaseException as exc:  # noqa: BLE001 - surface thread failures
+                errors.append(exc)
+
+        state.close = close  # type: ignore[method-assign]
+        callers = [threading.Thread(target=disconnect) for _ in range(caller_count)]
+        for caller in callers:
+            caller.start()
+        start.wait()
+        for caller in callers:
+            caller.join(5)
+
+        self.assertTrue(all(not caller.is_alive() for caller in callers))
+        self.assertEqual(errors, [])
+        self.assertEqual(close_count, 1)
+        self.assertNotIn(state, server.clients)
+
+    def test_disconnect_removes_active_and_evicted_job_contexts(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        active = server.build_job_for_client(state, clean_jobs=True)
+        evicted = server.build_job_for_client(state, clean_jobs=False)
+        active_id = active.job.job_id
+        evicted_id = evicted.job.job_id
+        state.active_job = active
+        state.active_job_ids = {active_id}
+        server.jobs = {active_id: active, evicted_id: evicted}
+        server.bury_evicted_job(state, evicted_id)
+        server.jobs.pop(evicted_id)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+
+        server.disconnect_client(state)
+
+        self.assertIsNone(state.active_job)
+        self.assertEqual(state.active_job_ids, set())
+        self.assertNotIn(active_id, server.jobs)
+        self.assertNotIn(evicted_id, server.evicted_job_graveyard)
+        self.assertNotIn(state.connection_id, server.evicted_jobs_by_connection)
+
+    def test_reconnect_storm_leaves_no_handler_threads_or_ghost_clients(self) -> None:
+        server, _ = coordinator()
+        connection_count = 32
+        start = threading.Barrier(connection_count + 1)
+        peers: list[socket.socket] = []
+        handlers: list[threading.Thread] = []
+
+        def handle(state: ClientState) -> None:
+            start.wait()
+            server.handle_client(state)
+
+        for connection_id in range(1, connection_count + 1):
+            coordinator_socket, peer_socket = socket.socketpair()
+            state = client(connection_id)
+            state.sock = coordinator_socket
+            server.clients.add(state)
+            peers.append(peer_socket)
+            handler = threading.Thread(
+                target=handle,
+                args=(state,),
+                name=f"prism-test-handler-{connection_id}",
+            )
+            handlers.append(handler)
+            handler.start()
+
+        start.wait()
+        for peer in peers:
+            peer.close()
+        for handler in handlers:
+            handler.join(5)
+
+        self.assertTrue(all(not handler.is_alive() for handler in handlers))
+        with server.lock:
+            self.assertEqual(server.clients, set())
 
 
 class HealthSnapshotTests(unittest.TestCase):
