@@ -13,6 +13,7 @@ from unittest.mock import patch
 from lab.prism.prism_coordinator import (
     ShutdownInProgress,
     TemplateRefreshBlocked,
+    TipRefreshPhaseTimeout,
     TipRefreshValidationToken,
     _FanoutCancellation,
     _PayoutStateDeliveryGate,
@@ -1500,6 +1501,60 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(results["new"], [1])
         self.assertEqual(sent_tips, [tip_b])
         self.assertEqual(max_active_builders, 1)
+
+    def test_timed_out_obsolete_generation_never_publishes_after_new_tip(self) -> None:
+        server, rpc = coordinator()
+        state = client(1)
+        server.clients = [state]  # type: ignore[assignment]
+        build_started = threading.Event()
+        release_timeout = threading.Event()
+        sent_tips: list[str] = []
+        errors: list[BaseException] = []
+
+        def timed_out_builder(**_kwargs: object) -> dict[str, object]:
+            build_started.set()
+            self.assertTrue(release_timeout.wait(1))
+            raise TipRefreshPhaseTimeout(
+                "bundle_builder",
+                "synthetic bundle builder timeout",
+            )
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                sent_tips.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        server.build_audit_bundle = timed_out_builder  # type: ignore[method-assign]
+        state.send = record_send  # type: ignore[method-assign]
+
+        def old_poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=old_poll)
+        thread.start()
+        self.assertTrue(build_started.wait(1))
+        newest_tip = "4a" * 32
+        _advance_fake_tip(rpc, newest_tip, 11)
+        release_timeout.set()
+        thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TipRefreshPhaseTimeout)
+        self.assertEqual(sent_tips, [])
+        self.assertIsNone(state.active_job)
+
+        install_fake_bundle_builder(server)
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        finally:
+            server.shutdown_tip_refresh_executor()
+        self.assertEqual(sent_tips, [newest_tip])
         self.assertFalse(server.tip_refresh_is_pending())
 
     def test_rapid_contention_observations_are_latest_wins(self) -> None:
@@ -1717,6 +1772,48 @@ class TipRefreshValidationTests(unittest.TestCase):
             server.tip_refresh_cancellation_counts["client_lock"],
             1,
         )
+
+    def test_client_lock_contention_times_out_and_retries_current_generation(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.client_job_lock_timeout_seconds = 0.05
+        state = client(1)
+        observed_lock = ObservedRLock()
+        state.job_update_lock = observed_lock  # type: ignore[assignment]
+        observed_lock.acquire()
+        observed_lock.acquire_attempted.clear()
+        notifications: list[dict[str, object]] = []
+        state.send = notifications.append  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        try:
+            self.assertTrue(observed_lock.acquire_attempted.wait(1))
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(notifications, [])
+            self.assertTrue(server._tip_refresh_retry.is_set())
+        finally:
+            observed_lock.release()
+            thread.join(1)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TipRefreshPhaseTimeout)
+        self.assertEqual(errors[0].phase, "client_lock")  # type: ignore[attr-defined]
+        self.assertGreaterEqual(server.blockpoll_timeout_counts["client_lock"], 1)
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        finally:
+            server.shutdown_tip_refresh_executor()
+        self.assertEqual(state.active_job.template["previousblockhash"], rpc.tip)
 
     def test_payout_gate_waiter_cancels_while_mutation_remains_held(self) -> None:
         server, rpc = coordinator()
@@ -2560,27 +2657,23 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         first.send = record_first_send  # type: ignore[method-assign]
         second.send = lambda _payload: None  # type: ignore[method-assign]
-        original_maybe_send_job = server.maybe_send_job
-        send_calls = 0
+        original_send_prepared_job = server.send_prepared_job
 
-        def advance_between_clients(*args: object, **kwargs: object) -> bool:
-            nonlocal send_calls
-            sent = original_maybe_send_job(*args, **kwargs)  # type: ignore[arg-type]
-            send_calls += 1
-            if send_calls == 1:
+        def advance_after_first(*args: object, **kwargs: object) -> object:
+            result = original_send_prepared_job(*args, **kwargs)  # type: ignore[arg-type]
+            if args and args[0] is first and result.result == "sent":  # type: ignore[attr-defined]
                 server._advance_payout_state_generation()
-            return sent
+            return result
 
-        server.maybe_send_job = advance_between_clients  # type: ignore[method-assign]
+        server.send_prepared_job = advance_after_first  # type: ignore[method-assign]
 
         with self.assertRaises(TemplateRefreshBlocked):
             server.poll_qbit_tip_template_once()
 
         self.assertEqual(first_notifications, 1)
         self.assertIsNotNone(first.active_job)
-        self.assertIsNotNone(second.active_job)
+        self.assertIsNone(second.active_job)
         self.assertEqual(first.active_job.payout_state_generation, 0)
-        self.assertEqual(second.active_job.payout_state_generation, 1)
         self.assertTrue(server._tip_refresh_retry.is_set())
 
     def test_payout_change_after_client_selection_retries_full_same_tip_set(self) -> None:

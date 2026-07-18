@@ -49,6 +49,103 @@ def coordinator(
 
 
 class PrismCoordinatorShutdownTests(unittest.TestCase):
+    def fire_watchdog(self, server: PrismCoordinator) -> None:
+        server.watchdog_interval_seconds = 0.001
+        server.watchdog_timeout_seconds = 0.01
+        server.watchdog_lease_release_timeout_seconds = 0.05
+        server._record_heartbeat("qbit_blockpoll")
+        with server._heartbeats_lock:
+            server._heartbeats["qbit_blockpoll"] = time.monotonic() - 1
+        server._set_blockpoll_phase("refresh_lock")
+        server._set_blockpoll_phase(
+            "bundle_construction",
+            tip_hash="ab" * 32,
+            generation=7,
+        )
+        server._set_blockpoll_helper_pid(4321)
+        with patch("builtins.print"), patch(
+            "lab.prism.prism_coordinator.os._exit",
+            side_effect=SystemExit(1),
+        ) as fatal_exit:
+            with self.assertRaises(SystemExit) as raised:
+                server.watchdog_loop()
+        self.assertEqual(raised.exception.code, 1)
+        fatal_exit.assert_called_once_with(1)
+
+    def test_watchdog_stops_work_releases_lease_and_exits_nonzero(self) -> None:
+        ledger = RecordingLeaseLedger()
+        server = coordinator(ledger)
+
+        self.fire_watchdog(server)
+
+        self.assertTrue(server.stop_event.is_set())
+        self.assertEqual(ledger.release_calls, 1)
+        with self.assertRaises(ShutdownInProgress):
+            with server._writer_operation("post_watchdog_work"):
+                pass
+        state = server.blockpoll_state_snapshot()
+        self.assertEqual(state["phase"], "bundle_construction")
+        self.assertEqual(state["active_helper_pid"], 4321)
+        metrics = "\n".join(server.blockpoll_metrics_lines())
+        self.assertIn("qbit_prism_watchdog_lease_release_attempts_total 1", metrics)
+        self.assertIn(
+            'qbit_prism_watchdog_lease_release_total{outcome="success"} 1',
+            metrics,
+        )
+
+    def test_watchdog_lease_release_failure_exits_and_preserves_fence(self) -> None:
+        class FailedReleaseLedger(RecordingLeaseLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.writer_held = True
+
+            def release_writer_lease(self) -> bool:
+                self.release_calls += 1
+                raise RuntimeError("database unavailable")
+
+            def replacement_can_acquire(self) -> bool:
+                return not self.writer_held
+
+        ledger = FailedReleaseLedger()
+        server = coordinator(ledger)
+
+        self.fire_watchdog(server)
+
+        self.assertEqual(ledger.release_calls, 1)
+        self.assertFalse(ledger.replacement_can_acquire())
+        self.assertEqual(
+            server._shutdown_controller.snapshot()["lease_release_last_outcome"],
+            "failure",
+        )
+        self.assertEqual(server.watchdog_lease_release_outcomes["failure"], 1)
+
+    def test_watchdog_bounds_hung_lease_release_and_exits(self) -> None:
+        release_started = threading.Event()
+        release_finish = threading.Event()
+
+        class HungReleaseLedger(RecordingLeaseLedger):
+            def release_writer_lease(self) -> bool:
+                self.release_calls += 1
+                release_started.set()
+                release_finish.wait(1)
+                return True
+
+        ledger = HungReleaseLedger()
+        server = coordinator(ledger)
+        started = time.monotonic()
+        try:
+            self.fire_watchdog(server)
+        finally:
+            release_finish.set()
+
+        self.assertTrue(release_started.is_set())
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(
+            server._shutdown_controller.snapshot()["lease_release_last_outcome"],
+            "timeout",
+        )
+        self.assertEqual(server.watchdog_lease_release_outcomes["timeout"], 1)
+
     def test_normal_shutdown_releases_lease_promptly_and_exports_metrics(self) -> None:
         ledger = RecordingLeaseLedger()
         server = coordinator(ledger)

@@ -537,12 +537,20 @@ class JobBundleCacheTests(unittest.TestCase):
                 cancellations.append("cancelled")
 
         class InjectCurrentFanoutLock:
-            def __enter__(self) -> object:
+            def acquire(self, timeout: float | None = None) -> bool:
+                del timeout
                 server._active_tip_refresh = (CurrentToken(), Cancellation())
+                return True
+
+            def release(self) -> None:
+                return None
+
+            def __enter__(self) -> object:
+                self.acquire()
                 return self
 
             def __exit__(self, *_args: object) -> None:
-                return None
+                self.release()
 
         # Model a new-generation refresh registering after the cache-state
         # increment but before the invalidator reaches the coordinator lock.
@@ -774,8 +782,19 @@ class JobBundleCacheTests(unittest.TestCase):
         class PublishAfterPrioritySnapshot:
             advanced = False
 
+            def acquire(self, timeout: float | None = None) -> bool:
+                if timeout is None:
+                    return original_lock.acquire()
+                return original_lock.acquire(timeout=timeout)
+
+            def release(self) -> None:
+                original_lock.release()
+                if not self.advanced:
+                    self.advanced = True
+                    server._payout_state_generation = 1
+
             def __enter__(self) -> object:
-                original_lock.acquire()
+                self.acquire()
                 return self
 
             def __exit__(
@@ -784,10 +803,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 _exc: object,
                 _traceback: object,
             ) -> None:
-                original_lock.release()
-                if not self.advanced:
-                    self.advanced = True
-                    server._payout_state_generation = 1
+                self.release()
 
         priorities: list[bool] = []
 
