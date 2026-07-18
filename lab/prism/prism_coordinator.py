@@ -116,6 +116,10 @@ MAX_PENDING_BLOCK_CANDIDATES = 32
 # waits for its batch's Postgres commit before receiving Stratum success, so
 # this is a latency-smoothing bound rather than a durable backlog.
 MAX_PENDING_SHARE_APPENDS = 4_096
+# A pending share commit normally clears the snapshot anchor floor within one
+# group-commit linger. Holding it longer than this is a wedged writer or a
+# leaked release path and is logged loudly (once per share).
+PRISM_PENDING_SHARE_COMMIT_WARN_SECONDS = 30.0
 DEFAULT_SHARE_COMMIT_BATCH_SIZE = 64
 DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS = 5.0
 DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS = 15.0
@@ -1109,6 +1113,11 @@ class PayoutLedgerArtifact:
     shares_json: tuple[dict[str, object], ...] = field(repr=False)
     prior_balances: tuple[dict[str, object], ...] = field(repr=False)
     prepared_monotonic: float
+    # The anchor the share snapshot was actually taken at. Bundles built from
+    # this artifact must declare it as anchor_job_issued_at_ms: an auditor
+    # replaying qbit_audit_share_window at the declared anchor must reproduce
+    # exactly these shares, which only holds at the snapshot's own anchor.
+    snapshot_anchor_ms: int | None = None
 
 
 @dataclass
@@ -2726,6 +2735,15 @@ class PrismCoordinator:
             self._payout_ledger_artifact: PayoutLedgerArtifact | None = None
         if not hasattr(self, "_payout_ledger_artifact_generation"):
             self._payout_ledger_artifact_generation = 0
+        if not hasattr(self, "_pending_share_commit_lock"):
+            self._pending_share_commit_lock = threading.Lock()
+        if not hasattr(self, "_pending_share_commit_floor"):
+            # Shares whose accepted_at_ms has been assigned but whose ledger
+            # row has not reached a terminal outcome in this process. Job and
+            # payout-artifact snapshot anchors clamp below every entry so a
+            # bundle's eligible-share set stays exactly reproducible from the
+            # durable ledger after those rows commit.
+            self._pending_share_commit_floor: dict[int, list[object]] = {}
         if not hasattr(self, "_payout_artifact_executor_lock"):
             self._payout_artifact_executor_lock = threading.Lock()
         if not hasattr(self, "_payout_artifact_executor"):
@@ -2933,9 +2951,10 @@ class PrismCoordinator:
                     * PRISM_SNAPSHOT_WINDOW_MARGIN
                     * int(network_difficulty)
                 )
+                snapshot_anchor_ms = self._job_snapshot_anchor_ms(now_ms())
                 records = list(
                     self.ledger.snapshot_at_job_issue(
-                        now_ms(),
+                        snapshot_anchor_ms,
                         window_weight=snapshot_window_weight,
                     )
                 )
@@ -2967,6 +2986,7 @@ class PrismCoordinator:
             shares_json=shares_json,
             prior_balances=frozen_balances,
             prepared_monotonic=time.monotonic(),
+            snapshot_anchor_ms=snapshot_anchor_ms,
         )
 
     def _prepare_payout_ledger_artifact(
@@ -4747,7 +4767,21 @@ class PrismCoordinator:
                     ),
                     worker=worker,
                 )
-            issued_at_ms = now_ms()
+            # The issued time doubles as the audit window anchor, so it must
+            # not cover a stamped share whose commit is still in flight.
+            issued_at_ms = self._job_snapshot_anchor_ms(now_ms())
+            # A reused artifact carries shares snapshotted at its own earlier
+            # anchor. The bundle must declare that anchor: replaying the audit
+            # window at this job's fresher anchor could include a share that
+            # was already durable at artifact build time but stamped after the
+            # artifact's clamped anchor, and the artifact's share set excludes
+            # it by construction.
+            bundle_anchor_ms = (
+                payout_artifact.snapshot_anchor_ms
+                if payout_artifact is not None
+                and payout_artifact.snapshot_anchor_ms is not None
+                else issued_at_ms
+            )
             # Bound the snapshot to a superset of the 8x reward window rather
             # than the whole accepted history: same audit bundle and digest,
             # but the ledger phase no longer scales with total ledger size.
@@ -4811,7 +4845,7 @@ class PrismCoordinator:
                         "block_height": int(template["height"]),
                         "coinbase_value_sats": int(template["coinbasevalue"]),
                         "network_difficulty": artifacts.network_difficulty,
-                        "anchor_job_issued_at_ms": issued_at_ms,
+                        "anchor_job_issued_at_ms": bundle_anchor_ms,
                     },
                     prior_balances=prior_balances,
                     coinbase_script_sig_suffix_hex=placeholder_suffix_hex,
@@ -10804,14 +10838,17 @@ class PrismCoordinator:
             # block_candidate_abandoned_counts; reject_stratum additionally counts
             # the miner-facing rejection (globally and per worker) so this rare
             # synchronous path is not missing from the rejection metrics.
-            candidate_intent = self.block_candidate_intent(candidate)
             persist_intent = getattr(self.ledger, "persist_block_candidate_intent", None)
             try:
+                candidate_intent = self.block_candidate_intent(candidate)
                 if callable(persist_intent):
                     persist_intent(candidate_intent)
             except BaseException:
                 # No retry slot is safe until the pre-submit outbox boundary is
-                # durable. Let the miner retry this submission instead.
+                # durable. Let the miner retry this submission instead. Without
+                # a durable intent nothing can commit this stamped share, so
+                # stop holding the snapshot anchor floor under it.
+                self._finish_pending_share_commit(pending_share)
                 with self.lock:
                     self.recent_share_keys.discard(share_key)
                 raise
@@ -10837,6 +10874,11 @@ class PrismCoordinator:
                         "block candidate outcome is pending durable retry"
                     )
                 if reason not in retryable_reasons:
+                    # This process will never credit the candidate share now:
+                    # release its snapshot anchor floor entry before the
+                    # terminal outbox update, whose failure would still leave
+                    # only restart replay (a fresh PendingShare) to credit it.
+                    self._finish_pending_share_commit(candidate.pending_share)
                     finish = getattr(self.ledger, "mark_block_candidate_abandoned", None)
                     if callable(finish):
                         finish(block_hash=submission.block_hash_hex, error=reason)
@@ -10879,6 +10921,9 @@ class PrismCoordinator:
             if evicted_entry is not None:
                 self.note_evicted_job_submit(credit_policy)
         except BaseException:
+            # Idempotent with append_accepted_share's own release; also covers
+            # an intent serialization failure before the append started.
+            self._finish_pending_share_commit(pending_share)
             with self.lock:
                 self.recent_share_keys.discard(share_key)
             raise
@@ -10993,6 +11038,69 @@ class PrismCoordinator:
             credit_share_on_accept=bool(intent.get("credit_share_on_accept", False)),
         )
 
+    def _ensure_pending_share_commit_state(self) -> None:
+        if not hasattr(self, "_pending_share_commit_lock"):
+            self._pending_share_commit_lock = threading.Lock()
+        if not hasattr(self, "_pending_share_commit_floor"):
+            self._pending_share_commit_floor = {}
+
+    def _finish_pending_share_commit(self, pending_share: PendingShare) -> None:
+        """Drop a share from the snapshot anchor floor.
+
+        Called once the share's ledger row reached a terminal outcome in this
+        process: durably committed, rejected back to the miner, recovered to
+        the on-disk replay file, or its block candidate terminally abandoned.
+        Idempotent, and a no-op for shares this process never registered
+        (intent/journal replays re-create PendingShare objects from JSON).
+        """
+        self._ensure_pending_share_commit_state()
+        with self._pending_share_commit_lock:
+            self._pending_share_commit_floor.pop(id(pending_share), None)
+
+    def _job_snapshot_anchor_ms(self, issued_at_ms: int) -> int:
+        """Clamp a share-snapshot anchor below every pending share commit.
+
+        The reward-window contract lets an auditor replay
+        qbit_audit_share_window(anchor) against the durable ledger and expect
+        exactly the shares the published bundle counted. A share whose
+        accepted_at_ms is already assigned but whose row has not committed yet
+        (group-commit queue, in-flight batch, or a block-candidate credit
+        linked after landing) would violate that: it is invisible to the MVCC
+        snapshot now but joins later replays at any anchor at or above its
+        accepted_at_ms. Anchoring strictly below every such share keeps the
+        issued snapshot reproducible without making job builds wait behind the
+        writer connection.
+        """
+        self._ensure_pending_share_commit_state()
+        stale_share_ids: list[str] = []
+        floor_ms: int | None = None
+        now_monotonic = time.monotonic()
+        with self._pending_share_commit_lock:
+            for entry in self._pending_share_commit_floor.values():
+                share = entry[0]
+                accepted_at_ms = int(share.accepted_at_ms)
+                if floor_ms is None or accepted_at_ms < floor_ms:
+                    floor_ms = accepted_at_ms
+                if (
+                    not entry[2]
+                    and now_monotonic - float(entry[1])
+                    > PRISM_PENDING_SHARE_COMMIT_WARN_SECONDS
+                ):
+                    entry[2] = True
+                    stale_share_ids.append(str(share.share_id))
+        for share_id in stale_share_ids:
+            # A long-held floor entry is a wedged writer or a leaked release
+            # path, not normal group-commit latency. The share-commit liveness
+            # watchdog owns recovery; this log makes the anchor clamp visible.
+            print(
+                "prism coordinator: pending share commit is holding the job "
+                f"snapshot anchor floor share_id={share_id}",
+                flush=True,
+            )
+        if floor_ms is None:
+            return issued_at_ms
+        return min(issued_at_ms, floor_ms - 1)
+
     def pending_share_from_submission(
         self,
         *,
@@ -11001,20 +11109,33 @@ class PrismCoordinator:
         ntime_hex: str,
         credit_policy: str | None = None,
     ) -> PendingShare:
-        return PendingShare(
-            share_id=f"{context.worker.username}:{submission.block_hash_hex}",
-            miner_id=context.worker.payout_address,
-            order_key=context.worker.payout_address,
-            p2mr_program_hex=context.worker.p2mr_program_hex,
-            share_difficulty=self.accepted_share_difficulty(context),
-            network_difficulty=max(1, int(context.found_block["network_difficulty"])),
-            template_height=int(context.template["height"]) - 1,
-            job_id=context.job.job_id,
-            job_issued_at_ms=context.issued_at_ms,
-            accepted_at_ms=now_ms(),
-            ntime=int(ntime_hex, 16),
-            credit_policy=credit_policy,
-        )
+        share_difficulty = self.accepted_share_difficulty(context)
+        self._ensure_pending_share_commit_state()
+        # Assign accepted_at_ms and register the commit-floor entry under one
+        # lock hold: a snapshot anchored between assignment and registration
+        # could otherwise anchor at or above this share and miss its later
+        # commit. Released via _finish_pending_share_commit.
+        with self._pending_share_commit_lock:
+            pending = PendingShare(
+                share_id=f"{context.worker.username}:{submission.block_hash_hex}",
+                miner_id=context.worker.payout_address,
+                order_key=context.worker.payout_address,
+                p2mr_program_hex=context.worker.p2mr_program_hex,
+                share_difficulty=share_difficulty,
+                network_difficulty=max(1, int(context.found_block["network_difficulty"])),
+                template_height=int(context.template["height"]) - 1,
+                job_id=context.job.job_id,
+                job_issued_at_ms=context.issued_at_ms,
+                accepted_at_ms=now_ms(),
+                ntime=int(ntime_hex, 16),
+                credit_policy=credit_policy,
+            )
+            self._pending_share_commit_floor[id(pending)] = [
+                pending,
+                time.monotonic(),
+                False,
+            ]
+        return pending
 
     @ledger_writer_operation("share_persistence")
     def append_accepted_share(
@@ -11036,10 +11157,17 @@ class PrismCoordinator:
             credit_policy=credit_policy,
             candidate_intent=candidate_intent,
         )
-        if getattr(self, "share_writer_active", False):
-            self.enqueue_share_append(entry, wait=True)
-        else:
-            self._append_share_entry(entry)
+        try:
+            if getattr(self, "share_writer_active", False):
+                self.enqueue_share_append(entry, wait=True)
+            else:
+                self._append_share_entry(entry)
+        finally:
+            # The append reached a terminal outcome for this process: durably
+            # committed, or surfaced an error the miner will retry with a fresh
+            # share. Either way the stamped share no longer holds the snapshot
+            # anchor floor. Idempotent with the group-commit writer's release.
+            self._finish_pending_share_commit(pending_share)
         # Only committed shares affect public accounting, vardiff, and the
         # response that handle_request sends immediately after this returns.
         self.note_worker_accepted_share(context.worker.username, credit_policy)
@@ -11169,6 +11297,7 @@ class PrismCoordinator:
             return False
         finally:
             for entry in batch:
+                self._finish_pending_share_commit(entry.pending_share)
                 entry.committed.set()
                 if entry.writer_token is not None:
                     entry.writer_token.finish()
@@ -11857,6 +11986,11 @@ class PrismCoordinator:
             # Compatibility ledgers without a durable candidate outbox have
             # no restart replay source that could require the tombstone.
             self._clear_accepted_block_payout_preview(block_hash)
+        # Terminal for this process either way: an accepted candidate credited
+        # its share during the success tail (a no-op release here), and an
+        # abandoned one can only be credited by restart replay, which stamps a
+        # fresh PendingShare. Stop holding the snapshot anchor floor.
+        self._finish_pending_share_commit(candidate.pending_share)
         if accepted:
             outcome.refresh_client = candidate.client
         return True
@@ -12528,8 +12662,18 @@ class PrismCoordinator:
                             self._publish_current_payout_state_with_retry_budget()
                         )
                     if publish_now and published is None:
-                        raise TemplateRefreshBlocked(
-                            "durable accepted payout state is pending publication"
+                        # The block is durably confirmed; only the payout
+                        # publication lost its race. Aborting would keep the
+                        # outbox row pending and replay persist/confirm churn
+                        # for an already-final block. Keep delivery fenced and
+                        # let the scheduled tip refresh publish the newest
+                        # source; this candidate's durable work is complete.
+                        self._block_payout_state_publication()
+                        print(
+                            "prism coordinator: accepted block confirmed "
+                            "durably; payout publication deferred to the "
+                            f"scheduled refresh hash={block_hash}",
+                            flush=True,
                         )
                 return final_bundle, report, persistence, confirmation
             except Exception:

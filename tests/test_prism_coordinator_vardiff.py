@@ -4956,6 +4956,92 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.request_shutdown()
         writer.join(timeout=2)
 
+    def test_job_snapshot_anchor_precedes_stamped_uncommitted_share(self) -> None:
+        # A share is stamped accepted_at_ms at validation time, before its
+        # group commit. Anchors chosen while that commit is pending must
+        # predate the stamp, or the issued window would omit a share that a
+        # later re-derivation at the same anchor includes.
+        server, state, ledger = submit_coordinator()
+        server.share_writer_active = True
+        server.share_commit_timeout_seconds = 2.0
+        server.share_commit_linger_seconds = 0.0
+        commit_started = threading.Event()
+        release_commit = threading.Event()
+
+        class BlockingBatchLedger(type(ledger)):
+            def append_batch(self, entries: object) -> list[object]:
+                commit_started.set()
+                release_commit.wait(timeout=2)
+                return [self.append(pending) for pending, _candidate in entries]
+
+        ledger = BlockingBatchLedger()
+        server.ledger = ledger
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            block_hash_hex="cc" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        writer = threading.Thread(target=server.share_append_loop, daemon=True)
+        writer.start()
+
+        def submit() -> None:
+            with patch(
+                "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+                return_value=submission,
+            ):
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        submitter = threading.Thread(target=submit)
+        submitter.start()
+        self.assertTrue(commit_started.wait(timeout=1))
+
+        floor = dict(server._pending_share_commit_floor)
+        self.assertEqual(len(floor), 1)
+        (floor_entry,) = floor.values()
+        stamped_ms = int(floor_entry[0].accepted_at_ms)
+        self.assertEqual(
+            server._job_snapshot_anchor_ms(stamped_ms + 60_000),
+            stamped_ms - 1,
+        )
+
+        release_commit.set()
+        submitter.join(timeout=2)
+        self.assertFalse(submitter.is_alive())
+        self.assertEqual(server._pending_share_commit_floor, {})
+        self.assertEqual(
+            server._job_snapshot_anchor_ms(stamped_ms + 60_000),
+            stamped_ms + 60_000,
+        )
+        server.request_shutdown()
+        writer.join(timeout=2)
+
+    def test_share_batch_failure_still_restores_snapshot_anchor(self) -> None:
+        server, _state, _ledger = submit_coordinator()
+        entry = self._pending_append("aa", accepted_at_ms=2)
+        server._ensure_pending_share_commit_state()
+        with server._pending_share_commit_lock:
+            server._pending_share_commit_floor[id(entry.pending_share)] = [
+                entry.pending_share,
+                time.monotonic(),
+                False,
+            ]
+        self.assertEqual(server._job_snapshot_anchor_ms(10_000), 1)
+
+        class FailingLedger(FakeLedger):
+            def append(self, pending: object) -> object:
+                raise RuntimeError("ledger unavailable")
+
+        server.ledger = FailingLedger()
+        self.assertFalse(server._append_share_batch([entry]))
+        self.assertTrue(entry.committed.is_set())
+        self.assertEqual(server._pending_share_commit_floor, {})
+        self.assertEqual(server._job_snapshot_anchor_ms(10_000), 10_000)
+
     def test_failed_commit_releases_duplicate_key_for_exact_retry(self) -> None:
         server, state, healthy = submit_coordinator()
         server.share_writer_active = True
@@ -6506,6 +6592,78 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         self.assertTrue(server._payout_state_publication_blocked)
         self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+
+    def test_post_confirm_publication_loss_completes_candidate_and_fences(self) -> None:
+        # Once persist + confirm are durable, losing the forced payout
+        # publication must not abort the candidate: the outbox row is marked
+        # submitted and the success tail runs, while delivery stays fenced
+        # until the scheduled refresh publishes the newest source.
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.max_blocks = 2
+        server.stop_after_block = False
+        block_hash = "e1" * 32
+        server.rpc = SubmitRpc(
+            tip="00" * 32,
+            block_hash=block_hash,
+            ledger=ledger,
+        )
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+        submitted: list[dict[str, object]] = []
+        ledger.mark_block_candidate_submitted = (  # type: ignore[attr-defined]
+            lambda **kwargs: submitted.append(kwargs) or True
+        )
+        real_confirm = ledger.confirm_accepted_block
+
+        def confirm_then_reserve_newer_source(**kwargs: object) -> dict[str, object]:
+            result = real_confirm(**kwargs)
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash="ee" * 32,
+            )
+            return result
+
+        ledger.confirm_accepted_block = confirm_then_reserve_newer_source  # type: ignore[method-assign]
+        server._publish_current_payout_state_with_retry_budget = (  # type: ignore[method-assign]
+            lambda **_kwargs: None
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            self.assertTrue(
+                server._submit_next_block_candidate_writer(
+                    block_candidate(server, state, submission)
+                )
+            )
+
+        self.assertIsNone(getattr(server, "_retry_block_candidate", None))
+        self.assertEqual(len(ledger.confirmed), 1)
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(submitted[0]["block_hash"], block_hash)
+        self.assertEqual(server.accepted_block_count, 1)
+        self.assertIn(block_hash, server._accounted_accepted_block_hashes)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertTrue(server.tip_refresh_is_pending())
+
+        # The scheduled refresh publishes the pending source and reopens
+        # delivery without any candidate replay.
+        del server._publish_current_payout_state_with_retry_budget
+        self.assertIsNotNone(server._publish_current_payout_state_with_retry_budget())
+        self.assertFalse(server._payout_state_publication_blocked)
+        self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
 
     def test_idempotent_direct_block_replay_skips_publication(self) -> None:
         server, state, ledger = submit_coordinator()

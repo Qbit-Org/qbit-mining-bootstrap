@@ -27,9 +27,10 @@ from lab.prism.prism_coordinator import (
     TemplateRefreshBlocked,
     WorkerIdentity,
     default_prism_coinbase_tag_hex,
+    now_ms,
     qbit_template_fingerprint,
 )
-from lab.prism.share_ledger import SingleWriterShareLedger
+from lab.prism.share_ledger import PendingShare, SingleWriterShareLedger
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"
 EXTRANONCE2_SIZE = 8
@@ -290,6 +291,111 @@ def install_fake_bundle_builder(server: PrismCoordinator) -> dict[str, object]:
 
     server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
     return recorded
+
+
+def stamped_pending_share(accepted_at_ms: int) -> PendingShare:
+    return PendingShare(
+        share_id=f"miner-a:{accepted_at_ms}",
+        miner_id="miner-a",
+        order_key="miner-a",
+        p2mr_program_hex="22" * 32,
+        share_difficulty=1,
+        network_difficulty=1,
+        template_height=9,
+        job_id="job-1",
+        job_issued_at_ms=accepted_at_ms - 1,
+        accepted_at_ms=accepted_at_ms,
+        ntime=1_700_000_000,
+    )
+
+
+class AnchorRecordingLedger(FakeLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchors: list[int] = []
+
+    def snapshot_at_job_issue(
+        self, anchor_job_issued_at_ms: int, *, window_weight: int | None = None
+    ) -> list[FakeShare]:
+        self.anchors.append(int(anchor_job_issued_at_ms))
+        return super().snapshot_at_job_issue(
+            anchor_job_issued_at_ms, window_weight=window_weight
+        )
+
+
+class SnapshotAnchorFloorTests(unittest.TestCase):
+    def _hold_floor(self, server: PrismCoordinator, share: PendingShare) -> None:
+        server._ensure_pending_share_commit_state()
+        with server._pending_share_commit_lock:
+            server._pending_share_commit_floor[id(share)] = [
+                share,
+                time.monotonic(),
+                False,
+            ]
+
+    def test_job_bundle_anchor_clamps_below_pending_share_commit(self) -> None:
+        # The issued snapshot must be reproducible from the durable ledger:
+        # while a stamped share's commit is pending, the job anchor (which the
+        # bundle declares as anchor_job_issued_at_ms) has to predate it, or
+        # qbit_audit_share_window at the declared anchor would include a share
+        # the published window omitted.
+        ledger = AnchorRecordingLedger()
+        server, _rpc = coordinator(ledger=ledger)
+        install_fake_bundle_builder(server)
+        stamped_ms = now_ms() - 5
+        share = stamped_pending_share(stamped_ms)
+        self._hold_floor(server, share)
+
+        bundle = server.build_shared_job_bundle(
+            server.current_template_artifacts(),
+            worker(),
+        )
+        self.assertEqual(ledger.anchors[-1], stamped_ms - 1)
+        self.assertEqual(
+            bundle.found_block["anchor_job_issued_at_ms"], stamped_ms - 1
+        )
+        self.assertEqual(bundle.issued_at_ms, stamped_ms - 1)
+
+        server._finish_pending_share_commit(share)
+        rebuilt = server.build_shared_job_bundle(
+            server.current_template_artifacts(),
+            worker(),
+        )
+        self.assertGreaterEqual(ledger.anchors[-1], stamped_ms)
+        self.assertGreaterEqual(
+            int(rebuilt.found_block["anchor_job_issued_at_ms"]), stamped_ms
+        )
+
+    def test_payout_artifact_declares_its_own_snapshot_anchor(self) -> None:
+        # An artifact snapshot is taken at its own (possibly clamped) anchor.
+        # A bundle reusing the artifact must declare that anchor rather than
+        # the fresher job-issue time: a share that was already durable at
+        # artifact build time but stamped above the artifact's clamped anchor
+        # is excluded from the artifact by construction, yet a re-derivation
+        # at the job-issue anchor would include it.
+        ledger = AnchorRecordingLedger()
+        server, _rpc = coordinator(ledger=ledger)
+        install_fake_bundle_builder(server)
+        stamped_ms = now_ms() - 5
+        share = stamped_pending_share(stamped_ms)
+        self._hold_floor(server, share)
+
+        artifact = server._build_payout_ledger_artifact(0, 0, 1_000)
+        assert artifact is not None
+        self.assertEqual(artifact.snapshot_anchor_ms, stamped_ms - 1)
+        self.assertEqual(ledger.anchors[-1], stamped_ms - 1)
+
+        server._finish_pending_share_commit(share)
+        bundle = server.build_shared_job_bundle(
+            server.current_template_artifacts(),
+            worker(),
+            payout_artifact=artifact,
+        )
+        self.assertEqual(
+            bundle.found_block["anchor_job_issued_at_ms"],
+            artifact.snapshot_anchor_ms,
+        )
+        self.assertGreater(bundle.issued_at_ms, int(artifact.snapshot_anchor_ms))
 
 
 class JobBundleCacheTests(unittest.TestCase):
