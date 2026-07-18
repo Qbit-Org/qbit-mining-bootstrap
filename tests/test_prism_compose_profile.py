@@ -68,7 +68,11 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_WORKER_METRICS_LIMIT": "8",
                 "PRISM_STRATUM_MAX_CONNECTIONS": "1900",
                 "PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME": "400",
+                "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS": "120",
+                "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS": "27",
+                "PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS": "29",
                 "PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS": "2",
+                "PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS": "9",
                 "PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES": "2048",
                 "PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS": "1800",
                 "PRISM_COORDINATOR_NOFILE_SOFT": "60000",
@@ -141,6 +145,7 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_POSTGRES_INIT_SCHEMA"], "1")
         self.assertEqual(env["PRISM_POSTGRES_READ_CONCURRENCY"], "4")
         self.assertEqual(env["PRISM_LEDGER_LEASE_TTL_SECONDS"], "60")
+        self.assertEqual(env["PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS"], "9")
         self.assertEqual(env["PRISM_WATCHDOG_ENABLED"], "1")
         self.assertEqual(env["PRISM_WATCHDOG_TIMEOUT_SECONDS"], "120")
         self.assertEqual(env["PRISM_WATCHDOG_INTERVAL_SECONDS"], "15")
@@ -157,6 +162,9 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_WORKER_METRICS_LIMIT"], "8")
         self.assertEqual(env["PRISM_STRATUM_MAX_CONNECTIONS"], "1900")
         self.assertEqual(env["PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME"], "400")
+        self.assertEqual(env["PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS"], "120")
+        self.assertEqual(env["PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS"], "27")
+        self.assertEqual(env["PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS"], "29")
         self.assertEqual(
             env["PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS"],
             "2",

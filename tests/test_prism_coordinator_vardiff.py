@@ -1058,6 +1058,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_low_difficulty_shares_total 3", metrics)
         self.assertIn("qbit_prism_grace_credited_shares_total 6", metrics)
         self.assertIn("qbit_prism_stratum_active_connections 0", metrics)
+        self.assertIn("qbit_prism_stratum_connection_limit 384", metrics)
+        self.assertIn("qbit_prism_stratum_peak_active_connections 0", metrics)
+        self.assertIn("qbit_prism_stratum_pending_initial_jobs 0", metrics)
+        self.assertIn("qbit_prism_stratum_pending_initial_job_limit 128", metrics)
+        self.assertIn("qbit_prism_stratum_current_tip_job_coverage 1.0", metrics)
+        self.assertIn("qbit_prism_stratum_handler_threads 0", metrics)
+        self.assertIn("qbit_prism_job_delivery_queue_depth 0", metrics)
+        self.assertIn("qbit_prism_job_delivery_active_workers 0", metrics)
         self.assertIn(
             'qbit_prism_stratum_connection_limit_rejections_total{scope="global"} 2',
             metrics,
@@ -3108,6 +3116,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
+            {**base, "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS",
+            ):
+                validate_prism_production_gate()
+
+        with patch.dict(
+            os.environ,
+            {**base, "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
+            ):
+                validate_prism_production_gate()
+
+        with patch.dict(
+            os.environ,
             {**base, "QBIT_CHAIN": "mainnet", "PRISM_STRATUM_STALE_GRACE_SECONDS": "3"},
             clear=True,
         ):
@@ -4664,7 +4694,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertEqual(ledger.pending[0].share_id, "miner-a:" + "cc" * 32)
         self.assertEqual(server.worker_share_counts["miner-a"]["accepted"], 1)
-        server.stop_event.set()
+        server.request_shutdown()
         writer.join(timeout=2)
 
     def test_failed_commit_releases_duplicate_key_for_exact_retry(self) -> None:
@@ -4710,7 +4740,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
         self.assertEqual(len(healthy.pending), 1)
         self.assertEqual(server.worker_share_counts["miner-a"]["accepted"], 1)
-        server.stop_event.set()
+        server.request_shutdown()
         writer.join(timeout=2)
 
     def test_share_writer_retries_failed_append_until_it_lands(self) -> None:
@@ -4941,13 +4971,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                     raise RuntimeError("postgres unavailable")
 
             server.ledger = DownLedger()
-            server.stop_event.set()
             entries = []
             for tag in ("s1", "s2", "s3"):
                 entry = self._pending_append(tag)
                 entries.append(entry)
                 server.enqueue_share_append(entry)
 
+            server.request_shutdown()
             server.share_append_loop()
 
             # The compatibility ledger fails on the first row; the whole batch
@@ -5532,6 +5562,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 block_candidate(server, state, submission, pending_share=pending)
             )
             self.assertTrue(accepted)
+            self.assertTrue(
+                server._ensure_shutdown_controller().writer_admission_closed()
+            )
 
             live_files = sorted(Path(tempdir).glob("prism-live-audit-bundle-[0-9]*.json"))
             self.assertEqual(len(live_files), 1)
@@ -6435,6 +6468,16 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             candidate = block_candidate(server, state, submission)
 
             self.assertTrue(server.submit_block_candidate(candidate))
+            # Direct finalization records the refresh for its caller so slow
+            # job fanout happens after writer admission has been released.
+            self.assertEqual(
+                state.post_accept_refresh_block,
+                (10, block_hash),
+            )
+            server.refresh_jobs_after_pending_accepted_block(
+                state,
+                heartbeat_name="block_submitter",
+            )
             # A failed outbox terminal update can replay A after later block B
             # changes global balances. Validate A against its height-bounded
             # active-chain view and suppress duplicate process-local accounting.
@@ -6549,6 +6592,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
             self.assertIs(client, state)
+            self.assertNotIn(
+                "accepted_block_handling",
+                server._ensure_shutdown_controller().snapshot()["active_writers"],
+            )
             return prism_context(
                 "fresh-job",
                 block_hash,
@@ -7373,6 +7420,7 @@ class PrismListenerProfileTests(unittest.TestCase):
         server = coordinator()
         state = client()
         state.share_difficulty = Decimal("1")
+        state.difficulty_generation = 7
         state.send = lambda payload: None  # type: ignore[method-assign]
         server.maybe_send_job = lambda client, *, clean_jobs: False  # type: ignore[method-assign]
 
@@ -7380,6 +7428,7 @@ class PrismListenerProfileTests(unittest.TestCase):
 
         self.assertIsNone(state.pending_share_difficulty)
         self.assertEqual(state.share_difficulty, Decimal("1"))
+        self.assertEqual(state.difficulty_generation, 7)
 
     def test_suggest_difficulty_yields_to_password_d_option(self) -> None:
         server = coordinator()
@@ -7495,8 +7544,13 @@ class PrismListenerProfileTests(unittest.TestCase):
         server, state, _ = self.authorize_server_and_client()
         send_job_calls: list[bool] = []
 
-        def counting_send_job(client: object, *, clean_jobs: bool) -> bool:
+        def counting_send_job(current: ClientState, *, clean_jobs: bool) -> bool:
             send_job_calls.append(clean_jobs)
+            current.active_job = SimpleNamespace(
+                template={"previousblockhash": "aa" * 32},
+                payout_state_generation=0,
+            )
+            server.current_tip_first_seen = ("aa" * 32, None)
             return True
 
         server.maybe_send_job = counting_send_job  # type: ignore[method-assign]

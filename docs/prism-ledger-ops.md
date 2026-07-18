@@ -56,6 +56,36 @@ The ledger is single-writer, not active-active. A replacement writer takes the
 lease after expiry. Active-active insertion would create ambiguous ordering and
 is outside the accepted PRISM contract.
 
+Graceful coordinator shutdown closes Stratum admission and all background
+writer admission first, then waits for admitted share batches, accepted-block
+finalization, CTV status updates, and payout/reorg mutations to finish. It
+releases the exact-session writer lease immediately after that writer barrier;
+client socket delivery, obsolete job fanout, and executor/thread cleanup drain
+after release and therefore cannot delay a replacement writer. SIGTERM only
+closes admission and wakes the serve loop; the barrier and database work run
+outside the signal handler.
+
+`PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS` bounds the writer barrier and defaults
+to 15 seconds. This leaves time for conservative synchronous Postgres flushing
+while remaining well below the default 60-second lease TTL. If the timeout
+expires, the coordinator logs each still-active writer component and
+deliberately does not release the lease; process termination and TTL fencing
+then preserve the single-writer invariant. Do not shorten this below the
+durable flush time of the deployed Postgres system.
+
+Shutdown emits structured JSON log events named `shutdown_start`,
+`writer_quiescence`, `lease_release_attempt`, `lease_release`,
+`lease_release_withheld`, and `non_writer_drain`. Prometheus exposes the same
+path through `qbit_prism_shutdowns_total`,
+`qbit_prism_shutdown_writer_quiescence_seconds`,
+`qbit_prism_shutdown_writer_quiescence_total`,
+`qbit_prism_shutdown_lease_release_attempts_total`,
+`qbit_prism_shutdown_lease_release_total`,
+`qbit_prism_shutdown_lease_release_seconds`,
+`qbit_prism_shutdown_sigterm_to_lease_release_seconds`,
+`qbit_prism_shutdown_non_writer_drain_seconds`, and
+`qbit_prism_shutdown_release_withheld_total`.
+
 ## Block Candidate Outbox
 
 A block-worthy share transaction also inserts an immutable intent into
