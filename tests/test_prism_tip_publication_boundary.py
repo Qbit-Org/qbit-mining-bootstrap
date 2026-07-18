@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import dataclasses
 import time
+import types
 import unittest
 
-from lab.prism.prism_coordinator import TemplateRefreshBlocked
+from lab.prism.prism_coordinator import (
+    TemplateRefreshBlocked,
+    _JobBuildCancellation,
+)
 from tests.test_prism_coordinator_job_cache import (
     base_template,
     client,
@@ -567,6 +571,154 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
             self.assertEqual(len(notifies), sent_before)
             self.assertEqual(server.current_tip_first_seen[0], next_tip)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_direct_send_skips_pinned_work_after_lease_lapse(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+
+            next_tip = "dd" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+            server.fetch_qbit_tip_template_snapshot()
+
+            # The pinned published-tip build starts while authority holds,
+            # then the divergence lease lapses during the payout-gate wait.
+            original_build = server.build_job_for_client
+
+            def build_then_lapse(
+                target: object,
+                *,
+                clean_jobs: bool,
+            ) -> object:
+                context = original_build(target, clean_jobs=clean_jobs)  # type: ignore[arg-type]
+                server.current_tip_observed_monotonic = (
+                    time.monotonic()
+                    - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
+                    - 1.0
+                )
+                server.template_refresh_failure_exit_seconds = 0.0
+                return context
+
+            server.build_job_for_client = build_then_lapse  # type: ignore[method-assign]
+            sent_before = len(notifies)
+
+            # Submit classification has fallen back to the live view; the
+            # pinned published-parent job would be stale on arrival.
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_lapsed_direct_send_revalidates_against_live_tip(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        notifies: list[str] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                notifies.append(
+                    str(state.active_job.template["previousblockhash"])
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            # The chain moves while the coordinator is blind (no blockpoll,
+            # no blockwait, template cache still fresh on the published tip),
+            # and the published authority lapses entirely.
+            next_tip = "ff" * 32
+            rpc.tip = next_tip
+            server.current_tip_observed_monotonic = (
+                time.monotonic()
+                - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
+                - 1.0
+            )
+            server.template_refresh_failure_exit_seconds = 0.0
+
+            state.active_job = None
+            state.active_job_ids = set()
+            sent_before = len(notifies)
+            # Submit classification is on the live RPC read now; advertising
+            # cached published-tip work would reject every share. The direct
+            # path revalidates against the live tip and records the detection.
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=False))
+            self.assertEqual(len(notifies), sent_before)
+            self.assertEqual(server.latest_detected_tip[0], next_tip)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_fingerprint_cancel_keeps_pinned_published_build(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_snapshot = server.tip_template_snapshot
+            assert published_snapshot is not None
+            pinned_artifacts = published_snapshot.template_artifacts
+            assert pinned_artifacts is not None
+
+            next_tip = "ee" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            self.assertTrue(server.observe_tip_for_refresh(next_tip))
+
+            pinned_cancellation = _JobBuildCancellation(timeout_seconds=30.0)
+            pinned_flight = types.SimpleNamespace(
+                request=types.SimpleNamespace(
+                    artifacts=pinned_artifacts,
+                    cancellation=pinned_cancellation,
+                    superseded_monotonic=None,
+                )
+            )
+            with server._job_build_scheduler_lock:
+                server._job_build_active = pinned_flight  # type: ignore[assignment]
+            try:
+                # The detected-tip store prunes fingerprints and sweeps stale
+                # builds, but an in-flight build for exactly the published
+                # snapshot is still valid, creditable work and must survive.
+                server.fetch_qbit_tip_template_snapshot()
+                self.assertFalse(pinned_cancellation.is_set())
+            finally:
+                with server._job_build_scheduler_lock:
+                    server._job_build_active = None
         finally:
             server.shutdown_tip_refresh_executor()
 

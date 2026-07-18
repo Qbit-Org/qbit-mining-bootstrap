@@ -3728,18 +3728,57 @@ class PrismCoordinator:
             self._job_build_pending = request
             return request.promise
 
-    def _cancel_obsolete_job_builds(self, reason: str) -> None:
+    def _cancel_obsolete_job_builds(
+        self,
+        reason: str,
+        *,
+        keep_published_snapshot: bool = False,
+    ) -> None:
         self._ensure_job_cache_state()
+        published_parent: str | None = None
+        published_fingerprint: str | None = None
+        if keep_published_snapshot:
+            # A per-client build for exactly the published snapshot is still
+            # valid, creditable work when a same-tip template bump sweeps old
+            # fingerprints. Detection-time sweeps deliberately do not use this:
+            # once a replacement tip is detected, even published-tip builds
+            # must vacate the single-flight lane for the replacement's work.
+            # Snapshot the identity outside the scheduler lock so the keep
+            # check stays lock-free below.
+            with self.lock:
+                published = getattr(self, "current_tip_first_seen", None)
+                snapshot = getattr(self, "tip_template_snapshot", None)
+                snapshot_tip = getattr(snapshot, "bestblockhash", None)
+                snapshot_fingerprint = getattr(
+                    snapshot, "template_fingerprint", None
+                )
+                if (
+                    published is not None
+                    and snapshot_tip == published[0]
+                    and snapshot_fingerprint is not None
+                    and self._published_tip_authoritative_locked(time.monotonic())
+                ):
+                    published_parent = published[0]
+                    published_fingerprint = snapshot_fingerprint
+
+        def keep(request: _JobBuildRequest) -> bool:
+            return bool(
+                published_fingerprint is not None
+                and request.artifacts.previousblockhash == published_parent
+                and request.artifacts.fingerprint == published_fingerprint
+            )
+
         with self._job_build_scheduler_lock:
             for flight in (self._job_build_active, self._job_build_retiring):
                 if (
                     flight is not None
+                    and not keep(flight.request)
                     and flight.request.cancellation.cancel(reason)
                 ):
                     flight.request.superseded_monotonic = time.monotonic()
                     self.job_build_scheduler_counts["supersessions"] += 1
             pending = self._job_build_pending
-            if pending is not None:
+            if pending is not None and not keep(pending):
                 pending.cancellation.cancel(reason)
                 if not pending.promise.done():
                     pending.promise.set_exception(
@@ -4329,7 +4368,10 @@ class PrismCoordinator:
                     if entry.template_fingerprint in keep_fingerprints
                 )
         if changed:
-            self._cancel_obsolete_job_builds("template fingerprint superseded")
+            self._cancel_obsolete_job_builds(
+                "template fingerprint superseded",
+                keep_published_snapshot=True,
+            )
         return True
 
     def store_template_artifacts(
@@ -10913,12 +10955,30 @@ class PrismCoordinator:
         )
         with self.lock:
             published_authority = getattr(self, "current_tip_first_seen", None)
+            published_authoritative = self._published_tip_authoritative_locked(
+                time.monotonic()
+            )
             pinned_published_delivery = bool(
                 context_parent
                 and published_authority is not None
                 and context_parent == published_authority[0]
-                and self._published_tip_authoritative_locked(time.monotonic())
+                and published_authoritative
             )
+        if not guarded_refresh and context_parent and not published_authoritative:
+            # The published authority lapsed, so per-share classification has
+            # fallen back to the live RPC read. Mirror the initial-job path:
+            # revalidate against the live tip (outside every lock), record
+            # the observation for the refresh machinery, and drop work that
+            # would be stale on arrival.
+            try:
+                lapsed_live_tip = str(self.rpc.call("getbestblockhash"))
+            except Exception:
+                lapsed_live_tip = None
+            if lapsed_live_tip is not None:
+                self.observe_tip_for_refresh(lapsed_live_tip)
+                if context_parent != lapsed_live_tip:
+                    self._schedule_tip_refresh_retry()
+                    return False
         priority_delivery = (
             not publication_blocked
             and context_payout_generation == current_payout_generation
@@ -10977,20 +11037,29 @@ class PrismCoordinator:
                             "client job build did not use the guarded refresh artifacts"
                         )
                 else:
-                    published_now = getattr(self, "current_tip_first_seen", None)
+                    if self._published_tip_authoritative_locked(time.monotonic()):
+                        published_now = getattr(
+                            self, "current_tip_first_seen", None
+                        )
+                        classify_reference = (
+                            published_now[0] if published_now is not None else None
+                        )
+                    else:
+                        # The lease lapsed while this build waited: submit
+                        # classification has fallen back to the live view, so
+                        # judge against the newest observation instead of the
+                        # stale published tip.
+                        classify_reference = self._newest_observed_tip_locked()
                     if (
                         context_parent
-                        and published_now is not None
-                        and context_parent != published_now[0]
-                        and self._published_tip_authoritative_locked(
-                            time.monotonic()
-                        )
+                        and classify_reference is not None
+                        and context_parent != classify_reference
                     ):
-                        # Publication moved while this direct build waited on
+                        # Authority moved while this direct build waited on
                         # the payout gate or client lock. Sending now would
-                        # advertise work that classifies stale-job on arrival
-                        # under the new authority; skip and let the refresh
-                        # fanout (or the pending retry) deliver current work.
+                        # advertise work that classifies stale-job on arrival;
+                        # skip and let the refresh fanout (or the pending
+                        # retry) deliver current work.
                         self._schedule_tip_refresh_retry()
                         return False
                 client.active_job = context
