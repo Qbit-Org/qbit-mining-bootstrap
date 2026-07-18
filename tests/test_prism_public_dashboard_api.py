@@ -861,19 +861,40 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(points[0]["accepted_share_difficulty"], "1200")
         self.assert_hashrate_ths(points[0]["hashrate_ths"], 1800, 1800)
 
-    def test_smooth_hashrate_series_points_leaves_malformed_points_unchanged(self) -> None:
-        points = [
-            {
-                "timestamp": "not-a-timestamp",
-                "hashrate_ths": "2.5",
-                "accepted_share_count": 1,
-                "accepted_share_difficulty": "100",
-            }
-        ]
+    def test_smooth_hashrate_series_points_drops_malformed_points(self) -> None:
+        # An unparseable point can be neither windowed nor range-checked, so it
+        # is dropped rather than passed through raw (which would leak pre-range
+        # lookback buckets past the min_epoch trim).
+        malformed = {
+            "timestamp": "not-a-timestamp",
+            "hashrate_ths": "2.5",
+            "accepted_share_count": 1,
+            "accepted_share_difficulty": "100",
+        }
+        valid = {
+            "timestamp": "2026-06-26T20:00:00Z",
+            "hashrate_ths": "2.5",
+            "accepted_share_count": 1,
+            "accepted_share_difficulty": "600",
+        }
         smoothed = public_api.smooth_hashrate_series_points(
-            points, bucket_seconds=300, window_seconds=1800
+            [malformed, valid], bucket_seconds=300, window_seconds=1800
         )
-        self.assertEqual(smoothed, points)
+        self.assertEqual(len(smoothed), 1)
+        self.assertEqual(smoothed[0]["accepted_share_difficulty"], "600")
+        self.assert_hashrate_ths(smoothed[0]["hashrate_ths"], 600, 1800)
+        # With trimming active, a malformed pre-range context point stays out
+        # of the response.
+        cutoff_epoch = 1_750_000_000 // 300 * 300
+        in_range = dict(valid, timestamp=_bucket_timestamp(cutoff_epoch))
+        smoothed = public_api.smooth_hashrate_series_points(
+            [malformed, in_range],
+            bucket_seconds=300,
+            window_seconds=1800,
+            min_epoch=cutoff_epoch,
+        )
+        self.assertEqual(len(smoothed), 1)
+        self.assertEqual(smoothed[0]["timestamp"], _bucket_timestamp(cutoff_epoch))
 
     def test_omitted_leaderboard_window_retains_exact_legacy_v1_keys(self) -> None:
         payload = self.get_json("/public/v1/leaderboard")

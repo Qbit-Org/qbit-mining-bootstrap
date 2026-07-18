@@ -1175,26 +1175,28 @@ def smooth_hashrate_series_points(
 
     Points before min_epoch are pre-range lookback context: they feed the
     trailing windows of the first in-range points and are dropped from the
-    result.
+    result. A point whose timestamp or difficulty does not parse is dropped as
+    well -- it can be neither windowed nor range-checked, and dropping it beats
+    leaking pre-range buckets or failing the endpoint over a display
+    refinement.
     """
     bucket_count = window_seconds // bucket_seconds if bucket_seconds > 0 else 0
     if (bucket_count < 2 and min_epoch is None) or not points:
         return points
     effective_window_seconds = bucket_count * bucket_seconds
     difficulty_by_epoch: dict[int, Decimal] = {}
-    epochs: list[int] = []
-    try:
-        for point in points:
+    parsed_points: list[tuple[dict[str, object], int]] = []
+    for point in points:
+        try:
             parsed = datetime.strptime(str(point["timestamp"]), "%Y-%m-%dT%H:%M:%SZ")
             epoch = int(parsed.replace(tzinfo=timezone.utc).timestamp())
-            epochs.append(epoch)
-            difficulty_by_epoch[epoch] = Decimal(str(point["accepted_share_difficulty"]))
-    except (KeyError, ValueError, ArithmeticError):
-        # A malformed point means we cannot window reliably; charts falling back
-        # to raw buckets beats failing the endpoint over a display refinement.
-        return points
+            difficulty = Decimal(str(point["accepted_share_difficulty"]))
+        except (KeyError, ValueError, ArithmeticError):
+            continue
+        parsed_points.append((point, epoch))
+        difficulty_by_epoch[epoch] = difficulty
     smoothed: list[dict[str, object]] = []
-    for point, epoch in zip(points, epochs):
+    for point, epoch in parsed_points:
         if min_epoch is not None and epoch < min_epoch:
             continue
         if bucket_count < 2:
