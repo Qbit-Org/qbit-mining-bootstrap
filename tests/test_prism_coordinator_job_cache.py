@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import socket
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal
+from types import SimpleNamespace
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
@@ -167,9 +170,34 @@ def client(connection_id: int, identity: WorkerIdentity | None = None) -> Client
     state.active_job_ids = set()
     state.post_accept_refresh_block = None
     state.tip_work_delivered = None
+    state.closing = False
     state.job_update_lock = threading.RLock()
     state.send_lock = threading.Lock()
     return state
+
+
+class ObservedRLock:
+    """RLock test double that exposes a contending acquire without sleeps."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.observe_acquires = False
+        self.acquire_attempted = threading.Event()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if self.observe_acquires:
+            self.acquire_attempted.set()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> ObservedRLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
 
 
 def coordinator(*, ledger: object | None = None, template: dict[str, object] | None = None) -> tuple[PrismCoordinator, FakeRpc]:
@@ -205,7 +233,7 @@ def coordinator(*, ledger: object | None = None, template: dict[str, object] | N
     server.last_reorg_reconciled_trusted = False
     server.last_reorg_reconciled_monotonic = None
     server.latest_evidence = None
-    server.latest_bundle = None
+    server.latest_coinbase_size_bytes = None
     server.tip_template_snapshot = None
     server.extranonce2_size = EXTRANONCE2_SIZE
     server.coinbase_tag_hex = default_prism_coinbase_tag_hex()
@@ -248,6 +276,7 @@ def install_fake_bundle_builder(server: PrismCoordinator) -> dict[str, object]:
         recorded["last_kwargs"] = kwargs
         return {
             "found_block": dict(kwargs["found_block"]),
+            "payout_policy_manifest": {"accounts": []},
             "signed_coinbase_manifest": {
                 "manifest": {
                     "coinbase_tx_hex": synthetic_manifest_coinbase_hex(suffix_hex),
@@ -317,7 +346,17 @@ class JobBundleCacheTests(unittest.TestCase):
         # split is byte-identical for every client.
         self.assertEqual(len({context.job.coinb1 for context in contexts}), 1)
         self.assertEqual(len({context.job.coinb2 for context in contexts}), 1)
-        self.assertIs(contexts[0].bundle, contexts[1].bundle)
+        self.assertTrue(all(not hasattr(context, "bundle") for context in contexts))
+        self.assertTrue(
+            all(context.prospective_prior_balances == () for context in contexts)
+        )
+        cached = next(iter(server._job_bundle_cache.values()))
+        self.assertFalse(hasattr(cached, "bundle"))
+        self.assertEqual(cached.prospective_prior_balances, ())
+        self.assertEqual(
+            cached.coinbase_manifest["coinbase_tx_hex"],
+            synthetic_manifest_coinbase_hex(recorded["suffixes"][0]),
+        )
         self.assertIs(contexts[0].shares_json, contexts[1].shares_json)
 
     def test_stamped_job_reassembles_coinbase_with_client_extranonce(self) -> None:
@@ -373,6 +412,27 @@ class JobBundleCacheTests(unittest.TestCase):
         server.build_job_for_client(client(2), clean_jobs=True)
 
         self.assertEqual(recorded["calls"], 2)
+
+    def test_bundle_cache_lookup_prunes_every_expired_snapshot(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(base_template())
+        assert artifacts is not None
+        current = server.shared_job_bundle(artifacts, worker())
+        expired_key = ("expired-template", "ready")
+        expired = dataclass_replace(
+            current,
+            key=expired_key,
+            template_fingerprint="expired-template",
+            built_monotonic=time.monotonic() - 60,
+        )
+        server._job_bundle_cache[expired_key] = expired
+
+        looked_up = server._lookup_job_bundle(current.key)
+
+        self.assertIs(looked_up, current)
+        self.assertNotIn(expired_key, server._job_bundle_cache)
+        self.assertEqual(list(server._job_bundle_cache.values()), [current])
 
     def test_zero_ttl_disables_bundle_cache(self) -> None:
         server, _ = coordinator()
@@ -851,6 +911,53 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         self.assertFalse(server.tip_refresh_is_pending())
 
+    def test_payout_only_advance_bounds_publish_supersession(self) -> None:
+        server, _rpc = coordinator()
+        server.payout_reconcile_supersession_retries = 2
+        real_publish = server._publish_payout_state_candidate
+        publish_attempts = 0
+
+        def supersede_before_publish(candidate: object) -> int | None:
+            nonlocal publish_attempts
+            publish_attempts += 1
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=f"{publish_attempts + 30:064x}",
+            )
+            return real_publish(candidate)  # type: ignore[arg-type]
+
+        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "payout-only invalidation was superseded",
+        ):
+            server._advance_payout_state_generation()
+
+        self.assertEqual(publish_attempts, 3)
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertTrue(server.tip_refresh_is_pending())
+
+    def test_payout_publication_fence_is_not_a_job_build_failure(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        server._pool_ready_latched = True
+        server._reserve_payout_state_source("payout_only")
+        server._block_payout_state_publication()
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "pending publication"):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertEqual(server.tip_refresh_client_counts["failed"], 0)
+        self.assertEqual(server.tip_refresh_client_counts["skipped"], 1)
+
     def test_successful_poll_clears_payout_pending_created_during_reconcile(self) -> None:
         server, _rpc = coordinator()
         server._ensure_tip_refresh_state()
@@ -978,6 +1085,60 @@ class JobBundleCacheTests(unittest.TestCase):
             ["mining.set_difficulty", "mining.notify"],
         )
 
+    def test_priority_decision_uses_one_publication_snapshot(self) -> None:
+        server, _rpc = coordinator()
+        state = client(1)
+        context = SimpleNamespace(
+            payout_state_generation=0,
+            template={"previousblockhash": "11" * 32},
+        )
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda **_kwargs: True
+        )
+        server.build_job_for_client = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: context
+        )
+        original_lock = server._job_cache_lock
+
+        class PublishAfterPrioritySnapshot:
+            advanced = False
+
+            def __enter__(self) -> object:
+                original_lock.acquire()
+                return self
+
+            def __exit__(
+                self,
+                _exc_type: object,
+                _exc: object,
+                _traceback: object,
+            ) -> None:
+                original_lock.release()
+                if not self.advanced:
+                    self.advanced = True
+                    server._payout_state_generation = 1
+
+        priorities: list[bool] = []
+
+        class RecordingGate:
+            @contextmanager
+            def delivery_cancelable(
+                self,
+                _cancelled: object,
+                *,
+                priority: bool,
+                **_kwargs: object,
+            ) -> object:
+                priorities.append(priority)
+                yield False
+
+        server._job_cache_lock = PublishAfterPrioritySnapshot()  # type: ignore[assignment]
+        server._payout_state_delivery_gate = RecordingGate()  # type: ignore[assignment]
+
+        self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(priorities, [True])
+        self.assertEqual(server._payout_state_generation, 1)
+
     def test_zero_template_ttl_fetches_template_per_build(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
@@ -1053,8 +1214,11 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertTrue(context_a1.collection_only)
         self.assertTrue(context_b.collection_only)
         self.assertEqual(recorded["calls"], 2)
-        self.assertIs(context_a1.bundle, context_a2.bundle)
-        self.assertIsNot(context_a1.bundle, context_b.bundle)
+        self.assertTrue(
+            all(not hasattr(context, "bundle") for context in (context_a1, context_a2, context_b))
+        )
+        self.assertIs(context_a1.shares_json, context_a2.shares_json)
+        self.assertIsNot(context_a1.shares_json, context_b.shares_json)
 
     def test_collection_bundle_cache_rebuilds_when_pool_becomes_ready(self) -> None:
         ledger = FakeLedger(miners=["solo"])
@@ -1241,9 +1405,9 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIn("qbit_prism_tip_refresh_first_delivery_seconds_count 1", metrics)
         self.assertIn("qbit_prism_tip_refresh_last_delivery_seconds_count 1", metrics)
 
-    def test_ready_tip_refresh_validates_chain_once_for_one_hundred_clients(self) -> None:
+    def test_ready_tip_refresh_shares_one_bundle_across_250_clients(self) -> None:
         server, rpc = coordinator()
-        install_fake_bundle_builder(server)
+        recorded = install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
         reconciled: list[str] = []
         trust_checks = 0
@@ -1262,7 +1426,7 @@ class JobBundleCacheTests(unittest.TestCase):
         server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
             lambda **_kwargs: self.fail("fanout repeated current-tip validation")
         )
-        clients = [client(index + 1) for index in range(100)]
+        clients = [client(index + 1) for index in range(250)]
         sent: dict[int, list[dict[str, object]]] = {
             state.connection_id: [] for state in clients
         }
@@ -1279,7 +1443,16 @@ class JobBundleCacheTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
-        self.assertEqual(refreshed, 100)
+        self.assertEqual(refreshed, 250)
+        self.assertEqual(recorded["calls"], 1)
+        cached = next(iter(server._job_bundle_cache.values()))
+        self.assertEqual(
+            len({id(state.active_job.shares_json) for state in clients}),
+            1,
+        )
+        self.assertTrue(
+            all(state.active_job.shares_json is cached.shares_json for state in clients)
+        )
         self.assertEqual(reconciled, [rpc.tip])
         self.assertEqual(trust_checks, 2)
         # The early priority probe, snapshot coherence, pre-fanout validation,
@@ -1328,7 +1501,7 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertTrue(rebuilt.collection_only)
         self.assertEqual(first.fingerprint, second.fingerprint)
         self.assertEqual(recorded["calls"], 2)
-        self.assertIsNot(rebuilt.bundle, original.bundle)
+        self.assertIsNot(rebuilt.coinbase_manifest, original.coinbase_manifest)
         self.assertIs(rebuilt.template, second.template)
         self.assertEqual(rebuilt.template_generation, second.generation)
 
@@ -2020,6 +2193,198 @@ class JobBundleCacheTests(unittest.TestCase):
             )
 
 
+class ClientCleanupTests(unittest.TestCase):
+    def test_disconnect_retires_and_closes_before_job_lock_cleanup(self) -> None:
+        server, _ = coordinator()
+        state = client(1)
+        server.clients = {state}
+        socket_closed = threading.Event()
+        state.close = socket_closed.set  # type: ignore[method-assign]
+        state.job_update_lock.acquire()
+        disconnect = threading.Thread(target=server.disconnect_client, args=(state,))
+        try:
+            disconnect.start()
+            self.assertTrue(socket_closed.wait(5))
+            with server.lock:
+                self.assertNotIn(state, server.clients)
+                self.assertTrue(state.closing)
+            self.assertTrue(disconnect.is_alive())
+        finally:
+            state.job_update_lock.release()
+            disconnect.join(5)
+
+        self.assertFalse(disconnect.is_alive())
+
+    def test_disconnect_during_prepared_refresh_skips_without_job_state(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        observed_lock = ObservedRLock()
+        state.job_update_lock = observed_lock  # type: ignore[assignment]
+        server.clients = {state}
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        server.observe_tip_first_seen(snapshot.bestblockhash)
+        server.pool_readiness_latched()
+        server.tip_template_snapshot = snapshot
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
+        state.send = lambda _payload: self.fail(  # type: ignore[method-assign]
+            "disconnected client received prepared work"
+        )
+        socket_closed = threading.Event()
+        state.close = socket_closed.set  # type: ignore[method-assign]
+        results: list[tuple[int, float | None, float | None, int]] = []
+        errors: list[BaseException] = []
+
+        def refresh() -> None:
+            try:
+                results.append(
+                    server._fanout_prepared_tip_refresh(
+                        [state],
+                        bundle,
+                        snapshot,
+                        heartbeat_name="qbit_blockpoll",
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surface thread failures
+                errors.append(exc)
+
+        observed_lock.acquire()
+        observed_lock.observe_acquires = True
+        refresh_thread = threading.Thread(target=refresh)
+        disconnect_thread = threading.Thread(
+            target=server.disconnect_client,
+            args=(state,),
+        )
+        try:
+            refresh_thread.start()
+            self.assertTrue(observed_lock.acquire_attempted.wait(5))
+            disconnect_thread.start()
+            self.assertTrue(socket_closed.wait(5))
+            refresh_thread.join(5)
+            self.assertFalse(refresh_thread.is_alive())
+            self.assertTrue(disconnect_thread.is_alive())
+        finally:
+            observed_lock.release()
+            refresh_thread.join(5)
+            disconnect_thread.join(5)
+            server.shutdown_tip_refresh_executor()
+
+        self.assertFalse(disconnect_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results[0][0], 0)
+        self.assertIsNone(state.active_job)
+        self.assertEqual(state.active_job_ids, set())
+        self.assertEqual(server.jobs, {})
+
+    def test_mass_disconnect_releases_active_connection_accounting(self) -> None:
+        server, _ = coordinator()
+        states = [client(index) for index in range(1, 129)]
+        for state in states:
+            state.close = lambda: None  # type: ignore[method-assign]
+        server.clients = set(states)
+
+        for state in states:
+            server.disconnect_client(state)
+
+        with server.lock:
+            self.assertEqual(len(server.clients), 0)
+        self.assertTrue(all(state.closing for state in states))
+
+    def test_concurrent_disconnect_is_idempotent_and_deadlock_free(self) -> None:
+        server, _ = coordinator()
+        state = client(1)
+        server.clients = {state}
+        close_count = 0
+        close_count_lock = threading.Lock()
+        caller_count = 16
+        start = threading.Barrier(caller_count + 1)
+        errors: list[BaseException] = []
+
+        def close() -> None:
+            nonlocal close_count
+            with close_count_lock:
+                close_count += 1
+
+        def disconnect() -> None:
+            try:
+                start.wait()
+                server.disconnect_client(state)
+            except BaseException as exc:  # noqa: BLE001 - surface thread failures
+                errors.append(exc)
+
+        state.close = close  # type: ignore[method-assign]
+        callers = [threading.Thread(target=disconnect) for _ in range(caller_count)]
+        for caller in callers:
+            caller.start()
+        start.wait()
+        for caller in callers:
+            caller.join(5)
+
+        self.assertTrue(all(not caller.is_alive() for caller in callers))
+        self.assertEqual(errors, [])
+        self.assertEqual(close_count, 1)
+        self.assertNotIn(state, server.clients)
+
+    def test_disconnect_removes_active_and_evicted_job_contexts(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        active = server.build_job_for_client(state, clean_jobs=True)
+        evicted = server.build_job_for_client(state, clean_jobs=False)
+        active_id = active.job.job_id
+        evicted_id = evicted.job.job_id
+        state.active_job = active
+        state.active_job_ids = {active_id}
+        server.jobs = {active_id: active, evicted_id: evicted}
+        server.bury_evicted_job(state, evicted_id)
+        server.jobs.pop(evicted_id)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+
+        server.disconnect_client(state)
+
+        self.assertIsNone(state.active_job)
+        self.assertEqual(state.active_job_ids, set())
+        self.assertNotIn(active_id, server.jobs)
+        self.assertNotIn(evicted_id, server.evicted_job_graveyard)
+        self.assertNotIn(state.connection_id, server.evicted_jobs_by_connection)
+
+    def test_reconnect_storm_leaves_no_handler_threads_or_ghost_clients(self) -> None:
+        server, _ = coordinator()
+        connection_count = 32
+        start = threading.Barrier(connection_count + 1)
+        peers: list[socket.socket] = []
+        handlers: list[threading.Thread] = []
+
+        def handle(state: ClientState) -> None:
+            start.wait()
+            server.handle_client(state)
+
+        for connection_id in range(1, connection_count + 1):
+            coordinator_socket, peer_socket = socket.socketpair()
+            state = client(connection_id)
+            state.sock = coordinator_socket
+            server.clients.add(state)
+            peers.append(peer_socket)
+            handler = threading.Thread(
+                target=handle,
+                args=(state,),
+                name=f"prism-test-handler-{connection_id}",
+            )
+            handlers.append(handler)
+            handler.start()
+
+        start.wait()
+        for peer in peers:
+            peer.close()
+        for handler in handlers:
+            handler.join(5)
+
+        self.assertTrue(all(not handler.is_alive() for handler in handlers))
+        with server.lock:
+            self.assertEqual(server.clients, set())
+
+
 class HealthSnapshotTests(unittest.TestCase):
     def test_health_payload_uses_aggregate_stats_not_all_shares(self) -> None:
         ledger = FakeLedger()
@@ -2084,6 +2449,29 @@ class JobBuildMetricsTests(unittest.TestCase):
         self.assertIn('qbit_prism_job_cache_misses_total{cache="bundle"} 1', metrics)
         self.assertIn('qbit_prism_job_build_phase_seconds_total{phase="bundle"} 0.2', metrics)
         self.assertIn("qbit_prism_connected_clients 0", metrics)
+
+    def test_metrics_split_payout_preparation_publication_and_delivery(self) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+
+        self.assertEqual(server._advance_payout_state_generation(), 1)
+        self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
+
+        metrics = server.metrics_payload()
+
+        self.assertIn("qbit_prism_payout_preparation_seconds_count 1", metrics)
+        self.assertIn("qbit_prism_payout_publish_seconds_count 1", metrics)
+        self.assertIn(
+            "qbit_prism_payout_invalidation_first_delivery_seconds_count 1",
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_payout_gate_wait_seconds_count{generation="current"} 1',
+            metrics,
+        )
+        self.assertIn("qbit_prism_payout_candidates_discarded_total 0", metrics)
 
 
 if __name__ == "__main__":

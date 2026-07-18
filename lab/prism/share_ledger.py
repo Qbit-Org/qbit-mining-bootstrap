@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import copy
 import hashlib
+import hmac
 import os
 import math
 import shlex
@@ -943,6 +944,7 @@ class SingleWriterShareLedger:
         parent_hash: str,
         final_bundle: dict[str, Any],
         audit_report: dict[str, Any],
+        canonical_bundle_path: Path | None = None,
     ) -> dict[str, int | str]:
         return {
             "backend": "memory",
@@ -4299,9 +4301,13 @@ FROM bucketed;
         share_parts = self._audit_share_parts(shares)
         if share_parts is None or not any(part.get("kind") == "segment" for part in share_parts):
             return None
-        bundle_without_shares = copy.deepcopy(final_bundle)
-        shares_key_index = list(bundle_without_shares).index("shares")
-        bundle_without_shares.pop("shares", None)
+        shares_key_index = list(final_bundle).index("shares")
+        # Persistence only reads this immutable build result.  A shallow outer
+        # mapping avoids recursively copying both the top-level shares and the
+        # reward-manifest share window merely to remove one key.
+        bundle_without_shares = {
+            key: value for key, value in final_bundle.items() if key != "shares"
+        }
         return {
             "schema": AUDIT_BODY_REF_SCHEMA,
             "block_hash": block_hash,
@@ -4329,9 +4335,10 @@ FROM bucketed;
         share_parts = self._audit_share_range_parts(shares)
         if share_parts is None:
             return None
-        bundle_without_shares = copy.deepcopy(final_bundle)
-        shares_key_index = list(bundle_without_shares).index("shares")
-        bundle_without_shares.pop("shares", None)
+        shares_key_index = list(final_bundle).index("shares")
+        bundle_without_shares = {
+            key: value for key, value in final_bundle.items() if key != "shares"
+        }
         reward_manifest = final_bundle.get("reward_manifest")
         proof: dict[str, Any] = {
             "schema": AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
@@ -4356,7 +4363,7 @@ FROM bucketed;
                 "share_slice_digest_hex",
             ):
                 if key in reward_manifest:
-                    proof[key] = copy.deepcopy(reward_manifest[key])
+                    proof[key] = reward_manifest[key]
         return {
             "schema": AUDIT_BUNDLE_V2_SCHEMA,
             "block_hash": block_hash,
@@ -4416,7 +4423,7 @@ FROM bucketed;
                         "first_share_seq": chunk_seqs[0],
                         "last_share_seq": chunk_seqs[-1],
                         "share_count": len(chunk),
-                        "shares": copy.deepcopy(chunk),
+                        "shares": chunk,
                     }
                 )
             index = end
@@ -4475,7 +4482,7 @@ FROM bucketed;
             "first_share_seq": first_share_seq,
             "last_share_seq": last_share_seq,
             "share_count": len(shares),
-            "shares": copy.deepcopy(shares),
+            "shares": shares,
         }
 
     def _write_audit_share_segment(
@@ -4498,7 +4505,7 @@ FROM bucketed;
             f"prism-audit-share-segment-{first_share_seq}-{last_share_seq}-{segment_sha256}.json"
         )
         if segment_path.exists():
-            if segment_path.read_bytes() != segment_bytes:
+            if not self._file_matches_bytes(segment_path, segment_bytes):
                 raise RuntimeError(f"existing audit share segment does not match payload at {segment_path}")
         else:
             self._write_bytes_atomically(segment_path, segment_bytes)
@@ -4520,11 +4527,26 @@ FROM bucketed;
         segment_path = self._audit_body_dir.resolve() / (
             f"prism-audit-share-segment-slot-{segment_first_share_seq}-{segment_last_share_seq}.json"
         )
-        merged_shares = copy.deepcopy(shares)
+        range_payload = self._audit_share_segment_payload(
+            first_share_seq=first_share_seq,
+            last_share_seq=last_share_seq,
+            shares=shares,
+        )
+        # Encode the incoming range once.  Completed 10k slots dominate normal
+        # block persistence; byte equality lets them return without parsing,
+        # merging, deep-copying, or serializing the existing slot tree.
+        range_bytes = self._storage_json_bytes(range_payload)
+        range_sha256 = sha256_bytes_hex(range_bytes)
+        if segment_path.exists() and self._file_matches_bytes(segment_path, range_bytes):
+            return str(segment_path), range_sha256
+
+        merged_shares = shares
+        existing_bytes: bytes | None = None
         if segment_path.exists():
             try:
-                existing = json.loads(segment_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
+                existing_bytes = segment_path.read_bytes()
+                existing = json.loads(existing_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise RuntimeError(f"existing audit share segment is not valid JSON at {segment_path}") from exc
             if not isinstance(existing, dict) or existing.get("schema") != AUDIT_SHARE_SEGMENT_SCHEMA:
                 raise RuntimeError(f"existing audit share segment has invalid schema at {segment_path}")
@@ -4538,21 +4560,21 @@ FROM bucketed;
             )
         segment_first = int(merged_shares[0]["share_seq"])
         segment_last = int(merged_shares[-1]["share_seq"])
-        segment = self._audit_share_segment_payload(
-            first_share_seq=segment_first,
-            last_share_seq=segment_last,
-            shares=merged_shares,
-        )
-        segment_bytes = self._storage_json_bytes(segment)
-        if not segment_path.exists() or segment_path.read_bytes() != segment_bytes:
+        if (
+            segment_first == first_share_seq
+            and segment_last == last_share_seq
+            and len(merged_shares) == len(shares)
+        ):
+            segment_bytes = range_bytes
+        else:
+            segment = self._audit_share_segment_payload(
+                first_share_seq=segment_first,
+                last_share_seq=segment_last,
+                shares=merged_shares,
+            )
+            segment_bytes = self._storage_json_bytes(segment)
+        if existing_bytes != segment_bytes:
             self._write_bytes_atomically(segment_path, segment_bytes)
-
-        range_payload = self._audit_share_segment_payload(
-            first_share_seq=first_share_seq,
-            last_share_seq=last_share_seq,
-            shares=shares,
-        )
-        range_sha256 = sha256_bytes_hex(self._storage_json_bytes(range_payload))
         return str(segment_path), range_sha256
 
     def _merge_audit_share_ranges(
@@ -4563,7 +4585,7 @@ FROM bucketed;
         segment_path: Path,
     ) -> list[Any]:
         if not existing_shares:
-            return copy.deepcopy(incoming_shares)
+            return list(incoming_shares)
         existing_by_seq = self._audit_shares_by_seq(existing_shares, segment_path=segment_path)
         incoming_by_seq = self._audit_shares_by_seq(incoming_shares, segment_path=segment_path)
         for share_seq, incoming in incoming_by_seq.items():
@@ -4574,7 +4596,7 @@ FROM bucketed;
         ordered_seqs = sorted(merged_by_seq)
         if any(current + 1 != nxt for current, nxt in zip(ordered_seqs, ordered_seqs[1:])):
             raise RuntimeError(f"existing audit share segment would become non-contiguous at {segment_path}")
-        return [copy.deepcopy(merged_by_seq[share_seq]) for share_seq in ordered_seqs]
+        return [merged_by_seq[share_seq] for share_seq in ordered_seqs]
 
     def _audit_shares_by_seq(self, shares: list[Any], *, segment_path: Path) -> dict[int, Any]:
         by_seq: dict[int, Any] = {}
@@ -4588,7 +4610,7 @@ FROM bucketed;
             existing = by_seq.get(share_seq)
             if existing is not None and existing != share:
                 raise RuntimeError(f"audit share segment has duplicate conflicting share_seq {share_seq} at {segment_path}")
-            by_seq[share_seq] = copy.deepcopy(share)
+            by_seq[share_seq] = share
         ordered = sorted(by_seq)
         if any(current + 1 != nxt for current, nxt in zip(ordered, ordered[1:])):
             raise RuntimeError(f"audit share segment has non-contiguous share_seq values at {segment_path}")
@@ -4596,6 +4618,23 @@ FROM bucketed;
 
     def _storage_json_bytes(self, payload: dict[str, Any]) -> bytes:
         return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    @staticmethod
+    def _file_matches_bytes(path: Path, expected: bytes) -> bool:
+        try:
+            if path.stat().st_size != len(expected):
+                return False
+            offset = 0
+            view = memoryview(expected)
+            with path.open("rb") as handle:
+                while offset < len(expected):
+                    chunk = handle.read(min(1024 * 1024, len(expected) - offset))
+                    if not chunk or chunk != view[offset : offset + len(chunk)]:
+                        return False
+                    offset += len(chunk)
+                return not handle.read(1)
+        except OSError:
+            return False
 
     def _write_bytes_atomically(self, path: Path, payload: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -4611,6 +4650,68 @@ FROM bucketed;
                 tmp_path.unlink()
             except FileNotFoundError:
                 pass
+
+    def _write_json_atomically(self, path: Path, payload: dict[str, Any]) -> None:
+        """Stream compact JSON through the existing fsync-and-rename boundary."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        encoder = json.JSONEncoder(separators=(",", ":"))
+        try:
+            with tmp_path.open("xb") as handle:
+                for chunk in encoder.iterencode(payload):
+                    handle.write(chunk.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            tmp_path.replace(path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _file_matches_json_payload(self, path: Path, payload: dict[str, Any]) -> bool:
+        """Compare compact JSON exactly without materializing expected bytes."""
+        expected_digest = hashlib.sha256()
+        expected_length = 0
+        encoder = json.JSONEncoder(separators=(",", ":"))
+        for chunk in encoder.iterencode(payload):
+            encoded = chunk.encode("utf-8")
+            expected_digest.update(encoded)
+            expected_length += len(encoded)
+        try:
+            return (
+                path.stat().st_size == expected_length
+                and hmac.compare_digest(
+                    self._file_sha256_hex(path),
+                    expected_digest.hexdigest(),
+                )
+            )
+        except OSError:
+            return False
+
+    def _copy_file_atomically(self, path: Path, source: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with source.open("rb") as input_handle, tmp_path.open("xb") as output_handle:
+                while chunk := input_handle.read(1024 * 1024):
+                    output_handle.write(chunk)
+                output_handle.flush()
+                os.fsync(output_handle.fileno())
+            tmp_path.replace(path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _file_sha256_hex(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _write_external_audit_body(
         self,
@@ -4747,15 +4848,24 @@ END;
             return None
         return str(self._audit_body_path(payload["block_hash"], payload["audit_bundle_sha256"]))
 
-    def _audit_body_byte_len(self, body_uri: object | None, final_bundle: dict[str, Any]) -> int:
+    def _audit_body_byte_len(
+        self,
+        body_uri: object | None,
+        final_bundle: dict[str, Any],
+        canonical_bundle_path: Path | None = None,
+    ) -> int:
         if body_uri:
             return self._resolve_audit_body_path(body_uri).stat().st_size
+        if canonical_bundle_path is not None:
+            return canonical_bundle_path.stat().st_size
         return len(self._canonical_audit_bundle_bytes(final_bundle))
 
     def _prepare_external_audit_body(
         self,
         payload: dict[str, Any],
         final_bundle: dict[str, Any],
+        *,
+        canonical_bundle_path: Path | None = None,
     ) -> str | None:
         if self._audit_body_dir is None:
             return None
@@ -4768,16 +4878,56 @@ END;
                 expected_bytes=32,
             ),
         }
-        body_bytes = self._canonical_audit_body_bytes_for_sha(
-            final_bundle,
-            str(payload["audit_bundle_sha256"]),
-        )
+        expected_sha256 = str(payload["audit_bundle_sha256"])
+        body_bytes: bytes | None = None
+        if canonical_bundle_path is not None:
+            canonical_bundle_path = canonical_bundle_path.resolve()
+            try:
+                actual_sha256 = self._file_sha256_hex(canonical_bundle_path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"canonical audit bundle is not retrievable at {canonical_bundle_path}: {exc}"
+                ) from exc
+            if actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    "audit bundle sha256 mismatch: "
+                    f"expected {expected_sha256}, got {actual_sha256}"
+                )
+        else:
+            body_bytes = self._canonical_audit_body_bytes_for_sha(
+                final_bundle,
+                expected_sha256,
+            )
         body_uri = self._external_audit_body_write_plan(payload)
         if body_uri is None:
             return None
         body_path = self._resolve_audit_body_path(body_uri)
+        storage_payload = self._audit_bundle_v2(
+            block_hash=str(payload["block_hash"]),
+            audit_bundle_sha256=expected_sha256,
+            final_bundle=final_bundle,
+        )
+        if storage_payload is None:
+            storage_payload = self._audit_body_ref(
+                block_hash=str(payload["block_hash"]),
+                audit_bundle_sha256=expected_sha256,
+                final_bundle=final_bundle,
+            )
         if body_path.exists():
-            if not self._external_body_matches_sha(body_path, str(payload["audit_bundle_sha256"])):
+            if storage_payload is not None and self._file_matches_json_payload(
+                body_path, storage_payload
+            ):
+                return str(body_path)
+            if (
+                storage_payload is None
+                and canonical_bundle_path is not None
+                and self._file_sha256_hex(body_path) == expected_sha256
+            ):
+                return str(body_path)
+            # Preserve compatibility with bodies written by an older storage
+            # layout. This expensive reconstruction is only the mismatch path;
+            # same-version crash retries take the bounded exact-match path.
+            if not self._external_body_matches_sha(body_path, expected_sha256):
                 raise RuntimeError(f"existing audit bundle body does not match payload at {body_path}")
             return str(body_path)
         canonical_body_path = self._audit_body_path(
@@ -4789,26 +4939,14 @@ END;
                 "existing audit bundle body pointer does not match canonical external path: "
                 f"{body_uri}"
             )
-        storage_bytes = self._external_audit_storage_bytes(
-            block_hash=str(payload["block_hash"]),
-            audit_bundle_sha256=str(payload["audit_bundle_sha256"]),
-            final_bundle=final_bundle,
-            canonical_body_bytes=body_bytes,
-        )
-        restored_body_uri = self._write_external_audit_body(
-            str(payload["block_hash"]),
-            str(payload["audit_bundle_sha256"]),
-            storage_bytes,
-        )
-        if restored_body_uri is None:
-            raise RuntimeError("audit body store is not configured")
-        restored_body_path = Path(restored_body_uri).resolve()
-        if restored_body_path != body_path:
-            raise RuntimeError(
-                "existing audit bundle body pointer does not match canonical external path: "
-                f"{body_uri}"
-            )
-        return restored_body_uri
+        if storage_payload is not None:
+            self._write_json_atomically(body_path, storage_payload)
+        elif canonical_bundle_path is not None:
+            self._copy_file_atomically(body_path, canonical_bundle_path)
+        else:
+            assert body_bytes is not None
+            self._write_bytes_atomically(body_path, body_bytes)
+        return str(body_path)
 
     def _read_external_body(
         self,
@@ -4935,7 +5073,9 @@ END;
                     raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid inline shares")
                 if len(inline_shares) != int(part.get("share_count") or 0):
                     raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: inline share count mismatch")
-                shares.extend(copy.deepcopy(inline_shares))
+                # The body was freshly parsed for this request; transfer its
+                # share objects into the reconstructed bundle without cloning.
+                shares.extend(inline_shares)
             else:
                 raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part kind")
         expected_share_count = int(body_ref.get("share_count") or 0)
@@ -4952,7 +5092,7 @@ END;
             if index == shares_key_index:
                 bundle["shares"] = shares
                 shares_inserted = True
-            bundle[str(key)] = copy.deepcopy(value)
+            bundle[str(key)] = value
         if not shares_inserted:
             bundle["shares"] = shares
         if expected:
@@ -5024,7 +5164,7 @@ END;
             if index == shares_key_index:
                 bundle["shares"] = shares
                 shares_inserted = True
-            bundle[str(key)] = copy.deepcopy(value)
+            bundle[str(key)] = value
         if not shares_inserted:
             bundle["shares"] = shares
         actual = sha256_bytes_hex(self._canonical_audit_bundle_bytes(bundle))
@@ -5114,7 +5254,8 @@ END;
                 )
         elif kind != "segment":
             raise RuntimeError(f"audit bundle body is not valid JSON at {parent_body_uri}: invalid share part kind")
-        return copy.deepcopy(selected_shares)
+        # selected_shares references a freshly parsed, request-local segment.
+        return selected_shares
 
     def _select_audit_share_segment_range(
         self,
@@ -5182,6 +5323,7 @@ END;
         parent_hash: str,
         final_bundle: dict[str, Any],
         audit_report: dict[str, Any],
+        canonical_bundle_path: Path | None = None,
     ) -> dict[str, int | str]:
         manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
         found_block = final_bundle.get("found_block") or {}
@@ -5204,8 +5346,16 @@ END;
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
         }
-        body_uri = self._prepare_external_audit_body(payload, final_bundle)
-        audit_body_byte_len = self._audit_body_byte_len(body_uri, final_bundle)
+        body_uri = self._prepare_external_audit_body(
+            payload,
+            final_bundle,
+            canonical_bundle_path=canonical_bundle_path,
+        )
+        audit_body_byte_len = self._audit_body_byte_len(
+            body_uri,
+            final_bundle,
+            canonical_bundle_path,
+        )
         payload = {
             **payload,
             # Externalized rows store the body in body_uri and NULL here; legacy

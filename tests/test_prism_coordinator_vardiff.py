@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import queue
@@ -63,6 +64,40 @@ from lab.prism.prism_coordinator import (
 )
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"
+
+
+def fake_audit_bundle_popen(
+    captured: dict[str, object],
+    *,
+    output_text: str = '{"ok":true}',
+    returncode: int = 0,
+    stderr_text: str = "",
+) -> type:
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.parts: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.parts.append(value)
+            return len(value)
+
+        def close(self) -> None:
+            return None
+
+    class FakePopen:
+        def __init__(self, cmd: list[str], **kwargs: object) -> None:
+            captured["cmd"] = cmd
+            self.stdin = FakeStdin()
+            self.stdout = kwargs["stdout"]
+            self.stderr = kwargs["stderr"]
+
+        def wait(self) -> int:
+            captured["payload"] = json.loads("".join(self.stdin.parts))
+            self.stdout.write(output_text)
+            self.stderr.write(stderr_text)
+            return returncode
+
+    return FakePopen
 
 
 def tx_output(value_sats: int, script_hex: str) -> str:
@@ -590,13 +625,7 @@ def coordinator() -> PrismCoordinator:
     server.accepted_block_count = 1
     server.started_monotonic = time.monotonic() - 10
     server.ledger = FakeLedger(shares=5)
-    server.latest_bundle = {
-        "signed_coinbase_manifest": {
-            "manifest": {
-                "coinbase_tx_hex": "00" * 250,
-            }
-        }
-    }
+    server.latest_coinbase_size_bytes = 250
     server.rpc = FakeRpc()
     server.qbit_chain = "regtest"
     server.blockpoll_seconds = 2.0
@@ -1876,11 +1905,6 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.ledger_attestation_signing_seed_hex = "43" * 32
         captured: dict[str, object] = {}
 
-        def fake_run(cmd: list[str], **kwargs: object) -> object:
-            captured["cmd"] = cmd
-            captured["payload"] = json.loads(str(kwargs["input"]))
-            return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
-
         with patch.dict(
             os.environ,
             {
@@ -1889,7 +1913,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 "PRISM_POOL_FEE_ADDRESS": "tq1fee",
             },
             clear=True,
-        ), patch("lab.prism.prism_coordinator.subprocess.run", side_effect=fake_run):
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(captured),
+        ):
             bundle = server.build_audit_bundle(
                 shares=[],
                 found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
@@ -1910,10 +1937,6 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.ledger_attestation_signing_seed_hex = "43" * 32
         captured: dict[str, object] = {}
 
-        def fake_run(cmd: list[str], **kwargs: object) -> object:
-            captured["payload"] = json.loads(str(kwargs["input"]))
-            return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
-
         with patch.dict(
             os.environ,
             {
@@ -1926,7 +1949,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS": "12000",
             },
             clear=True,
-        ), patch("lab.prism.prism_coordinator.subprocess.run", side_effect=fake_run):
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(captured),
+        ):
             bundle = server.build_audit_bundle(
                 shares=[],
                 found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
@@ -1951,6 +1977,122 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_build_audit_bundle_preserves_exact_canonical_output_file(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        canonical_bytes = b'{"ok":true,"nested":[1,2]}'
+        captured: dict[str, object] = {}
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(
+                captured,
+                output_text=canonical_bytes.decode("utf-8"),
+            ),
+        ):
+            output_path = Path(tmp) / "candidate.audit.json"
+            bundle = server.build_audit_bundle(
+                shares=[],
+                found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                canonical_output_path=output_path,
+            )
+
+            self.assertEqual(bundle, {"ok": True, "nested": [1, 2]})
+            self.assertEqual(output_path.read_bytes(), canonical_bytes)
+            self.assertIn("--canonical-output", captured["cmd"])
+            self.assertEqual(captured["payload"]["shares"], [])
+
+    def test_build_audit_bundle_summary_only_requests_and_parses_job_summary(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        summary = {
+            "found_block": {
+                "block_height": 10,
+                "coinbase_value_sats": 50_00000000,
+            },
+            "signed_coinbase_manifest": {
+                "manifest": {"coinbase_tx_hex": "c0ffee"},
+                "signature": {"signature_hex": "11" * 64},
+            },
+        }
+        captured: dict[str, object] = {}
+
+        with patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(
+                captured,
+                output_text=json.dumps(summary, separators=(",", ":")),
+            ),
+        ), patch.object(
+            Path,
+            "open",
+            side_effect=AssertionError("summary-only build must not open an output path"),
+        ):
+            bundle = server.build_audit_bundle(
+                shares=[],
+                found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                summary_only=True,
+            )
+
+        self.assertEqual(bundle, summary)
+        self.assertEqual(set(bundle), {"found_block", "signed_coinbase_manifest"})
+        self.assertIn("--job-summary-output", captured["cmd"])
+        self.assertNotIn("--canonical-output", captured["cmd"])
+
+    def test_build_audit_bundle_removes_partial_output_after_builder_failure(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(
+                captured,
+                output_text='{"partial":',
+                returncode=9,
+                stderr_text="synthetic builder failure",
+            ),
+        ):
+            output_path = Path(tmp) / "candidate.audit.json"
+            with self.assertRaisesRegex(RuntimeError, "synthetic builder failure"):
+                server.build_audit_bundle(
+                    shares=[],
+                    found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                    prior_balances=[],
+                    coinbase_script_sig_suffix_hex="00",
+                    canonical_output_path=output_path,
+                )
+            self.assertFalse(output_path.exists())
+
+    def test_build_audit_bundle_does_not_unlink_preexisting_output_path(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "lab.prism.prism_coordinator.subprocess.Popen"
+        ) as popen:
+            output_path = Path(tmp) / "preexisting-candidate.audit.json"
+            output_path.write_bytes(b"do-not-clobber")
+            with self.assertRaises(FileExistsError):
+                server.build_audit_bundle(
+                    shares=[],
+                    found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                    prior_balances=[],
+                    coinbase_script_sig_suffix_hex="00",
+                    canonical_output_path=output_path,
+                )
+
+            self.assertEqual(output_path.read_bytes(), b"do-not-clobber")
+            popen.assert_not_called()
 
     def test_prism_ctv_settlement_config_uses_legacy_unit_aliases(self) -> None:
         server = coordinator()
@@ -2761,6 +2903,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(server.ensure_reorg_reconciled_for_tip(tip))
 
         self.assertEqual(ledger.events, [("watch", 10), ("mature", 10), ("watch", 10), ("mature", 10)])
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_source[0], 1)
 
     def test_reconciliation_reactivates_inactive_block_that_returns_to_active_chain(self) -> None:
         pool_block_hash = "cc" * 32
@@ -3189,21 +3333,30 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         ):
             server.validate_live_template_and_fee_policy()
 
-    def test_template_refresh_failure_budget_distinguishes_transient_and_sustained_outage(self) -> None:
+    def test_template_refresh_failure_budget_starts_at_first_failure(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
         server.template_refresh_failure_exit_seconds = 120
         server.last_successful_template_refresh_monotonic = 100.0
 
-        self.assertFalse(server.template_refresh_failure_expired(219.999))
-        self.assertTrue(server.template_refresh_failure_expired(220.0))
+        server._record_template_refresh_failure(500.0)
+        self.assertFalse(server.template_refresh_failure_expired(500.0))
+        self.assertEqual(server.template_refresh_failure_started_monotonic, 500.0)
+        self.assertFalse(server.template_refresh_failure_expired(619.999))
+        self.assertTrue(server.template_refresh_failure_expired(620.0))
 
-        server.last_successful_template_refresh_monotonic = 219.0
-        self.assertFalse(server.template_refresh_failure_expired(220.0))
+    def test_disabled_template_refresh_failure_budget_does_not_start_or_expire(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server.template_refresh_failure_exit_seconds = 0
+
+        server._record_template_refresh_failure(500.0)
+        self.assertFalse(server.template_refresh_failure_expired(500.0))
+        self.assertFalse(hasattr(server, "template_refresh_failure_started_monotonic"))
 
     def test_healthy_noop_template_poll_resets_refresh_failure_clock(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
         server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_started_monotonic = 190.0
         server.template_refresh_failure_exit_seconds = 10.0
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         snapshot = QbitTipTemplateSnapshot(
@@ -3211,6 +3364,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             previousblockhash="11" * 32,
             template_fingerprint="22" * 32,
         )
+        server.tip_template_snapshot = snapshot
         server.rpc = TipRpc(snapshot.bestblockhash)
         server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
 
@@ -3223,6 +3377,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server.blockpoll_loop()
 
         self.assertEqual(server.last_successful_template_refresh_monotonic, 200.0)
+        self.assertIsNone(server.template_refresh_failure_started_monotonic)
+        self.assertFalse(server.template_refresh_failure_expired(300.0))
+        self.assertIsNone(server.template_refresh_failure_started_monotonic)
+        server._record_template_refresh_failure(300.0)
+        self.assertEqual(server.template_refresh_failure_started_monotonic, 300.0)
 
     def test_shared_template_poll_records_success_for_blockwait_callers(self) -> None:
         server = coordinator()
@@ -3246,6 +3405,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server = coordinator()
         server.blockpoll_seconds = 0
         server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_started_monotonic = 100.0
         server.template_refresh_failure_exit_seconds = 10.0
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         snapshot = QbitTipTemplateSnapshot(
@@ -3274,6 +3434,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server = coordinator()
         server.blockpoll_seconds = 0
         server.last_successful_template_refresh_monotonic = 100.0
+        server.template_refresh_failure_started_monotonic = 100.0
         server.template_refresh_failure_exit_seconds = 10.0
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         state = client()
@@ -5114,6 +5275,16 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.block_candidate_retry_delays = {candidate.submission.block_hash_hex: 2.0}
 
         def terminal(_candidate: PrismBlockCandidate) -> bool:
+            block_hash = _candidate.submission.block_hash_hex
+            block_height = int(_candidate.context.template["height"])
+            server._begin_accepted_block_payout_preview(
+                block_hash,
+                block_height=block_height,
+            )
+            server._mark_accepted_block_payout_landed(
+                block_hash,
+                block_height=block_height,
+            )
             server._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
                 "tip moved",
@@ -5129,6 +5300,69 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertNotIn(candidate.submission.block_hash_hex, server.block_candidate_retry_delays)
         self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
         self.assertEqual(ledger.pending_block_candidates(), [])
+        self.assertNotIn(
+            candidate.submission.block_hash_hex,
+            server._accepted_block_payout_previews,
+        )
+        self.assertNotIn(
+            candidate.submission.block_hash_hex,
+            server._invalidated_accepted_block_payout_previews,
+        )
+
+    def test_terminal_abandonment_keeps_tombstone_when_outbox_update_fails(
+        self,
+    ) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        pending = self._pending_append("terminal-outbox-failure").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="a3" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        block_hash = candidate.submission.block_hash_hex
+        block_height = int(candidate.context.template["height"])
+        ledger.append_batch([(pending, server.block_candidate_intent(candidate))])
+
+        def terminal(_candidate: PrismBlockCandidate) -> bool:
+            server._begin_accepted_block_payout_preview(
+                block_hash,
+                block_height=block_height,
+            )
+            server._mark_accepted_block_payout_landed(
+                block_hash,
+                block_height=block_height,
+            )
+            server._abandon_block_candidate(
+                PRISM_REJECTION_STALE_JOB,
+                "tip moved",
+                worker="miner-a",
+            )
+            return False
+
+        server.submit_block_candidate = terminal  # type: ignore[method-assign]
+        server.enqueue_block_candidate(candidate)
+        with patch.object(
+            ledger,
+            "mark_block_candidate_abandoned",
+            side_effect=RuntimeError("postgres unavailable"),
+        ):
+            self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+        self.assertIn(block_hash, server._invalidated_accepted_block_payout_previews)
+        self.assertEqual(
+            [intent["block_hash_hex"] for intent in ledger.pending_block_candidates()],
+            [block_hash],
+        )
 
     def test_invalid_durable_candidate_is_quarantined_by_outbox_row_key(self) -> None:
         for payload_hash in (None, "ff" * 32):
@@ -5227,28 +5461,66 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             witness_tx = synthetic_witness_transaction("44")
             server.jobs["job-1"].job.transaction_hexes = (witness_tx,)
             build_kwargs: list[dict[str, object]] = []
-
-            def fake_build_audit_bundle(**kwargs: object) -> dict[str, object]:
-                build_kwargs.append(kwargs)
-                return {
-                "found_block": {"coinbase_value_sats": 50_00000000},
-                "ledger_window_attestation": {"signature": {"public_key_hex": "aa" * 32}},
-                "payout_policy_manifest": {"accounts": []},
+            # Deliberately use insertion order that differs from this fixture's
+            # stand-in canonical serialization. The alternate builder creates
+            # the requested output but writes pretty, noncanonical JSON, so
+            # existence alone must not make the path eligible for persistence.
+            alternate_bundle = {
                 "signed_coinbase_manifest": {
                     "manifest": {
                         "coinbase_tx_hex": "c0ffee",
                         "payout_count": 1,
                     }
                 },
+                "payout_policy_manifest": {"accounts": []},
+                "ledger_window_attestation": {"signature": {"public_key_hex": "aa" * 32}},
+                "found_block": {"coinbase_value_sats": 50_00000000},
+            }
+            canonical_bytes = json.dumps(
+                alternate_bundle,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+
+            def fake_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+                build_kwargs.append(kwargs)
+                output_path = kwargs["canonical_output_path"]
+                assert isinstance(output_path, Path)
+                output_path.write_text(
+                    json.dumps(alternate_bundle, indent=2),
+                    encoding="utf-8",
+                )
+                return alternate_bundle
+
+            def fake_verify_bundle(bundle_path: Path, *_args: object, **_kwargs: object) -> dict[str, object]:
+                candidate_bytes = bundle_path.read_bytes()
+                self.assertEqual(json.loads(candidate_bytes), alternate_bundle)
+                self.assertNotEqual(candidate_bytes, canonical_bytes)
+                self.assertNotEqual(
+                    hashlib.sha256(candidate_bytes).hexdigest(),
+                    canonical_sha256,
+                )
+                return {
+                    "coinbase_txid": "11" * 32,
+                    "coinbase_manifest_sha256_hex": "22" * 32,
+                    "audit_bundle_sha256_hex": canonical_sha256,
+                    "coinbase_tx_hex": "c0ffee",
                 }
 
+            persist_accepted_block = ledger.persist_accepted_block
+
+            def persist_with_canonicalization(**kwargs: object) -> dict[str, object]:
+                self.assertIsNone(kwargs["canonical_bundle_path"])
+                self.assertEqual(kwargs["final_bundle"], alternate_bundle)
+                report = kwargs["audit_report"]
+                assert isinstance(report, dict)
+                self.assertEqual(report["audit_bundle_sha256_hex"], canonical_sha256)
+                return persist_accepted_block(**kwargs)
+
             server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
-            server.verify_bundle = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
-                "coinbase_txid": "11" * 32,
-                "coinbase_manifest_sha256_hex": "22" * 32,
-                "audit_bundle_sha256_hex": "33" * 32,
-                "coinbase_tx_hex": "c0ffee",
-            }
+            server.verify_bundle = fake_verify_bundle  # type: ignore[method-assign]
+            ledger.persist_accepted_block = persist_with_canonicalization  # type: ignore[method-assign]
             submission = SimpleNamespace(
                 coinbase_tx_hex="c0ffee",
                 block_hash_hex=block_hash,
@@ -5269,7 +5541,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertEqual(envelope["schema"], "qbit.prism.live-audit-bundle-envelope.v1")
             self.assertEqual(envelope["block_hash"], block_hash)
             self.assertEqual(envelope["block_height"], 10)
-            self.assertEqual(envelope["audit_bundle_sha256"], "33" * 32)
+            self.assertEqual(envelope["audit_bundle_sha256"], canonical_sha256)
             self.assertNotIn("signed_coinbase_manifest", envelope)
             self.assertEqual(server.latest_evidence["audit_bundle_path"], str(live_files[0]))
 
@@ -5285,6 +5557,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.persisted[0]["block_hash"], block_hash)
         self.assertEqual(ledger.persisted[0]["block_height"], 10)
         self.assertTrue(ledger.persisted[0]["submit_seen_at_persist"])
+        # This alternate test builder wrote noncanonical bytes to the requested
+        # path. The verified content is valid, but the path is never claimed as
+        # a byte-canonical artifact for ledger persistence.
+        self.assertIsNone(ledger.persisted[0]["canonical_bundle_path"])
         self.assertEqual(server._payout_state_generation, 1)
         self.assertEqual(server._job_bundle_cache, {})
         self.assertTrue(active_fanout.is_set())
@@ -5304,9 +5580,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             block_hex="00",
         )
         candidate = block_candidate(server, state, submission)
-        candidate.context.bundle = verified_block_bundle()
+        candidate.context.prospective_prior_balances = ()
 
-        self.assertFalse(server.submit_block_candidate(candidate))
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            self.assertFalse(server.submit_block_candidate(candidate))
 
         self.assertEqual(server._payout_state_generation, 2)
         self.assertEqual(server._accepted_block_payout_previews, {})
@@ -5472,7 +5750,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             if errors:
                 raise errors[0]
             self.assertTrue(admitted_while_persisting)
-            self.assertTrue(confirmation_waited_for_delivery)
+            # Confirmation is durable catch-up to the already-published
+            # prospective state and therefore does not wait on delivery.
+            self.assertFalse(confirmation_waited_for_delivery)
             self.assertTrue(confirm_started.is_set())
             self.assertTrue(reconcile_mutated.is_set())
             self.assertEqual(accepted, [True])
@@ -5621,7 +5901,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             block_hex="00",
         )
         parent_candidate = block_candidate(server, state, parent_submission)
-        parent_candidate.context.bundle = payout_bundle_payload()
+        parent_candidate.context.prospective_prior_balances = (
+            server._serialize_prior_balance_preview(preview)
+        )
         parent_results: list[bool] = []
         parent_errors: list[BaseException] = []
 
@@ -5698,6 +5980,395 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             0,
         )
         self.assertEqual(server._accepted_block_payout_previews, {})
+
+    def test_direct_block_preparation_does_not_hold_delivery_gate(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        entered = threading.Event()
+        release = threading.Event()
+        accepted: list[bool] = []
+        errors: list[BaseException] = []
+        block_hash = "cf" * 32
+        original_persist = ledger.persist_accepted_block
+
+        def blocking_persist(**kwargs: object) -> dict[str, object]:
+            self.assertIsNone(
+                server._payout_state_delivery_gate._mutation_owner
+            )
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("test did not release direct-block preparation")
+            return original_persist(**kwargs)
+
+        ledger.persist_accepted_block = blocking_persist  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            def submit() -> None:
+                try:
+                    accepted.append(
+                        server.submit_block_candidate(
+                            block_candidate(server, state, submission)
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            thread = threading.Thread(target=submit)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                with server._payout_state_delivery_gate.delivery_cancelable(
+                    lambda: False,
+                    generation=server._payout_state_generation,
+                    priority=True,
+                ) as admission:
+                    self.assertTrue(admission)
+                    release.set()
+                    thread.join(5)
+                    self.assertFalse(thread.is_alive())
+                    self.assertTrue(
+                        server._payout_state_prepare_lock.acquire(timeout=1)
+                    )
+                    server._payout_state_prepare_lock.release()
+                    admission.mark_delivered()
+            finally:
+                release.set()
+                thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(accepted, [True])
+        self.assertEqual(server._payout_state_generation, 1)
+
+    def test_failed_direct_block_audit_does_not_reserve_payout_source(self) -> None:
+        for failure_phase in ("build", "verify"):
+            with self.subTest(failure_phase=failure_phase):
+                server, state, ledger = submit_coordinator()
+                server._ensure_job_cache_state()
+                initial_source = server._payout_state_source
+                initial_published = server._published_payout_state
+                block_hash = "ce" * 32
+                server.rpc = SubmitRpc(
+                    tip="00" * 32,
+                    block_hash=block_hash,
+                    ledger=ledger,
+                )
+                submission = SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                )
+
+                with tempfile.TemporaryDirectory() as tempdir:
+                    server.audit_dir = Path(tempdir)
+                    server.ledger_writer_public_key_hex = "aa" * 32
+                    if failure_phase == "build":
+                        server.build_audit_bundle = (  # type: ignore[method-assign]
+                            lambda **_kwargs: (_ for _ in ()).throw(
+                                RuntimeError("audit reconstruction failed")
+                            )
+                        )
+                    else:
+                        server.build_audit_bundle = (  # type: ignore[method-assign]
+                            lambda **_kwargs: verified_block_bundle()
+                        )
+                        server.verify_bundle = (  # type: ignore[method-assign]
+                            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                                RuntimeError("audit verification failed")
+                            )
+                        )
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "audit (reconstruction|verification) failed",
+                    ):
+                        server.submit_block_candidate(
+                            block_candidate(server, state, submission)
+                        )
+
+                self.assertEqual(server._payout_state_source, initial_source)
+                self.assertEqual(server._published_payout_state, initial_published)
+                self.assertEqual(server._payout_state_generation, 0)
+                self.assertEqual(ledger.persisted, [])
+
+    def test_uncertain_direct_block_ledger_commit_fences_delivery(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        block_hash = "cd" * 32
+        server.rpc = SubmitRpc(
+            tip="00" * 32,
+            block_hash=block_hash,
+            ledger=ledger,
+        )
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+        ledger.confirm_accepted_block = (  # type: ignore[method-assign]
+            lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("ledger confirmation unavailable")
+            )
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.ledger_writer_public_key_hex = "aa" * 32
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ledger confirmation unavailable",
+            ):
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+
+        self.assertEqual(len(ledger.persisted), 1)
+        # The prospective preview was source/generation 1; the uncertain
+        # durable commit supersedes it with fenced source 2.
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_source[0], 2)
+        self.assertEqual(server._published_payout_state.source_generation, 1)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+
+    def test_uncertain_commit_supersedes_concurrently_published_source(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        block_hash = "cb" * 32
+        newer_tip = "dc" * 32
+        server.rpc = SubmitRpc(
+            tip="00" * 32,
+            block_hash=block_hash,
+            ledger=ledger,
+        )
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+
+        def publish_newer_source_then_fail(**_kwargs: object) -> dict[str, object]:
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=newer_tip,
+            )
+            self.assertEqual(
+                server._publish_payout_state_candidate(
+                    server._current_payout_state_candidate()
+                ),
+                2,
+            )
+            raise RuntimeError("ledger confirmation unavailable")
+
+        ledger.confirm_accepted_block = publish_newer_source_then_fail  # type: ignore[method-assign]
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.ledger_writer_public_key_hex = "aa" * 32
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ledger confirmation unavailable",
+            ):
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+
+        self.assertEqual(server._payout_state_generation, 2)
+        self.assertEqual(server._published_payout_state.source_generation, 2)
+        self.assertEqual(server._payout_state_source[0], 3)
+        self.assertEqual(server._payout_state_source[1], newer_tip)
+        self.assertEqual(
+            server._payout_state_source[2],
+            "direct_block_uncertain",
+        )
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+
+    def test_idempotent_direct_block_confirmation_publishes_reserved_source(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        block_hash = "d0" * 32
+        ledger.confirm_accepted_block = (  # type: ignore[method-assign]
+            lambda **_kwargs: {"backend": "fake", "confirmed_count": 0}
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, block_hash)
+
+    def test_direct_block_disabled_reconciler_bounds_publish_supersession(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.payout_reconcile_supersession_retries = 2
+        block_hash = "d3" * 32
+        real_publish = server._publish_payout_state_candidate
+        publish_attempts = 0
+
+        def supersede_before_publish(candidate: object) -> int | None:
+            nonlocal publish_attempts
+            publish_attempts += 1
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=f"{publish_attempts + 20:064x}",
+            )
+            return real_publish(candidate)  # type: ignore[arg-type]
+
+        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(publish_attempts, 3)
+        self.assertEqual(server._payout_state_generation, 0)
+        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertTrue(server.tip_refresh_is_pending())
+
+    def test_untrusted_direct_block_reconcile_publishes_newer_source_once(self) -> None:
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.reorg_reconciler_enabled = True
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: True  # type: ignore[method-assign]
+        block_hash = "d1" * 32
+        newer_tip = "d2" * 32
+
+        def superseding_noop_confirmation(**_kwargs: object) -> dict[str, object]:
+            server._reserve_payout_state_source(
+                "external_tip",
+                tip_hash=newer_tip,
+            )
+            return {"backend": "fake", "confirmed_count": 0}
+
+        ledger.confirm_accepted_block = superseding_noop_confirmation  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(server._payout_state_generation, 2)
+        self.assertEqual(server._published_payout_state.source_tip_hash, newer_tip)
+        self.assertEqual(server.payout_state_candidates_discarded, 0)
+        self.assertEqual(server.reorg_reconcile_skip_count, 1)
+
+    def test_verified_canonical_bundle_path_requires_exact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            candidate_path = Path(tempdir) / "candidate.json"
+            candidate_bytes = b'{"canonical":true}'
+            candidate_path.write_bytes(candidate_bytes)
+            canonical_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+
+            self.assertEqual(
+                PrismCoordinator.verified_canonical_bundle_path(
+                    candidate_path,
+                    {"audit_bundle_sha256_hex": canonical_sha256.upper()},
+                ),
+                candidate_path,
+            )
+            self.assertIsNone(
+                PrismCoordinator.verified_canonical_bundle_path(
+                    candidate_path,
+                    {"audit_bundle_sha256_hex": "00" * 32},
+                )
+            )
 
     def test_active_ancestor_candidate_resumes_full_finalization_without_resubmit(self) -> None:
         server, state, ledger = submit_coordinator()
@@ -5789,6 +6460,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertTrue(server.submit_block_candidate(candidate))
 
         self.assertEqual([row["block_hash"] for row in ledger.persisted], [block_hash] * 2)
+        # This compatibility builder ignores canonical_output_path, so its
+        # Python fallback remains verifier-only.
+        self.assertIsNone(ledger.persisted[0]["canonical_bundle_path"])
         self.assertEqual(ledger.confirmed[0]["active_tip_height"], 10)
         self.assertEqual(ledger.confirmed[0]["block_hash"], block_hash)
         self.assertEqual(active_rpc.revalidated_heights, [10, 10])
@@ -7237,7 +7911,7 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             key=("test",),
             template=gbt_template("00" * 32),
             template_fingerprint="fp",
-            bundle={},
+            coinbase_manifest={},
             shares_json=[],
             prior_balances=[],
             found_block={"network_difficulty": 1},
@@ -7611,9 +8285,12 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         self.assertFalse(queued.credit_share_on_accept)
         self.assertEqual(server.collection_block_submission_count, 1)
 
-    def test_block_candidate_intent_round_trips_collection_flag(self) -> None:
+    def test_block_candidate_intent_round_trips_compact_payout_state(self) -> None:
         server, state, _ledger = submit_coordinator()
         server.jobs["job-1"].collection_only = True
+        server.jobs["job-1"].prospective_prior_balances = (
+            ("miner-a", "miner-a", "11" * 32, 25),
+        )
         pending = PendingShare(
             share_id="miner-a:" + "dd" * 32,
             miner_id="miner-a",
@@ -7638,12 +8315,20 @@ class PrismStampedJobFloorTests(unittest.TestCase):
 
         intent = server.block_candidate_intent(candidate)
         self.assertIs(intent["collection_only"], True)
-        self.assertTrue(server.block_candidate_from_intent(intent).context.collection_only)
+        replayed = server.block_candidate_from_intent(intent)
+        self.assertTrue(replayed.context.collection_only)
+        self.assertEqual(
+            replayed.context.prospective_prior_balances,
+            (("miner-a", "miner-a", "11" * 32, 25),),
+        )
 
         # Intents persisted before the flag existed replay as ready-window
         # candidates, which is all the outbox could ever have contained then.
         intent.pop("collection_only")
-        self.assertFalse(server.block_candidate_from_intent(intent).context.collection_only)
+        intent.pop("prospective_prior_balances")
+        replayed = server.block_candidate_from_intent(intent)
+        self.assertFalse(replayed.context.collection_only)
+        self.assertIsNone(replayed.context.prospective_prior_balances)
 
     def test_ready_pool_refreshes_clients_left_on_collection_jobs(self) -> None:
         # Once the pool crosses min_ready_miners, the poller must replace

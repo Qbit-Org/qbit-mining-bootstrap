@@ -1,11 +1,11 @@
-use qbit_pool_builder::ManifestSigningKey;
+use qbit_pool_builder::{ManifestSigningKey, SignedPayoutManifest};
 use qbit_prism::{
     build_audit_bundle_with_coinbase_options, build_audit_bundle_with_ctv_settlement_options,
     AcceptedShare, AuditBundle, CarryForwardBalance, FanoutFeeRatePolicy, FoundBlock, PayoutPolicy,
-    SettlementModeConfig,
+    PayoutPolicyManifest, SettlementModeConfig,
 };
-use serde::Deserialize;
-use std::io::{self, Read};
+use serde::{Deserialize, Serialize};
+use std::io::{self, BufReader, Write};
 use std::{env, error::Error, fs, process};
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +32,13 @@ struct CtvSettlementInput {
     fanout_fee_rate_policy: Option<FanoutFeeRatePolicy>,
 }
 
+#[derive(Serialize)]
+struct JobBuildSummary<'a> {
+    found_block: &'a FoundBlock,
+    signed_coinbase_manifest: &'a SignedPayoutManifest,
+    payout_policy_manifest: &'a PayoutPolicyManifest,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("qbit-prism-build-audit-bundle: {error}");
@@ -43,6 +50,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut input_path: Option<String> = None;
     let mut signing_key_seed_hex: Option<String> = None;
     let mut ledger_signing_key_seed_hex: Option<String> = None;
+    let mut canonical_output = false;
+    let mut job_summary_output = false;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -50,6 +59,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--input" => input_path = args.next(),
             "--signing-key-seed-hex" => signing_key_seed_hex = args.next(),
             "--ledger-signing-key-seed-hex" => ledger_signing_key_seed_hex = args.next(),
+            "--canonical-output" => canonical_output = true,
+            "--job-summary-output" => job_summary_output = true,
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -58,15 +69,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let input_json = match input_path.as_deref() {
-        Some("-") | None => {
-            let mut buffer = String::new();
-            io::stdin().read_to_string(&mut buffer)?;
-            buffer
-        }
-        Some(path) => fs::read_to_string(path)?,
+    if canonical_output && job_summary_output {
+        return Err("--canonical-output and --job-summary-output are mutually exclusive".into());
+    }
+
+    let input: BuildAuditBundleInput = match input_path.as_deref() {
+        Some("-") | None => serde_json::from_reader(io::stdin().lock())?,
+        Some(path) => serde_json::from_reader(BufReader::new(fs::File::open(path)?))?,
     };
-    let input: BuildAuditBundleInput = serde_json::from_str(&input_json)?;
     let signing_key_seed_hex = signing_key_seed_hex.ok_or("--signing-key-seed-hex is required")?;
     let ledger_signing_key_seed_hex =
         ledger_signing_key_seed_hex.ok_or("--ledger-signing-key-seed-hex is required")?;
@@ -102,12 +112,31 @@ fn run() -> Result<(), Box<dyn Error>> {
         )?
     };
 
-    println!("{}", serde_json::to_string_pretty(&bundle)?);
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    if canonical_output {
+        // serde_json::to_writer uses the same compact serializer as the
+        // canonical to_vec helper, without allocating a second full body.
+        serde_json::to_writer(&mut output, &bundle)?;
+    } else if job_summary_output {
+        serde_json::to_writer(
+            &mut output,
+            &JobBuildSummary {
+                found_block: &bundle.found_block,
+                signed_coinbase_manifest: &bundle.signed_coinbase_manifest,
+                payout_policy_manifest: &bundle.payout_policy_manifest,
+            },
+        )?;
+    } else {
+        serde_json::to_writer_pretty(&mut output, &bundle)?;
+        writeln!(output)?;
+    }
+    output.flush()?;
     Ok(())
 }
 
 fn print_usage() {
     println!(
-        "usage: qbit-prism-build-audit-bundle --signing-key-seed-hex <64 hex chars> --ledger-signing-key-seed-hex <64 hex chars> [--input <bundle-input.json|-]"
+        "usage: qbit-prism-build-audit-bundle --signing-key-seed-hex <64 hex chars> --ledger-signing-key-seed-hex <64 hex chars> [--input <bundle-input.json|-] [--canonical-output|--job-summary-output]"
     );
 }
