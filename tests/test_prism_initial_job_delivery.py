@@ -8,6 +8,7 @@ import time
 import unittest
 
 from lab.prism.prism_coordinator import (
+    PendingInitialJob,
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     TemplateRefreshBlocked,
 )
@@ -107,6 +108,57 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertEqual(artifact_attempts, 2)
         self.assertEqual(server.job_build_failure_count, 1)
         self.assertIn(state, server.clients)
+
+    def test_initial_delivery_backs_off_after_superseded_work(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        bundle = server.prewarm_current_tip_ready_bundle()
+        state = client(1)
+        state.authorization_generation = 1
+        state.difficulty_generation = 0
+        server.clients = {state}
+        server._ensure_initial_job_state()
+        request = PendingInitialJob(
+            client=state,
+            authorization_generation=1,
+            worker=state.worker,
+            requested_monotonic=0.0,
+            deadline_monotonic=None,
+            connection_id=state.connection_id,
+            difficulty_generation=0,
+        )
+        server.pending_initial_jobs[state] = request
+        artifacts = server.current_template_artifacts()
+        waits: list[float] = []
+        request.cancelled.wait = (  # type: ignore[method-assign]
+            lambda timeout: waits.append(timeout) or False
+        )
+        original_call = rpc.call
+        best_tip_calls = 0
+
+        def tip_churn_once(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            nonlocal best_tip_calls
+            if method == "getbestblockhash":
+                best_tip_calls += 1
+                if best_tip_calls == 1:
+                    return "ff" * 32
+                return artifacts.previousblockhash
+            return original_call(method, params)
+
+        deliveries = iter((None, True))
+        rpc.call = tip_churn_once  # type: ignore[method-assign]
+        server.current_template_artifacts = lambda: artifacts  # type: ignore[method-assign]
+        server.shared_job_bundle = lambda *_args, **_kwargs: bundle  # type: ignore[method-assign]
+        server._deliver_initial_bundle = (  # type: ignore[method-assign]
+            lambda *_args: next(deliveries)
+        )
+
+        self.assertTrue(server._run_initial_job(request))
+        self.assertEqual(best_tip_calls, 3)
+        self.assertEqual(waits, [0.05, 0.1])
 
     def test_250_client_reconnect_storm_uses_one_build_without_client_locks(self) -> None:
         server, _rpc = coordinator()

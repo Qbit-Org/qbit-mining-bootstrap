@@ -4572,6 +4572,8 @@ class PrismCoordinator:
                         with self._job_cache_lock:
                             if self._template_artifacts is artifacts:
                                 self._template_artifacts = None
+                        if not retry_later():
+                            return False
                         continue
                 except _JobBuildCancelled:
                     if self._initial_request_cancelled(request):
@@ -4607,6 +4609,8 @@ class PrismCoordinator:
                     continue
                 delivered = self._deliver_initial_bundle(request, artifacts, bundle)
                 if delivered is None:
+                    if not retry_later():
+                        return False
                     continue
                 return delivered
             return False
