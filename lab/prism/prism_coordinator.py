@@ -4644,21 +4644,35 @@ class PrismCoordinator:
                     raise JobBuildSuperseded(
                         "observed tip changed before cache publication"
                     )
-                if not retry_superseded:
-                    with self._job_cache_lock:
-                        payout_current = (
-                            built.payout_state_generation
-                            == self._payout_state_generation
-                        )
-                    if (
-                        payout_current
-                        and built.template is artifacts.template
-                        and built.template_generation == artifacts.generation
-                    ):
-                        # Snapshot-owned work may outlive an unrelated global
-                        # cache fill. Return it only to the refresh validator;
-                        # it is deliberately not retained in the shared cache.
-                        return built
+                with self._job_cache_lock:
+                    payout_current = (
+                        built.payout_state_generation
+                        == self._payout_state_generation
+                    )
+                with self.lock:
+                    published_snapshot = getattr(
+                        self,
+                        "tip_template_snapshot",
+                        None,
+                    )
+                    published_artifacts = (
+                        published_snapshot.template_artifacts
+                        if published_snapshot is not None
+                        else None
+                    )
+                if (
+                    payout_current
+                    and built.template is artifacts.template
+                    and built.template_generation == artifacts.generation
+                    and (
+                        not retry_superseded
+                        or published_artifacts is artifacts
+                    )
+                ):
+                    # Snapshot-owned work may outlive an unrelated global
+                    # cache fill. Return it only to its refresh validator or
+                    # retained collection delivery; never retain it globally.
+                    return built
                 if retry_superseded:
                     with self._job_cache_lock:
                         current = self._template_artifacts
@@ -7773,6 +7787,12 @@ class PrismCoordinator:
         try:
             observation_sequence = self._reserve_tip_observation_sequence()
             pending_signal_token = self._claim_tip_refresh_pending()
+            with self.lock:
+                poll_start_clients = tuple(
+                    client
+                    for client in self.clients
+                    if self.client_can_receive_jobs(client)
+                )
             # The interval poller has no push notification to mark priority for
             # it. Probe the cheap best-tip RPC before fetching and deriving the
             # template so CTV maintenance can yield as soon as a changed tip is
@@ -7892,6 +7912,20 @@ class PrismCoordinator:
                         pending_signal_token,
                         observation_sequence,
                     )
+            with self.lock:
+                selected_clients_list = list(clients)
+                selected_client_set = set(clients)
+                for client in poll_start_clients:
+                    if client in selected_client_set:
+                        continue
+                    if snapshot_changed or self.client_needs_tip_template_refresh(
+                        client,
+                        snapshot,
+                    ):
+                        selected_clients_list.append(client)
+                        selected_client_set.add(client)
+                        expected_active_jobs[client] = client.active_job
+                selected_clients = tuple(selected_clients_list)
             use_prepared_fanout = bool(
                 clients
                 and getattr(self, "_pool_ready_latched", False)
@@ -7980,6 +8014,7 @@ class PrismCoordinator:
                     "tip/template poll was superseded by a newer tip observation"
                 )
             self.prune_evicted_job_graveyard(force=False)
+            dropped_client_results: list[str] = []
             with self.lock:
                 current_tip = getattr(self, "current_tip_first_seen", None)
                 if (
@@ -7992,19 +8027,25 @@ class PrismCoordinator:
                         "tip/template poll was superseded before snapshot publication"
                     )
                 self.tip_template_snapshot = snapshot
-                # Repeat selection at the publication boundary. Connections,
-                # authorization, Vardiff jobs, and payout generations may all
-                # have changed while construction ran.
-                clients = [
-                    client
-                    for client in self.clients
-                    if self.client_can_receive_jobs(client)
-                    and self.client_needs_tip_template_refresh(client, snapshot)
-                ]
-                expected_active_jobs = {
-                    client: client.active_job
-                    for client in clients
-                }
+                # Revalidate the originally selected targets at publication.
+                # New connections keep their own pending/retained wake; this
+                # pass must not consume work that appeared after construction.
+                # Preserve the pre-build expected job pointer so an intervening
+                # authorize/Vardiff delivery is never overwritten.
+                current_clients: list[ClientState] = []
+                for client in selected_clients:
+                    if client not in self.clients:
+                        dropped_client_results.append("disconnected")
+                    elif not self.client_can_receive_jobs(client):
+                        dropped_client_results.append("skipped")
+                    elif not self.client_needs_tip_template_refresh(client, snapshot):
+                        dropped_client_results.append("skipped")
+                    else:
+                        current_clients.append(client)
+                clients = current_clients
+
+            for result in dropped_client_results:
+                self._record_tip_refresh_client_result(result)
 
             if bundle is not None and not bundle.collection_only:
                 with self._job_cache_lock:
