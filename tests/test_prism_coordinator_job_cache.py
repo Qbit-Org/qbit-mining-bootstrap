@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import queue
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -1579,6 +1580,72 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(rebound.template_generation, second.generation)
         self.assertEqual(rebound.base_job.ntime, f'{updated_template["curtime"]:08x}')
 
+    def test_clock_only_refresh_does_not_discard_inflight_ready_build(self) -> None:
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        first = server.store_template_artifacts(dict(rpc.template))
+        assert first is not None
+        build_entered = threading.Event()
+        release_build = threading.Event()
+        original_build = server.build_shared_job_bundle
+        build_calls = 0
+        build_calls_lock = threading.Lock()
+
+        def blocking_build(*args: object, **kwargs: object) -> object:
+            nonlocal build_calls
+            with build_calls_lock:
+                build_calls += 1
+            build_entered.set()
+            self.assertTrue(release_build.wait(5))
+            return original_build(*args, **kwargs)  # type: ignore[arg-type]
+
+        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        results: list[list[object]] = [[], []]
+        errors: list[list[BaseException]] = [[], []]
+
+        def build(index: int, build_artifacts: object) -> None:
+            try:
+                results[index].append(
+                    server.shared_job_bundle(  # type: ignore[arg-type]
+                        build_artifacts,
+                        mode="ready",
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors[index].append(exc)
+
+        first_thread = threading.Thread(target=build, args=(0, first))
+        second_thread: threading.Thread | None = None
+        first_thread.start()
+        try:
+            self.assertTrue(build_entered.wait(5))
+            updated_template = dict(first.template)
+            updated_template["curtime"] = int(updated_template["curtime"]) + 30
+            second = server.store_template_artifacts(updated_template)
+            assert second is not None
+            second_thread = threading.Thread(target=build, args=(1, second))
+            second_thread.start()
+            time.sleep(0.05)
+            with build_calls_lock:
+                self.assertEqual(build_calls, 1)
+        finally:
+            release_build.set()
+            first_thread.join(5)
+            if second_thread is not None:
+                second_thread.join(5)
+
+        self.assertFalse(first_thread.is_alive())
+        assert second_thread is not None
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(errors, [[], []])
+        self.assertEqual([len(items) for items in results], [1, 1])
+        built = results[0][0]
+        self.assertIs(built.template, first.template)  # type: ignore[union-attr]
+        rebound = results[1][0]
+        self.assertIs(rebound.template, second.template)
+        self.assertEqual(rebound.template_generation, second.generation)
+        self.assertEqual(recorded["calls"], 1)
+
     def test_same_fingerprint_collection_bundle_rebuilds_exact_observation(self) -> None:
         server, _ = coordinator(ledger=FakeLedger(miners=["miner-a"]))
         recorded = install_fake_bundle_builder(server)
@@ -1662,7 +1729,7 @@ class JobBundleCacheTests(unittest.TestCase):
         server, rpc = coordinator()
         first = server.store_template_artifacts(dict(rpc.template))
         second_template = dict(rpc.template)
-        second_template["curtime"] = int(second_template["curtime"]) + 1
+        second_template["coinbasevalue"] = int(second_template["coinbasevalue"]) + 1
         second = server.store_template_artifacts(second_template)
         assert first is not None and second is not None
         payout_generation = server._payout_state_generation
@@ -1702,6 +1769,236 @@ class JobBundleCacheTests(unittest.TestCase):
             pending.promise.exception(),  # type: ignore[union-attr]
             JobBuildSuperseded,
         )
+
+    def test_independent_collection_workers_do_not_supersede_each_other(self) -> None:
+        server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        identities = [
+            worker(f"tq1worker-{index}", f"tq1worker-{index}.rig")
+            for index in range(4)
+        ]
+        entered = [threading.Event() for _identity in identities]
+        release = threading.Event()
+        original_build = server.build_shared_job_bundle
+        active_builds = 0
+        max_active_builds = 0
+        active_lock = threading.Lock()
+
+        def blocking_build(
+            build_artifacts: object,
+            identity: WorkerIdentity,
+            **kwargs: object,
+        ) -> object:
+            nonlocal active_builds, max_active_builds
+            index = identities.index(identity)
+            with active_lock:
+                active_builds += 1
+                max_active_builds = max(max_active_builds, active_builds)
+            entered[index].set()
+            try:
+                self.assertTrue(release.wait(5))
+                return original_build(
+                    build_artifacts,  # type: ignore[arg-type]
+                    identity,
+                    **kwargs,
+                )
+            finally:
+                with active_lock:
+                    active_builds -= 1
+
+        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        results: list[list[object]] = [[] for _identity in identities]
+        errors: list[list[BaseException]] = [[] for _identity in identities]
+
+        def build(index: int) -> None:
+            try:
+                results[index].append(
+                    server.shared_job_bundle(
+                        artifacts,
+                        identities[index],
+                        mode="collection",
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors[index].append(exc)
+
+        threads = [
+            threading.Thread(target=build, args=(index,))
+            for index in range(len(identities))
+        ]
+        threads[0].start()
+        try:
+            self.assertTrue(entered[0].wait(5))
+            threads[1].start()
+            self.assertTrue(entered[1].wait(5))
+            threads[2].start()
+            threads[3].start()
+            time.sleep(0.05)
+            self.assertEqual(server.job_build_scheduler_counts["starts"], 2)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [[], [], [], []])
+        self.assertEqual([len(items) for items in results], [1, 1, 1, 1])
+        self.assertEqual(recorded["calls"], 4)
+        self.assertLessEqual(max_active_builds, 2)
+        self.assertEqual(server.job_build_scheduler_counts["supersessions"], 0)
+
+    def test_shutdown_cancels_builder_with_full_helper_input_pipe(self) -> None:
+        server, rpc = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        payout_generation = server._payout_state_generation
+        request = server._new_job_build_request(
+            artifacts,
+            None,
+            mode="ready",
+            payout_state_generation=payout_generation,
+            cache_key=server._job_bundle_key(
+                artifacts,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                worker=None,
+            ),
+        )
+        helper_started = threading.Event()
+        helper_processes: list[subprocess.Popen[str]] = []
+        real_popen = subprocess.Popen
+
+        def capture_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+            process = real_popen(*args, **kwargs)  # type: ignore[arg-type]
+            helper_processes.append(process)
+            helper_started.set()
+            return process
+
+        def fill_helper_pipe(*_args: object, **kwargs: object) -> object:
+            build_request = kwargs["build_request"]
+            return server.build_audit_bundle(
+                shares=[],
+                found_block={
+                    "block_height": 10,
+                    "coinbase_value_sats": 50_00000000,
+                    "network_difficulty": 1,
+                    "anchor_job_issued_at_ms": 1_700_000_000_000,
+                },
+                prior_balances=[
+                    {
+                        "miner_id": "pipe-filler",
+                        "balance_sats": 1,
+                        "padding": "x" * (4 * 1024 * 1024),
+                    }
+                ],
+                coinbase_script_sig_suffix_hex="00",
+                cancellation=build_request.cancellation,  # type: ignore[union-attr]
+            )
+
+        server.build_shared_job_bundle = fill_helper_pipe  # type: ignore[method-assign]
+        shutdown_finished = threading.Event()
+        shutdown_errors: list[BaseException] = []
+
+        def shutdown() -> None:
+            try:
+                server.shutdown_job_build_executor()
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                shutdown_errors.append(exc)
+            finally:
+                shutdown_finished.set()
+
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            side_effect=capture_popen,
+        ):
+            promise = server._request_job_build(request)
+            self.assertTrue(
+                helper_started.wait(5),
+                repr(promise.exception(timeout=1)) if promise.done() else None,
+            )
+            time.sleep(0.1)
+            self.assertFalse(promise.done())
+            shutdown_thread = threading.Thread(target=shutdown)
+            shutdown_thread.start()
+            shutdown_returned = shutdown_finished.wait(2)
+            if not shutdown_returned:
+                for process in helper_processes:
+                    if process.poll() is None:
+                        process.kill()
+            shutdown_thread.join(5)
+
+        self.assertTrue(shutdown_returned)
+        self.assertFalse(shutdown_thread.is_alive())
+        self.assertEqual(shutdown_errors, [])
+        self.assertIsInstance(promise.exception(timeout=1), JobBuildSuperseded)
+
+    def test_full_helper_input_pipe_obeys_builder_timeout(self) -> None:
+        server, _rpc = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        server.bundle_build_timeout_seconds = 0.05
+        helper_started = threading.Event()
+        helper_processes: list[subprocess.Popen[str]] = []
+        real_popen = subprocess.Popen
+
+        def capture_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+            process = real_popen(*args, **kwargs)  # type: ignore[arg-type]
+            helper_processes.append(process)
+            helper_started.set()
+            return process
+
+        errors: list[BaseException] = []
+
+        def build() -> None:
+            try:
+                server.build_audit_bundle(
+                    shares=[],
+                    found_block={
+                        "block_height": 10,
+                        "coinbase_value_sats": 50_00000000,
+                        "network_difficulty": 1,
+                        "anchor_job_issued_at_ms": 1_700_000_000_000,
+                    },
+                    prior_balances=[
+                        {
+                            "miner_id": "pipe-filler",
+                            "balance_sats": 1,
+                            "padding": "x" * (4 * 1024 * 1024),
+                        }
+                    ],
+                    coinbase_script_sig_suffix_hex="00",
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            side_effect=capture_popen,
+        ):
+            build_thread = threading.Thread(target=build)
+            build_thread.start()
+            self.assertTrue(helper_started.wait(5))
+            build_thread.join(2)
+            if build_thread.is_alive():
+                for process in helper_processes:
+                    if process.poll() is None:
+                        process.kill()
+                build_thread.join(5)
+
+        self.assertFalse(build_thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertIn("timed out", str(errors[0]))
 
     def test_supersession_retry_wakes_blockpoll_without_full_interval(self) -> None:
         server, _ = coordinator()
