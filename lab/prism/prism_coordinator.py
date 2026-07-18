@@ -9574,10 +9574,18 @@ class PrismCoordinator:
                     # would bump the payout generation, wipe the job-bundle
                     # cache, and abort every in-flight template refresh for
                     # identical payout state — livelocking job delivery while
-                    # the candidate replays. A prior attempt that confirmed
-                    # rows but failed before publishing always leaves its
-                    # source reserved (or fenced as direct_block_uncertain),
-                    # so it never takes this branch and still publishes below.
+                    # the candidate replays. qbit_confirm_pool_block reports 0
+                    # for an already-confirmed block once the active tip moved
+                    # past its height (the sustained replay state); while the
+                    # block is still the tip it reports 1, indistinguishable
+                    # from a freshly flipped row, so that replay must keep
+                    # publishing. A prior attempt that confirmed rows but
+                    # failed before publishing always leaves its source
+                    # reserved (or fenced as direct_block_uncertain), so it
+                    # never takes this branch and still publishes below. A
+                    # restart cannot leak stale state through here either: a
+                    # fresh process builds every bundle from ledger reads that
+                    # already include the confirmed rows.
                     payout_publication_covered = True
                 elif confirmed_count in {0, 1}:
                     direct_payout_source = (

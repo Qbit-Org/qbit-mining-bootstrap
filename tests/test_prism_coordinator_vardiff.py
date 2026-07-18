@@ -5579,13 +5579,34 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
             self.assertEqual(server._payout_state_source[0], 1)
 
-            # Replay the durable candidate after its block landed and its
-            # confirmation committed: the candidate is the active tip and the
-            # ledger confirms nothing new. The published payout state already
-            # covers it, so the replay must not reserve a source, bump the
+            # Replay the durable candidate after its block landed, its
+            # confirmation committed, and the network built on top of it.
+            # qbit_confirm_pool_block reports confirmed_count=0 for an
+            # already-confirmed block whose height no longer matches the
+            # active tip — the sustained replay state of the post-block
+            # livelock. The published payout state already covers the
+            # candidate, so the replay must not reserve a source, bump the
             # generation, wipe the job-bundle cache, or schedule refresh
-            # churn (the post-block livelock).
-            rpc.tip = block_hash
+            # churn.
+            child_tip = "d7" * 32
+
+            class AncestorReplayRpc:
+                def call(self, method: str, params: object = None) -> object:
+                    if method == "getbestblockhash":
+                        return child_tip
+                    if method == "getblockheader":
+                        if params != [block_hash]:
+                            raise AssertionError(params)
+                        return {"height": 10, "confirmations": 2}
+                    if method == "getblockcount":
+                        return 11
+                    if method == "submitblock":
+                        raise AssertionError(
+                            "active ancestor must not be resubmitted"
+                        )
+                    raise RuntimeError(method)
+
+            server.rpc = AncestorReplayRpc()
             ledger.confirm_accepted_block = (  # type: ignore[method-assign]
                 lambda **_kwargs: {"backend": "fake", "confirmed_count": 0}
             )
