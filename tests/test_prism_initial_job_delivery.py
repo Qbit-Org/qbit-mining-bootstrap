@@ -117,6 +117,10 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertEqual(artifact_attempts, 2)
         self.assertEqual(server.job_build_failure_count, 1)
         self.assertIn(state, server.clients)
+        self.assertEqual(
+            server.progress_health_snapshot()["eligible_clients_requiring_refresh"],
+            0,
+        )
 
     def test_initial_delivery_backs_off_after_superseded_work(self) -> None:
         server, rpc = coordinator()

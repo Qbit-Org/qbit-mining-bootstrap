@@ -504,6 +504,8 @@ services:
       PRISM_REORG_RECONCILE_CACHE_SECONDS: ${PRISM_REORG_RECONCILE_CACHE_SECONDS:-5}
       PRISM_HEALTH_REFRESH_SECONDS: ${PRISM_HEALTH_REFRESH_SECONDS:-5}
       PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS: ${PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS:-30}
+      PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS: ${PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS:-15}
+      PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS: ${PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS:-15}
       PRISM_STRATUM_SEND_TIMEOUT_SECONDS: ${PRISM_STRATUM_SEND_TIMEOUT_SECONDS:-20}
       PRISM_STRATUM_MAX_CONNECTIONS: ${PRISM_STRATUM_MAX_CONNECTIONS:-384}
       PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME: ${PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME:-0}
@@ -616,7 +618,8 @@ services:
           python3 -c "import os, socket, urllib.request; p=int(os.environ.get('PRISM_STRATUM_PORT','3340')); s=socket.create_connection(('127.0.0.1', p), 2); s.close(); ap=int(os.environ.get('PRISM_AUDIT_PORT','0') or '0'); h=os.environ.get('PRISM_AUDIT_BIND','127.0.0.1') or '127.0.0.1'; h='127.0.0.1' if h in ('0.0.0.0','::') else h; assert not ap or urllib.request.urlopen(f'http://{h}:{ap}/healthz', timeout=2).status == 200"
       interval: 5s
       timeout: 5s
-      retries: 30
+      start_period: 15s
+      retries: 3
 
 volumes:
   bitcoin-data:

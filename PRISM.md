@@ -212,9 +212,25 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_BLOCKWAIT_ENABLED` | `1` | enables a `waitfornewblock` thread so new tips trigger immediate clean-job refreshes |
 | `PRISM_BLOCKWAIT_TIMEOUT_SECONDS` | `5` | server-side timeout for each `waitfornewblock` call |
 | `PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS` | `60` | fail-closed timeout for one signed shared-bundle subprocess |
+| `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` | `15` | maximum monotonic age of a known tip/template/payout refresh before `/healthz` returns HTTP 503 |
+| `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | `15` | maximum monotonic age of the last coherent qbit tip/template poll before `/healthz` returns HTTP 503 |
 | `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | after a tip flip, credits same-connection prior-tip shares until this long after that connection receives new-tip work (shares stay creditable while delivery is still pending); set `0` to reject all prior-tip shares |
 | `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` | `15` | cadence for checking zero-submitted, zero-accepted vardiff windows so over-diffed idle miners can step down; set `0` to disable |
 | `PRISM_WORKER_METRICS_LIMIT` | `100` | maximum distinct worker labels in private metrics before new workers aggregate into `_other` |
+
+`/healthz` remains healthy across arbitrarily long periods without a new block
+when the observed template and payout generation are unchanged. It returns HTTP
+503 only when tip polling is stale, an active bundle build is stuck, or known
+new work is not published (and, when eligible miners exist, delivered) within
+the configured bounds. The response and Prometheus metrics expose only bounded
+generation, age, client-count, and reason fields; miner identities and work
+payloads are never included.
+
+The Compose healthcheck samples `/healthz` every five seconds and marks the
+container unhealthy after three consecutive failures. This is an alerting
+signal only: Compose `restart: on-failure` restarts coordinator process exits,
+not containers whose health status alone becomes unhealthy. Use `/healthz` or
+the `qbit_prism_health_state` metrics for alerting and automation.
 
 Stale-grace crediting never submits a block candidate. The submitted header must
 still satisfy the assigned share target, is marked with `credit_policy:
