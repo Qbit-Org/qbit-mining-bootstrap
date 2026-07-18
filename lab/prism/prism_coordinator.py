@@ -13855,6 +13855,12 @@ class PrismCoordinator:
                 if reason is not None:
                     self._record_vardiff_idle_skip(reason)
                     return
+            # Prepared bundles bypass _maybe_send_job_locked's normal build
+            # admission, so preserve its live reorg/headers/IBD trust guard on
+            # the dedicated worker before taking the client lock or sending.
+            if not self.ensure_reorg_reconciled_for_current_tip():
+                self._record_vardiff_idle_skip("superseded")
+                return
             if not client.job_update_lock.acquire(blocking=False):
                 self._record_vardiff_idle_skip("busy")
                 return

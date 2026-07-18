@@ -1105,6 +1105,35 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.job_build_failure_count, 1)
         self.assertEqual(server.vardiff_idle_task_failures, 1)
 
+    def test_idle_cached_bundle_requires_live_reorg_trust(self) -> None:
+        server = coordinator()
+        state = client()
+        prepare_idle_client(server, state)
+        install_idle_job_cache(server)
+        trust_checked = threading.Event()
+        sent: list[dict[str, object]] = []
+        window_started = state.vardiff_window_started_monotonic
+
+        def reject_untrusted_tip() -> bool:
+            trust_checked.set()
+            return False
+
+        state.send = sent.append  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            reject_untrusted_tip
+        )
+
+        self.assertEqual(server.vardiff_idle_sweep_once(), 1)
+        server.shutdown_vardiff_idle_executor()
+
+        self.assertTrue(trust_checked.is_set())
+        self.assertEqual(sent, [])
+        self.assertEqual(server.idle_retarget_count, 0)
+        self.assertEqual(state.share_difficulty, Decimal("16"))
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(state.vardiff_window_started_monotonic, window_started)
+        self.assertGreaterEqual(server.vardiff_idle_skip_counts["superseded"], 1)
+
     def test_repeated_idle_sweeps_do_not_enqueue_duplicate_connection_work(self) -> None:
         server = coordinator()
         state = client()
