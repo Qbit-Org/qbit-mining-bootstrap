@@ -7338,6 +7338,16 @@ class PrismCoordinator:
             self.last_successful_template_refresh_monotonic = time.monotonic()
             self.template_refresh_failure_started_monotonic = None
             return refreshed
+        except (TemplateRefreshBlocked, _PayoutStatePublicationBlocked):
+            # Coordination-blocked refreshes -- a superseded tip, a pending
+            # payout publication fence, a refresh raced by payout mutation --
+            # are churn between healthy components, not qbitd unhealthiness.
+            # They must not arm the restart budget: sustained payout churn
+            # would otherwise self-terminate a process whose RPC is fine, and
+            # each restart re-triggers the same churn. Re-raise so callers
+            # still schedule their immediate retry; only real failures below
+            # start the exit clock.
+            raise
         except Exception:
             self._record_template_refresh_failure(time.monotonic())
             raise

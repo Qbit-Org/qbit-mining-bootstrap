@@ -47,6 +47,7 @@ from lab.prism.prism_coordinator import (
     PrismCoordinator,
     WorkerIdentity,
     _FanoutCancellation,
+    _PayoutStatePublicationBlocked,
     default_prism_coinbase_tag_hex,
     default_prism_username_fallback_address,
     load_prism_highdiff_listener,
@@ -3380,6 +3381,93 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server._record_template_refresh_failure(500.0)
         self.assertFalse(server.template_refresh_failure_expired(500.0))
         self.assertFalse(hasattr(server, "template_refresh_failure_started_monotonic"))
+
+    def test_coordination_blocked_refresh_does_not_start_failure_budget(self) -> None:
+        for blocked_error in (
+            TemplateRefreshBlocked("qbit tip changed during sequential refresh"),
+            _PayoutStatePublicationBlocked("payout state invalidation is pending publication"),
+        ):
+            with self.subTest(blocked=type(blocked_error).__name__):
+                server = coordinator()
+                server.template_refresh_failure_exit_seconds = 10.0
+                server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+                server.rpc = TipRpc("11" * 32)
+
+                def raise_blocked(error: Exception = blocked_error) -> QbitTipTemplateSnapshot:
+                    raise error
+
+                server.fetch_qbit_tip_template_snapshot = raise_blocked  # type: ignore[method-assign]
+                with self.assertRaises(type(blocked_error)):
+                    server.poll_qbit_tip_template_once()
+
+                self.assertIsNone(
+                    getattr(server, "template_refresh_failure_started_monotonic", None)
+                )
+                self.assertFalse(server.template_refresh_failure_expired(10_000.0))
+
+    def test_sustained_blocked_refresh_storm_never_exhausts_failure_budget(self) -> None:
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.rpc = TipRpc("11" * 32)
+        clock = {"now": 100.0}
+        blocked_polls = 0
+
+        def blocked_fetch() -> QbitTipTemplateSnapshot:
+            nonlocal blocked_polls
+            blocked_polls += 1
+            clock["now"] += 6.0
+            if blocked_polls >= 4:
+                server.stop_event.set()
+            raise _PayoutStatePublicationBlocked(
+                "payout state invalidation is pending publication"
+            )
+
+        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+        ):
+            server.blockpoll_loop()
+
+        self.assertEqual(blocked_polls, 4)
+        self.assertGreater(clock["now"] - 100.0, server.template_refresh_failure_exit_seconds)
+        exit_process.assert_not_called()
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+
+    def test_rpc_outage_arms_and_exhausts_failure_budget(self) -> None:
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        clock = {"now": 100.0}
+
+        class OutageRpc:
+            def call(self, method: str, params: list[object] | None = None, **_kwargs: object) -> object:
+                clock["now"] += 6.0
+                raise ConnectionError("qbitd unreachable")
+
+        server.rpc = OutageRpc()
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
+            self.assertRaises(SystemExit),
+        ):
+            server.blockpoll_loop()
+
+        exit_process.assert_called_once_with(1)
+        self.assertIsNotNone(server.template_refresh_failure_started_monotonic)
 
     def test_healthy_noop_template_poll_resets_refresh_failure_clock(self) -> None:
         server = coordinator()
