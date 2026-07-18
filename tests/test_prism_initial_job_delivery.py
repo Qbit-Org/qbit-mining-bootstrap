@@ -54,7 +54,16 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertIsNotNone(bundle)
         assert bundle is not None
         self.assertFalse(bundle.collection_only)
-        self.assertEqual(bundle.key, (bundle.template_fingerprint, "ready", 0))
+        self.assertEqual(
+            bundle.key,
+            (
+                bundle.template_fingerprint,
+                bundle.template["previousblockhash"],
+                "ready",
+                0,
+                0,
+            ),
+        )
         self.assertEqual(recorded["calls"], 1)
         self.assertEqual(server.ledger.snapshot_calls, 1)
         self.assertEqual(server.tip_template_snapshot.bestblockhash, rpc.tip)
@@ -361,10 +370,10 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         collection_keys = {
             key
             for key in server._job_bundle_cache
-            if len(key) >= 6 and key[1] == "collection"
+            if len(key) >= 8 and key[2] == "collection"
         }
         self.assertEqual(
-            {key[4] for key in collection_keys},
+            {key[6] for key in collection_keys},
             {"tq1worker-a", "tq1worker-b"},
         )
 

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import queue
 import socket
+import sys
 import threading
 import time
 import unittest
@@ -11,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
@@ -551,14 +554,16 @@ class JobBundleCacheTests(unittest.TestCase):
         bundle = bundles[0]
         self.assertEqual(bundle.prior_balances, preview)  # type: ignore[union-attr]
         self.assertEqual(recorded["last_kwargs"]["prior_balances"], preview)  # type: ignore[index]
-        self.assertEqual(ledger.current_balance_reads, 0)
+        # Preview publication prepares an artifact from one confirmed snapshot;
+        # the zero count captured above proves the waiting child did not read it.
+        self.assertEqual(ledger.current_balance_reads, 1)
         self.assertEqual(  # type: ignore[union-attr]
             bundle.payout_state_generation,
             server._payout_state_generation,
         )
 
         self.assertEqual(server._prior_balances_for_job_parent(parent_hash), [])
-        self.assertEqual(ledger.current_balance_reads, 1)
+        self.assertEqual(ledger.current_balance_reads, 2)
 
     def test_parent_preview_publication_is_idempotent_and_withdrawal_invalidates(
         self,
@@ -656,6 +661,63 @@ class JobBundleCacheTests(unittest.TestCase):
                 parent_height=11,
             )
         self.assertEqual(ledger.current_balance_reads, 0)
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_inactive_landed_ancestor_rejects_preview_patched_artifact(
+        self,
+    ) -> None:
+        accepted_hash = "c0" * 32
+        alternate_tip = "c1" * 32
+        server, rpc = coordinator(
+            template=base_template(height=12, prevhash=alternate_tip)
+        )
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        self.assertTrue(server.pool_readiness_latched())
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        server._begin_accepted_block_payout_preview(
+            accepted_hash,
+            block_height=10,
+        )
+        server._mark_accepted_block_payout_landed(
+            accepted_hash,
+            block_height=10,
+        )
+        server._publish_accepted_block_payout_preview(accepted_hash, preview)
+        with server._job_cache_lock:
+            artifact = server._payout_ledger_artifact
+        self.assertIsNotNone(artifact)
+        assert artifact is not None
+        self.assertEqual(list(artifact.prior_balances), preview)
+
+        original_rpc_call = rpc.call
+
+        def alternate_chain_call(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getblockhash":
+                self.assertEqual(params, [10])
+                return "c2" * 32
+            return original_rpc_call(method, params)
+
+        rpc.call = alternate_chain_call  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked,
+            "no longer active",
+        ):
+            server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertEqual(recorded["calls"], 0)
         self.assertTrue(server._tip_refresh_retry.is_set())
 
     def test_waiting_child_does_not_fall_back_after_transition_withdrawal(
@@ -1387,6 +1449,316 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(recorded["calls"], 1)
+
+    def test_precomputed_payout_artifact_matches_inline_output_exactly(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        with patch("lab.prism.prism_coordinator.now_ms", return_value=1_700_000_123_000):
+            inline = server.shared_job_bundle(artifacts, mode="ready")
+            with server._job_cache_lock:
+                server._job_bundle_cache.clear()
+            server._prepare_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            prepared = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertEqual(prepared.base_job, inline.base_job)
+        self.assertEqual(prepared.coinbase_manifest, inline.coinbase_manifest)
+        self.assertEqual(prepared.shares_json, inline.shares_json)
+        self.assertEqual(prepared.prior_balances, inline.prior_balances)
+        self.assertEqual(prepared.found_block, inline.found_block)
+        self.assertGreater(prepared.payout_artifact_generation, 0)
+
+    def test_accepted_preview_patches_artifact_across_normal_clear(self) -> None:
+        class CountingBalanceLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prior_balance_reads = 0
+                self.database_balances = [
+                    {
+                        "recipient_id": "stale-miner",
+                        "order_key": "stale-miner",
+                        "p2mr_program_hex": "22" * 32,
+                        "balance_sats": 1,
+                    }
+                ]
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.prior_balance_reads += 1
+                return [dict(balance) for balance in self.database_balances]
+
+        ledger = CountingBalanceLedger()
+        server, rpc = coordinator(ledger=ledger)
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        parent_hash = str(rpc.template["previousblockhash"])
+        parent_height = int(rpc.template["height"]) - 1
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=parent_height,
+        )
+        server._publish_accepted_block_payout_preview(parent_hash, preview)
+
+        artifact = server._payout_ledger_artifact
+        self.assertIsNotNone(artifact)
+        assert artifact is not None
+        self.assertEqual(artifact.prior_balances, tuple(preview))
+        self.assertEqual(
+            artifact.payout_state_generation,
+            server._payout_state_generation,
+        )
+        self.assertGreater(artifact.generation, 0)
+
+        ledger.prior_balance_reads = 0
+        preview_bundle = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertEqual(preview_bundle.prior_balances, preview)
+        self.assertEqual(recorded["last_kwargs"]["prior_balances"], preview)  # type: ignore[index]
+        self.assertEqual(
+            preview_bundle.payout_artifact_generation,
+            artifact.generation,
+        )
+        self.assertEqual(ledger.prior_balance_reads, 0)
+
+        payout_generation = server._payout_state_generation
+        ledger.database_balances = [dict(balance) for balance in preview]
+        server._clear_accepted_block_payout_preview(parent_hash)
+        self.assertEqual(server._payout_state_generation, payout_generation)
+        self.assertIs(server._payout_ledger_artifact, artifact)
+        self.assertNotIn(parent_hash, server._accepted_block_payout_previews)
+        self.assertNotIn(
+            parent_hash,
+            server._invalidated_accepted_block_payout_previews,
+        )
+        with server._job_cache_lock:
+            server._job_bundle_cache.clear()
+
+        post_clear_bundle = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertEqual(post_clear_bundle.prior_balances, preview)
+        self.assertEqual(recorded["last_kwargs"]["prior_balances"], preview)  # type: ignore[index]
+        self.assertEqual(
+            post_clear_bundle.payout_artifact_generation,
+            artifact.generation,
+        )
+        self.assertEqual(ledger.prior_balance_reads, 0)
+
+    def test_valid_precomputed_artifact_skips_tip_path_ledger_snapshot(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        assert snapshot.template_artifacts is not None
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            snapshot.template_artifacts.network_difficulty,
+        )
+        server.ledger.snapshot_calls = 0
+
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
+
+        self.assertFalse(bundle.collection_only)
+        self.assertGreater(bundle.payout_artifact_generation, 0)
+        self.assertEqual(server.ledger.snapshot_calls, 0)
+
+    def test_new_tip_cancels_blocked_old_bundle_without_publication(self) -> None:
+        old_tip = "11" * 32
+        new_tip = "22" * 32
+        server, rpc = coordinator(template=base_template(prevhash=old_tip))
+        recorded = install_fake_bundle_builder(server)
+        original_builder = server.build_audit_bundle
+        build_started = threading.Event()
+
+        def cancelable_builder(**kwargs: object) -> dict[str, object]:
+            control = server._job_build_phase_local.bundle_build_control
+            build_started.set()
+            self.assertTrue(control.cancel_event.wait(2))
+            return original_builder(**kwargs)
+
+        server.build_audit_bundle = cancelable_builder  # type: ignore[method-assign]
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.observe_tip_first_seen(old_tip, observation_sequence=1)
+        errors: list[BaseException] = []
+        thread = threading.Thread(
+            target=lambda: self._capture_error(
+                errors,
+                lambda: server.shared_job_bundle(artifacts, mode="ready"),
+            )
+        )
+        thread.start()
+        self.assertTrue(build_started.wait(2))
+
+        server.observe_tip_first_seen(new_tip, observation_sequence=2)
+        thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+        self.assertEqual(recorded["calls"], 1)
+        self.assertEqual(server._active_job_bundle_builds, {})
+        self.assertEqual(server.tip_refresh_build_inflight, 0)
+        self.assertFalse(any(
+            entry.template_fingerprint == artifacts.fingerprint
+            for entry in server._job_bundle_cache.values()
+        ))
+        self.assertEqual(server.tip_refresh_superseded_results, 1)
+
+    def test_builder_crash_and_timeout_fail_closed_then_recover(self) -> None:
+        server, _rpc = coordinator()
+        server.prism_ctv_settlement_config = lambda **_kwargs: None  # type: ignore[method-assign]
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        build_kwargs = {
+            "shares": [],
+            "found_block": {
+                "block_height": 10,
+                "coinbase_value_sats": 50_00000000,
+                "network_difficulty": 1,
+                "anchor_job_issued_at_ms": 1_700_000_000_000,
+            },
+            "prior_balances": [],
+            "coinbase_script_sig_suffix_hex": "00",
+        }
+
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[sys.executable, "-c", "raise SystemExit(7)"],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                server.build_audit_bundle(**build_kwargs)
+
+        server.bundle_build_timeout_seconds = 0.01
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[
+                sys.executable,
+                "-c",
+                "import time; time.sleep(5)",
+            ],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                server.build_audit_bundle(**build_kwargs)
+
+        server.bundle_build_timeout_seconds = 1.0
+        recovery_script = (
+            "import json,sys; json.load(sys.stdin); "
+            "json.dump({'recovered': True}, sys.stdout)"
+        )
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[sys.executable, "-c", recovery_script],
+        ):
+            recovered = server.build_audit_bundle(**build_kwargs)
+        self.assertEqual(recovered, {"recovered": True})
+
+    def test_audit_builder_child_does_not_inherit_open_socket(self) -> None:
+        server, _rpc = coordinator()
+        server.prism_ctv_settlement_config = lambda **_kwargs: None  # type: ignore[method-assign]
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        probe_script = (
+            "import json,os,sys; json.load(sys.stdin); fd=int(sys.argv[1]); "
+            "inherited=True; "
+            "\ntry: os.fstat(fd)"
+            "\nexcept OSError: inherited=False"
+            "\njson.dump({'inherited_socket': inherited}, sys.stdout)"
+        )
+        with socket.socket() as parent_socket:
+            parent_socket.set_inheritable(True)
+            with patch(
+                "lab.prism.prism_coordinator.prism_tool_command",
+                return_value=[
+                    sys.executable,
+                    "-c",
+                    probe_script,
+                    str(parent_socket.fileno()),
+                ],
+            ):
+                result = server.build_audit_bundle(
+                    shares=[],
+                    found_block={
+                        "block_height": 10,
+                        "coinbase_value_sats": 50_00000000,
+                        "network_difficulty": 1,
+                        "anchor_job_issued_at_ms": 1_700_000_000_000,
+                    },
+                    prior_balances=[],
+                    coinbase_script_sig_suffix_hex="00",
+                )
+        self.assertEqual(result, {"inherited_socket": False})
+
+    def test_repeated_superseded_builds_leave_state_bounded(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        original_builder = server.build_audit_bundle
+        starts: queue.Queue[None] = queue.Queue()
+
+        def cancelable_builder(**kwargs: object) -> dict[str, object]:
+            control = server._job_build_phase_local.bundle_build_control
+            starts.put(None)
+            self.assertTrue(control.cancel_event.wait(2))
+            return original_builder(**kwargs)
+
+        server.build_audit_bundle = cancelable_builder  # type: ignore[method-assign]
+        current_tip = str(rpc.tip)
+        server.observe_tip_first_seen(current_tip, observation_sequence=1)
+        errors: list[BaseException] = []
+        for index in range(8):
+            rpc.template = base_template(height=10 + index, prevhash=current_tip)
+            artifacts = server.store_template_artifacts(dict(rpc.template))
+            assert artifacts is not None
+            thread = threading.Thread(
+                target=lambda current=artifacts: self._capture_error(
+                    errors,
+                    lambda: server.shared_job_bundle(current, mode="ready"),
+                )
+            )
+            thread.start()
+            starts.get(timeout=2)
+            current_tip = f"{index + 2:064x}"
+            rpc.tip = current_tip
+            server.observe_tip_first_seen(
+                current_tip,
+                observation_sequence=index + 2,
+            )
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(len(errors), 8)
+        self.assertTrue(all(isinstance(exc, TemplateRefreshBlocked) for exc in errors))
+        self.assertEqual(server._active_job_bundle_builds, {})
+        self.assertEqual(server.tip_refresh_build_inflight, 0)
+        self.assertEqual(server.tip_refresh_build_queue_depth, 0)
+        self.assertLessEqual(
+            len(server._job_bundle_cache),
+            MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
+        )
+        self.assertEqual(server.tip_refresh_superseded_results, 8)
+
+    @staticmethod
+    def _capture_error(
+        errors: list[BaseException],
+        operation: object,
+    ) -> None:
+        try:
+            operation()  # type: ignore[operator]
+        except BaseException as exc:  # noqa: BLE001 - test thread handoff
+            errors.append(exc)
 
     def test_ready_tip_refresh_builds_once_and_stamps_every_client(self) -> None:
         server, _ = coordinator()
@@ -2457,6 +2829,8 @@ class JobBuildMetricsTests(unittest.TestCase):
         server.build_job_for_client(client(1), clean_jobs=True)
         server.build_job_for_client(client(2), clean_jobs=True)
         server.observe_job_build_elapsed(0.3, {"bundle": 0.2, "stamp": 0.01})
+        server._observe_tip_refresh_build_phase("payout_state_derivation", 0.25)
+        server._record_tip_refresh_ipc_bytes("input", 123)
 
         metrics = server.metrics_payload()
 
@@ -2466,6 +2840,16 @@ class JobBuildMetricsTests(unittest.TestCase):
         self.assertIn('qbit_prism_job_cache_hits_total{cache="bundle"} 1', metrics)
         self.assertIn('qbit_prism_job_cache_misses_total{cache="bundle"} 1', metrics)
         self.assertIn('qbit_prism_job_build_phase_seconds_total{phase="bundle"} 0.2', metrics)
+        self.assertIn(
+            'qbit_prism_tip_refresh_bundle_phase_seconds_count{phase="payout_state_derivation"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_tip_refresh_builder_ipc_bytes_total{direction="input"} 123',
+            metrics,
+        )
+        self.assertIn("qbit_prism_tip_refresh_bundle_queue_depth 0", metrics)
+        self.assertIn("qbit_prism_tip_refresh_bundle_inflight 0", metrics)
         self.assertIn("qbit_prism_connected_clients 0", metrics)
 
     def test_metrics_split_payout_preparation_publication_and_delivery(self) -> None:

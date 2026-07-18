@@ -1,11 +1,75 @@
 use qbit_pool_builder::{
-    build_manifest, build_signed_manifest, verify_ed25519_message, verify_signed_manifest,
+    build_manifest, canonical_manifest_bytes, verify_ed25519_message, verify_signed_manifest,
     BuilderError, CoinbaseBuildRequest, ManifestSignature, ManifestSigningKey, PayoutManifest,
     SignedPayoutManifest, WeightedEntitlement,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::Instant;
+
+pub const AUDIT_BUILD_PAYOUT_DERIVATION_PHASE: &str = "payout_state_derivation";
+pub const AUDIT_BUILD_CTV_MANIFEST_PHASE: &str = "ctv_manifest_construction";
+pub const AUDIT_BUILD_COINBASE_PHASE: &str = "coinbase_bundle_construction";
+pub const AUDIT_BUILD_SIGNING_PHASE: &str = "signing_verification";
+
+thread_local! {
+    static AUDIT_BUILD_PHASE_TIMINGS: RefCell<Option<BTreeMap<&'static str, f64>>> =
+        const { RefCell::new(None) };
+}
+
+/// Profile one synchronous audit build without changing its deterministic
+/// inputs or output. The builder CLI uses this to export bounded phase metrics;
+/// ordinary library callers pay only the phase timer checks.
+pub fn profile_audit_build<T>(build: impl FnOnce() -> T) -> (T, BTreeMap<&'static str, f64>) {
+    AUDIT_BUILD_PHASE_TIMINGS.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "nested audit build profiling is unsupported"
+        );
+        *slot.borrow_mut() = Some(BTreeMap::new());
+    });
+    let result = build();
+    let timings = AUDIT_BUILD_PHASE_TIMINGS.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("audit build profiling state disappeared")
+    });
+    (result, timings)
+}
+
+fn profile_audit_build_phase<T>(phase: &'static str, build: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = build();
+    let elapsed = started.elapsed().as_secs_f64();
+    AUDIT_BUILD_PHASE_TIMINGS.with(|slot| {
+        if let Some(timings) = slot.borrow_mut().as_mut() {
+            *timings.entry(phase).or_default() += elapsed;
+        }
+    });
+    result
+}
+
+fn build_profiled_signed_manifest(
+    request: CoinbaseBuildRequest,
+    signing_key: &ManifestSigningKey,
+) -> Result<SignedPayoutManifest, PrismError> {
+    let manifest =
+        profile_audit_build_phase(AUDIT_BUILD_COINBASE_PHASE, || build_manifest(request))?;
+    profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
+        let canonical_manifest = canonical_manifest_bytes(&manifest)?;
+        Ok::<SignedPayoutManifest, BuilderError>(SignedPayoutManifest {
+            signature: ManifestSignature {
+                algorithm: "ed25519".to_string(),
+                public_key_hex: signing_key.public_key_hex(),
+                signature_hex: signing_key.sign_message_hex(&canonical_manifest),
+            },
+            manifest,
+        })
+    })
+    .map_err(PrismError::from)
+}
 
 mod ctv;
 pub use ctv::*;
@@ -403,19 +467,23 @@ pub fn compute_prism_window(
     if found_block.network_difficulty == 0 {
         return Err(PrismError::ZeroNetworkDifficulty);
     }
+    let mut seen_share_ids = HashSet::with_capacity(shares.len());
+    let mut eligible = Vec::with_capacity(shares.len());
     for share in shares {
         if share.share_difficulty == 0 {
             return Err(PrismError::ZeroShareDifficulty {
                 share_seq: share.share_seq,
             });
         }
-    }
-    let mut seen_share_ids = BTreeSet::new();
-    for share in shares {
         if !seen_share_ids.insert(share.share_id.as_str()) {
             return Err(PrismError::DuplicateShareId {
                 share_id: share.share_id.clone(),
             });
+        }
+        if share.job_issued_at_ms <= found_block.anchor_job_issued_at_ms
+            && share.accepted_at_ms <= found_block.anchor_job_issued_at_ms
+        {
+            eligible.push(share);
         }
     }
 
@@ -423,14 +491,20 @@ pub fn compute_prism_window(
         .network_difficulty
         .checked_mul(PRISM_WINDOW_MULTIPLIER)
         .ok_or(PrismError::WindowOverflow)?;
-    let mut eligible = shares
-        .iter()
-        .filter(|share| {
-            share.job_issued_at_ms <= found_block.anchor_job_issued_at_ms
-                && share.accepted_at_ms <= found_block.anchor_job_issued_at_ms
-        })
-        .collect::<Vec<_>>();
-    eligible.sort_by(|left, right| right.share_seq.cmp(&left.share_seq));
+    // Production ledger snapshots are emitted in strictly ascending share
+    // sequence. Reverse that common case in O(n), while retaining the stable
+    // sort (and therefore byte-for-byte behavior) for arbitrary API callers.
+    if eligible
+        .windows(2)
+        .all(|pair| pair[0].share_seq < pair[1].share_seq)
+    {
+        eligible.reverse();
+    } else if !eligible
+        .windows(2)
+        .all(|pair| pair[0].share_seq > pair[1].share_seq)
+    {
+        eligible.sort_by(|left, right| right.share_seq.cmp(&left.share_seq));
+    }
 
     let mut remaining = requested_window_weight;
     let mut counted_shares = Vec::new();
@@ -1144,16 +1218,25 @@ pub fn build_audit_bundle_with_coinbase_options(
     {
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
-    let reward_manifest = build_prism_reward_manifest(&shares, &found_block)?;
-    let ledger_window_attestation =
-        build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)?;
+    let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
+        build_prism_reward_manifest(&shares, &found_block)
+    })?;
+    let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
+        build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
+    })?;
     let payout_policy_manifest =
-        apply_payout_policy(&reward_manifest, &prior_balances, &payout_policy)?;
-    let audit_commitment_leaves_hex = vec![prism_audit_commitment_leaf_hex(
-        &reward_manifest,
-        &payout_policy_manifest,
-    )?];
-    let audit_commitment_root_hex = audit_commitment_root_hex(&audit_commitment_leaves_hex)?;
+        profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
+            apply_payout_policy(&reward_manifest, &prior_balances, &payout_policy)
+        })?;
+    let (audit_commitment_leaves_hex, audit_commitment_root_hex) =
+        profile_audit_build_phase(AUDIT_BUILD_COINBASE_PHASE, || {
+            let leaves = vec![prism_audit_commitment_leaf_hex(
+                &reward_manifest,
+                &payout_policy_manifest,
+            )?];
+            let root = audit_commitment_root_hex(&leaves)?;
+            Ok::<_, PrismError>((leaves, root))
+        })?;
     let coinbase_request = CoinbaseBuildRequest {
         block_height: reward_manifest.block_height,
         coinbase_value_sats: reward_manifest.coinbase_value_sats,
@@ -1162,7 +1245,8 @@ pub fn build_audit_bundle_with_coinbase_options(
         witness_merkle_leaves_hex: witness_merkle_leaves_hex.clone(),
         coinbase_script_sig_suffix_hex: coinbase_script_sig_suffix_hex.clone(),
     };
-    let signed_coinbase_manifest = build_signed_manifest(coinbase_request, coinbase_signing_key)?;
+    let signed_coinbase_manifest =
+        build_profiled_signed_manifest(coinbase_request, coinbase_signing_key)?;
 
     Ok(AuditBundle {
         schema: audit_bundle_schema_for_shares(&shares).to_string(),
@@ -1203,87 +1287,105 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
     {
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
-    let reward_manifest = build_prism_reward_manifest(&shares, &found_block)?;
-    let ledger_window_attestation =
-        build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)?;
-    let mut payout_policy_manifest =
-        apply_payout_policy(&reward_manifest, &prior_balances, &payout_policy)?;
-    let settlement_recipients =
-        settlement_recipients_from_entitlements(&payout_policy_manifest.onchain_entitlements)?;
-    let settlement_mode_decision = select_settlement_mode(
-        &settlement_recipients,
-        direct_floor_sats,
-        &settlement_config,
-    )?;
-    let fanout_fee_recipients = if let Some(fee_policy) = ctv_fanout_fee_policy.as_ref() {
-        apply_ctv_fanout_fee_accounting(
-            &mut payout_policy_manifest,
-            &settlement_mode_decision,
-            fee_policy,
-        )?
-    } else {
-        BTreeMap::new()
-    };
-    let reward_manifest_sha256_hex =
-        sha256_hex(&canonical_reward_manifest_bytes(&reward_manifest)?);
-    let payout_policy_manifest_sha256_hex = sha256_hex(&canonical_payout_policy_manifest_bytes(
-        &payout_policy_manifest,
-    )?);
+    let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
+        build_prism_reward_manifest(&shares, &found_block)
+    })?;
+    let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
+        build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
+    })?;
+    let (payout_policy_manifest, settlement_mode_decision, fanout_fee_recipients) =
+        profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
+            let mut payout_manifest =
+                apply_payout_policy(&reward_manifest, &prior_balances, &payout_policy)?;
+            let settlement_recipients =
+                settlement_recipients_from_entitlements(&payout_manifest.onchain_entitlements)?;
+            let settlement_decision = select_settlement_mode(
+                &settlement_recipients,
+                direct_floor_sats,
+                &settlement_config,
+            )?;
+            let fee_recipients = if let Some(fee_policy) = ctv_fanout_fee_policy.as_ref() {
+                apply_ctv_fanout_fee_accounting(
+                    &mut payout_manifest,
+                    &settlement_decision,
+                    fee_policy,
+                )?
+            } else {
+                BTreeMap::new()
+            };
+            Ok::<_, PrismError>((payout_manifest, settlement_decision, fee_recipients))
+        })?;
+    let (reward_manifest_sha256_hex, payout_policy_manifest_sha256_hex) =
+        profile_audit_build_phase(AUDIT_BUILD_CTV_MANIFEST_PHASE, || {
+            Ok::<_, PrismError>((
+                sha256_hex(&canonical_reward_manifest_bytes(&reward_manifest)?),
+                sha256_hex(&canonical_payout_policy_manifest_bytes(
+                    &payout_policy_manifest,
+                )?),
+            ))
+        })?;
 
-    let mut prepared_fanouts = Vec::new();
-    for chunk in &settlement_mode_decision.fanout_chunks {
-        let chunk_index =
-            u32::try_from(chunk.chunk_index).map_err(|_| PrismError::PayoutPolicyOverflow)?;
-        let chunk_count = u32::try_from(settlement_mode_decision.fanout_chunk_count)
-            .map_err(|_| PrismError::PayoutPolicyOverflow)?;
-        prepared_fanouts.push(prepare_ctv_fanout_precommitment(
-            CtvFanoutPrecommitmentInput {
-                block_height: reward_manifest.block_height,
-                chunk_index,
-                chunk_count,
-                coinbase_value_sats: reward_manifest.coinbase_value_sats,
-                settlement_mode: settlement_mode_decision.mode.clone(),
-                reward_manifest_sha256_hex: reward_manifest_sha256_hex.clone(),
-                payout_policy_manifest_sha256_hex: payout_policy_manifest_sha256_hex.clone(),
-                payouts: chunk
-                    .recipients
+    let prepared_fanouts = profile_audit_build_phase(AUDIT_BUILD_CTV_MANIFEST_PHASE, || {
+        let mut prepared = Vec::new();
+        for chunk in &settlement_mode_decision.fanout_chunks {
+            let chunk_index =
+                u32::try_from(chunk.chunk_index).map_err(|_| PrismError::PayoutPolicyOverflow)?;
+            let chunk_count = u32::try_from(settlement_mode_decision.fanout_chunk_count)
+                .map_err(|_| PrismError::PayoutPolicyOverflow)?;
+            prepared.push(prepare_ctv_fanout_precommitment(
+                CtvFanoutPrecommitmentInput {
+                    block_height: reward_manifest.block_height,
+                    chunk_index,
+                    chunk_count,
+                    coinbase_value_sats: reward_manifest.coinbase_value_sats,
+                    settlement_mode: settlement_mode_decision.mode.clone(),
+                    reward_manifest_sha256_hex: reward_manifest_sha256_hex.clone(),
+                    payout_policy_manifest_sha256_hex: payout_policy_manifest_sha256_hex.clone(),
+                    payouts: chunk
+                        .recipients
+                        .iter()
+                        .map(|recipient| {
+                            let fee_recipient = fanout_fee_recipients.get(&account_key(
+                                &recipient.recipient_id,
+                                &recipient.order_key,
+                                &recipient.p2mr_program_hex,
+                            ));
+                            CtvFanoutPayout {
+                                recipient_id: recipient.recipient_id.clone(),
+                                order_key: recipient.order_key.clone(),
+                                p2mr_program_hex: recipient.p2mr_program_hex.clone(),
+                                gross_amount_sats: fee_recipient
+                                    .map(|recipient| recipient.gross_amount_sats)
+                                    .unwrap_or(0),
+                                fee_sats: fee_recipient
+                                    .map(|recipient| recipient.fee_sats)
+                                    .unwrap_or(0),
+                                amount_sats: fee_recipient
+                                    .map(|recipient| recipient.net_amount_sats)
+                                    .unwrap_or(recipient.amount_sats),
+                            }
+                        })
+                        .collect(),
+                },
+            )?);
+        }
+        Ok::<_, PrismError>(prepared)
+    })?;
+
+    let (audit_commitment_leaves_hex, audit_commitment_root_hex) =
+        profile_audit_build_phase(AUDIT_BUILD_COINBASE_PHASE, || {
+            let mut leaves = vec![prism_audit_commitment_leaf_hex(
+                &reward_manifest,
+                &payout_policy_manifest,
+            )?];
+            leaves.extend(
+                prepared_fanouts
                     .iter()
-                    .map(|recipient| {
-                        let fee_recipient = fanout_fee_recipients.get(&account_key(
-                            &recipient.recipient_id,
-                            &recipient.order_key,
-                            &recipient.p2mr_program_hex,
-                        ));
-                        CtvFanoutPayout {
-                            recipient_id: recipient.recipient_id.clone(),
-                            order_key: recipient.order_key.clone(),
-                            p2mr_program_hex: recipient.p2mr_program_hex.clone(),
-                            gross_amount_sats: fee_recipient
-                                .map(|recipient| recipient.gross_amount_sats)
-                                .unwrap_or(0),
-                            fee_sats: fee_recipient
-                                .map(|recipient| recipient.fee_sats)
-                                .unwrap_or(0),
-                            amount_sats: fee_recipient
-                                .map(|recipient| recipient.net_amount_sats)
-                                .unwrap_or(recipient.amount_sats),
-                        }
-                    })
-                    .collect(),
-            },
-        )?);
-    }
-
-    let mut audit_commitment_leaves_hex = vec![prism_audit_commitment_leaf_hex(
-        &reward_manifest,
-        &payout_policy_manifest,
-    )?];
-    audit_commitment_leaves_hex.extend(
-        prepared_fanouts
-            .iter()
-            .map(|fanout| fanout.commitment_witness_leaf_hex.clone()),
-    );
-    let audit_commitment_root_hex = audit_commitment_root_hex(&audit_commitment_leaves_hex)?;
+                    .map(|fanout| fanout.commitment_witness_leaf_hex.clone()),
+            );
+            let root = audit_commitment_root_hex(&leaves)?;
+            Ok::<_, PrismError>((leaves, root))
+        })?;
 
     let coinbase_request = CoinbaseBuildRequest {
         block_height: reward_manifest.block_height,
@@ -1296,28 +1398,34 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
         witness_merkle_leaves_hex: witness_merkle_leaves_hex.clone(),
         coinbase_script_sig_suffix_hex: coinbase_script_sig_suffix_hex.clone(),
     };
-    let signed_coinbase_manifest = build_signed_manifest(coinbase_request, coinbase_signing_key)?;
+    let signed_coinbase_manifest =
+        build_profiled_signed_manifest(coinbase_request, coinbase_signing_key)?;
     let ctv_fanout_manifest_set = if prepared_fanouts.is_empty() {
         None
     } else {
-        let manifests = prepared_fanouts
-            .into_iter()
-            .map(|prepared| {
-                let parent_vout = find_coinbase_output_vout(
-                    &signed_coinbase_manifest.manifest,
-                    &prepared.covenant_recipient_id,
-                    &prepared.covenant_order_key,
-                    &prepared.covenant_p2mr_program_hex,
-                    prepared.covenant_output_value_sats,
-                )?;
-                build_ctv_fanout_manifest_from_precommitment(
-                    prepared.precommitment,
-                    signed_coinbase_manifest.manifest.coinbase_tx_hex.clone(),
-                    parent_vout,
-                )
-            })
-            .collect::<Result<Vec<_>, PrismError>>()?;
-        Some(build_ctv_fanout_manifest_set(manifests)?)
+        Some(profile_audit_build_phase(
+            AUDIT_BUILD_CTV_MANIFEST_PHASE,
+            || {
+                let manifests = prepared_fanouts
+                    .into_iter()
+                    .map(|prepared| {
+                        let parent_vout = find_coinbase_output_vout(
+                            &signed_coinbase_manifest.manifest,
+                            &prepared.covenant_recipient_id,
+                            &prepared.covenant_order_key,
+                            &prepared.covenant_p2mr_program_hex,
+                            prepared.covenant_output_value_sats,
+                        )?;
+                        build_ctv_fanout_manifest_from_precommitment(
+                            prepared.precommitment,
+                            signed_coinbase_manifest.manifest.coinbase_tx_hex.clone(),
+                            parent_vout,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, PrismError>>()?;
+                build_ctv_fanout_manifest_set(manifests)
+            },
+        )?)
     };
 
     Ok(AuditBundle {

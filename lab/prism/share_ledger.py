@@ -1890,40 +1890,75 @@ WITH rows AS (
       AND accepted_at <= {anchor}
 )"""
         else:
-            # Only the most-recent shares whose cumulative difficulty covers
-            # window_weight -- a superset of the reward window the audit bundle
-            # selects. compute_prism_window re-sorts by share_seq DESC and stops
-            # at 8x network difficulty, dropping anything older, so a superset
-            # yields the identical counted window and digest. Bounding the walk
-            # here keeps the job-build ledger phase O(window), not O(ledger
-            # history), and stops it growing without bound as the ledger grows.
+            # Find the bounded reward window in indexed pages, then apply one
+            # exact cumulative cutoff over only those pages. The previous
+            # recursive query fetched one row per recursive step; at production
+            # window sizes that meant 100k+ lateral index probes. Paging keeps
+            # the scan O(window), not O(history), while returning the identical
+            # final crossing row and therefore byte-identical audit input.
             rows_cte = f"""
-WITH RECURSIVE eligible AS (
-    (
-        SELECT ledger.*, ledger.share_difficulty::numeric AS cumulative_difficulty
-        FROM qbit_share_ledger ledger
-        WHERE ledger.accepted
-          AND ledger.job_issued_at <= {anchor}
-          AND ledger.accepted_at <= {anchor}
-        ORDER BY ledger.share_seq DESC
-        LIMIT 1
-    )
+WITH RECURSIVE pages AS (
+    SELECT page.min_share_seq,
+           page.page_weight,
+           page.page_weight AS cumulative_weight
+    FROM LATERAL (
+        SELECT min(page_rows.share_seq) AS min_share_seq,
+               COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+        FROM (
+            SELECT ledger.share_seq, ledger.share_difficulty
+            FROM qbit_share_ledger ledger
+            WHERE ledger.accepted
+              AND ledger.job_issued_at <= {anchor}
+              AND ledger.accepted_at <= {anchor}
+            ORDER BY ledger.share_seq DESC
+            LIMIT 4096
+        ) page_rows
+    ) page
     UNION ALL
-    SELECT next_ledger.*, eligible.cumulative_difficulty + next_ledger.share_difficulty
-    FROM eligible
+    SELECT page.min_share_seq,
+           page.page_weight,
+           pages.cumulative_weight + page.page_weight
+    FROM pages
     CROSS JOIN LATERAL (
-        SELECT ledger.*
-        FROM qbit_share_ledger ledger
-        WHERE ledger.accepted
-          AND ledger.job_issued_at <= {anchor}
-          AND ledger.accepted_at <= {anchor}
-          AND ledger.share_seq < eligible.share_seq
-        ORDER BY ledger.share_seq DESC
-        LIMIT 1
-    ) next_ledger
-    WHERE eligible.cumulative_difficulty < {int(window_weight)}::numeric
+        SELECT min(page_rows.share_seq) AS min_share_seq,
+               COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+        FROM (
+            SELECT ledger.share_seq, ledger.share_difficulty
+            FROM qbit_share_ledger ledger
+            WHERE ledger.accepted
+              AND ledger.job_issued_at <= {anchor}
+              AND ledger.accepted_at <= {anchor}
+              AND ledger.share_seq < pages.min_share_seq
+            ORDER BY ledger.share_seq DESC
+            LIMIT 4096
+        ) page_rows
+    ) page
+    WHERE pages.cumulative_weight < {int(window_weight)}::numeric
+      AND pages.min_share_seq IS NOT NULL
 ),
-rows AS (SELECT * FROM eligible)"""
+page_cutoff AS (
+    SELECT min(min_share_seq) AS min_share_seq
+    FROM pages
+    WHERE min_share_seq IS NOT NULL
+),
+ranked AS (
+    SELECT ledger.*,
+           sum(ledger.share_difficulty) OVER (
+               ORDER BY ledger.share_seq DESC
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+           )::numeric AS cumulative_difficulty
+    FROM qbit_share_ledger ledger
+    CROSS JOIN page_cutoff
+    WHERE ledger.accepted
+      AND ledger.job_issued_at <= {anchor}
+      AND ledger.accepted_at <= {anchor}
+      AND ledger.share_seq >= page_cutoff.min_share_seq
+),
+rows AS (
+    SELECT *
+    FROM ranked
+    WHERE cumulative_difficulty - share_difficulty < {int(window_weight)}::numeric
+)"""
         sql = rows_cte + """
 SELECT COALESCE(json_agg(json_build_object(
     'share_seq', share_seq,

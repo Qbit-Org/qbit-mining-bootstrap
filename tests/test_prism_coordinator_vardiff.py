@@ -91,7 +91,8 @@ def fake_audit_bundle_popen(
             self.stdout = kwargs["stdout"]
             self.stderr = kwargs["stderr"]
 
-        def wait(self) -> int:
+        def wait(self, timeout: float | None = None) -> int:
+            captured["timeout"] = timeout
             captured["payload"] = json.loads("".join(self.stdin.parts))
             self.stdout.write(output_text)
             self.stderr.write(stderr_text)

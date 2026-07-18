@@ -987,7 +987,7 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(snapshots, [[]])
-        self.assertIn("WITH RECURSIVE eligible", ledger.queries[0])
+        self.assertIn("WITH RECURSIVE pages", ledger.queries[0])
 
     def test_postgres_read_concurrency_must_be_positive(self) -> None:
         with self.assertRaisesRegex(ValueError, "read_concurrency"):
