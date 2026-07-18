@@ -1305,6 +1305,9 @@ class ClientState:
     # received replacement work, however long the refresh pass took to reach
     # it. See stale_grace_deadline_open.
     tip_work_delivered: tuple[str, float] | None = None
+    # Protected by the coordinator lock. Disconnect retirement sets this before
+    # waiting for any per-client job update so queued work can reject the client.
+    closing: bool = False
     # Serializes every job build/register/send transition for this connection.
     # The coordinator lock may be acquired while this lock is held, never in
     # the reverse order. RLock permits authorize/retarget helpers to call the
@@ -4494,6 +4497,13 @@ class PrismCoordinator:
         client_lock_attempted = False
         try:
             while True:
+                with self.lock:
+                    if (
+                        client not in self.clients
+                        or client.connection_id != expected_connection_id
+                        or getattr(client, "closing", False)
+                    ):
+                        return RefreshResult("disconnected")
                 if self._prepared_tip_refresh_obsolete(
                     validation_token,
                     bundle,
@@ -6445,7 +6455,12 @@ class PrismCoordinator:
             return finish(trusted=attempt_trusted)
 
     def client_can_receive_jobs(self, client: ClientState) -> bool:
-        return client.subscribed and client.authorized and client.worker is not None
+        return (
+            not getattr(client, "closing", False)
+            and client.subscribed
+            and client.authorized
+            and client.worker is not None
+        )
 
     def pool_readiness_latched(self) -> bool:
         """Latch, once, the transition past min_ready_miners.
@@ -6603,19 +6618,33 @@ class PrismCoordinator:
                 self.disconnect_client(client)
 
     def disconnect_client(self, client: ClientState) -> None:
-        with client.job_update_lock:
-            with self.lock:
-                self.clients.discard(client)
-                for job_id in client.active_job_ids:
-                    self.jobs.pop(job_id, None)
-                client.active_job_ids.clear()
-                self._ensure_evicted_job_state()
-                for job_id in tuple(
-                    self.evicted_jobs_by_connection.get(client.connection_id, ())
-                ):
-                    self._remove_evicted_job_locked(job_id)
+        # Retire admission and fanout eligibility without waiting behind job
+        # delivery. Only the first caller owns socket close and final cleanup.
+        with self.lock:
+            if getattr(client, "closing", False):
+                return
+            client.closing = True
+            self.clients.discard(client)
+
+        # Do not take send_lock here: shutdown must interrupt an in-flight
+        # sendall as well as the handler's blocking reader.
+        try:
             client.close()
-        self._retain_current_collection_refresh_if_unrepresented()
+        finally:
+            # Every mixed lock path uses job_update_lock -> coordinator lock.
+            # Retirement above holds neither while this potentially waits.
+            with client.job_update_lock:
+                with self.lock:
+                    for job_id in tuple(client.active_job_ids):
+                        self.jobs.pop(job_id, None)
+                    client.active_job_ids.clear()
+                    client.active_job = None
+                    self._ensure_evicted_job_state()
+                    for job_id in tuple(
+                        self.evicted_jobs_by_connection.get(client.connection_id, ())
+                    ):
+                        self._remove_evicted_job_locked(job_id)
+            self._retain_current_collection_refresh_if_unrepresented()
 
     def handle_request(self, client: ClientState, request: dict[str, object]) -> None:
         method = request.get("method")
@@ -7032,6 +7061,8 @@ class PrismCoordinator:
                     )
                 return False
             with self.lock:
+                if getattr(client, "closing", False):
+                    return False
                 if guarded_refresh:
                     assert tip_refresh_snapshot is not None
                     assert tip_refresh_observation_sequence is not None
