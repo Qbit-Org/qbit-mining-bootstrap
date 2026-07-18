@@ -45,12 +45,14 @@ from lab.prism.prism_coordinator import (
     QbitTipTemplateSnapshot,
     StratumError,
     StratumListenerProfile,
+    JobBuildCancelled,
     TemplateRefreshBlocked,
     TemplateRefreshSuperseded,
     PrismCoordinator,
     WorkerIdentity,
     _FanoutCancellation,
     _PayoutStatePublicationBlocked,
+    _JobBuildCancellation,
     default_prism_coinbase_tag_hex,
     default_prism_username_fallback_address,
     load_prism_highdiff_listener,
@@ -2063,25 +2065,117 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.ledger_attestation_signing_seed_hex = "43" * 32
 
         captured: dict[str, object] = {}
-        with tempfile.TemporaryDirectory() as tmp, patch(
-            "lab.prism.prism_coordinator.subprocess.Popen",
-            fake_audit_bundle_popen(
-                captured,
-                output_text='{"partial":',
-                returncode=9,
-                stderr_text="synthetic builder failure",
-            ),
-        ):
+        with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "candidate.audit.json"
-            with self.assertRaisesRegex(RuntimeError, "synthetic builder failure"):
-                server.build_audit_bundle(
+            with patch(
+                "lab.prism.prism_coordinator.subprocess.Popen",
+                fake_audit_bundle_popen(
+                    captured,
+                    output_text='{"partial":',
+                    returncode=9,
+                    stderr_text="synthetic builder failure",
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic builder failure"):
+                    server.build_audit_bundle(
+                        shares=[],
+                        found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                        prior_balances=[],
+                        coinbase_script_sig_suffix_hex="00",
+                        canonical_output_path=output_path,
+                    )
+            self.assertFalse(output_path.exists())
+            self.assertEqual(server.job_build_worker_counts["crashes"], 1)
+
+            with patch(
+                "lab.prism.prism_coordinator.subprocess.Popen",
+                fake_audit_bundle_popen(captured),
+            ):
+                recovered = server.build_audit_bundle(
                     shares=[],
                     found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
                     prior_balances=[],
                     coinbase_script_sig_suffix_hex="00",
-                    canonical_output_path=output_path,
                 )
-            self.assertFalse(output_path.exists())
+
+            self.assertEqual(recovered, {"ok": True})
+            self.assertEqual(server.job_build_worker_counts["restarts"], 1)
+
+    def test_build_audit_bundle_recovers_after_cancelled_worker_timeout(self) -> None:
+        server = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        cancellation = _JobBuildCancellation(timeout_seconds=60)
+        process_calls = 0
+
+        class FakeStdin:
+            def write(self, value: str) -> int:
+                return len(value)
+
+            def close(self) -> None:
+                return None
+
+        class HungThenHealthyPopen:
+            def __init__(self, _cmd: list[str], **kwargs: object) -> None:
+                nonlocal process_calls
+                process_calls += 1
+                self.healthy = process_calls == 2
+                self.stdin = FakeStdin()
+                self.stdout = kwargs["stdout"]
+                self.stderr = kwargs["stderr"]
+                self.returncode: int | None = None
+                self.output_written = False
+
+            def poll(self) -> int | None:
+                if self.returncode is not None:
+                    return self.returncode
+                if self.healthy:
+                    if not self.output_written:
+                        self.stdout.write('{"ok":true}')  # type: ignore[union-attr]
+                        self.output_written = True
+                    self.returncode = 0
+                    return 0
+                cancellation.cancel("timeout")
+                return None
+
+            def terminate(self) -> None:
+                self.returncode = -15
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                assert self.returncode is not None
+                return self.returncode
+
+        build_kwargs = {
+            "shares": [],
+            "found_block": {
+                "block_height": 10,
+                "coinbase_value_sats": 50_00000000,
+            },
+            "prior_balances": [],
+            "coinbase_script_sig_suffix_hex": "00",
+        }
+        with patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            HungThenHealthyPopen,
+        ):
+            with self.assertRaisesRegex(JobBuildCancelled, "timeout"):
+                server.build_audit_bundle(
+                    **build_kwargs,
+                    cancellation=cancellation,
+                )
+            recovered = server.build_audit_bundle(
+                **build_kwargs,
+                cancellation=_JobBuildCancellation(timeout_seconds=60),
+            )
+
+        self.assertEqual(recovered, {"ok": True})
+        self.assertEqual(process_calls, 2)
+        self.assertEqual(server.job_build_worker_counts["terminations"], 1)
+        self.assertEqual(server.job_build_worker_counts["restarts"], 1)
 
     def test_build_audit_bundle_does_not_unlink_preexisting_output_path(self) -> None:
         server = coordinator()
@@ -2479,7 +2573,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.jobs, {"old-job": old_context})
         self.assertEqual(state.active_job_ids, {"old-job"})
         self.assertEqual(sent, [])
-        self.assertIsNone(server.current_tip_first_seen)
+        # Tip observation is published before expensive template construction
+        # so obsolete builders can be cancelled immediately. The incoherent
+        # template still never enters the artifact cache or client job maps.
+        self.assertEqual(server.current_tip_first_seen, (old_tip, None))
         self.assertIsNone(server._template_artifacts)
 
     def test_slow_tip_poll_cannot_regress_newer_blockwait_observation(self) -> None:
