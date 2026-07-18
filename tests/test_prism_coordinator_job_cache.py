@@ -358,6 +358,58 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         self.assertIs(contexts[0].shares_json, contexts[1].shares_json)
 
+    def test_latest_wins_scheduler_preserves_synchronous_builder_output(self) -> None:
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        identity = worker()
+        cache_key = server._job_bundle_key(
+            artifacts,
+            mode="ready",
+            payout_state_generation=0,
+            worker=identity,
+        )
+
+        with patch("lab.prism.prism_coordinator.now_ms", return_value=1_700_000_001_000):
+            direct_request = server._new_job_build_request(
+                artifacts,
+                identity,
+                mode="ready",
+                payout_state_generation=0,
+                cache_key=cache_key,
+            )
+            direct = server.build_shared_job_bundle(
+                artifacts,
+                identity,
+                mode="ready",
+                payout_state_generation=0,
+                key=cache_key,
+                build_request=direct_request,
+            )
+            scheduled_request = server._new_job_build_request(
+                artifacts,
+                identity,
+                mode="ready",
+                payout_state_generation=0,
+                cache_key=cache_key,
+            )
+            scheduled = server._request_job_build(scheduled_request).result(5)
+
+        server.shutdown_job_build_executor()
+        self.assertEqual(recorded["calls"], 2)
+        self.assertEqual(scheduled.key, direct.key)
+        self.assertEqual(scheduled.template, direct.template)
+        self.assertEqual(scheduled.template_fingerprint, direct.template_fingerprint)
+        self.assertEqual(scheduled.coinbase_manifest, direct.coinbase_manifest)
+        self.assertEqual(scheduled.shares_json, direct.shares_json)
+        self.assertEqual(scheduled.prior_balances, direct.prior_balances)
+        self.assertEqual(scheduled.found_block, direct.found_block)
+        self.assertEqual(scheduled.collection_only, direct.collection_only)
+        self.assertEqual(scheduled.issued_at_ms, direct.issued_at_ms)
+        self.assertEqual(scheduled.base_job, direct.base_job)
+        self.assertEqual(scheduled.build_key, direct.build_key)
+
     def test_stamped_job_reassembles_coinbase_with_client_extranonce(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
