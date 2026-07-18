@@ -570,6 +570,42 @@ class TipPublicationBoundaryTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
+    def test_issuance_fetch_racing_ahead_of_detection_repins_published(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            # qbit advances, but neither blockpoll nor blockwait has observed
+            # it yet; a template-cache miss makes direct issuance the first
+            # reader to see the new parent.
+            next_tip = "cc" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            with server._job_cache_lock:
+                server._template_artifacts = None
+
+            artifacts = server.job_issuance_template_artifacts()
+            # The fetch is recorded as a detection and issuance stays on the
+            # still-authoritative published snapshot instead of starving on
+            # work the buildability gates would reject.
+            self.assertEqual(artifacts.previousblockhash, published_tip[0])
+            self.assertEqual(server.latest_detected_tip[0], next_tip)
+            context = server.build_job_for_client(state, clean_jobs=False)
+            self.assertEqual(
+                str(context.template["previousblockhash"]),
+                published_tip[0],
+            )
+        finally:
+            server.shutdown_tip_refresh_executor()
+
     def test_pinned_delivery_keeps_priority_when_payout_sources_detected_tip(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)

@@ -4390,7 +4390,27 @@ class PrismCoordinator:
             assert published_snapshot is not None
             assert published_snapshot.template_artifacts is not None
             return published_snapshot.template_artifacts
-        return self.current_template_artifacts()
+        artifacts = self.current_template_artifacts()
+        # The fetch above may itself be the first observation of a newer tip
+        # (a template-cache miss racing ahead of blockpoll/blockwait). The
+        # published tip still owns share classification, so serve its
+        # snapshot; the recorded detection has already armed the refresh.
+        with self.lock:
+            published = getattr(self, "current_tip_first_seen", None)
+            published_snapshot = getattr(self, "tip_template_snapshot", None)
+            repinned = bool(
+                published is not None
+                and artifacts.previousblockhash != published[0]
+                and published_snapshot is not None
+                and published_snapshot.bestblockhash == published[0]
+                and published_snapshot.template_artifacts is not None
+                and self._published_tip_authoritative_locked(time.monotonic())
+            )
+        if repinned:
+            assert published_snapshot is not None
+            assert published_snapshot.template_artifacts is not None
+            return published_snapshot.template_artifacts
+        return artifacts
 
     def current_template_artifacts(self) -> CachedTemplateArtifacts:
         """Return fresh template artifacts, fetching a template on cache miss."""
@@ -4430,6 +4450,11 @@ class PrismCoordinator:
             generation=generation,
         )
         if self._store_template_artifacts(artifacts):
+            # A direct fetch can be the first reader to see qbit advance.
+            # Record it as a detection like every other live-tip observation,
+            # or the buildability gates would treat the newer parent as
+            # unknown while pinned issuance still waits on blockpoll.
+            self.observe_tip_for_refresh(artifacts.previousblockhash)
             return artifacts
         # A later fetch completed first. Build from that current observation,
         # never from the stale response that lost the cache-write race.
@@ -4437,6 +4462,7 @@ class PrismCoordinator:
             current = self._template_artifacts
         if current is None:
             raise RuntimeError("newer template artifacts disappeared after cache race")
+        self.observe_tip_for_refresh(current.previousblockhash)
         return current
 
     @staticmethod
