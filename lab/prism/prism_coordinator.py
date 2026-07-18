@@ -1992,7 +1992,7 @@ class _PayoutStatePublicationBlocked(TemplateRefreshBlocked):
     """Job construction is waiting for a prepared payout publication."""
 
 
-class _JobBundleBuildSuperseded(TemplateRefreshBlocked):
+class _JobBundleBuildSuperseded(JobBuildSuperseded):
     """A newer tip or payout generation canceled this deterministic build."""
 
 
@@ -3411,17 +3411,116 @@ class PrismCoordinator:
                     self._active_job_bundle_builds.pop(control.key, None)
                 control.process = None
 
+    @staticmethod
+    def _collection_job_builds_are_independent(
+        first: _JobBuildRequest,
+        second: _JobBuildRequest,
+    ) -> bool:
+        """Distinct workers in one immutable collection cohort are peers."""
+
+        return (
+            first.mode == "collection"
+            and second.mode == "collection"
+            and first.key.collection_identity != second.key.collection_identity
+            and dataclass_replace(first.key, collection_identity=None)
+            == dataclass_replace(second.key, collection_identity=None)
+        )
+
+    @staticmethod
+    def _job_build_requests_can_share(
+        first: _JobBuildRequest,
+        second: _JobBuildRequest,
+    ) -> bool:
+        """Share exact builds plus ready work stable across clock-only refreshes."""
+
+        return first.equivalence_key == second.equivalence_key or (
+            first.mode == "ready"
+            and second.mode == "ready"
+            and first.cache_key == second.cache_key
+        )
+
+    @staticmethod
+    def _ready_job_build_precedes_collection(
+        first: _JobBuildRequest,
+        second: _JobBuildRequest,
+    ) -> bool:
+        """Live ready work cannot be displaced by a collection-mode retry."""
+
+        return (
+            first.mode == "ready"
+            and second.mode == "collection"
+            and not first.cancellation.is_set()
+        )
+
+    @staticmethod
+    def _defer_collection_job_build_locked(
+        *blockers: Future[CachedJobBundle],
+    ) -> Future[CachedJobBundle]:
+        """Wake a bounded collection waiter when any occupied slot exits."""
+
+        deferred: Future[CachedJobBundle] = Future()
+        wake_lock = threading.Lock()
+
+        def wake_for_retry(_completed: Future[CachedJobBundle]) -> None:
+            with wake_lock:
+                if not deferred.done():
+                    deferred.set_exception(
+                        JobBuildSuperseded(
+                            "collection build capacity became available; retrying"
+                        )
+                    )
+
+        for blocker in blockers:
+            blocker.add_done_callback(wake_for_retry)
+        return deferred
+
+    def _cancel_job_build_flight_locked(
+        self,
+        flight: _JobBuildFlight,
+        reason: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        if not flight.request.cancellation.cancel(reason):
+            return False
+        flight.request.superseded_monotonic = (
+            time.monotonic() if now is None else now
+        )
+        self.job_build_scheduler_counts["supersessions"] += 1
+        return True
+
     def _promote_pending_job_build_locked(self) -> None:
         pending = self._job_build_pending
         if pending is None:
             return
-        if self._job_build_active is not None:
-            if self._job_build_retiring is not None:
+        active = self._job_build_active
+        retiring = self._job_build_retiring
+        if active is not None:
+            if retiring is not None:
                 return
-            active = self._job_build_active
-            active.request.cancellation.cancel("superseded")
+            if self._ready_job_build_precedes_collection(
+                active.request,
+                pending,
+            ):
+                return
+            if not self._collection_job_builds_are_independent(
+                active.request,
+                pending,
+            ):
+                self._cancel_job_build_flight_locked(active, "superseded")
             self._job_build_retiring = active
             self._job_build_active = None
+        elif retiring is not None:
+            if self._ready_job_build_precedes_collection(
+                retiring.request,
+                pending,
+            ):
+                return
+            if not self._collection_job_builds_are_independent(
+                retiring.request,
+                pending,
+            ):
+                self._cancel_job_build_flight_locked(retiring, "superseded")
         self._job_build_pending = None
         flight = self._start_job_build_locked(pending)
         self._job_build_active = flight
@@ -3462,7 +3561,7 @@ class PrismCoordinator:
                 )
                 self.job_build_cancellation_seconds["sum"] += elapsed
                 self.job_build_cancellation_seconds["count"] += 1
-            coordination_cancelled = (
+            coordination_cancelled = isinstance(error, JobBuildSuperseded) or (
                 request.cancellation.is_set()
                 and request.cancellation.reason != "timeout"
             )
@@ -3492,21 +3591,65 @@ class PrismCoordinator:
         with self._job_build_scheduler_lock:
             self.job_build_scheduler_counts["requests"] += 1
             active = self._job_build_active
+            retiring = self._job_build_retiring
+            pending = self._job_build_pending
+            if request.mode == "collection":
+                possible_blockers = (
+                    pending,
+                    active.request if active is not None else None,
+                    retiring.request if retiring is not None else None,
+                )
+                for blocker in possible_blockers:
+                    if (
+                        blocker is not None
+                        and not blocker.cancellation.is_set()
+                        and self._ready_job_build_precedes_collection(
+                            blocker,
+                            request,
+                        )
+                    ):
+                        return self._defer_collection_job_build_locked(
+                            blocker.promise
+                        )
             if (
                 active is not None
                 and not active.request.cancellation.is_set()
-                and active.request.equivalence_key == request.equivalence_key
+                and self._job_build_requests_can_share(active.request, request)
             ):
                 return active.request.promise
-            pending = self._job_build_pending
+            if (
+                retiring is not None
+                and not retiring.request.cancellation.is_set()
+                and self._job_build_requests_can_share(retiring.request, request)
+            ):
+                return retiring.request.promise
             if (
                 pending is not None
                 and not pending.cancellation.is_set()
-                and pending.equivalence_key == request.equivalence_key
+                and self._job_build_requests_can_share(pending, request)
             ):
                 return pending.promise
             if active is None:
                 if pending is not None:
+                    if self._collection_job_builds_are_independent(
+                        pending,
+                        request,
+                    ):
+                        self._job_build_pending = None
+                        flight = self._start_job_build_locked(pending)
+                        if retiring is None:
+                            replacement = self._start_job_build_locked(request)
+                            self._job_build_retiring = flight
+                            self._job_build_active = replacement
+                            self._arm_job_build_locked(flight)
+                            self._arm_job_build_locked(replacement)
+                            return request.promise
+                        self._job_build_active = flight
+                        self._arm_job_build_locked(flight)
+                        return self._defer_collection_job_build_locked(
+                            flight.request.promise,
+                            retiring.request.promise,
+                        )
                     pending.cancellation.cancel("superseded while pending")
                     if not pending.promise.done():
                         pending.promise.set_exception(
@@ -3514,17 +3657,54 @@ class PrismCoordinator:
                         )
                     self._job_build_pending = None
                     self.job_build_scheduler_counts["supersessions"] += 1
+                if (
+                    retiring is not None
+                    and not self._collection_job_builds_are_independent(
+                        retiring.request,
+                        request,
+                    )
+                ):
+                    now = time.monotonic()
+                    if self._cancel_job_build_flight_locked(
+                        retiring,
+                        "superseded",
+                        now=now,
+                    ):
+                        request.superseded_monotonic = now
                 flight = self._start_job_build_locked(request)
                 self._job_build_active = flight
                 self._arm_job_build_locked(flight)
                 return request.promise
 
+            if self._collection_job_builds_are_independent(
+                active.request,
+                request,
+            ):
+                if self._job_build_retiring is None:
+                    self._job_build_retiring = active
+                    flight = self._start_job_build_locked(request)
+                    self._job_build_active = flight
+                    self._arm_job_build_locked(flight)
+                    return request.promise
+                if pending is None:
+                    self._job_build_pending = request
+                    return request.promise
+                assert retiring is not None
+                return self._defer_collection_job_build_locked(
+                    active.request.promise,
+                    retiring.request.promise,
+                )
+
             now = time.monotonic()
-            if active.request.cancellation.cancel("superseded"):
-                active.request.superseded_monotonic = now
-                self.job_build_scheduler_counts["supersessions"] += 1
+            for obsolete in (active, retiring):
+                if obsolete is not None:
+                    self._cancel_job_build_flight_locked(
+                        obsolete,
+                        "superseded",
+                        now=now,
+                    )
             request.superseded_monotonic = now
-            if self._job_build_retiring is None:
+            if retiring is None:
                 self._job_build_retiring = active
                 flight = self._start_job_build_locked(request)
                 self._job_build_active = flight
@@ -3545,10 +3725,13 @@ class PrismCoordinator:
     def _cancel_obsolete_job_builds(self, reason: str) -> None:
         self._ensure_job_cache_state()
         with self._job_build_scheduler_lock:
-            active = self._job_build_active
-            if active is not None and active.request.cancellation.cancel(reason):
-                active.request.superseded_monotonic = time.monotonic()
-                self.job_build_scheduler_counts["supersessions"] += 1
+            for flight in (self._job_build_active, self._job_build_retiring):
+                if (
+                    flight is not None
+                    and flight.request.cancellation.cancel(reason)
+                ):
+                    flight.request.superseded_monotonic = time.monotonic()
+                    self.job_build_scheduler_counts["supersessions"] += 1
             pending = self._job_build_pending
             if pending is not None:
                 pending.cancellation.cancel(reason)
@@ -4549,7 +4732,11 @@ class PrismCoordinator:
             if (
                 current is None
                 or current.fingerprint != artifacts.fingerprint
-                or current.generation != artifacts.generation
+                or current.previousblockhash != artifacts.previousblockhash
+                or (
+                    built.collection_only
+                    and current.generation != artifacts.generation
+                )
             ):
                 return False
             self._job_bundle_cache[built.key] = built
@@ -10735,19 +10922,79 @@ class PrismCoordinator:
                     self.job_build_worker_counts["starts"] += 1
                 assert process.stdin is not None
                 input_byte_count = 0
+                builder_started = time.monotonic()
+                worker_deadline = builder_started + float(
+                    getattr(
+                        self,
+                        "bundle_build_timeout_seconds",
+                        DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
+                    )
+                )
+                coordinator = self
 
                 class _CancelableInput:
                     def __init__(self, stream: Any) -> None:
                         self.stream = stream
+                        try:
+                            file_descriptor = int(stream.fileno())
+                        except (AttributeError, OSError, TypeError, ValueError):
+                            # Lightweight process fakes used by embedders and
+                            # tests do not necessarily expose an OS pipe.
+                            self.file_descriptor: int | None = None
+                        else:
+                            os.set_blocking(file_descriptor, False)
+                            self.file_descriptor = file_descriptor
 
-                    def write(self, value: str) -> int:
-                        nonlocal input_byte_count
+                    def check_cancelled(self) -> None:
                         if cancellation is not None:
                             cancellation.raise_if_cancelled(
                                 "builder input serialization"
                             )
-                        input_byte_count += len(value)
-                        return int(self.stream.write(value))
+                        if (
+                            isinstance(build_control, _JobBundleBuildControl)
+                            and build_control.cancel_event.is_set()
+                        ):
+                            raise _JobBundleBuildSuperseded(
+                                "audit-builder input was canceled after supersession"
+                            )
+                        if time.monotonic() >= worker_deadline:
+                            with coordinator._tip_refresh_metrics_lock:
+                                coordinator.tip_refresh_worker_failures += 1
+                            raise RuntimeError(
+                                "qbit-prism-build-audit-bundle timed out"
+                            )
+
+                    def write(self, value: str) -> int:
+                        nonlocal input_byte_count
+                        self.check_cancelled()
+                        if self.file_descriptor is None:
+                            written = int(self.stream.write(value))
+                            input_byte_count += len(value[:written].encode("utf-8"))
+                            return written
+                        encoded = value.encode("utf-8")
+                        remaining = memoryview(encoded)
+                        while remaining:
+                            self.check_cancelled()
+                            try:
+                                written = os.write(
+                                    self.file_descriptor,
+                                    remaining,
+                                )
+                            except (BlockingIOError, InterruptedError):
+                                time.sleep(
+                                    min(
+                                        0.02,
+                                        PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
+                                    )
+                                )
+                                continue
+                            if written <= 0:
+                                raise BrokenPipeError(
+                                    "audit-builder input pipe closed"
+                                )
+                            input_byte_count += written
+                            remaining = remaining[written:]
+                        return len(value)
 
                 serialization_started = time.monotonic()
                 try:
@@ -10761,9 +11008,19 @@ class PrismCoordinator:
                 except BrokenPipeError:
                     # Prefer the builder's diagnostic below.
                     pass
-                except BaseException:
-                    process.kill()
+                except BaseException as exc:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
                     process.wait()
+                    if isinstance(
+                        exc,
+                        (JobBuildCancelled, _JobBundleBuildSuperseded),
+                    ):
+                        with self._job_build_scheduler_lock:
+                            self.job_build_worker_counts["terminations"] += 1
+                            self._job_build_worker_restart_pending = True
                     raise
                 finally:
                     phases = self._job_build_phases()
@@ -10773,7 +11030,7 @@ class PrismCoordinator:
                     ) + (time.monotonic() - serialization_started)
                     try:
                         process.stdin.close()
-                    except BrokenPipeError:
+                    except (BlockingIOError, BrokenPipeError):
                         pass
                 if record_phase_metrics:
                     self._observe_tip_refresh_build_phase(
@@ -10782,13 +11039,6 @@ class PrismCoordinator:
                     )
                     self._record_tip_refresh_ipc_bytes("input", input_byte_count)
                 worker_started = time.monotonic()
-                worker_deadline = worker_started + float(
-                    getattr(
-                        self,
-                        "bundle_build_timeout_seconds",
-                        DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
-                    )
-                )
                 terminated = False
                 returncode: int | None = None
                 if cancellation is None and not hasattr(process, "poll"):
