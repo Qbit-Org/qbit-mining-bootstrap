@@ -3838,6 +3838,13 @@ class PrismCoordinator:
         self._mark_tip_refresh_pending(next_payout_generation)
         self._schedule_tip_refresh_retry()
 
+    def _payout_state_publication_fenced(self) -> bool:
+        """Report whether delivery is still blocked awaiting a publication."""
+
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            return self._payout_state_publication_blocked
+
     def _payout_source_requires_publication(
         self,
         candidate: PayoutStateCandidate | None = None,
@@ -4035,6 +4042,10 @@ class PrismCoordinator:
 
     def _advance_payout_state_generation(self) -> int:
         """Publish a payout-only invalidation with no expensive gate work."""
+        # No production caller remains: direct-block finalization publishes
+        # through submit_block_candidate's reserve/publish path instead. Tests
+        # keep using this as the smallest complete reserve -> block -> publish
+        # invalidation cycle.
         self._ensure_job_cache_state()
         self._reserve_payout_state_source("payout_only")
         prepared_started = time.monotonic()
@@ -12419,18 +12430,31 @@ class PrismCoordinator:
                 # clearing the parent override needs no second generation bump.
                 self._clear_accepted_block_payout_preview(block_hash)
                 self._schedule_current_payout_ledger_artifact_if_missing()
-                if self._payout_source_requires_publication():
-                    with self._job_cache_lock:
-                        publication_blocked = self._payout_state_publication_blocked
+                payout_publication_required = (
+                    self._payout_source_requires_publication()
+                )
+                payout_publication_fenced = (
+                    self._payout_state_publication_fenced()
+                )
+                if payout_publication_required or payout_publication_fenced:
+                    # A covered replay normally has no publication work. The
+                    # exception is a leaked delivery fence whose source already
+                    # published: force one republish so the replay heals it.
+                    covered_replay_fence = (
+                        payout_publication_fenced
+                        and not payout_publication_required
+                    )
                     with self.lock:
                         pending_cause = self._payout_state_source[2]
                     # A bounded preview-publication loss already left the gate
                     # fenced and its retry scheduled. Do not monopolize the
                     # submitter with a second retry budget. Uncertain commits,
-                    # and ordinary unfenced tip sources, still reconcile now.
+                    # ordinary unfenced tip sources, and a covered replay's
+                    # leaked fence still reconcile now.
                     publish_now = (
-                        pending_cause == "direct_block_uncertain"
-                        or not publication_blocked
+                        covered_replay_fence
+                        or pending_cause == "direct_block_uncertain"
+                        or not payout_publication_fenced
                     )
                     published: int | None = None
                     if publish_now and getattr(
