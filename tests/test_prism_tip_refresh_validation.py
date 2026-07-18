@@ -1364,6 +1364,23 @@ class TipRefreshValidationTests(unittest.TestCase):
             return observed
 
         server.observe_tip_for_refresh = record_observation  # type: ignore[method-assign]
+        # Park the replacement build so the detected-but-unpublished window
+        # can be asserted deterministically before tip B is published.
+        replacement_build_started = threading.Event()
+        release_replacement_build = threading.Event()
+        build_calls = 0
+        original_build = server.build_shared_job_bundle
+
+        def gated_build(*args: object, **kwargs: object) -> object:
+            nonlocal build_calls
+            build_calls += 1
+            if build_calls >= 2:
+                replacement_build_started.set()
+                if not release_replacement_build.wait(5):
+                    raise AssertionError("test did not release replacement build")
+            return original_build(*args, **kwargs)  # type: ignore[arg-type]
+
+        server.build_shared_job_bundle = gated_build  # type: ignore[method-assign]
         results: dict[str, list[int]] = {"old": [], "new": []}
         errors: dict[str, list[BaseException]] = {"old": [], "new": []}
 
@@ -1387,12 +1404,15 @@ class TipRefreshValidationTests(unittest.TestCase):
             new_poll.start()
 
             self.assertTrue(tip_b_observed.wait(5))
+            self.assertTrue(replacement_build_started.wait(5))
             self.assertTrue(active[1].is_set())
             self.assertEqual(server.latest_detected_tip[0], tip_b)
             self.assertEqual(server.current_tip_first_seen[0], tip_a)
             pending_tip_b = server._tip_refresh_pending_token
             self.assertIsNotNone(pending_tip_b)
+            release_replacement_build.set()
         finally:
+            release_replacement_build.set()
             release_first_send.set()
             old_poll.join(5)
 

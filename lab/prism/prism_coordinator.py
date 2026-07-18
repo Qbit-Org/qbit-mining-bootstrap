@@ -7518,11 +7518,16 @@ class PrismCoordinator:
                     )
                     self.current_tip_observation_sequence = token.observation_sequence
                     self.current_tip_observed_monotonic = now
-                    self.current_tip_parent = (
-                        (token.tip_hash, parent_hash)
-                        if parent_hash is not None
-                        else None
-                    )
+                    if parent_hash is not None:
+                        self.current_tip_parent = (token.tip_hash, parent_hash)
+                    else:
+                        # The parent lookup is best-effort cleanup metadata. A
+                        # transient RPC failure during a same-tip republication
+                        # must not wipe the still-valid cached parent; only a
+                        # parent belonging to a different tip is stale here.
+                        prior_parent = getattr(self, "current_tip_parent", None)
+                        if prior_parent is None or prior_parent[0] != token.tip_hash:
+                            self.current_tip_parent = None
                     self.tip_template_snapshot = snapshot
                     self.tip_refresh_divergence_started_monotonic = None
                     if tip_changed:

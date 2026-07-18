@@ -313,6 +313,87 @@ class TipPublicationBoundaryTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
+    def test_same_tip_republication_preserves_parent_on_lookup_failure(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+            cached_parent = (published_tip[0], "aa" * 32)
+            with server.lock:
+                server.current_tip_parent = cached_parent
+
+            sequence = server._reserve_tip_observation_sequence()
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            bundle = server.prepare_tip_refresh_bundle(snapshot)
+            token = server._validate_prepared_tip_refresh(bundle, snapshot, sequence)
+            cancellation = server._publish_prepared_tip_refresh(
+                token,
+                bundle,
+                snapshot,
+                parent_hash=None,
+            )
+            try:
+                # A transient parent lookup failure during a same-tip
+                # republication must not wipe the still-valid cached parent.
+                self.assertEqual(server.current_tip_parent, cached_parent)
+                self.assertEqual(server.current_tip_first_seen[0], published_tip[0])
+            finally:
+                server._clear_active_tip_refresh(token, cancellation)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_tip_flip_publication_clears_mismatched_parent_on_lookup_failure(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+            with server.lock:
+                server.current_tip_parent = (published_tip[0], "aa" * 32)
+
+            next_tip = "66" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    next_tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            snapshot = server.fetch_qbit_tip_template_snapshot()
+            bundle = server.prepare_tip_refresh_bundle(snapshot)
+            token = server._validate_prepared_tip_refresh(bundle, snapshot, sequence)
+            cancellation = server._publish_prepared_tip_refresh(
+                token,
+                bundle,
+                snapshot,
+                parent_hash=None,
+            )
+            try:
+                # The old tip's parent must never survive a flip; submit
+                # classification would otherwise trust stale lineage.
+                self.assertIsNone(server.current_tip_parent)
+                self.assertEqual(server.current_tip_first_seen[0], next_tip)
+            finally:
+                server._clear_active_tip_refresh(token, cancellation)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
 
 if __name__ == "__main__":
     unittest.main()
