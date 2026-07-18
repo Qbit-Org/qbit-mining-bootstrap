@@ -326,6 +326,50 @@ fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
         .arg("--job-summary-output")
         .output()
         .unwrap();
+    let mut compact_input = input.clone();
+    let mut compact_identities = Vec::<serde_json::Value>::new();
+    let mut compact_shares = Vec::<serde_json::Value>::new();
+    for share in input["shares"].as_array().unwrap() {
+        let identity = serde_json::json!([
+            share["miner_id"],
+            share["order_key"],
+            share["p2mr_program_hex"],
+        ]);
+        let identity_index = compact_identities
+            .iter()
+            .position(|candidate| candidate == &identity)
+            .unwrap_or_else(|| {
+                compact_identities.push(identity);
+                compact_identities.len() - 1
+            });
+        compact_shares.push(serde_json::json!([
+            share["share_seq"],
+            share["share_id"],
+            identity_index,
+            share["share_difficulty"],
+            share["job_issued_at_ms"],
+            share["accepted_at_ms"],
+            share
+                .get("credit_policy")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ]));
+    }
+    compact_input["shares"] = serde_json::json!([]);
+    compact_input["compact_share_identities"] = serde_json::Value::Array(compact_identities);
+    compact_input["compact_shares"] = serde_json::Value::Array(compact_shares);
+    fs::write(&input_path, serde_json::to_vec(&compact_input).unwrap()).unwrap();
+    let compact_summary_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .arg("--job-summary-output")
+        .arg("--phase-metrics")
+        .output()
+        .unwrap();
     let _ = fs::remove_file(&input_path);
 
     assert!(
@@ -365,6 +409,15 @@ fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
     );
     assert!(summary.get("shares").is_none());
     assert!(summary.get("reward_manifest").is_none());
+    assert!(
+        compact_summary_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&compact_summary_output.stdout),
+        String::from_utf8_lossy(&compact_summary_output.stderr)
+    );
+    assert_eq!(compact_summary_output.stdout, summary_output.stdout);
+    assert!(String::from_utf8_lossy(&compact_summary_output.stderr)
+        .contains("qbit-prism-build-phase-metrics"));
 
     let report = verify_audit_bundle(&emitted_bundle, &ledger_public_key_hex()).unwrap();
     assert_eq!(output.stdout.len(), 10_999);

@@ -6,7 +6,7 @@ from __future__ import annotations
 import base64
 import copy
 from collections import OrderedDict
-from concurrent.futures import FIRST_COMPLETED, Future, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 import dataclasses
 import errno
@@ -78,6 +78,7 @@ TESTNET_QBIT_CHAINS = {"testnet", "testnet3", "testnet4", "signet"}
 DEFAULT_PRISM_BLOCKPOLL_SECONDS = 2.0
 DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS = 5.0
 DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS = 10.0
+DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS = 60.0
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
 DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
@@ -162,6 +163,16 @@ PRISM_CTV_BROADCASTER_SECONDS_BUCKETS = (
 PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS = (1, 2, 5, 10, 25, 50, 100)
 PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
+PRISM_TIP_REFRESH_BUILD_PHASES = (
+    "ledger_snapshot",
+    "payout_state_derivation",
+    "ctv_manifest_construction",
+    "coinbase_bundle_construction",
+    "signing_verification",
+    "serialization_copy",
+    "singleflight_wait",
+)
+PRISM_BUILDER_PHASE_METRICS_PREFIX = "qbit-prism-build-phase-metrics "
 PRISM_PAYOUT_DELIVERY_GENERATIONS = ("current", "stale", "future")
 DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES = 8
 PRISM_JOB_BUILD_PHASES = (
@@ -884,6 +895,7 @@ class PrismJobContext:
     template_fingerprint: str | None = None
     template_generation: int = 0
     payout_state_generation: int = 0
+    payout_artifact_generation: int = 0
     connection_id: int = 0
     authorization_generation: int = 0
     difficulty_generation: int = 0
@@ -1005,6 +1017,7 @@ class CachedJobBundle:
     built_monotonic: float
     template_generation: int = 0
     payout_state_generation: int = 0
+    payout_artifact_generation: int = 0
     # Collection coinbases commit a synthetic share to this exact payout
     # identity. Ready bundles have no worker-specific inputs and keep this
     # unset, which makes accidental cross-worker stamping fail closed.
@@ -1048,6 +1061,11 @@ class PayoutStateCandidate:
     cause: str
     invalidated_monotonic: float
     prepared_monotonic: float
+    ledger_artifact: PayoutLedgerArtifact | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -1058,6 +1076,19 @@ class PublishedPayoutState:
     source_generation: int
     source_tip_hash: str | None
     published_monotonic: float
+
+
+@dataclass(frozen=True)
+class PayoutLedgerArtifact:
+    """Immutable ledger input prepared independently of a qbit template."""
+
+    generation: int
+    payout_state_generation: int
+    network_difficulty: int
+    accepted_share_count: int
+    shares_json: tuple[dict[str, object], ...] = field(repr=False)
+    prior_balances: tuple[dict[str, object], ...] = field(repr=False)
+    prepared_monotonic: float
 
 
 @dataclass
@@ -1251,6 +1282,16 @@ class _FanoutCancellation:
         with self._condition:
             while self._active_deliveries:
                 self._condition.wait()
+
+
+@dataclass
+class _JobBundleBuildControl:
+    key: tuple[object, ...]
+    previousblockhash: str
+    payout_state_generation: int
+    payout_artifact_generation: int
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    process: subprocess.Popen[str] | None = None
 
 
 class _PayoutStateDeliveryGate:
@@ -1792,6 +1833,10 @@ class _PayoutStatePublicationBlocked(TemplateRefreshBlocked):
     """Job construction is waiting for a prepared payout publication."""
 
 
+class _JobBundleBuildSuperseded(TemplateRefreshBlocked):
+    """A newer tip or payout generation canceled this deterministic build."""
+
+
 class CollectionIdentityUnavailable(TemplateRefreshBlocked):
     """Current collection work is waiting for an authorized worker identity."""
 
@@ -1888,6 +1933,10 @@ class PrismCoordinator:
         self.job_bundle_cache_seconds = env_nonnegative_float(
             "PRISM_JOB_BUNDLE_CACHE_SECONDS",
             DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS,
+        )
+        self.bundle_build_timeout_seconds = env_positive_float(
+            "PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS",
+            DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
         )
         self.template_cache_seconds = env_nonnegative_float(
             "PRISM_TEMPLATE_CACHE_SECONDS",
@@ -2596,6 +2645,10 @@ class PrismCoordinator:
     def _ensure_job_cache_state(self) -> None:
         if not hasattr(self, "_job_cache_lock"):
             self._job_cache_lock = threading.Lock()
+        if not hasattr(self, "_active_job_bundle_builds"):
+            self._active_job_bundle_builds: dict[
+                tuple[object, ...], _JobBundleBuildControl
+            ] = {}
         if not hasattr(self, "_template_artifacts"):
             self._template_artifacts: CachedTemplateArtifacts | None = None
         if not hasattr(self, "_template_artifact_generation"):
@@ -2627,6 +2680,20 @@ class PrismCoordinator:
                 source_tip_hash=None,
                 published_monotonic=time.monotonic(),
             )
+        if not hasattr(self, "_payout_ledger_artifact"):
+            self._payout_ledger_artifact: PayoutLedgerArtifact | None = None
+        if not hasattr(self, "_payout_ledger_artifact_generation"):
+            self._payout_ledger_artifact_generation = 0
+        if not hasattr(self, "_payout_artifact_executor_lock"):
+            self._payout_artifact_executor_lock = threading.Lock()
+        if not hasattr(self, "_payout_artifact_executor"):
+            self._payout_artifact_executor: ThreadPoolExecutor | None = None
+        if not hasattr(self, "_payout_artifact_future"):
+            self._payout_artifact_future: Future[None] | None = None
+        if not hasattr(self, "_payout_artifact_requested"):
+            self._payout_artifact_requested: tuple[int, int] | None = None
+        if not hasattr(self, "_payout_artifact_executor_shutdown"):
+            self._payout_artifact_executor_shutdown = False
         if not hasattr(self, "_payout_state_delivery_gate"):
             # Orders reconciliation mutations against final job-delivery
             # admission while preserving parallel sends to different miners.
@@ -2717,6 +2784,214 @@ class PrismCoordinator:
             phases = {}
             self._job_build_phase_local.phases = phases
         return phases
+
+    def _cancel_obsolete_job_bundle_builds(
+        self,
+        *,
+        current_tip: str | None = None,
+        payout_state_generation: int | None = None,
+    ) -> None:
+        """Cancel only builds proven obsolete by a newer exact generation."""
+        self._ensure_job_cache_state()
+        processes: list[subprocess.Popen[str]] = []
+        with self._job_cache_lock:
+            for control in self._active_job_bundle_builds.values():
+                obsolete = (
+                    current_tip is not None
+                    and control.previousblockhash != current_tip
+                ) or (
+                    payout_state_generation is not None
+                    and control.payout_state_generation
+                    != int(payout_state_generation)
+                )
+                if not obsolete or control.cancel_event.is_set():
+                    continue
+                control.cancel_event.set()
+                if control.process is not None:
+                    processes.append(control.process)
+        for process in processes:
+            if process.poll() is not None:
+                continue
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
+    def _register_job_bundle_process(
+        self,
+        control: _JobBundleBuildControl,
+        process: subprocess.Popen[str],
+    ) -> None:
+        terminate = False
+        with self._job_cache_lock:
+            if (
+                self._active_job_bundle_builds.get(control.key) is not control
+                or control.cancel_event.is_set()
+            ):
+                terminate = True
+            else:
+                control.process = process
+        if terminate and process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
+    def _build_payout_ledger_artifact(
+        self,
+        expected_payout_state_generation: int,
+        artifact_payout_state_generation: int,
+        network_difficulty: int,
+    ) -> PayoutLedgerArtifact | None:
+        """Build a stable ledger snapshot without publishing it.
+
+        Accepted-share counts fence both sides of the snapshot. If a writer
+        commits concurrently, this attempt is discarded rather than publishing
+        an artifact with an ambiguous cutoff; the normal inline path remains
+        the fail-closed fallback.
+        """
+        self._ensure_job_cache_state()
+        ledger_started = time.monotonic()
+        try:
+            accepted_before, _ = self.accepted_share_stats()
+            with self._payout_state_prepare_lock:
+                with self._job_cache_lock:
+                    if (
+                        expected_payout_state_generation
+                        != self._payout_state_generation
+                    ):
+                        return None
+                snapshot_window_weight = (
+                    PRISM_REWARD_WINDOW_MULTIPLIER
+                    * PRISM_SNAPSHOT_WINDOW_MARGIN
+                    * int(network_difficulty)
+                )
+                records = list(
+                    self.ledger.snapshot_at_job_issue(
+                        now_ms(),
+                        window_weight=snapshot_window_weight,
+                    )
+                )
+                prior_balances = self.ledger.current_prior_balances()
+            accepted_after, _ = self.accepted_share_stats()
+        except Exception:
+            # Artifact preparation is speculative. The synchronous bundle path
+            # still owns errors when current work actually requires a snapshot.
+            return None
+        finally:
+            self._observe_tip_refresh_build_phase(
+                "ledger_snapshot",
+                time.monotonic() - ledger_started,
+            )
+        if accepted_before != accepted_after or not records:
+            return None
+        copy_started = time.monotonic()
+        shares_json = tuple(record.to_prism_json() for record in records)
+        frozen_balances = tuple(prior_balances)
+        self._observe_tip_refresh_build_phase(
+            "serialization_copy",
+            time.monotonic() - copy_started,
+        )
+        return PayoutLedgerArtifact(
+            generation=0,
+            payout_state_generation=artifact_payout_state_generation,
+            network_difficulty=int(network_difficulty),
+            accepted_share_count=accepted_after,
+            shares_json=shares_json,
+            prior_balances=frozen_balances,
+            prepared_monotonic=time.monotonic(),
+        )
+
+    def _prepare_payout_ledger_artifact(
+        self,
+        payout_state_generation: int,
+        network_difficulty: int,
+    ) -> None:
+        """Prepare and atomically publish an artifact for a current generation."""
+        artifact = self._build_payout_ledger_artifact(
+            payout_state_generation,
+            payout_state_generation,
+            network_difficulty,
+        )
+        if artifact is None:
+            return
+        with self._job_cache_lock:
+            if payout_state_generation != self._payout_state_generation:
+                return
+            self._payout_ledger_artifact_generation += 1
+            self._payout_ledger_artifact = dataclass_replace(
+                artifact,
+                generation=self._payout_ledger_artifact_generation,
+            )
+
+    def _payout_artifact_preparation_loop(self) -> None:
+        while True:
+            with self._payout_artifact_executor_lock:
+                request = self._payout_artifact_requested
+                self._payout_artifact_requested = None
+                if request is None:
+                    self._payout_artifact_future = None
+                    return
+            self._prepare_payout_ledger_artifact(*request)
+
+    def _schedule_payout_ledger_artifact_preparation(
+        self,
+        payout_state_generation: int,
+        network_difficulty: int,
+    ) -> None:
+        """Latest-generation-wins scheduling with one worker and one slot."""
+        self._ensure_job_cache_state()
+        with self._payout_artifact_executor_lock:
+            if self._payout_artifact_executor_shutdown:
+                return
+            self._payout_artifact_requested = (
+                int(payout_state_generation),
+                int(network_difficulty),
+            )
+            if self._payout_artifact_future is not None:
+                return
+            executor = self._payout_artifact_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="prism-payout-artifact",
+                )
+                self._payout_artifact_executor = executor
+            self._payout_artifact_future = executor.submit(
+                self._payout_artifact_preparation_loop
+            )
+
+    def _usable_payout_ledger_artifact(
+        self,
+        payout_state_generation: int,
+        network_difficulty: int,
+    ) -> PayoutLedgerArtifact | None:
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            artifact = self._payout_ledger_artifact
+        if (
+            artifact is None
+            or artifact.payout_state_generation != payout_state_generation
+            or artifact.network_difficulty != int(network_difficulty)
+        ):
+            return None
+        try:
+            accepted_share_count, _ = self.accepted_share_stats()
+        except Exception:
+            return None
+        if accepted_share_count != artifact.accepted_share_count:
+            return None
+        return artifact
+
+    def shutdown_payout_artifact_executor(self) -> None:
+        self._ensure_job_cache_state()
+        with self._payout_artifact_executor_lock:
+            executor = self._payout_artifact_executor
+            self._payout_artifact_executor = None
+            self._payout_artifact_executor_shutdown = True
+            self._payout_artifact_requested = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _record_job_cache_event(self, kind: str, *, hit: bool) -> None:
         self._ensure_job_cache_state()
@@ -2855,11 +3130,23 @@ class PrismCoordinator:
             invalidated,
         )
 
-    @staticmethod
     def _prepared_payout_state_candidate(
+        self,
         captured: tuple[int, int, str | None, str, float],
     ) -> PayoutStateCandidate:
         base_generation, source_generation, source_tip, cause, invalidated = captured
+        ledger_artifact: PayoutLedgerArtifact | None = None
+        with self._job_cache_lock:
+            template_artifacts = self._template_artifacts
+        if (
+            template_artifacts is not None
+            and getattr(self, "_pool_ready_latched", False)
+        ):
+            ledger_artifact = self._build_payout_ledger_artifact(
+                base_generation,
+                base_generation + 1,
+                template_artifacts.network_difficulty,
+            )
         return PayoutStateCandidate(
             base_generation=base_generation,
             source_generation=source_generation,
@@ -2867,6 +3154,7 @@ class PrismCoordinator:
             cause=cause,
             invalidated_monotonic=invalidated,
             prepared_monotonic=time.monotonic(),
+            ledger_artifact=ledger_artifact,
         )
 
     def _current_payout_state_candidate(self) -> PayoutStateCandidate:
@@ -3001,6 +3289,19 @@ class PrismCoordinator:
                     ):
                         self._payout_state_generation += 1
                         published_generation = self._payout_state_generation
+                        prepared_artifact = candidate.ledger_artifact
+                        if (
+                            prepared_artifact is not None
+                            and prepared_artifact.payout_state_generation
+                            == published_generation
+                        ):
+                            self._payout_ledger_artifact_generation += 1
+                            self._payout_ledger_artifact = dataclass_replace(
+                                prepared_artifact,
+                                generation=self._payout_ledger_artifact_generation,
+                            )
+                        else:
+                            self._payout_ledger_artifact = None
                         self._published_payout_state = PublishedPayoutState(
                             generation=published_generation,
                             source_generation=candidate.source_generation,
@@ -3040,11 +3341,29 @@ class PrismCoordinator:
         if published_generation is None:
             self._record_discarded_payout_candidate()
             return None
+        self._cancel_obsolete_job_bundle_builds(
+            payout_state_generation=published_generation
+        )
         if active_to_cancel is not None:
             active_to_cancel.cancel()
         if schedule_retry:
             self._mark_tip_refresh_pending(published_generation)
             self._schedule_tip_refresh_retry()
+        with self._job_cache_lock:
+            current_artifacts = self._template_artifacts
+        published_artifact_usable = (
+            self._usable_payout_ledger_artifact(
+                published_generation,
+                current_artifacts.network_difficulty,
+            )
+            if current_artifacts is not None
+            else None
+        )
+        if current_artifacts is not None and published_artifact_usable is None:
+            self._schedule_payout_ledger_artifact_preparation(
+                published_generation,
+                current_artifacts.network_difficulty,
+            )
         return published_generation
 
     def _record_first_payout_delivery(
@@ -3257,13 +3576,16 @@ class PrismCoordinator:
         *,
         mode: str,
         payout_state_generation: int,
+        payout_artifact_generation: int,
         worker: WorkerIdentity | None,
     ) -> tuple[object, ...]:
         if mode == "ready":
             return (
                 artifacts.fingerprint,
+                artifacts.previousblockhash,
                 "ready",
                 payout_state_generation,
+                payout_artifact_generation,
             )
         if mode != "collection":
             raise ValueError(f"unknown PRISM job-bundle mode: {mode}")
@@ -3273,9 +3595,11 @@ class PrismCoordinator:
             )
         return (
             artifacts.fingerprint,
+            artifacts.previousblockhash,
             "collection",
             artifacts.generation,
             payout_state_generation,
+            payout_artifact_generation,
             *self._collection_bundle_identity(worker),
         )
 
@@ -3429,6 +3753,7 @@ class PrismCoordinator:
         transitions cannot reuse an obsolete preparation.
         """
         self._ensure_job_cache_state()
+        self._ensure_tip_refresh_state()
         while True:
             resolved_mode = self._job_bundle_mode(mode)
             if resolved_mode == "collection" and worker is None:
@@ -3437,10 +3762,22 @@ class PrismCoordinator:
                 )
             with self._job_cache_lock:
                 payout_state_generation = self._payout_state_generation
+            payout_artifact = (
+                self._usable_payout_ledger_artifact(
+                    payout_state_generation,
+                    artifacts.network_difficulty,
+                )
+                if resolved_mode == "ready"
+                else None
+            )
+            payout_artifact_generation = (
+                payout_artifact.generation if payout_artifact is not None else 0
+            )
             key = self._job_bundle_key(
                 artifacts,
                 mode=resolved_mode,
                 payout_state_generation=payout_state_generation,
+                payout_artifact_generation=payout_artifact_generation,
                 worker=worker,
             )
             cached = self._lookup_job_bundle(key)
@@ -3464,29 +3801,39 @@ class PrismCoordinator:
                 else:
                     flight.waiters += 1
                     self.shared_bundle_preparation_waiters += 1
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_build_queue_depth += 1
 
             if not leader:
                 wait_started = time.monotonic()
-                while not flight.event.wait(timeout=0.1):
-                    if cancelled is not None and cancelled():
-                        with self._bundle_preparation_lock:
-                            self.shared_bundle_preparation_waiters = max(
-                                0, self.shared_bundle_preparation_waiters - 1
+                try:
+                    while not flight.event.wait(timeout=0.1):
+                        if cancelled is not None and cancelled():
+                            raise _JobBuildCancelled(
+                                "job bundle waiter was superseded during preparation"
                             )
-                        raise _JobBuildCancelled(
-                            "job bundle waiter was superseded during preparation"
+                finally:
+                    wait_elapsed = time.monotonic() - wait_started
+                    with self._bundle_preparation_lock:
+                        self.shared_bundle_preparation_waiters = max(
+                            0, self.shared_bundle_preparation_waiters - 1
                         )
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_build_queue_depth = max(
+                            0, self.tip_refresh_build_queue_depth - 1
+                        )
+                    self._observe_tip_refresh_build_phase(
+                        "singleflight_wait",
+                        wait_elapsed,
+                    )
                 self._job_build_phases()["preparation_wait"] = (
                     self._job_build_phases().get("preparation_wait", 0.0)
-                    + time.monotonic()
-                    - wait_started
+                    + wait_elapsed
                 )
-                with self._bundle_preparation_lock:
-                    self.shared_bundle_preparation_waiters = max(
-                        0, self.shared_bundle_preparation_waiters - 1
-                    )
                 if self._job_bundle_entry_usable(flight.result, artifacts):
                     self._record_job_cache_event("bundle", hit=True)
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_singleflight_hits += 1
                     assert flight.result is not None
                     return self._bind_cached_bundle_to_artifacts(
                         flight.result,
@@ -3519,17 +3866,87 @@ class PrismCoordinator:
                 # A flight owns this exact work identity. Different identities
                 # need not queue behind an obsolete global build lock.
                 self._record_job_cache_event("bundle", hit=False)
-                built = self.build_shared_job_bundle(
-                    artifacts,
-                    worker,
-                    mode=resolved_mode,
+                control = _JobBundleBuildControl(
+                    key=flight_key,
+                    previousblockhash=artifacts.previousblockhash,
                     payout_state_generation=payout_state_generation,
-                    key=key,
+                    payout_artifact_generation=payout_artifact_generation,
                 )
+                with self._job_cache_lock:
+                    self._active_job_bundle_builds[flight_key] = control
+                previous_control = getattr(
+                    self._job_build_phase_local,
+                    "bundle_build_control",
+                    None,
+                )
+                self._job_build_phase_local.bundle_build_control = control
+                with self._tip_refresh_metrics_lock:
+                    self.tip_refresh_build_inflight += 1
+                try:
+                    if control.cancel_event.is_set():
+                        raise _JobBundleBuildSuperseded(
+                            "shared bundle build was superseded before execution"
+                        )
+                    built = self.build_shared_job_bundle(
+                        artifacts,
+                        worker,
+                        mode=resolved_mode,
+                        payout_state_generation=payout_state_generation,
+                        payout_artifact=payout_artifact,
+                        key=key,
+                    )
+                    if control.cancel_event.is_set():
+                        raise _JobBundleBuildSuperseded(
+                            "shared bundle result was superseded before publication"
+                        )
+                except _JobBundleBuildSuperseded as exc:
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_superseded_results += 1
+                    with self._job_cache_lock:
+                        current_payout_generation = self._payout_state_generation
+                    with self.lock:
+                        current_tip = getattr(self, "current_tip_first_seen", None)
+                    if current_payout_generation != payout_state_generation and (
+                        current_tip is None
+                        or current_tip[0] == artifacts.previousblockhash
+                    ):
+                        raise TemplateRefreshBlocked(
+                            "payout generation superseded shared bundle preparation"
+                        ) from exc
+                    raise _BundlePreparationSuperseded(
+                        "newer tip superseded shared bundle preparation"
+                    ) from exc
+                finally:
+                    self._job_build_phase_local.bundle_build_control = previous_control
+                    with self._job_cache_lock:
+                        if self._active_job_bundle_builds.get(flight_key) is control:
+                            self._active_job_bundle_builds.pop(flight_key, None)
+                        control.process = None
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_build_inflight = max(
+                            0, self.tip_refresh_build_inflight - 1
+                        )
+                if payout_artifact is not None and (
+                    self._usable_payout_ledger_artifact(
+                        payout_state_generation,
+                        artifacts.network_difficulty,
+                    )
+                    is not payout_artifact
+                ):
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_superseded_results += 1
+                    raise TemplateRefreshBlocked(
+                        "payout artifact superseded shared bundle preparation"
+                    )
+                # A reconciliation may have committed while this expensive
+                # build was running. Never cache or return its stale signed
+                # payout snapshot; retry against the new generation instead.
                 with self.lock:
                     observed_tip = getattr(self, "current_tip_first_seen", None)
                     published_snapshot = self.tip_template_snapshot
                 if observed_tip is not None and observed_tip[0] != artifacts.previousblockhash:
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_superseded_results += 1
                     raise _BundlePreparationSuperseded(
                         "newer tip superseded shared bundle preparation"
                     )
@@ -3538,6 +3955,8 @@ class PrismCoordinator:
                     and published_snapshot.bestblockhash == artifacts.previousblockhash
                     and published_snapshot.template_generation > artifacts.generation
                 ):
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_superseded_results += 1
                     raise _BundlePreparationSuperseded(
                         "newer template superseded shared bundle preparation"
                     )
@@ -3546,6 +3965,8 @@ class PrismCoordinator:
                         "readiness superseded shared bundle preparation"
                     )
                 if not self._cache_job_bundle_if_current(built, artifacts):
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_superseded_results += 1
                     raise TemplateRefreshBlocked(
                         "payout state superseded shared bundle preparation"
                     )
@@ -3597,6 +4018,7 @@ class PrismCoordinator:
         *,
         mode: str | None = None,
         payout_state_generation: int | None = None,
+        payout_artifact: PayoutLedgerArtifact | None = None,
         key: tuple[object, ...] | None = None,
     ) -> CachedJobBundle:
         phases = self._job_build_phases()
@@ -3607,6 +4029,7 @@ class PrismCoordinator:
                 "collection-mode worker identity is temporarily unavailable"
             )
         started = time.monotonic()
+        share_records: list[object] = []
         with self._payout_state_prepare_lock:
             with self._job_cache_lock:
                 publication_blocked = self._payout_state_publication_blocked
@@ -3618,10 +4041,20 @@ class PrismCoordinator:
                 with self._job_cache_lock:
                     payout_state_generation = self._payout_state_generation
             if key is None:
+                if payout_artifact is None and resolved_mode == "ready":
+                    payout_artifact = self._usable_payout_ledger_artifact(
+                        payout_state_generation,
+                        artifacts.network_difficulty,
+                    )
                 key = self._job_bundle_key(
                     artifacts,
                     mode=resolved_mode,
                     payout_state_generation=payout_state_generation,
+                    payout_artifact_generation=(
+                        payout_artifact.generation
+                        if payout_artifact is not None
+                        else 0
+                    ),
                     worker=worker,
                 )
             issued_at_ms = now_ms()
@@ -3633,58 +4066,82 @@ class PrismCoordinator:
                 * PRISM_SNAPSHOT_WINDOW_MARGIN
                 * int(artifacts.network_difficulty)
             )
-            shares: list[dict[str, object]] = (
-                [
-                    record.to_prism_json()
-                    for record in self.ledger.snapshot_at_job_issue(
+            if resolved_mode == "ready" and payout_artifact is None:
+                share_records = list(
+                    self.ledger.snapshot_at_job_issue(
                         issued_at_ms, window_weight=snapshot_window_weight
                     )
-                ]
-                if resolved_mode == "ready"
-                else []
+                )
+            prior_balances = (
+                list(payout_artifact.prior_balances)
+                if payout_artifact is not None
+                else self.ledger.current_prior_balances()
             )
-            prior_balances = self.ledger.current_prior_balances()
-        phases["ledger"] = phases.get("ledger", 0.0) + (time.monotonic() - started)
+        ledger_elapsed = time.monotonic() - started
+        phases["ledger"] = phases.get("ledger", 0.0) + ledger_elapsed
+        if resolved_mode == "ready":
+            self._observe_tip_refresh_build_phase("ledger_snapshot", ledger_elapsed)
+        copy_started = time.monotonic()
+        shares: list[dict[str, object]] = (
+            list(payout_artifact.shares_json)
+            if payout_artifact is not None
+            else [
+                record.to_prism_json()  # type: ignore[union-attr]
+                for record in share_records
+            ]
+        )
+        if resolved_mode == "ready":
+            self._observe_tip_refresh_build_phase(
+                "serialization_copy",
+                time.monotonic() - copy_started,
+            )
         started = time.monotonic()
         placeholder_suffix_hex = self.coinbase_script_sig_suffix_hex(
             PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
             "00" * self.extranonce2_size,
         )
         collection_identity: tuple[str, str] | None = None
-        if resolved_mode == "ready":
-            if not shares:
-                raise RuntimeError(
-                    "ready-pool ledger snapshot contained no payout shares"
+        previous_metrics_scope = bool(
+            getattr(self._job_build_phase_local, "tip_refresh_metrics", False)
+        )
+        self._job_build_phase_local.tip_refresh_metrics = resolved_mode == "ready"
+        try:
+            if resolved_mode == "ready":
+                if not shares:
+                    raise RuntimeError(
+                        "ready-pool ledger snapshot contained no payout shares"
+                    )
+                bundle = self.build_audit_bundle(
+                    shares=shares,
+                    found_block={
+                        "block_height": int(template["height"]),
+                        "coinbase_value_sats": int(template["coinbasevalue"]),
+                        "network_difficulty": artifacts.network_difficulty,
+                        "anchor_job_issued_at_ms": issued_at_ms,
+                    },
+                    prior_balances=prior_balances,
+                    coinbase_script_sig_suffix_hex=placeholder_suffix_hex,
+                    witness_merkle_leaves_hex=list(artifacts.witness_merkle_leaves_hex),
+                    ctv_fee_parent_hash=str(template["previousblockhash"]),
+                    summary_only=True,
                 )
-            bundle = self.build_audit_bundle(
-                shares=shares,
-                found_block={
-                    "block_height": int(template["height"]),
-                    "coinbase_value_sats": int(template["coinbasevalue"]),
-                    "network_difficulty": artifacts.network_difficulty,
-                    "anchor_job_issued_at_ms": issued_at_ms,
-                },
-                prior_balances=prior_balances,
-                coinbase_script_sig_suffix_hex=placeholder_suffix_hex,
-                witness_merkle_leaves_hex=list(artifacts.witness_merkle_leaves_hex),
-                ctv_fee_parent_hash=str(template["previousblockhash"]),
-                summary_only=True,
-            )
-            collection_only = False
-        else:
-            assert worker is not None
-            bundle = self.build_collection_bundle(
-                template=template,
-                transaction_hexes=artifacts.transaction_hexes,
-                worker=worker,
-                network_difficulty=artifacts.network_difficulty,
-                issued_at_ms=issued_at_ms,
-                suffix_hex=placeholder_suffix_hex,
-                summary_only=True,
-            )
-            shares = []
-            collection_only = True
-            collection_identity = self._collection_bundle_identity(worker)
+                collection_only = False
+            else:
+                assert worker is not None
+                bundle = self.build_collection_bundle(
+                    template=template,
+                    transaction_hexes=artifacts.transaction_hexes,
+                    worker=worker,
+                    network_difficulty=artifacts.network_difficulty,
+                    issued_at_ms=issued_at_ms,
+                    suffix_hex=placeholder_suffix_hex,
+                    summary_only=True,
+                )
+                shares = []
+                collection_only = True
+                collection_identity = self._collection_bundle_identity(worker)
+        finally:
+            self._job_build_phase_local.tip_refresh_metrics = previous_metrics_scope
         manifest = bundle["signed_coinbase_manifest"]["manifest"]
         base_job = direct_stratum.make_job_from_builder_manifest(
             job_id="prism-template-base",
@@ -3714,6 +4171,9 @@ class PrismCoordinator:
             built_monotonic=time.monotonic(),
             template_generation=artifacts.generation,
             payout_state_generation=payout_state_generation,
+            payout_artifact_generation=(
+                payout_artifact.generation if payout_artifact is not None else 0
+            ),
             collection_identity=collection_identity,
         )
 
@@ -3762,6 +4222,7 @@ class PrismCoordinator:
             template_fingerprint=cached.template_fingerprint,
             template_generation=cached.template_generation,
             payout_state_generation=cached.payout_state_generation,
+            payout_artifact_generation=cached.payout_artifact_generation,
             connection_id=client.connection_id,
             authorization_generation=int(
                 getattr(client, "authorization_generation", 0)
@@ -3955,6 +4416,17 @@ class PrismCoordinator:
                 }
                 for name in ("refresh", "bundle_build", "first_delivery", "last_delivery")
             }
+        if not hasattr(self, "tip_refresh_build_phase_histograms"):
+            self.tip_refresh_build_phase_histograms = {
+                phase: {
+                    "buckets": {
+                        bucket: 0 for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS
+                    },
+                    "sum": 0.0,
+                    "count": 0,
+                }
+                for phase in PRISM_TIP_REFRESH_BUILD_PHASES
+            }
         if not hasattr(self, "tip_refresh_client_counts"):
             self.tip_refresh_client_counts = {
                 result: 0 for result in PRISM_TIP_REFRESH_RESULTS
@@ -3965,6 +4437,20 @@ class PrismCoordinator:
             }
         if not hasattr(self, "tip_refresh_inflight"):
             self.tip_refresh_inflight = 0
+        if not hasattr(self, "tip_refresh_build_inflight"):
+            self.tip_refresh_build_inflight = 0
+        if not hasattr(self, "tip_refresh_build_queue_depth"):
+            self.tip_refresh_build_queue_depth = 0
+        if not hasattr(self, "tip_refresh_singleflight_hits"):
+            self.tip_refresh_singleflight_hits = 0
+        if not hasattr(self, "tip_refresh_superseded_results"):
+            self.tip_refresh_superseded_results = 0
+        if not hasattr(self, "tip_refresh_worker_failures"):
+            self.tip_refresh_worker_failures = 0
+        if not hasattr(self, "tip_refresh_worker_restarts"):
+            self.tip_refresh_worker_restarts = 0
+        if not hasattr(self, "tip_refresh_ipc_bytes"):
+            self.tip_refresh_ipc_bytes = {"input": 0, "output": 0}
         if not hasattr(self, "_tip_refresh_pending_event"):
             self._tip_refresh_pending_event = threading.Event()
         if not hasattr(self, "_tip_refresh_pending_counter"):
@@ -4204,6 +4690,33 @@ class PrismCoordinator:
                 if elapsed_seconds <= bucket:
                     buckets[bucket] = int(buckets.get(bucket, 0)) + 1
 
+    def _observe_tip_refresh_build_phase(
+        self,
+        phase: str,
+        elapsed_seconds: float,
+    ) -> None:
+        if phase not in PRISM_TIP_REFRESH_BUILD_PHASES:
+            raise ValueError(f"unknown tip refresh build phase: {phase}")
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_metrics_lock:
+            histogram = self.tip_refresh_build_phase_histograms[phase]
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + max(
+                0.0, elapsed_seconds
+            )
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
+    def _record_tip_refresh_ipc_bytes(self, direction: str, byte_count: int) -> None:
+        if direction not in {"input", "output"}:
+            raise ValueError(f"unknown tip refresh IPC direction: {direction}")
+        self._ensure_tip_refresh_state()
+        with self._tip_refresh_metrics_lock:
+            self.tip_refresh_ipc_bytes[direction] += max(0, int(byte_count))
+
     def _record_tip_refresh_client_result(self, result: str) -> None:
         if result not in PRISM_TIP_REFRESH_RESULTS:
             raise ValueError(f"unknown tip refresh result: {result}")
@@ -4260,6 +4773,7 @@ class PrismCoordinator:
             # socket send. Drain them before serve returns and the writer lease
             # is released; queued workers are cancelled without starting.
             executor.shutdown(wait=True, cancel_futures=True)
+        self.shutdown_payout_artifact_executor()
 
     def _initial_request_current_locked(self, request: PendingInitialJob) -> bool:
         client = request.client
@@ -6946,6 +7460,7 @@ class PrismCoordinator:
         if same_tip:
             return True
         if tip_changed:
+            self._cancel_obsolete_job_bundle_builds(current_tip=tip_hash)
             # Supersede payout preparation immediately. The preparer will
             # discard its old immutable candidate before publication; this
             # marker does not wait for its ledger/RPC work to finish.
@@ -9069,14 +9584,53 @@ class PrismCoordinator:
         canonical_output_path: Path | None = None,
         summary_only: bool = False,
     ) -> dict[str, Any]:
-        payload = {
-            "shares": shares,
+        payload: dict[str, object] = {
             "found_block": found_block,
             "prior_balances": prior_balances,
             "payout_policy": self.prism_payout_policy(),
             "coinbase_script_sig_suffix_hex": coinbase_script_sig_suffix_hex,
             "witness_merkle_leaves_hex": witness_merkle_leaves_hex or [],
         }
+        job_build_phase_local = getattr(self, "_job_build_phase_local", None)
+        record_phase_metrics = bool(
+            getattr(job_build_phase_local, "tip_refresh_metrics", False)
+        )
+        if summary_only:
+            artifact_started = time.monotonic()
+            identity_indexes: dict[tuple[str, str, str], int] = {}
+            identities: list[tuple[str, str, str]] = []
+            compact_shares: list[tuple[object, ...]] = []
+            for share in shares:
+                identity = (
+                    str(share["miner_id"]),
+                    str(share["order_key"]),
+                    str(share["p2mr_program_hex"]),
+                )
+                identity_index = identity_indexes.get(identity)
+                if identity_index is None:
+                    identity_index = len(identities)
+                    identity_indexes[identity] = identity_index
+                    identities.append(identity)
+                compact_shares.append(
+                    (
+                        share["share_seq"],
+                        share["share_id"],
+                        identity_index,
+                        share["share_difficulty"],
+                        share["job_issued_at_ms"],
+                        share["accepted_at_ms"],
+                        share.get("credit_policy"),
+                    )
+                )
+            payload["compact_share_identities"] = identities
+            payload["compact_shares"] = compact_shares
+            if record_phase_metrics:
+                self._observe_tip_refresh_build_phase(
+                    "serialization_copy",
+                    time.monotonic() - artifact_started,
+                )
+        else:
+            payload["shares"] = shares
         ctv_settlement = self.prism_ctv_settlement_config(
             block_height=int(found_block["block_height"]),
             parent_hash=ctv_fee_parent_hash,
@@ -9094,6 +9648,8 @@ class PrismCoordinator:
             self.ledger_attestation_signing_seed_hex,
         ]
         command.append("--job-summary-output" if summary_only else "--canonical-output")
+        if record_phase_metrics:
+            command.append("--phase-metrics")
         if canonical_output_path is not None:
             canonical_output_path.parent.mkdir(parents=True, exist_ok=True)
         succeeded = False
@@ -9119,12 +9675,31 @@ class PrismCoordinator:
                     stderr=stderr,
                     text=True,
                     encoding="utf-8",
+                    close_fds=True,
                 )
+                build_control = getattr(
+                    job_build_phase_local,
+                    "bundle_build_control",
+                    None,
+                )
+                if isinstance(build_control, _JobBundleBuildControl):
+                    self._register_job_bundle_process(build_control, process)
                 assert process.stdin is not None
+                input_byte_count = 0
+                serialization_started = time.monotonic()
+
+                class CountingWriter:
+                    def write(_self, fragment: str) -> int:
+                        nonlocal input_byte_count
+                        # json.dump's ensure_ascii default guarantees one output
+                        # byte per Python character for this UTF-8 text pipe.
+                        input_byte_count += len(fragment)
+                        return process.stdin.write(fragment)
+
                 try:
                     # iterencode writes bounded fragments to the child instead
                     # of allocating a second full JSON representation in Python.
-                    json.dump(payload, process.stdin, separators=(",", ":"))
+                    json.dump(payload, CountingWriter(), separators=(",", ":"))
                 except BrokenPipeError:
                     # Prefer the builder's diagnostic below.
                     pass
@@ -9137,14 +9712,96 @@ class PrismCoordinator:
                         process.stdin.close()
                     except BrokenPipeError:
                         pass
-                returncode = process.wait()
+                if record_phase_metrics:
+                    self._observe_tip_refresh_build_phase(
+                        "serialization_copy",
+                        time.monotonic() - serialization_started,
+                    )
+                    self._record_tip_refresh_ipc_bytes("input", input_byte_count)
+                try:
+                    returncode = process.wait(
+                        timeout=float(
+                            getattr(
+                                self,
+                                "bundle_build_timeout_seconds",
+                                DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
+                            )
+                        )
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    process.kill()
+                    process.wait()
+                    if record_phase_metrics:
+                        with self._tip_refresh_metrics_lock:
+                            self.tip_refresh_worker_failures += 1
+                    raise RuntimeError(
+                        "qbit-prism-build-audit-bundle timed out"
+                    ) from exc
                 stderr.seek(0)
                 error_text = stderr.read()
                 if returncode != 0:
+                    if (
+                        isinstance(build_control, _JobBundleBuildControl)
+                        and build_control.cancel_event.is_set()
+                    ):
+                        raise _JobBundleBuildSuperseded(
+                            "audit-builder subprocess was canceled after supersession"
+                        )
+                    if record_phase_metrics:
+                        with self._tip_refresh_metrics_lock:
+                            self.tip_refresh_worker_failures += 1
                     raise RuntimeError(
                         f"qbit-prism-build-audit-bundle failed: {error_text}"
                     )
+                if (
+                    isinstance(build_control, _JobBundleBuildControl)
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder result completed after supersession"
+                    )
                 output.flush()
+                output_size = os.fstat(output.fileno()).st_size
+                if record_phase_metrics:
+                    self._record_tip_refresh_ipc_bytes("output", output_size)
+                    for line in error_text.splitlines():
+                        if not line.startswith(PRISM_BUILDER_PHASE_METRICS_PREFIX):
+                            continue
+                        raw_metrics = line.removeprefix(
+                            PRISM_BUILDER_PHASE_METRICS_PREFIX
+                        )
+                        try:
+                            metrics = json.loads(raw_metrics)
+                            phase_seconds = metrics.get("phases_seconds", {})
+                            if isinstance(phase_seconds, dict):
+                                for phase in (
+                                    "payout_state_derivation",
+                                    "ctv_manifest_construction",
+                                    "coinbase_bundle_construction",
+                                    "signing_verification",
+                                ):
+                                    elapsed = phase_seconds.get(phase)
+                                    if isinstance(elapsed, (int, float)):
+                                        self._observe_tip_refresh_build_phase(
+                                            phase,
+                                            float(elapsed),
+                                        )
+                            rust_serialization = sum(
+                                float(metrics.get(name, 0.0))
+                                for name in (
+                                    "input_deserialization_seconds",
+                                    "output_serialization_seconds",
+                                )
+                            )
+                            self._observe_tip_refresh_build_phase(
+                                "serialization_copy",
+                                rust_serialization,
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            # Metrics are diagnostic only. A malformed timing
+                            # line must never invalidate an otherwise valid
+                            # signed bundle.
+                            pass
                 if canonical_output_path is not None:
                     os.fsync(output.fileno())
                 output.seek(0)
@@ -11979,9 +12636,24 @@ class PrismCoordinator:
                 }
                 for name, histogram in self.tip_refresh_histograms.items()
             }
+            phase_histograms = {
+                phase: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
+                }
+                for phase, histogram in self.tip_refresh_build_phase_histograms.items()
+            }
             client_counts = dict(self.tip_refresh_client_counts)
             cancellation_counts = dict(self.tip_refresh_cancellation_counts)
             inflight = self.tip_refresh_inflight
+            build_inflight = self.tip_refresh_build_inflight
+            build_queue_depth = self.tip_refresh_build_queue_depth
+            singleflight_hits = self.tip_refresh_singleflight_hits
+            superseded_results = self.tip_refresh_superseded_results
+            worker_failures = self.tip_refresh_worker_failures
+            worker_restarts = self.tip_refresh_worker_restarts
+            ipc_bytes = dict(self.tip_refresh_ipc_bytes)
 
         metric_names = {
             "refresh": "qbit_prism_tip_refresh_seconds",
@@ -12013,6 +12685,28 @@ class PrismCoordinator:
                     f'{metric_name}_count {histogram["count"]}',
                 ]
             )
+        phase_metric_name = "qbit_prism_tip_refresh_bundle_phase_seconds"
+        lines.extend(
+            [
+                "# HELP qbit_prism_tip_refresh_bundle_phase_seconds Shared bundle-build phase wall time.",
+                "# TYPE qbit_prism_tip_refresh_bundle_phase_seconds histogram",
+            ]
+        )
+        for phase in PRISM_TIP_REFRESH_BUILD_PHASES:
+            histogram = phase_histograms[phase]
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            lines.extend(
+                [
+                    *[
+                        f'{phase_metric_name}_bucket{{phase="{phase}",le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+                        for bucket in PRISM_TIP_REFRESH_SECONDS_BUCKETS
+                    ],
+                    f'{phase_metric_name}_bucket{{phase="{phase}",le="+Inf"}} {histogram["count"]}',
+                    f'{phase_metric_name}_sum{{phase="{phase}"}} {float(histogram["sum"]):.6f}',
+                    f'{phase_metric_name}_count{{phase="{phase}"}} {histogram["count"]}',
+                ]
+            )
         lines.extend(
             [
                 "# HELP qbit_prism_tip_refresh_clients_total Client outcomes from tip/template refresh passes.",
@@ -12033,6 +12727,30 @@ class PrismCoordinator:
                 "# HELP qbit_prism_tip_refresh_executor_workers Configured persistent refresh executor workers, or zero before creation.",
                 "# TYPE qbit_prism_tip_refresh_executor_workers gauge",
                 f"qbit_prism_tip_refresh_executor_workers {executor_workers}",
+                "# HELP qbit_prism_tip_refresh_bundle_inflight Shared bundle builds currently running.",
+                "# TYPE qbit_prism_tip_refresh_bundle_inflight gauge",
+                f"qbit_prism_tip_refresh_bundle_inflight {build_inflight}",
+                "# HELP qbit_prism_tip_refresh_bundle_queue_depth Shared bundle callers waiting on bounded build admission or an identical single-flight.",
+                "# TYPE qbit_prism_tip_refresh_bundle_queue_depth gauge",
+                f"qbit_prism_tip_refresh_bundle_queue_depth {build_queue_depth}",
+                "# HELP qbit_prism_tip_refresh_bundle_singleflight_hits_total Shared bundle callers coalesced behind an identical build.",
+                "# TYPE qbit_prism_tip_refresh_bundle_singleflight_hits_total counter",
+                f"qbit_prism_tip_refresh_bundle_singleflight_hits_total {singleflight_hits}",
+                "# HELP qbit_prism_tip_refresh_bundle_superseded_results_total Completed or canceled shared bundles discarded after supersession.",
+                "# TYPE qbit_prism_tip_refresh_bundle_superseded_results_total counter",
+                f"qbit_prism_tip_refresh_bundle_superseded_results_total {superseded_results}",
+                "# HELP qbit_prism_tip_refresh_builder_worker_failures_total Audit-builder subprocess failures.",
+                "# TYPE qbit_prism_tip_refresh_builder_worker_failures_total counter",
+                f"qbit_prism_tip_refresh_builder_worker_failures_total {worker_failures}",
+                "# HELP qbit_prism_tip_refresh_builder_worker_restarts_total Long-lived builder worker restarts; zero for the inline subprocess design.",
+                "# TYPE qbit_prism_tip_refresh_builder_worker_restarts_total counter",
+                f"qbit_prism_tip_refresh_builder_worker_restarts_total {worker_restarts}",
+                "# HELP qbit_prism_tip_refresh_builder_ipc_bytes_total Bytes copied across audit-builder subprocess IPC.",
+                "# TYPE qbit_prism_tip_refresh_builder_ipc_bytes_total counter",
+                *[
+                    f'qbit_prism_tip_refresh_builder_ipc_bytes_total{{direction="{direction}"}} {int(ipc_bytes.get(direction, 0))}'
+                    for direction in ("input", "output")
+                ],
             ]
         )
         return lines
