@@ -308,7 +308,7 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
         self.assertEqual(broadcaster.tip_probes, 0)
         self.assertEqual(ledger.lease_renewals, 1)
 
-    def test_yielded_pass_defers_lease_renewal_to_next_pass(self) -> None:
+    def test_yielded_pass_without_writes_still_renews_lease(self) -> None:
         ledger = FakeLedger([pending_row()])
         daemon = CtvFanoutBroadcastDaemon(ledger, FakeBroadcaster({}), fee_sats=0)
 
@@ -316,7 +316,32 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
 
         self.assertTrue(result.yielded_to_tip_refresh)
         self.assertEqual(result.scanned_count, 0)
-        self.assertEqual(ledger.lease_renewals, 0)
+        self.assertEqual(ledger.lease_renewals, 1)
+
+    def test_mid_pass_yield_after_immature_skips_still_renews_lease(self) -> None:
+        # Repeated tip-refresh yields across write-free passes must not let
+        # the writer lease lapse now that immature rows skip their no-op
+        # (lease-refreshing) status rewrites.
+        txids = ["aa" * 32, "bb" * 32]
+        ledger = FakeLedger([awaiting_maturity_row(txid) for txid in txids])
+        broadcaster = FakeBroadcaster({}, tip=1099)
+        refresh_pending = False
+
+        def flag_refresh() -> None:
+            nonlocal refresh_pending
+            refresh_pending = True
+
+        result = CtvFanoutBroadcastDaemon(ledger, broadcaster, fee_sats=0).run_once(
+            chunk_size=1,
+            progress_callback=flag_refresh,
+            tip_refresh_pending=lambda: refresh_pending,
+        )
+
+        self.assertTrue(result.yielded_to_tip_refresh)
+        self.assertEqual(result.scanned_count, 1)
+        self.assertEqual(ledger.updates, [])
+        self.assertEqual(ledger.attempts, [])
+        self.assertEqual(ledger.lease_renewals, 1)
 
     def test_ledger_without_lease_renewal_support_is_tolerated(self) -> None:
         result = CtvFanoutBroadcastDaemon(

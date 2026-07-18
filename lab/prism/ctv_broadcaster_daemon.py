@@ -225,13 +225,14 @@ class CtvFanoutBroadcastDaemon:
                     )
                 )
 
-        if not wrote_ledger and not yielded_to_tip_refresh:
+        if not wrote_ledger:
             # Fenced writes are the only thing that refreshes the writer
             # lease, and the no-op status rewrites this pass used to make were
             # an otherwise-idle daemon's only fenced writes. Renew explicitly
             # so the lease does not sit expired while idle and a fenced-out
-            # daemon still fails fast. A yielded pass stays out of the tip
-            # refresh's way; the next pass renews.
+            # daemon still fails fast. Yielded passes renew too: consecutive
+            # yields must not let the lease lapse, and the single lease-row
+            # update is negligible next to the per-row work a yield defers.
             renew_writer_lease = getattr(self.ledger, "renew_writer_lease", None)
             if renew_writer_lease is not None:
                 renew_writer_lease()
