@@ -36,9 +36,12 @@ handling does not race ahead by reading a merely detected tip while replacement
 work is still being built. This is especially important when stale grace is
 zero: miners keep receiving normal credit for the work the coordinator is still
 advertising until the prepared tip, snapshot, and cancellation token are
-published atomically. Block candidates independently recheck qbit's live tip
-before `submitblock`, so an old-tip share accepted during preparation is never
-sent as a stale block.
+published atomically. Direct issuance paths (initial delivery retries, Vardiff
+retargets, reauthorization) stay pinned to the published snapshot during that
+window for the same reason: work issued for a merely detected tip would have
+every share rejected until publication. Block candidates independently recheck
+qbit's live tip before `submitblock`, so an old-tip share accepted during
+preparation is never sent as a stale block.
 
 Stale-grace credited shares are accepted shares, not rejections. When
 `PRISM_STRATUM_STALE_GRACE_SECONDS` is non-zero, a same-connection share whose

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 
 from lab.prism.prism_coordinator import TemplateRefreshBlocked
@@ -346,6 +347,64 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                 self.assertEqual(server.current_tip_first_seen[0], published_tip[0])
             finally:
                 server._clear_active_tip_refresh(token, cancellation)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_direct_issuance_pins_published_snapshot_during_unpublished_window(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            published_tip = server.current_tip_first_seen
+            assert published_tip is not None
+
+            # Detect a replacement tip and let its template fetch install the
+            # new global artifacts, exactly like an in-flight refresh does
+            # before publication.
+            next_tip = "77" * 32
+            rpc.tip = next_tip
+            rpc.template = base_template(height=11, prevhash=next_tip)
+            sequence = server._reserve_tip_observation_sequence()
+            self.assertTrue(
+                server.observe_tip_for_refresh(
+                    next_tip,
+                    observation_sequence=sequence,
+                    mark_pending=False,
+                )
+            )
+            server.fetch_qbit_tip_template_snapshot()
+            with server._job_cache_lock:
+                self.assertEqual(
+                    server._template_artifacts.previousblockhash,
+                    next_tip,
+                )
+
+            # Direct issuance stays pinned to the published snapshot while the
+            # published tip still owns share classification, so the issued job
+            # is immediately creditable.
+            artifacts = server.job_issuance_template_artifacts()
+            self.assertEqual(artifacts.previousblockhash, published_tip[0])
+            context = server.build_job_for_client(state, clean_jobs=False)
+            self.assertEqual(
+                str(context.template["previousblockhash"]),
+                published_tip[0],
+            )
+
+            # Once the published authority lapses, issuance falls through to
+            # the live template, mirroring the submit-path RPC fallback.
+            server.current_tip_observed_monotonic = (
+                time.monotonic()
+                - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
+                - 1.0
+            )
+            server.template_refresh_failure_exit_seconds = 0.0
+            lapsed = server.job_issuance_template_artifacts()
+            self.assertEqual(lapsed.previousblockhash, next_tip)
         finally:
             server.shutdown_tip_refresh_executor()
 

@@ -127,6 +127,16 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         state.difficulty_generation = 0
         server.clients = {state}
         server._ensure_initial_job_state()
+        # Lapse the published authority entirely: age the freshness stamp and
+        # close the divergence lease so the live RPC read owns classification
+        # again, which is the only state where prepared published-tip work
+        # must be dropped instead of delivered.
+        server.current_tip_observed_monotonic = (
+            time.monotonic()
+            - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
+            - 1.0
+        )
+        server.template_refresh_failure_exit_seconds = 0.0
         request = PendingInitialJob(
             client=state,
             authorization_generation=1,
@@ -168,6 +178,62 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertTrue(server._run_initial_job(request))
         self.assertEqual(best_tip_calls, 3)
         self.assertEqual(waits, [0.05, 0.1])
+
+    def test_initial_delivery_keeps_authoritative_published_work_on_tip_churn(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        bundle = server.prewarm_current_tip_ready_bundle()
+        state = client(1)
+        state.authorization_generation = 1
+        state.difficulty_generation = 0
+        server.clients = {state}
+        server._ensure_initial_job_state()
+        request = PendingInitialJob(
+            client=state,
+            authorization_generation=1,
+            worker=state.worker,
+            requested_monotonic=0.0,
+            deadline_monotonic=None,
+            connection_id=state.connection_id,
+            difficulty_generation=0,
+        )
+        server.pending_initial_jobs[state] = request
+        artifacts = server.current_template_artifacts()
+        waits: list[float] = []
+        request.cancelled.wait = (  # type: ignore[method-assign]
+            lambda timeout: waits.append(timeout) or False
+        )
+        original_call = rpc.call
+        detected_tip = "ee" * 32
+        best_tip_calls = 0
+
+        def churned_tip(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            nonlocal best_tip_calls
+            if method == "getbestblockhash":
+                best_tip_calls += 1
+                return detected_tip
+            return original_call(method, params)
+
+        rpc.call = churned_tip  # type: ignore[method-assign]
+        server.current_template_artifacts = lambda: artifacts  # type: ignore[method-assign]
+        server.shared_job_bundle = lambda *_args, **_kwargs: bundle  # type: ignore[method-assign]
+        server._deliver_initial_bundle = (  # type: ignore[method-assign]
+            lambda *_args: True
+        )
+
+        # The published tip is fresh, so a live read racing ahead of the
+        # refresh must not drop deliverable published-tip work; it is only
+        # recorded as a detection for the refresh path to act on.
+        self.assertTrue(server._run_initial_job(request))
+        self.assertEqual(best_tip_calls, 1)
+        self.assertEqual(waits, [])
+        self.assertEqual(server.latest_detected_tip[0], detected_tip)
+        published = server.current_tip_first_seen
+        assert published is not None
+        self.assertEqual(published[0], artifacts.previousblockhash)
 
     def test_250_client_reconnect_storm_uses_one_build_without_client_locks(self) -> None:
         server, _rpc = coordinator()
