@@ -12,6 +12,7 @@ import dataclasses
 import errno
 from functools import wraps
 import hashlib
+import heapq
 import http.client
 import json
 import math
@@ -1347,6 +1348,34 @@ class _BoundedPriorityExecutor:
                     self._active_workers -= 1
                 self._queue.task_done()
 
+    def cancel(self, future: Future[Any]) -> bool:
+        """Cancel ``future`` and immediately discard it when still queued.
+
+        ``Future.cancel`` alone leaves the cancelled entry in PriorityQueue
+        until a worker dequeues it. Removing the exact entry while holding the
+        queue mutex makes bounded admission available to a replacement at the
+        cancellation boundary. A worker that already dequeued the entry owns
+        the normal ``task_done`` path, so the two paths cannot double-release.
+        """
+        removed = False
+        with self._queue.mutex:
+            queued_items = self._queue.queue
+            for index, item in enumerate(queued_items):
+                if item[2] is not future:
+                    continue
+                queued_items.pop(index)
+                heapq.heapify(queued_items)
+                self._queue.unfinished_tasks -= 1
+                if self._queue.unfinished_tasks == 0:
+                    self._queue.all_tasks_done.notify_all()
+                self._queue.not_full.notify()
+                removed = True
+                break
+        # Invoke callbacks only after releasing the queue mutex. Initial-job
+        # cancellation callbacks may submit a replacement to this executor.
+        future.cancel()
+        return removed
+
     def stats(self) -> tuple[int, int]:
         with self._lock:
             return self._queue.qsize(), self._active_workers
@@ -2408,6 +2437,7 @@ class PrismCoordinator:
         self.initial_job_timeout_count = 0
         self.initial_job_cancelled_count = 0
         self.initial_job_coalesced_count = 0
+        self.initial_job_queue_capacity_reclaimed_count = 0
         self.last_initial_job_delivery_monotonic: float | None = None
         self._mining_overload_started_monotonic: float | None = None
         self._mining_delivery_failure_started_monotonic: float | None = None
@@ -6435,6 +6465,8 @@ class PrismCoordinator:
             self.initial_job_cancelled_count = 0
         if not hasattr(self, "initial_job_coalesced_count"):
             self.initial_job_coalesced_count = 0
+        if not hasattr(self, "initial_job_queue_capacity_reclaimed_count"):
+            self.initial_job_queue_capacity_reclaimed_count = 0
         if not hasattr(self, "initial_job_sent_count"):
             self.initial_job_sent_count = 0
         if not hasattr(self, "initial_job_failed_count"):
@@ -6909,10 +6941,13 @@ class PrismCoordinator:
         self._ensure_initial_job_state()
         with self.lock:
             for request in tuple(self.pending_initial_jobs.values()):
+                if self.pending_initial_jobs.get(request.client) is not request:
+                    continue
+                self.pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
                 if request.future is not None:
-                    request.future.cancel()
-            self.pending_initial_jobs.clear()
+                    self._cancel_initial_job_future(request.future)
+                self.initial_job_cancelled_count += 1
         with self._initial_job_executor_lock:
             executor = self._initial_job_executor
             self._initial_job_executor = None
@@ -6940,11 +6975,28 @@ class PrismCoordinator:
         self.shutdown_job_build_executor()
         self.shutdown_payout_artifact_executor()
 
+    def _cancel_initial_job_future(self, future: Future[bool]) -> bool:
+        """Cancel one initial-job future and account physical queue removal."""
+        executor = getattr(self, "_initial_job_executor", None)
+        reclaimed = bool(
+            executor is not None
+            and executor.cancel(future)
+        )
+        if executor is None:
+            future.cancel()
+        if reclaimed:
+            with self.lock:
+                self._ensure_initial_job_state()
+                self.initial_job_queue_capacity_reclaimed_count += 1
+        return reclaimed
+
     def _initial_request_current_locked(self, request: PendingInitialJob) -> bool:
         client = request.client
+        deadline = request.deadline_monotonic
         return (
             self.pending_initial_jobs.get(client) is request
             and client in self.clients
+            and not getattr(client, "closing", False)
             and (
                 request.connection_id is None
                 or client.connection_id == request.connection_id
@@ -6959,6 +7011,7 @@ class PrismCoordinator:
                 or int(getattr(client, "difficulty_generation", 0))
                 == request.difficulty_generation
             )
+            and (deadline is None or time.monotonic() < deadline)
             and not request.cancelled.is_set()
         )
 
@@ -6981,7 +7034,7 @@ class PrismCoordinator:
             return None
         request.cancelled.set()
         if request.future is not None:
-            request.future.cancel()
+            self._cancel_initial_job_future(request.future)
         if count:
             self.initial_job_cancelled_count += 1
         return request
@@ -7036,7 +7089,7 @@ class PrismCoordinator:
             if request is not None:
                 request.cancelled.set()
                 if request.future is not None:
-                    request.future.cancel()
+                    self._cancel_initial_job_future(request.future)
                 delivered = time.monotonic()
                 self.initial_job_sent_count += 1
                 self.initial_job_delivery_latency_seconds_sum += max(
@@ -7089,7 +7142,7 @@ class PrismCoordinator:
                 if existing is not None:
                     self.pending_initial_jobs.pop(client, None)
                     if superseded_future is not None:
-                        superseded_future.cancel()
+                        self._cancel_initial_job_future(superseded_future)
                 return True
             if (
                 existing is None
@@ -7123,7 +7176,7 @@ class PrismCoordinator:
             # Install the replacement before cancellation callbacks can run;
             # the predecessor callback then hands off exactly one client slot
             # instead of mistaking the obsolete request for a terminal failure.
-            superseded_future.cancel()
+            self._cancel_initial_job_future(superseded_future)
         if reject or request is None:
             self.disconnect_client(client)
             return False
@@ -7151,18 +7204,24 @@ class PrismCoordinator:
                 priority=PRISM_DELIVERY_PRIORITY_INITIAL,
             )
         except (_DeliveryQueueFull, RuntimeError):
+            disconnect = False
             with self.lock:
                 if self.pending_initial_jobs.get(client) is request:
                     self.pending_initial_jobs.pop(client, None)
                     request.cancelled.set()
                     self.initial_job_queue_rejection_count += 1
-            self.disconnect_client(client)
-            return False
+                    disconnect = True
+            if disconnect:
+                self.disconnect_client(client)
+            # An obsolete submit can race its already-installed replacement.
+            # It owns neither the client slot nor the right to retire the live
+            # session when admission fails.
+            return not disconnect
         with self.lock:
             if self.pending_initial_jobs.get(client) is request:
                 request.future = future
             else:
-                future.cancel()
+                self._cancel_initial_job_future(future)
         future.add_done_callback(
             lambda completed: self._initial_job_future_finished(request, completed)
         )
@@ -7203,14 +7262,26 @@ class PrismCoordinator:
                 ):
                     current.predecessor = None
                     replacement = current
-            elif delivered and self._client_has_current_tip_job_locked(request.client):
+            elif (
+                delivered
+                and self._initial_request_current_locked(request)
+                and self._client_has_current_tip_job_locked(request.client)
+            ):
                 self.pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
                 self.last_initial_job_delivery_monotonic = time.monotonic()
             elif current is request:
                 self.pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
-                self.initial_job_failed_count += 1
+                if (
+                    request.deadline_monotonic is not None
+                    and request.deadline_monotonic <= time.monotonic()
+                ):
+                    request.client.closing = True
+                    self.initial_job_timeout_count += 1
+                    self.initial_job_cancelled_count += 1
+                else:
+                    self.initial_job_failed_count += 1
                 disconnect = True
         if replacement is not None:
             self._submit_initial_job_request(replacement)
@@ -7503,12 +7574,13 @@ class PrismCoordinator:
                 self.pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
                 if request.future is not None:
-                    request.future.cancel()
+                    self._cancel_initial_job_future(request.future)
                 # Commit teardown while this request still owns the pending
                 # slot. A concurrent reauthorization will observe closing and
                 # cannot install a replacement between expiry and disconnect.
                 request.client.closing = True
                 self.initial_job_timeout_count += 1
+                self.initial_job_cancelled_count += 1
                 timed_out.append(request)
         for request in timed_out:
             self.disconnect_client(request.client)
@@ -11771,6 +11843,24 @@ class PrismCoordinator:
             worker = self.resolve_worker(username)
             with client.job_update_lock:
                 was_authorized = client.authorized
+                if was_authorized:
+                    with self.lock:
+                        self._ensure_initial_job_state()
+                        if (
+                            client not in self.pending_initial_jobs
+                            and len(self.pending_initial_jobs)
+                            >= self.stratum_max_pending_initial_jobs
+                            and self._client_has_current_tip_job_locked(client)
+                        ):
+                            # Reject before mutating identity or difficulty. A
+                            # working session keeps its current authorization
+                            # when there is no live first-job slot for the
+                            # superseding generation.
+                            raise StratumError(
+                                20,
+                                "initial job delivery capacity unavailable",
+                                disconnect=False,
+                            )
                 if not self.reserve_client_username(client, worker):
                     raise StratumError(
                         20,
@@ -16768,6 +16858,9 @@ class PrismCoordinator:
             queue_rejections = self.initial_job_queue_rejection_count
             cancelled = self.initial_job_cancelled_count
             coalesced = self.initial_job_coalesced_count
+            queue_capacity_reclaimed = (
+                self.initial_job_queue_capacity_reclaimed_count
+            )
             peak = self.peak_active_connection_count
             handlers = self.handler_thread_count
 
@@ -16877,6 +16970,7 @@ class PrismCoordinator:
             "initial_job_timeout_disconnects": timeout_disconnects,
             "initial_job_cancelled_tasks": cancelled,
             "initial_job_coalesced_tasks": coalesced,
+            "initial_job_queue_capacity_reclaimed": queue_capacity_reclaimed,
             "handler_threads": handlers,
             "delivery_executor_queue_depth": queue_depth,
             "delivery_executor_active_workers": active_workers,
@@ -17202,6 +17296,9 @@ class PrismCoordinator:
             "# TYPE qbit_prism_stratum_initial_job_tasks_total counter",
             f'qbit_prism_stratum_initial_job_tasks_total{{result="cancelled"}} {mining_metrics["initial_job_cancelled_tasks"]}',
             f'qbit_prism_stratum_initial_job_tasks_total{{result="coalesced"}} {mining_metrics["initial_job_coalesced_tasks"]}',
+            "# HELP qbit_prism_stratum_initial_job_queue_capacity_reclaimed_total Queued first-job admission slots reclaimed immediately by cancellation.",
+            "# TYPE qbit_prism_stratum_initial_job_queue_capacity_reclaimed_total counter",
+            f'qbit_prism_stratum_initial_job_queue_capacity_reclaimed_total {mining_metrics["initial_job_queue_capacity_reclaimed"]}',
             "# HELP qbit_prism_stratum_clients_with_current_tip_jobs Authorized clients holding usable current-tip work.",
             "# TYPE qbit_prism_stratum_clients_with_current_tip_jobs gauge",
             f"qbit_prism_stratum_clients_with_current_tip_jobs {mining_metrics['clients_with_current_tip_jobs']}",
@@ -17601,6 +17698,9 @@ class PrismCoordinator:
             }
             latency_sum = self.initial_job_delivery_latency_seconds_sum
             latency_count = self.initial_job_delivery_latency_count
+            queue_capacity_reclaimed = (
+                self.initial_job_queue_capacity_reclaimed_count
+            )
         executor = getattr(self, "_initial_job_executor", None)
         queued, slots = executor.stats() if executor is not None else (0, 0)
         configured_workers = int(
@@ -17659,6 +17759,9 @@ class PrismCoordinator:
                 f'qbit_prism_initial_job_requests_total{{result="{result}"}} {count}'
                 for result, count in sorted(counts.items())
             ],
+            "# HELP qbit_prism_initial_job_queue_capacity_reclaimed_total Queued initial-job slots reclaimed immediately by cancellation.",
+            "# TYPE qbit_prism_initial_job_queue_capacity_reclaimed_total counter",
+            f"qbit_prism_initial_job_queue_capacity_reclaimed_total {queue_capacity_reclaimed}",
             "# HELP qbit_prism_shared_bundle_preparation_seconds Heavy shared bundle preparation wall time.",
             "# TYPE qbit_prism_shared_bundle_preparation_seconds summary",
             f"qbit_prism_shared_bundle_preparation_seconds_sum {preparation_sum:.6f}",
