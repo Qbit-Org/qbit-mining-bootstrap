@@ -773,9 +773,11 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         server.initial_job_max_workers = 4
         workers_ready = 0
         workers_contending = 0
+        workers_passed_priority = 0
         worker_lock = threading.Lock()
         all_workers_ready = threading.Event()
         all_workers_contending = threading.Event()
+        any_worker_passed_priority = threading.Event()
         contend = threading.Event()
         release_workers = threading.Event()
 
@@ -784,6 +786,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             *,
             publication_critical: bool,
             source: str,
+            requested_monotonic: float | None = None,
         ) -> SimpleNamespace:
             return SimpleNamespace(
                 idle_retarget=False,
@@ -794,30 +797,33 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
                 promise=Future(),
                 publication_critical=publication_critical,
                 request_source=source,
-                requested_monotonic=time.monotonic(),
+                requested_monotonic=(
+                    time.monotonic()
+                    if requested_monotonic is None
+                    else requested_monotonic
+                ),
                 priority_admission_recorded=False,
             )
 
         def contending_initial(_request: PendingInitialJob) -> bool:
-            nonlocal workers_ready, workers_contending
+            nonlocal workers_ready, workers_contending, workers_passed_priority
             with worker_lock:
                 workers_ready += 1
                 if workers_ready == server.initial_job_max_workers:
                     all_workers_ready.set()
             if not contend.wait(5):
                 raise AssertionError("test did not release initial builders")
-            deferred = server._request_job_build(  # type: ignore[arg-type]
-                build_request(
-                    "published-tip",
-                    publication_critical=False,
-                    source="initial",
-                )
-            )
-            self.assertFalse(deferred.done())
             with worker_lock:
                 workers_contending += 1
                 if workers_contending == server.initial_job_max_workers:
                     all_workers_contending.set()
+            server._await_publication_priority_clear(
+                request_source="initial",
+                cancelled=_request.cancelled.is_set,
+            )
+            with worker_lock:
+                workers_passed_priority += 1
+                any_worker_passed_priority.set()
             release_workers.wait(5)
             return False
 
@@ -832,12 +838,6 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertEqual(len(server.pending_initial_jobs), 128)
         self.assertEqual(server.initial_job_executor().stats(), (124, 4))
 
-        latest = build_request(
-            "latest-tip",
-            publication_critical=True,
-            source="tip_refresh",
-        )
-
         def start_without_execution(request: object) -> SimpleNamespace:
             server.job_build_scheduler_counts["starts"] += 1
             server._record_priority_admission_locked(  # type: ignore[arg-type]
@@ -849,12 +849,25 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         server._start_job_build_locked = start_without_execution  # type: ignore[method-assign]
         server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
         admission_started = time.monotonic()
-        latest_promise = server._request_job_build(latest)  # type: ignore[arg-type]
+        priority_token, priority_requested = (
+            server._begin_job_build_priority_preparation()
+        )
+        latest = build_request(
+            "latest-tip",
+            publication_critical=True,
+            source="tip_refresh",
+            requested_monotonic=priority_requested,
+        )
+        try:
+            latest_promise = server._request_job_build(latest)  # type: ignore[arg-type]
+        finally:
+            server._finish_job_build_priority_preparation(priority_token)
         admission_elapsed = time.monotonic() - admission_started
         contend.set()
 
         try:
             self.assertTrue(all_workers_contending.wait(5))
+            self.assertFalse(any_worker_passed_priority.wait(0.1))
             self.assertLess(admission_elapsed, 0.1)
             self.assertIs(latest_promise, latest.promise)
             self.assertFalse(latest.cancellation.is_set())
@@ -873,10 +886,12 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
                 1,
             )
         finally:
-            release_workers.set()
-            server.shutdown_initial_job_executor()
             with server._job_build_scheduler_lock:
                 server._job_build_active = None
+                server._job_build_priority_changed.set()
+            release_workers.set()
+            server.shutdown_initial_job_executor()
+        self.assertEqual(workers_passed_priority, 4)
 
     def test_shutdown_cancels_queued_initial_work_and_joins_both_executors(self) -> None:
         server = coordinator(connection_limit=4, pending_limit=3)

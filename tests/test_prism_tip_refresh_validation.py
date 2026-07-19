@@ -1528,13 +1528,9 @@ class TipRefreshValidationTests(unittest.TestCase):
             new_poll.join(5)
 
         self.assertFalse(old_poll.is_alive())
-        self.assertEqual(results["old"], [])
-        self.assertEqual(len(errors["old"]), 1)
-        self.assertIsInstance(errors["old"][0], TemplateRefreshBlocked)
-        try:
-            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
-        finally:
-            server.shutdown_tip_refresh_executor()
+        server.shutdown_tip_refresh_executor()
+        self.assertEqual(errors["old"], [])
+        self.assertEqual(results["old"], [1])
         self.assertTrue(replacement_started.is_set())
         self.assertEqual(sent_generations, [1])
         self.assertEqual(max_active_builders, 1)
@@ -3143,7 +3139,9 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(second.active_job.payout_state_generation, 1)
         self.assertTrue(server._tip_refresh_retry.is_set())
 
-    def test_payout_change_after_client_selection_retries_full_same_tip_set(self) -> None:
+    def test_payout_change_after_client_selection_coalesces_full_same_tip_set(
+        self,
+    ) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)
         first = client(1)
@@ -3172,13 +3170,6 @@ class TipRefreshValidationTests(unittest.TestCase):
 
             server.prepare_tip_refresh_bundle = advance_before_prepare  # type: ignore[method-assign]
 
-            with self.assertRaises(TemplateRefreshBlocked):
-                server.poll_qbit_tip_template_once()
-
-            self.assertIsNone(first.active_job)
-            self.assertEqual(second.active_job.payout_state_generation, 0)
-            self.assertTrue(server._tip_refresh_retry.is_set())
-
             self.assertEqual(server.poll_qbit_tip_template_once(), 2)
         finally:
             server.shutdown_tip_refresh_executor()
@@ -3195,6 +3186,51 @@ class TipRefreshValidationTests(unittest.TestCase):
             sum(payload["method"] == "mining.notify" for payload in second_sent),
             2,
         )
+        self.assertFalse(server.tip_refresh_is_pending())
+
+    def test_payout_change_during_build_coalesces_latest_generation(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        sent_generations: list[int] = []
+
+        def record_send(payload: dict[str, object]) -> None:
+            if payload["method"] == "mining.notify":
+                assert state.active_job is not None
+                sent_generations.append(
+                    state.active_job.payout_state_generation
+                )
+
+        state.send = record_send  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        original_build = server.build_shared_job_bundle
+        build_calls = 0
+
+        def advance_first_build(*args: object, **kwargs: object) -> object:
+            nonlocal build_calls
+            build_calls += 1
+            if build_calls == 1:
+                self.assertEqual(server._advance_payout_state_generation(), 1)
+            return original_build(*args, **kwargs)  # type: ignore[arg-type]
+
+        server.build_shared_job_bundle = advance_first_build  # type: ignore[method-assign]
+
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(build_calls, 2)
+        self.assertEqual(sent_generations, [1])
+        self.assertIsNotNone(state.active_job)
+        self.assertEqual(state.active_job.payout_state_generation, 1)
+        self.assertTrue(
+            all(
+                bundle.payout_state_generation == 1
+                for bundle in server._job_bundle_cache.values()
+            )
+        )
+        self.assertFalse(server.tip_refresh_is_pending())
 
     def test_executor_submission_failure_cancels_and_drains_started_work(self) -> None:
         server, _rpc = coordinator()

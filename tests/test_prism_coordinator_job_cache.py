@@ -2589,6 +2589,177 @@ class JobBundleCacheTests(unittest.TestCase):
             1,
         )
 
+    def test_publication_critical_build_restarts_unhealthy_exact_flight(
+        self,
+    ) -> None:
+        for unhealthy in ("almost_expired", "stalled"):
+            with self.subTest(unhealthy=unhealthy):
+                server, rpc = coordinator()
+                artifacts = server.store_template_artifacts(dict(rpc.template))
+                assert artifacts is not None
+                payout_generation = server._payout_state_generation
+
+                def request_for(
+                    *,
+                    publication_critical: bool,
+                    priority_requested_monotonic: float | None = None,
+                ) -> object:
+                    return server._new_job_build_request(
+                        artifacts,
+                        None,
+                        mode="ready",
+                        payout_state_generation=payout_generation,
+                        cache_key=server._job_bundle_key(
+                            artifacts,
+                            mode="ready",
+                            payout_state_generation=payout_generation,
+                            worker=None,
+                        ),
+                        publication_critical=publication_critical,
+                        request_source=(
+                            "tip_refresh"
+                            if publication_critical
+                            else "initial"
+                        ),
+                        priority_requested_monotonic=(
+                            priority_requested_monotonic
+                        ),
+                    )
+
+                routine = request_for(publication_critical=False)
+                now = time.monotonic()
+                if unhealthy == "almost_expired":
+                    routine.cancellation.started_monotonic = now - 59.99
+                    routine.cancellation.deadline_monotonic = now + 0.01
+                    routine.cancellation.last_checkpoint_monotonic = now
+                else:
+                    routine.cancellation.started_monotonic = now - 1.0
+                    routine.cancellation.deadline_monotonic = now + 59.0
+                    routine.cancellation.last_checkpoint_monotonic = (
+                        now - server.job_build_cancel_grace_seconds - 0.01
+                    )
+                priority_requested = now - 59.0
+                latest = request_for(
+                    publication_critical=True,
+                    priority_requested_monotonic=priority_requested,
+                )
+                routine_flight = SimpleNamespace(request=routine)
+                server._job_build_active = routine_flight
+                server._job_build_retiring = None
+                server._job_build_pending = None
+                server._start_job_build_locked = (  # type: ignore[method-assign]
+                    lambda request: SimpleNamespace(request=request, future=None)
+                )
+                server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
+
+                promise = server._request_job_build(latest)  # type: ignore[arg-type]
+
+                self.assertIs(promise, latest.promise)
+                self.assertIsNot(promise, routine.promise)
+                self.assertTrue(routine.cancellation.is_set())
+                self.assertIs(server._job_build_retiring, routine_flight)
+                assert server._job_build_active is not None
+                self.assertIs(server._job_build_active.request, latest)
+                self.assertEqual(
+                    latest.requested_monotonic,
+                    priority_requested,
+                )
+                self.assertGreater(
+                    latest.cancellation.deadline_monotonic
+                    - time.monotonic(),
+                    server.job_build_timeout_seconds - 1.0,
+                )
+                self.assertEqual(
+                    server.job_build_priority_counts["routine_preempted"],
+                    1,
+                )
+
+    def test_publication_priority_precedes_immutable_request_preparation(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        critical_preparation_entered = threading.Event()
+        release_critical_preparation = threading.Event()
+        initial_preparation_entered = threading.Event()
+        original_new_request = server._new_job_build_request
+
+        def observed_new_request(*args: object, **kwargs: object) -> object:
+            request_source = str(kwargs.get("request_source", "routine"))
+            if request_source == "tip_refresh":
+                critical_preparation_entered.set()
+                if not release_critical_preparation.wait(5):
+                    raise AssertionError("test did not release priority preparation")
+            elif request_source == "initial":
+                initial_preparation_entered.set()
+            return original_new_request(*args, **kwargs)  # type: ignore[arg-type]
+
+        server._new_job_build_request = observed_new_request  # type: ignore[method-assign]
+        results: dict[str, list[object]] = {"critical": [], "initial": []}
+        errors: list[BaseException] = []
+
+        def build(label: str, *, publication_critical: bool) -> None:
+            try:
+                results[label].append(
+                    server.shared_job_bundle(
+                        artifacts,
+                        mode="ready",
+                        publication_critical=publication_critical,
+                        request_source=(
+                            "tip_refresh" if publication_critical else "initial"
+                        ),
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        critical_thread = threading.Thread(
+            target=build,
+            args=("critical",),
+            kwargs={"publication_critical": True},
+        )
+        initial_thread = threading.Thread(
+            target=build,
+            args=("initial",),
+            kwargs={"publication_critical": False},
+        )
+        critical_thread.start()
+        try:
+            self.assertTrue(critical_preparation_entered.wait(5))
+            initial_thread.start()
+            self.assertFalse(initial_preparation_entered.wait(0.1))
+            metrics = "\n".join(server.job_build_metrics_lines())
+            self.assertIn("qbit_prism_job_build_priority_active 1", metrics)
+        finally:
+            release_critical_preparation.set()
+            critical_thread.join(5)
+            initial_thread.join(5)
+
+        self.assertFalse(critical_thread.is_alive())
+        self.assertFalse(initial_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([len(results[label]) for label in results], [1, 1])
+        self.assertIs(results["critical"][0], results["initial"][0])
+        self.assertFalse(initial_preparation_entered.is_set())
+        self.assertEqual(
+            server.initial_job_prepared_work_counts["deferred"],
+            1,
+        )
+        self.assertEqual(
+            server.initial_job_prepared_work_counts["cache_hit"],
+            1,
+        )
+        self.assertEqual(
+            server.job_build_priority_admission_seconds["count"],
+            1,
+        )
+        self.assertGreaterEqual(
+            server.job_build_priority_admission_seconds["sum"],
+            0.1,
+        )
+
     def test_publication_critical_collection_promotes_past_ready_work(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
         old_artifacts = server.store_template_artifacts(dict(rpc.template))
@@ -2647,6 +2818,79 @@ class JobBundleCacheTests(unittest.TestCase):
             server.job_build_priority_counts["routine_preempted"],
             1,
         )
+
+    def test_routine_pending_never_promotes_over_publication_critical_flight(
+        self,
+    ) -> None:
+        for placement in ("active", "retiring"):
+            with self.subTest(placement=placement):
+                server, rpc = coordinator()
+                critical_artifacts = server.store_template_artifacts(
+                    dict(rpc.template)
+                )
+                routine_artifacts = server.store_template_artifacts(
+                    base_template(height=11, prevhash="22" * 32)
+                )
+                assert critical_artifacts is not None
+                assert routine_artifacts is not None
+                payout_generation = server._payout_state_generation
+
+                def request_for(
+                    artifacts: object,
+                    *,
+                    publication_critical: bool,
+                ) -> object:
+                    return server._new_job_build_request(
+                        artifacts,  # type: ignore[arg-type]
+                        None,
+                        mode="ready",
+                        payout_state_generation=payout_generation,
+                        cache_key=server._job_bundle_key(
+                            artifacts,  # type: ignore[arg-type]
+                            mode="ready",
+                            payout_state_generation=payout_generation,
+                            worker=None,
+                        ),
+                        publication_critical=publication_critical,
+                        request_source=(
+                            "tip_refresh" if publication_critical else "initial"
+                        ),
+                    )
+
+                critical = request_for(
+                    critical_artifacts,
+                    publication_critical=True,
+                )
+                routine = request_for(
+                    routine_artifacts,
+                    publication_critical=False,
+                )
+                critical_flight = SimpleNamespace(request=critical)
+                server._job_build_active = (
+                    critical_flight if placement == "active" else None
+                )
+                server._job_build_retiring = (
+                    critical_flight if placement == "retiring" else None
+                )
+                server._job_build_pending = routine
+                server._start_job_build_locked = (  # type: ignore[method-assign]
+                    lambda _request: self.fail(
+                        "routine pending work displaced publication-critical work"
+                    )
+                )
+
+                server._promote_pending_job_build_locked()
+
+                self.assertIs(server._job_build_pending, routine)
+                self.assertFalse(critical.cancellation.is_set())
+                self.assertIs(
+                    (
+                        server._job_build_active
+                        if placement == "active"
+                        else server._job_build_retiring
+                    ),
+                    critical_flight,
+                )
 
     def test_cancelled_ready_does_not_block_collection_promotion(self) -> None:
         for placement in ("active", "retiring"):
