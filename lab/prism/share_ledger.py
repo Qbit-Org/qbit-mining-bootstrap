@@ -1276,6 +1276,7 @@ class PsqlShareLedger:
         lease_ttl_seconds: float = 60.0,
         read_concurrency: int = 4,
         accepted_stats_cache_seconds: float = 60.0,
+        reward_window_cache_seconds: float = 30.0,
         audit_body_dir: str | Path | None = None,
         audit_bundle_canonicalizer: Callable[[dict[str, Any]], bytes] | None = None,
         audit_share_segment_size: int = 0,
@@ -1287,6 +1288,9 @@ class PsqlShareLedger:
         accepted_stats_cache_seconds = float(accepted_stats_cache_seconds)
         if not math.isfinite(accepted_stats_cache_seconds) or accepted_stats_cache_seconds < 0:
             raise ValueError("accepted_stats_cache_seconds must be finite and non-negative")
+        reward_window_cache_seconds = float(reward_window_cache_seconds)
+        if not math.isfinite(reward_window_cache_seconds) or reward_window_cache_seconds < 0:
+            raise ValueError("reward_window_cache_seconds must be finite and non-negative")
         lease_retry_max_sleep_seconds = float(lease_retry_max_sleep_seconds)
         if lease_retry_max_sleep_seconds <= 0:
             raise ValueError("lease_retry_max_sleep_seconds must be positive")
@@ -1329,6 +1333,9 @@ class PsqlShareLedger:
             raise ValueError("ctv_broadcast_retry_backoff_seconds must be non-negative")
         self._ctv_broadcast_retry_backoff_seconds = ctv_broadcast_retry_backoff_seconds
         self._accepted_stats_cache_seconds = accepted_stats_cache_seconds
+        self._reward_window_cache_seconds = reward_window_cache_seconds
+        self._reward_window_cache_lock = Lock()
+        self._reward_window_cache: tuple[str, float, dict[str, Any]] | None = None
         self._stats_lock = Lock()
         self._stats_refresh_lock = Lock()
         self._stats_counts: dict[str, int] | None = None
@@ -2493,6 +2500,56 @@ SELECT json_build_object(
             "share_percent": public_api.percent_string(miner_3h_difficulty, pool_3h_difficulty),
         }
 
+    def _pool_reward_window_aggregate(self, window_weight: Decimal) -> dict[str, Any]:
+        """Pool-wide PRISM reward-window totals grouped by miner, briefly cached.
+
+        Every public miner page needs the same pool-wide recursive
+        qbit_prism_window scan and only differs in which miner's slice it
+        reads, so the aggregate is computed once and every miner-page request
+        within the cache window is served from the shared copy. Concurrent
+        misses wait for the in-flight computation instead of re-running it.
+        The cache is keyed by the requested window weight, so a
+        network-difficulty change recomputes immediately; a TTL of 0 disables
+        caching.
+        """
+        from lab.prism import public_api
+
+        window_weight_sql = public_api.decimal_string(window_weight)
+        cache_seconds = self._reward_window_cache_seconds
+        with self._reward_window_cache_lock:
+            cached = self._reward_window_cache
+            if (
+                cache_seconds > 0
+                and cached is not None
+                and cached[0] == window_weight_sql
+                and time.monotonic() - cached[1] < cache_seconds
+            ):
+                return cached[2]
+            sql = f"""
+WITH bounds AS (
+    SELECT clock_timestamp() AS ended_at
+),
+window_rows AS (
+    SELECT window_row.*
+    FROM bounds
+    CROSS JOIN LATERAL qbit_prism_window(bounds.ended_at, {window_weight_sql}::numeric) AS window_row
+)
+SELECT json_build_object(
+    'pool_counted_difficulty', COALESCE((SELECT sum(counted_difficulty) FROM window_rows), 0)::text,
+    'miner_counted_difficulty', COALESCE((
+        SELECT json_object_agg(miner_id, counted_difficulty)
+        FROM (
+            SELECT miner_id, sum(counted_difficulty)::text AS counted_difficulty
+            FROM window_rows
+            GROUP BY miner_id
+        ) grouped
+    ), '{{}}'::json)
+);
+"""
+            payload = self._run_read_json(sql)
+            self._reward_window_cache = (window_weight_sql, time.monotonic(), payload)
+            return payload
+
     def dashboard_miner_reward_window(
         self,
         *,
@@ -2504,30 +2561,10 @@ SELECT json_build_object(
         if not recipient_id:
             raise ValueError("recipient_id is required")
         window_weight = _reward_window_weight(current_network_difficulty)
-        window_weight_sql = public_api.decimal_string(window_weight)
-        sql = f"""
-WITH bounds AS (
-    SELECT clock_timestamp() AS ended_at
-),
-window_rows AS (
-    SELECT window_row.*
-    FROM bounds
-    CROSS JOIN LATERAL qbit_prism_window(bounds.ended_at, {window_weight_sql}::numeric) AS window_row
-),
-totals AS (
-    SELECT
-        COALESCE(sum(counted_difficulty), 0)::text AS pool_counted_difficulty,
-        COALESCE(sum(counted_difficulty) FILTER (WHERE miner_id = {self._text_literal(recipient_id)}), 0)::text AS miner_counted_difficulty
-    FROM window_rows
-)
-SELECT json_build_object(
-    'pool_counted_difficulty', (SELECT pool_counted_difficulty FROM totals),
-    'miner_counted_difficulty', (SELECT miner_counted_difficulty FROM totals)
-);
-"""
-        payload = self._run_read_json(sql)
-        pool_difficulty = Decimal(str(payload["pool_counted_difficulty"]))
-        miner_difficulty = Decimal(str(payload["miner_counted_difficulty"]))
+        aggregate = self._pool_reward_window_aggregate(window_weight)
+        pool_difficulty = Decimal(str(aggregate["pool_counted_difficulty"]))
+        by_miner = aggregate["miner_counted_difficulty"]
+        miner_difficulty = Decimal(str(by_miner.get(recipient_id, "0")))
         share_percent = None
         if pool_difficulty > 0:
             share_percent = public_api.decimal_string(miner_difficulty * Decimal(100) / pool_difficulty)
@@ -2776,6 +2813,9 @@ named AS (
         FROM qbit_share_ledger
         WHERE accepted
           AND miner_id = {self._text_literal(recipient_id)}
+          -- 3 hours is the largest rollup window this endpoint reports
+          -- (h3_difficulty), so the scan never needs the miner's full history.
+          AND accepted_at >= (SELECT now_at FROM bounds) - interval '3 hours'
     ) shares
 ),
 grouped AS (

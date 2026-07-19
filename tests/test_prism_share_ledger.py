@@ -781,6 +781,31 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertNotIn("lower(worker_name) LIKE", query)
         self.assertNotIn("username LIKE", query)
 
+    def test_postgres_miner_worker_query_bounds_scan_to_largest_reported_window(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"total_count": 0, "active_count": 0, "rows": []},
+            ]
+        )
+
+        ledger.dashboard_miner_worker_rows(
+            recipient_id="miner-a",
+            page=1,
+            limit=15,
+            search=None,
+            hide_inactive=False,
+        )
+        query = ledger.lease_queries[-1]
+
+        # The share scan must carry the 3-hour lower bound (the largest rollup
+        # window the endpoint reports) inside the ledger subquery itself, not
+        # only in the per-window FILTER clauses that follow it.
+        bound = "accepted_at >= (SELECT now_at FROM bounds) - interval '3 hours'"
+        self.assertIn(bound, query)
+        self.assertLess(query.index("FROM qbit_share_ledger"), query.index(bound))
+        self.assertLess(query.index(bound), query.index(") shares"))
+
     def test_writer_lease_ttl_is_configurable_in_acquire_sql(self) -> None:
         ledger = FakeLeasePsqlShareLedger([acquired_lease()], lease_ttl_seconds=42)
 
@@ -1542,7 +1567,7 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger = FakeLeasePsqlShareLedger(
             [
                 acquired_lease(),
-                {"pool_counted_difficulty": "4", "miner_counted_difficulty": "1"},
+                {"pool_counted_difficulty": "4", "miner_counted_difficulty": {"miner-a": "1", "miner-b": "3"}},
             ]
         )
 
@@ -1553,7 +1578,86 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(payload["pool_accepted_difficulty"], "4")
         self.assertEqual(payload["share_percent"], "25")
         self.assertIn("qbit_prism_window(bounds.ended_at, 9.6::numeric)", query)
-        self.assertIn("FILTER (WHERE miner_id = 'miner-a')", query)
+        self.assertIn("json_object_agg(miner_id, counted_difficulty)", query)
+        self.assertIn("GROUP BY miner_id", query)
+
+    def test_postgres_miner_reward_window_shares_one_cached_pool_aggregate(self) -> None:
+        # FakeLeasePsqlShareLedger raises on any query beyond the canned
+        # results, so the second and third requests below pass only if they
+        # are served from the shared cached aggregate.
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"pool_counted_difficulty": "4", "miner_counted_difficulty": {"miner-a": "1", "miner-b": "3"}},
+            ]
+        )
+
+        first = ledger.dashboard_miner_reward_window(recipient_id="miner-a", current_network_difficulty="1.2")
+        queries_after_first = len(ledger.lease_queries)
+        second = ledger.dashboard_miner_reward_window(recipient_id="miner-b", current_network_difficulty="1.2")
+        absent = ledger.dashboard_miner_reward_window(recipient_id="miner-absent", current_network_difficulty="1.2")
+
+        self.assertEqual(len(ledger.lease_queries), queries_after_first)
+        self.assertEqual(first["share_percent"], "25")
+        self.assertEqual(second["share_percent"], "75")
+        self.assertEqual(absent["accepted_difficulty"], "0")
+        self.assertEqual(absent["pool_accepted_difficulty"], "4")
+        self.assertEqual(absent["share_percent"], "0")
+
+    def test_postgres_miner_reward_window_recomputes_when_window_weight_changes(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"pool_counted_difficulty": "4", "miner_counted_difficulty": {"miner-a": "1"}},
+                {"pool_counted_difficulty": "16", "miner_counted_difficulty": {"miner-a": "8"}},
+            ]
+        )
+
+        first = ledger.dashboard_miner_reward_window(recipient_id="miner-a", current_network_difficulty="1.2")
+        second = ledger.dashboard_miner_reward_window(recipient_id="miner-a", current_network_difficulty="2")
+
+        self.assertEqual(first["share_percent"], "25")
+        self.assertEqual(second["share_percent"], "50")
+        self.assertIn("qbit_prism_window(bounds.ended_at, 16::numeric)", ledger.lease_queries[-1])
+
+    def test_postgres_miner_reward_window_cache_expires_after_ttl(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"pool_counted_difficulty": "4", "miner_counted_difficulty": {"miner-a": "1"}},
+                {"pool_counted_difficulty": "8", "miner_counted_difficulty": {"miner-a": "2"}},
+            ],
+            reward_window_cache_seconds=30.0,
+        )
+        clock = {"now": 100.0}
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.time.monotonic", side_effect=lambda: clock["now"]
+        ):
+            first = ledger.dashboard_miner_reward_window(recipient_id="miner-a", current_network_difficulty="1.2")
+            clock["now"] = 129.0
+            cached = ledger.dashboard_miner_reward_window(recipient_id="miner-a", current_network_difficulty="1.2")
+            clock["now"] = 131.0
+            refreshed = ledger.dashboard_miner_reward_window(recipient_id="miner-a", current_network_difficulty="1.2")
+
+        self.assertEqual(first["pool_accepted_difficulty"], "4")
+        self.assertEqual(cached["pool_accepted_difficulty"], "4")
+        self.assertEqual(refreshed["pool_accepted_difficulty"], "8")
+
+    def test_postgres_miner_reward_window_cache_can_be_disabled(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"pool_counted_difficulty": "4", "miner_counted_difficulty": {"miner-a": "1"}},
+                {"pool_counted_difficulty": "8", "miner_counted_difficulty": {"miner-a": "2"}},
+            ],
+            reward_window_cache_seconds=0,
+        )
+
+        first = ledger.dashboard_miner_reward_window(recipient_id="miner-a", current_network_difficulty="1.2")
+        second = ledger.dashboard_miner_reward_window(recipient_id="miner-a", current_network_difficulty="1.2")
+
+        self.assertEqual(first["pool_accepted_difficulty"], "4")
+        self.assertEqual(second["pool_accepted_difficulty"], "8")
 
     def test_postgres_miner_share_summary_zero_fills_empty_payload(self) -> None:
         ledger = FakeLeasePsqlShareLedger(

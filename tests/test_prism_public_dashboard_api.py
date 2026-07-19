@@ -1057,6 +1057,46 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(ledger.leaderboard_calls, 1)
         self.assertEqual(len(ledger.reward_leaderboard_calls), 1)
 
+    def test_public_cache_policy_gives_aggregate_endpoints_longer_default_ttl(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            for path in (
+                "/public/v1/pool-summary",
+                "/public/v1/hashrate-series",
+                "/public/v1/miners/miner-a/workers",
+            ):
+                with self.subTest(path=path):
+                    policy = public_api.public_cache_policy(path)
+                    self.assertEqual(policy.ttl_seconds, 30)
+                    self.assertEqual(policy.stale_while_revalidate_seconds, 30)
+            for path in (
+                "/public/v1/miners/miner-a",
+                "/public/v1/miners/workers",
+                "/public/v1/miners/miner-a/earnings",
+                "/public/v1/leaderboard",
+                "/public/v1/blocks",
+            ):
+                with self.subTest(path=path):
+                    self.assertEqual(public_api.public_cache_policy(path).ttl_seconds, 5)
+
+    def test_public_cache_policy_aggregate_ttl_honors_env_and_kill_switch(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS": "45",
+                "PRISM_PUBLIC_AGGREGATE_CACHE_STALE_WHILE_REVALIDATE_SECONDS": "90",
+                "PRISM_PUBLIC_CACHE_TTL_SECONDS": "7",
+            },
+            clear=True,
+        ):
+            policy = public_api.public_cache_policy("/public/v1/pool-summary")
+            self.assertEqual(policy.ttl_seconds, 45)
+            self.assertEqual(policy.stale_while_revalidate_seconds, 90)
+            self.assertEqual(public_api.public_cache_policy("/public/v1/blocks").ttl_seconds, 7)
+        with patch.dict(os.environ, {"PRISM_PUBLIC_CACHE_ENABLED": "0"}, clear=True):
+            disabled = public_api.public_cache_policy("/public/v1/pool-summary")
+            self.assertEqual(disabled.ttl_seconds, 0)
+            self.assertEqual(disabled.stale_while_revalidate_seconds, 0)
+
     def test_public_api_successes_emit_cache_headers_and_hit_origin_cache(self) -> None:
         ledger = FakePublicLedger()
         handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]

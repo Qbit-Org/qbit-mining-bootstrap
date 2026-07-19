@@ -38,15 +38,21 @@ Successful `GET /public/v1` responses are safe to cache briefly. The coordinator
 emits conservative browser caching (`Cache-Control: public, max-age=0,
 must-revalidate`) plus shared-cache headers for CDNs such as Vercel. Dynamic
 dashboard read models default to a 5-second shared-cache TTL with 30 seconds of
-`stale-while-revalidate`. `GET /public/v1/mining-configuration` defaults to 300
-seconds, and content-addressed artifact routes default to 86400 seconds with an
-immutable shared-cache hint.
+`stale-while-revalidate`. The pool-wide aggregate read models —
+`GET /public/v1/pool-summary`, `GET /public/v1/hashrate-series`, and
+`GET /public/v1/miners/{recipient_id}/workers` — are expensive to recompute and
+default to a 30-second shared-cache TTL instead.
+`GET /public/v1/mining-configuration` defaults to 300 seconds, and
+content-addressed artifact routes default to 86400 seconds with an immutable
+shared-cache hint.
 
 Operators can tune the defaults with:
 
 - `PRISM_PUBLIC_CACHE_ENABLED`
 - `PRISM_PUBLIC_CACHE_TTL_SECONDS`
 - `PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS`
+- `PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS`
+- `PRISM_PUBLIC_AGGREGATE_CACHE_STALE_WHILE_REVALIDATE_SECONDS`
 - `PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS`
 - `PRISM_PUBLIC_CONFIG_CACHE_STALE_WHILE_REVALIDATE_SECONDS`
 - `PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS`
@@ -58,6 +64,10 @@ Operators can tune the defaults with:
 The coordinator also keeps a small in-process origin cache keyed by normalized
 path and query string, and coalesces concurrent misses for the same key. Error
 responses use `Cache-Control: no-store` and are not cached by that origin cache.
+Miner pages additionally share one briefly cached pool-wide reward-window
+aggregate (`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`, default 30 seconds, 0
+disables), so requests for different miners reuse a single recursive
+reward-window scan instead of each re-running it.
 
 ## Conventions
 

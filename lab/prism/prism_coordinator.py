@@ -2783,6 +2783,7 @@ class PrismCoordinator:
             lease_ttl_seconds=env_positive_float("PRISM_LEDGER_LEASE_TTL_SECONDS", 60.0),
             read_concurrency=env_positive_int("PRISM_POSTGRES_READ_CONCURRENCY", 4),
             accepted_stats_cache_seconds=env_nonnegative_float("PRISM_ACCEPTED_STATS_CACHE_SECONDS", 60.0),
+            reward_window_cache_seconds=env_nonnegative_float("PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS", 30.0),
             audit_body_dir=str(audit_body_dir) if audit_body_dir is not None else None,
             audit_share_segment_size=getattr(self, "audit_share_segment_size", DEFAULT_AUDIT_SHARE_SEGMENT_SIZE),
             ctv_broadcast_attempt_detail_limit=getattr(
