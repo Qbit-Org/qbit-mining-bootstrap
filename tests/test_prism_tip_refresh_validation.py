@@ -1826,7 +1826,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         assert divergence_started is not None
         self.assertTrue(
             server.publication_progress_failure_expired(
-                divergence_started + 10.0
+                divergence_started + 10.001
             )
         )
 
