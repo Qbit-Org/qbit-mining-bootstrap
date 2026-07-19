@@ -23,6 +23,7 @@ from lab.prism.prism_coordinator import (
     ClientState,
     JobBuildSuperseded,
     MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
+    PendingShareAppend,
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     PRISM_REJECTION_REASON_IDS,
     PrismCoordinator,
@@ -77,6 +78,25 @@ class FakeLedger:
 
     def metrics(self) -> dict[str, int]:
         return {"blocks": 0, "owed_accounts": 0}
+
+
+class MutableFakeLedger(FakeLedger):
+    """Small durable-commit stand-in for payout snapshot concurrency tests."""
+
+    def append_batch(
+        self,
+        entries: list[tuple[PendingShare, dict[str, object] | None]],
+    ) -> list[FakeShare]:
+        records: list[FakeShare] = []
+        for pending, _intent in entries:
+            self.miners.append(pending.miner_id)
+            records.append(
+                FakeShare(
+                    miner_id=pending.miner_id,
+                    share_seq=len(self.miners),
+                )
+            )
+        return records
 
 
 class ReadyLedgerWithEmptyFirstSnapshot(FakeLedger):
@@ -314,6 +334,30 @@ def stamped_pending_share(accepted_at_ms: int) -> PendingShare:
     )
 
 
+def pending_share_append(sequence: int) -> PendingShareAppend:
+    accepted_at_ms = 1_800_000_000_000 + sequence
+    return PendingShareAppend(
+        pending_share=PendingShare(
+            share_id=f"miner-{sequence}:{sequence:064x}",
+            miner_id=f"miner-{sequence}",
+            order_key=f"miner-{sequence}",
+            p2mr_program_hex=f"{sequence % 255:02x}" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=9,
+            job_id=f"job-{sequence}",
+            job_issued_at_ms=accepted_at_ms - 1,
+            accepted_at_ms=accepted_at_ms,
+            ntime=1_700_000_000,
+        ),
+        username=f"miner-{sequence}",
+        job_id=f"job-{sequence}",
+        block_hash_hex=f"{sequence:064x}",
+        collection_only=False,
+        credit_policy=None,
+    )
+
+
 class AnchorRecordingLedger(FakeLedger):
     def __init__(self) -> None:
         super().__init__()
@@ -421,6 +465,375 @@ def mark_progress_healthy(server: PrismCoordinator) -> None:
         snapshot,
         int(getattr(server, "_payout_state_generation", 0)),
     )
+
+
+class PayoutSnapshotEpochTests(unittest.TestCase):
+    @staticmethod
+    def _run_poll(
+        server: PrismCoordinator,
+        results: list[int],
+        errors: list[BaseException],
+    ) -> None:
+        try:
+            results.append(server.poll_qbit_tip_template_once())
+        except BaseException as exc:  # noqa: BLE001 - test thread handoff
+            errors.append(exc)
+
+    def test_continuous_share_commits_publish_then_coalesce_one_followup(
+        self,
+    ) -> None:
+        server, _rpc = coordinator(ledger=MutableFakeLedger())
+        self.addCleanup(server.shutdown_tip_refresh_executor)
+        recorded = install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        build_entered = threading.Event()
+        release_build = threading.Event()
+        original_builder = server.build_audit_bundle
+
+        def blocking_builder(**kwargs: object) -> dict[str, object]:
+            build_entered.set()
+            self.assertTrue(release_build.wait(5))
+            return original_builder(**kwargs)
+
+        server.build_audit_bundle = blocking_builder  # type: ignore[method-assign]
+        results: list[int] = []
+        errors: list[BaseException] = []
+        thread = threading.Thread(
+            target=self._run_poll,
+            args=(server, results, errors),
+        )
+        thread.start()
+        try:
+            self.assertTrue(build_entered.wait(5))
+            for sequence in range(1, 33):
+                self.assertTrue(
+                    server._append_share_batch([pending_share_append(sequence)])
+                )
+            # A real settlement/carry generation can also advance while the
+            # immutable ledger epoch is building. It belongs to the same one
+            # follow-up, not to cancellation of the selected publication.
+            self.assertEqual(server._advance_payout_state_generation(), 1)
+            self.assertEqual(recorded["calls"], 0)
+            with server._payout_snapshot_lock:
+                self.assertIsNotNone(server._active_payout_snapshot_attempt)
+        finally:
+            release_build.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [1])
+        self.assertEqual(recorded["calls"], 1)
+        first_context = state.active_job
+        self.assertIsNotNone(first_context)
+        assert first_context is not None
+        self.assertLess(
+            first_context.payout_snapshot_id,
+            server._latest_available_payout_snapshot_id,
+        )
+        self.assertEqual(server.payout_snapshot_advances_coalesced, 33)
+        self.assertEqual(
+            server.job_build_supersession_reason_counts["payout"],
+            0,
+        )
+        self.assertEqual(server.payout_snapshot_followup_counts["scheduled"], 1)
+        self.assertIsNone(server._active_payout_snapshot_attempt)
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        self.assertEqual(recorded["calls"], 2)
+        self.assertEqual(
+            state.active_job.payout_snapshot_id,  # type: ignore[union-attr]
+            server._latest_available_payout_snapshot_id,
+        )
+        self.assertEqual(server.payout_snapshot_followup_counts["scheduled"], 1)
+        self.assertEqual(server.payout_snapshot_followup_counts["completed"], 1)
+        self.assertIsNone(server._active_payout_snapshot_attempt)
+
+    def test_chain_tip_change_supersedes_snapshot_build_and_releases_owner(
+        self,
+    ) -> None:
+        server, rpc = coordinator(ledger=MutableFakeLedger())
+        self.addCleanup(server.shutdown_tip_refresh_executor)
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        build_entered = threading.Event()
+        release_build = threading.Event()
+        original_builder = server.build_audit_bundle
+
+        def blocking_builder(**kwargs: object) -> dict[str, object]:
+            build_entered.set()
+            self.assertTrue(release_build.wait(5))
+            return original_builder(**kwargs)
+
+        server.build_audit_bundle = blocking_builder  # type: ignore[method-assign]
+        results: list[int] = []
+        errors: list[BaseException] = []
+        thread = threading.Thread(
+            target=self._run_poll,
+            args=(server, results, errors),
+        )
+        thread.start()
+        new_tip = "44" * 32
+        try:
+            self.assertTrue(build_entered.wait(5))
+            rpc.tip = new_tip
+            rpc.template = base_template(height=11, prevhash=new_tip)
+            self.assertTrue(server.observe_tip_for_refresh(new_tip))
+        finally:
+            release_build.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
+        self.assertIsNone(server._active_payout_snapshot_attempt)
+        self.assertGreaterEqual(
+            server.job_build_supersession_reason_counts["chain_tip"],
+            1,
+        )
+        self.assertIsNone(state.active_job)
+
+        server.build_audit_bundle = original_builder  # type: ignore[method-assign]
+        self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        self.assertEqual(
+            state.active_job.template["previousblockhash"],  # type: ignore[union-attr]
+            new_tip,
+        )
+
+    def test_job_coinbase_ctv_and_settlement_share_one_snapshot(self) -> None:
+        server, _rpc = coordinator(ledger=MutableFakeLedger())
+        self.addCleanup(server.shutdown_tip_refresh_executor)
+        recorded = install_fake_bundle_builder(server)
+        ctv_settlement = {
+            "schema": "qbit.test.snapshot-settlement.v1",
+            "outputs": [{"recipient_id": "miner-a", "amount_sats": 7}],
+        }
+        server.prism_ctv_settlement_config = (  # type: ignore[method-assign]
+            lambda **_kwargs: ctv_settlement
+        )
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        context = state.active_job
+        bundle = server._prepared_ready_bundle
+        self.assertIsNotNone(context)
+        self.assertIsNotNone(bundle)
+        assert context is not None and bundle is not None
+        self.assertIsNotNone(bundle.build_key)
+        assert bundle.build_key is not None
+        snapshot_identity = (
+            bundle.payout_snapshot_id,
+            bundle.payout_snapshot_sha256,
+        )
+        self.assertGreater(snapshot_identity[0], 0)
+        self.assertEqual(
+            snapshot_identity,
+            (context.payout_snapshot_id, context.payout_snapshot_sha256),
+        )
+        self.assertEqual(
+            snapshot_identity,
+            (
+                bundle.build_key.payout_snapshot_id,
+                bundle.build_key.payout_snapshot_sha256,
+            ),
+        )
+        self.assertEqual(
+            bundle.found_block["payout_snapshot_id"],
+            snapshot_identity[0],
+        )
+        self.assertEqual(
+            bundle.found_block["payout_snapshot_sha256"],
+            snapshot_identity[1],
+        )
+        self.assertEqual(recorded["last_kwargs"]["shares"], bundle.shares_json)
+        self.assertEqual(
+            recorded["last_kwargs"]["prior_balances"],
+            bundle.prior_balances,
+        )
+        self.assertEqual(
+            recorded["last_kwargs"]["ctv_settlement"],
+            ctv_settlement,
+        )
+        self.assertEqual(
+            bundle.build_key.ctv_settlement_sha256,
+            canonical_json_sha256(ctv_settlement),
+        )
+        self.assertEqual(
+            context.payout_policy_sha256,
+            bundle.build_key.payout_policy_sha256,
+        )
+        self.assertEqual(
+            context.ctv_settlement_sha256,
+            bundle.build_key.ctv_settlement_sha256,
+        )
+        self.assertEqual(
+            context.ctv_settlement_json,
+            canonical_json_text(ctv_settlement),
+        )
+        self.assertEqual(
+            bundle.coinbase_manifest["coinbase_tx_hex"],
+            synthetic_manifest_coinbase_hex(recorded["suffixes"][0]),
+        )
+        metrics = server.metrics_payload()
+        self.assertIn(
+            f'qbit_prism_payout_snapshot_id{{state="selected"}} {snapshot_identity[0]}',
+            metrics,
+        )
+        self.assertIn(
+            f'qbit_prism_payout_snapshot_id{{state="published"}} {snapshot_identity[0]}',
+            metrics,
+        )
+        self.assertIn("qbit_prism_payout_snapshot_retention_count 1", metrics)
+
+    def test_older_issued_snapshot_remains_attributable_until_job_expiry(
+        self,
+    ) -> None:
+        server, _rpc = coordinator(ledger=MutableFakeLedger())
+        self.addCleanup(server.shutdown_tip_refresh_executor)
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        older = state.active_job
+        self.assertIsNotNone(older)
+        assert older is not None
+
+        self.assertTrue(server._append_share_batch([pending_share_append(100)]))
+        self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        newer = state.active_job
+        self.assertIsNotNone(newer)
+        assert newer is not None
+        self.assertGreater(newer.payout_snapshot_id, older.payout_snapshot_id)
+        self.assertTrue(server._resolve_payout_snapshot_for_submission(older))
+
+        candidate = SimpleNamespace(
+            context=older,
+            submission=SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="55" * 32,
+                block_hex="00",
+            ),
+            extranonce1_hex=state.extranonce1_hex,
+            extranonce2_hex="00" * EXTRANONCE2_SIZE,
+            pending_share=stamped_pending_share(1_800_000_000_500),
+            credit_share_on_accept=False,
+        )
+        intent = server.block_candidate_intent(candidate)
+        self.assertEqual(intent["payout_snapshot_id"], older.payout_snapshot_id)
+        self.assertEqual(
+            intent["payout_snapshot_sha256"],
+            older.payout_snapshot_sha256,
+        )
+        replayed = server.block_candidate_from_intent(intent)
+        self.assertEqual(
+            replayed.context.payout_policy_json,
+            older.payout_policy_json,
+        )
+        self.assertEqual(
+            replayed.context.ctv_settlement_json,
+            older.ctv_settlement_json,
+        )
+        self.assertTrue(
+            server._resolve_payout_snapshot_for_submission(replayed.context)
+        )
+        with self.assertRaisesRegex(ValueError, "payout policy snapshot mismatch"):
+            server.block_candidate_from_intent(
+                {**intent, "payout_policy_json": "{}"}
+            )
+        self.assertFalse(
+            server._resolve_payout_snapshot_for_submission(
+                dataclass_replace(
+                    older,
+                    payout_snapshot_sha256="00" * 32,
+                )
+            )
+        )
+
+        older_key = (
+            older.payout_snapshot_id,
+            older.payout_snapshot_sha256,
+        )
+        server._prune_retained_payout_snapshots()
+        self.assertIn(older_key, server._retained_payout_snapshots)
+        with server.lock:
+            server.evicted_job_graveyard = {
+                key: entry
+                for key, entry in server.evicted_job_graveyard.items()
+                if entry.context is not older
+            }
+        server._prune_retained_payout_snapshots()
+        self.assertNotIn(older_key, server._retained_payout_snapshots)
+        self.assertGreaterEqual(
+            server.payout_snapshot_eviction_counts["jobs_expired"],
+            1,
+        )
+
+    def test_failure_shutdown_and_retention_bound_release_snapshot_state(
+        self,
+    ) -> None:
+        failed_server, _rpc = coordinator(ledger=MutableFakeLedger())
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        failed_server.clients = {state}
+
+        def fail_builder(**_kwargs: object) -> dict[str, object]:
+            raise RuntimeError("forced snapshot build failure")
+
+        failed_server.build_audit_bundle = fail_builder  # type: ignore[method-assign]
+        with self.assertRaises(TemplateRefreshBlocked):
+            failed_server.poll_qbit_tip_template_once()
+        self.assertIsNone(failed_server._active_payout_snapshot_attempt)
+        failed_server._prune_retained_payout_snapshots()
+        self.assertEqual(failed_server._retained_payout_snapshots, {})
+        failed_server.shutdown_tip_refresh_executor()
+
+        retained_server, retained_rpc = coordinator(ledger=MutableFakeLedger())
+        artifacts = retained_server.store_template_artifacts(
+            dict(retained_rpc.template)
+        )
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None
+        with patch(
+            "lab.prism.prism_coordinator.MAX_PRISM_RETAINED_PAYOUT_SNAPSHOTS",
+            3,
+        ):
+            for sequence in range(12):
+                with retained_server._payout_snapshot_lock:
+                    retained_server._note_payout_snapshot_available_locked(
+                        len(retained_server.ledger.miners) + sequence + 1
+                    )
+                retained_server._select_payout_publication_snapshot(
+                    artifacts,
+                    claim_owner=False,
+                )
+                self.assertLessEqual(
+                    len(retained_server._retained_payout_snapshots),
+                    3,
+                )
+        snapshot, attempt = retained_server._select_payout_publication_snapshot(
+            artifacts,
+            claim_owner=True,
+        )
+        self.assertIsNotNone(attempt)
+        self.assertIn(
+            (snapshot.snapshot_id, snapshot.snapshot_sha256),
+            retained_server._retained_payout_snapshots,
+        )
+        retained_server.shutdown_tip_refresh_executor()
+        self.assertIsNone(retained_server._active_payout_snapshot_attempt)
+        self.assertEqual(retained_server._retained_payout_snapshots, {})
+        self.assertGreaterEqual(
+            retained_server.payout_snapshot_eviction_counts["shutdown"],
+            1,
+        )
 
 
 class JobBundleCacheTests(unittest.TestCase):

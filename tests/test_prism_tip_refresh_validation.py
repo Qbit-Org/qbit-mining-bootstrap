@@ -2884,7 +2884,9 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(notifications, [1, 2])
         self.assertFalse(server.tip_refresh_is_pending())
 
-    def test_post_fanout_payout_change_schedules_immediate_retry(self) -> None:
+    def test_post_fanout_payout_change_preserves_publish_and_schedules_followup(
+        self,
+    ) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
@@ -2907,15 +2909,23 @@ class TipRefreshValidationTests(unittest.TestCase):
         rpc.call = advance_during_post_fanout_tip_check  # type: ignore[method-assign]
 
         try:
-            with self.assertRaises(TemplateRefreshBlocked):
-                server.poll_qbit_tip_template_once()
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+            self.assertIsNotNone(state.active_job)
+            self.assertEqual(state.active_job.payout_state_generation, 0)
+            self.assertEqual(server._payout_state_generation, 1)
+            self.assertTrue(server._tip_refresh_retry.is_set())
+            self.assertEqual(
+                server.payout_snapshot_followup_counts["scheduled"],
+                1,
+            )
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
         finally:
             server.shutdown_tip_refresh_executor()
 
         self.assertIsNotNone(state.active_job)
-        self.assertEqual(state.active_job.payout_state_generation, 0)
+        self.assertEqual(state.active_job.payout_state_generation, 1)
         self.assertEqual(server._payout_state_generation, 1)
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertEqual(server.payout_snapshot_followup_counts["completed"], 1)
 
     def test_payout_mutation_waits_for_prepared_network_delivery(self) -> None:
         server, _rpc = coordinator()
@@ -3172,12 +3182,16 @@ class TipRefreshValidationTests(unittest.TestCase):
 
             server.prepare_tip_refresh_bundle = advance_before_prepare  # type: ignore[method-assign]
 
-            with self.assertRaises(TemplateRefreshBlocked):
-                server.poll_qbit_tip_template_once()
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
 
-            self.assertIsNone(first.active_job)
+            self.assertIsNotNone(first.active_job)
+            self.assertEqual(first.active_job.payout_state_generation, 0)
             self.assertEqual(second.active_job.payout_state_generation, 0)
             self.assertTrue(server._tip_refresh_retry.is_set())
+            self.assertEqual(
+                server.payout_snapshot_followup_counts["scheduled"],
+                1,
+            )
 
             self.assertEqual(server.poll_qbit_tip_template_once(), 2)
         finally:
@@ -3189,7 +3203,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(second.active_job.payout_state_generation, 1)
         self.assertEqual(
             sum(payload["method"] == "mining.notify" for payload in first_sent),
-            1,
+            2,
         )
         self.assertEqual(
             sum(payload["method"] == "mining.notify" for payload in second_sent),
