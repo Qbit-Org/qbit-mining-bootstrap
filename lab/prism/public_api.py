@@ -9,7 +9,7 @@ import os
 import threading
 import time
 import urllib.parse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -1188,42 +1188,50 @@ def smooth_hashrate_series_points(
 
     Points before min_epoch are pre-range lookback context: they feed the
     trailing windows of the first in-range points and are dropped from the
-    result. A point whose timestamp or difficulty does not parse is dropped as
-    well -- it can be neither windowed nor range-checked, and dropping it beats
-    leaking pre-range buckets or failing the endpoint over a display
-    refinement.
+    result. A point whose timestamp or integer difficulty does not parse is
+    dropped as well -- it can be neither windowed nor range-checked, and
+    dropping it beats leaking pre-range buckets or failing the endpoint over a
+    display refinement. Points are returned ascending by timestamp.
+
+    The trailing total is a rolling int sum (add the entering bucket, evict
+    expired ones), keeping the pass linear in the number of points regardless
+    of the window size and exact regardless of the thread-local Decimal
+    precision.
     """
     bucket_count = window_seconds // bucket_seconds if bucket_seconds > 0 else 0
     if (bucket_count < 2 and min_epoch is None) or not points:
         return points
     effective_window_seconds = bucket_count * bucket_seconds
-    difficulty_by_epoch: dict[int, Decimal] = {}
-    parsed_points: list[tuple[dict[str, object], int]] = []
+    parsed_points: list[tuple[int, int, dict[str, object]]] = []
     for point in points:
         try:
             parsed = datetime.strptime(str(point["timestamp"]), "%Y-%m-%dT%H:%M:%SZ")
             epoch = int(parsed.replace(tzinfo=timezone.utc).timestamp())
-            difficulty = Decimal(str(point["accepted_share_difficulty"]))
-        except (KeyError, ValueError, ArithmeticError):
+            difficulty = int(str(point["accepted_share_difficulty"]))
+        except (KeyError, ValueError):
             continue
-        parsed_points.append((point, epoch))
-        difficulty_by_epoch[epoch] = difficulty
+        parsed_points.append((epoch, difficulty, point))
+    parsed_points.sort(key=lambda entry: entry[0])
     smoothed: list[dict[str, object]] = []
-    for point, epoch in parsed_points:
+    window: deque[tuple[int, int]] = deque()
+    window_total = 0
+    for epoch, difficulty, point in parsed_points:
+        if bucket_count < 2:
+            if min_epoch is None or epoch >= min_epoch:
+                smoothed.append(point)
+            continue
+        window.append((epoch, difficulty))
+        window_total += difficulty
+        while window and window[0][0] <= epoch - effective_window_seconds:
+            _, expired_difficulty = window.popleft()
+            window_total -= expired_difficulty
         if min_epoch is not None and epoch < min_epoch:
             continue
-        if bucket_count < 2:
-            smoothed.append(point)
-            continue
-        total = sum(
-            (
-                difficulty_by_epoch.get(epoch - offset * bucket_seconds, Decimal(0))
-                for offset in range(bucket_count)
-            ),
-            Decimal(0),
-        )
         smoothed.append(
-            {**point, "hashrate_ths": hashrate_ths_from_difficulty(total, effective_window_seconds)}
+            {
+                **point,
+                "hashrate_ths": hashrate_ths_from_difficulty(window_total, effective_window_seconds),
+            }
         )
     return smoothed
 

@@ -870,6 +870,38 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         # the first kept bucket is the next fully covered one.
         self.assertEqual(public_api.hashrate_series_min_epoch(1050, 700, 300), 600)
 
+    def test_smooth_hashrate_series_rolling_total_matches_naive_window_sums(self) -> None:
+        # The rolling int total must equal an independently computed sum over
+        # each point's trailing window, across gaps and window evictions.
+        base_epoch = 1_750_000_000 // 300 * 300
+        series = [
+            (base_epoch, 100),
+            (base_epoch + 300, 250),
+            (base_epoch + 900, 75),
+            (base_epoch + 1500, 500),
+            (base_epoch + 1800, 125),
+            (base_epoch + 3600, 900),
+        ]
+        points = [
+            {
+                "timestamp": _bucket_timestamp(epoch),
+                "hashrate_ths": "0",
+                "accepted_share_count": 1,
+                "accepted_share_difficulty": str(difficulty),
+            }
+            for epoch, difficulty in series
+        ]
+        smoothed = public_api.smooth_hashrate_series_points(
+            points, bucket_seconds=300, window_seconds=1800
+        )
+        self.assertEqual(len(smoothed), len(series))
+        for (epoch, _), point in zip(series, smoothed):
+            expected_total = sum(d for ep, d in series if epoch - 1800 < ep <= epoch)
+            self.assertEqual(
+                point["hashrate_ths"],
+                public_api.hashrate_ths_from_difficulty(expected_total, 1800),
+            )
+
     def test_smooth_hashrate_series_points_drops_malformed_points(self) -> None:
         # An unparseable point can be neither windowed nor range-checked, so it
         # is dropped rather than passed through raw (which would leak pre-range
