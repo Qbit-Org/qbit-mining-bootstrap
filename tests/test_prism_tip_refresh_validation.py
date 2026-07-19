@@ -1691,20 +1691,42 @@ class TipRefreshValidationTests(unittest.TestCase):
     def test_refresh_exception_releases_owner_and_coalesces_one_retry(self) -> None:
         server, _rpc = coordinator()
         original_fetch = server.fetch_qbit_tip_template_snapshot
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
         fetches = 0
+        errors: list[BaseException] = []
 
         def fail_once() -> object:
             nonlocal fetches
             fetches += 1
             if fetches == 1:
+                fetch_started.set()
+                if not release_fetch.wait(5):
+                    raise AssertionError("test did not release failing fetch")
                 raise RuntimeError("transient template failure")
             return original_fetch()
 
         server.fetch_qbit_tip_template_snapshot = fail_once  # type: ignore[method-assign]
 
-        with self.assertRaisesRegex(RuntimeError, "transient template failure"):
-            server.poll_qbit_tip_template_once()
+        def run_owner() -> None:
+            try:
+                server.poll_qbit_tip_template_once()
+            except BaseException as exc:
+                errors.append(exc)
 
+        owner = threading.Thread(target=run_owner)
+        owner.start()
+        self.assertTrue(fetch_started.wait(5))
+        try:
+            self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        finally:
+            release_fetch.set()
+        owner.join(5)
+
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertEqual(str(errors[0]), "transient template failure")
         self.assertTrue(server._tip_refresh_singleflight_lock.acquire(blocking=False))
         server._tip_refresh_singleflight_lock.release()
         self.assertTrue(server._consume_tip_refresh_retry())
@@ -1712,6 +1734,22 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         self.assertEqual(fetches, 2)
         self.assertIsNone(server.template_refresh_failure_started_monotonic)
+
+    def test_refresh_exception_does_not_self_schedule_immediate_retry(self) -> None:
+        server, _rpc = coordinator()
+
+        def fail_fetch() -> object:
+            raise RuntimeError("persistent template failure")
+
+        server.fetch_qbit_tip_template_snapshot = fail_fetch  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "persistent template failure"):
+            server.poll_qbit_tip_template_once()
+
+        self.assertTrue(server._tip_refresh_singleflight_lock.acquire(blocking=False))
+        server._tip_refresh_singleflight_lock.release()
+        self.assertFalse(server._consume_tip_refresh_retry())
+        self.assertIsNotNone(server.template_refresh_failure_started_monotonic)
 
     def test_rapid_contention_coalesces_one_latest_tip_retry(self) -> None:
         server, rpc = coordinator()

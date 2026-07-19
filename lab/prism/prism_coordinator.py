@@ -10100,8 +10100,6 @@ class PrismCoordinator:
             # whose persistence must still take the budgeted restart path.
             raise
         except Exception:
-            if not self.stop_event.is_set():
-                self._schedule_tip_refresh_retry()
             self._record_template_refresh_failure(time.monotonic())
             raise
         finally:
