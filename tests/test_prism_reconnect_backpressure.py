@@ -15,6 +15,9 @@ from lab.auxpow import vardiff
 from lab.prism.prism_coordinator import (
     ClientState,
     PendingInitialJob,
+    PRISM_DELIVERY_PRIORITY_INITIAL,
+    PRISM_DELIVERY_PRIORITY_NEW_TIP,
+    PRISM_DELIVERY_PRIORITY_SAME_TIP,
     PrismCoordinator,
     StratumListenerProfile,
     WorkerIdentity,
@@ -184,7 +187,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
 
     def test_current_job_coverage_requires_an_observed_matching_tip(self) -> None:
         server = coordinator(connection_limit=2)
-        state = client(server, 1, with_job=True)
+        client(server, 1, with_job=True)
 
         missing_tip = server.mining_delivery_snapshot(now=1.0)
         self.assertEqual(missing_tip["clients_with_current_tip_jobs"], 0)
@@ -202,9 +205,12 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
 
     def test_pending_initial_jobs_are_bounded_and_duplicate_requests_coalesce(self) -> None:
         server = coordinator(connection_limit=5, pending_limit=2)
+        server.initial_job_max_workers = 1
+        started = threading.Event()
         release = threading.Event()
 
         def blocked(request: PendingInitialJob) -> bool:
+            started.set()
             release.wait(5)
             return not server._initial_request_cancelled(request)
 
@@ -212,10 +218,14 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         first, second, excess = (client(server, index) for index in (1, 2, 3))
 
         self.assertTrue(server.schedule_initial_job(first))
+        self.assertTrue(started.wait(5))
         self.assertTrue(server.schedule_initial_job(first))
         self.assertTrue(server.schedule_initial_job(second))
         self.assertFalse(server.schedule_initial_job(excess))
 
+        executor = server.initial_job_executor()
+        self.assertEqual(executor.max_queue_size, 2)
+        self.assertEqual(executor.stats(), (1, 1))
         self.assertEqual(len(server.pending_initial_jobs), 2)
         self.assertEqual(server.initial_job_coalesced_count, 1)
         self.assertEqual(server.initial_job_queue_rejection_count, 1)
@@ -463,7 +473,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertTrue(server.schedule_initial_job(newcomer))
         server.shutdown_tip_refresh_executor()
 
-    def test_delivery_executor_prioritizes_initial_over_routine_work(self) -> None:
+    def test_delivery_executor_prioritizes_new_tip_then_initial_then_same_tip(self) -> None:
         executor = _BoundedPriorityExecutor(max_workers=1, max_queue_size=4)
         blocker_started = threading.Event()
         release = threading.Event()
@@ -473,16 +483,145 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             blocker_started.set()
             release.wait(5)
 
-        executor.submit(blocker, priority=2)
+        executor.submit(blocker, priority=PRISM_DELIVERY_PRIORITY_SAME_TIP)
         self.assertTrue(blocker_started.wait(5))
-        routine = executor.submit(lambda: order.append("routine"), priority=2)
-        initial = executor.submit(lambda: order.append("initial"), priority=0)
+        routine = executor.submit(
+            lambda: order.append("routine"),
+            priority=PRISM_DELIVERY_PRIORITY_SAME_TIP,
+        )
+        initial = executor.submit(
+            lambda: order.append("initial"),
+            priority=PRISM_DELIVERY_PRIORITY_INITIAL,
+        )
+        new_tip = executor.submit(
+            lambda: order.append("new-tip"),
+            priority=PRISM_DELIVERY_PRIORITY_NEW_TIP,
+        )
         release.set()
+        new_tip.result(5)
         initial.result(5)
         routine.result(5)
         executor.shutdown(wait=True, cancel_futures=True)
 
-        self.assertEqual(order, ["initial", "routine"])
+        self.assertEqual(order, ["new-tip", "initial", "routine"])
+
+    def test_blocked_initial_workers_do_not_starve_new_tip_delivery(self) -> None:
+        server = coordinator(connection_limit=8, pending_limit=8)
+        server.initial_job_max_workers = 4
+        started = 0
+        started_lock = threading.Lock()
+        all_started = threading.Event()
+
+        def blocked_retry(request: PendingInitialJob) -> bool:
+            nonlocal started
+            with started_lock:
+                started += 1
+                if started == server.initial_job_max_workers:
+                    all_started.set()
+            while not request.cancelled.wait(0.01):
+                pass
+            return False
+
+        server._run_initial_job = blocked_retry  # type: ignore[method-assign]
+        clients = [client(server, index) for index in range(1, 5)]
+        for state in clients:
+            self.assertTrue(server.schedule_initial_job(state))
+
+        try:
+            self.assertTrue(all_started.wait(5))
+            tip_started = threading.Event()
+
+            def publish_new_tip() -> str:
+                tip_started.set()
+                return "published"
+
+            future = server._submit_delivery_task(
+                server.tip_refresh_executor(),
+                publish_new_tip,
+                priority=PRISM_DELIVERY_PRIORITY_NEW_TIP,
+            )
+            self.assertTrue(tip_started.wait(0.5))
+            self.assertEqual(future.result(1), "published")
+            self.assertEqual(server.initial_job_executor().stats(), (0, 4))
+            metrics = "\n".join(server.initial_delivery_metrics_lines())
+            self.assertIn("qbit_prism_initial_job_delivery_queue_depth 0", metrics)
+            self.assertIn("qbit_prism_initial_job_delivery_active_workers 4", metrics)
+            self.assertIn("qbit_prism_initial_job_delivery_configured_workers 4", metrics)
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+    def test_shutdown_cancels_queued_initial_work_and_joins_both_executors(self) -> None:
+        server = coordinator(connection_limit=4, pending_limit=3)
+        server.initial_job_max_workers = 1
+        initial_started = threading.Event()
+        initial_stopped = threading.Event()
+        initial_runs: list[int] = []
+        queued_tip_ran = threading.Event()
+
+        def blocked_initial(request: PendingInitialJob) -> bool:
+            initial_runs.append(request.client.connection_id)
+            initial_started.set()
+            request.cancelled.wait(5)
+            initial_stopped.set()
+            return False
+
+        server._run_initial_job = blocked_initial  # type: ignore[method-assign]
+        first, second = (client(server, index) for index in (1, 2))
+        self.assertTrue(server.schedule_initial_job(first))
+        self.assertTrue(initial_started.wait(5))
+        self.assertTrue(server.schedule_initial_job(second))
+        second_request = server.pending_initial_jobs[second]
+        assert second_request.future is not None
+        second_future = second_request.future
+
+        tip_started = threading.Event()
+        release_tip = threading.Event()
+
+        def blocked_tip() -> None:
+            tip_started.set()
+            release_tip.wait(5)
+
+        tip_executor = server.tip_refresh_executor()
+        tip_executor.submit(
+            blocked_tip,
+            priority=PRISM_DELIVERY_PRIORITY_NEW_TIP,
+        )
+        self.assertTrue(tip_started.wait(5))
+        queued_tip = tip_executor.submit(
+            queued_tip_ran.set,
+            priority=PRISM_DELIVERY_PRIORITY_SAME_TIP,
+        )
+        initial_executor = server.initial_job_executor()
+        initial_threads = tuple(initial_executor._threads)
+        tip_threads = tuple(tip_executor._threads)
+        shutdown_complete = threading.Event()
+
+        def shutdown_executors() -> None:
+            server.shutdown_tip_refresh_executor()
+            shutdown_complete.set()
+
+        shutdown_thread = threading.Thread(target=shutdown_executors)
+        shutdown_thread.start()
+        try:
+            self.assertTrue(initial_stopped.wait(1))
+            self.assertFalse(shutdown_complete.wait(0.05))
+            self.assertTrue(second_future.cancelled())
+            self.assertTrue(queued_tip.cancelled())
+            self.assertFalse(queued_tip_ran.is_set())
+        finally:
+            release_tip.set()
+            shutdown_thread.join(5)
+
+        self.assertFalse(shutdown_thread.is_alive())
+        self.assertTrue(shutdown_complete.is_set())
+        self.assertEqual(server.pending_initial_jobs, {})
+        self.assertEqual(initial_runs, [first.connection_id])
+        self.assertTrue(all(not thread.is_alive() for thread in initial_threads))
+        self.assertTrue(all(not thread.is_alive() for thread in tip_threads))
+        with self.assertRaisesRegex(RuntimeError, "initial job executor is shut down"):
+            server.initial_job_executor()
+        with self.assertRaisesRegex(RuntimeError, "tip refresh executor is shut down"):
+            server.tip_refresh_executor()
 
     def test_health_grace_failure_and_recovery_follow_job_coverage(self) -> None:
         server = coordinator(connection_limit=2, pending_limit=2)

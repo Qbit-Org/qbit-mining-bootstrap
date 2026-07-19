@@ -112,6 +112,7 @@ DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS = 30.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
 DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
 DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
+DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS = 4
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
 DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS = 60.0
 DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS = 0.25
@@ -230,8 +231,8 @@ PRISM_TIP_REFRESH_CANCELLATION_STAGES = (
     "client_lock",
     "payout_gate",
 )
-PRISM_DELIVERY_PRIORITY_INITIAL = 0
-PRISM_DELIVERY_PRIORITY_NEW_TIP = 1
+PRISM_DELIVERY_PRIORITY_NEW_TIP = 0
+PRISM_DELIVERY_PRIORITY_INITIAL = 1
 PRISM_DELIVERY_PRIORITY_SAME_TIP = 2
 PRISM_PROGRESS_HEALTH_REASONS = (
     "tip_poll_stale",
@@ -1268,7 +1269,13 @@ class _JobBuildCancelled(RuntimeError):
 class _BoundedPriorityExecutor:
     """Small Future-compatible executor with bounded, priority-ordered work."""
 
-    def __init__(self, *, max_workers: int, max_queue_size: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_workers: int,
+        max_queue_size: int,
+        thread_name_prefix: str = "prism-job-delivery",
+    ) -> None:
         self.max_workers = max_workers
         self.max_queue_size = max_queue_size
         self._queue: queue.PriorityQueue[tuple[object, ...]] = queue.PriorityQueue(
@@ -1281,7 +1288,7 @@ class _BoundedPriorityExecutor:
         self._threads = [
             threading.Thread(
                 target=self._worker,
-                name=f"prism-job-delivery-{index + 1}",
+                name=f"{thread_name_prefix}-{index + 1}",
                 daemon=True,
             )
             for index in range(max_workers)
@@ -2229,6 +2236,7 @@ class PrismCoordinator:
             "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
             DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
         )
+        self.initial_job_max_workers = DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS
         if (
             self.stratum_max_connections > 0
             and self.stratum_max_pending_initial_jobs > self.stratum_max_connections
@@ -2542,6 +2550,9 @@ class PrismCoordinator:
         self._tip_refresh_executor_lock = threading.Lock()
         self._tip_refresh_executor: _BoundedPriorityExecutor | None = None
         self._tip_refresh_executor_shutdown = False
+        self._initial_job_executor_lock = threading.Lock()
+        self._initial_job_executor: _BoundedPriorityExecutor | None = None
+        self._initial_job_executor_shutdown = False
         self._tip_refresh_pending_event = threading.Event()
         self._tip_refresh_pending_counter = 0
         self._tip_refresh_pending_token: int | None = None
@@ -6399,6 +6410,14 @@ class PrismCoordinator:
             self.stratum_initial_job_timeout_seconds = (
                 DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS
             )
+        if not hasattr(self, "initial_job_max_workers"):
+            self.initial_job_max_workers = DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS
+        if not hasattr(self, "_initial_job_executor_lock"):
+            self._initial_job_executor_lock = threading.Lock()
+        if not hasattr(self, "_initial_job_executor"):
+            self._initial_job_executor: _BoundedPriorityExecutor | None = None
+        if not hasattr(self, "_initial_job_executor_shutdown"):
+            self._initial_job_executor_shutdown = False
         if not hasattr(self, "initial_job_queue_rejection_count"):
             self.initial_job_queue_rejection_count = 0
         if not hasattr(self, "initial_job_timeout_count"):
@@ -6818,28 +6837,58 @@ class PrismCoordinator:
                 executor = _BoundedPriorityExecutor(
                     max_workers=self.tip_refresh_max_workers,
                     max_queue_size=self.delivery_queue_limit(),
+                    thread_name_prefix="prism-tip-refresh-delivery",
                 )
                 self._tip_refresh_executor = executor
             return executor
 
-    def shutdown_tip_refresh_executor(self) -> None:
-        self._ensure_tip_refresh_state()
+    def initial_job_executor(self) -> _BoundedPriorityExecutor:
+        self._ensure_initial_job_state()
+        with self._initial_job_executor_lock:
+            if self._initial_job_executor_shutdown:
+                raise RuntimeError("initial job executor is shut down")
+            executor = self._initial_job_executor
+            if executor is None:
+                executor = _BoundedPriorityExecutor(
+                    max_workers=self.initial_job_max_workers,
+                    max_queue_size=self.stratum_max_pending_initial_jobs,
+                    thread_name_prefix="prism-initial-job-delivery",
+                )
+                self._initial_job_executor = executor
+            return executor
+
+    def shutdown_initial_job_executor(self) -> None:
+        self._ensure_initial_job_state()
         with self.lock:
-            self._ensure_initial_job_state()
             for request in tuple(self.pending_initial_jobs.values()):
                 request.cancelled.set()
                 if request.future is not None:
                     request.future.cancel()
             self.pending_initial_jobs.clear()
+        with self._initial_job_executor_lock:
+            executor = self._initial_job_executor
+            self._initial_job_executor = None
+            self._initial_job_executor_shutdown = True
+        if executor is not None:
+            # Running workers observe request cancellation before shutdown
+            # returns; queued reconnect work is cancelled without starting.
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def shutdown_tip_refresh_executor(self) -> None:
+        self._ensure_tip_refresh_state()
         with self._tip_refresh_executor_lock:
             executor = self._tip_refresh_executor
             self._tip_refresh_executor = None
             self._tip_refresh_executor_shutdown = True
         if executor is not None:
+            # Stop queued publication work before waiting on reconnect workers.
+            executor.shutdown(wait=False, cancel_futures=True)
+        self.shutdown_initial_job_executor()
+        if executor is not None:
             # Running workers may already hold client/job state or be inside a
             # socket send. Drain them before serve returns and the writer lease
             # is released; queued workers are cancelled without starting.
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor.shutdown(wait=True)
         self.shutdown_job_build_executor()
         self.shutdown_payout_artifact_executor()
 
@@ -7048,7 +7097,7 @@ class PrismCoordinator:
         client = request.client
         try:
             future = self._submit_delivery_task(
-                self.tip_refresh_executor(),
+                self.initial_job_executor(),
                 self._run_initial_job,
                 request,
                 priority=PRISM_DELIVERY_PRIORITY_INITIAL,
@@ -17377,8 +17426,15 @@ class PrismCoordinator:
             }
             latency_sum = self.initial_job_delivery_latency_seconds_sum
             latency_count = self.initial_job_delivery_latency_count
-        executor = getattr(self, "_tip_refresh_executor", None)
-        _queued, slots = executor.stats() if executor is not None else (0, 0)
+        executor = getattr(self, "_initial_job_executor", None)
+        queued, slots = executor.stats() if executor is not None else (0, 0)
+        configured_workers = int(
+            getattr(
+                self,
+                "initial_job_max_workers",
+                DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
+            )
+        )
         with self._bundle_preparation_lock:
             build_counts = dict(self.shared_bundle_build_counts)
             preparation_sum = self.shared_bundle_preparation_seconds_sum
@@ -17409,6 +17465,15 @@ class PrismCoordinator:
             "# HELP qbit_prism_initial_job_delivery_tasks_inflight Bounded shared delivery slots currently occupied.",
             "# TYPE qbit_prism_initial_job_delivery_tasks_inflight gauge",
             f"qbit_prism_initial_job_delivery_tasks_inflight {slots}",
+            "# HELP qbit_prism_initial_job_delivery_queue_depth Initial-job tasks waiting for a dedicated worker.",
+            "# TYPE qbit_prism_initial_job_delivery_queue_depth gauge",
+            f"qbit_prism_initial_job_delivery_queue_depth {queued}",
+            "# HELP qbit_prism_initial_job_delivery_active_workers Dedicated initial-job workers currently running tasks.",
+            "# TYPE qbit_prism_initial_job_delivery_active_workers gauge",
+            f"qbit_prism_initial_job_delivery_active_workers {slots}",
+            "# HELP qbit_prism_initial_job_delivery_configured_workers Configured dedicated initial-job worker count.",
+            "# TYPE qbit_prism_initial_job_delivery_configured_workers gauge",
+            f"qbit_prism_initial_job_delivery_configured_workers {configured_workers}",
             "# HELP qbit_prism_initial_job_delivery_seconds Authorization-to-current-job latency.",
             "# TYPE qbit_prism_initial_job_delivery_seconds summary",
             f"qbit_prism_initial_job_delivery_seconds_sum {latency_sum:.6f}",

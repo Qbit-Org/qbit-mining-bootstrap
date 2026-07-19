@@ -291,9 +291,9 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             for thread in request_threads:
                 thread.join(5)
             self.assertTrue(all(not thread.is_alive() for thread in request_threads))
-            executor = server.tip_refresh_executor()
+            executor = server.initial_job_executor()
             _queued, active_workers = executor.stats()
-            self.assertLessEqual(active_workers, 8)
+            self.assertLessEqual(active_workers, 4)
             self.assertLessEqual(
                 len(server.pending_initial_jobs),
                 250,
