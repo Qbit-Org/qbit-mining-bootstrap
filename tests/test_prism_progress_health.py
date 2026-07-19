@@ -69,6 +69,7 @@ def progress_coordinator() -> tuple[object, FakeMonotonicClock]:
         server._progress_last_delivery_payout_generation = 0
         server._progress_last_delivery_monotonic = None
         server._progress_pending_since_monotonic = clock.now
+        server._progress_publication_divergence_since_monotonic = clock.now
         server._progress_refresh_signal_pending = False
         server._progress_active_refresh_count = 0
         server._progress_last_refresh_activity_monotonic = None
@@ -90,6 +91,179 @@ def publish(
 
 
 class ProgressHealthTests(unittest.TestCase):
+    def test_publication_progress_uses_template_failure_budget(self) -> None:
+        server, clock = progress_coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        current = snapshot(generation=1, fingerprint="aa" * 32)
+        publish(server, current)
+        replacement = snapshot(
+            generation=2,
+            fingerprint="bb" * 32,
+            tip="22" * 32,
+        )
+        server._record_progress_tip_poll(replacement)
+
+        clock.advance(9.999)
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+        clock.advance(0.001)
+        self.assertTrue(server.publication_progress_failure_expired(clock.now))
+
+        server._record_progress_publication(replacement, 0)
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+
+    def test_publication_watchdog_does_not_inherit_client_delivery_age(self) -> None:
+        server, clock = progress_coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        current = snapshot(generation=1, fingerprint="aa" * 32)
+        publish(server, current)
+        miner = client(1)
+        server.clients.add(miner)
+        server._progress_reconcile_pending(now=clock.now)
+
+        clock.advance(20.0)
+        self.assertEqual(server._progress_pending_since_monotonic, 100.0)
+        self.assertIsNone(
+            server._progress_publication_divergence_since_monotonic
+        )
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+
+        replacement = snapshot(
+            generation=2,
+            fingerprint="bb" * 32,
+            tip="22" * 32,
+        )
+        with server.lock:
+            server.latest_detected_tip = (replacement.bestblockhash, 1)
+        server._progress_note_refresh_pending(clock.now)
+
+        # A delayed delivery of the still-published tip can clear the broader
+        # client health condition, but it must not clear or age the newer
+        # publication-divergence deadline.
+        server._record_progress_delivery(
+            miner,
+            context_for(current, 0),
+            clock.now,
+        )
+        self.assertIsNone(server._progress_pending_since_monotonic)
+        self.assertEqual(
+            server._progress_publication_divergence_since_monotonic,
+            clock.now,
+        )
+
+        server._record_progress_tip_poll(replacement, clock.now)
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+        clock.advance(9.999)
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+        clock.advance(0.001)
+        self.assertTrue(server.publication_progress_failure_expired(clock.now))
+
+    def test_publication_divergence_survives_old_tip_delivery(self) -> None:
+        server, clock = progress_coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        current = snapshot(generation=1, fingerprint="aa" * 32)
+        publish(server, current)
+        miner = client(1)
+        server.clients.add(miner)
+        replacement = snapshot(
+            generation=2,
+            fingerprint="bb" * 32,
+            tip="22" * 32,
+        )
+        with server.lock:
+            server.latest_detected_tip = (replacement.bestblockhash, 1)
+        server._progress_note_refresh_pending(clock.now)
+
+        clock.advance(6.0)
+        server._record_progress_delivery(
+            miner,
+            context_for(current, 0),
+            clock.now,
+        )
+
+        self.assertEqual(
+            server._progress_publication_divergence_since_monotonic,
+            100.0,
+        )
+        clock.advance(3.999)
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+        clock.advance(0.001)
+        self.assertTrue(server.publication_progress_failure_expired(clock.now))
+
+    def test_publication_divergence_churn_does_not_renew_deadline(self) -> None:
+        server, clock = progress_coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        publish(server, snapshot(generation=1, fingerprint="aa" * 32))
+        latest = None
+        first_replacement = None
+
+        for generation, marker in ((2, "bb"), (3, "cc"), (4, "dd")):
+            latest = snapshot(
+                generation=generation,
+                fingerprint=marker * 32,
+                tip=marker * 32,
+            )
+            if first_replacement is None:
+                first_replacement = latest
+            with server.lock:
+                server.latest_detected_tip = (latest.bestblockhash, generation)
+            server._progress_note_refresh_pending(clock.now)
+            server._record_progress_tip_poll(latest, clock.now)
+            self.assertEqual(
+                server._progress_publication_divergence_since_monotonic,
+                100.0,
+            )
+            clock.advance(3.0)
+
+        self.assertIsNotNone(latest)
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+        clock.advance(1.0)
+        self.assertTrue(server.publication_progress_failure_expired(clock.now))
+
+        assert first_replacement is not None
+        server._record_progress_publication(first_replacement, 0)
+        self.assertEqual(
+            server._progress_publication_divergence_since_monotonic,
+            100.0,
+        )
+
+        assert latest is not None
+        server._record_progress_publication(latest, 0)
+        self.assertIsNone(
+            server._progress_publication_divergence_since_monotonic
+        )
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+
+    def test_publication_watchdog_fires_with_heartbeat_watchdog_disabled(self) -> None:
+        server, clock = progress_coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        server.watchdog_enabled = False
+        server.watchdog_interval_seconds = 0.001
+        publish(server, snapshot(generation=1, fingerprint="aa" * 32))
+        server._record_progress_tip_poll(
+            snapshot(
+                generation=2,
+                fingerprint="bb" * 32,
+                tip="22" * 32,
+            )
+        )
+        clock.advance(10.0)
+
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                return_value=clock.now,
+            ),
+            patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=SystemExit(1),
+            ) as exit_process,
+            patch("builtins.print"),
+            self.assertRaises(SystemExit),
+        ):
+            server.watchdog_loop()
+
+        exit_process.assert_called_once_with(1)
+
     def test_unchanged_tip_for_hours_with_valid_work_stays_healthy(self) -> None:
         server, clock = progress_coordinator()
         original = snapshot(generation=1, fingerprint="aa" * 32)

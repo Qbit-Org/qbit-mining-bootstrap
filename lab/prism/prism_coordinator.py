@@ -2547,6 +2547,7 @@ class PrismCoordinator:
         self.latest_coinbase_size_bytes: int | None = None
         self.tip_template_snapshot: QbitTipTemplateSnapshot | None = None
         self._tip_refresh_lock = threading.Lock()
+        self._tip_refresh_singleflight_lock = threading.Lock()
         self._tip_refresh_executor_lock = threading.Lock()
         self._tip_refresh_executor: _BoundedPriorityExecutor | None = None
         self._tip_refresh_executor_shutdown = False
@@ -2557,6 +2558,8 @@ class PrismCoordinator:
         self._tip_refresh_pending_counter = 0
         self._tip_refresh_pending_token: int | None = None
         self._tip_refresh_retry = threading.Event()
+        self._tip_refresh_retry_counter = 0
+        self._tip_refresh_retry_consumed = 0
         self._active_tip_refresh: tuple[
             TipRefreshValidationToken,
             _FanoutCancellation,
@@ -3171,6 +3174,12 @@ class PrismCoordinator:
         if not hasattr(self, "_progress_pending_since_monotonic"):
             self._progress_pending_since_monotonic: float | None = float(
                 getattr(self, "started_monotonic", time.monotonic())
+            )
+        if not hasattr(self, "_progress_publication_divergence_since_monotonic"):
+            self._progress_publication_divergence_since_monotonic: float | None = (
+                None
+                if self._progress_has_published_work
+                else float(getattr(self, "started_monotonic", time.monotonic()))
             )
         if not hasattr(self, "_progress_refresh_signal_pending"):
             self._progress_refresh_signal_pending = False
@@ -6471,6 +6480,8 @@ class PrismCoordinator:
     def _ensure_tip_refresh_state(self) -> None:
         if not hasattr(self, "_tip_refresh_lock"):
             self._tip_refresh_lock = threading.Lock()
+        if not hasattr(self, "_tip_refresh_singleflight_lock"):
+            self._tip_refresh_singleflight_lock = threading.Lock()
         if not hasattr(self, "_tip_refresh_executor_lock"):
             self._tip_refresh_executor_lock = threading.Lock()
         if not hasattr(self, "_tip_refresh_executor"):
@@ -6533,6 +6544,10 @@ class PrismCoordinator:
             self._tip_refresh_pending_token: int | None = None
         if not hasattr(self, "_tip_refresh_retry"):
             self._tip_refresh_retry = threading.Event()
+        if not hasattr(self, "_tip_refresh_retry_counter"):
+            self._tip_refresh_retry_counter = 0
+        if not hasattr(self, "_tip_refresh_retry_consumed"):
+            self._tip_refresh_retry_consumed = 0
         if not hasattr(self, "_active_tip_refresh"):
             self._active_tip_refresh: tuple[
                 TipRefreshValidationToken,
@@ -6758,11 +6773,44 @@ class PrismCoordinator:
                     return False
                 self._tip_refresh_pending_token = None
                 self._tip_refresh_pending_event.clear()
+                with self._progress_health_lock:
+                    published_current = bool(
+                        self._progress_has_published_work
+                        and self._progress_published_template_fingerprint
+                        == snapshot.template_fingerprint
+                        and self._progress_published_payout_generation
+                        == payout_state_generation
+                    )
+                    if published_current:
+                        # The completion guard above proves this coherent
+                        # snapshot still represents the latest detected and
+                        # published tip. A transient A -> B -> A observation
+                        # therefore closes its publication-divergence epoch
+                        # even when existing A work needed no new delivery.
+                        self._progress_refresh_signal_pending = False
+                        self._progress_publication_divergence_since_monotonic = None
                 return True
 
     def _schedule_tip_refresh_retry(self) -> None:
         self._ensure_tip_refresh_state()
-        self._tip_refresh_retry.set()
+        # Pair the Event with a monotonic generation so a producer cannot set
+        # it between a waiter's wake and clear and lose the newest retry. The
+        # event remains the blocking primitive; the generation is the durable
+        # coalesced work marker.
+        with self.lock:
+            self._tip_refresh_retry_counter += 1
+            self._tip_refresh_retry.set()
+
+    def _consume_tip_refresh_retry(self) -> bool:
+        """Consume all retry signals visible at one atomic wake boundary."""
+        self._ensure_tip_refresh_state()
+        with self.lock:
+            generation = self._tip_refresh_retry_counter
+            if generation == self._tip_refresh_retry_consumed:
+                return False
+            self._tip_refresh_retry_consumed = generation
+            self._tip_refresh_retry.clear()
+            return True
 
     def _observe_tip_refresh_seconds(self, name: str, elapsed_seconds: float) -> None:
         self._ensure_tip_refresh_state()
@@ -7530,7 +7578,22 @@ class PrismCoordinator:
 
     def watchdog_loop(self) -> None:
         while not self.stop_event.wait(self.watchdog_interval_seconds):
-            overdue = self._overdue_heartbeats(time.monotonic())
+            now = time.monotonic()
+            if self.publication_progress_failure_expired(now):
+                print(
+                    "prism coordinator: publication-progress watchdog firing; "
+                    "current tip/generation remained unpublished past the "
+                    f"template refresh failure budget="
+                    f"{self.template_refresh_failure_exit_seconds:g}s. "
+                    "Exiting non-zero so the restart policy recovers the process.",
+                    flush=True,
+                )
+                os._exit(1)
+            overdue = (
+                self._overdue_heartbeats(now)
+                if getattr(self, "watchdog_enabled", True)
+                else []
+            )
             if overdue:
                 print(
                     "prism coordinator: liveness watchdog firing; unresponsive "
@@ -7924,11 +7987,22 @@ class PrismCoordinator:
                 f"chunk_size={self.ctv_broadcaster_chunk_size}",
                 flush=True,
             )
+        # Publication progress is mandatory even when the operator disables
+        # the ordinary heartbeat watchdog: advancing retry heartbeats do not
+        # prove that current work has ever reached publication.
+        threading.Thread(target=self.watchdog_loop, daemon=True).start()
         if self.watchdog_enabled:
-            threading.Thread(target=self.watchdog_loop, daemon=True).start()
             print(
-                "prism coordinator: liveness watchdog enabled "
+                "prism coordinator: liveness and publication-progress watchdog enabled "
                 f"timeout={self.watchdog_timeout_seconds:g}s "
+                f"publication_budget={self.template_refresh_failure_exit_seconds:g}s "
+                f"interval={self.watchdog_interval_seconds:g}s",
+                flush=True,
+            )
+        else:
+            print(
+                "prism coordinator: publication-progress watchdog enabled "
+                f"budget={self.template_refresh_failure_exit_seconds:g}s "
                 f"interval={self.watchdog_interval_seconds:g}s",
                 flush=True,
             )
@@ -8239,10 +8313,10 @@ class PrismCoordinator:
         while remaining > 0:
             if self.stop_event.is_set():
                 return False
-            wait_seconds = min(remaining, 0.25)
-            if self._tip_refresh_retry.wait(wait_seconds):
-                self._tip_refresh_retry.clear()
+            if self._consume_tip_refresh_retry():
                 return not self.stop_event.is_set()
+            wait_seconds = min(remaining, 0.25)
+            self._tip_refresh_retry.wait(wait_seconds)
             remaining -= wait_seconds
         return not self.stop_event.is_set()
 
@@ -8304,6 +8378,33 @@ class PrismCoordinator:
             return False
         failure_started = getattr(self, "template_refresh_failure_started_monotonic", None)
         return failure_started is not None and now - failure_started >= budget
+
+    def publication_progress_failure_expired(self, now: float) -> bool:
+        """Bound sustained detected/current publication divergence.
+
+        Retry-loop heartbeats prove only that the driver is scheduled. This
+        dedicated deadline is independent of client-delivery health and is
+        cleared only by current work publication/delivery, so old delivery
+        backlog cannot make a later legitimate divergence expire immediately.
+        """
+        budget = float(
+            getattr(
+                self,
+                "template_refresh_failure_exit_seconds",
+                DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
+            )
+        )
+        if budget <= 0:
+            return False
+        self._ensure_job_cache_state()
+        with self._progress_health_lock:
+            divergence_since = (
+                self._progress_publication_divergence_since_monotonic
+            )
+        return bool(
+            divergence_since is not None
+            and now - divergence_since >= budget
+        )
 
     def _record_template_refresh_failure(self, now: float) -> None:
         budget = float(
@@ -8369,14 +8470,22 @@ class PrismCoordinator:
                     if self.stop_event.wait(0.25):
                         return
                     continue
-                # Detection can supersede/cancel obsolete heavy work, but only
-                # the successful refresh path may publish submit authority.
-                self.observe_tip_for_refresh(new_tip)
-                refreshed = self.poll_qbit_tip_template_once(heartbeat_name="qbit_blockwait")
+                # Advance the wait cursor before observation/logging. If either
+                # operation raises, the next wait must not rediscover the same
+                # already-seen transition and create a notification storm.
                 known_tip = new_tip
+                # Detection can supersede/cancel obsolete heavy work, but only
+                # the blockpoll single-flight owner may fetch, build, and
+                # publish replacement work.
+                try:
+                    self.observe_tip_for_refresh(new_tip)
+                finally:
+                    # Preserve the wake even if observation-side cancellation
+                    # or bookkeeping raises after known_tip advanced.
+                    self._schedule_tip_refresh_retry()
                 print(
                     f"prism coordinator: blockwait saw new tip {new_tip}; "
-                    f"refreshed {refreshed} client job(s)",
+                    "single-flight refresh scheduled",
                     flush=True,
                 )
             except Exception as exc:
@@ -9435,19 +9544,13 @@ class PrismCoordinator:
         self._ensure_tip_refresh_state()
         self._ensure_job_cache_state()
         refresh_started = time.monotonic()
+        singleflight_acquired = False
         publication_lock_acquired = False
         progress_refresh_active = False
         observation_sequence = 0
         pending_signal_token: int | None = None
         try:
             observation_sequence = self._reserve_tip_observation_sequence()
-            pending_signal_token = self._claim_tip_refresh_pending()
-            with self.lock:
-                poll_start_clients = tuple(
-                    client
-                    for client in self.clients
-                    if self.client_can_receive_jobs(client)
-                )
             # The interval poller has no push notification to mark priority for
             # it. Probe the cheap best-tip RPC before fetching and deriving the
             # template so CTV maintenance can yield as soon as a changed tip is
@@ -9459,8 +9562,29 @@ class PrismCoordinator:
                 mark_pending=False,
             ):
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "tip/template poll was superseded before template fetch"
+                )
+            if not self._tip_refresh_singleflight_lock.acquire(blocking=False):
+                # Observation above remains deliberately outside the owner
+                # lane: a newer tip cancels the obsolete owner immediately.
+                # Mark a replacement only when publication actually differs;
+                # a same-tip contender still coalesces one follow-up template
+                # fetch without superseding the current owner.
+                self.observe_tip_for_refresh(
+                    observed_best_tip,
+                    observation_sequence=observation_sequence,
+                    mark_pending=True,
+                )
+                self._schedule_tip_refresh_retry()
+                return 0
+            singleflight_acquired = True
+            pending_signal_token = self._claim_tip_refresh_pending()
+            with self.lock:
+                poll_start_clients = tuple(
+                    client
+                    for client in self.clients
+                    if self.client_can_receive_jobs(client)
                 )
             with self.lock:
                 current_tip = getattr(self, "current_tip_first_seen", None)
@@ -9476,7 +9600,7 @@ class PrismCoordinator:
                 mark_pending=False,
             ):
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "tip/template poll was superseded during template fetch"
                 )
             with self.lock:
@@ -9993,14 +10117,19 @@ class PrismCoordinator:
             self._record_template_refresh_failure(time.monotonic())
             raise
         finally:
-            if publication_lock_acquired:
-                self._tip_refresh_lock.release()
-            if progress_refresh_active:
-                self._progress_refresh_finished()
-            self._observe_tip_refresh_seconds(
-                "refresh",
-                time.monotonic() - refresh_started,
-            )
+            try:
+                if publication_lock_acquired:
+                    self._tip_refresh_lock.release()
+                if progress_refresh_active:
+                    self._progress_refresh_finished()
+                if singleflight_acquired:
+                    self._observe_tip_refresh_seconds(
+                        "refresh",
+                        time.monotonic() - refresh_started,
+                    )
+            finally:
+                if singleflight_acquired:
+                    self._tip_refresh_singleflight_lock.release()
 
     def _probe_tip_while_refresh_waiting(self) -> None:
         """Detect a changed live tip without entering the heavy refresh lane."""
@@ -10780,7 +10909,21 @@ class PrismCoordinator:
         self, *, block_height: int, block_hash: str, heartbeat_name: str = "qbit_blockpoll"
     ) -> int:
         try:
-            refreshed = self.poll_qbit_tip_template_once(heartbeat_name=heartbeat_name)
+            self._record_heartbeat(heartbeat_name)
+            observation_sequence = self._reserve_tip_observation_sequence()
+            observed_tip = str(self.rpc.call("getbestblockhash"))
+            if not self.observe_tip_for_refresh(
+                observed_tip,
+                observation_sequence=observation_sequence,
+            ):
+                raise TemplateRefreshSuperseded(
+                    "post-accept tip observation was superseded"
+                )
+        except TemplateRefreshSuperseded:
+            # A newer observation won before this notification could publish
+            # its tip. The shared driver is woken below; this is coordination
+            # churn, not a post-accept refresh failure.
+            return 0
         except Exception:
             with self.lock:
                 self.post_accept_refresh_failure_count += 1
@@ -10791,14 +10934,18 @@ class PrismCoordinator:
             )
             traceback.print_exc()
             return 0
-        if refreshed:
-            print(
-                "prism coordinator: refreshed "
-                f"{refreshed} client job(s) after direct PRISM block "
-                f"height={block_height} hash={block_hash}",
-                flush=True,
-            )
-        return refreshed
+        finally:
+            # Accepted-block payout/template changes can require a same-tip
+            # rebuild. Wake the driver even when the immediate best-tip RPC or
+            # observation fails; the owner will refetch a coherent snapshot.
+            self._schedule_tip_refresh_retry()
+        print(
+            "prism coordinator: scheduled single-flight job refresh after "
+            f"direct PRISM block height={block_height} hash={block_hash} "
+            f"observed_tip={observed_tip}",
+            flush=True,
+        )
+        return 0
 
     def fetch_qbit_tip_template_snapshot(self) -> QbitTipTemplateSnapshot:
         # Reserve ordering before either RPC: a fetch that started on an older
@@ -16048,6 +16195,9 @@ class PrismCoordinator:
             pending_since = self._progress_pending_since_monotonic
             if pending_since is None or started < pending_since:
                 self._progress_pending_since_monotonic = started
+            divergence_since = self._progress_publication_divergence_since_monotonic
+            if divergence_since is None or started < divergence_since:
+                self._progress_publication_divergence_since_monotonic = started
             self._progress_refresh_signal_pending = True
 
     def _record_progress_tip_poll(
@@ -16091,6 +16241,11 @@ class PrismCoordinator:
                 pending_since = self._progress_pending_since_monotonic
                 if pending_since is None or observed < pending_since:
                     self._progress_pending_since_monotonic = observed
+                divergence_since = (
+                    self._progress_publication_divergence_since_monotonic
+                )
+                if divergence_since is None or observed < divergence_since:
+                    self._progress_publication_divergence_since_monotonic = observed
 
     def _record_progress_payout_generation(
         self,
@@ -16111,6 +16266,11 @@ class PrismCoordinator:
                 pending_since = self._progress_pending_since_monotonic
                 if pending_since is None or invalidated < pending_since:
                     self._progress_pending_since_monotonic = invalidated
+                divergence_since = (
+                    self._progress_publication_divergence_since_monotonic
+                )
+                if divergence_since is None or invalidated < divergence_since:
+                    self._progress_publication_divergence_since_monotonic = invalidated
                 self._progress_refresh_signal_pending = True
 
     def _record_progress_publication(
@@ -16120,7 +16280,12 @@ class PrismCoordinator:
     ) -> None:
         """Record that current in-memory work is available for delivery."""
         self._ensure_job_cache_state()
-        with self._progress_health_lock:
+        with self.lock, self._progress_health_lock:
+            latest_detected = getattr(self, "latest_detected_tip", None)
+            publication_matches_latest_tip = bool(
+                latest_detected is None
+                or latest_detected[0] == snapshot.bestblockhash
+            )
             if (
                 snapshot.template_generation
                 < self._progress_published_template_generation
@@ -16139,11 +16304,13 @@ class PrismCoordinator:
             )
             self._progress_has_published_work = True
             if (
-                self._progress_current_template_fingerprint
+                publication_matches_latest_tip
+                and self._progress_current_template_fingerprint
                 == snapshot.template_fingerprint
                 and self._progress_current_payout_generation == payout_generation
             ):
                 self._progress_refresh_signal_pending = False
+                self._progress_publication_divergence_since_monotonic = None
         self._progress_note_refresh_activity()
         self._progress_reconcile_pending()
 
@@ -16159,7 +16326,9 @@ class PrismCoordinator:
         if fingerprint is None:
             fingerprint = qbit_template_fingerprint(context.template)
         payout_generation = int(getattr(context, "payout_state_generation", 0))
-        with self.lock:
+        delivered_tip = str(context.template.get("previousblockhash", ""))
+        recorded = False
+        with self.lock, self._progress_health_lock:
             client._progress_delivered_context = context
             client._progress_delivered_template_fingerprint = fingerprint
             client._progress_delivered_template_generation = int(
@@ -16170,8 +16339,10 @@ class PrismCoordinator:
             ready_mode_required = bool(
                 getattr(self, "_pool_ready_latched", False)
             )
-        recorded = False
-        with self._progress_health_lock:
+            latest_detected = getattr(self, "latest_detected_tip", None)
+            delivery_matches_latest_tip = bool(
+                latest_detected is None or latest_detected[0] == delivered_tip
+            )
             if (
                 fingerprint == self._progress_current_template_fingerprint
                 and payout_generation == self._progress_current_payout_generation
@@ -16186,7 +16357,9 @@ class PrismCoordinator:
                 self._progress_last_delivery_template_fingerprint = fingerprint
                 self._progress_last_delivery_payout_generation = payout_generation
                 self._progress_last_delivery_monotonic = delivered_monotonic
-                # A successful delivery is also definitive publication proof.
+                # A successful delivery proves publication for its coherent
+                # generation. Only the latest observed tip can close the
+                # outstanding divergence below.
                 self._progress_published_template_generation = max(
                     self._progress_published_template_generation,
                     self._progress_current_template_generation,
@@ -16198,6 +16371,8 @@ class PrismCoordinator:
                 )
                 self._progress_has_published_work = True
                 self._progress_refresh_signal_pending = False
+                if delivery_matches_latest_tip:
+                    self._progress_publication_divergence_since_monotonic = None
                 recorded = True
         if recorded:
             self._progress_note_refresh_activity(delivered_monotonic)

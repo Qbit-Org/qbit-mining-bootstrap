@@ -270,15 +270,13 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
             rpc.tip = tip_b
             rpc.template = template_b
             self.assertTrue(server.observe_tip_for_refresh(tip_b))
-            # Model blockwait's already-observed winning refresh request. It
-            # queues directly behind the old refresh lock and therefore needs
-            # neither a sleep nor another periodic poll to run.
+            # A competing producer observes/cancels immediately, but cannot
+            # enter the heavy lane while the obsolete owner unwinds.
             new_thread.start()
         finally:
             release_first_build.set()
             old_thread.join(5)
             new_thread.join(5)
-            server.shutdown_tip_refresh_executor()
 
         self.assertFalse(old_thread.is_alive())
         self.assertFalse(new_thread.is_alive())
@@ -286,7 +284,14 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
         self.assertEqual(len(old_errors), 1)
         self.assertIsInstance(old_errors[0], TemplateRefreshBlocked)
         self.assertEqual(new_errors, [])
-        self.assertEqual(new_results, [len(states)])
+        self.assertEqual(new_results, [0])
+        try:
+            self.assertEqual(
+                server.poll_qbit_tip_template_once(),
+                len(states),
+            )
+        finally:
+            server.shutdown_tip_refresh_executor()
         self.assertEqual(
             sent_fingerprints,
             [qbit_template_fingerprint(template_b)] * len(states),
