@@ -3531,7 +3531,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.fetch_qbit_tip_template_snapshot = overtake_poll  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(
-            TemplateRefreshBlocked,
+            TemplateRefreshSuperseded,
             "tip/template poll was superseded during template fetch",
         ):
             server.poll_qbit_tip_template_once()
@@ -3539,6 +3539,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.latest_detected_tip[0], new_tip)
         self.assertEqual(server.current_tip_first_seen[0], old_tip)
         self.assertIsNone(server.tip_template_snapshot)
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+        self.assertTrue(server._consume_tip_refresh_retry())
+        self.assertFalse(server._consume_tip_refresh_retry())
 
     def test_same_tip_template_refresh_sends_non_clean_job_and_keeps_old_job_submittable(self) -> None:
         tip = "00" * 32

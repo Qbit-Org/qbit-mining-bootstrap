@@ -1751,6 +1751,52 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertFalse(server._consume_tip_refresh_retry())
         self.assertIsNotNone(server.template_refresh_failure_started_monotonic)
 
+    def test_post_accept_rpc_failure_still_wakes_refresh_driver(self) -> None:
+        server, rpc = coordinator()
+        original_call = rpc.call
+
+        def fail_best_tip(method: str, *args: object) -> object:
+            if method == "getbestblockhash":
+                raise RuntimeError("temporary best-tip failure")
+            return original_call(method, *args)
+
+        rpc.call = fail_best_tip  # type: ignore[method-assign]
+
+        with patch("lab.prism.prism_coordinator.traceback.print_exc"):
+            self.assertEqual(
+                server.refresh_jobs_after_accepted_block(
+                    block_height=14,
+                    block_hash="88" * 32,
+                    heartbeat_name="block_submitter",
+                ),
+                0,
+            )
+
+        self.assertEqual(server.post_accept_refresh_failure_count, 1)
+        self.assertTrue(server._consume_tip_refresh_retry())
+        self.assertFalse(server._consume_tip_refresh_retry())
+
+    def test_post_accept_supersession_is_not_counted_as_failure(self) -> None:
+        server, _rpc = coordinator()
+        server.observe_tip_for_refresh = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: False
+        )
+
+        with patch("lab.prism.prism_coordinator.traceback.print_exc") as print_exc:
+            self.assertEqual(
+                server.refresh_jobs_after_accepted_block(
+                    block_height=15,
+                    block_hash="99" * 32,
+                    heartbeat_name="block_submitter",
+                ),
+                0,
+            )
+
+        self.assertEqual(server.post_accept_refresh_failure_count, 0)
+        print_exc.assert_not_called()
+        self.assertTrue(server._consume_tip_refresh_retry())
+        self.assertFalse(server._consume_tip_refresh_retry())
+
     def test_rapid_contention_coalesces_one_latest_tip_retry(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)

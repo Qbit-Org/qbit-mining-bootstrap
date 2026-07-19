@@ -3175,6 +3175,12 @@ class PrismCoordinator:
             self._progress_pending_since_monotonic: float | None = float(
                 getattr(self, "started_monotonic", time.monotonic())
             )
+        if not hasattr(self, "_progress_publication_divergence_since_monotonic"):
+            self._progress_publication_divergence_since_monotonic: float | None = (
+                None
+                if self._progress_has_published_work
+                else float(getattr(self, "started_monotonic", time.monotonic()))
+            )
         if not hasattr(self, "_progress_refresh_signal_pending"):
             self._progress_refresh_signal_pending = False
         if not hasattr(self, "_progress_active_refresh_count"):
@@ -8361,9 +8367,9 @@ class PrismCoordinator:
         """Bound sustained detected/current publication divergence.
 
         Retry-loop heartbeats prove only that the driver is scheduled. This
-        deadline is anchored to the oldest unresolved publication state and is
-        cleared only by current work publication/delivery, so repeated ordinary
-        supersessions cannot keep an unpublished process alive indefinitely.
+        dedicated deadline is independent of client-delivery health and is
+        cleared only by current work publication/delivery, so old delivery
+        backlog cannot make a later legitimate divergence expire immediately.
         """
         budget = float(
             getattr(
@@ -8375,21 +8381,13 @@ class PrismCoordinator:
         if budget <= 0:
             return False
         self._ensure_job_cache_state()
-        self._progress_reconcile_pending(now=now)
         with self._progress_health_lock:
-            pending_since = self._progress_pending_since_monotonic
-            publication_pending = bool(
-                self._progress_refresh_signal_pending
-                or not self._progress_has_published_work
-                or self._progress_published_template_fingerprint
-                != self._progress_current_template_fingerprint
-                or self._progress_published_payout_generation
-                != self._progress_current_payout_generation
+            divergence_since = (
+                self._progress_publication_divergence_since_monotonic
             )
         return bool(
-            publication_pending
-            and pending_since is not None
-            and now - pending_since >= budget
+            divergence_since is not None
+            and now - divergence_since >= budget
         )
 
     def _record_template_refresh_failure(self, now: float) -> None:
@@ -9586,7 +9584,7 @@ class PrismCoordinator:
                 mark_pending=False,
             ):
                 self._schedule_tip_refresh_retry()
-                raise TemplateRefreshBlocked(
+                raise TemplateRefreshSuperseded(
                     "tip/template poll was superseded during template fetch"
                 )
             with self.lock:
@@ -10898,19 +10896,18 @@ class PrismCoordinator:
             self._record_heartbeat(heartbeat_name)
             observation_sequence = self._reserve_tip_observation_sequence()
             observed_tip = str(self.rpc.call("getbestblockhash"))
-            try:
-                if not self.observe_tip_for_refresh(
-                    observed_tip,
-                    observation_sequence=observation_sequence,
-                ):
-                    raise TemplateRefreshSuperseded(
-                        "post-accept tip observation was superseded"
-                    )
-            finally:
-                # Accepted-block payout/template changes can require a
-                # same-tip rebuild, so wake the driver even when the best hash
-                # itself is unchanged.
-                self._schedule_tip_refresh_retry()
+            if not self.observe_tip_for_refresh(
+                observed_tip,
+                observation_sequence=observation_sequence,
+            ):
+                raise TemplateRefreshSuperseded(
+                    "post-accept tip observation was superseded"
+                )
+        except TemplateRefreshSuperseded:
+            # A newer observation won before this notification could publish
+            # its tip. The shared driver is woken below; this is coordination
+            # churn, not a post-accept refresh failure.
+            return 0
         except Exception:
             with self.lock:
                 self.post_accept_refresh_failure_count += 1
@@ -10921,6 +10918,11 @@ class PrismCoordinator:
             )
             traceback.print_exc()
             return 0
+        finally:
+            # Accepted-block payout/template changes can require a same-tip
+            # rebuild. Wake the driver even when the immediate best-tip RPC or
+            # observation fails; the owner will refetch a coherent snapshot.
+            self._schedule_tip_refresh_retry()
         print(
             "prism coordinator: scheduled single-flight job refresh after "
             f"direct PRISM block height={block_height} hash={block_hash} "
@@ -16177,6 +16179,9 @@ class PrismCoordinator:
             pending_since = self._progress_pending_since_monotonic
             if pending_since is None or started < pending_since:
                 self._progress_pending_since_monotonic = started
+            divergence_since = self._progress_publication_divergence_since_monotonic
+            if divergence_since is None or started < divergence_since:
+                self._progress_publication_divergence_since_monotonic = started
             self._progress_refresh_signal_pending = True
 
     def _record_progress_tip_poll(
@@ -16220,6 +16225,11 @@ class PrismCoordinator:
                 pending_since = self._progress_pending_since_monotonic
                 if pending_since is None or observed < pending_since:
                     self._progress_pending_since_monotonic = observed
+                divergence_since = (
+                    self._progress_publication_divergence_since_monotonic
+                )
+                if divergence_since is None or observed < divergence_since:
+                    self._progress_publication_divergence_since_monotonic = observed
 
     def _record_progress_payout_generation(
         self,
@@ -16240,6 +16250,11 @@ class PrismCoordinator:
                 pending_since = self._progress_pending_since_monotonic
                 if pending_since is None or invalidated < pending_since:
                     self._progress_pending_since_monotonic = invalidated
+                divergence_since = (
+                    self._progress_publication_divergence_since_monotonic
+                )
+                if divergence_since is None or invalidated < divergence_since:
+                    self._progress_publication_divergence_since_monotonic = invalidated
                 self._progress_refresh_signal_pending = True
 
     def _record_progress_publication(
@@ -16249,7 +16264,12 @@ class PrismCoordinator:
     ) -> None:
         """Record that current in-memory work is available for delivery."""
         self._ensure_job_cache_state()
-        with self._progress_health_lock:
+        with self.lock, self._progress_health_lock:
+            latest_detected = getattr(self, "latest_detected_tip", None)
+            publication_matches_latest_tip = bool(
+                latest_detected is None
+                or latest_detected[0] == snapshot.bestblockhash
+            )
             if (
                 snapshot.template_generation
                 < self._progress_published_template_generation
@@ -16268,11 +16288,13 @@ class PrismCoordinator:
             )
             self._progress_has_published_work = True
             if (
-                self._progress_current_template_fingerprint
+                publication_matches_latest_tip
+                and self._progress_current_template_fingerprint
                 == snapshot.template_fingerprint
                 and self._progress_current_payout_generation == payout_generation
             ):
                 self._progress_refresh_signal_pending = False
+                self._progress_publication_divergence_since_monotonic = None
         self._progress_note_refresh_activity()
         self._progress_reconcile_pending()
 
@@ -16288,7 +16310,9 @@ class PrismCoordinator:
         if fingerprint is None:
             fingerprint = qbit_template_fingerprint(context.template)
         payout_generation = int(getattr(context, "payout_state_generation", 0))
-        with self.lock:
+        delivered_tip = str(context.template.get("previousblockhash", ""))
+        recorded = False
+        with self.lock, self._progress_health_lock:
             client._progress_delivered_context = context
             client._progress_delivered_template_fingerprint = fingerprint
             client._progress_delivered_template_generation = int(
@@ -16299,8 +16323,10 @@ class PrismCoordinator:
             ready_mode_required = bool(
                 getattr(self, "_pool_ready_latched", False)
             )
-        recorded = False
-        with self._progress_health_lock:
+            latest_detected = getattr(self, "latest_detected_tip", None)
+            delivery_matches_latest_tip = bool(
+                latest_detected is None or latest_detected[0] == delivered_tip
+            )
             if (
                 fingerprint == self._progress_current_template_fingerprint
                 and payout_generation == self._progress_current_payout_generation
@@ -16315,7 +16341,9 @@ class PrismCoordinator:
                 self._progress_last_delivery_template_fingerprint = fingerprint
                 self._progress_last_delivery_payout_generation = payout_generation
                 self._progress_last_delivery_monotonic = delivered_monotonic
-                # A successful delivery is also definitive publication proof.
+                # A successful delivery proves publication for its coherent
+                # generation. Only the latest observed tip can close the
+                # outstanding divergence below.
                 self._progress_published_template_generation = max(
                     self._progress_published_template_generation,
                     self._progress_current_template_generation,
@@ -16327,6 +16355,8 @@ class PrismCoordinator:
                 )
                 self._progress_has_published_work = True
                 self._progress_refresh_signal_pending = False
+                if delivery_matches_latest_tip:
+                    self._progress_publication_divergence_since_monotonic = None
                 recorded = True
         if recorded:
             self._progress_note_refresh_activity(delivered_monotonic)
