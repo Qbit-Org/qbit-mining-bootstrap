@@ -1797,6 +1797,52 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertTrue(server._consume_tip_refresh_retry())
         self.assertFalse(server._consume_tip_refresh_retry())
 
+    def test_tip_flicker_back_to_published_work_clears_watchdog(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.template_refresh_failure_exit_seconds = 10.0
+        server.min_ready_miners = 10_000
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
+        original_tip = rpc.tip
+        original_template = rpc.template
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 1)
+        published_job = state.active_job
+        self.assertIsNotNone(published_job)
+
+        _advance_fake_tip(rpc, "aa" * 32, 11)
+        self.assertTrue(server.observe_tip_for_refresh(rpc.tip))
+        rpc.tip = original_tip
+        rpc.template = original_template
+        self.assertTrue(server.observe_tip_for_refresh(original_tip))
+        divergence_started = (
+            server._progress_publication_divergence_since_monotonic
+        )
+        self.assertIsNotNone(divergence_started)
+        assert divergence_started is not None
+        self.assertTrue(
+            server.publication_progress_failure_expired(
+                divergence_started + 10.0
+            )
+        )
+
+        # The coherent A poll has no replacement delivery to make because the
+        # existing A job is already current. Completion itself must close the
+        # A -> B -> A publication-divergence epoch.
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+
+        self.assertIs(state.active_job, published_job)
+        self.assertIsNone(
+            server._progress_publication_divergence_since_monotonic
+        )
+        self.assertFalse(
+            server.publication_progress_failure_expired(10_000_000_000.0)
+        )
+
     def test_rapid_contention_coalesces_one_latest_tip_retry(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)

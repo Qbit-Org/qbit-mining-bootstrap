@@ -6773,6 +6773,22 @@ class PrismCoordinator:
                     return False
                 self._tip_refresh_pending_token = None
                 self._tip_refresh_pending_event.clear()
+                with self._progress_health_lock:
+                    published_current = bool(
+                        self._progress_has_published_work
+                        and self._progress_published_template_fingerprint
+                        == snapshot.template_fingerprint
+                        and self._progress_published_payout_generation
+                        == payout_state_generation
+                    )
+                    if published_current:
+                        # The completion guard above proves this coherent
+                        # snapshot still represents the latest detected and
+                        # published tip. A transient A -> B -> A observation
+                        # therefore closes its publication-divergence epoch
+                        # even when existing A work needed no new delivery.
+                        self._progress_refresh_signal_pending = False
+                        self._progress_publication_divergence_since_monotonic = None
                 return True
 
     def _schedule_tip_refresh_retry(self) -> None:
