@@ -2546,6 +2546,9 @@ class PrismCoordinator:
         )
         self.block_candidate_retry_max_seconds = DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS
         self.block_candidate_retry_delays: dict[str, float] = {}
+        # Terminal candidates whose durable outbox update failed; replays for
+        # these run finalize-only (see _finalize_block_candidate).
+        self._block_candidate_finalize_retries: dict[str, tuple[bool, str]] = {}
         # A block candidate that loses its tip race (or fails to submit) is a
         # BLOCK-path event, not a share rejection: under the async model the
         # share was already accepted and credited, so it must not touch the
@@ -11796,6 +11799,12 @@ class PrismCoordinator:
         # drive tip observation/graveyard pruning.
         bestblockhash = str(self.rpc.call("getbestblockhash"))
         if bestblockhash != previousblockhash:
+            # Record the discovery before failing: the retry-spacing gate
+            # releases on a newer DETECTED tip, and without blockwait this
+            # mismatch is the only place the new tip becomes known. An
+            # unrecorded discovery would hold the immediate new-tip retry
+            # for the full failure holdoff.
+            self.observe_tip_for_refresh(bestblockhash)
             self._schedule_tip_refresh_retry()
             raise TemplateRefreshSuperseded(
                 "qbit tip changed while fetching block template "
@@ -15880,13 +15889,34 @@ class PrismCoordinator:
         candidate: PrismBlockCandidate,
     ) -> bool:
         """Land one dequeued block candidate inside writer admission."""
-        accepted = False
-        error = "candidate became stale or submission failed"
         outcome = getattr(self, "_block_candidate_outcome", None)
         if outcome is None:
             outcome = threading.local()
             self._block_candidate_outcome = outcome
         outcome.reason = None
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        with self.lock:
+            registry = getattr(self, "_block_candidate_finalize_retries", None)
+            pending_finalize = (
+                registry.get(block_hash) if registry is not None else None
+            )
+        if pending_finalize is not None:
+            # Finalize-only replay: submission, terminal accounting, and
+            # payout persistence already completed on the pass that armed
+            # this entry; only the durable outbox update remains. Re-running
+            # submit_block_candidate here would recount terminal
+            # abandonments and redo the accepted-path audit/persist work
+            # once per paced retry.
+            accepted, error = pending_finalize
+            return self._finalize_block_candidate(
+                candidate,
+                block_hash=block_hash,
+                accepted=accepted,
+                error=error,
+                outcome=outcome,
+            )
+        accepted = False
+        error = "candidate became stale or submission failed"
         try:
             accepted = self.submit_block_candidate(candidate)
         except Exception:
@@ -15897,7 +15927,6 @@ class PrismCoordinator:
                 flush=True,
             )
             traceback.print_exc()
-        block_hash = str(candidate.submission.block_hash_hex).lower()
         abandon_reason = getattr(outcome, "reason", None) if outcome is not None else None
         retryable = not accepted and (
             abandon_reason is None
@@ -15937,6 +15966,30 @@ class PrismCoordinator:
                 self._retain_block_candidate_for_retry(candidate)
                 self.stop_event.wait(self._next_block_candidate_retry_delay(block_hash))
                 return True
+        return self._finalize_block_candidate(
+            candidate,
+            block_hash=block_hash,
+            accepted=accepted,
+            error=error,
+            outcome=outcome,
+        )
+
+    def _finalize_block_candidate(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        block_hash: str,
+        accepted: bool,
+        error: str,
+        outcome: threading.local,
+    ) -> bool:
+        """Drive a terminal candidate's durable outbox update, with backoff.
+
+        Failure retains the candidate as a finalize-only replay: the next
+        paced attempt re-enters here directly, never submit_block_candidate,
+        so terminal abandonment accounting stays once-per-candidate and an
+        accepted candidate's audit/persist work is not redone per retry.
+        """
         self._clear_accepted_block_payout_preview(
             block_hash,
             invalidate_published=not accepted,
@@ -15961,15 +16014,27 @@ class PrismCoordinator:
             except Exception:
                 # Keep the coordinator alive. The terminal-state update
                 # failed, so the durable row stays pending and its replay
-                # must pace like any other retained retry -- an unthrottled
-                # replay would redo the full audit/persist pass every
-                # submitter iteration for as long as the ledger is down.
+                # must pace like any other retained retry.
                 print(
                     "prism coordinator: could not finalize durable block candidate "
                     f"hash={block_hash}",
                     flush=True,
                 )
                 traceback.print_exc()
+                with self.lock:
+                    registry = getattr(
+                        self, "_block_candidate_finalize_retries", None
+                    )
+                    if registry is None:
+                        registry = {}
+                        self._block_candidate_finalize_retries = registry
+                    first_failure = block_hash not in registry
+                    registry[block_hash] = (accepted, error)
+                if accepted and first_failure:
+                    # The block is active regardless of the outbox update;
+                    # post-accept fleet refresh must not wait for the ledger
+                    # to recover.
+                    outcome.refresh_client = candidate.client
                 self._retain_block_candidate_for_retry(candidate)
                 self.stop_event.wait(self._next_block_candidate_retry_delay(block_hash))
                 return True
@@ -15977,6 +16042,10 @@ class PrismCoordinator:
             # Compatibility ledgers without a durable candidate outbox have
             # no restart replay source that could require the tombstone.
             self._clear_accepted_block_payout_preview(block_hash)
+        with self.lock:
+            registry = getattr(self, "_block_candidate_finalize_retries", None)
+            if registry is not None:
+                registry.pop(block_hash, None)
         self._clear_block_candidate_retry_state(block_hash)
         # Terminal for this process either way: an accepted candidate credited
         # its share during the success tail (a no-op release here), and an

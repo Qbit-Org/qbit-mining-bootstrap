@@ -116,6 +116,40 @@ class FailedTipRefreshSpacingTests(unittest.TestCase):
         self.assertTrue(server._wait_for_blockpoll_trigger())
         self.assertLess(time.monotonic() - started, 0.2)
 
+    def test_mid_fetch_tip_discovery_releases_the_holdoff(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.clients = set()
+        server.blockpoll_seconds = 30.0
+        server.tip_refresh_failure_holdoff_seconds = 30.0
+        server.template_cache_seconds = 0.0
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+
+        original_call = rpc.call
+
+        def advance_tip_after_template(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            result = original_call(method, params)
+            if method == "getblocktemplate":
+                # The served template still extends the old tip; the fetch's
+                # consistency probe is the only place the new tip surfaces
+                # (the blockwait-disabled configuration).
+                rpc.tip = NEW_TIP
+            return result
+
+        rpc.call = advance_tip_after_template  # type: ignore[method-assign]
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked, "tip changed while fetching"
+        ):
+            server.poll_qbit_tip_template_once()
+
+        # The failed pass recorded its discovery, so the newer tip's retry
+        # is not held for the spacing window.
+        self.assertEqual(server._tip_refresh_failure_holdoff_remaining(), 0.0)
+
     def test_successful_pass_clears_the_holdoff(self) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)
