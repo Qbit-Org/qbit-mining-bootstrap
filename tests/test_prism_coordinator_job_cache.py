@@ -2434,6 +2434,220 @@ class JobBundleCacheTests(unittest.TestCase):
             JobBuildSuperseded,
         )
 
+    def test_publication_critical_build_cannot_be_displaced_by_initial_work(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        old_artifacts = server.store_template_artifacts(dict(rpc.template))
+        new_artifacts = server.store_template_artifacts(
+            base_template(height=11, prevhash="22" * 32)
+        )
+        assert old_artifacts is not None and new_artifacts is not None
+        payout_generation = server._payout_state_generation
+
+        def request_for(
+            artifacts: object,
+            *,
+            publication_critical: bool,
+            request_source: str,
+        ) -> object:
+            return server._new_job_build_request(
+                artifacts,  # type: ignore[arg-type]
+                None,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    artifacts,  # type: ignore[arg-type]
+                    mode="ready",
+                    payout_state_generation=payout_generation,
+                    worker=None,
+                ),
+                publication_critical=publication_critical,
+                request_source=request_source,
+            )
+
+        latest = request_for(
+            new_artifacts,
+            publication_critical=True,
+            request_source="tip_refresh",
+        )
+        reconnect = request_for(
+            old_artifacts,
+            publication_critical=False,
+            request_source="initial",
+        )
+        same_tip_reconnect = request_for(
+            new_artifacts,
+            publication_critical=False,
+            request_source="initial",
+        )
+        latest_flight = SimpleNamespace(request=latest)
+        server._job_build_active = latest_flight
+        server._job_build_retiring = None
+        server._job_build_pending = None
+
+        deferred = server._request_job_build(reconnect)  # type: ignore[arg-type]
+        coalesced = server._request_job_build(  # type: ignore[arg-type]
+            same_tip_reconnect
+        )
+
+        self.assertIs(server._job_build_active, latest_flight)
+        self.assertIs(coalesced, latest.promise)  # type: ignore[union-attr]
+        self.assertFalse(latest.cancellation.is_set())  # type: ignore[union-attr]
+        self.assertFalse(deferred.done())
+        self.assertEqual(
+            server.job_build_priority_counts["routine_deferred"],
+            1,
+        )
+        self.assertEqual(
+            server.initial_job_prepared_work_counts["deferred"],
+            1,
+        )
+        self.assertEqual(
+            server.initial_job_prepared_work_counts["singleflight"],
+            1,
+        )
+
+        latest.promise.set_result(object())  # type: ignore[union-attr]
+        with self.assertRaises(JobBuildSuperseded):
+            deferred.result()
+
+        metrics = "\n".join(server.job_build_metrics_lines())
+        self.assertIn(
+            'qbit_prism_job_build_priority_events_total{result="routine_deferred"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_initial_job_prepared_work_total{result="deferred"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_initial_job_prepared_work_total{result="singleflight"} 1',
+            metrics,
+        )
+
+    def test_publication_critical_build_preempts_routine_builder_capacity(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        old_artifacts = server.store_template_artifacts(dict(rpc.template))
+        new_artifacts = server.store_template_artifacts(
+            base_template(height=11, prevhash="22" * 32)
+        )
+        assert old_artifacts is not None and new_artifacts is not None
+        payout_generation = server._payout_state_generation
+
+        def request_for(
+            artifacts: object,
+            *,
+            publication_critical: bool,
+            request_source: str,
+        ) -> object:
+            return server._new_job_build_request(
+                artifacts,  # type: ignore[arg-type]
+                None,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    artifacts,  # type: ignore[arg-type]
+                    mode="ready",
+                    payout_state_generation=payout_generation,
+                    worker=None,
+                ),
+                publication_critical=publication_critical,
+                request_source=request_source,
+            )
+
+        routine = request_for(
+            old_artifacts,
+            publication_critical=False,
+            request_source="initial",
+        )
+        latest = request_for(
+            new_artifacts,
+            publication_critical=True,
+            request_source="tip_refresh",
+        )
+        routine_flight = SimpleNamespace(request=routine)
+        server._job_build_active = routine_flight
+        server._job_build_retiring = None
+        server._job_build_pending = None
+        server._start_job_build_locked = (  # type: ignore[method-assign]
+            lambda request: SimpleNamespace(request=request, future=None)
+        )
+        server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
+
+        promise = server._request_job_build(latest)  # type: ignore[arg-type]
+
+        self.assertIs(promise, latest.promise)  # type: ignore[union-attr]
+        self.assertTrue(routine.cancellation.is_set())  # type: ignore[union-attr]
+        self.assertIs(server._job_build_retiring, routine_flight)
+        assert server._job_build_active is not None
+        self.assertIs(server._job_build_active.request, latest)
+        self.assertEqual(
+            server.job_build_priority_counts["routine_preempted"],
+            1,
+        )
+
+    def test_publication_critical_collection_promotes_past_ready_work(self) -> None:
+        server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        old_artifacts = server.store_template_artifacts(dict(rpc.template))
+        new_artifacts = server.store_template_artifacts(
+            base_template(height=11, prevhash="22" * 32)
+        )
+        assert old_artifacts is not None and new_artifacts is not None
+        payout_generation = server._payout_state_generation
+        ready = server._new_job_build_request(
+            old_artifacts,
+            None,
+            mode="ready",
+            payout_state_generation=payout_generation,
+            cache_key=server._job_bundle_key(
+                old_artifacts,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                worker=None,
+            ),
+            request_source="initial",
+        )
+        latest_identity = worker("tq1latest", "tq1latest.rig")
+        latest = server._new_job_build_request(
+            new_artifacts,
+            latest_identity,
+            mode="collection",
+            payout_state_generation=payout_generation,
+            cache_key=server._job_bundle_key(
+                new_artifacts,
+                mode="collection",
+                payout_state_generation=payout_generation,
+                worker=latest_identity,
+            ),
+            publication_critical=True,
+            request_source="tip_refresh",
+        )
+        ready_flight = SimpleNamespace(request=ready)
+        server._job_build_active = ready_flight
+        server._job_build_retiring = None
+        server._job_build_pending = latest
+        armed: list[object] = []
+        server._start_job_build_locked = (  # type: ignore[method-assign]
+            lambda request: SimpleNamespace(request=request, future=None)
+        )
+        server._arm_job_build_locked = armed.append  # type: ignore[method-assign]
+
+        server._promote_pending_job_build_locked()
+
+        self.assertTrue(ready.cancellation.is_set())
+        self.assertIs(server._job_build_retiring, ready_flight)
+        self.assertIsNone(server._job_build_pending)
+        assert server._job_build_active is not None
+        self.assertIs(server._job_build_active.request, latest)
+        self.assertEqual(armed, [server._job_build_active])
+        self.assertEqual(
+            server.job_build_priority_counts["routine_preempted"],
+            1,
+        )
+
     def test_cancelled_ready_does_not_block_collection_promotion(self) -> None:
         for placement in ("active", "retiring"):
             with self.subTest(placement=placement):

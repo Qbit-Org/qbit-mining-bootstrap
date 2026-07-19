@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 import unittest
+from concurrent.futures import Future
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,6 +24,7 @@ from lab.prism.prism_coordinator import (
     StratumListenerProfile,
     WorkerIdentity,
     _BoundedPriorityExecutor,
+    _JobBuildCancellation,
 )
 
 
@@ -765,6 +767,116 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             self.assertIn("qbit_prism_initial_job_delivery_configured_workers 4", metrics)
         finally:
             server.shutdown_tip_refresh_executor()
+
+    def test_640_client_storm_cannot_displace_latest_tip_builder(self) -> None:
+        server = coordinator(connection_limit=800, pending_limit=128)
+        server.initial_job_max_workers = 4
+        workers_ready = 0
+        workers_contending = 0
+        worker_lock = threading.Lock()
+        all_workers_ready = threading.Event()
+        all_workers_contending = threading.Event()
+        contend = threading.Event()
+        release_workers = threading.Event()
+
+        def build_request(
+            key: str,
+            *,
+            publication_critical: bool,
+            source: str,
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                idle_retarget=False,
+                mode="ready",
+                equivalence_key=(key,),
+                cache_key=(key,),
+                cancellation=_JobBuildCancellation(timeout_seconds=30.0),
+                promise=Future(),
+                publication_critical=publication_critical,
+                request_source=source,
+                requested_monotonic=time.monotonic(),
+                priority_admission_recorded=False,
+            )
+
+        def contending_initial(_request: PendingInitialJob) -> bool:
+            nonlocal workers_ready, workers_contending
+            with worker_lock:
+                workers_ready += 1
+                if workers_ready == server.initial_job_max_workers:
+                    all_workers_ready.set()
+            if not contend.wait(5):
+                raise AssertionError("test did not release initial builders")
+            deferred = server._request_job_build(  # type: ignore[arg-type]
+                build_request(
+                    "published-tip",
+                    publication_critical=False,
+                    source="initial",
+                )
+            )
+            self.assertFalse(deferred.done())
+            with worker_lock:
+                workers_contending += 1
+                if workers_contending == server.initial_job_max_workers:
+                    all_workers_contending.set()
+            release_workers.wait(5)
+            return False
+
+        server._run_initial_job = contending_initial  # type: ignore[method-assign]
+        clients = [client(server, index) for index in range(1, 641)]
+        admitted = 0
+        for state in clients:
+            admitted += int(server.schedule_initial_job(state))
+
+        self.assertTrue(all_workers_ready.wait(5))
+        self.assertEqual(admitted, 128)
+        self.assertEqual(len(server.pending_initial_jobs), 128)
+        self.assertEqual(server.initial_job_executor().stats(), (124, 4))
+
+        latest = build_request(
+            "latest-tip",
+            publication_critical=True,
+            source="tip_refresh",
+        )
+
+        def start_without_execution(request: object) -> SimpleNamespace:
+            server.job_build_scheduler_counts["starts"] += 1
+            server._record_priority_admission_locked(  # type: ignore[arg-type]
+                request,
+                "started",
+            )
+            return SimpleNamespace(request=request, future=Future())
+
+        server._start_job_build_locked = start_without_execution  # type: ignore[method-assign]
+        server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
+        admission_started = time.monotonic()
+        latest_promise = server._request_job_build(latest)  # type: ignore[arg-type]
+        admission_elapsed = time.monotonic() - admission_started
+        contend.set()
+
+        try:
+            self.assertTrue(all_workers_contending.wait(5))
+            self.assertLess(admission_elapsed, 0.1)
+            self.assertIs(latest_promise, latest.promise)
+            self.assertFalse(latest.cancellation.is_set())
+            assert server._job_build_active is not None
+            self.assertIs(server._job_build_active.request, latest)
+            self.assertEqual(
+                server.job_build_priority_counts["routine_deferred"],
+                4,
+            )
+            self.assertEqual(
+                server.initial_job_prepared_work_counts["deferred"],
+                4,
+            )
+            self.assertEqual(
+                server.job_build_priority_admission_seconds["count"],
+                1,
+            )
+        finally:
+            release_workers.set()
+            server.shutdown_initial_job_executor()
+            with server._job_build_scheduler_lock:
+                server._job_build_active = None
 
     def test_shutdown_cancels_queued_initial_work_and_joins_both_executors(self) -> None:
         server = coordinator(connection_limit=4, pending_limit=3)
