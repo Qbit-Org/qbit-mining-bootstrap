@@ -758,6 +758,10 @@ def coordinator() -> PrismCoordinator:
     server.rpc = FakeRpc()
     server.qbit_chain = "regtest"
     server.blockpoll_seconds = 2.0
+    # Failed-refresh spacing is opt-in per test: its holdoff waits on real
+    # time, which deadlocks tests that freeze time.monotonic around failing
+    # polls. Pacing behavior is covered by test_prism_refresh_retry_pacing.
+    server.tip_refresh_failure_holdoff_seconds = 0.0
     server.ctv_broadcaster_enabled = False
     server.ctv_broadcaster_wallet = None
     server.ctv_broadcaster_fee_sats = 0
@@ -6774,6 +6778,65 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(
             [intent["block_hash_hex"] for intent in ledger.pending_block_candidates()],
             [block_hash],
+        )
+
+    def test_finalize_failure_replays_with_candidate_backoff(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        pending = self._pending_append("f1").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="f1" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        candidate_intent = server.block_candidate_intent(candidate)
+        ledger.append_batch([(pending, candidate_intent)])
+        server.block_candidate_retry_initial_seconds = 0.1
+        server.block_candidate_retry_max_seconds = 0.4
+        # The block itself lands every time; only the terminal outbox update
+        # fails. That replay must pace like any other candidate retry instead
+        # of redoing the full finalization every submitter iteration.
+        server.submit_block_candidate = lambda _candidate: True  # type: ignore[method-assign]
+        original_finish = ledger.mark_block_candidate_submitted
+        finish_attempts = 0
+
+        def flaky_finish(*, block_hash: str) -> bool:
+            nonlocal finish_attempts
+            finish_attempts += 1
+            if finish_attempts <= 4:
+                raise RuntimeError("ledger unavailable")
+            return original_finish(block_hash=block_hash)
+
+        ledger.mark_block_candidate_submitted = flaky_finish  # type: ignore[method-assign]
+        waits: list[float] = []
+        with patch.object(
+            server.stop_event,
+            "wait",
+            side_effect=lambda delay: waits.append(delay) or False,
+        ):
+            for _attempt in range(4):
+                server.enqueue_block_candidate(candidate)
+                self.assertTrue(server.submit_next_block_candidate())
+                self.assertEqual(ledger.pending_block_candidates(), [candidate_intent])
+            server.enqueue_block_candidate(candidate)
+            self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(waits, [0.1, 0.2, 0.4, 0.4])
+        self.assertEqual(finish_attempts, 5)
+        self.assertNotIn(candidate.submission.block_hash_hex, server.block_candidate_retry_delays)
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
+        self.assertEqual(ledger.pending_block_candidates(), [])
+        self.assertIn(
+            "qbit_prism_block_candidate_retries_total 4",
+            server.metrics_payload(),
         )
 
     def test_invalid_durable_candidate_is_quarantined_by_outbox_row_key(self) -> None:

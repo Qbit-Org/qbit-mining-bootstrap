@@ -265,6 +265,10 @@ def coordinator(*, ledger: object | None = None, template: dict[str, object] | N
     server.min_ready_miners = 3
     server.ledger = ledger if ledger is not None else FakeLedger()
     server.blockpoll_seconds = 2.0
+    # Failed-refresh spacing is opt-in per test: its holdoff waits on real
+    # time, which deadlocks tests that freeze time.monotonic around failing
+    # polls. Pacing behavior is covered by test_prism_refresh_retry_pacing.
+    server.tip_refresh_failure_holdoff_seconds = 0.0
     server.job_bundle_cache_seconds = 10.0
     server.template_cache_seconds = 2.0
     server.reorg_reconcile_cache_seconds = 5.0
@@ -4181,6 +4185,10 @@ class JobBundleCacheTests(unittest.TestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        # The poll must observe the same-tip template rotation immediately for
+        # the queued-fanout replacement race below; disable the same-tip
+        # template reuse window so the rotation is fetched, not deferred.
+        server.template_cache_seconds = 0.0
         first = client(1)
         second = client(2)
         server.clients = [first, second]  # type: ignore[assignment]

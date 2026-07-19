@@ -271,6 +271,10 @@ def coordinator(
     server.min_ready_miners = 3
     server.ledger = FakeAppendLedger()
     server.blockpoll_seconds = 2.0
+    # Failed-refresh spacing is opt-in per test: its holdoff waits on real
+    # time, which deadlocks tests that freeze time.monotonic around failing
+    # polls. Pacing behavior is covered by test_prism_refresh_retry_pacing.
+    server.tip_refresh_failure_holdoff_seconds = 0.0
     server.job_bundle_cache_seconds = 10.0
     server.template_cache_seconds = 2.0
     server.reorg_reconcile_cache_seconds = 5.0
