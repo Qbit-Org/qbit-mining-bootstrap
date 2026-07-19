@@ -185,6 +185,8 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "30")
         self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS"], "300")
         self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "3600")
+        self.assertEqual(env["PRISM_PUBLIC_SETTLEMENT_CACHE_TTL_SECONDS"], "")
+        self.assertEqual(env["PRISM_PUBLIC_SETTLEMENT_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "")
         self.assertEqual(env["PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS"], "86400")
         self.assertEqual(env["PRISM_PUBLIC_ARTIFACT_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "86400")
         self.assertEqual(env["PRISM_PUBLIC_CACHE_MAX_ENTRIES"], "512")

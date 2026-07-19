@@ -39,8 +39,14 @@ emits conservative browser caching (`Cache-Control: public, max-age=0,
 must-revalidate`) plus shared-cache headers for CDNs such as Vercel. Dynamic
 dashboard read models default to a 5-second shared-cache TTL with 30 seconds of
 `stale-while-revalidate`. `GET /public/v1/mining-configuration` defaults to 300
-seconds, and content-addressed artifact routes default to 86400 seconds with an
-immutable shared-cache hint.
+seconds. Settlement-artifact responses also default to 5 seconds because they
+include live fanout status and broadcast attempts. Content-addressed artifact
+routes default to 86400 seconds with an immutable shared-cache hint.
+
+Settlement-specific cache controls are blank by default and inherit
+`PRISM_PUBLIC_CACHE_TTL_SECONDS` and
+`PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS`. Set them only when an
+explicit route-specific override is required.
 
 Operators can tune the defaults with:
 
@@ -49,6 +55,8 @@ Operators can tune the defaults with:
 - `PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS`
 - `PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS`
 - `PRISM_PUBLIC_CONFIG_CACHE_STALE_WHILE_REVALIDATE_SECONDS`
+- `PRISM_PUBLIC_SETTLEMENT_CACHE_TTL_SECONDS`
+- `PRISM_PUBLIC_SETTLEMENT_CACHE_STALE_WHILE_REVALIDATE_SECONDS`
 - `PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS`
 - `PRISM_PUBLIC_ARTIFACT_CACHE_STALE_WHILE_REVALIDATE_SECONDS`
 - `PRISM_PUBLIC_CACHE_MAX_ENTRIES`
