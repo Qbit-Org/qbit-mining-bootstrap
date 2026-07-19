@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -85,6 +86,10 @@ class FakeRpc:
         if method == "getnetworkinfo":
             return {"connections": 8, **self.network_info}
         raise AssertionError(f"unexpected RPC method {method}")
+
+
+def _bucket_timestamp(epoch: int) -> str:
+    return public_api.iso_datetime(datetime.fromtimestamp(epoch, timezone.utc))
 
 
 class FakePublicLedger:
@@ -345,7 +350,29 @@ class FakePublicLedger:
         subject_id: str | None,
         range_id: str,
         bucket: str,
+        lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
+        self.last_hashrate_series_lookback = lookback_seconds
+        self.last_hashrate_series_anchor = range_anchor_epoch
+        if bucket == "5m":
+            # Recent bucket epochs (with a gap between them) so the points sit
+            # inside every bounded range after lookback trimming.
+            aligned_epoch = int(time.time()) // 300 * 300
+            return [
+                {
+                    "timestamp": _bucket_timestamp(aligned_epoch - 600),
+                    "hashrate_ths": public_api.hashrate_ths_from_difficulty(600, 300),
+                    "accepted_share_count": 2,
+                    "accepted_share_difficulty": "600",
+                },
+                {
+                    "timestamp": _bucket_timestamp(aligned_epoch),
+                    "hashrate_ths": public_api.hashrate_ths_from_difficulty(1200, 300),
+                    "accepted_share_count": 1,
+                    "accepted_share_difficulty": "1200",
+                },
+            ]
         return [
             {
                 "timestamp": "2026-06-26T20:00:00Z",
@@ -445,6 +472,41 @@ class FakePublicLedger:
                 "maturity_state": "immature",
                 "created_at": "2026-06-26 19:45:00+00",
                 "found_at": "2026-06-26 19:40:00+00",
+            },
+        ]
+
+
+class RangeBoundaryPublicLedger(FakePublicLedger):
+    """Serves one bucket just before the 1w range boundary and one inside it."""
+
+    def dashboard_hashrate_series(
+        self,
+        *,
+        subject_type: str,
+        subject_id: str | None,
+        range_id: str,
+        bucket: str,
+        lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
+    ) -> list[dict[str, object]]:
+        self.last_hashrate_series_lookback = lookback_seconds
+        self.last_hashrate_series_anchor = range_anchor_epoch
+        # Derive the boundary from the caller-provided anchor, exactly as the
+        # endpoint's min_epoch trim does, so this stub is deterministic.
+        anchor_epoch = range_anchor_epoch if range_anchor_epoch is not None else int(time.time())
+        cutoff_epoch = public_api.hashrate_series_min_epoch(anchor_epoch, 7 * 86400, 300)
+        return [
+            {
+                "timestamp": _bucket_timestamp(cutoff_epoch - 300),
+                "hashrate_ths": public_api.hashrate_ths_from_difficulty(600, 300),
+                "accepted_share_count": 1,
+                "accepted_share_difficulty": "600",
+            },
+            {
+                "timestamp": _bucket_timestamp(cutoff_epoch + 1200),
+                "hashrate_ths": public_api.hashrate_ths_from_difficulty(1200, 300),
+                "accepted_share_count": 1,
+                "accepted_share_difficulty": "1200",
             },
         ]
 
@@ -743,6 +805,147 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v1")
         self.assertEqual(series["subject"], {"type": "miner", "id": "miner-a"})
         self.assertEqual(series["bucket"], "1h")
+        # 1h buckets already exceed the default smoothing window, so ledger
+        # rates pass through untouched.
+        self.assertEqual(series["points"][0]["hashrate_ths"], "2.5")
+
+    def assert_hashrate_ths(self, actual: object, difficulty: int, seconds: int) -> None:
+        # Hashrate strings are Decimal-context dependent (direct_stratum pins
+        # prec=40 in the importing thread while HTTP handler threads use the
+        # default 28), so compare values with a tight relative tolerance
+        # instead of exact strings.
+        expected = (
+            Decimal(difficulty)
+            * public_api.HASHES_PER_QBIT_SCALED_DIFFICULTY
+            / Decimal(seconds)
+            / public_api.TERAHASH
+        )
+        self.assertLess(abs(Decimal(str(actual)) - expected), expected * Decimal("1e-25"))
+
+    def test_hashrate_series_smooths_5m_buckets_over_trailing_window(self) -> None:
+        series = self.get_json("/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m")
+
+        points = series["points"]
+        self.assertEqual(len(points), 2)
+        # Raw per-bucket fields are preserved; only the rate is windowed.
+        self.assertEqual([point["accepted_share_difficulty"] for point in points], ["600", "1200"])
+        self.assertEqual([point["accepted_share_count"] for point in points], [2, 1])
+        self.assert_hashrate_ths(points[0]["hashrate_ths"], 600, 1800)
+        # The second point's 30m window spans 20:00 and 20:10 with the empty
+        # 20:05 bucket counting as zero difficulty.
+        self.assert_hashrate_ths(points[1]["hashrate_ths"], 1800, 1800)
+
+    def test_hashrate_series_smoothing_disabled_by_env(self) -> None:
+        with patch.dict(os.environ, {"PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS": "0"}):
+            series = self.get_json("/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m")
+
+        points = series["points"]
+        self.assert_hashrate_ths(points[0]["hashrate_ths"], 600, 300)
+        self.assert_hashrate_ths(points[1]["hashrate_ths"], 1200, 300)
+
+    def test_hashrate_series_fetches_lookback_and_trims_pre_range_points(self) -> None:
+        ledger = RangeBoundaryPublicLedger()
+        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m"
+            with urllib.request.urlopen(url, timeout=5) as response:
+                series = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        # The ledger is asked for one extra smoothing window of history so the
+        # first in-range windows average over real pre-range buckets, anchored
+        # on the same epoch the endpoint trims against so database clock skew
+        # cannot shift the boundary.
+        self.assertEqual(ledger.last_hashrate_series_lookback, 1800)
+        self.assertIsNotNone(ledger.last_hashrate_series_anchor)
+        points = series["points"]
+        # The pre-range context bucket feeds the trailing window but is dropped
+        # from the response instead of charting an artificial ramp-up.
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0]["accepted_share_difficulty"], "1200")
+        self.assert_hashrate_ths(points[0]["hashrate_ths"], 1800, 1800)
+
+    def test_hashrate_series_min_epoch_trims_straddling_bucket(self) -> None:
+        # Range start aligned to the bucket grid: that bucket is fully in range
+        # and is the first one kept.
+        self.assertEqual(public_api.hashrate_series_min_epoch(1000, 700, 300), 300)
+        # Unaligned range start (350) falls inside bucket [300, 600): that
+        # straddling bucket would mix pre-range shares into its raw fields, so
+        # the first kept bucket is the next fully covered one.
+        self.assertEqual(public_api.hashrate_series_min_epoch(1050, 700, 300), 600)
+
+    def test_smooth_hashrate_series_rolling_total_matches_naive_window_sums(self) -> None:
+        # The rolling int total must equal an independently computed sum over
+        # each point's trailing window, across gaps and window evictions.
+        base_epoch = 1_750_000_000 // 300 * 300
+        series = [
+            (base_epoch, 100),
+            (base_epoch + 300, 250),
+            (base_epoch + 900, 75),
+            (base_epoch + 1500, 500),
+            (base_epoch + 1800, 125),
+            (base_epoch + 3600, 900),
+        ]
+        points = [
+            {
+                "timestamp": _bucket_timestamp(epoch),
+                "hashrate_ths": "0",
+                "accepted_share_count": 1,
+                "accepted_share_difficulty": str(difficulty),
+            }
+            for epoch, difficulty in series
+        ]
+        smoothed = public_api.smooth_hashrate_series_points(
+            points, bucket_seconds=300, window_seconds=1800
+        )
+        self.assertEqual(len(smoothed), len(series))
+        for (epoch, _), point in zip(series, smoothed):
+            expected_total = sum(d for ep, d in series if epoch - 1800 < ep <= epoch)
+            self.assertEqual(
+                point["hashrate_ths"],
+                public_api.hashrate_ths_from_difficulty(expected_total, 1800),
+            )
+
+    def test_smooth_hashrate_series_points_drops_malformed_points(self) -> None:
+        # An unparseable point can be neither windowed nor range-checked, so it
+        # is dropped rather than passed through raw (which would leak pre-range
+        # lookback buckets past the min_epoch trim).
+        malformed = {
+            "timestamp": "not-a-timestamp",
+            "hashrate_ths": "2.5",
+            "accepted_share_count": 1,
+            "accepted_share_difficulty": "100",
+        }
+        valid = {
+            "timestamp": "2026-06-26T20:00:00Z",
+            "hashrate_ths": "2.5",
+            "accepted_share_count": 1,
+            "accepted_share_difficulty": "600",
+        }
+        smoothed = public_api.smooth_hashrate_series_points(
+            [malformed, valid], bucket_seconds=300, window_seconds=1800
+        )
+        self.assertEqual(len(smoothed), 1)
+        self.assertEqual(smoothed[0]["accepted_share_difficulty"], "600")
+        self.assert_hashrate_ths(smoothed[0]["hashrate_ths"], 600, 1800)
+        # With trimming active, a malformed pre-range context point stays out
+        # of the response.
+        cutoff_epoch = 1_750_000_000 // 300 * 300
+        in_range = dict(valid, timestamp=_bucket_timestamp(cutoff_epoch))
+        smoothed = public_api.smooth_hashrate_series_points(
+            [malformed, in_range],
+            bucket_seconds=300,
+            window_seconds=1800,
+            min_epoch=cutoff_epoch,
+        )
+        self.assertEqual(len(smoothed), 1)
+        self.assertEqual(smoothed[0]["timestamp"], _bucket_timestamp(cutoff_epoch))
 
     def test_omitted_leaderboard_window_retains_exact_legacy_v1_keys(self) -> None:
         payload = self.get_json("/public/v1/leaderboard")

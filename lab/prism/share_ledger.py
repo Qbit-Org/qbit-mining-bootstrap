@@ -909,11 +909,24 @@ class SingleWriterShareLedger:
         subject_id: str | None,
         range_id: str,
         bucket: str,
+        lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
         from lab.prism import public_api
 
         now = datetime.now(timezone.utc)
-        started = _series_start(now, range_id)
+        # Anchor the range lower bound on the caller's clock when provided so
+        # it agrees with the caller's min_epoch trim regardless of clock skew.
+        anchor = (
+            datetime.fromtimestamp(range_anchor_epoch, timezone.utc)
+            if range_anchor_epoch is not None
+            else now
+        )
+        started = _series_start(anchor, range_id)
+        if lookback_seconds > 0 and range_id != "all":
+            # Pre-range context requested by the smoother; the caller trims
+            # these buckets from the response after windowing.
+            started -= timedelta(seconds=int(lookback_seconds))
         bucket_seconds = {"5m": 300, "1h": 3600, "1d": 86400}[bucket]
         buckets: dict[int, dict[str, int]] = {}
         for share in self.all_shares():
@@ -4211,17 +4224,34 @@ CROSS JOIN window_summary;
         subject_id: str | None,
         range_id: str,
         bucket: str,
+        lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
         from lab.prism import public_api
 
         bucket_seconds = {"5m": 300, "1h": 3600, "1d": 86400}[bucket]
-        range_filter = {
-            "1w": "AND ledger.accepted_at >= bounds.ended_at - interval '7 days'",
-            "1m": "AND ledger.accepted_at >= bounds.ended_at - interval '30 days'",
-            "6m": "AND ledger.accepted_at >= bounds.ended_at - interval '180 days'",
-            "window": "AND ledger.accepted_at >= bounds.ended_at - interval '3 hours'",
-            "all": "",
+        range_interval = {
+            "1w": "7 days",
+            "1m": "30 days",
+            "6m": "180 days",
+            "window": "3 hours",
+            "all": None,
         }[range_id]
+        range_filter = ""
+        if range_interval is not None:
+            # Anchor the range lower bound on the caller's clock when provided
+            # so it agrees with the caller's min_epoch trim even when the
+            # database clock disagrees with the application clock.
+            range_anchor_sql = (
+                f"to_timestamp({int(range_anchor_epoch)})"
+                if range_anchor_epoch is not None
+                else "bounds.ended_at"
+            )
+            range_filter = f"AND ledger.accepted_at >= {range_anchor_sql} - interval '{range_interval}'"
+            if lookback_seconds > 0:
+                # Pre-range context requested by the smoother; the caller trims
+                # these buckets from the response after windowing.
+                range_filter += f" - interval '{int(lookback_seconds)} seconds'"
         subject_filter = ""
         if subject_type == "miner":
             subject_filter = f"AND ledger.miner_id = {self._text_literal(str(subject_id))}"

@@ -9,7 +9,7 @@ import os
 import threading
 import time
 import urllib.parse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -27,6 +27,14 @@ HASHES_PER_QBIT_SCALED_DIFFICULTY = (
 )
 MAX_SEARCH_LENGTH = 128
 MAX_RECIPIENT_ID_LENGTH = 256
+HASHRATE_SERIES_BUCKET_SECONDS = {"5m": 300, "1h": 3600, "1d": 86400}
+HASHRATE_SERIES_RANGE_SECONDS = {
+    "1w": 7 * 86400,
+    "1m": 30 * 86400,
+    "6m": 180 * 86400,
+    "all": None,
+}
+DEFAULT_HASHRATE_SMOOTHING_SECONDS = 30 * 60
 
 PUBLIC_ERROR_CODES = {
     "not_found": "not_found",
@@ -481,6 +489,35 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
     else:
         raise PublicApiError(400, "invalid_subject", "subject must be pool or miner:{recipient_id}")
     generated_at = utc_now_iso()
+    bucket_seconds = HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+    window_seconds = public_hashrate_smoothing_seconds()
+    range_seconds = HASHRATE_SERIES_RANGE_SECONDS[range_id]
+    lookback_seconds = 0
+    min_epoch: int | None = None
+    range_anchor_epoch: int | None = None
+    if window_seconds // bucket_seconds >= 2 and range_seconds is not None:
+        # Fetch one full smoothing window of pre-range history so the first
+        # in-range points average over real data instead of artificial zeros,
+        # then trim the context-only points after smoothing. The ledger anchors
+        # its range lower bound on the same epoch min_epoch derives from, so
+        # the trim cannot disagree with the fetch under clock skew.
+        lookback_seconds = (window_seconds // bucket_seconds) * bucket_seconds
+        range_anchor_epoch = int(datetime.now(timezone.utc).timestamp())
+        min_epoch = hashrate_series_min_epoch(range_anchor_epoch, range_seconds, bucket_seconds)
+    points = coordinator.ledger.dashboard_hashrate_series(
+        subject_type=subject_type,
+        subject_id=subject_id,
+        range_id=range_id,
+        bucket=bucket,
+        lookback_seconds=lookback_seconds,
+        range_anchor_epoch=range_anchor_epoch,
+    )
+    points = smooth_hashrate_series_points(
+        points,
+        bucket_seconds=bucket_seconds,
+        window_seconds=window_seconds,
+        min_epoch=min_epoch,
+    )
     return {
         "schema": "prism.dashboard.hashrate-series.v1",
         "generated_at": generated_at,
@@ -488,12 +525,7 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
         "range": range_id,
         "bucket": bucket,
         "unit": "ths",
-        "points": coordinator.ledger.dashboard_hashrate_series(
-            subject_type=subject_type,
-            subject_id=subject_id,
-            range_id=range_id,
-            bucket=bucket,
-        ),
+        "points": points,
     }
 
 
@@ -602,6 +634,21 @@ def public_pool_fee_bps() -> int:
     except (TypeError, ValueError):
         return 0
     return max(0, min(10_000, bps))
+
+
+def public_hashrate_smoothing_seconds() -> int:
+    """Trailing window used to steady hashrate-series points, clamped to [0, 86400].
+
+    0 disables smoothing and returns raw per-bucket rates.
+    """
+    raw = os.environ.get("PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_HASHRATE_SMOOTHING_SECONDS
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_HASHRATE_SMOOTHING_SECONDS
+    return max(0, min(86_400, seconds))
 
 
 def latest_block_coinbase_value_bits(coordinator: Any) -> int | None:
@@ -1112,6 +1159,85 @@ def hashrate_ths_from_difficulty(total_difficulty: int | str | Decimal, seconds:
     if difficulty <= 0:
         return "0"
     return decimal_string(difficulty * HASHES_PER_QBIT_SCALED_DIFFICULTY / Decimal(seconds) / TERAHASH)
+
+
+def hashrate_series_min_epoch(now_epoch: int, range_seconds: int, bucket_seconds: int) -> int:
+    """First bucket epoch whose full span lies inside the bounded range.
+
+    A bucket straddling the range start is trimmed from the response: the
+    lookback-widened ledger query would aggregate pre-range shares into its raw
+    fields (and the unwidened query clipped it short), so neither raw reading
+    describes a fully covered bucket. Its shares still feed the trailing
+    windows of the kept points.
+    """
+    range_start_epoch = now_epoch - range_seconds
+    return -(-range_start_epoch // bucket_seconds) * bucket_seconds
+
+
+def smooth_hashrate_series_points(
+    points: list[dict[str, object]],
+    *,
+    bucket_seconds: int,
+    window_seconds: int,
+    min_epoch: int | None = None,
+) -> list[dict[str, object]]:
+    """Recompute each point's hashrate over a trailing window of buckets.
+
+    Vardiff keeps accepted-share counts per bucket small, so raw 5m bucket rates
+    swing tens of percent point-to-point and the dashboard charts come out
+    choppy. Each point keeps its bucket cadence but its rate is averaged over
+    the trailing window, with buckets missing from the series counting as zero
+    difficulty. accepted_share_count and accepted_share_difficulty stay
+    per-bucket. Windows smaller than two buckets leave the rates unchanged.
+
+    Points before min_epoch are pre-range lookback context: they feed the
+    trailing windows of the first in-range points and are dropped from the
+    result. A point whose timestamp or integer difficulty does not parse is
+    dropped as well -- it can be neither windowed nor range-checked, and
+    dropping it beats leaking pre-range buckets or failing the endpoint over a
+    display refinement. Points are returned ascending by timestamp.
+
+    The trailing total is a rolling int sum (add the entering bucket, evict
+    expired ones), keeping the pass linear in the number of points regardless
+    of the window size and exact regardless of the thread-local Decimal
+    precision.
+    """
+    bucket_count = window_seconds // bucket_seconds if bucket_seconds > 0 else 0
+    if (bucket_count < 2 and min_epoch is None) or not points:
+        return points
+    effective_window_seconds = bucket_count * bucket_seconds
+    parsed_points: list[tuple[int, int, dict[str, object]]] = []
+    for point in points:
+        try:
+            parsed = datetime.strptime(str(point["timestamp"]), "%Y-%m-%dT%H:%M:%SZ")
+            epoch = int(parsed.replace(tzinfo=timezone.utc).timestamp())
+            difficulty = int(str(point["accepted_share_difficulty"]))
+        except (KeyError, ValueError):
+            continue
+        parsed_points.append((epoch, difficulty, point))
+    parsed_points.sort(key=lambda entry: entry[0])
+    smoothed: list[dict[str, object]] = []
+    window: deque[tuple[int, int]] = deque()
+    window_total = 0
+    for epoch, difficulty, point in parsed_points:
+        if bucket_count < 2:
+            if min_epoch is None or epoch >= min_epoch:
+                smoothed.append(point)
+            continue
+        window.append((epoch, difficulty))
+        window_total += difficulty
+        while window and window[0][0] <= epoch - effective_window_seconds:
+            _, expired_difficulty = window.popleft()
+            window_total -= expired_difficulty
+        if min_epoch is not None and epoch < min_epoch:
+            continue
+        smoothed.append(
+            {
+                **point,
+                "hashrate_ths": hashrate_ths_from_difficulty(window_total, effective_window_seconds),
+            }
+        )
+    return smoothed
 
 
 def pagination(page: int, limit: int, total_count: int) -> dict[str, int]:
