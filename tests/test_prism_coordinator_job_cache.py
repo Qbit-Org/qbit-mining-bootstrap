@@ -2434,6 +2434,537 @@ class JobBundleCacheTests(unittest.TestCase):
             JobBuildSuperseded,
         )
 
+    def test_publication_critical_build_cannot_be_displaced_by_initial_work(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        old_artifacts = server.store_template_artifacts(dict(rpc.template))
+        new_artifacts = server.store_template_artifacts(
+            base_template(height=11, prevhash="22" * 32)
+        )
+        assert old_artifacts is not None and new_artifacts is not None
+        payout_generation = server._payout_state_generation
+
+        def request_for(
+            artifacts: object,
+            *,
+            publication_critical: bool,
+            request_source: str,
+        ) -> object:
+            return server._new_job_build_request(
+                artifacts,  # type: ignore[arg-type]
+                None,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    artifacts,  # type: ignore[arg-type]
+                    mode="ready",
+                    payout_state_generation=payout_generation,
+                    worker=None,
+                ),
+                publication_critical=publication_critical,
+                request_source=request_source,
+            )
+
+        latest = request_for(
+            new_artifacts,
+            publication_critical=True,
+            request_source="tip_refresh",
+        )
+        reconnect = request_for(
+            old_artifacts,
+            publication_critical=False,
+            request_source="initial",
+        )
+        same_tip_reconnect = request_for(
+            new_artifacts,
+            publication_critical=False,
+            request_source="initial",
+        )
+        latest_flight = SimpleNamespace(request=latest)
+        server._job_build_active = latest_flight
+        server._job_build_retiring = None
+        server._job_build_pending = None
+
+        deferred = server._request_job_build(reconnect)  # type: ignore[arg-type]
+        coalesced = server._request_job_build(  # type: ignore[arg-type]
+            same_tip_reconnect
+        )
+
+        self.assertIs(server._job_build_active, latest_flight)
+        self.assertIs(coalesced, latest.promise)  # type: ignore[union-attr]
+        self.assertFalse(latest.cancellation.is_set())  # type: ignore[union-attr]
+        self.assertFalse(deferred.done())
+        self.assertEqual(
+            server.job_build_priority_counts["routine_deferred"],
+            1,
+        )
+        self.assertEqual(
+            server.initial_job_prepared_work_counts["deferred"],
+            1,
+        )
+        self.assertEqual(
+            server.initial_job_prepared_work_counts["singleflight"],
+            1,
+        )
+
+        latest.promise.set_result(object())  # type: ignore[union-attr]
+        with self.assertRaises(JobBuildSuperseded):
+            deferred.result()
+
+        metrics = "\n".join(server.job_build_metrics_lines())
+        self.assertIn(
+            'qbit_prism_job_build_priority_events_total{result="routine_deferred"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_initial_job_prepared_work_total{result="deferred"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_initial_job_prepared_work_total{result="singleflight"} 1',
+            metrics,
+        )
+
+    def test_publication_critical_build_preempts_routine_builder_capacity(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        old_artifacts = server.store_template_artifacts(dict(rpc.template))
+        new_artifacts = server.store_template_artifacts(
+            base_template(height=11, prevhash="22" * 32)
+        )
+        assert old_artifacts is not None and new_artifacts is not None
+        payout_generation = server._payout_state_generation
+
+        def request_for(
+            artifacts: object,
+            *,
+            publication_critical: bool,
+            request_source: str,
+        ) -> object:
+            return server._new_job_build_request(
+                artifacts,  # type: ignore[arg-type]
+                None,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                cache_key=server._job_bundle_key(
+                    artifacts,  # type: ignore[arg-type]
+                    mode="ready",
+                    payout_state_generation=payout_generation,
+                    worker=None,
+                ),
+                publication_critical=publication_critical,
+                request_source=request_source,
+            )
+
+        routine = request_for(
+            old_artifacts,
+            publication_critical=False,
+            request_source="initial",
+        )
+        latest = request_for(
+            new_artifacts,
+            publication_critical=True,
+            request_source="tip_refresh",
+        )
+        routine_flight = SimpleNamespace(request=routine)
+        server._job_build_active = routine_flight
+        server._job_build_retiring = None
+        server._job_build_pending = None
+        server._start_job_build_locked = (  # type: ignore[method-assign]
+            lambda request: SimpleNamespace(request=request, future=None)
+        )
+        server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
+
+        promise = server._request_job_build(latest)  # type: ignore[arg-type]
+
+        self.assertIs(promise, latest.promise)  # type: ignore[union-attr]
+        self.assertTrue(routine.cancellation.is_set())  # type: ignore[union-attr]
+        self.assertIs(server._job_build_retiring, routine_flight)
+        assert server._job_build_active is not None
+        self.assertIs(server._job_build_active.request, latest)
+        self.assertEqual(
+            server.job_build_priority_counts["routine_preempted"],
+            1,
+        )
+
+    def test_publication_critical_build_restarts_unhealthy_exact_flight(
+        self,
+    ) -> None:
+        for unhealthy in ("almost_expired", "stalled"):
+            with self.subTest(unhealthy=unhealthy):
+                server, rpc = coordinator()
+                artifacts = server.store_template_artifacts(dict(rpc.template))
+                assert artifacts is not None
+                payout_generation = server._payout_state_generation
+
+                def request_for(
+                    *,
+                    publication_critical: bool,
+                    priority_requested_monotonic: float | None = None,
+                ) -> object:
+                    return server._new_job_build_request(
+                        artifacts,
+                        None,
+                        mode="ready",
+                        payout_state_generation=payout_generation,
+                        cache_key=server._job_bundle_key(
+                            artifacts,
+                            mode="ready",
+                            payout_state_generation=payout_generation,
+                            worker=None,
+                        ),
+                        publication_critical=publication_critical,
+                        request_source=(
+                            "tip_refresh"
+                            if publication_critical
+                            else "initial"
+                        ),
+                        priority_requested_monotonic=(
+                            priority_requested_monotonic
+                        ),
+                    )
+
+                routine = request_for(publication_critical=False)
+                now = time.monotonic()
+                if unhealthy == "almost_expired":
+                    routine.cancellation.started_monotonic = now - 59.99
+                    routine.cancellation.deadline_monotonic = now + 0.01
+                    routine.cancellation.last_checkpoint_monotonic = now
+                else:
+                    routine.cancellation.started_monotonic = now - 1.0
+                    routine.cancellation.deadline_monotonic = now + 59.0
+                    routine.cancellation.last_checkpoint_monotonic = (
+                        now - server.job_build_cancel_grace_seconds - 0.01
+                    )
+                priority_requested = now - 59.0
+                latest = request_for(
+                    publication_critical=True,
+                    priority_requested_monotonic=priority_requested,
+                )
+                routine_flight = SimpleNamespace(request=routine)
+                server._job_build_active = routine_flight
+                server._job_build_retiring = None
+                server._job_build_pending = None
+                server._start_job_build_locked = (  # type: ignore[method-assign]
+                    lambda request: SimpleNamespace(request=request, future=None)
+                )
+                server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
+
+                promise = server._request_job_build(latest)  # type: ignore[arg-type]
+
+                self.assertIs(promise, latest.promise)
+                self.assertIsNot(promise, routine.promise)
+                self.assertTrue(routine.cancellation.is_set())
+                self.assertIs(server._job_build_retiring, routine_flight)
+                assert server._job_build_active is not None
+                self.assertIs(server._job_build_active.request, latest)
+                self.assertEqual(
+                    latest.requested_monotonic,
+                    priority_requested,
+                )
+                self.assertGreater(
+                    latest.cancellation.deadline_monotonic
+                    - time.monotonic(),
+                    server.job_build_timeout_seconds - 1.0,
+                )
+                self.assertEqual(
+                    server.job_build_priority_counts["routine_preempted"],
+                    1,
+                )
+
+    def test_publication_priority_precedes_immutable_request_preparation(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        critical_preparation_entered = threading.Event()
+        release_critical_preparation = threading.Event()
+        initial_preparation_entered = threading.Event()
+        original_new_request = server._new_job_build_request
+
+        def observed_new_request(*args: object, **kwargs: object) -> object:
+            request_source = str(kwargs.get("request_source", "routine"))
+            if request_source == "tip_refresh":
+                critical_preparation_entered.set()
+                if not release_critical_preparation.wait(5):
+                    raise AssertionError("test did not release priority preparation")
+            elif request_source == "initial":
+                initial_preparation_entered.set()
+            return original_new_request(*args, **kwargs)  # type: ignore[arg-type]
+
+        server._new_job_build_request = observed_new_request  # type: ignore[method-assign]
+        results: dict[str, list[object]] = {"critical": [], "initial": []}
+        errors: list[BaseException] = []
+
+        def build(label: str, *, publication_critical: bool) -> None:
+            try:
+                results[label].append(
+                    server.shared_job_bundle(
+                        artifacts,
+                        mode="ready",
+                        publication_critical=publication_critical,
+                        request_source=(
+                            "tip_refresh" if publication_critical else "initial"
+                        ),
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        critical_thread = threading.Thread(
+            target=build,
+            args=("critical",),
+            kwargs={"publication_critical": True},
+        )
+        initial_thread = threading.Thread(
+            target=build,
+            args=("initial",),
+            kwargs={"publication_critical": False},
+        )
+        critical_thread.start()
+        try:
+            self.assertTrue(critical_preparation_entered.wait(5))
+            initial_thread.start()
+            self.assertFalse(initial_preparation_entered.wait(0.1))
+            metrics = "\n".join(server.job_build_metrics_lines())
+            self.assertIn("qbit_prism_job_build_priority_active 1", metrics)
+        finally:
+            release_critical_preparation.set()
+            critical_thread.join(5)
+            initial_thread.join(5)
+
+        self.assertFalse(critical_thread.is_alive())
+        self.assertFalse(initial_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([len(results[label]) for label in results], [1, 1])
+        self.assertIs(results["critical"][0], results["initial"][0])
+        self.assertFalse(initial_preparation_entered.is_set())
+        self.assertEqual(
+            server.initial_job_prepared_work_counts["deferred"],
+            1,
+        )
+        self.assertEqual(
+            server.initial_job_prepared_work_counts["cache_hit"],
+            1,
+        )
+        self.assertEqual(
+            server.job_build_priority_admission_seconds["count"],
+            1,
+        )
+        self.assertGreaterEqual(
+            server.job_build_priority_admission_seconds["sum"],
+            0.1,
+        )
+
+    def test_priority_reservation_cancels_admitted_routine_preparation(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        routine_in_payout_lookup = threading.Event()
+        release_routine_lookup = threading.Event()
+        routine_request_constructed = threading.Event()
+        original_usable_artifact = server._usable_payout_ledger_artifact
+        original_new_request = server._new_job_build_request
+        routine_thread: threading.Thread
+
+        def blocked_usable_artifact(*args: object, **kwargs: object) -> object:
+            if threading.current_thread() is routine_thread:
+                routine_in_payout_lookup.set()
+                if not release_routine_lookup.wait(5):
+                    raise AssertionError("test did not release payout lookup")
+            return original_usable_artifact(*args, **kwargs)  # type: ignore[arg-type]
+
+        def observed_new_request(*args: object, **kwargs: object) -> object:
+            if kwargs.get("request_source") == "initial":
+                routine_request_constructed.set()
+            return original_new_request(*args, **kwargs)  # type: ignore[arg-type]
+
+        server._usable_payout_ledger_artifact = blocked_usable_artifact  # type: ignore[method-assign]
+        server._new_job_build_request = observed_new_request  # type: ignore[method-assign]
+        errors: list[BaseException] = []
+
+        def build_routine() -> None:
+            try:
+                server.shared_job_bundle(
+                    artifacts,
+                    mode="ready",
+                    retry_superseded=False,
+                    request_source="initial",
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        routine_thread = threading.Thread(target=build_routine)
+        routine_thread.start()
+        priority_token: int | None = None
+        try:
+            self.assertTrue(routine_in_payout_lookup.wait(5))
+            with server._job_build_scheduler_lock:
+                routine_cancellations = tuple(
+                    cancellation_ref()
+                    for cancellation_ref in (
+                        server._job_build_routine_preparations.values()
+                    )
+                )
+            self.assertEqual(len(routine_cancellations), 1)
+            self.assertIsNotNone(routine_cancellations[0])
+            priority_token, _requested = (
+                server._begin_job_build_priority_preparation()
+            )
+            assert routine_cancellations[0] is not None
+            self.assertTrue(routine_cancellations[0].is_set())
+        finally:
+            release_routine_lookup.set()
+            routine_thread.join(5)
+            if priority_token is not None:
+                server._finish_job_build_priority_preparation(priority_token)
+
+        self.assertFalse(routine_thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], JobBuildSuperseded)
+        self.assertFalse(routine_request_constructed.is_set())
+        with server._job_build_scheduler_lock:
+            self.assertEqual(len(server._job_build_routine_preparations), 0)
+
+    def test_publication_critical_collection_promotes_past_ready_work(self) -> None:
+        server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
+        old_artifacts = server.store_template_artifacts(dict(rpc.template))
+        new_artifacts = server.store_template_artifacts(
+            base_template(height=11, prevhash="22" * 32)
+        )
+        assert old_artifacts is not None and new_artifacts is not None
+        payout_generation = server._payout_state_generation
+        ready = server._new_job_build_request(
+            old_artifacts,
+            None,
+            mode="ready",
+            payout_state_generation=payout_generation,
+            cache_key=server._job_bundle_key(
+                old_artifacts,
+                mode="ready",
+                payout_state_generation=payout_generation,
+                worker=None,
+            ),
+            request_source="initial",
+        )
+        latest_identity = worker("tq1latest", "tq1latest.rig")
+        latest = server._new_job_build_request(
+            new_artifacts,
+            latest_identity,
+            mode="collection",
+            payout_state_generation=payout_generation,
+            cache_key=server._job_bundle_key(
+                new_artifacts,
+                mode="collection",
+                payout_state_generation=payout_generation,
+                worker=latest_identity,
+            ),
+            publication_critical=True,
+            request_source="tip_refresh",
+        )
+        ready_flight = SimpleNamespace(request=ready)
+        server._job_build_active = ready_flight
+        server._job_build_retiring = None
+        server._job_build_pending = latest
+        armed: list[object] = []
+        server._start_job_build_locked = (  # type: ignore[method-assign]
+            lambda request: SimpleNamespace(request=request, future=None)
+        )
+        server._arm_job_build_locked = armed.append  # type: ignore[method-assign]
+
+        server._promote_pending_job_build_locked()
+
+        self.assertTrue(ready.cancellation.is_set())
+        self.assertIs(server._job_build_retiring, ready_flight)
+        self.assertIsNone(server._job_build_pending)
+        assert server._job_build_active is not None
+        self.assertIs(server._job_build_active.request, latest)
+        self.assertEqual(armed, [server._job_build_active])
+        self.assertEqual(
+            server.job_build_priority_counts["routine_preempted"],
+            1,
+        )
+
+    def test_routine_pending_never_promotes_over_publication_critical_flight(
+        self,
+    ) -> None:
+        for placement in ("active", "retiring"):
+            with self.subTest(placement=placement):
+                server, rpc = coordinator()
+                critical_artifacts = server.store_template_artifacts(
+                    dict(rpc.template)
+                )
+                routine_artifacts = server.store_template_artifacts(
+                    base_template(height=11, prevhash="22" * 32)
+                )
+                assert critical_artifacts is not None
+                assert routine_artifacts is not None
+                payout_generation = server._payout_state_generation
+
+                def request_for(
+                    artifacts: object,
+                    *,
+                    publication_critical: bool,
+                ) -> object:
+                    return server._new_job_build_request(
+                        artifacts,  # type: ignore[arg-type]
+                        None,
+                        mode="ready",
+                        payout_state_generation=payout_generation,
+                        cache_key=server._job_bundle_key(
+                            artifacts,  # type: ignore[arg-type]
+                            mode="ready",
+                            payout_state_generation=payout_generation,
+                            worker=None,
+                        ),
+                        publication_critical=publication_critical,
+                        request_source=(
+                            "tip_refresh" if publication_critical else "initial"
+                        ),
+                    )
+
+                critical = request_for(
+                    critical_artifacts,
+                    publication_critical=True,
+                )
+                routine = request_for(
+                    routine_artifacts,
+                    publication_critical=False,
+                )
+                critical_flight = SimpleNamespace(request=critical)
+                server._job_build_active = (
+                    critical_flight if placement == "active" else None
+                )
+                server._job_build_retiring = (
+                    critical_flight if placement == "retiring" else None
+                )
+                server._job_build_pending = routine
+                server._start_job_build_locked = (  # type: ignore[method-assign]
+                    lambda _request: self.fail(
+                        "routine pending work displaced publication-critical work"
+                    )
+                )
+
+                server._promote_pending_job_build_locked()
+
+                self.assertIs(server._job_build_pending, routine)
+                self.assertFalse(critical.cancellation.is_set())
+                self.assertIs(
+                    (
+                        server._job_build_active
+                        if placement == "active"
+                        else server._job_build_retiring
+                    ),
+                    critical_flight,
+                )
+
     def test_cancelled_ready_does_not_block_collection_promotion(self) -> None:
         for placement in ("active", "retiring"):
             with self.subTest(placement=placement):
