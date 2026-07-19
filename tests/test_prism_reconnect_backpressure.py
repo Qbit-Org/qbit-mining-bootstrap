@@ -19,6 +19,7 @@ from lab.prism.prism_coordinator import (
     PRISM_DELIVERY_PRIORITY_NEW_TIP,
     PRISM_DELIVERY_PRIORITY_SAME_TIP,
     PrismCoordinator,
+    StratumError,
     StratumListenerProfile,
     WorkerIdentity,
     _BoundedPriorityExecutor,
@@ -234,6 +235,196 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         release.set()
         server.shutdown_tip_refresh_executor()
 
+    def test_cancelled_queued_requests_immediately_reclaim_admission(self) -> None:
+        server = coordinator(connection_limit=6, pending_limit=2)
+        server.initial_job_max_workers = 1
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked(_request: PendingInitialJob) -> bool:
+            started.set()
+            release.wait(5)
+            return False
+
+        server._run_initial_job = blocked  # type: ignore[method-assign]
+        running = client(server, 1)
+        cancelled = [client(server, index) for index in (2, 3)]
+        replacement = client(server, 4)
+
+        try:
+            self.assertTrue(server.schedule_initial_job(running))
+            self.assertTrue(started.wait(5))
+            for state in cancelled:
+                self.assertTrue(server.schedule_initial_job(state))
+                self.assertEqual(server.initial_job_executor().stats(), (1, 1))
+                server.cancel_initial_job_delivery(state)
+            server.cancel_initial_job_delivery(running)
+
+            executor = server.initial_job_executor()
+            self.assertEqual(executor.stats(), (0, 1))
+            health = server.mining_delivery_snapshot()
+            self.assertEqual(health["pending_initial_jobs"], 0)
+            self.assertFalse(health["pending_initial_jobs_saturated"])
+            self.assertEqual(server.initial_job_queue_capacity_reclaimed_count, 2)
+            metrics = "\n".join(server.initial_delivery_metrics_lines())
+            self.assertIn("qbit_prism_initial_job_delivery_queue_depth 0", metrics)
+            self.assertIn(
+                "qbit_prism_initial_job_queue_capacity_reclaimed_total 2",
+                metrics,
+            )
+
+            # Before cancellation-aware removal, the two tombstones filled the
+            # physical queue and this valid replacement was rejected.
+            self.assertTrue(server.schedule_initial_job(replacement))
+            self.assertEqual(executor.stats(), (1, 1))
+            self.assertIn(replacement, server.clients)
+            self.assertFalse(replacement.sock.closed)
+        finally:
+            release.set()
+            server.shutdown_tip_refresh_executor()
+
+    def test_disconnect_and_timeout_reclaim_queued_admission(self) -> None:
+        server = coordinator(connection_limit=6, pending_limit=2)
+        server.initial_job_max_workers = 1
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked(_request: PendingInitialJob) -> bool:
+            started.set()
+            release.wait(5)
+            return False
+
+        server._run_initial_job = blocked  # type: ignore[method-assign]
+        running = client(server, 1)
+        disconnected = client(server, 2)
+        timed_out = client(server, 3)
+        replacement = client(server, 4)
+
+        try:
+            self.assertTrue(server.schedule_initial_job(running))
+            self.assertTrue(started.wait(5))
+            server.pending_initial_jobs[running].deadline_monotonic = None
+
+            self.assertTrue(server.schedule_initial_job(disconnected))
+            server.disconnect_client(disconnected)
+            self.assertEqual(server.initial_job_executor().stats(), (0, 1))
+            self.assertTrue(disconnected.sock.closed)
+
+            self.assertTrue(server.schedule_initial_job(timed_out))
+            request = server.pending_initial_jobs[timed_out]
+            assert request.deadline_monotonic is not None
+            self.assertEqual(
+                server.sweep_initial_job_timeouts(
+                    now=request.deadline_monotonic,
+                ),
+                1,
+            )
+            self.assertEqual(server.initial_job_executor().stats(), (0, 1))
+            self.assertTrue(timed_out.sock.closed)
+            self.assertEqual(server.initial_job_timeout_count, 1)
+
+            self.assertTrue(server.schedule_initial_job(replacement))
+            self.assertEqual(server.initial_job_executor().stats(), (1, 1))
+            self.assertEqual(server.initial_job_queue_capacity_reclaimed_count, 2)
+        finally:
+            release.set()
+            server.shutdown_tip_refresh_executor()
+
+    def test_saturated_queue_reauthorization_preserves_working_session(self) -> None:
+        server = coordinator(connection_limit=4, pending_limit=1)
+        server.initial_job_max_workers = 1
+        server.current_tip_first_seen = ("aa" * 32, time.monotonic())
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked(_request: PendingInitialJob) -> bool:
+            started.set()
+            release.wait(5)
+            return False
+
+        server._run_initial_job = blocked  # type: ignore[method-assign]
+        waiting = client(server, 1)
+        live = client(server, 2, with_job=True)
+        original_worker = live.worker
+        server.resolve_worker = lambda username: worker(username)  # type: ignore[method-assign]
+
+        try:
+            self.assertTrue(server.schedule_initial_job(waiting))
+            self.assertTrue(started.wait(5))
+            with self.assertRaises(StratumError) as raised:
+                server.handle_request(
+                    live,
+                    {
+                        "id": 7,
+                        "method": "mining.authorize",
+                        "params": ["replacement-worker", "x"],
+                    },
+                )
+
+            self.assertFalse(raised.exception.disconnect)
+            self.assertEqual(
+                raised.exception.message,
+                "initial job delivery capacity unavailable",
+            )
+            self.assertEqual(live.authorization_generation, 1)
+            self.assertIs(live.worker, original_worker)
+            self.assertIn(live, server.clients)
+            self.assertFalse(live.sock.closed)
+            self.assertIsNotNone(live.active_job)
+            self.assertIs(server.pending_initial_jobs[waiting].client, waiting)
+            self.assertEqual(server.initial_job_queue_rejection_count, 0)
+        finally:
+            release.set()
+            server.shutdown_tip_refresh_executor()
+
+    def test_executor_cancel_racing_dequeue_does_not_leak_or_double_release(self) -> None:
+        for _ in range(10):
+            executor = _BoundedPriorityExecutor(max_workers=1, max_queue_size=1)
+            blocker_started = threading.Event()
+            release_blocker = threading.Event()
+            raced_started = threading.Event()
+            release_raced = threading.Event()
+            cancel_now = threading.Event()
+            cancel_results: list[bool] = []
+
+            def blocker() -> None:
+                blocker_started.set()
+                release_blocker.wait(5)
+
+            def raced() -> None:
+                raced_started.set()
+                release_raced.wait(5)
+
+            first = executor.submit(blocker)
+            self.assertTrue(blocker_started.wait(5))
+            second = executor.submit(raced)
+
+            def cancel_raced() -> None:
+                cancel_now.wait(5)
+                cancel_results.append(executor.cancel(second))
+
+            cancel_thread = threading.Thread(target=cancel_raced)
+            cancel_thread.start()
+            cancel_now.set()
+            release_blocker.set()
+            release_raced.set()
+            cancel_thread.join(5)
+            self.assertFalse(cancel_thread.is_alive())
+            first.result(5)
+            if not second.cancelled():
+                second.result(5)
+
+            # A second cancellation cannot release the same queue entry, and
+            # fresh bounded work remains admissible whichever side won.
+            self.assertFalse(executor.cancel(second))
+            probe = executor.submit(lambda: "admitted")
+            self.assertEqual(probe.result(5), "admitted")
+            executor._queue.join()
+            self.assertEqual(executor.stats(), (0, 0))
+            self.assertEqual(executor._queue.unfinished_tasks, 0)
+            self.assertEqual(len(cancel_results), 1)
+            executor.shutdown(wait=True, cancel_futures=True)
+
     def test_initial_job_deadline_starts_only_after_protocol_handshake(self) -> None:
         server = coordinator(connection_limit=3, pending_limit=2)
         release = threading.Event()
@@ -249,6 +440,27 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertIn(state, server.pending_initial_jobs)
         release.set()
         server.shutdown_tip_refresh_executor()
+
+    def test_expired_initial_request_is_fenced_before_preparation(self) -> None:
+        server = coordinator(connection_limit=2, pending_limit=1)
+        state = client(server, 1)
+        preparation_started = threading.Event()
+        request = PendingInitialJob(
+            client=state,
+            connection_id=state.connection_id,
+            authorization_generation=state.authorization_generation,
+            difficulty_generation=state.difficulty_generation,
+            worker=state.worker,
+            requested_monotonic=time.monotonic() - 2,
+            deadline_monotonic=time.monotonic() - 1,
+        )
+        server.pending_initial_jobs[state] = request
+        server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
+            lambda: preparation_started.set() or True
+        )
+
+        self.assertFalse(server._run_initial_job(request))
+        self.assertFalse(preparation_started.is_set())
 
     def test_failed_initial_job_releases_capacity_and_disconnects_client(self) -> None:
         server = coordinator(connection_limit=3, pending_limit=1)
@@ -523,7 +735,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             return False
 
         server._run_initial_job = blocked_retry  # type: ignore[method-assign]
-        clients = [client(server, index) for index in range(1, 5)]
+        clients = [client(server, index) for index in range(1, 9)]
         for state in clients:
             self.assertTrue(server.schedule_initial_job(state))
 
@@ -542,9 +754,13 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             )
             self.assertTrue(tip_started.wait(0.5))
             self.assertEqual(future.result(1), "published")
-            self.assertEqual(server.initial_job_executor().stats(), (0, 4))
+            self.assertEqual(len(server.pending_initial_jobs), 8)
+            self.assertTrue(
+                server.mining_delivery_snapshot()["pending_initial_jobs_saturated"]
+            )
+            self.assertEqual(server.initial_job_executor().stats(), (4, 4))
             metrics = "\n".join(server.initial_delivery_metrics_lines())
-            self.assertIn("qbit_prism_initial_job_delivery_queue_depth 0", metrics)
+            self.assertIn("qbit_prism_initial_job_delivery_queue_depth 4", metrics)
             self.assertIn("qbit_prism_initial_job_delivery_active_workers 4", metrics)
             self.assertIn("qbit_prism_initial_job_delivery_configured_workers 4", metrics)
         finally:
@@ -616,6 +832,8 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertTrue(shutdown_complete.is_set())
         self.assertEqual(server.pending_initial_jobs, {})
         self.assertEqual(initial_runs, [first.connection_id])
+        self.assertEqual(initial_executor.stats(), (0, 0))
+        self.assertEqual(server.initial_job_queue_capacity_reclaimed_count, 1)
         self.assertTrue(all(not thread.is_alive() for thread in initial_threads))
         self.assertTrue(all(not thread.is_alive() for thread in tip_threads))
         with self.assertRaisesRegex(RuntimeError, "initial job executor is shut down"):
