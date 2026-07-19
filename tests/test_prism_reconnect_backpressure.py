@@ -817,14 +817,21 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
                 workers_contending += 1
                 if workers_contending == server.initial_job_max_workers:
                     all_workers_contending.set()
-            server._await_publication_priority_clear(
-                request_source="initial",
-                cancelled=_request.cancelled.is_set,
+            preparation_token, _preparation_cancellation = (
+                server._begin_routine_job_build_preparation(
+                    request_source="initial",
+                    cancelled=_request.cancelled.is_set,
+                )
             )
-            with worker_lock:
-                workers_passed_priority += 1
-                any_worker_passed_priority.set()
-            release_workers.wait(5)
+            try:
+                with worker_lock:
+                    workers_passed_priority += 1
+                    any_worker_passed_priority.set()
+                release_workers.wait(5)
+            finally:
+                server._finish_routine_job_build_preparation(
+                    preparation_token
+                )
             return False
 
         server._run_initial_job = contending_initial  # type: ignore[method-assign]

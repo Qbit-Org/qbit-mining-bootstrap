@@ -30,6 +30,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import uuid
+import weakref
 from types import SimpleNamespace
 from dataclasses import dataclass, field, replace as dataclass_replace
 from decimal import Context, Decimal, InvalidOperation, ROUND_CEILING, getcontext, localcontext
@@ -2980,6 +2981,13 @@ class PrismCoordinator:
             self._job_build_priority_preparations: dict[int, float] = {}
         if not hasattr(self, "_job_build_priority_preparation_sequence"):
             self._job_build_priority_preparation_sequence = 0
+        if not hasattr(self, "_job_build_routine_preparations"):
+            self._job_build_routine_preparations: dict[
+                int,
+                weakref.ReferenceType[_JobBuildCancellation],
+            ] = {}
+        if not hasattr(self, "_job_build_routine_preparation_sequence"):
+            self._job_build_routine_preparation_sequence = 0
         if not hasattr(self, "_job_build_priority_changed"):
             self._job_build_priority_changed = threading.Event()
         if not hasattr(self, "_job_build_executor"):
@@ -3781,6 +3789,20 @@ class PrismCoordinator:
     def _record_initial_prepared_work_locked(self, result: str) -> None:
         self.initial_job_prepared_work_counts[result] += 1
 
+    def _new_job_build_cancellation(self) -> _JobBuildCancellation:
+        return _JobBuildCancellation(
+            timeout_seconds=max(
+                0.001,
+                float(
+                    getattr(
+                        self,
+                        "job_build_timeout_seconds",
+                        DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS,
+                    )
+                ),
+            )
+        )
+
     def _begin_job_build_priority_preparation(
         self,
         requested_monotonic: float | None = None,
@@ -3796,6 +3818,13 @@ class PrismCoordinator:
             self._job_build_priority_preparation_sequence += 1
             token = self._job_build_priority_preparation_sequence
             self._job_build_priority_preparations[token] = started
+            for routine_cancellation_ref in tuple(
+                self._job_build_routine_preparations.values()
+            ):
+                routine_cancellation = routine_cancellation_ref()
+                if routine_cancellation is not None:
+                    routine_cancellation.cancel("publication priority")
+            self._job_build_routine_preparations.clear()
             self._job_build_priority_changed.set()
         return token, started
 
@@ -3803,6 +3832,73 @@ class PrismCoordinator:
         with self._job_build_scheduler_lock:
             self._job_build_priority_preparations.pop(token, None)
             self._job_build_priority_changed.set()
+
+    def _begin_routine_job_build_preparation(
+        self,
+        *,
+        request_source: str,
+        cancelled: Callable[[], bool] | None,
+    ) -> tuple[int, _JobBuildCancellation]:
+        """Atomically admit cancellable routine request construction."""
+
+        deferred_recorded = False
+        while True:
+            self._job_build_priority_changed.clear()
+            with self._job_build_scheduler_lock:
+                if not self._publication_priority_scheduled_locked():
+                    self._job_build_routine_preparation_sequence += 1
+                    token = self._job_build_routine_preparation_sequence
+                    preparation_cancellation = (
+                        self._new_job_build_cancellation()
+                    )
+                    coordinator_ref = weakref.ref(self)
+
+                    def remove_dead_preparation(
+                        dead_ref: weakref.ReferenceType[
+                            _JobBuildCancellation
+                        ],
+                        *,
+                        preparation_token: int = token,
+                    ) -> None:
+                        coordinator = coordinator_ref()
+                        if coordinator is None:
+                            return
+                        with coordinator._job_build_scheduler_lock:
+                            if (
+                                coordinator._job_build_routine_preparations.get(
+                                    preparation_token
+                                )
+                                is dead_ref
+                            ):
+                                coordinator._job_build_routine_preparations.pop(
+                                    preparation_token,
+                                    None,
+                                )
+
+                    self._job_build_routine_preparations[token] = weakref.ref(
+                        preparation_cancellation,
+                        remove_dead_preparation,
+                    )
+                    return token, preparation_cancellation
+                if not deferred_recorded:
+                    self.job_build_priority_counts["routine_deferred"] += 1
+                    if request_source == "initial":
+                        self._record_initial_prepared_work_locked("deferred")
+                    deferred_recorded = True
+            if cancelled is not None and cancelled():
+                raise _JobBuildCancelled(
+                    "job bundle request was cancelled behind publication priority"
+                )
+            stop_event = getattr(self, "stop_event", None)
+            if stop_event is not None and stop_event.is_set():
+                raise _JobBuildCancelled(
+                    "coordinator stopped behind publication priority"
+                )
+            self._job_build_priority_changed.wait(0.05)
+
+    def _finish_routine_job_build_preparation(self, token: int) -> None:
+        with self._job_build_scheduler_lock:
+            self._job_build_routine_preparations.pop(token, None)
 
     def _publication_priority_scheduled_locked(self) -> bool:
         if self._job_build_priority_preparations:
@@ -3823,36 +3919,6 @@ class PrismCoordinator:
                 self._job_build_retiring,
             )
         )
-
-    def _await_publication_priority_clear(
-        self,
-        *,
-        request_source: str,
-        cancelled: Callable[[], bool] | None,
-    ) -> None:
-        """Keep routine callers out of snapshot/serialization preparation."""
-
-        deferred_recorded = False
-        while True:
-            self._job_build_priority_changed.clear()
-            with self._job_build_scheduler_lock:
-                if not self._publication_priority_scheduled_locked():
-                    return
-                if not deferred_recorded:
-                    self.job_build_priority_counts["routine_deferred"] += 1
-                    if request_source == "initial":
-                        self._record_initial_prepared_work_locked("deferred")
-                    deferred_recorded = True
-            if cancelled is not None and cancelled():
-                raise _JobBuildCancelled(
-                    "job bundle request was cancelled behind publication priority"
-                )
-            stop_event = getattr(self, "stop_event", None)
-            if stop_event is not None and stop_event.is_set():
-                raise _JobBuildCancelled(
-                    "coordinator stopped behind publication priority"
-                )
-            self._job_build_priority_changed.wait(0.05)
 
     def _job_build_can_inherit_publication_priority(
         self,
@@ -5921,18 +5987,12 @@ class PrismCoordinator:
         publication_critical: bool = False,
         request_source: str = "routine",
         priority_requested_monotonic: float | None = None,
+        preparation_cancellation: _JobBuildCancellation | None = None,
     ) -> _JobBuildRequest:
-        cancellation = _JobBuildCancellation(
-            timeout_seconds=max(
-                0.001,
-                float(
-                    getattr(
-                        self,
-                        "job_build_timeout_seconds",
-                        DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS,
-                    )
-                ),
-            ),
+        cancellation = (
+            self._new_job_build_cancellation()
+            if preparation_cancellation is None
+            else preparation_cancellation
         )
         cancellation.raise_if_cancelled("immutable snapshot")
         # A pending accepted-parent transition owns the balances children must
@@ -6242,12 +6302,21 @@ class PrismCoordinator:
         priority_requested_monotonic: float | None = None,
     ) -> CachedJobBundle:
         while True:
+            routine_preparation_token: int | None = None
+            preparation_cancellation: _JobBuildCancellation | None = None
             if not publication_critical:
-                self._await_publication_priority_clear(
+                (
+                    routine_preparation_token,
+                    preparation_cancellation,
+                ) = self._begin_routine_job_build_preparation(
                     request_source=request_source,
                     cancelled=cancelled,
                 )
             resolved_mode = self._job_bundle_mode(mode)
+            if preparation_cancellation is not None:
+                preparation_cancellation.raise_if_cancelled(
+                    "request preparation admission"
+                )
             if resolved_mode == "collection" and worker is None:
                 raise CollectionIdentityUnavailable(
                     "collection-mode worker identity is temporarily unavailable"
@@ -6262,6 +6331,10 @@ class PrismCoordinator:
                 if resolved_mode == "ready"
                 else None
             )
+            if preparation_cancellation is not None:
+                preparation_cancellation.raise_if_cancelled(
+                    "payout artifact lookup"
+                )
             payout_artifact_generation = (
                 payout_artifact.generation if payout_artifact is not None else 0
             )
@@ -6274,6 +6347,14 @@ class PrismCoordinator:
             )
             cached = self._lookup_job_bundle(key)
             if self._job_bundle_entry_usable(cached, artifacts):
+                if preparation_cancellation is not None:
+                    preparation_cancellation.raise_if_cancelled(
+                        "bundle cache lookup"
+                    )
+                if routine_preparation_token is not None:
+                    self._finish_routine_job_build_preparation(
+                        routine_preparation_token
+                    )
                 self._record_job_cache_event("bundle", hit=True)
                 if request_source == "initial":
                     with self._job_build_scheduler_lock:
@@ -6281,6 +6362,10 @@ class PrismCoordinator:
                 assert cached is not None
                 return self._bind_cached_bundle_to_artifacts(cached, artifacts)
             if self._job_bundle_mode(mode) != resolved_mode:
+                if routine_preparation_token is not None:
+                    self._finish_routine_job_build_preparation(
+                        routine_preparation_token
+                    )
                 continue
             self._record_job_cache_event("bundle", hit=False)
             try:
@@ -6297,19 +6382,31 @@ class PrismCoordinator:
                     priority_requested_monotonic=(
                         priority_requested_monotonic
                     ),
+                    preparation_cancellation=preparation_cancellation,
                 )
                 # Preserve the historical readiness handoff without holding a
                 # lock across construction: only admission and the final mode
                 # re-selection are serialized here.
                 with self._job_build_lock:
-                    if self._job_bundle_mode(mode) != resolved_mode:
-                        request.cancellation.cancel("worker mode superseded")
-                        continue
-                    if cancelled is not None and cancelled():
-                        raise _JobBuildCancelled(
-                            "job bundle request was cancelled before preparation"
+                    with self._job_build_scheduler_lock:
+                        if routine_preparation_token is not None:
+                            self._finish_routine_job_build_preparation(
+                                routine_preparation_token
+                            )
+                            routine_preparation_token = None
+                        request.cancellation.raise_if_cancelled(
+                            "scheduler admission"
                         )
-                    promise = self._request_job_build(request)
+                        if self._job_bundle_mode(mode) != resolved_mode:
+                            request.cancellation.cancel(
+                                "worker mode superseded"
+                            )
+                            continue
+                        if cancelled is not None and cancelled():
+                            raise _JobBuildCancelled(
+                                "job bundle request was cancelled before preparation"
+                            )
+                        promise = self._request_job_build(request)
                 wait_deadline = time.monotonic() + max(
                     0.001,
                     float(self.job_build_timeout_seconds)
@@ -6339,6 +6436,10 @@ class PrismCoordinator:
                     "job build timed out; immediate retry scheduled"
                 ) from exc
             except JobBuildCancelled:
+                if routine_preparation_token is not None:
+                    self._finish_routine_job_build_preparation(
+                        routine_preparation_token
+                    )
                 self._schedule_tip_refresh_retry()
                 if not retry_superseded:
                     raise

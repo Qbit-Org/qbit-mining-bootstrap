@@ -2760,6 +2760,79 @@ class JobBundleCacheTests(unittest.TestCase):
             0.1,
         )
 
+    def test_priority_reservation_cancels_admitted_routine_preparation(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        routine_in_payout_lookup = threading.Event()
+        release_routine_lookup = threading.Event()
+        routine_request_constructed = threading.Event()
+        original_usable_artifact = server._usable_payout_ledger_artifact
+        original_new_request = server._new_job_build_request
+        routine_thread: threading.Thread
+
+        def blocked_usable_artifact(*args: object, **kwargs: object) -> object:
+            if threading.current_thread() is routine_thread:
+                routine_in_payout_lookup.set()
+                if not release_routine_lookup.wait(5):
+                    raise AssertionError("test did not release payout lookup")
+            return original_usable_artifact(*args, **kwargs)  # type: ignore[arg-type]
+
+        def observed_new_request(*args: object, **kwargs: object) -> object:
+            if kwargs.get("request_source") == "initial":
+                routine_request_constructed.set()
+            return original_new_request(*args, **kwargs)  # type: ignore[arg-type]
+
+        server._usable_payout_ledger_artifact = blocked_usable_artifact  # type: ignore[method-assign]
+        server._new_job_build_request = observed_new_request  # type: ignore[method-assign]
+        errors: list[BaseException] = []
+
+        def build_routine() -> None:
+            try:
+                server.shared_job_bundle(
+                    artifacts,
+                    mode="ready",
+                    retry_superseded=False,
+                    request_source="initial",
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        routine_thread = threading.Thread(target=build_routine)
+        routine_thread.start()
+        priority_token: int | None = None
+        try:
+            self.assertTrue(routine_in_payout_lookup.wait(5))
+            with server._job_build_scheduler_lock:
+                routine_cancellations = tuple(
+                    cancellation_ref()
+                    for cancellation_ref in (
+                        server._job_build_routine_preparations.values()
+                    )
+                )
+            self.assertEqual(len(routine_cancellations), 1)
+            self.assertIsNotNone(routine_cancellations[0])
+            priority_token, _requested = (
+                server._begin_job_build_priority_preparation()
+            )
+            assert routine_cancellations[0] is not None
+            self.assertTrue(routine_cancellations[0].is_set())
+        finally:
+            release_routine_lookup.set()
+            routine_thread.join(5)
+            if priority_token is not None:
+                server._finish_job_build_priority_preparation(priority_token)
+
+        self.assertFalse(routine_thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], JobBuildSuperseded)
+        self.assertFalse(routine_request_constructed.is_set())
+        with server._job_build_scheduler_lock:
+            self.assertEqual(len(server._job_build_routine_preparations), 0)
+
     def test_publication_critical_collection_promotes_past_ready_work(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
         old_artifacts = server.store_template_artifacts(dict(rpc.template))
