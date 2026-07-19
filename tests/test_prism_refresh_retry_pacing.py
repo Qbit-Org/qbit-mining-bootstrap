@@ -62,6 +62,29 @@ class FailedTipRefreshSpacingTests(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic(), deadline)
         self.assertFalse(server._tip_refresh_retry.is_set())
 
+    def test_holdoff_wait_keeps_blockpoll_heartbeat_alive(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.clients = set()
+        server.blockpoll_seconds = 30.0
+        server.tip_refresh_failure_holdoff_seconds = 0.4
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        _block_refreshes(server)
+        with patch("lab.prism.prism_coordinator.random.uniform", return_value=0.0):
+            self._fail_one_poll(server)
+
+        server._schedule_tip_refresh_retry()
+        started = time.monotonic()
+        self.assertTrue(server._wait_for_blockpoll_trigger())
+        self.assertGreaterEqual(time.monotonic() - started, 0.3)
+        # The deliberately held poller must keep beating so a holdoff longer
+        # than the watchdog timeout cannot read as a hung loop.
+        beat = server._heartbeats.get("qbit_blockpoll")
+        self.assertIsNotNone(beat)
+        assert beat is not None
+        self.assertGreaterEqual(beat, started)
+
     def test_trigger_without_prior_failure_stays_immediate(self) -> None:
         server, _rpc = coordinator()
         server.blockpoll_seconds = 30.0

@@ -8994,6 +8994,10 @@ class PrismCoordinator:
                 # The retry event may already be set; pace on the stop event
                 # so the spacing window cannot be spun through instantly.
                 # Short slices keep a newly detected tip's release prompt.
+                # Beat per slice: a deliberately held poller is idle, not
+                # hung, and must not trip the watchdog when the configured
+                # holdoff exceeds its timeout.
+                self._record_heartbeat("qbit_blockpoll")
                 wait_seconds = min(wait_seconds, holdoff, 0.05)
                 self.stop_event.wait(wait_seconds)
             else:
@@ -9005,6 +9009,7 @@ class PrismCoordinator:
             holdoff = self._tip_refresh_failure_holdoff_remaining()
             if holdoff <= 0:
                 break
+            self._record_heartbeat("qbit_blockpoll")
             self.stop_event.wait(min(holdoff, 0.05))
         self._consume_tip_refresh_retry()
         return not self.stop_event.is_set()
