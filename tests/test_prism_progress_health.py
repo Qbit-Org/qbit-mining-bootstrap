@@ -90,6 +90,57 @@ def publish(
 
 
 class ProgressHealthTests(unittest.TestCase):
+    def test_publication_progress_uses_template_failure_budget(self) -> None:
+        server, clock = progress_coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        current = snapshot(generation=1, fingerprint="aa" * 32)
+        publish(server, current)
+        replacement = snapshot(
+            generation=2,
+            fingerprint="bb" * 32,
+            tip="22" * 32,
+        )
+        server._record_progress_tip_poll(replacement)
+
+        clock.advance(9.999)
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+        clock.advance(0.001)
+        self.assertTrue(server.publication_progress_failure_expired(clock.now))
+
+        server._record_progress_publication(replacement, 0)
+        self.assertFalse(server.publication_progress_failure_expired(clock.now))
+
+    def test_publication_watchdog_fires_with_heartbeat_watchdog_disabled(self) -> None:
+        server, clock = progress_coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        server.watchdog_enabled = False
+        server.watchdog_interval_seconds = 0.001
+        publish(server, snapshot(generation=1, fingerprint="aa" * 32))
+        server._record_progress_tip_poll(
+            snapshot(
+                generation=2,
+                fingerprint="bb" * 32,
+                tip="22" * 32,
+            )
+        )
+        clock.advance(10.0)
+
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                return_value=clock.now,
+            ),
+            patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=SystemExit(1),
+            ) as exit_process,
+            patch("builtins.print"),
+            self.assertRaises(SystemExit),
+        ):
+            server.watchdog_loop()
+
+        exit_process.assert_called_once_with(1)
+
     def test_unchanged_tip_for_hours_with_valid_work_stays_healthy(self) -> None:
         server, clock = progress_coordinator()
         original = snapshot(generation=1, fingerprint="aa" * 32)

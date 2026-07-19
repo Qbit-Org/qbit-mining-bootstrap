@@ -8260,6 +8260,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 # submitter queue lands the block and pushes fresh work.
                 self.assertEqual(sent, [{"id": "submit-1", "result": True, "error": None}])
                 self.assertTrue(server.submit_next_block_candidate())
+                self.assertEqual(server.poll_qbit_tip_template_once(), 1)
 
         self.assertEqual(sent[0], {"id": "submit-1", "result": True, "error": None})
         self.assertEqual([payload.get("method") for payload in sent[1:]], ["mining.set_difficulty", "mining.notify"])
@@ -8300,7 +8301,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(should_close)
         self.assertEqual(ledger.pending[-1].job_id, "fresh-job")
 
-    def test_post_accept_refresh_failure_does_not_fail_accepted_direct_block(self) -> None:
+    def test_post_accept_notification_does_not_run_failing_template_build(self) -> None:
         old_tip = "00" * 32
         block_hash = "ad" * 32
         server, state, ledger = submit_coordinator(tip=old_tip)
@@ -8356,10 +8357,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.confirmed), 1)
         self.assertEqual(len(ledger.pending), 1)
         self.assertEqual(server.tip_refresh_job_count, 0)
-        self.assertEqual(server.post_accept_refresh_failure_count, 1)
+        self.assertEqual(server.post_accept_refresh_failure_count, 0)
         self.assertEqual(state.active_job_ids, {"job-1"})
         self.assertIn("job-1", server.jobs)
-        self.assertIn("qbit_prism_post_accept_refresh_failures_total 1", server.metrics_payload())
+        self.assertTrue(server.tip_refresh_is_pending())
+        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertIn("qbit_prism_post_accept_refresh_failures_total 0", server.metrics_payload())
 
     def test_post_accept_refresh_preserves_pending_vardiff_difficulty_pair(self) -> None:
         old_tip = "00" * 32
@@ -8426,6 +8429,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                     },
                 )
                 self.assertTrue(server.submit_next_block_candidate())
+                self.assertEqual(server.poll_qbit_tip_template_once(), 1)
 
         self.assertEqual(sent[0], {"id": "submit-1", "result": True, "error": None})
         self.assertEqual(sent[1]["method"], "mining.set_difficulty")
@@ -8484,6 +8488,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 class PrismCoordinatorReliabilityTests(unittest.TestCase):
     def _bare_coordinator(self) -> PrismCoordinator:
         server = PrismCoordinator.__new__(PrismCoordinator)
+        server.lock = threading.RLock()
         server.stop_event = threading.Event()
         server._heartbeats = {}
         server._watchdog_pauses = {}
@@ -8693,37 +8698,27 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             )
         )
 
-    def test_blockwait_retries_tip_refresh_before_advancing_known_tip(self) -> None:
+    def test_blockwait_advances_known_tip_before_notification_failure(self) -> None:
         server = self._bare_coordinator()
         tip_a = "aa" * 32
         tip_b = "bb" * 32
         server.rpc = SimpleNamespace(call=lambda method: tip_a)
         server.blockpoll_seconds = 1.0
         known_tips: list[str] = []
-        refresh_attempts: list[str] = []
         detected_tips: list[str] = []
 
         def blockwait_once(known_tip: str) -> str:
             known_tips.append(known_tip)
-            if len(known_tips) == 3:
+            if len(known_tips) == 2:
                 server.stop_event.set()
             return tip_b
 
-        def poll_qbit_tip_template_once(*, heartbeat_name: str) -> int:
-            refresh_attempts.append(heartbeat_name)
-            if len(refresh_attempts) == 1:
-                raise TemplateRefreshBlocked(
-                    "payout state changed after refresh client selection"
-                )
-            return 1
-
         server.blockwait_once = blockwait_once  # type: ignore[method-assign]
-        server.poll_qbit_tip_template_once = (  # type: ignore[method-assign]
-            poll_qbit_tip_template_once
-        )
 
         def observe_tip_for_refresh(tip_hash: str, **_kwargs: object) -> bool:
             detected_tips.append(tip_hash)
+            if tip_hash == tip_b:
+                raise TemplateRefreshBlocked("notification failed")
             return True
 
         def reject_premature_publication(*_args: object, **_kwargs: object) -> bool:
@@ -8741,9 +8736,8 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         ):
             server.blockwait_loop()
 
-        self.assertEqual(known_tips, [tip_a, tip_a, tip_b])
-        self.assertEqual(refresh_attempts, ["qbit_blockwait", "qbit_blockwait"])
-        self.assertEqual(detected_tips, [tip_a, tip_b, tip_b])
+        self.assertEqual(known_tips, [tip_a, tip_b])
+        self.assertEqual(detected_tips, [tip_a, tip_b])
 
     def test_blockwait_unsupported_removes_watchdog_heartbeat(self) -> None:
         server = coordinator()
@@ -9857,18 +9851,10 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             submission.block_hash_hex,
         )
 
-    def test_post_block_refresh_stamps_block_submitter_heartbeat(self) -> None:
-        # The post-block job push runs on the block-submitter thread, so it must
-        # stamp block_submitter (not the poller heartbeat) through the refresh,
-        # or a long multi-client push trips a false liveness-watchdog exit.
+    def test_post_block_notification_stamps_caller_heartbeat(self) -> None:
         server, _state, _ledger = submit_coordinator()
         seen: list[str] = []
-
-        def fake_poll(*, heartbeat_name: str = "qbit_blockpoll") -> int:
-            seen.append(heartbeat_name)
-            return 0
-
-        server.poll_qbit_tip_template_once = fake_poll  # type: ignore[method-assign]
+        server._record_heartbeat = seen.append  # type: ignore[method-assign]
         server.refresh_jobs_after_accepted_block(
             block_height=10, block_hash="bb" * 32, heartbeat_name="block_submitter"
         )
