@@ -351,8 +351,10 @@ class FakePublicLedger:
         range_id: str,
         bucket: str,
         lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
         self.last_hashrate_series_lookback = lookback_seconds
+        self.last_hashrate_series_anchor = range_anchor_epoch
         if bucket == "5m":
             # Recent bucket epochs (with a gap between them) so the points sit
             # inside every bounded range after lookback trimming.
@@ -485,9 +487,14 @@ class RangeBoundaryPublicLedger(FakePublicLedger):
         range_id: str,
         bucket: str,
         lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
         self.last_hashrate_series_lookback = lookback_seconds
-        cutoff_epoch = (int(time.time()) - 7 * 86400) // 300 * 300
+        self.last_hashrate_series_anchor = range_anchor_epoch
+        # Derive the boundary from the caller-provided anchor, exactly as the
+        # endpoint's min_epoch trim does, so this stub is deterministic.
+        anchor_epoch = range_anchor_epoch if range_anchor_epoch is not None else int(time.time())
+        cutoff_epoch = public_api.hashrate_series_min_epoch(anchor_epoch, 7 * 86400, 300)
         return [
             {
                 "timestamp": _bucket_timestamp(cutoff_epoch - 300),
@@ -852,8 +859,11 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             thread.join(timeout=5)
 
         # The ledger is asked for one extra smoothing window of history so the
-        # first in-range windows average over real pre-range buckets.
+        # first in-range windows average over real pre-range buckets, anchored
+        # on the same epoch the endpoint trims against so database clock skew
+        # cannot shift the boundary.
         self.assertEqual(ledger.last_hashrate_series_lookback, 1800)
+        self.assertIsNotNone(ledger.last_hashrate_series_anchor)
         points = series["points"]
         # The pre-range context bucket feeds the trailing window but is dropped
         # from the response instead of charting an artificial ramp-up.

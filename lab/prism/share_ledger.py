@@ -910,11 +910,19 @@ class SingleWriterShareLedger:
         range_id: str,
         bucket: str,
         lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
         from lab.prism import public_api
 
         now = datetime.now(timezone.utc)
-        started = _series_start(now, range_id)
+        # Anchor the range lower bound on the caller's clock when provided so
+        # it agrees with the caller's min_epoch trim regardless of clock skew.
+        anchor = (
+            datetime.fromtimestamp(range_anchor_epoch, timezone.utc)
+            if range_anchor_epoch is not None
+            else now
+        )
+        started = _series_start(anchor, range_id)
         if lookback_seconds > 0 and range_id != "all":
             # Pre-range context requested by the smoother; the caller trims
             # these buckets from the response after windowing.
@@ -4217,6 +4225,7 @@ CROSS JOIN window_summary;
         range_id: str,
         bucket: str,
         lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
         from lab.prism import public_api
 
@@ -4230,7 +4239,15 @@ CROSS JOIN window_summary;
         }[range_id]
         range_filter = ""
         if range_interval is not None:
-            range_filter = f"AND ledger.accepted_at >= bounds.ended_at - interval '{range_interval}'"
+            # Anchor the range lower bound on the caller's clock when provided
+            # so it agrees with the caller's min_epoch trim even when the
+            # database clock disagrees with the application clock.
+            range_anchor_sql = (
+                f"to_timestamp({int(range_anchor_epoch)})"
+                if range_anchor_epoch is not None
+                else "bounds.ended_at"
+            )
+            range_filter = f"AND ledger.accepted_at >= {range_anchor_sql} - interval '{range_interval}'"
             if lookback_seconds > 0:
                 # Pre-range context requested by the smoother; the caller trims
                 # these buckets from the response after windowing.

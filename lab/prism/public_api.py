@@ -494,19 +494,23 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
     range_seconds = HASHRATE_SERIES_RANGE_SECONDS[range_id]
     lookback_seconds = 0
     min_epoch: int | None = None
+    range_anchor_epoch: int | None = None
     if window_seconds // bucket_seconds >= 2 and range_seconds is not None:
         # Fetch one full smoothing window of pre-range history so the first
         # in-range points average over real data instead of artificial zeros,
-        # then trim the context-only points after smoothing.
+        # then trim the context-only points after smoothing. The ledger anchors
+        # its range lower bound on the same epoch min_epoch derives from, so
+        # the trim cannot disagree with the fetch under clock skew.
         lookback_seconds = (window_seconds // bucket_seconds) * bucket_seconds
-        now_epoch = int(datetime.now(timezone.utc).timestamp())
-        min_epoch = hashrate_series_min_epoch(now_epoch, range_seconds, bucket_seconds)
+        range_anchor_epoch = int(datetime.now(timezone.utc).timestamp())
+        min_epoch = hashrate_series_min_epoch(range_anchor_epoch, range_seconds, bucket_seconds)
     points = coordinator.ledger.dashboard_hashrate_series(
         subject_type=subject_type,
         subject_id=subject_id,
         range_id=range_id,
         bucket=bucket,
         lookback_seconds=lookback_seconds,
+        range_anchor_epoch=range_anchor_epoch,
     )
     points = smooth_hashrate_series_points(
         points,
