@@ -6836,7 +6836,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server.enqueue_block_candidate(candidate)
             self.assertTrue(server.submit_next_block_candidate())
 
-        self.assertEqual(waits, [0.1, 0.2, 0.4, 0.4])
+        # The first accepted finalize failure returns unpaced so the caller
+        # can refresh the fleet immediately; the ladder starts at the first
+        # finalize-only replay.
+        self.assertEqual(waits, [0.1, 0.2, 0.4])
         self.assertEqual(finish_attempts, 5)
         self.assertEqual(submit_calls, 1)
         self.assertNotIn(candidate.submission.block_hash_hex, server.block_candidate_retry_delays)
@@ -6943,18 +6946,32 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.refresh_jobs_after_pending_accepted_block = (  # type: ignore[method-assign]
             lambda client, **_kwargs: refreshed_clients.append(client) or 0
         )
+        released_shares: list[object] = []
+        original_release = server._finish_pending_share_commit
+
+        def recording_release(pending_share: object) -> None:
+            released_shares.append(pending_share)
+            original_release(pending_share)
+
+        server._finish_pending_share_commit = recording_release  # type: ignore[method-assign]
+        waits: list[float] = []
         with patch.object(
             server.stop_event,
             "wait",
-            side_effect=lambda _delay: False,
+            side_effect=lambda delay: waits.append(delay) or False,
         ):
             server.enqueue_block_candidate(candidate)
             self.assertTrue(server.submit_next_block_candidate())
-            # The block is active on-chain; the fleet refresh must fire on the
-            # first finalize failure, not after the ledger recovers.
+            # The block is active on-chain; the fleet refresh fires on the
+            # first finalize failure without waiting out a backoff, and the
+            # snapshot anchor floor is released despite the pending outbox
+            # mark.
             self.assertEqual(refreshed_clients, [state])
+            self.assertEqual(waits, [])
+            self.assertIn(pending, released_shares)
             self.assertTrue(server.submit_next_block_candidate())
             self.assertEqual(refreshed_clients, [state])
+            self.assertEqual(waits, [0.1])
 
     def test_invalid_durable_candidate_is_quarantined_by_outbox_row_key(self) -> None:
         for payload_hash in (None, "ff" * 32):

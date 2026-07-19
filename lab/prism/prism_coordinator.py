@@ -16030,12 +16030,21 @@ class PrismCoordinator:
                         self._block_candidate_finalize_retries = registry
                     first_failure = block_hash not in registry
                     registry[block_hash] = (accepted, error)
+                # The share row already reached its terminal outcome in this
+                # process; only the outbox mark is pending. Release the
+                # snapshot anchor floor now (idempotent) -- holding it across
+                # paced retries would clamp job snapshot anchors and
+                # under-count already-durable shares in reward windows.
+                self._finish_pending_share_commit(candidate.pending_share)
+                self._retain_block_candidate_for_retry(candidate)
                 if accepted and first_failure:
                     # The block is active regardless of the outbox update;
-                    # post-accept fleet refresh must not wait for the ledger
-                    # to recover.
+                    # post-accept fleet refresh must wait for neither ledger
+                    # recovery nor the first backoff. Return unpaced so the
+                    # caller refreshes immediately; the paced ladder starts
+                    # from the first finalize-only replay.
                     outcome.refresh_client = candidate.client
-                self._retain_block_candidate_for_retry(candidate)
+                    return True
                 self.stop_event.wait(self._next_block_candidate_retry_delay(block_hash))
                 return True
         elif not accepted:
