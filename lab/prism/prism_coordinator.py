@@ -81,6 +81,11 @@ DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS = 5.0
 DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS = 10.0
 DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS = 60.0
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
+# Immutable payout snapshots retain the exact ledger/payout inputs used by
+# issued jobs.  The cap is an admission bound, not an eviction license: a
+# snapshot referenced by a submit-capable active or graveyard job is never
+# removed merely to make room.
+MAX_PRISM_RETAINED_PAYOUT_SNAPSHOTS = 128
 DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
@@ -203,6 +208,12 @@ PRISM_VARDIFF_IDLE_SKIP_REASONS = (
     "superseded",
 )
 PRISM_PAYOUT_DELIVERY_GENERATIONS = ("current", "stale", "future")
+PRISM_PAYOUT_SNAPSHOT_EVICTION_REASONS = (
+    "unpublished_superseded",
+    "jobs_expired",
+    "shutdown",
+)
+PRISM_JOB_BUILD_SUPERSESSION_REASONS = ("chain_tip", "payout")
 DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES = 8
 PRISM_JOB_BUILD_PHASES = (
     "reorg",
@@ -947,6 +958,13 @@ class PrismJobContext:
     template_fingerprint: str | None = None
     template_generation: int = 0
     payout_state_generation: int = 0
+    payout_snapshot_id: int = 0
+    payout_snapshot_sha256: str = ""
+    payout_snapshot_payout_artifact_sha256: str = ""
+    payout_policy_json: str = ""
+    payout_policy_sha256: str = ""
+    ctv_settlement_json: str | None = None
+    ctv_settlement_sha256: str | None = None
     prospective_prior_balances: tuple[tuple[str, str, str, int], ...] | None = None
     payout_artifact_generation: int = 0
     connection_id: int = 0
@@ -1072,6 +1090,8 @@ class JobBuildKey:
     template_fingerprint: str
     template_generation: int
     payout_state_generation: int
+    payout_snapshot_id: int
+    payout_snapshot_sha256: str
     payout_artifact_sha256: str
     mode: str
     collection_identity: tuple[str, str] | None
@@ -1114,6 +1134,11 @@ class CachedJobBundle:
     built_monotonic: float
     template_generation: int = 0
     payout_state_generation: int = 0
+    payout_snapshot_id: int = 0
+    payout_snapshot_sha256: str = ""
+    payout_snapshot_payout_artifact_sha256: str = ""
+    payout_policy_json: str = ""
+    ctv_settlement_json: str | None = None
     payout_artifact_generation: int = 0
     # Collection coinbases commit a synthetic share to this exact payout
     # identity. Ready bundles have no worker-specific inputs and keep this
@@ -1172,6 +1197,8 @@ class TipRefreshValidationToken:
     template_fingerprint: str
     template_generation: int
     payout_state_generation: int
+    payout_snapshot_id: int
+    payout_snapshot_sha256: str
     observation_sequence: int
     build_key: JobBuildKey
     snapshot: QbitTipTemplateSnapshot = field(repr=False)
@@ -1225,6 +1252,49 @@ class PayoutLedgerArtifact:
     # replaying qbit_audit_share_window at the declared anchor must reproduce
     # exactly these shares, which only holds at the snapshot's own anchor.
     snapshot_anchor_ms: int | None = None
+    # Publication-snapshot identity is separate from payout-state generation:
+    # accepted shares can advance this ledger boundary without changing carry
+    # balances, and must not invalidate a build already pinned to it.
+    snapshot_id: int = 0
+    snapshot_sha256: str = ""
+
+
+@dataclass(frozen=True)
+class PayoutPublicationSnapshot:
+    """Exact immutable payout inputs selected by one publication attempt."""
+
+    snapshot_id: int
+    snapshot_sha256: str
+    tip_hash: str
+    payout_state_generation: int
+    payout_artifact_sha256: str
+    share_snapshot_sha256: str
+    prior_balances_sha256: str
+    payout_policy_sha256: str
+    ctv_settlement_sha256: str | None
+    selected_monotonic: float
+    payout_policy_json: str = field(default="", repr=False)
+    ctv_settlement_json: str | None = field(default=None, repr=False)
+    ledger_artifact: PayoutLedgerArtifact | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    payout_state_artifact: PayoutStateArtifact | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    published_monotonic: float | None = None
+
+
+@dataclass(frozen=True)
+class _PayoutSnapshotAttempt:
+    tip_hash: str
+    snapshot_id: int
+    snapshot_sha256: str
+    followup_target_id: int | None
+    started_monotonic: float
 
 
 @dataclass
@@ -1460,6 +1530,7 @@ class _JobBundleBuildControl:
     previousblockhash: str
     payout_state_generation: int
     payout_artifact_generation: int
+    payout_snapshot_id: int = 0
     cancel_event: threading.Event = field(default_factory=threading.Event)
     process: subprocess.Popen[str] | None = None
 
@@ -1506,6 +1577,7 @@ class _PayoutStateDeliveryGate:
         *,
         generation: int | None = None,
         priority: bool = False,
+        allow_stale: bool = False,
         poll_seconds: float = PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
     ) -> Iterator[_PayoutDeliveryAdmission]:
         """Admit a delivery unless cancellation wins while mutation owns the gate."""
@@ -1520,7 +1592,7 @@ class _PayoutStateDeliveryGate:
                     break
                 if self._delivery_blocked:
                     break
-                if generation < self._published_generation:
+                if generation < self._published_generation and not allow_stale:
                     break
                 publication_blocked = (
                     self._publisher_waiting or self._mutation_owner is not None
@@ -3023,6 +3095,44 @@ class PrismCoordinator:
             self._payout_ledger_artifact: PayoutLedgerArtifact | None = None
         if not hasattr(self, "_payout_ledger_artifact_generation"):
             self._payout_ledger_artifact_generation = 0
+        if not hasattr(self, "_payout_snapshot_lock"):
+            # Linearizes accepted-share commits with publication-snapshot
+            # capture.  It is never held during serialization, template
+            # construction, signing, client stamping, or fanout.
+            self._payout_snapshot_lock = threading.RLock()
+        if not hasattr(self, "_retained_payout_snapshots"):
+            self._retained_payout_snapshots: OrderedDict[
+                tuple[int, str], PayoutPublicationSnapshot
+            ] = OrderedDict()
+        if not hasattr(self, "_payout_snapshot_epoch_counter"):
+            self._payout_snapshot_epoch_counter = 0
+        if not hasattr(self, "_latest_available_payout_snapshot_id"):
+            self._latest_available_payout_snapshot_id = 0
+        if not hasattr(self, "_selected_payout_snapshot_id"):
+            self._selected_payout_snapshot_id = 0
+        if not hasattr(self, "_published_payout_snapshot_id"):
+            self._published_payout_snapshot_id = 0
+        if not hasattr(self, "_active_payout_snapshot_attempt"):
+            self._active_payout_snapshot_attempt: _PayoutSnapshotAttempt | None = None
+        if not hasattr(self, "_payout_snapshot_followup_scheduled"):
+            self._payout_snapshot_followup_scheduled = False
+        if not hasattr(self, "_payout_snapshot_followup_target_id"):
+            self._payout_snapshot_followup_target_id: int | None = None
+        if not hasattr(self, "payout_snapshot_advances_coalesced"):
+            self.payout_snapshot_advances_coalesced = 0
+        if not hasattr(self, "payout_snapshot_followup_counts"):
+            self.payout_snapshot_followup_counts = {
+                "scheduled": 0,
+                "completed": 0,
+            }
+        if not hasattr(self, "payout_snapshot_eviction_counts"):
+            self.payout_snapshot_eviction_counts = {
+                reason: 0 for reason in PRISM_PAYOUT_SNAPSHOT_EVICTION_REASONS
+            }
+        if not hasattr(self, "job_build_supersession_reason_counts"):
+            self.job_build_supersession_reason_counts = {
+                reason: 0 for reason in PRISM_JOB_BUILD_SUPERSESSION_REASONS
+            }
         if not hasattr(self, "_pending_share_commit_lock"):
             self._pending_share_commit_lock = threading.Lock()
         if not hasattr(self, "_pending_share_commit_floor"):
@@ -3231,6 +3341,686 @@ class PrismCoordinator:
             self._job_build_phase_local.phases = phases
         return phases
 
+    @staticmethod
+    def _payout_snapshot_digest(
+        *,
+        snapshot_id: int,
+        tip_hash: str,
+        payout_state_generation: int,
+        payout_artifact_sha256: str,
+        share_snapshot_sha256: str,
+        prior_balances_sha256: str,
+        payout_policy_sha256: str,
+        ctv_settlement_sha256: str | None,
+        snapshot_anchor_ms: int | None,
+    ) -> str:
+        return canonical_json_sha256(
+            {
+                "snapshot_id": int(snapshot_id),
+                "tip_hash": str(tip_hash),
+                "payout_state_generation": int(payout_state_generation),
+                "payout_artifact_sha256": str(payout_artifact_sha256),
+                "share_snapshot_sha256": str(share_snapshot_sha256),
+                "prior_balances_sha256": str(prior_balances_sha256),
+                "payout_policy_sha256": str(payout_policy_sha256),
+                "ctv_settlement_sha256": ctv_settlement_sha256,
+                "snapshot_anchor_ms": (
+                    int(snapshot_anchor_ms)
+                    if snapshot_anchor_ms is not None
+                    else None
+                ),
+            }
+        )
+
+    def _note_payout_snapshot_available_locked(self, accepted_share_count: int) -> int:
+        """Advance the ledger epoch after one durable accepted-share batch.
+
+        Caller holds ``_payout_snapshot_lock`` across the ledger commit and
+        this update, so a selector observes either the complete earlier epoch
+        or the complete later one.  It can never combine half of a batch with
+        an older snapshot identity.
+        """
+
+        self._payout_snapshot_epoch_counter = max(
+            int(self._payout_snapshot_epoch_counter) + 1,
+            int(accepted_share_count),
+            1,
+        )
+        self._latest_available_payout_snapshot_id = (
+            self._payout_snapshot_epoch_counter
+        )
+        active = self._active_payout_snapshot_attempt
+        if (
+            active is not None
+            and self._latest_available_payout_snapshot_id > active.snapshot_id
+        ):
+            self.payout_snapshot_advances_coalesced += 1
+        return self._latest_available_payout_snapshot_id
+
+    def _note_payout_state_snapshot_available(self) -> int:
+        """Mint a later payout epoch after a real carry/settlement mutation."""
+
+        self._ensure_job_cache_state()
+        with self._payout_snapshot_lock:
+            try:
+                accepted_share_count = self.accepted_share_stats()[0]
+            except Exception:
+                accepted_share_count = self._latest_available_payout_snapshot_id
+            return self._note_payout_snapshot_available_locked(
+                accepted_share_count
+            )
+
+    def _issued_payout_snapshot_keys(self) -> set[tuple[int, str]]:
+        """Return snapshot identities still reachable by submit-capable jobs."""
+
+        keys: set[tuple[int, str]] = set()
+        with self.lock:
+            contexts = list(getattr(self, "jobs", {}).values())
+            graveyard = getattr(self, "evicted_job_graveyard", {})
+            contexts.extend(entry.context for entry in graveyard.values())
+            retry_candidate = getattr(self, "_retry_block_candidate", None)
+            if retry_candidate is not None:
+                contexts.append(retry_candidate.context)
+        candidate_queue = getattr(self, "block_candidate_queue", None)
+        if isinstance(candidate_queue, queue.Queue):
+            with candidate_queue.mutex:
+                contexts.extend(
+                    candidate.context
+                    for candidate in candidate_queue.queue
+                    if hasattr(candidate, "context")
+                )
+        for context in contexts:
+            snapshot_id = int(getattr(context, "payout_snapshot_id", 0))
+            snapshot_sha256 = str(
+                getattr(context, "payout_snapshot_sha256", "")
+            )
+            if snapshot_id > 0 and snapshot_sha256:
+                keys.add((snapshot_id, snapshot_sha256))
+        return keys
+
+    def _prune_retained_payout_snapshots(self) -> None:
+        """Evict only snapshots no longer reachable by a valid submission."""
+
+        self._ensure_job_cache_state()
+        issued = self._issued_payout_snapshot_keys()
+        evicted: list[tuple[PayoutPublicationSnapshot, str]] = []
+        with self._payout_snapshot_lock:
+            active = self._active_payout_snapshot_attempt
+            active_key = (
+                (active.snapshot_id, active.snapshot_sha256)
+                if active is not None and active.snapshot_sha256
+                else None
+            )
+            published_entries = [
+                (key, snapshot)
+                for key, snapshot in self._retained_payout_snapshots.items()
+                if snapshot.published_monotonic is not None
+            ]
+            newest_published_key = (
+                max(
+                    published_entries,
+                    key=lambda item: float(item[1].published_monotonic or 0.0),
+                )[0]
+                if published_entries
+                else None
+            )
+            for key, snapshot in tuple(self._retained_payout_snapshots.items()):
+                if key in issued or key == active_key or key == newest_published_key:
+                    continue
+                if snapshot.published_monotonic is None:
+                    reason = "unpublished_superseded"
+                else:
+                    reason = "jobs_expired"
+                self._retained_payout_snapshots.pop(key, None)
+                self.payout_snapshot_eviction_counts[reason] += 1
+                evicted.append((snapshot, reason))
+        for snapshot, reason in evicted:
+            print(
+                "prism coordinator: evicted payout snapshot "
+                f"id={snapshot.snapshot_id} reason={reason}",
+                flush=True,
+            )
+
+    def _select_payout_publication_snapshot(
+        self,
+        artifacts: CachedTemplateArtifacts,
+        *,
+        claim_owner: bool,
+    ) -> tuple[PayoutPublicationSnapshot, _PayoutSnapshotAttempt | None]:
+        """Freeze one exact ledger/payout epoch for construction and publish.
+
+        The short snapshot lock is held only while reading the ledger boundary;
+        JSON conversion and every expensive template/signing/fanout phase run
+        after it is released.  Accepted-share commits take the same lock, so a
+        commit that arrives after selection advances a later epoch instead of
+        invalidating these inputs.
+        """
+
+        self._ensure_job_cache_state()
+        self._prune_retained_payout_snapshots()
+        payout_state_generation = int(self._payout_state_generation)
+        payout_state_artifact = self._current_payout_state_artifact()
+        if payout_state_artifact.generation != payout_state_generation:
+            raise TemplateRefreshSuperseded(
+                "payout state changed before snapshot selection"
+            )
+        # Decode the immutable payout artifact before taking the short
+        # commit/selection lock. JSON work must never stall share ingestion.
+        payout_fallback_balances = payout_state_artifact.prior_balances()
+        attempt: _PayoutSnapshotAttempt | None = None
+        records: list[object]
+        prior_balances: list[dict[str, object]]
+        snapshot_anchor_ms: int
+        accepted_share_count: int
+        try:
+            with self._payout_state_prepare_lock:
+                with self._job_cache_lock:
+                    if (
+                        self._payout_state_publication_blocked
+                        or self._payout_state_generation
+                        != payout_state_generation
+                        or self._published_payout_state.artifact
+                        is not payout_state_artifact
+                    ):
+                        raise TemplateRefreshSuperseded(
+                            "payout state changed during snapshot selection"
+                        )
+                with self._payout_snapshot_lock:
+                    if (
+                        claim_owner
+                        and self._active_payout_snapshot_attempt is not None
+                    ):
+                        raise TemplateRefreshBlocked(
+                            "another payout snapshot publication owns the refresh"
+                        )
+                    accepted_share_count = self.accepted_share_stats()[0]
+                    self._payout_snapshot_epoch_counter = max(
+                        self._payout_snapshot_epoch_counter,
+                        accepted_share_count,
+                        1,
+                    )
+                    self._latest_available_payout_snapshot_id = max(
+                        self._latest_available_payout_snapshot_id,
+                        self._payout_snapshot_epoch_counter,
+                    )
+                    snapshot_id = self._latest_available_payout_snapshot_id
+                    for retained in reversed(
+                        tuple(self._retained_payout_snapshots.values())
+                    ):
+                        if (
+                            retained.snapshot_id == snapshot_id
+                            and retained.tip_hash == artifacts.previousblockhash
+                            and retained.payout_state_generation
+                            == payout_state_generation
+                            and retained.payout_artifact_sha256
+                            == payout_state_artifact.prior_balances_sha256
+                            and retained.ledger_artifact is not None
+                            and retained.ledger_artifact.network_difficulty
+                            == int(artifacts.network_difficulty)
+                        ):
+                            followup_target = (
+                                self._payout_snapshot_followup_target_id
+                                if self._payout_snapshot_followup_scheduled
+                                else None
+                            )
+                            attempt = (
+                                _PayoutSnapshotAttempt(
+                                    tip_hash=artifacts.previousblockhash,
+                                    snapshot_id=retained.snapshot_id,
+                                    snapshot_sha256=retained.snapshot_sha256,
+                                    followup_target_id=followup_target,
+                                    started_monotonic=time.monotonic(),
+                                )
+                                if claim_owner
+                                else None
+                            )
+                            if attempt is not None:
+                                self._active_payout_snapshot_attempt = attempt
+                                self._selected_payout_snapshot_id = snapshot_id
+                            return retained, attempt
+                    if (
+                        len(self._retained_payout_snapshots)
+                        >= MAX_PRISM_RETAINED_PAYOUT_SNAPSHOTS
+                    ):
+                        raise TemplateRefreshBlocked(
+                            "payout snapshot retention is full of submit-capable epochs"
+                        )
+                    followup_target = (
+                        self._payout_snapshot_followup_target_id
+                        if self._payout_snapshot_followup_scheduled
+                        else None
+                    )
+                    if claim_owner:
+                        attempt = _PayoutSnapshotAttempt(
+                            tip_hash=artifacts.previousblockhash,
+                            snapshot_id=snapshot_id,
+                            snapshot_sha256="",
+                            followup_target_id=followup_target,
+                            started_monotonic=time.monotonic(),
+                        )
+                        self._active_payout_snapshot_attempt = attempt
+                        self._selected_payout_snapshot_id = snapshot_id
+                    # Anchor below the selection millisecond as an additional
+                    # replay guard: a later share cannot share this boundary
+                    # merely because the wall clock has millisecond precision.
+                    snapshot_anchor_ms = self._job_snapshot_anchor_ms(
+                        now_ms() - 1
+                    )
+                    snapshot_window_weight = (
+                        PRISM_REWARD_WINDOW_MULTIPLIER
+                        * PRISM_SNAPSHOT_WINDOW_MARGIN
+                        * int(artifacts.network_difficulty)
+                    )
+                    records = list(
+                        self.ledger.snapshot_at_job_issue(
+                            snapshot_anchor_ms,
+                            window_weight=snapshot_window_weight,
+                        )
+                    )
+                    prior_balances = self._prior_balances_for_job_parent(
+                        artifacts.previousblockhash,
+                        parent_height=int(artifacts.template["height"]) - 1,
+                        fallback_balances=payout_fallback_balances,
+                    )
+                    if self.accepted_share_stats()[0] != accepted_share_count:
+                        raise RuntimeError(
+                            "accepted-share boundary moved while snapshot lock was held"
+                        )
+        except BaseException:
+            if attempt is not None:
+                with self._payout_snapshot_lock:
+                    if self._active_payout_snapshot_attempt is attempt:
+                        self._active_payout_snapshot_attempt = None
+            raise
+
+        # Convert and hash after every coordinator/ledger boundary is released.
+        try:
+            shares_json = tuple(record.to_prism_json() for record in records)
+            frozen_balances = tuple(prior_balances)
+            share_snapshot_sha256 = canonical_json_sha256(shares_json)
+            prior_balances_sha256 = canonical_json_sha256(frozen_balances)
+            payout_policy_json = canonical_json_text(self.prism_payout_policy())
+            ctv_settlement = self.prism_ctv_settlement_config(
+                block_height=int(artifacts.template["height"]),
+                parent_hash=artifacts.previousblockhash,
+            )
+            ctv_settlement_json = (
+                canonical_json_text(ctv_settlement)
+                if ctv_settlement is not None
+                else None
+            )
+            payout_policy_sha256 = hashlib.sha256(
+                payout_policy_json.encode()
+            ).hexdigest()
+            ctv_settlement_sha256 = (
+                hashlib.sha256(ctv_settlement_json.encode()).hexdigest()
+                if ctv_settlement_json is not None
+                else None
+            )
+            snapshot_sha256 = self._payout_snapshot_digest(
+                snapshot_id=snapshot_id,
+                tip_hash=artifacts.previousblockhash,
+                payout_state_generation=payout_state_generation,
+                payout_artifact_sha256=(
+                    payout_state_artifact.prior_balances_sha256
+                ),
+                share_snapshot_sha256=share_snapshot_sha256,
+                prior_balances_sha256=prior_balances_sha256,
+                payout_policy_sha256=payout_policy_sha256,
+                ctv_settlement_sha256=ctv_settlement_sha256,
+                snapshot_anchor_ms=snapshot_anchor_ms,
+            )
+        except BaseException:
+            if attempt is not None:
+                with self._payout_snapshot_lock:
+                    active = self._active_payout_snapshot_attempt
+                    if (
+                        active is not None
+                        and active.snapshot_id == attempt.snapshot_id
+                        and active.tip_hash == attempt.tip_hash
+                    ):
+                        self._active_payout_snapshot_attempt = None
+            raise
+        try:
+            with self._job_cache_lock:
+                self._payout_ledger_artifact_generation += 1
+                artifact_generation = self._payout_ledger_artifact_generation
+            ledger_artifact = PayoutLedgerArtifact(
+                generation=artifact_generation,
+                payout_state_generation=payout_state_generation,
+                network_difficulty=int(artifacts.network_difficulty),
+                accepted_share_count=accepted_share_count,
+                shares_json=shares_json,
+                prior_balances=frozen_balances,
+                prepared_monotonic=time.monotonic(),
+                snapshot_anchor_ms=snapshot_anchor_ms,
+                snapshot_id=snapshot_id,
+                snapshot_sha256=snapshot_sha256,
+            )
+            selected = PayoutPublicationSnapshot(
+                snapshot_id=snapshot_id,
+                snapshot_sha256=snapshot_sha256,
+                tip_hash=artifacts.previousblockhash,
+                payout_state_generation=payout_state_generation,
+                payout_artifact_sha256=(
+                    payout_state_artifact.prior_balances_sha256
+                ),
+                share_snapshot_sha256=share_snapshot_sha256,
+                prior_balances_sha256=prior_balances_sha256,
+                payout_policy_sha256=payout_policy_sha256,
+                ctv_settlement_sha256=ctv_settlement_sha256,
+                selected_monotonic=time.monotonic(),
+                payout_policy_json=payout_policy_json,
+                ctv_settlement_json=ctv_settlement_json,
+                ledger_artifact=ledger_artifact,
+                payout_state_artifact=payout_state_artifact,
+            )
+            with self._payout_snapshot_lock:
+                key = (selected.snapshot_id, selected.snapshot_sha256)
+                self._retained_payout_snapshots[key] = selected
+                self._retained_payout_snapshots.move_to_end(key)
+                if attempt is not None:
+                    completed_attempt = dataclass_replace(
+                        attempt,
+                        snapshot_sha256=selected.snapshot_sha256,
+                    )
+                    if self._active_payout_snapshot_attempt is attempt:
+                        self._active_payout_snapshot_attempt = completed_attempt
+                    attempt = completed_attempt
+                self._selected_payout_snapshot_id = selected.snapshot_id
+            print(
+                "prism coordinator: selected payout snapshot "
+                f"id={selected.snapshot_id} tip={selected.tip_hash} "
+                f"latest={self._latest_available_payout_snapshot_id}",
+                flush=True,
+            )
+            return selected, attempt
+        except BaseException:
+            if attempt is not None:
+                with self._payout_snapshot_lock:
+                    active = self._active_payout_snapshot_attempt
+                    if (
+                        active is not None
+                        and active.snapshot_id == attempt.snapshot_id
+                        and active.tip_hash == attempt.tip_hash
+                    ):
+                        self._active_payout_snapshot_attempt = None
+            raise
+
+    def _mark_payout_snapshot_published(
+        self,
+        snapshot_id: int,
+        snapshot_sha256: str,
+    ) -> None:
+        self._ensure_job_cache_state()
+        now = time.monotonic()
+        first_publish = False
+        with self._payout_snapshot_lock:
+            key = (int(snapshot_id), str(snapshot_sha256))
+            retained = self._retained_payout_snapshots.get(key)
+            if retained is None:
+                raise TemplateRefreshBlocked(
+                    "published job references an unretained payout snapshot"
+                )
+            if retained.published_monotonic is None:
+                retained = dataclass_replace(retained, published_monotonic=now)
+                self._retained_payout_snapshots[key] = retained
+                first_publish = True
+            self._published_payout_snapshot_id = retained.snapshot_id
+        if first_publish:
+            print(
+                "prism coordinator: published payout snapshot "
+                f"id={snapshot_id}",
+                flush=True,
+            )
+
+    def _finish_payout_snapshot_attempt(
+        self,
+        attempt: _PayoutSnapshotAttempt | None,
+        *,
+        completed: bool,
+    ) -> None:
+        """Release ownership and schedule at most one same-tip follow-up."""
+
+        if attempt is None:
+            return
+        schedule_followup = False
+        completed_followup = False
+        target_id = 0
+        with self._payout_snapshot_lock:
+            active = self._active_payout_snapshot_attempt
+            if (
+                active is not None
+                and active.snapshot_id == attempt.snapshot_id
+                and active.tip_hash == attempt.tip_hash
+            ):
+                self._active_payout_snapshot_attempt = None
+            if (
+                completed
+                and attempt.followup_target_id is not None
+                and attempt.snapshot_id >= attempt.followup_target_id
+            ):
+                self.payout_snapshot_followup_counts["completed"] += 1
+                self._payout_snapshot_followup_scheduled = False
+                self._payout_snapshot_followup_target_id = None
+                completed_followup = True
+            if (
+                completed
+                and self._latest_available_payout_snapshot_id
+                > attempt.snapshot_id
+                and not self._payout_snapshot_followup_scheduled
+            ):
+                target_id = self._latest_available_payout_snapshot_id
+                self._payout_snapshot_followup_scheduled = True
+                self._payout_snapshot_followup_target_id = target_id
+                self.payout_snapshot_followup_counts["scheduled"] += 1
+                schedule_followup = True
+        if completed_followup:
+            print(
+                "prism coordinator: completed same-tip payout snapshot follow-up "
+                f"id={attempt.snapshot_id}",
+                flush=True,
+            )
+        if schedule_followup:
+            with self.lock:
+                latest = getattr(self, "latest_detected_tip", None)
+                tip_current = latest is None or latest[0] == attempt.tip_hash
+            if tip_current and not self.stop_event.is_set():
+                self._mark_tip_refresh_pending(target_id)
+                self._schedule_tip_refresh_retry()
+                print(
+                    "prism coordinator: scheduled coalesced same-tip payout "
+                    f"snapshot follow-up target={target_id}",
+                    flush=True,
+                )
+
+    def _retain_replayed_payout_snapshot(self, context: PrismJobContext) -> None:
+        snapshot_id = int(getattr(context, "payout_snapshot_id", 0))
+        snapshot_sha256 = str(getattr(context, "payout_snapshot_sha256", ""))
+        if snapshot_id <= 0 or not snapshot_sha256:
+            return
+        payout_policy_json = str(getattr(context, "payout_policy_json", ""))
+        payout_policy_sha256 = str(
+            getattr(context, "payout_policy_sha256", "")
+        )
+        ctv_settlement_json = getattr(context, "ctv_settlement_json", None)
+        ctv_settlement_sha256 = getattr(
+            context,
+            "ctv_settlement_sha256",
+            None,
+        )
+        try:
+            payout_policy_value = json.loads(payout_policy_json)
+            ctv_settlement_value = (
+                json.loads(ctv_settlement_json)
+                if ctv_settlement_json is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("block candidate payout snapshot is not JSON") from exc
+        if (
+            not payout_policy_json
+            or not isinstance(payout_policy_value, dict)
+            or (
+                ctv_settlement_value is not None
+                and not isinstance(ctv_settlement_value, dict)
+            )
+            or hashlib.sha256(payout_policy_json.encode()).hexdigest()
+            != payout_policy_sha256
+            or (
+                ctv_settlement_json is None
+                and ctv_settlement_sha256 is not None
+            )
+            or (
+                ctv_settlement_json is not None
+                and hashlib.sha256(str(ctv_settlement_json).encode()).hexdigest()
+                != ctv_settlement_sha256
+            )
+        ):
+            raise ValueError("block candidate payout policy snapshot mismatch")
+        share_sha256 = canonical_json_sha256(context.shares_json)
+        balances_sha256 = canonical_json_sha256(context.prior_balances)
+        expected = self._payout_snapshot_digest(
+            snapshot_id=snapshot_id,
+            tip_hash=str(context.template.get("previousblockhash", "")),
+            payout_state_generation=int(context.payout_state_generation),
+            payout_artifact_sha256=str(
+                getattr(context, "payout_snapshot_payout_artifact_sha256", "")
+            ),
+            share_snapshot_sha256=share_sha256,
+            prior_balances_sha256=balances_sha256,
+            payout_policy_sha256=payout_policy_sha256,
+            ctv_settlement_sha256=ctv_settlement_sha256,
+            snapshot_anchor_ms=(
+                int(context.found_block["anchor_job_issued_at_ms"])
+                if context.found_block.get("anchor_job_issued_at_ms") is not None
+                else None
+            ),
+        )
+        # New intents carry the complete digest inputs. Legacy contexts have
+        # snapshot id zero and bypass this path.
+        if expected != snapshot_sha256:
+            raise ValueError("block candidate payout snapshot digest mismatch")
+        retained = PayoutPublicationSnapshot(
+            snapshot_id=snapshot_id,
+            snapshot_sha256=snapshot_sha256,
+            tip_hash=str(context.template.get("previousblockhash", "")),
+            payout_state_generation=int(context.payout_state_generation),
+            payout_artifact_sha256=str(
+                getattr(context, "payout_snapshot_payout_artifact_sha256", "")
+            ),
+            share_snapshot_sha256=share_sha256,
+            prior_balances_sha256=balances_sha256,
+            payout_policy_sha256=payout_policy_sha256,
+            ctv_settlement_sha256=ctv_settlement_sha256,
+            selected_monotonic=time.monotonic(),
+            payout_policy_json=payout_policy_json,
+            ctv_settlement_json=ctv_settlement_json,
+            published_monotonic=time.monotonic(),
+        )
+        with self._payout_snapshot_lock:
+            self._retained_payout_snapshots.setdefault(
+                (snapshot_id, snapshot_sha256),
+                retained,
+            )
+
+    def _resolve_payout_snapshot_for_submission(
+        self,
+        context: PrismJobContext,
+    ) -> bool:
+        snapshot_id = int(getattr(context, "payout_snapshot_id", 0))
+        snapshot_sha256 = str(getattr(context, "payout_snapshot_sha256", ""))
+        if snapshot_id <= 0:
+            return True
+        payout_policy_json = str(getattr(context, "payout_policy_json", ""))
+        payout_policy_sha256 = str(
+            getattr(context, "payout_policy_sha256", "")
+        )
+        ctv_settlement_json = getattr(context, "ctv_settlement_json", None)
+        ctv_settlement_sha256 = getattr(
+            context,
+            "ctv_settlement_sha256",
+            None,
+        )
+        try:
+            payout_policy_value = json.loads(payout_policy_json)
+            ctv_settlement_value = (
+                json.loads(ctv_settlement_json)
+                if ctv_settlement_json is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            return False
+        if (
+            not payout_policy_json
+            or not isinstance(payout_policy_value, dict)
+            or (
+                ctv_settlement_value is not None
+                and not isinstance(ctv_settlement_value, dict)
+            )
+            or hashlib.sha256(payout_policy_json.encode()).hexdigest()
+            != payout_policy_sha256
+            or (
+                ctv_settlement_json is None
+                and ctv_settlement_sha256 is not None
+            )
+            or (
+                ctv_settlement_json is not None
+                and hashlib.sha256(str(ctv_settlement_json).encode()).hexdigest()
+                != ctv_settlement_sha256
+            )
+        ):
+            return False
+        expected_snapshot_sha256 = self._payout_snapshot_digest(
+            snapshot_id=snapshot_id,
+            tip_hash=str(context.template.get("previousblockhash", "")),
+            payout_state_generation=int(context.payout_state_generation),
+            payout_artifact_sha256=str(
+                getattr(
+                    context,
+                    "payout_snapshot_payout_artifact_sha256",
+                    "",
+                )
+            ),
+            share_snapshot_sha256=canonical_json_sha256(context.shares_json),
+            prior_balances_sha256=canonical_json_sha256(context.prior_balances),
+            payout_policy_sha256=payout_policy_sha256,
+            ctv_settlement_sha256=ctv_settlement_sha256,
+            snapshot_anchor_ms=(
+                int(context.found_block["anchor_job_issued_at_ms"])
+                if context.found_block.get("anchor_job_issued_at_ms") is not None
+                else None
+            ),
+        )
+        if expected_snapshot_sha256 != snapshot_sha256:
+            return False
+        key = (snapshot_id, snapshot_sha256)
+        with self._payout_snapshot_lock:
+            retained = self._retained_payout_snapshots.get(key)
+        if retained is None:
+            try:
+                self._retain_replayed_payout_snapshot(context)
+            except (TypeError, ValueError):
+                return False
+            with self._payout_snapshot_lock:
+                retained = self._retained_payout_snapshots.get(key)
+        if retained is None:
+            return False
+        return bool(
+            retained.tip_hash
+            == str(context.template.get("previousblockhash", ""))
+            and retained.payout_state_generation
+            == int(context.payout_state_generation)
+            and retained.share_snapshot_sha256
+            == canonical_json_sha256(context.shares_json)
+            and retained.prior_balances_sha256
+            == canonical_json_sha256(context.prior_balances)
+            and retained.payout_policy_sha256
+            == str(getattr(context, "payout_policy_sha256", ""))
+            and retained.ctv_settlement_sha256
+            == getattr(context, "ctv_settlement_sha256", None)
+        )
+
     def _cancel_obsolete_job_bundle_builds(
         self,
         *,
@@ -3247,6 +4037,7 @@ class PrismCoordinator:
                     and control.previousblockhash != current_tip
                 ) or (
                     payout_state_generation is not None
+                    and control.payout_snapshot_id <= 0
                     and control.payout_state_generation
                     != int(payout_state_generation)
                 )
@@ -3631,6 +4422,7 @@ class PrismCoordinator:
                 if request.payout_ledger_artifact is not None
                 else 0
             ),
+            payout_snapshot_id=request.key.payout_snapshot_id,
         )
         with self._job_cache_lock:
             self._active_job_bundle_builds[control.key] = control
@@ -4018,11 +4810,18 @@ class PrismCoordinator:
 
         def keep(request: _JobBuildRequest) -> bool:
             return bool(
-                published_fingerprint is not None
-                and request.artifacts.previousblockhash == published_parent
-                and request.artifacts.fingerprint == published_fingerprint
+                (
+                    "payout" in reason
+                    and request.key.payout_snapshot_id > 0
+                )
+                or (
+                    published_fingerprint is not None
+                    and request.artifacts.previousblockhash == published_parent
+                    and request.artifacts.fingerprint == published_fingerprint
+                )
             )
 
+        cancelled_count = 0
         with self._job_build_scheduler_lock:
             for flight in (self._job_build_active, self._job_build_retiring):
                 if (
@@ -4032,6 +4831,7 @@ class PrismCoordinator:
                 ):
                     flight.request.superseded_monotonic = time.monotonic()
                     self.job_build_scheduler_counts["supersessions"] += 1
+                    cancelled_count += 1
             pending = self._job_build_pending
             if pending is not None and not keep(pending):
                 pending.cancellation.cancel(reason)
@@ -4041,6 +4841,19 @@ class PrismCoordinator:
                     )
                 self._job_build_pending = None
                 self.job_build_scheduler_counts["supersessions"] += 1
+                cancelled_count += 1
+        if cancelled_count:
+            if "tip" in reason or "block accepted" in reason:
+                bounded_reason = "chain_tip"
+            elif "payout" in reason:
+                bounded_reason = "payout"
+            else:
+                bounded_reason = None
+            if bounded_reason is not None:
+                with self._payout_state_metrics_lock:
+                    self.job_build_supersession_reason_counts[
+                        bounded_reason
+                    ] += cancelled_count
 
     def shutdown_job_build_executor(self) -> None:
         self._ensure_job_cache_state()
@@ -4064,6 +4877,23 @@ class PrismCoordinator:
 
     def _job_bundle_payout_state_current(self, bundle: CachedJobBundle) -> bool:
         self._ensure_job_cache_state()
+        if (
+            bundle.payout_snapshot_id > 0
+            and bundle.build_key is not None
+        ):
+            with self._payout_snapshot_lock:
+                retained = self._retained_payout_snapshots.get(
+                    (bundle.payout_snapshot_id, bundle.payout_snapshot_sha256)
+                )
+            return bool(
+                retained is not None
+                and retained.tip_hash
+                == str(bundle.template.get("previousblockhash", ""))
+                and retained.payout_state_generation
+                == bundle.payout_state_generation
+                and retained.payout_artifact_sha256
+                == bundle.build_key.payout_artifact_sha256
+            )
         with self._job_cache_lock:
             artifact = self._published_payout_state.artifact
             return bool(
@@ -4871,6 +5701,7 @@ class PrismCoordinator:
         if (
             active is not None
             and active[0].payout_state_generation < next_payout_generation
+            and active[0].payout_snapshot_id <= 0
         ):
             active[1].cancel()
         elif active is not None:
@@ -5038,7 +5869,11 @@ class PrismCoordinator:
                         active = getattr(self, "_active_tip_refresh", None)
                         if active is None:
                             schedule_retry = True
-                        elif active[0].payout_state_generation < published_generation:
+                        elif (
+                            active[0].payout_state_generation
+                            < published_generation
+                            and active[0].payout_snapshot_id <= 0
+                        ):
                             # The payout gate itself rejects this old generation.
                             # Signal its fanout only after atomic publication.
                             active_to_cancel = active[1]
@@ -5065,6 +5900,7 @@ class PrismCoordinator:
         if published_generation is None:
             self._record_discarded_payout_candidate()
             return None
+        self._note_payout_state_snapshot_available()
         self._cancel_obsolete_job_bundle_builds(
             payout_state_generation=published_generation
         )
@@ -5576,6 +6412,9 @@ class PrismCoordinator:
         payout_state_generation: int,
         cache_key: tuple[object, ...],
         payout_ledger_artifact: PayoutLedgerArtifact | None = None,
+        payout_state_artifact: PayoutStateArtifact | None = None,
+        selected_payout_policy_json: str | None = None,
+        selected_ctv_settlement_json: str | None = None,
         idle_retarget: bool = False,
     ) -> _JobBuildRequest:
         cancellation = _JobBuildCancellation(
@@ -5596,36 +6435,43 @@ class PrismCoordinator:
         # input so a child build cannot take -- or cache into the published
         # artifact -- confirmed state that omits its new parent. The preview
         # itself is re-resolved consistently during construction.
-        self._await_pending_parent_payout_preview(
-            artifacts.previousblockhash,
-            parent_height=int(artifacts.template["height"]) - 1,
-        )
-        payout_artifact = self._current_payout_state_artifact(cancellation)
+        if payout_state_artifact is None:
+            self._await_pending_parent_payout_preview(
+                artifacts.previousblockhash,
+                parent_height=int(artifacts.template["height"]) - 1,
+            )
+            payout_artifact = self._current_payout_state_artifact(cancellation)
+        else:
+            payout_artifact = payout_state_artifact
         if payout_artifact.generation != payout_state_generation:
             raise JobBuildSuperseded(
                 "payout artifact generation changed before build request"
             )
 
         phases = self._job_build_phases()
-        payout_started = time.monotonic()
-        payout_policy_json = canonical_json_text(self.prism_payout_policy())
-        phases["payout"] = phases.get("payout", 0.0) + (
-            time.monotonic() - payout_started
-        )
-        cancellation.raise_if_cancelled("payout policy")
-        ctv_started = time.monotonic()
-        ctv_settlement = self.prism_ctv_settlement_config(
-            block_height=int(artifacts.template["height"]),
-            parent_hash=artifacts.previousblockhash,
-        )
-        ctv_settlement_json = (
-            canonical_json_text(ctv_settlement)
-            if ctv_settlement is not None
-            else None
-        )
-        phases["ctv"] = phases.get("ctv", 0.0) + (
-            time.monotonic() - ctv_started
-        )
+        if selected_payout_policy_json is None:
+            payout_started = time.monotonic()
+            payout_policy_json = canonical_json_text(self.prism_payout_policy())
+            phases["payout"] = phases.get("payout", 0.0) + (
+                time.monotonic() - payout_started
+            )
+            cancellation.raise_if_cancelled("payout policy")
+            ctv_started = time.monotonic()
+            ctv_settlement = self.prism_ctv_settlement_config(
+                block_height=int(artifacts.template["height"]),
+                parent_hash=artifacts.previousblockhash,
+            )
+            ctv_settlement_json = (
+                canonical_json_text(ctv_settlement)
+                if ctv_settlement is not None
+                else None
+            )
+            phases["ctv"] = phases.get("ctv", 0.0) + (
+                time.monotonic() - ctv_started
+            )
+        else:
+            payout_policy_json = selected_payout_policy_json
+            ctv_settlement_json = selected_ctv_settlement_json
         cancellation.raise_if_cancelled("CTV configuration")
 
         suffix_hex = self.coinbase_script_sig_suffix_hex(
@@ -5665,6 +6511,16 @@ class PrismCoordinator:
             template_fingerprint=artifacts.fingerprint,
             template_generation=artifacts.generation,
             payout_state_generation=payout_state_generation,
+            payout_snapshot_id=(
+                payout_ledger_artifact.snapshot_id
+                if payout_ledger_artifact is not None
+                else 0
+            ),
+            payout_snapshot_sha256=(
+                payout_ledger_artifact.snapshot_sha256
+                if payout_ledger_artifact is not None
+                else ""
+            ),
             payout_artifact_sha256=payout_artifact.prior_balances_sha256,
             mode=mode,
             collection_identity=collection_identity,
@@ -5705,6 +6561,8 @@ class PrismCoordinator:
             cache_key,
             artifacts.generation,
             issued_at_ms,
+            build_key.payout_snapshot_id,
+            build_key.payout_snapshot_sha256,
             payout_artifact.prior_balances_sha256,
             build_key.payout_policy_sha256,
             build_key.ctv_settlement_sha256,
@@ -5790,6 +6648,20 @@ class PrismCoordinator:
         artifacts: CachedTemplateArtifacts,
     ) -> bool:
         """Cache only current state; report whether payout state stayed valid."""
+        snapshot_retained = False
+        if built.build_key is not None and built.payout_snapshot_id > 0:
+            with self._payout_snapshot_lock:
+                retained = self._retained_payout_snapshots.get(
+                    (built.payout_snapshot_id, built.payout_snapshot_sha256)
+                )
+                snapshot_retained = bool(
+                    retained is not None
+                    and retained.tip_hash == artifacts.previousblockhash
+                    and retained.payout_state_generation
+                    == built.payout_state_generation
+                    and retained.payout_artifact_sha256
+                    == built.build_key.payout_artifact_sha256
+                )
         with self._job_cache_lock:
             with self.lock:
                 buildable = self._artifacts_buildable_locked(artifacts)
@@ -5799,9 +6671,10 @@ class PrismCoordinator:
             published_artifact = self._published_payout_state.artifact
             if not buildable:
                 return False
-            if (
+            if built.build_key is None:
+                return False
+            if not snapshot_retained and (
                 built.payout_state_generation != self._payout_state_generation
-                or built.build_key is None
                 or published_artifact is None
                 or built.build_key.payout_artifact_sha256
                 != published_artifact.prior_balances_sha256
@@ -5836,6 +6709,7 @@ class PrismCoordinator:
         worker: WorkerIdentity | None = None,
         *,
         mode: str | None = None,
+        payout_snapshot: PayoutPublicationSnapshot | None = None,
         cancelled: Callable[[], bool] | None = None,
         retry_superseded: bool = True,
         idle_retarget: bool = False,
@@ -5854,16 +6728,84 @@ class PrismCoordinator:
                 raise CollectionIdentityUnavailable(
                     "collection-mode worker identity is temporarily unavailable"
                 )
-            with self._job_cache_lock:
-                payout_state_generation = self._payout_state_generation
-            payout_artifact = (
-                self._usable_payout_ledger_artifact(
-                    payout_state_generation,
-                    artifacts.network_difficulty,
+            if payout_snapshot is None and resolved_mode == "ready":
+                # Initial-job and vardiff callers arriving during a tip-owner
+                # build must join its exact immutable epoch.  Letting them
+                # select the continuously advancing live ledger would replace
+                # the publication owner's build and recreate the churn this
+                # boundary is designed to stop.
+                with self._payout_snapshot_lock:
+                    active_attempt = self._active_payout_snapshot_attempt
+                    active_selection_pending = bool(
+                        active_attempt is not None
+                        and not active_attempt.snapshot_sha256
+                        and active_attempt.tip_hash
+                        == artifacts.previousblockhash
+                    )
+                    retained_active = (
+                        self._retained_payout_snapshots.get(
+                            (
+                                active_attempt.snapshot_id,
+                                active_attempt.snapshot_sha256,
+                            )
+                        )
+                        if active_attempt is not None
+                        and active_attempt.snapshot_sha256
+                        and active_attempt.tip_hash
+                        == artifacts.previousblockhash
+                        else None
+                    )
+                    retained_published = next(
+                        (
+                            retained
+                            for retained in reversed(
+                                tuple(self._retained_payout_snapshots.values())
+                            )
+                            if retained.published_monotonic is not None
+                            and retained.tip_hash
+                            == artifacts.previousblockhash
+                            and retained.ledger_artifact is not None
+                            and retained.payout_state_artifact is not None
+                        ),
+                        None,
+                    )
+                if active_selection_pending:
+                    raise _PayoutStatePublicationBlocked(
+                        "payout snapshot selection is still in progress"
+                    )
+                if retained_active is not None:
+                    payout_snapshot = retained_active
+                elif retained_published is not None:
+                    payout_snapshot = retained_published
+            if payout_snapshot is not None:
+                if (
+                    resolved_mode != "ready"
+                    or payout_snapshot.tip_hash != artifacts.previousblockhash
+                    or payout_snapshot.ledger_artifact is None
+                    or payout_snapshot.payout_state_artifact is None
+                ):
+                    raise TemplateRefreshBlocked(
+                        "selected payout snapshot does not match ready artifacts"
+                    )
+                payout_state_generation = (
+                    payout_snapshot.payout_state_generation
                 )
-                if resolved_mode == "ready"
-                else None
-            )
+                payout_artifact = payout_snapshot.ledger_artifact
+                selected_payout_state_artifact = (
+                    payout_snapshot.payout_state_artifact
+                )
+            else:
+                with self._job_cache_lock:
+                    payout_state_generation = self._payout_state_generation
+                payout_artifact = (
+                    self._usable_payout_ledger_artifact(
+                        payout_state_generation,
+                        artifacts.network_difficulty,
+                    )
+                    if resolved_mode == "ready"
+                    else None
+                )
+                selected_payout_state_artifact = None
             payout_artifact_generation = (
                 payout_artifact.generation if payout_artifact is not None else 0
             )
@@ -5890,6 +6832,17 @@ class PrismCoordinator:
                     payout_state_generation=payout_state_generation,
                     cache_key=key,
                     payout_ledger_artifact=payout_artifact,
+                    payout_state_artifact=selected_payout_state_artifact,
+                    selected_payout_policy_json=(
+                        payout_snapshot.payout_policy_json
+                        if payout_snapshot is not None
+                        else None
+                    ),
+                    selected_ctv_settlement_json=(
+                        payout_snapshot.ctv_settlement_json
+                        if payout_snapshot is not None
+                        else None
+                    ),
                     idle_retarget=idle_retarget,
                 )
                 # Preserve the historical readiness handoff without holding a
@@ -5943,7 +6896,8 @@ class PrismCoordinator:
                 with self._job_cache_lock:
                     current = self._template_artifacts
                     payout_current = (
-                        payout_state_generation == self._payout_state_generation
+                        payout_snapshot is not None
+                        or payout_state_generation == self._payout_state_generation
                     )
                 if current is artifacts and payout_current:
                     continue
@@ -5964,7 +6918,8 @@ class PrismCoordinator:
                     )
                 with self._job_cache_lock:
                     payout_current = (
-                        built.payout_state_generation
+                        built.payout_snapshot_id > 0
+                        or built.payout_state_generation
                         == self._payout_state_generation
                     )
                 with self.lock:
@@ -6022,7 +6977,10 @@ class PrismCoordinator:
             publication_blocked = self._payout_state_publication_blocked
             if payout_state_generation is None:
                 payout_state_generation = self._payout_state_generation
-        if publication_blocked:
+        selected_snapshot_build = bool(
+            payout_artifact is not None and payout_artifact.snapshot_id > 0
+        )
+        if publication_blocked and not selected_snapshot_build:
             raise _PayoutStatePublicationBlocked(
                 "payout state invalidation is pending publication"
             )
@@ -6063,7 +7021,7 @@ class PrismCoordinator:
             * int(build_request.key.network_difficulty)
         )
         if payout_artifact is not None:
-            if (
+            if payout_artifact.snapshot_id <= 0 and (
                 self._usable_payout_ledger_artifact(
                     payout_state_generation,
                     build_request.key.network_difficulty,
@@ -6072,6 +7030,15 @@ class PrismCoordinator:
             ):
                 raise JobBuildSuperseded(
                     "precomputed payout artifact changed before construction"
+                )
+            if (
+                payout_artifact.snapshot_id
+                != build_request.key.payout_snapshot_id
+                or payout_artifact.snapshot_sha256
+                != build_request.key.payout_snapshot_sha256
+            ):
+                raise JobBuildSuperseded(
+                    "selected payout snapshot changed before construction"
                 )
             prior_balances = list(payout_artifact.prior_balances)
             if (
@@ -6082,12 +7049,19 @@ class PrismCoordinator:
                     "precomputed payout artifact does not match payout generation"
                 )
             shares = list(payout_artifact.shares_json)
-            # The artifact binds the key above; the balances actually used may
-            # still be an accepted parent's prospective carry state.
-            prior_balances = self._prior_balances_for_job_parent(
-                str(template["previousblockhash"]),
-                parent_height=int(template["height"]) - 1,
-                fallback_balances=prior_balances,
+            if payout_artifact.snapshot_id <= 0:
+                # Speculative background artifacts predate publication
+                # snapshot ownership, so a pending accepted-parent preview
+                # may still replace their fallback carry state. A selected
+                # snapshot already froze this exact parent input.
+                prior_balances = self._prior_balances_for_job_parent(
+                    str(template["previousblockhash"]),
+                    parent_height=int(template["height"]) - 1,
+                    fallback_balances=prior_balances,
+                )
+            self._job_build_checkpoint(
+                "ledger_snapshot_complete",
+                cancellation,
             )
         else:
             with self._payout_state_prepare_lock:
@@ -6155,6 +7129,23 @@ class PrismCoordinator:
             build_request.key,
             share_snapshot_sha256=share_snapshot_sha256,
         )
+        if payout_artifact is not None and payout_artifact.snapshot_id > 0:
+            expected_snapshot_sha256 = self._payout_snapshot_digest(
+                snapshot_id=payout_artifact.snapshot_id,
+                tip_hash=str(template["previousblockhash"]),
+                payout_state_generation=payout_state_generation,
+                payout_artifact_sha256=build_request.key.payout_artifact_sha256,
+                share_snapshot_sha256=share_snapshot_sha256,
+                prior_balances_sha256=canonical_json_sha256(prior_balances),
+                payout_policy_sha256=final_build_key.payout_policy_sha256,
+                ctv_settlement_sha256=final_build_key.ctv_settlement_sha256,
+                snapshot_anchor_ms=bundle_anchor_ms,
+            )
+            if expected_snapshot_sha256 != payout_artifact.snapshot_sha256:
+                raise JobBuildSuperseded(
+                    "payout, share window, and settlement inputs do not share "
+                    "one selected snapshot"
+                )
         self._job_build_checkpoint("payout_derivation", cancellation)
         started = time.monotonic()
         placeholder_suffix_hex = final_build_key.coinbase_suffix_hex
@@ -6266,13 +7257,26 @@ class PrismCoordinator:
             coinbase_manifest=manifest,
             shares_json=shares,
             prior_balances=prior_balances,
-            found_block=bundle["found_block"],
+            found_block={
+                **bundle["found_block"],
+                "payout_snapshot_id": final_build_key.payout_snapshot_id,
+                "payout_snapshot_sha256": (
+                    final_build_key.payout_snapshot_sha256
+                ),
+            },
             collection_only=collection_only,
             issued_at_ms=issued_at_ms,
             base_job=base_job,
             built_monotonic=time.monotonic(),
             template_generation=artifacts.generation,
             payout_state_generation=payout_state_generation,
+            payout_snapshot_id=final_build_key.payout_snapshot_id,
+            payout_snapshot_sha256=final_build_key.payout_snapshot_sha256,
+            payout_snapshot_payout_artifact_sha256=(
+                final_build_key.payout_artifact_sha256
+            ),
+            payout_policy_json=build_request.payout_policy_json,
+            ctv_settlement_json=build_request.ctv_settlement_json,
             payout_artifact_generation=(
                 payout_artifact.generation if payout_artifact is not None else 0
             ),
@@ -6326,6 +7330,23 @@ class PrismCoordinator:
             template_fingerprint=cached.template_fingerprint,
             template_generation=cached.template_generation,
             payout_state_generation=cached.payout_state_generation,
+            payout_snapshot_id=cached.payout_snapshot_id,
+            payout_snapshot_sha256=cached.payout_snapshot_sha256,
+            payout_snapshot_payout_artifact_sha256=(
+                cached.payout_snapshot_payout_artifact_sha256
+            ),
+            payout_policy_json=cached.payout_policy_json,
+            payout_policy_sha256=(
+                cached.build_key.payout_policy_sha256
+                if cached.build_key is not None
+                else ""
+            ),
+            ctv_settlement_json=cached.ctv_settlement_json,
+            ctv_settlement_sha256=(
+                cached.build_key.ctv_settlement_sha256
+                if cached.build_key is not None
+                else None
+            ),
             prospective_prior_balances=cached.prospective_prior_balances,
             payout_artifact_generation=cached.payout_artifact_generation,
             connection_id=client.connection_id,
@@ -6775,9 +7796,25 @@ class PrismCoordinator:
         observation_sequence: int,
         payout_state_generation: int,
         pending_signal_token: int | None = None,
+        *,
+        payout_snapshot_id: int = 0,
     ) -> bool:
         """Atomically acknowledge pending work handled by a completed poll."""
         self._ensure_job_cache_state()
+        if payout_snapshot_id > 0:
+            with self.lock:
+                if not self._tip_refresh_snapshot_current_locked(
+                    snapshot,
+                    observation_sequence,
+                ):
+                    return False
+                # A later payout epoch owns a newer pending token. Publishing
+                # this exact snapshot is still complete; leave that token
+                # armed for the single coalesced same-tip follow-up.
+                if self._tip_refresh_pending_token == pending_signal_token:
+                    self._tip_refresh_pending_token = None
+                    self._tip_refresh_pending_event.clear()
+            return True
         with self._payout_state_delivery_gate.delivery_cancelable(
             lambda: self._payout_state_generation != payout_state_generation,
             generation=payout_state_generation,
@@ -6974,6 +8011,15 @@ class PrismCoordinator:
             executor.shutdown(wait=True)
         self.shutdown_job_build_executor()
         self.shutdown_payout_artifact_executor()
+        with self._payout_snapshot_lock:
+            shutdown_evictions = len(self._retained_payout_snapshots)
+            self._retained_payout_snapshots.clear()
+            self._active_payout_snapshot_attempt = None
+            self._payout_snapshot_followup_scheduled = False
+            self._payout_snapshot_followup_target_id = None
+            self.payout_snapshot_eviction_counts["shutdown"] += (
+                shutdown_evictions
+            )
 
     def _cancel_initial_job_future(self, future: Future[bool]) -> bool:
         """Cancel one initial-job future and account physical queue removal."""
@@ -7450,6 +8496,7 @@ class PrismCoordinator:
         cancelled: Callable[[], bool],
         *,
         generation: int,
+        payout_snapshot_id: int = 0,
     ) -> Any:
         """Use cancellable admission while retaining focused gate test seams."""
         gate = self._payout_state_delivery_gate
@@ -7459,6 +8506,7 @@ class PrismCoordinator:
                 cancelled,
                 generation=generation,
                 priority=True,
+                allow_stale=payout_snapshot_id > 0,
             )
         delivery = gate.delivery
         try:
@@ -7501,6 +8549,7 @@ class PrismCoordinator:
             with self._payout_delivery(
                 cancelled,
                 generation=bundle.payout_state_generation,
+                payout_snapshot_id=bundle.payout_snapshot_id,
             ) as admitted:
                 self._observe_payout_gate_admission(
                     admitted,
@@ -7509,10 +8558,7 @@ class PrismCoordinator:
                 )
                 if not admitted or cancelled():
                     return False
-                with self._job_cache_lock:
-                    payout_current = (
-                        bundle.payout_state_generation == self._payout_state_generation
-                    )
+                payout_current = self._job_bundle_payout_state_current(bundle)
                 if not payout_current or not self._issuance_artifacts_current(artifacts):
                     return None
                 with self.lock:
@@ -8689,6 +9735,7 @@ class PrismCoordinator:
     def prepare_tip_refresh_bundle(
         self,
         snapshot: QbitTipTemplateSnapshot,
+        payout_snapshot: PayoutPublicationSnapshot | None = None,
     ) -> CachedJobBundle:
         """Build ready-pool work from immutable shared inputs only.
 
@@ -8703,6 +9750,7 @@ class PrismCoordinator:
             bundle = self.shared_job_bundle(
                 artifacts,
                 mode="ready",
+                payout_snapshot=payout_snapshot,
                 retry_superseded=False,
             )
         except TemplateRefreshBlocked:
@@ -8734,11 +9782,22 @@ class PrismCoordinator:
             raise TemplateRefreshBlocked(
                 "ready-pool prepared refresh unexpectedly produced a collection bundle"
             )
+        if payout_snapshot is not None and (
+            bundle.payout_snapshot_id != payout_snapshot.snapshot_id
+            or bundle.payout_snapshot_sha256
+            != payout_snapshot.snapshot_sha256
+        ):
+            raise TemplateRefreshBlocked(
+                "prepared refresh bundle does not match selected payout snapshot"
+            )
         return bundle
 
     def prewarm_current_tip_ready_bundle(self) -> CachedJobBundle | None:
         """Publish one exact current-tip ready bundle before Stratum accepts."""
         self._ensure_job_cache_state()
+        payout_snapshot: PayoutPublicationSnapshot | None = None
+        payout_attempt: _PayoutSnapshotAttempt | None = None
+        completed = False
         with self._job_cache_lock:
             self.job_preparation_pending = True
         try:
@@ -8761,11 +9820,18 @@ class PrismCoordinator:
             ready = self.pool_readiness_latched()
             bundle: CachedJobBundle | None = None
             if ready:
+                payout_snapshot, payout_attempt = (
+                    self._select_payout_publication_snapshot(
+                        self._tip_refresh_artifacts(snapshot),
+                        claim_owner=True,
+                    )
+                )
                 progress_build_token = self._progress_bundle_build_started()
                 try:
                     bundle = self.shared_job_bundle(
                         self._tip_refresh_artifacts(snapshot),
                         None,
+                        payout_snapshot=payout_snapshot,
                     )
                 finally:
                     self._progress_bundle_build_finished(progress_build_token)
@@ -8773,11 +9839,13 @@ class PrismCoordinator:
                     raise TemplateRefreshBlocked(
                         "startup ready preparation produced collection work"
                     )
-                if bundle.payout_state_generation != int(
-                    getattr(self, "_payout_state_generation", 0)
+                if (
+                    bundle.payout_snapshot_id != payout_snapshot.snapshot_id
+                    or bundle.payout_snapshot_sha256
+                    != payout_snapshot.snapshot_sha256
                 ):
                     raise TemplateRefreshSuperseded(
-                        "payout state changed during startup job preparation"
+                        "payout snapshot changed during startup job preparation"
                     )
 
             if str(self.rpc.call("getbestblockhash")) != snapshot.bestblockhash:
@@ -8796,6 +9864,11 @@ class PrismCoordinator:
             with self._job_cache_lock:
                 self._prepared_ready_snapshot = snapshot if bundle is not None else None
                 self._prepared_ready_bundle = bundle
+            if payout_snapshot is not None:
+                self._mark_payout_snapshot_published(
+                    payout_snapshot.snapshot_id,
+                    payout_snapshot.snapshot_sha256,
+                )
             self._record_progress_publication(
                 snapshot,
                 (
@@ -8806,8 +9879,13 @@ class PrismCoordinator:
             )
             self.last_successful_template_refresh_monotonic = time.monotonic()
             self._record_progress_tip_poll(snapshot)
+            completed = True
             return bundle
         finally:
+            self._finish_payout_snapshot_attempt(
+                payout_attempt,
+                completed=completed,
+            )
             with self._job_cache_lock:
                 self.job_preparation_pending = False
 
@@ -8851,7 +9929,6 @@ class PrismCoordinator:
         bundle: CachedJobBundle,
         snapshot: QbitTipTemplateSnapshot,
     ) -> bool:
-        published = getattr(self, "_published_payout_state", None)
         return bool(
             token.snapshot is snapshot
             and token.tip_hash == snapshot.bestblockhash
@@ -8860,6 +9937,9 @@ class PrismCoordinator:
             and bundle.template_fingerprint == token.template_fingerprint
             and bundle.template_generation == token.template_generation
             and bundle.payout_state_generation == token.payout_state_generation
+            and bundle.payout_snapshot_id == token.payout_snapshot_id
+            and bundle.payout_snapshot_sha256
+            == token.payout_snapshot_sha256
             and bundle.build_key is token.build_key
             and token.build_key.best_tip_hash == snapshot.bestblockhash
             and token.build_key.previous_block_hash == snapshot.previousblockhash
@@ -8868,12 +9948,10 @@ class PrismCoordinator:
             and token.build_key.template_generation == snapshot.template_generation
             and token.build_key.payout_state_generation
             == token.payout_state_generation
-            and token.payout_state_generation
-            == int(getattr(self, "_payout_state_generation", 0))
-            and published is not None
-            and published.artifact is not None
-            and token.build_key.payout_artifact_sha256
-            == published.artifact.prior_balances_sha256
+            and token.build_key.payout_snapshot_id
+            == token.payout_snapshot_id
+            and token.build_key.payout_snapshot_sha256
+            == token.payout_snapshot_sha256
             and snapshot.template_artifacts is not None
             and bundle.template is snapshot.template_artifacts.template
             and not self._detected_tip_supersedes_locked(
@@ -8955,6 +10033,8 @@ class PrismCoordinator:
             template_fingerprint=artifacts.fingerprint,
             template_generation=artifacts.generation,
             payout_state_generation=bundle.payout_state_generation,
+            payout_snapshot_id=bundle.payout_snapshot_id,
+            payout_snapshot_sha256=bundle.payout_snapshot_sha256,
             observation_sequence=observation_sequence,
             build_key=bundle.build_key,
             snapshot=snapshot,
@@ -9007,6 +10087,7 @@ class PrismCoordinator:
             lambda: False,
             generation=token.payout_state_generation,
             priority=True,
+            allow_stale=token.payout_snapshot_id > 0,
         ) as payout_admitted:
             if not payout_admitted:
                 self._schedule_tip_refresh_retry()
@@ -9087,6 +10168,11 @@ class PrismCoordinator:
                     if active is not None:
                         active[1].cancel()
                     self._active_tip_refresh = (token, cancel_event)
+        if token.payout_snapshot_id > 0:
+            self._mark_payout_snapshot_published(
+                token.payout_snapshot_id,
+                token.payout_snapshot_sha256,
+            )
         return cancel_event
 
     def _clear_active_tip_refresh(
@@ -9191,8 +10277,13 @@ class PrismCoordinator:
                         client.active_job,
                         expected_active_job,
                         snapshot,
+                        bundle.payout_snapshot_id,
                     )
-                    or not self.client_needs_tip_template_refresh(client, snapshot)
+                    or not self.client_needs_tip_template_refresh(
+                        client,
+                        snapshot,
+                        bundle.payout_snapshot_id,
+                    )
                 ):
                     return RefreshResult("skipped")
             self._ensure_job_cache_state()
@@ -9201,6 +10292,7 @@ class PrismCoordinator:
                 cancelled,
                 generation=bundle.payout_state_generation,
                 priority=True,
+                allow_stale=bundle.payout_snapshot_id > 0,
             ) as payout_admitted:
                 phases["payout_gate"] = max(
                     0.0,
@@ -9246,16 +10338,19 @@ class PrismCoordinator:
                                 client.active_job,
                                 expected_active_job,
                                 snapshot,
+                                bundle.payout_snapshot_id,
                             )
                             or not self.client_needs_tip_template_refresh(
                                 client,
                                 snapshot,
+                                bundle.payout_snapshot_id,
                             )
                         ):
                             return RefreshResult("skipped")
                         clean_jobs = self.client_tip_changed_for_snapshot(
                             client,
                             snapshot,
+                            bundle.payout_snapshot_id,
                         )
                         stamp_started = time.monotonic()
                         context = self.stamp_job_for_client(
@@ -9403,7 +10498,11 @@ class PrismCoordinator:
                 active_job = expected_active_jobs.get(client)
                 if active_job is None:
                     priority = PRISM_DELIVERY_PRIORITY_INITIAL
-                elif self.client_tip_changed_for_snapshot(client, snapshot):
+                elif self.client_tip_changed_for_snapshot(
+                    client,
+                    snapshot,
+                    bundle.payout_snapshot_id,
+                ):
                     priority = PRISM_DELIVERY_PRIORITY_NEW_TIP
                 else:
                     priority = PRISM_DELIVERY_PRIORITY_SAME_TIP
@@ -9619,6 +10718,9 @@ class PrismCoordinator:
         singleflight_acquired = False
         publication_lock_acquired = False
         progress_refresh_active = False
+        payout_publication_snapshot: PayoutPublicationSnapshot | None = None
+        payout_snapshot_attempt: _PayoutSnapshotAttempt | None = None
+        refresh_completed = False
         observation_sequence = 0
         pending_signal_token: int | None = None
         try:
@@ -9791,6 +10893,33 @@ class PrismCoordinator:
                 # both token ownership and payout/detected-tip currentness, so
                 # a later producer cannot be cleared accidentally.
                 pending_signal_token = self._claim_tip_refresh_pending()
+            ready_mode = bool(getattr(self, "_pool_ready_latched", False))
+            if ready_mode:
+                try:
+                    (
+                        payout_publication_snapshot,
+                        payout_snapshot_attempt,
+                    ) = self._select_payout_publication_snapshot(
+                        self._tip_refresh_artifacts(snapshot),
+                        claim_owner=True,
+                    )
+                except _PayoutStatePublicationBlocked:
+                    for _client in clients:
+                        self._record_tip_refresh_client_result("skipped")
+                    self._schedule_tip_refresh_retry()
+                    raise
+                if (
+                    payout_publication_snapshot.payout_state_generation
+                    != payout_generation_after_reconciliation
+                ):
+                    raise TemplateRefreshSuperseded(
+                        "payout state changed after snapshot selection"
+                    )
+            selected_payout_snapshot_id = (
+                payout_publication_snapshot.snapshot_id
+                if payout_publication_snapshot is not None
+                else None
+            )
             with self.lock:
                 selected_clients_list = list(clients)
                 selected_client_set = set(clients)
@@ -9800,6 +10929,7 @@ class PrismCoordinator:
                     if snapshot_changed or self.client_needs_tip_template_refresh(
                         client,
                         snapshot,
+                        selected_payout_snapshot_id,
                     ):
                         selected_clients_list.append(client)
                         selected_client_set.add(client)
@@ -9814,7 +10944,6 @@ class PrismCoordinator:
                 selected_clients
                 and getattr(self, "_pool_ready_latched", False)
             )
-            ready_mode = bool(getattr(self, "_pool_ready_latched", False))
             bundle: CachedJobBundle | None = None
             validation_token: TipRefreshValidationToken | None = None
             preactivated_cancel_event: _FanoutCancellation | None = None
@@ -9825,7 +10954,10 @@ class PrismCoordinator:
                     observation_sequence,
                 )
                 try:
-                    bundle = self.prepare_tip_refresh_bundle(snapshot)
+                    bundle = self.prepare_tip_refresh_bundle(
+                        snapshot,
+                        payout_publication_snapshot,
+                    )
                 except _PayoutStatePublicationBlocked:
                     for _client in selected_clients:
                         self._record_tip_refresh_client_result("skipped")
@@ -9869,10 +11001,29 @@ class PrismCoordinator:
                     observation_sequence,
                 )
             publication_lock_acquired = True
+            snapshot_bundle_current = False
+            if payout_publication_snapshot is not None and bundle is not None:
+                with self._payout_snapshot_lock:
+                    retained_snapshot = self._retained_payout_snapshots.get(
+                        (
+                            payout_publication_snapshot.snapshot_id,
+                            payout_publication_snapshot.snapshot_sha256,
+                        )
+                    )
+                snapshot_bundle_current = bool(
+                    retained_snapshot is not None
+                    and bundle.build_key is not None
+                    and bundle.payout_snapshot_id
+                    == payout_publication_snapshot.snapshot_id
+                    and bundle.payout_snapshot_sha256
+                    == payout_publication_snapshot.snapshot_sha256
+                    and bundle.build_key.payout_artifact_sha256
+                    == payout_publication_snapshot.payout_artifact_sha256
+                )
             with self._job_cache_lock:
                 current_payout_generation = self._payout_state_generation
                 current_payout_artifact = self._published_payout_state.artifact
-            if (
+            if not snapshot_bundle_current and (
                 current_payout_generation
                 != payout_generation_after_reconciliation
                 or (
@@ -9962,7 +11113,11 @@ class PrismCoordinator:
                         dropped_client_results.append("disconnected")
                     elif not self.client_can_receive_jobs(client):
                         dropped_client_results.append("skipped")
-                    elif not self.client_needs_tip_template_refresh(client, snapshot):
+                    elif not self.client_needs_tip_template_refresh(
+                        client,
+                        snapshot,
+                        selected_payout_snapshot_id,
+                    ):
                         dropped_client_results.append("skipped")
                     else:
                         current_clients.append(client)
@@ -9974,11 +11129,18 @@ class PrismCoordinator:
             if bundle is not None and not bundle.collection_only:
                 with self._job_cache_lock:
                     if (
-                        bundle.payout_state_generation
+                        bundle.payout_snapshot_id > 0
+                        or bundle.payout_state_generation
                         == self._payout_state_generation
                     ):
                         self._prepared_ready_snapshot = snapshot
                         self._prepared_ready_bundle = bundle
+
+            if payout_publication_snapshot is not None:
+                self._mark_payout_snapshot_published(
+                    payout_publication_snapshot.snapshot_id,
+                    payout_publication_snapshot.snapshot_sha256,
+                )
 
             if (
                 not use_prepared_fanout
@@ -10065,7 +11227,11 @@ class PrismCoordinator:
                     try:
                         if self.maybe_send_job(
                             client,
-                            clean_jobs=self.client_tip_changed_for_snapshot(client, snapshot),
+                            clean_jobs=self.client_tip_changed_for_snapshot(
+                                client,
+                                snapshot,
+                                selected_payout_snapshot_id,
+                            ),
                             raise_on_reorg_failure=True,
                             raise_on_build_failure=True,
                             tip_refresh_snapshot=snapshot,
@@ -10156,6 +11322,11 @@ class PrismCoordinator:
                 observation_sequence,
                 payout_generation_after_reconciliation,
                 pending_signal_token,
+                payout_snapshot_id=(
+                    payout_publication_snapshot.snapshot_id
+                    if payout_publication_snapshot is not None
+                    else 0
+                ),
             ):
                 # A newer tip or payout mutation won after the last delivery
                 # guard. Preserve its pending token and retry immediately.
@@ -10172,6 +11343,7 @@ class PrismCoordinator:
             # stamp so a legitimately long, progressing pass does not become
             # stale the instant its active marker is cleared.
             self._record_progress_tip_poll(snapshot)
+            refresh_completed = True
             return refreshed
         except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked):
             # Coordination-blocked refreshes -- a superseded tip, a pending
@@ -10192,6 +11364,10 @@ class PrismCoordinator:
             try:
                 if publication_lock_acquired:
                     self._tip_refresh_lock.release()
+                self._finish_payout_snapshot_attempt(
+                    payout_snapshot_attempt,
+                    completed=refresh_completed,
+                )
                 if progress_refresh_active:
                     self._progress_refresh_finished()
                 if singleflight_acquired:
@@ -10346,6 +11522,12 @@ class PrismCoordinator:
         if active_to_cancel is not None:
             active_to_cancel.cancel()
         if detection_changed:
+            with self._payout_snapshot_lock:
+                # A real tip replacement absorbs any pending same-tip payout
+                # refresh; the new-tip owner will select the latest available
+                # snapshot directly.
+                self._payout_snapshot_followup_scheduled = False
+                self._payout_snapshot_followup_target_id = None
             self._progress_note_refresh_pending(now)
             # In-flight constructions for older parents can no longer win;
             # stop them at detection so replacement preparation starts
@@ -11613,6 +12795,7 @@ class PrismCoordinator:
         self,
         client: ClientState,
         snapshot: QbitTipTemplateSnapshot,
+        payout_snapshot_id: int | None = None,
     ) -> bool:
         context = client.active_job
         if context is None:
@@ -11638,6 +12821,11 @@ class PrismCoordinator:
             or context_fingerprint != snapshot.template_fingerprint
             or context_payout_generation
             != int(getattr(self, "_payout_state_generation", 0))
+            or (
+                payout_snapshot_id is not None
+                and int(getattr(context, "payout_snapshot_id", 0))
+                != int(payout_snapshot_id)
+            )
         )
 
     def intervening_job_supersedes_snapshot(
@@ -11645,6 +12833,7 @@ class PrismCoordinator:
         active_job: PrismJobContext | None,
         expected_active_job: PrismJobContext | None,
         snapshot: QbitTipTemplateSnapshot,
+        payout_snapshot_id: int | None = None,
     ) -> bool:
         if active_job is expected_active_job or active_job is None:
             return False
@@ -11669,6 +12858,14 @@ class PrismCoordinator:
             # and therefore carry a larger generation; it must not prevent
             # the new-tip snapshot from replacing that stale work.
             return False
+        if payout_snapshot_id is not None:
+            active_snapshot_id = int(
+                getattr(active_job, "payout_snapshot_id", 0)
+            )
+            if active_snapshot_id < int(payout_snapshot_id):
+                return False
+            if active_snapshot_id > int(payout_snapshot_id):
+                return True
         active_generation = int(getattr(active_job, "template_generation", 0))
         snapshot_generation = int(getattr(snapshot, "template_generation", 0))
         if active_generation <= 0 or snapshot_generation <= 0:
@@ -11681,6 +12878,7 @@ class PrismCoordinator:
         self,
         client: ClientState,
         snapshot: QbitTipTemplateSnapshot,
+        payout_snapshot_id: int | None = None,
     ) -> bool:
         context = client.active_job
         if context is None:
@@ -11691,6 +12889,11 @@ class PrismCoordinator:
             or previousblockhash != snapshot.previousblockhash
             or int(getattr(context, "payout_state_generation", 0))
             != int(getattr(self, "_payout_state_generation", 0))
+            or (
+                payout_snapshot_id is not None
+                and int(getattr(context, "payout_snapshot_id", 0))
+                != int(payout_snapshot_id)
+            )
         )
 
     def handle_client(self, client: ClientState) -> None:
@@ -12285,7 +13488,10 @@ class PrismCoordinator:
                 lapsed_live_validated = True
         priority_delivery = (
             not publication_blocked
-            and context_payout_generation == current_payout_generation
+            and (
+                int(getattr(context, "payout_snapshot_id", 0)) > 0
+                or context_payout_generation == current_payout_generation
+            )
             and (
                 published_tip is None
                 or context_parent == published_tip
@@ -12299,9 +13505,13 @@ class PrismCoordinator:
         )
         payout_gate_started = time.monotonic()
         with self._payout_state_delivery_gate.delivery_cancelable(
-            lambda: context_payout_generation != self._payout_state_generation,
+            lambda: (
+                int(getattr(context, "payout_snapshot_id", 0)) <= 0
+                and context_payout_generation != self._payout_state_generation
+            ),
             generation=context_payout_generation,
             priority=priority_delivery,
+            allow_stale=int(getattr(context, "payout_snapshot_id", 0)) > 0,
         ) as payout_admitted:
             payout_gate_wait = max(0.0, time.monotonic() - payout_gate_started)
             phases["payout_gate"] = phases.get("payout_gate", 0.0) + payout_gate_wait
@@ -13530,14 +14740,48 @@ class PrismCoordinator:
             "pending_share": dataclasses.asdict(candidate.pending_share),
             "credit_share_on_accept": candidate.credit_share_on_accept,
             "collection_only": bool(context.collection_only),
+            "payout_state_generation": int(
+                getattr(context, "payout_state_generation", 0)
+            ),
+            "payout_snapshot_id": int(
+                getattr(context, "payout_snapshot_id", 0)
+            ),
+            "payout_snapshot_sha256": str(
+                getattr(context, "payout_snapshot_sha256", "")
+            ),
+            "payout_snapshot_payout_artifact_sha256": str(
+                getattr(
+                    context,
+                    "payout_snapshot_payout_artifact_sha256",
+                    "",
+                )
+            ),
+            "payout_policy_json": str(
+                getattr(context, "payout_policy_json", "")
+            ),
+            "payout_policy_sha256": str(
+                getattr(context, "payout_policy_sha256", "")
+            ),
+            "ctv_settlement_json": getattr(
+                context,
+                "ctv_settlement_json",
+                None,
+            ),
+            "ctv_settlement_sha256": getattr(
+                context,
+                "ctv_settlement_sha256",
+                None,
+            ),
         }
         # Fail on the client thread before committing a share if a future field
         # introduces a value that cannot survive the durable JSON boundary.
         json.dumps(intent, separators=(",", ":"), sort_keys=True)
         return intent
 
-    @staticmethod
-    def block_candidate_from_intent(intent: dict[str, Any]) -> PrismBlockCandidate:
+    def block_candidate_from_intent(
+        self,
+        intent: dict[str, Any],
+    ) -> PrismBlockCandidate:
         if intent.get("schema") != "qbit.prism.block-candidate-intent.v1":
             raise ValueError("unsupported block candidate intent schema")
         block_hash = str(intent["block_hash_hex"]).lower()
@@ -13578,6 +14822,30 @@ class PrismCoordinator:
                 p2mr_program_hex="",
             ),
             issued_at_ms=0,
+            payout_state_generation=int(
+                intent.get("payout_state_generation", 0)
+            ),
+            payout_snapshot_id=int(intent.get("payout_snapshot_id", 0)),
+            payout_snapshot_sha256=str(
+                intent.get("payout_snapshot_sha256", "")
+            ),
+            payout_snapshot_payout_artifact_sha256=str(
+                intent.get("payout_snapshot_payout_artifact_sha256", "")
+            ),
+            payout_policy_json=str(intent.get("payout_policy_json", "")),
+            payout_policy_sha256=str(
+                intent.get("payout_policy_sha256", "")
+            ),
+            ctv_settlement_json=(
+                str(intent["ctv_settlement_json"])
+                if intent.get("ctv_settlement_json") is not None
+                else None
+            ),
+            ctv_settlement_sha256=(
+                str(intent["ctv_settlement_sha256"])
+                if intent.get("ctv_settlement_sha256") is not None
+                else None
+            ),
             prospective_prior_balances=(
                 tuple(
                     (str(row[0]), str(row[1]), str(row[2]), int(row[3]))
@@ -13587,6 +14855,7 @@ class PrismCoordinator:
                 else None
             ),
         )
+        self._retain_replayed_payout_snapshot(context)
         return PrismBlockCandidate(
             context=context,
             submission=submission,
@@ -13818,15 +15087,26 @@ class PrismCoordinator:
     def _append_share_batch(self, batch: list[PendingShareAppend]) -> bool:
         """Commit a writer batch, then release every waiting submitter."""
         try:
-            append_batch = getattr(self.ledger, "append_batch", None)
-            if callable(append_batch):
-                records = append_batch(
-                    [(entry.pending_share, entry.candidate_intent) for entry in batch]
+            self._ensure_job_cache_state()
+            with self._payout_snapshot_lock:
+                append_batch = getattr(self.ledger, "append_batch", None)
+                if callable(append_batch):
+                    records = append_batch(
+                        [
+                            (entry.pending_share, entry.candidate_intent)
+                            for entry in batch
+                        ]
+                    )
+                else:
+                    # Compatibility for lightweight test/tool ledgers.
+                    # Production's Postgres ledger always supplies the atomic
+                    # batch method.
+                    records = [
+                        self.ledger.append(entry.pending_share) for entry in batch
+                    ]
+                self._note_payout_snapshot_available_locked(
+                    self.accepted_share_stats()[0]
                 )
-            else:
-                # Compatibility for lightweight test/tool ledgers. Production's
-                # Postgres ledger always supplies the atomic batch method.
-                records = [self.ledger.append(entry.pending_share) for entry in batch]
             if len(records) != len(batch):
                 raise RuntimeError("share ledger returned an incomplete commit batch")
             hot_path_log = getattr(self, "hot_path_log_enabled", False)
@@ -14000,13 +15280,18 @@ class PrismCoordinator:
         backoff_seconds = 0.5
         while True:
             try:
-                append_batch = getattr(self.ledger, "append_batch", None)
-                if callable(append_batch):
-                    record = append_batch(
-                        [(entry.pending_share, entry.candidate_intent)]
-                    )[0]
-                else:
-                    record = self.ledger.append(entry.pending_share)
+                self._ensure_job_cache_state()
+                with self._payout_snapshot_lock:
+                    append_batch = getattr(self.ledger, "append_batch", None)
+                    if callable(append_batch):
+                        record = append_batch(
+                            [(entry.pending_share, entry.candidate_intent)]
+                        )[0]
+                    else:
+                        record = self.ledger.append(entry.pending_share)
+                    self._note_payout_snapshot_available_locked(
+                        self.accepted_share_stats()[0]
+                    )
                 entry.record = record
                 break
             except Exception:
@@ -14164,9 +15449,22 @@ class PrismCoordinator:
         if artifacts is None or self._payout_state_publication_blocked:
             return False
         payout_artifact = self._published_payout_state.artifact
-        if (
-            bundle.build_key is None
-            or payout_artifact is None
+        if bundle.build_key is None:
+            return False
+        snapshot_current = False
+        if bundle.payout_snapshot_id > 0:
+            with self._payout_snapshot_lock:
+                retained = self._retained_payout_snapshots.get(
+                    (bundle.payout_snapshot_id, bundle.payout_snapshot_sha256)
+                )
+            snapshot_current = bool(
+                retained is not None
+                and retained.tip_hash == artifacts.previousblockhash
+                and retained.payout_artifact_sha256
+                == bundle.build_key.payout_artifact_sha256
+            )
+        if not snapshot_current and (
+            payout_artifact is None
             or bundle.build_key.payout_artifact_sha256
             != payout_artifact.prior_balances_sha256
         ):
@@ -14176,7 +15474,11 @@ class PrismCoordinator:
             return False
         if (
             bundle.template_fingerprint != artifacts.fingerprint
-            or bundle.payout_state_generation != self._payout_state_generation
+            or (
+                not snapshot_current
+                and bundle.payout_state_generation
+                != self._payout_state_generation
+            )
             or str(bundle.template.get("previousblockhash", ""))
             != artifacts.previousblockhash
         ):
@@ -14201,7 +15503,7 @@ class PrismCoordinator:
         key = self._job_bundle_key(
             artifacts,
             mode=mode,
-            payout_state_generation=self._payout_state_generation,
+            payout_state_generation=bundle.payout_state_generation,
             payout_artifact_generation=bundle.payout_artifact_generation,
             worker=worker,
         )
@@ -14232,6 +15534,9 @@ class PrismCoordinator:
             and bundle.built_monotonic == cached.built_monotonic
             and bundle.payout_state_generation
             == cached.payout_state_generation
+            and bundle.payout_snapshot_id == cached.payout_snapshot_id
+            and bundle.payout_snapshot_sha256
+            == cached.payout_snapshot_sha256
             and bundle.payout_artifact_generation
             == cached.payout_artifact_generation
             and bundle.collection_identity == cached.collection_identity
@@ -15628,6 +16933,33 @@ class PrismCoordinator:
             candidate_bundle_path = self.temporary_audit_bundle_path(
                 block_hash=submission.block_hash_hex
             )
+            issued_bundle_inputs: dict[str, object] = {}
+            payout_policy_json = str(
+                getattr(context, "payout_policy_json", "")
+            )
+            if payout_policy_json:
+                payout_policy = json.loads(payout_policy_json)
+                if not isinstance(payout_policy, dict):
+                    raise ValueError("issued payout policy is not an object")
+                ctv_settlement_json = getattr(
+                    context,
+                    "ctv_settlement_json",
+                    None,
+                )
+                ctv_settlement = (
+                    json.loads(ctv_settlement_json)
+                    if ctv_settlement_json is not None
+                    else None
+                )
+                if ctv_settlement is not None and not isinstance(
+                    ctv_settlement,
+                    dict,
+                ):
+                    raise ValueError("issued CTV settlement is not an object")
+                issued_bundle_inputs = {
+                    "payout_policy": payout_policy,
+                    "ctv_settlement": ctv_settlement,
+                }
             final_bundle = self.build_audit_bundle(
                 shares=context.shares_json,
                 found_block=context.found_block,
@@ -15644,6 +16976,7 @@ class PrismCoordinator:
                 ),
                 ctv_fee_parent_hash=parent_hash,
                 canonical_output_path=candidate_bundle_path,
+                **issued_bundle_inputs,
             )
             # Compatibility builders used by tests and older integrations may
             # ignore canonical_output_path. Persist their logical bundle via
@@ -15950,6 +17283,17 @@ class PrismCoordinator:
         block_hash = str(submission.block_hash_hex).lower()
         parent_hash = str(context.template["previousblockhash"])
         self._ensure_job_cache_state()
+        if not self._resolve_payout_snapshot_for_submission(context):
+            self._clear_accepted_block_payout_preview(
+                block_hash,
+                invalidate_published=True,
+            )
+            self._abandon_block_candidate(
+                PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
+                "issued job payout snapshot cannot be resolved exactly",
+                worker=worker,
+            )
+            return False
         with self.lock:
             pool_closed = (
                 self.accepted_block_count >= self.max_blocks
@@ -16074,6 +17418,8 @@ class PrismCoordinator:
             "accepted_share_count": evidence_share_count,
             "distinct_miner_count": evidence_distinct_miners,
             "job_share_count": len(context.shares_json),
+            "payout_snapshot_id": int(context.payout_snapshot_id),
+            "payout_snapshot_sha256": str(context.payout_snapshot_sha256),
         }
         self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
         with self.lock:
@@ -18079,6 +19425,7 @@ class PrismCoordinator:
 
     def payout_state_metrics_lines(self) -> list[str]:
         self._ensure_job_cache_state()
+        self._prune_retained_payout_snapshots()
         with self._payout_state_metrics_lock:
             state_histograms = {
                 name: {
@@ -18097,6 +19444,27 @@ class PrismCoordinator:
                 for relation, histogram in self.payout_gate_wait_histograms.items()
             }
             discarded = self.payout_state_candidates_discarded
+            build_supersessions = dict(
+                self.job_build_supersession_reason_counts
+            )
+        with self._payout_snapshot_lock:
+            selected_snapshot_id = self._selected_payout_snapshot_id
+            published_snapshot_id = self._published_payout_snapshot_id
+            latest_snapshot_id = self._latest_available_payout_snapshot_id
+            advances_coalesced = self.payout_snapshot_advances_coalesced
+            followup_counts = dict(self.payout_snapshot_followup_counts)
+            retention_count = len(self._retained_payout_snapshots)
+            eviction_counts = dict(self.payout_snapshot_eviction_counts)
+            unpublished = [
+                snapshot.selected_monotonic
+                for snapshot in self._retained_payout_snapshots.values()
+                if snapshot.published_monotonic is None
+            ]
+        oldest_unpublished_seconds = (
+            max(0.0, time.monotonic() - min(unpublished))
+            if unpublished
+            else 0.0
+        )
 
         metric_names = {
             "preparation": "qbit_prism_payout_preparation_seconds",
@@ -18154,6 +19522,38 @@ class PrismCoordinator:
                 "# HELP qbit_prism_payout_candidates_discarded_total Prepared payout candidates discarded after source supersession.",
                 "# TYPE qbit_prism_payout_candidates_discarded_total counter",
                 f"qbit_prism_payout_candidates_discarded_total {discarded}",
+                "# HELP qbit_prism_payout_snapshot_id Selected, published, and latest available immutable payout snapshot IDs.",
+                "# TYPE qbit_prism_payout_snapshot_id gauge",
+                f'qbit_prism_payout_snapshot_id{{state="selected"}} {selected_snapshot_id}',
+                f'qbit_prism_payout_snapshot_id{{state="published"}} {published_snapshot_id}',
+                f'qbit_prism_payout_snapshot_id{{state="latest_available"}} {latest_snapshot_id}',
+                "# HELP qbit_prism_payout_snapshot_advances_coalesced_total Payout snapshot advances collapsed behind an active immutable build.",
+                "# TYPE qbit_prism_payout_snapshot_advances_coalesced_total counter",
+                f"qbit_prism_payout_snapshot_advances_coalesced_total {advances_coalesced}",
+                "# HELP qbit_prism_payout_snapshot_followups_total Coalesced same-tip payout snapshot refreshes by lifecycle result.",
+                "# TYPE qbit_prism_payout_snapshot_followups_total counter",
+                *[
+                    f'qbit_prism_payout_snapshot_followups_total{{result="{result}"}} {int(followup_counts.get(result, 0))}'
+                    for result in ("scheduled", "completed")
+                ],
+                "# HELP qbit_prism_job_build_superseded_by_change_total Immutable job builds superseded by a real chain-tip or payout-state change.",
+                "# TYPE qbit_prism_job_build_superseded_by_change_total counter",
+                *[
+                    f'qbit_prism_job_build_superseded_by_change_total{{change="{reason}"}} {int(build_supersessions.get(reason, 0))}'
+                    for reason in PRISM_JOB_BUILD_SUPERSESSION_REASONS
+                ],
+                "# HELP qbit_prism_oldest_unpublished_payout_snapshot_seconds Age of the oldest retained selected snapshot not yet published.",
+                "# TYPE qbit_prism_oldest_unpublished_payout_snapshot_seconds gauge",
+                f"qbit_prism_oldest_unpublished_payout_snapshot_seconds {oldest_unpublished_seconds:.6f}",
+                "# HELP qbit_prism_payout_snapshot_retention_count Retained immutable payout snapshots still needed for publication or submission.",
+                "# TYPE qbit_prism_payout_snapshot_retention_count gauge",
+                f"qbit_prism_payout_snapshot_retention_count {retention_count}",
+                "# HELP qbit_prism_payout_snapshot_evictions_total Immutable payout snapshots evicted by bounded reason after submit authority ended.",
+                "# TYPE qbit_prism_payout_snapshot_evictions_total counter",
+                *[
+                    f'qbit_prism_payout_snapshot_evictions_total{{reason="{reason}"}} {int(eviction_counts.get(reason, 0))}'
+                    for reason in PRISM_PAYOUT_SNAPSHOT_EVICTION_REASONS
+                ],
             ]
         )
         return lines

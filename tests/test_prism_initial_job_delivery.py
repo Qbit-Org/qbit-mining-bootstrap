@@ -61,7 +61,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
                 bundle.template["previousblockhash"],
                 "ready",
                 0,
-                0,
+                bundle.payout_artifact_generation,
             ),
         )
         self.assertEqual(recorded["calls"], 1)
@@ -314,7 +314,9 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
 
         self.assertEqual(build_calls, 1)
         self.assertEqual(recorded["calls"], 2)
-        self.assertEqual(server.ledger.snapshot_calls, 2)
+        # Initial delivery rebuilds from the immutable prewarmed payout
+        # snapshot instead of re-reading a continuously moving ledger.
+        self.assertEqual(server.ledger.snapshot_calls, 1)
         self.assertIsNotNone(server.last_initial_job_delivery_monotonic)
         expected_tip = server.tip_template_snapshot.bestblockhash
         self.assertTrue(
@@ -368,7 +370,9 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertEqual(state.active_job.worker, replacement)
         self.assertEqual(state.active_job.authorization_generation, 2)
 
-    def test_payout_generation_supersedes_pending_initial_bundle(self) -> None:
+    def test_payout_generation_preserves_pinned_initial_bundle_then_refreshes(
+        self,
+    ) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)
         server.prewarm_current_tip_ready_bundle()
@@ -400,10 +404,10 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertEqual(server._advance_payout_state_generation(), 1)
         release_build.set()
         try:
-            wait_until(
-                lambda: state.active_job is not None
-                and state.active_job.payout_state_generation == 1
-            )
+            wait_until(lambda: state.active_job is not None)
+            self.assertEqual(state.active_job.payout_state_generation, 0)
+            self.assertTrue(server._tip_refresh_retry.is_set())
+            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
         finally:
             server.shutdown_tip_refresh_executor()
 

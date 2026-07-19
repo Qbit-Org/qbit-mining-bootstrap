@@ -896,11 +896,16 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             def needs_after_initial_selection(
                 target: object,
                 snapshot: object,
+                payout_snapshot_id: int | None = None,
             ) -> bool:
                 calls["count"] += 1
                 if calls["count"] == 1:
                     return False
-                return original_needs(target, snapshot)  # type: ignore[arg-type]
+                return original_needs(  # type: ignore[arg-type]
+                    target,
+                    snapshot,
+                    payout_snapshot_id,
+                )
 
             server.client_needs_tip_template_refresh = (  # type: ignore[method-assign]
                 needs_after_initial_selection
