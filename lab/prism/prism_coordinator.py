@@ -7398,22 +7398,9 @@ class PrismCoordinator:
         )
         with self.lock:
             if observed_tip is None:
-                observed_tip = self._latest_known_tip_hash_locked()
+                observed_tip = self._newest_observed_tip_locked()
             self._tip_refresh_failure_tip = observed_tip
             self._tip_refresh_failure_holdoff_until = time.monotonic() + holdoff
-
-    def _latest_known_tip_hash_locked(self) -> str | None:
-        """Newest tip this process knows of: detection outranks publication.
-
-        ``observe_tip_for_refresh`` records detections without publishing
-        share-validation authority, so ``current_tip_first_seen`` can lag a
-        genuinely newer tip while refreshes keep failing.
-        """
-        detected = getattr(self, "latest_detected_tip", None)
-        if detected is not None:
-            return detected[0]
-        published = getattr(self, "current_tip_first_seen", None)
-        return published[0] if published is not None else None
 
     def _clear_tip_refresh_failure_holdoff(self) -> None:
         self._ensure_tip_refresh_state()
@@ -7433,7 +7420,7 @@ class PrismCoordinator:
         with self.lock:
             deadline = self._tip_refresh_failure_holdoff_until
             failed_tip = self._tip_refresh_failure_tip
-            current_hash = self._latest_known_tip_hash_locked()
+            current_hash = self._newest_observed_tip_locked()
         if deadline is None:
             return 0.0
         if current_hash != failed_tip:
