@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lab.prism.prism_coordinator import QbitTipTemplateSnapshot
-from tests.test_prism_coordinator_job_cache import client, coordinator
+from tests.prism_coordinator_test_support import client, coordinator
 
 
 class FakeMonotonicClock:

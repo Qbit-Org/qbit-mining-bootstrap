@@ -17,7 +17,7 @@ from lab.prism.prism_coordinator import (
     _FanoutCancellation,
     _PayoutStateDeliveryGate,
 )
-from tests.test_prism_coordinator_job_cache import (
+from tests.prism_coordinator_test_support import (
     FakeLedger,
     FakeRpc,
     base_template,
