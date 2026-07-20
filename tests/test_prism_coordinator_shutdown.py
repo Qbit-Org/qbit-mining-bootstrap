@@ -160,6 +160,27 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             drain_thread.join(1)
         self.assertFalse(drain_thread.is_alive())
 
+    def test_audit_listener_stops_during_non_writer_drain_after_lease_release(
+        self,
+    ) -> None:
+        ledger = RecordingLeaseLedger()
+        server = coordinator(ledger)
+        stop_saw_release: list[bool] = []
+        server._audit_http_facade = SimpleNamespace(
+            stop=lambda: stop_saw_release.append(ledger.released.is_set()) or True
+        )
+        server._background_services = SimpleNamespace(
+            threads_to_drain=lambda: (),
+        )
+        server.shutdown_vardiff_idle_executor = lambda: None  # type: ignore[method-assign]
+        server.shutdown_tip_refresh_executor = lambda: None  # type: ignore[method-assign]
+
+        with patch("builtins.print"):
+            self.assertTrue(server.shutdown())
+            server.drain_non_writer_components()
+
+        self.assertEqual(stop_saw_release, [True])
+
     def test_pending_share_batch_flushes_before_release(self) -> None:
         append_started = threading.Event()
         allow_flush = threading.Event()

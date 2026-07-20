@@ -18,11 +18,9 @@ import subprocess
 import threading
 import time
 import traceback
-import urllib.parse
-import urllib.request
 from dataclasses import replace as dataclass_replace
 from decimal import Decimal, ROUND_CEILING
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, MutableMapping, Sequence
 
@@ -47,6 +45,11 @@ from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
     AuditArtifactStore,
     AuditPublicationIdentity,
+)
+from lab.prism.audit_http import (
+    AuditHttpConfig,
+    AuditHttpFacade,
+    AuditHttpPort,
 )
 from lab.prism.bundle_compiler import canonical_bundle_bytes
 from lab.prism.block_candidates import (
@@ -111,6 +114,7 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS,
     DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS,
     DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,
+    DEFAULT_PRISM_METRICS_REFRESH_SECONDS,
     DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES,
     DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS,
     DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
@@ -297,7 +301,11 @@ from lab.prism.progress_health import (
     ProgressHealthSnapshot,
     RefreshActivityToken,  # noqa: F401 - compatibility re-export
     WorkGeneration,
-    overlay_progress_health,
+)
+from lab.prism.observability import (
+    MiningDeliveryInputs,
+    ObservabilityPort,
+    ObservabilityService,
 )
 # Compatibility re-exports; new callers should import lab.prism.payout_state.
 from lab.prism.payout_state import (
@@ -1154,6 +1162,341 @@ class _CoordinatorProgressDelivery(ProgressDeliveryPort):
         self._reconcile_health_eligibility()
 
 
+class _CoordinatorObservability(ObservabilityPort):
+    """Collect immutable health inputs without exporting coordinator state."""
+
+    def __init__(self, coordinator: PrismCoordinator) -> None:
+        self.coordinator = coordinator
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def mining_delivery_inputs(self, now: float) -> MiningDeliveryInputs:
+        coordinator = self.coordinator
+        delivery_service = coordinator._ensure_job_delivery_service()
+        current_job_source = delivery_service.current_job_source()
+        with coordinator.lock:
+            initial_state = coordinator._ensure_initial_job_state()
+            initial_snapshot = initial_state.snapshot()
+            clients = tuple(coordinator.clients)
+            active = len(clients)
+            current_tip = coordinator._current_published_tip_hash_locked()
+            published_snapshot = getattr(coordinator, "tip_template_snapshot", None)
+            subscribed = sum(1 for client in clients if client.subscribed)
+            authorized_clients = tuple(
+                client
+                for client in clients
+                if client.subscribed and client.authorized and client.worker is not None
+            )
+            clients_with_current_work = tuple(
+                client
+                for client in authorized_clients
+                if delivery_service.client_has_current_tip_job_locked(
+                    client,
+                    current_job_source,
+                )
+            )
+            current = len(clients_with_current_work)
+            pending_requests = tuple(initial_state.pending.values())
+            oldest_pending_age = max(
+                (
+                    max(0.0, now - request.requested_monotonic)
+                    for request in pending_requests
+                ),
+                default=0.0,
+            )
+            genuinely_pending_initial_clients = tuple(
+                client
+                for client in authorized_clients
+                if not delivery_service.client_has_delivered_work_locked(client)
+            )
+            genuine_initial_started = tuple(
+                started
+                for client in genuinely_pending_initial_clients
+                for started in (
+                    client.authorized_monotonic,
+                    (
+                        initial_state.pending[client].requested_monotonic
+                        if client in initial_state.pending
+                        else None
+                    ),
+                )
+                if started is not None
+            )
+            oldest_genuine_initial_age = max(
+                (max(0.0, now - started) for started in genuine_initial_started),
+                default=0.0,
+            )
+            connection_limit = int(
+                getattr(
+                    coordinator,
+                    "stratum_max_connections",
+                    DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+                )
+            )
+            pending_limit = int(initial_state.config.max_pending)
+            peak = coordinator.peak_active_connection_count
+            handlers = coordinator.handler_thread_count
+
+        (
+            prepared_bundle,
+            prepared_snapshot,
+            preparation_pending,
+        ) = coordinator._ensure_job_bundle_service().prepared_ready_snapshot()
+        payout_generation = int(
+            coordinator._ensure_payout_state_service().snapshot().generation
+        )
+        prepared_current = bool(
+            prepared_bundle is not None
+            and prepared_snapshot is published_snapshot
+            and published_snapshot is not None
+            and current_tip is not None
+            and published_snapshot.bestblockhash == current_tip
+            and published_snapshot.template_artifacts is not None
+            and not prepared_bundle.collection_only
+            and prepared_bundle.template
+            is published_snapshot.template_artifacts.template
+            and prepared_bundle.template_fingerprint
+            == published_snapshot.template_fingerprint
+            and prepared_bundle.template_generation
+            == published_snapshot.template_generation
+            and prepared_bundle.payout_state_generation == payout_generation
+        )
+        queue_depth, active_workers = (
+            coordinator._ensure_tip_refresh_service().executor_stats()
+        )
+        rejection_counts = getattr(coordinator, "rejection_counts_by_reason", {})
+        stale_unknown = int(rejection_counts.get(PRISM_REJECTION_STALE_JOB, 0)) + int(
+            rejection_counts.get(PRISM_REJECTION_UNKNOWN_JOB, 0)
+        )
+        return MiningDeliveryInputs(
+            active_connections=active,
+            connection_capacity=connection_limit,
+            peak_active_connections=peak,
+            subscribed_connections=subscribed,
+            authorized_connections=len(authorized_clients),
+            pending_initial_jobs=initial_snapshot.pending_count,
+            pending_initial_job_capacity=pending_limit,
+            oldest_pending_initial_job_age_seconds=oldest_pending_age,
+            oldest_genuinely_pending_initial_job_age_seconds=(
+                oldest_genuine_initial_age
+            ),
+            clients_with_current_tip_jobs=current,
+            clients_with_no_active_job=sum(
+                1 for client in authorized_clients if client.active_job is None
+            ),
+            last_initial_job_delivery_monotonic=(
+                initial_snapshot.last_delivery_monotonic
+            ),
+            initial_job_timeout_seconds=float(initial_state.config.timeout_seconds),
+            initial_job_queue_rejections=initial_snapshot.queue_rejection_count,
+            initial_job_timeout_disconnects=initial_snapshot.timeout_count,
+            initial_job_cancelled_tasks=initial_snapshot.cancelled_count,
+            initial_job_coalesced_tasks=initial_snapshot.coalesced_count,
+            initial_job_queue_capacity_reclaimed=(
+                initial_snapshot.queue_capacity_reclaimed_count
+            ),
+            handler_threads=handlers,
+            delivery_executor_queue_depth=queue_depth,
+            delivery_executor_active_workers=active_workers,
+            started_monotonic=float(getattr(coordinator, "started_monotonic", now)),
+            startup_grace_seconds=float(
+                getattr(
+                    coordinator,
+                    "mining_health_startup_grace_seconds",
+                    DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,
+                )
+            ),
+            stale_unknown_rejections=stale_unknown,
+            submitted_shares=int(getattr(coordinator, "submitted_share_count", 0)),
+            job_preparation_pending=preparation_pending,
+            current_observed_tip=current_tip,
+            prepared_bundle_current=prepared_current,
+            prepared_bundle_tip=(
+                prepared_snapshot.bestblockhash
+                if prepared_snapshot is not None
+                else None
+            ),
+            prepared_bundle_template_generation=(
+                prepared_bundle.template_generation
+                if prepared_bundle is not None
+                else None
+            ),
+            prepared_bundle_payout_generation=(
+                prepared_bundle.payout_state_generation
+                if prepared_bundle is not None
+                else None
+            ),
+        )
+
+    def accepted_share_stats(self) -> tuple[int, int]:
+        return self.coordinator.accepted_share_stats()
+
+    def ledger_backend(self) -> str:
+        return str(self.coordinator.ledger.backend_name)
+
+    def block_counts(self) -> tuple[int, int]:
+        coordinator = self.coordinator
+        lock = getattr(coordinator, "lock", None)
+        if lock is None:
+            return int(coordinator.accepted_block_count), int(coordinator.max_blocks)
+        with lock:
+            return int(coordinator.accepted_block_count), int(coordinator.max_blocks)
+
+    def progress_health(self) -> Mapping[str, object]:
+        return self.coordinator.progress_health_snapshot()
+
+    def health_refresh_seconds(self) -> float:
+        return float(
+            getattr(
+                self.coordinator,
+                "health_refresh_seconds",
+                DEFAULT_PRISM_HEALTH_REFRESH_SECONDS,
+            )
+        )
+
+    def render_metrics_payload(self) -> str:
+        return self.coordinator._render_metrics_payload()
+
+    def metrics_refresh_seconds(self) -> float:
+        return float(
+            getattr(
+                self.coordinator,
+                "metrics_refresh_seconds",
+                DEFAULT_PRISM_METRICS_REFRESH_SECONDS,
+            )
+        )
+
+    def stop_requested(self) -> bool:
+        return self.coordinator.stop_event.is_set()
+
+    def wait_for_stop(self, timeout: float) -> bool:
+        return self.coordinator.stop_event.wait(timeout)
+
+    def log(self, message: str) -> None:
+        print(message, flush=True)
+
+    def log_exception(self) -> None:
+        traceback.print_exc()
+
+
+class _CoordinatorAuditHttp(AuditHttpPort):
+    """Expose purpose-specific dynamic reads to the HTTP facade."""
+
+    def __init__(
+        self,
+        coordinator: PrismCoordinator,
+        *,
+        allow_uncached_compatibility: bool = False,
+    ) -> None:
+        self.coordinator = coordinator
+        self.allow_uncached_compatibility = allow_uncached_compatibility
+
+    def cached_health_payload(self) -> tuple[int, Mapping[str, object]]:
+        cached = getattr(self.coordinator, "cached_health_payload", None)
+        if callable(cached):
+            return cached()
+        if self.allow_uncached_compatibility:
+            return 200, self.coordinator.health_payload()
+        raise RuntimeError("cached health is unavailable")
+
+    def cached_metrics_payload(self) -> tuple[int, str]:
+        cached = getattr(self.coordinator, "cached_metrics_payload", None)
+        if callable(cached):
+            status, payload = cached()
+            if status != 503 or not self.allow_uncached_compatibility:
+                return status, payload
+        if self.allow_uncached_compatibility:
+            return 200, self.coordinator.metrics_payload()
+        raise RuntimeError("cached metrics are unavailable")
+
+    def latest_evidence_payload(self) -> Mapping[str, object] | None:
+        return self.coordinator.latest_evidence_payload()
+
+    def owed_balances_payload(self) -> Mapping[str, object]:
+        return self.coordinator.owed_balances_payload()
+
+    def carry_forward_integrity_payload(self) -> Mapping[str, object]:
+        return self.coordinator.carry_forward_integrity_payload()
+
+    def miner_status_payload(self, recipient_id: str) -> Mapping[str, object]:
+        return self.coordinator.miner_status_payload(recipient_id)
+
+    def public_payload(
+        self,
+        path: str,
+        query: Mapping[str, list[str]],
+    ) -> tuple[int, object]:
+        return public_api.dispatch(self.coordinator, path, dict(query))
+
+    def ledger_backend(self) -> str:
+        return str(self.coordinator.ledger.backend_name)
+
+    def audit_share_window(
+        self,
+        *,
+        anchor_job_issued_at_ms: int,
+        network_difficulty: int,
+    ) -> list[dict[str, object]]:
+        return self.coordinator.ledger.audit_share_window(
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            network_difficulty=network_difficulty,
+        )
+
+    def audit_block_payouts(
+        self,
+        *,
+        block_hash: str,
+    ) -> list[dict[str, object]]:
+        return self.coordinator.ledger.audit_block_payouts(block_hash=block_hash)
+
+    def audit_ctv_fanouts(
+        self,
+        *,
+        block_hash: str,
+    ) -> list[dict[str, object]]:
+        return self.coordinator.ledger.audit_ctv_fanouts(block_hash=block_hash)
+
+    def audit_ctv_fanout_manifest_set(
+        self,
+        *,
+        block_hash: str,
+    ) -> Mapping[str, object] | None:
+        return self.coordinator.ledger.audit_ctv_fanout_manifest_set(
+            block_hash=block_hash
+        )
+
+    def ctv_fanout_status(
+        self,
+        *,
+        fanout_txid: str,
+    ) -> Mapping[str, object] | None:
+        return self.coordinator.ledger.ctv_fanout_status(fanout_txid=fanout_txid)
+
+    def pending_ctv_fanout_statuses(
+        self,
+        *,
+        limit: int,
+    ) -> list[dict[str, object]]:
+        return self.coordinator.ledger.pending_ctv_fanout_statuses(limit=limit)
+
+    def audit_bundle(
+        self,
+        *,
+        block_hash: str,
+    ) -> Mapping[str, object] | None:
+        return self.coordinator.ledger.audit_bundle(block_hash=block_hash)
+
+    def audit_bundle_by_commitment(
+        self,
+        *,
+        commitment_leaf_hex: str,
+    ) -> Mapping[str, object] | None:
+        return self.coordinator.ledger.audit_bundle_by_commitment(
+            commitment_leaf_hex=commitment_leaf_hex
+        )
+
+
 class _InitialJobPendingCompatibility:
     """Compatibility alias that adopts replacements into S2 ownership."""
 
@@ -1383,6 +1726,60 @@ class _RetainedStateCompatibility:
 
 
 class PrismCoordinator:
+    @property
+    def _health_snapshot(self) -> dict[str, object] | None:
+        return self._ensure_observability_service().state().health_snapshot
+
+    @_health_snapshot.setter
+    def _health_snapshot(self, value: dict[str, object] | None) -> None:
+        self._ensure_observability_service().set_health_snapshot_for_compatibility(
+            value
+        )
+
+    @property
+    def _health_snapshot_monotonic(self) -> float | None:
+        return (
+            self._ensure_observability_service().state().health_snapshot_monotonic
+        )
+
+    @_health_snapshot_monotonic.setter
+    def _health_snapshot_monotonic(self, value: float | None) -> None:
+        self._ensure_observability_service().set_health_snapshot_monotonic_for_compatibility(
+            value
+        )
+
+    @property
+    def _health_refresh_loop_running(self) -> bool:
+        return (
+            self._ensure_observability_service().state().health_refresh_loop_running
+        )
+
+    @_health_refresh_loop_running.setter
+    def _health_refresh_loop_running(self, value: bool) -> None:
+        self._ensure_observability_service().set_loop_running_for_compatibility(value)
+
+    @property
+    def _health_snapshot_lock(self) -> threading.RLock:
+        return self._ensure_observability_service().lock
+
+    @_health_snapshot_lock.setter
+    def _health_snapshot_lock(self, value: threading.RLock) -> None:
+        self._ensure_observability_service().replace_lock_for_test(value)
+
+    @property
+    def health_snapshot_refresh_failure_count(self) -> int:
+        return (
+            self._ensure_observability_service()
+            .state()
+            .health_snapshot_refresh_failure_count
+        )
+
+    @health_snapshot_refresh_failure_count.setter
+    def health_snapshot_refresh_failure_count(self, value: int) -> None:
+        self._ensure_observability_service().set_refresh_failure_count_for_compatibility(
+            value
+        )
+
     recent_share_keys = RecentShareCompatibilityField()
     idle_retarget_count = VardiffCompatibilityField(
         "idle_retarget_count",
@@ -1776,6 +2173,7 @@ class PrismCoordinator:
         )
         self.reorg_reconcile_cache_seconds = job_config.reorg_reconcile_cache_seconds
         self.health_refresh_seconds = lifecycle_config.health_refresh_seconds
+        self.metrics_refresh_seconds = lifecycle_config.metrics_refresh_seconds
         self.health_pending_refresh_max_age_seconds = (
             lifecycle_config.pending_refresh_health_deadline_seconds
         )
@@ -1842,8 +2240,6 @@ class PrismCoordinator:
         self.initial_job_cancelled_count = 0
         self.initial_job_coalesced_count = 0
         self.last_initial_job_delivery_monotonic: float | None = None
-        self._mining_overload_started_monotonic: float | None = None
-        self._mining_delivery_failure_started_monotonic: float | None = None
         self._p2mr_address_cache_lock = threading.Lock()
         self._p2mr_address_cache: OrderedDict[
             str, tuple[float, tuple[str, str]]
@@ -3080,16 +3476,7 @@ class PrismCoordinator:
         if not hasattr(self, "_accounted_accepted_block_hashes"):
             self._accounted_accepted_block_hashes: set[str] = set()
         self._ensure_payout_state_service()
-        if not hasattr(self, "_health_snapshot"):
-            self._health_snapshot: dict[str, object] | None = None
-        if not hasattr(self, "_health_snapshot_lock"):
-            self._health_snapshot_lock = threading.Lock()
-        if not hasattr(self, "_health_snapshot_monotonic"):
-            self._health_snapshot_monotonic: float | None = None
-        if not hasattr(self, "_health_refresh_loop_running"):
-            self._health_refresh_loop_running = False
-        if not hasattr(self, "health_snapshot_refresh_failure_count"):
-            self.health_snapshot_refresh_failure_count = 0
+        self._ensure_observability_service()
         self._ensure_progress_health_service()
 
     def _ensure_job_bundle_service(self) -> JobBundleService:
@@ -3553,6 +3940,42 @@ class PrismCoordinator:
             )
             self.progress_health_service = service
         return service
+
+    def _ensure_observability_service(self) -> ObservabilityService:
+        service = self.__dict__.get("_observability_service")
+        if service is not None:
+            return service
+        init_lock = self.__dict__.setdefault(
+            "_observability_service_init_lock",
+            threading.Lock(),
+        )
+        with init_lock:
+            service = self.__dict__.get("_observability_service")
+            if service is None:
+                service = ObservabilityService(_CoordinatorObservability(self))
+                self.__dict__["_observability_service"] = service
+            return service
+
+    def _ensure_audit_http_facade(self) -> AuditHttpFacade:
+        facade = self.__dict__.get("_audit_http_facade")
+        if facade is not None:
+            return facade
+        init_lock = self.__dict__.setdefault(
+            "_audit_http_facade_init_lock",
+            threading.Lock(),
+        )
+        with init_lock:
+            facade = self.__dict__.get("_audit_http_facade")
+            if facade is None:
+                facade = AuditHttpFacade(
+                    _CoordinatorAuditHttp(self),
+                    AuditHttpConfig(
+                        bind=str(getattr(self, "audit_bind", None) or "127.0.0.1"),
+                        port=int(getattr(self, "audit_port", 0)),
+                    ),
+                )
+                self.__dict__["_audit_http_facade"] = facade
+            return facade
 
     def _job_build_phases(self) -> dict[str, float]:
         return self._ensure_job_bundle_service().phases()
@@ -4514,10 +4937,6 @@ class PrismCoordinator:
             self.handler_thread_count = 0
         if not hasattr(self, "peak_active_connection_count"):
             self.peak_active_connection_count = len(getattr(self, "clients", ()))
-        if not hasattr(self, "_mining_overload_started_monotonic"):
-            self._mining_overload_started_monotonic = None
-        if not hasattr(self, "_mining_delivery_failure_started_monotonic"):
-            self._mining_delivery_failure_started_monotonic = None
         return state
 
     def delivery_queue_limit(self) -> int:
@@ -4868,7 +5287,7 @@ class PrismCoordinator:
             if client.subscribed and client.authorized and client.worker is not None
         ]
         if not authorized_clients:
-            self._mining_delivery_failure_started_monotonic = None
+            self._ensure_observability_service().reset_delivery_failure()
             return
         delivery_service = self._ensure_job_delivery_service()
         source = delivery_service.current_job_source()
@@ -4878,7 +5297,7 @@ class PrismCoordinator:
             if delivery_service.client_has_current_tip_job_locked(client, source)
         )
         if current / len(authorized_clients) >= 0.95:
-            self._mining_delivery_failure_started_monotonic = None
+            self._ensure_observability_service().reset_delivery_failure()
 
     def note_initial_job_delivered(
         self,
@@ -5086,6 +5505,7 @@ class PrismCoordinator:
             getattr(self, "audit_port", 0)
         ):
             specifications.append(self._health_snapshot_service_spec())
+            specifications.append(self._metrics_snapshot_service_spec())
         return BackgroundServiceRegistry(specifications)
 
     def _health_snapshot_service_spec(self) -> BackgroundServiceSpec:
@@ -5093,6 +5513,16 @@ class PrismCoordinator:
             name="health_snapshot_refresher",
             thread_name="prism-health-snapshot-refresher",
             target=self.health_snapshot_loop,
+            daemon=True,
+            join_timeout=1.0,
+            watchdog_monitored=False,
+        )
+
+    def _metrics_snapshot_service_spec(self) -> BackgroundServiceSpec:
+        return BackgroundServiceSpec(
+            name="metrics_snapshot_refresher",
+            thread_name="prism-metrics-snapshot-refresher",
+            target=self.metrics_snapshot_loop,
             daemon=True,
             join_timeout=1.0,
             watchdog_monitored=False,
@@ -6012,6 +6442,12 @@ class PrismCoordinator:
             # Temporary compatibility for focused shutdown callers. Process
             # startup itself is fully registry-owned.
             drain_threads = threads
+        audit_http = self.__dict__.get("_audit_http_facade")
+        if audit_http is not None and not audit_http.stop():
+            self._shutdown_log(
+                "audit_http_stop",
+                outcome="timeout",
+            )
         for thread, timeout in drain_threads:
             thread.join(timeout=timeout)
         self.shutdown_vardiff_idle_executor()
@@ -6232,14 +6668,8 @@ class PrismCoordinator:
 
     def start_audit_server(self) -> None:
         self.start_health_snapshot_refresher()
-        handler_cls = make_audit_handler(self)
-        httpd = ThreadingHTTPServer((self.audit_bind or "127.0.0.1", self.audit_port), handler_cls)
-        thread = threading.Thread(
-            target=httpd.serve_forever,
-            name="prism-audit-http",
-            daemon=True,
-        )
-        thread.start()
+        self.start_metrics_snapshot_refresher()
+        self._ensure_audit_http_facade().start()
         print(
             f"prism coordinator: audit HTTP listening on {self.audit_bind}:{self.audit_port}",
             flush=True,
@@ -8529,7 +8959,7 @@ class PrismCoordinator:
         payload: dict[str, object],
         progress: dict[str, object],
     ) -> dict[str, object]:
-        return dict(overlay_progress_health(payload, progress))
+        return ObservabilityService.apply_progress_health(payload, progress)
 
     def progress_health_metrics_lines(self) -> list[str]:
         return list(
@@ -8541,372 +8971,31 @@ class PrismCoordinator:
     def ready_miner_count(self) -> int:
         return self.accepted_share_stats()[1]
 
-    def mining_delivery_snapshot(self, *, now: float | None = None) -> dict[str, object]:
-        now = time.monotonic() if now is None else now
-        delivery_service = self._ensure_job_delivery_service()
-        current_job_source = delivery_service.current_job_source()
-        with self.lock:
-            initial_state = self._ensure_initial_job_state()
-            initial_snapshot = initial_state.snapshot()
-            active = len(self.clients)
-            current_tip = self._current_published_tip_hash_locked()
-            published_snapshot = getattr(self, "tip_template_snapshot", None)
-            subscribed = sum(1 for client in self.clients if client.subscribed)
-            authorized_clients = [
-                client
-                for client in self.clients
-                if client.subscribed and client.authorized and client.worker is not None
-            ]
-            authorized = len(authorized_clients)
-            clients_with_current_work = [
-                client
-                for client in authorized_clients
-                if delivery_service.client_has_current_tip_job_locked(
-                    client, current_job_source
-                )
-            ]
-            current = len(clients_with_current_work)
-            pending_requests = list(initial_state.pending.values())
-            pending = initial_snapshot.pending_count
-            oldest_age = max(
-                (
-                    max(0.0, now - request.requested_monotonic)
-                    for request in pending_requests
-                ),
-                default=0.0,
-            )
-            genuinely_pending_initial_clients = [
-                client
-                for client in authorized_clients
-                if not delivery_service.client_has_delivered_work_locked(client)
-            ]
-            genuine_initial_started = [
-                started
-                for client in genuinely_pending_initial_clients
-                for started in (
-                    client.authorized_monotonic,
-                    (
-                        initial_state.pending[client].requested_monotonic
-                        if client in initial_state.pending
-                        else None
-                    ),
-                )
-                if started is not None
-            ]
-            oldest_genuine_initial_age = max(
-                (max(0.0, now - started) for started in genuine_initial_started),
-                default=0.0,
-            )
-            connection_limit = int(
-                getattr(
-                    self,
-                    "stratum_max_connections",
-                    DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
-                )
-            )
-            pending_limit = int(initial_state.config.max_pending)
-            coverage = current / authorized if authorized else 1.0
-            cap_saturated = connection_limit > 0 and active >= connection_limit
-            pending_saturated = pending >= pending_limit
-            # A reconnect incident is operationally significant well before
-            # nearly every miner is missing work. Treat any sustained loss of
-            # at least five percent of current-job coverage as degraded.
-            poor_coverage = authorized > 0 and coverage < 0.95
-            if poor_coverage:
-                if self._mining_delivery_failure_started_monotonic is None:
-                    self._mining_delivery_failure_started_monotonic = now
-            else:
-                self._mining_delivery_failure_started_monotonic = None
-            delivery_failure_age = (
-                max(0.0, now - self._mining_delivery_failure_started_monotonic)
-                if self._mining_delivery_failure_started_monotonic is not None
-                else 0.0
-            )
-            overload_now = pending_saturated or (cap_saturated and poor_coverage)
-            if overload_now:
-                if self._mining_overload_started_monotonic is None:
-                    self._mining_overload_started_monotonic = now
-            else:
-                self._mining_overload_started_monotonic = None
-            overload_age = (
-                max(0.0, now - self._mining_overload_started_monotonic)
-                if self._mining_overload_started_monotonic is not None
-                else 0.0
-            )
-            timeout = float(initial_state.config.timeout_seconds)
-            timeout_disconnects = initial_snapshot.timeout_count
-            queue_rejections = initial_snapshot.queue_rejection_count
-            cancelled = initial_snapshot.cancelled_count
-            coalesced = initial_snapshot.coalesced_count
-            queue_capacity_reclaimed = (
-                initial_snapshot.queue_capacity_reclaimed_count
-            )
-            peak = self.peak_active_connection_count
-            handlers = self.handler_thread_count
-
-        (
-            prepared_bundle,
-            prepared_snapshot,
-            preparation_pending,
-        ) = self._ensure_job_bundle_service().prepared_ready_snapshot()
-        payout_generation = int(
-            self._ensure_payout_state_service().snapshot().generation
-        )
-        prepared_current = bool(
-            prepared_bundle is not None
-            and prepared_snapshot is published_snapshot
-            and published_snapshot is not None
-            and current_tip is not None
-            and published_snapshot.bestblockhash == current_tip
-            and published_snapshot.template_artifacts is not None
-            and not prepared_bundle.collection_only
-            and prepared_bundle.template
-            is published_snapshot.template_artifacts.template
-            and prepared_bundle.template_fingerprint
-            == published_snapshot.template_fingerprint
-            and prepared_bundle.template_generation
-            == published_snapshot.template_generation
-            and prepared_bundle.payout_state_generation == payout_generation
-        )
-
-        deadline = timeout if timeout > 0 else None
-        startup_age = max(0.0, now - getattr(self, "started_monotonic", now))
-        startup_grace = float(
-            getattr(
-                self,
-                "mining_health_startup_grace_seconds",
-                DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,
-            )
-        )
-        in_startup_grace = startup_age < startup_grace
-        initial_job_starved = bool(
-            deadline is not None
-            and oldest_genuine_initial_age >= deadline
-            and genuinely_pending_initial_clients
-        )
-        current_tip_coverage_stalled = bool(
-            deadline is not None
-            and poor_coverage
-            and delivery_failure_age >= deadline
-        )
-        no_delivery_progress = bool(
-            initial_job_starved or current_tip_coverage_stalled
-        )
-        stale_unknown = int(
-            getattr(self, "rejection_counts_by_reason", {}).get(
-                PRISM_REJECTION_STALE_JOB,
-                0,
-            )
-        ) + int(
-            getattr(self, "rejection_counts_by_reason", {}).get(
-                PRISM_REJECTION_UNKNOWN_JOB,
-                0,
-            )
-        )
-        submitted = int(getattr(self, "submitted_share_count", 0))
-        reject_storm = (
-            poor_coverage
-            and submitted > 0
-            and stale_unknown / submitted >= 0.95
-        )
-        persistent_overload = deadline is not None and overload_age >= deadline
-        unhealthy_reasons: list[str] = []
-        if not in_startup_grace:
-            if no_delivery_progress:
-                unhealthy_reasons.append("initial-delivery-stalled")
-            if pending_saturated and persistent_overload:
-                unhealthy_reasons.append("pending-initial-jobs-saturated")
-            if cap_saturated and poor_coverage and persistent_overload:
-                unhealthy_reasons.append("connection-capacity-saturated")
-            if reject_storm:
-                unhealthy_reasons.append("stale-unknown-rejection-storm")
-        mining_ready = not unhealthy_reasons
-        queue_depth, active_workers = (
-            self._ensure_tip_refresh_service().executor_stats()
-        )
-        return {
-            "mining_ready": mining_ready,
-            "mining_delivery_healthy": mining_ready,
-            "mining_health_startup_grace": in_startup_grace,
-            "active_connections": active,
-            "connection_capacity": connection_limit,
-            "peak_active_connections": peak,
-            "subscribed_connections": subscribed,
-            "authorized_connections": authorized,
-            "pending_initial_jobs": pending,
-            "pending_initial_job_capacity": pending_limit,
-            "oldest_pending_initial_job_age_seconds": round(oldest_age, 3),
-            "oldest_genuinely_pending_initial_job_age_seconds": round(
-                oldest_genuine_initial_age,
-                3,
-            ),
-            "clients_with_current_tip_jobs": current,
-            "current_tip_job_coverage": round(coverage, 6),
-            "current_tip_coverage_gap_age_seconds": round(
-                delivery_failure_age,
-                3,
-            ),
-            "connection_capacity_saturated": cap_saturated,
-            "pending_initial_jobs_saturated": pending_saturated,
-            "initial_delivery_stalled": no_delivery_progress,
-            "overload": bool(overload_now or reject_storm),
-            "overload_age_seconds": round(overload_age, 3),
-            "unhealthy_reasons": unhealthy_reasons,
-            "initial_job_queue_rejections": queue_rejections,
-            "initial_job_timeout_disconnects": timeout_disconnects,
-            "initial_job_cancelled_tasks": cancelled,
-            "initial_job_coalesced_tasks": coalesced,
-            "initial_job_queue_capacity_reclaimed": queue_capacity_reclaimed,
-            "handler_threads": handlers,
-            "delivery_executor_queue_depth": queue_depth,
-            "delivery_executor_active_workers": active_workers,
-            # Compatibility aliases and preparation visibility introduced by
-            # the prewarm work. These retain the original bounded-pipeline
-            # names above for existing dashboards.
-            "subscribed_clients": subscribed,
-            "authorized_clients": authorized,
-            "clients_with_no_active_job": sum(
-                1 for client in authorized_clients if client.active_job is None
-            ),
-            "clients_without_current_tip_job": authorized - current,
-            "clients_with_current_tip_job": current,
-            "clients_pending_initial_job": pending,
-            "current_tip_job_coverage_ratio": coverage,
-            # Compatibility alias: this now reports only genuine first-job
-            # starvation. Current-tip fanout lag has its own age above.
-            "oldest_initial_job_pending_seconds": round(
-                oldest_genuine_initial_age,
-                3,
-            ),
-            "job_preparation_pending": preparation_pending,
-            "current_observed_tip": current_tip,
-            "prepared_bundle_current": prepared_current,
-            "prepared_bundle_tip": (
-                prepared_snapshot.bestblockhash
-                if prepared_snapshot is not None
-                else None
-            ),
-            "prepared_bundle_template_generation": (
-                prepared_bundle.template_generation
-                if prepared_bundle is not None
-                else None
-            ),
-            "prepared_bundle_payout_generation": (
-                prepared_bundle.payout_state_generation
-                if prepared_bundle is not None
-                else None
-            ),
-        }
+    def mining_delivery_snapshot(
+        self,
+        *,
+        now: float | None = None,
+    ) -> dict[str, object]:
+        return self._ensure_observability_service().mining_delivery_snapshot(now=now)
 
     def health_payload(self) -> dict[str, object]:
-        accepted_share_count, ready_miner_count = self.accepted_share_stats()
-        mining = self.mining_delivery_snapshot()
-        payload = {
-            "ok": bool(mining["mining_ready"]),
-            "schema": "qbit.prism.audit-health.v1",
-            "ledger_backend": self.ledger.backend_name,
-            "accepted_share_count": accepted_share_count,
-            "ready_miner_count": ready_miner_count,
-            "accepted_block": self.accepted_block_count > 0,
-            "accepted_block_count": self.accepted_block_count,
-            "max_blocks": self.max_blocks,
-            **mining,
-        }
-        return self._apply_progress_health(payload, self.progress_health_snapshot())
+        return self._ensure_observability_service().health_payload()
 
     def refresh_health_snapshot(self) -> dict[str, object]:
-        payload = self.health_payload()
-        self._ensure_job_cache_state()
-        with self._health_snapshot_lock:
-            self._health_snapshot = payload
-            self._health_snapshot_monotonic = time.monotonic()
-        return payload
+        return self._ensure_observability_service().refresh_health_snapshot()
 
     def cached_health_payload(self) -> tuple[int, dict[str, object]]:
-        """Health response served from the background snapshot.
-
-        The HTTP handler must never run ledger queries synchronously: under
-        job-build load those starve behind the GIL and the ledger lock, health
-        checks time out, and the container is flagged unhealthy exactly when
-        it is busiest. A snapshot older than the staleness budget flips the
-        endpoint to 503 so a genuinely wedged ledger still surfaces.
-        """
-        self._ensure_job_cache_state()
-        refresh_seconds = getattr(
-            self, "health_refresh_seconds", DEFAULT_PRISM_HEALTH_REFRESH_SECONDS
-        )
-        with self._health_snapshot_lock:
-            snapshot = self._health_snapshot
-            snapshot_monotonic = self._health_snapshot_monotonic
-            loop_running = self._health_refresh_loop_running
-        if snapshot is None or snapshot_monotonic is None:
-            if not loop_running:
-                # No refresher (tests, or audit HTTP without serve()): compute
-                # inline like the legacy endpoint did.
-                payload = self.refresh_health_snapshot()
-                return (200 if payload.get("ok") else 503), payload
-            payload = self._apply_progress_health(
-                {
-                    "ok": False,
-                    "schema": "qbit.prism.audit-health.v1",
-                    "error": "health snapshot is not available yet",
-                },
-                self.progress_health_snapshot(),
-            )
-            payload["ok"] = False
-            return 503, payload
-        age_seconds = time.monotonic() - snapshot_monotonic
-        stale_after = max(3 * refresh_seconds, 15.0)
-        if age_seconds > stale_after:
-            payload = self._apply_progress_health(
-                {
-                    "ok": False,
-                    "schema": "qbit.prism.audit-health.v1",
-                    "error": "health snapshot is stale",
-                    "snapshot_age_seconds": round(age_seconds, 3),
-                },
-                self.progress_health_snapshot(),
-            )
-            payload["ok"] = False
-            return 503, payload
-        # Ledger-backed fields stay cached, but progress state is an in-memory
-        # monotonic snapshot and must be overlaid on every request. Otherwise a
-        # cached ok=true response can mask a known failed refresh for another
-        # full cache cycle (the production incident this endpoint must expose).
-        payload = self._apply_progress_health(
-            snapshot,
-            self.progress_health_snapshot(),
-        )
-        payload["snapshot_age_seconds"] = round(age_seconds, 3)
-        return (200 if payload.get("ok") else 503), payload
+        return self._ensure_observability_service().cached_health_payload()
 
     def health_snapshot_loop(self) -> None:
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    self.refresh_health_snapshot()
-                except Exception:
-                    with self._health_snapshot_lock:
-                        self.health_snapshot_refresh_failure_count += 1
-                    print("prism coordinator: health snapshot refresh failed", flush=True)
-                    traceback.print_exc()
-                if self.stop_event.wait(
-                    getattr(self, "health_refresh_seconds", DEFAULT_PRISM_HEALTH_REFRESH_SECONDS)
-                ):
-                    break
-        finally:
-            self._ensure_job_cache_state()
-            with self._health_snapshot_lock:
-                self._health_refresh_loop_running = False
+        self._ensure_observability_service().health_snapshot_loop()
 
     def start_health_snapshot_refresher(self) -> None:
-        self._ensure_job_cache_state()
-        with self._health_snapshot_lock:
-            if self._health_refresh_loop_running:
-                return
-            self._health_refresh_loop_running = True
+        service = self._ensure_observability_service()
+        if not service.begin_refresh_loop():
+            return
         try:
-            self.refresh_health_snapshot()
+            service.refresh_health_snapshot()
         except Exception:
             print("prism coordinator: initial health snapshot refresh failed", flush=True)
             traceback.print_exc()
@@ -8914,6 +9003,29 @@ class PrismCoordinator:
         if not registry.contains("health_snapshot_refresher"):
             registry.register(self._health_snapshot_service_spec())
         self._start_background_service("health_snapshot_refresher")
+
+    def refresh_metrics_snapshot(self) -> str:
+        return self._ensure_observability_service().refresh_metrics_snapshot()
+
+    def cached_metrics_payload(self) -> tuple[int, str]:
+        return self._ensure_observability_service().cached_metrics_payload()
+
+    def metrics_snapshot_loop(self) -> None:
+        self._ensure_observability_service().metrics_snapshot_loop()
+
+    def start_metrics_snapshot_refresher(self) -> None:
+        service = self._ensure_observability_service()
+        if not service.begin_metrics_refresh_loop():
+            return
+        try:
+            service.refresh_metrics_snapshot()
+        except Exception:
+            print("prism coordinator: initial metrics snapshot refresh failed", flush=True)
+            traceback.print_exc()
+        registry = self._ensure_background_services()
+        if not registry.contains("metrics_snapshot_refresher"):
+            registry.register(self._metrics_snapshot_service_spec())
+        self._start_background_service("metrics_snapshot_refresher")
 
     @property
     def latest_evidence(self) -> dict[str, Any] | None:
@@ -9048,7 +9160,7 @@ class PrismCoordinator:
             f"qbit_prism_block_submitter_retry_backoff_seconds {backoff_delay:.6f}",
         ]
 
-    def metrics_payload(self) -> str:
+    def _render_metrics_payload(self) -> str:
         ledger_metrics = self.ledger.metrics()
         job_metrics = self._ensure_job_bundle_service().metrics_snapshot()
         share_writer_metrics = self._ensure_share_writer_service().metrics_snapshot()
@@ -9433,6 +9545,11 @@ class PrismCoordinator:
         lines.extend(self.progress_health_metrics_lines())
         return "\n".join(lines) + "\n"
 
+    def metrics_payload(self) -> str:
+        """Compatibility renderer; HTTP uses the complete cached snapshot."""
+
+        return self._render_metrics_payload()
+
     def shutdown_metrics_lines(self) -> list[str]:
         snapshot = self._ensure_shutdown_controller().snapshot()
         quiescence = snapshot["writer_quiescence_outcomes"]
@@ -9739,275 +9856,14 @@ class PrismCoordinator:
 
 
 def make_audit_handler(coordinator: PrismCoordinator) -> type[BaseHTTPRequestHandler]:
-    public_response_cache = public_api.PublicResponseCache()
+    """Compatibility factory backed by the coordinator-free H1 facade."""
 
-    class AuditHandler(BaseHTTPRequestHandler):
-        server_version = "QbitPrismAudit/0.1"
-
-        def do_GET(self) -> None:
-            parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path.rstrip("/") or "/"
-            query = urllib.parse.parse_qs(parsed.query)
-            try:
-                if path == "/healthz":
-                    cached_health = getattr(coordinator, "cached_health_payload", None)
-                    if callable(cached_health):
-                        status, payload = cached_health()
-                        self.write_json(status, payload)
-                    else:
-                        self.write_json(200, coordinator.health_payload())
-                    return
-                if path == "/metrics":
-                    self.write_text(200, coordinator.metrics_payload(), "text/plain; version=0.0.4")
-                    return
-                if path == "/public/v1" or path.startswith("/public/v1/"):
-                    self.handle_public(path, query)
-                    return
-                if path == "/audit/latest":
-                    payload = coordinator.latest_evidence_payload()
-                    if payload is None:
-                        self.write_json(404, {"error": "no PRISM evidence has been produced"})
-                    else:
-                        self.write_json(200, payload)
-                    return
-                if path in {"/owed", "/owed-balances"}:
-                    self.write_json(200, coordinator.owed_balances_payload())
-                    return
-                if path in {"/audit/carry-forward-integrity", "/audit/ledger-integrity"}:
-                    self.write_json(200, coordinator.carry_forward_integrity_payload())
-                    return
-                if path.startswith("/miners/") and path.endswith("/status"):
-                    recipient_id = urllib.parse.unquote(path.removeprefix("/miners/").removesuffix("/status"))
-                    self.write_json(200, coordinator.miner_status_payload(recipient_id))
-                    return
-                if path.startswith("/payouts/") and path.endswith("/status"):
-                    recipient_id = urllib.parse.unquote(path.removeprefix("/payouts/").removesuffix("/status"))
-                    self.write_json(200, coordinator.miner_status_payload(recipient_id))
-                    return
-                if path == "/audit/share-window":
-                    self.handle_share_window(query)
-                    return
-                if path.startswith("/audit/blocks/") and path.endswith("/payouts"):
-                    block_hash = path.removeprefix("/audit/blocks/").removesuffix("/payouts")
-                    self.handle_block_payouts(block_hash)
-                    return
-                if path.startswith("/audit/blocks/") and path.endswith("/ctv-fanouts"):
-                    block_hash = path.removeprefix("/audit/blocks/").removesuffix("/ctv-fanouts")
-                    self.handle_block_ctv_fanouts(block_hash)
-                    return
-                if path.startswith("/audit/blocks/") and path.endswith("/ctv-fanout-manifest-set"):
-                    block_hash = path.removeprefix("/audit/blocks/").removesuffix("/ctv-fanout-manifest-set")
-                    self.handle_block_ctv_fanout_manifest_set(block_hash)
-                    return
-                if path == "/audit/fanouts/pending":
-                    self.handle_pending_ctv_fanouts(query)
-                    return
-                if path.startswith("/audit/fanouts/") and path.endswith("/status"):
-                    fanout_txid = path.removeprefix("/audit/fanouts/").removesuffix("/status")
-                    self.handle_ctv_fanout_status(fanout_txid)
-                    return
-                if path.startswith("/audit/commitments/") and path.endswith("/bundle"):
-                    commitment_leaf_hex = path.removeprefix("/audit/commitments/").removesuffix("/bundle")
-                    self.handle_commitment_bundle(commitment_leaf_hex)
-                    return
-                if path.startswith("/audit/block/"):
-                    block_hash = path.removeprefix("/audit/block/")
-                    self.handle_block_payouts(block_hash)
-                    return
-                if path.startswith("/audit/blocks/") and path.endswith("/bundle"):
-                    block_hash = path.removeprefix("/audit/blocks/").removesuffix("/bundle")
-                    self.handle_block_bundle(block_hash)
-                    return
-                self.write_json(404, {"error": "unknown endpoint"})
-            except public_api.PublicApiError as exc:
-                self.write_json(
-                    exc.status,
-                    public_api.error_payload(exc.code, exc.message),
-                    headers=public_api.public_error_headers(),
-                )
-            except ValueError as exc:
-                if path == "/public/v1" or path.startswith("/public/v1/"):
-                    self.write_json(
-                        500,
-                        public_api.error_payload("internal_error", "internal server error"),
-                        headers=public_api.public_error_headers(),
-                    )
-                else:
-                    self.write_json(400, {"error": str(exc)})
-            except Exception as exc:
-                if path == "/public/v1" or path.startswith("/public/v1/"):
-                    self.write_json(
-                        500,
-                        public_api.error_payload("internal_error", "internal server error"),
-                        headers=public_api.public_error_headers(),
-                    )
-                else:
-                    self.write_json(500, {"error": str(exc)})
-
-        def handle_public(self, path: str, query: dict[str, list[str]]) -> None:
-            cache_policy = public_api.public_cache_policy(path)
-            status, payload, cache_state, age_seconds = public_response_cache.get_or_compute(
-                key=public_api.public_cache_key(path, query),
-                ttl_seconds=cache_policy.ttl_seconds,
-                compute=lambda: public_api.dispatch(coordinator, path, query),
-            )
-            self.write_json(
-                status,
-                payload,
-                headers=public_api.public_cache_headers(
-                    cache_policy,
-                    cache_state=cache_state,
-                    age_seconds=age_seconds,
-                ),
-            )
-
-        def handle_share_window(self, query: dict[str, list[str]]) -> None:
-            anchor_raw = self.first_query_value(query, "anchor_job_issued_at_ms", "anchor")
-            difficulty_raw = self.first_query_value(query, "network_difficulty")
-            if anchor_raw is None or difficulty_raw is None:
-                raise ValueError("anchor_job_issued_at_ms and network_difficulty are required")
-            rows = coordinator.ledger.audit_share_window(
-                anchor_job_issued_at_ms=int(anchor_raw),
-                network_difficulty=int(difficulty_raw),
-            )
-            self.write_json(
-                200,
-                {
-                    "schema": "qbit.prism.audit-share-window.v1",
-                    "ledger_backend": coordinator.ledger.backend_name,
-                    "rows": rows,
-                },
-            )
-
-        def handle_block_payouts(self, block_hash: str) -> None:
-            block_hash = self.clean_hash(block_hash)
-            rows = coordinator.ledger.audit_block_payouts(block_hash=block_hash)
-            if not rows:
-                self.write_json(404, {"error": "unknown PRISM block", "block_hash": block_hash})
-                return
-            self.write_json(
-                200,
-                {
-                    "schema": "qbit.prism.audit-block-payouts.v1",
-                    "ledger_backend": coordinator.ledger.backend_name,
-                    "block_hash": block_hash,
-                    "rows": rows,
-                },
-            )
-
-        def handle_block_ctv_fanouts(self, block_hash: str) -> None:
-            block_hash = self.clean_hash(block_hash, name="block hash")
-            rows = coordinator.ledger.audit_ctv_fanouts(block_hash=block_hash)
-            if not rows:
-                self.write_json(404, {"error": "unknown CTV fanout block", "block_hash": block_hash})
-                return
-            self.write_json(
-                200,
-                {
-                    "schema": "qbit.prism.audit-ctv-fanouts.v1",
-                    "ledger_backend": coordinator.ledger.backend_name,
-                    "block_hash": block_hash,
-                    "rows": rows,
-                },
-            )
-
-        def handle_block_ctv_fanout_manifest_set(self, block_hash: str) -> None:
-            block_hash = self.clean_hash(block_hash, name="block hash")
-            payload = coordinator.ledger.audit_ctv_fanout_manifest_set(block_hash=block_hash)
-            if payload is None:
-                self.write_json(404, {"error": "unknown CTV fanout block", "block_hash": block_hash})
-                return
-            self.write_json(200, payload)
-
-        def handle_ctv_fanout_status(self, fanout_txid: str) -> None:
-            fanout_txid = self.clean_hash(fanout_txid, name="fanout txid")
-            payload = coordinator.ledger.ctv_fanout_status(fanout_txid=fanout_txid)
-            if payload is None:
-                self.write_json(404, {"error": "unknown CTV fanout", "fanout_txid": fanout_txid})
-                return
-            self.write_json(200, payload)
-
-        def handle_pending_ctv_fanouts(self, query: dict[str, list[str]]) -> None:
-            limit_raw = self.first_query_value(query, "limit")
-            limit = int(limit_raw) if limit_raw is not None else 100
-            rows = coordinator.ledger.pending_ctv_fanout_statuses(limit=limit)
-            self.write_json(
-                200,
-                {
-                    "schema": "qbit.prism.pending-ctv-fanouts.v1",
-                    "ledger_backend": coordinator.ledger.backend_name,
-                    "count": len(rows),
-                    "rows": rows,
-                },
-            )
-
-        def handle_block_bundle(self, block_hash: str) -> None:
-            block_hash = self.clean_hash(block_hash, name="block hash")
-            payload = coordinator.ledger.audit_bundle(block_hash=block_hash)
-            if payload is None:
-                self.write_json(404, {"error": "unknown PRISM block", "block_hash": block_hash})
-                return
-            self.write_json(200, payload)
-
-        def handle_commitment_bundle(self, commitment_leaf_hex: str) -> None:
-            commitment_leaf_hex = self.clean_hash(commitment_leaf_hex, name="audit commitment leaf")
-            payload = coordinator.ledger.audit_bundle_by_commitment(commitment_leaf_hex=commitment_leaf_hex)
-            if payload is None:
-                self.write_json(
-                    404,
-                    {
-                        "error": "unknown PRISM audit commitment",
-                        "audit_commitment_leaf_hex": commitment_leaf_hex,
-                    },
-                )
-                return
-            self.write_json(200, payload)
-
-        def write_json(self, status: int, payload: object, headers: dict[str, str] | None = None) -> None:
-            body = json.dumps(payload, sort_keys=True).encode() + b"\n"
-            try:
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                for key, value in (headers or {}).items():
-                    self.send_header(key, value)
-                self.end_headers()
-                self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                # The client (typically a health checker with a short timeout)
-                # hung up before the response was written; nothing to salvage.
-                return
-
-        def write_text(self, status: int, payload: str, content_type: str) -> None:
-            body = payload.encode()
-            try:
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                return
-
-        def log_message(self, format: str, *args: object) -> None:
-            return
-
-        @staticmethod
-        def first_query_value(query: dict[str, list[str]], *keys: str) -> str | None:
-            for key in keys:
-                values = query.get(key)
-                if values:
-                    return values[0]
-            return None
-
-        @staticmethod
-        def clean_hash(value: str, *, name: str = "block hash") -> str:
-            value = urllib.parse.unquote(value).strip()
-            if len(value) != 64 or any(char not in "0123456789abcdefABCDEF" for char in value):
-                raise ValueError(f"{name} must be 64 hex characters")
-            return value.lower()
-
-    return AuditHandler
+    return AuditHttpFacade(
+        _CoordinatorAuditHttp(
+            coordinator,
+            allow_uncached_compatibility=True,
+        )
+    ).handler_type()
 
 
 def target_from_compact(bits_hex: str) -> int:

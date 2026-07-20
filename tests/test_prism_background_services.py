@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from lab.prism.background_services import (
     BackgroundServiceRegistry,
@@ -294,6 +295,28 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
             ("qbit_blockpoll", "block_submitter", "share_writer"),
         )
 
+    def test_audit_http_starts_only_after_both_initial_snapshot_attempts(
+        self,
+    ) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server.audit_bind = "127.0.0.1"
+        server.audit_port = 3341
+        events: list[str] = []
+        server.start_health_snapshot_refresher = lambda: events.append(  # type: ignore[method-assign]
+            "health"
+        )
+        server.start_metrics_snapshot_refresher = lambda: events.append(  # type: ignore[method-assign]
+            "metrics"
+        )
+        server._ensure_audit_http_facade = lambda: SimpleNamespace(  # type: ignore[method-assign]
+            start=lambda: events.append("http")
+        )
+
+        with patch("builtins.print"):
+            server.start_audit_server()
+
+        self.assertEqual(events, ["health", "metrics", "http"])
+
     def test_process_service_specs_preserve_names_and_join_order(self) -> None:
         server = self.coordinator_with_optional_services(True)
 
@@ -311,6 +334,7 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
                 "ctv_fanout_broadcaster",
                 "watchdog",
                 "health_snapshot_refresher",
+                "metrics_snapshot_refresher",
             ),
         )
         expected = {
@@ -328,6 +352,11 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
             "watchdog": ("prism-watchdog", 1.0, False),
             "health_snapshot_refresher": (
                 "prism-health-snapshot-refresher",
+                1.0,
+                False,
+            ),
+            "metrics_snapshot_refresher": (
+                "prism-metrics-snapshot-refresher",
                 1.0,
                 False,
             ),
