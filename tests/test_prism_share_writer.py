@@ -223,6 +223,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(len(flaky.pending), 1)
         self.assertEqual(server.share_append_failure_count, 2)
+        self.assertIn(
+            "qbit_prism_share_append_failures_total 2",
+            server.metrics_payload(),
+        )
         self.assertEqual(waited.call_count, 2)
     def _pending_append(self, tag: str, accepted_at_ms: int = 2) -> PendingShareAppend:
         from lab.prism.share_ledger import PendingShare
@@ -340,8 +344,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
             # File kept because a line could not be parsed.
             self.assertTrue(server.share_recovery_path.exists())
-            # Re-running dedups the good shares (ledger is idempotent by id).
-            self.assertEqual(server.replay_recovered_shares(), 2)
+            # Re-running classifies the intact rows as exact-existing. They are
+            # not inserted or counted again, while the torn line keeps the
+            # journal for inspection.
+            self.assertEqual(server.replay_recovered_shares(), 0)
     def test_replay_is_idempotent_across_partial_replay(self) -> None:
         # Finding: a partial replay (A commits, B fails transiently) kept the
         # whole file; on retry, replay hit A's duplicate and stopped, stranding
@@ -355,16 +361,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             class DedupLedger:
                 def __init__(self) -> None:
                     self.ids: list[str] = []
+                    self.pending_by_id: dict[str, object] = {}
                     self.fail_b_once = True
 
-                def append(self, pending: object) -> object:
+                def append_recovered_share(self, pending: object) -> object:
                     if pending.share_id == "miner-a:B" and self.fail_b_once:
                         self.fail_b_once = False
                         raise RuntimeError("postgres unavailable")
                     if pending.share_id in self.ids:
-                        raise RuntimeError("duplicate share_id")
+                        if self.pending_by_id[pending.share_id] != pending:
+                            raise ShareReplayConflict(pending.share_id)
+                        return ShareReplayResult(
+                            "exact_existing",
+                            SimpleNamespace(
+                                share_seq=self.ids.index(pending.share_id) + 1
+                            ),
+                        )
                     self.ids.append(pending.share_id)
-                    return SimpleNamespace(share_seq=len(self.ids))
+                    self.pending_by_id[pending.share_id] = pending
+                    return ShareReplayResult(
+                        "inserted",
+                        SimpleNamespace(share_seq=len(self.ids)),
+                    )
 
             server.ledger = DedupLedger()
 

@@ -11,14 +11,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lab.prism import prism_coordinator
-from lab.prism.prism_coordinator import (
+from lab.prism.coordinator_shutdown import (
     CoordinatorShutdownController,
+    ShutdownInProgress,
+)
+from lab.prism.prism_coordinator import (
     PendingShareAppend,
     PRISM_REJECTION_POOL_CLOSED,
     PrismCoordinator,
-    ShutdownInProgress,
     StratumError,
 )
+from lab.prism.share_writer import PendingShareInput
 
 
 class RecordingLeaseLedger:
@@ -48,7 +51,68 @@ def coordinator(
     return server
 
 
+class CoordinatorShutdownControllerTests(unittest.TestCase):
+    def test_compatibility_reexports_reference_shutdown_owner(self) -> None:
+        self.assertIs(
+            prism_coordinator.CoordinatorShutdownController,
+            CoordinatorShutdownController,
+        )
+        self.assertIs(prism_coordinator.ShutdownInProgress, ShutdownInProgress)
+
+    def test_nested_writer_inherits_admission_after_shutdown_request(self) -> None:
+        controller = CoordinatorShutdownController(0.5)
+        outer = controller.enter_writer("outer")
+        controller.request_shutdown(signal.SIGTERM)
+        inner = controller.enter_writer("inner")
+
+        controller.exit_writer(inner)
+        controller.exit_writer(outer)
+
+        self.assertEqual(controller.snapshot()["active_writers"], {})
+        with self.assertRaisesRegex(ShutdownInProgress, "coordinator is shutting down"):
+            controller.enter_writer("late")
+
+    def test_transferable_writer_token_finishes_idempotently_on_another_thread(
+        self,
+    ) -> None:
+        controller = CoordinatorShutdownController(0.5)
+        token = controller.reserve_writer("share_persistence")
+
+        finisher = threading.Thread(target=lambda: (token.finish(), token.finish()))
+        finisher.start()
+        finisher.join(1)
+
+        self.assertFalse(finisher.is_alive())
+        self.assertTrue(token.finished)
+        self.assertEqual(controller.snapshot()["active_writers"], {})
+
+
 class PrismCoordinatorShutdownTests(unittest.TestCase):
+    def test_refresh_timeout_still_drains_build_executors(self) -> None:
+        server = coordinator()
+        calls: list[str] = []
+        server._ensure_job_delivery_service = (  # type: ignore[method-assign]
+            lambda: SimpleNamespace(
+                shutdown_initial_executor=lambda: calls.append("initial")
+            )
+        )
+        server._ensure_tip_refresh_service = (  # type: ignore[method-assign]
+            lambda: SimpleNamespace(shutdown=lambda: calls.append("refresh") or False)
+        )
+        server.shutdown_job_build_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("job_build")
+        )
+        server.shutdown_payout_artifact_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("payout_artifact")
+        )
+
+        server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(
+            calls,
+            ["initial", "refresh", "job_build", "payout_artifact"],
+        )
+
     def test_normal_shutdown_releases_lease_promptly_and_exports_metrics(self) -> None:
         ledger = RecordingLeaseLedger()
         server = coordinator(ledger)
@@ -198,6 +262,9 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             writer_thread.join(1)
             shutdown_thread.join(1)
 
+        self.assertFalse(producer_thread.is_alive(), "producer thread leaked")
+        self.assertFalse(writer_thread.is_alive(), "share writer thread leaked")
+        self.assertFalse(shutdown_thread.is_alive(), "shutdown thread leaked")
         self.assertTrue(entry.committed.is_set())
         self.assertEqual(ledger.release_calls, 1)
 
@@ -333,13 +400,17 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
     def test_blockpoll_shutdown_race_does_not_take_hard_exit_path(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
 
         def rejected_poll() -> int:
             server.request_shutdown(signal.SIGTERM)
             raise ShutdownInProgress("PRISM coordinator is shutting down")
 
-        server.poll_qbit_tip_template_once = rejected_poll  # type: ignore[method-assign]
+        tip_refresh = server._ensure_tip_refresh_service()
+        tip_refresh.poll_once = rejected_poll  # type: ignore[method-assign]
         with patch("lab.prism.prism_coordinator.os._exit") as hard_exit:
             server.blockpoll_loop()
 
@@ -399,6 +470,96 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
                 ("drain", drain_threads),
             ],
         )
+
+    def test_startup_replay_shutdown_cancels_gated_candidate_before_quiescence(
+        self,
+    ) -> None:
+        class StartupRaceLedger(RecordingLeaseLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.append_calls = 0
+
+            def append(self, pending: object) -> object:
+                self.append_calls += 1
+                return pending
+
+        ledger = StartupRaceLedger()
+        server = coordinator(ledger, timeout=0.5)
+        share_writer = server._ensure_share_writer_service()
+        pending = share_writer.make_pending_share(
+            PendingShareInput(
+                share_id="miner-a:startup-race",
+                miner_id="miner-a",
+                order_key="miner-a",
+                p2mr_program_hex="11" * 32,
+                share_difficulty=1,
+                network_difficulty=1,
+                template_height=9,
+                job_id="job-1",
+                job_issued_at_ms=1,
+                ntime=1_700_000_000,
+            )
+        )
+        entry = PendingShareAppend(
+            pending_share=pending,
+            username="miner-a",
+            job_id="job-1",
+            block_hash_hex="aa" * 32,
+            collection_only=False,
+            credit_policy=None,
+        )
+        share_writer.begin_startup_recovery()
+        entered = threading.Event()
+        errors: list[BaseException] = []
+
+        def gated_candidate() -> None:
+            try:
+                with server._writer_operation("accepted_block_handling"):
+                    entered.set()
+                    share_writer.append_and_wait(entry)
+            except BaseException as exc:
+                errors.append(exc)
+
+        writer = threading.Thread(target=gated_candidate)
+        writer.start()
+        self.assertTrue(entered.wait(0.2))
+        self.assertEqual(
+            server._ensure_shutdown_controller().snapshot()["active_writers"],
+            {"accepted_block_handling": 1},
+        )
+
+        def rejected_replay() -> int:
+            server.request_shutdown(signal.SIGTERM)
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+
+        started = time.monotonic()
+        with patch("builtins.print"):
+            self.assertFalse(
+                server._run_startup_writer_replay(
+                    rejected_replay,
+                    drain_threads=[],
+                    before_shutdown=share_writer.cancel_startup_recovery,
+                )
+            )
+        elapsed = time.monotonic() - started
+        # Match serve()'s unconditional finally without erasing cancellation.
+        share_writer.finish_startup_recovery()
+        writer.join(1)
+
+        self.assertLess(elapsed, 0.25)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ShutdownInProgress)
+        self.assertEqual(ledger.append_calls, 0)
+        self.assertEqual(ledger.release_calls, 1)
+        snapshot = server._ensure_shutdown_controller().snapshot()
+        self.assertEqual(snapshot["active_writers"], {})
+        self.assertFalse(snapshot["lease_release_withheld"])
+        self.assertEqual(snapshot["release_withheld_total"], 0)
+        self.assertEqual(snapshot["lease_release_outcomes"]["success"], 1)
+        with patch("builtins.print"):
+            self.assertTrue(server.shutdown(reason="main_finally"))
+        self.assertEqual(ledger.release_calls, 1)
 
     def test_replacement_can_acquire_immediately_after_graceful_release(self) -> None:
         lease_lock = threading.Lock()

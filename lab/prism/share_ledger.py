@@ -99,6 +99,18 @@ class PendingShare:
     credit_policy: str | None = None
 
 
+class ShareReplayConflict(RuntimeError):
+    """A recovery row reused a share ID with a different durable payload."""
+
+
+@dataclass(frozen=True)
+class ShareReplayResult:
+    """Typed result for one legacy recovery-journal append."""
+
+    disposition: str
+    record: AcceptedShareRecord
+
+
 class SingleWriterShareLedger:
     """Assigns canonical share_seq values and returns immutable snapshots.
 
@@ -166,6 +178,46 @@ class SingleWriterShareLedger:
             self._shares_by_id[pending.share_id] = record
             self._next_share_seq += 1
             return record
+
+    def append_recovered_share(self, pending: PendingShare) -> ShareReplayResult:
+        """Append one recovery row with an explicit exact/conflict outcome."""
+        if pending.share_difficulty <= 0:
+            raise ValueError("share_difficulty must be positive")
+        if pending.network_difficulty <= 0:
+            raise ValueError("network_difficulty must be positive")
+        credit_policy = validate_credit_policy(pending.credit_policy)
+        with self._lock:
+            existing = self._shares_by_id.get(pending.share_id)
+            if existing is not None:
+                if not self._pending_matches_record(
+                    pending,
+                    existing,
+                    credit_policy=credit_policy,
+                ):
+                    raise ShareReplayConflict(
+                        f"recovered share payload conflicts with {pending.share_id}"
+                    )
+                return ShareReplayResult("exact_existing", replace(existing))
+            record = AcceptedShareRecord(
+                share_seq=self._next_share_seq,
+                share_id=pending.share_id,
+                miner_id=pending.miner_id,
+                order_key=pending.order_key,
+                p2mr_program_hex=pending.p2mr_program_hex,
+                share_difficulty=pending.share_difficulty,
+                network_difficulty=pending.network_difficulty,
+                template_height=pending.template_height,
+                job_id=pending.job_id,
+                job_issued_at_ms=pending.job_issued_at_ms,
+                accepted_at_ms=pending.accepted_at_ms,
+                ntime=pending.ntime,
+                credit_policy=credit_policy,
+            )
+            self._shares.append(record)
+            self._share_ids.add(pending.share_id)
+            self._shares_by_id[pending.share_id] = record
+            self._next_share_seq += 1
+            return ShareReplayResult("inserted", replace(record))
 
     @staticmethod
     def _pending_matches_record(
@@ -1556,10 +1608,10 @@ END;
             )
             return record
 
-    def append_batch(
+    def _append_batch_with_replay_outcomes(
         self,
         entries: list[tuple[PendingShare, dict[str, Any] | None]],
-    ) -> list[AcceptedShareRecord]:
+    ) -> list[ShareReplayResult]:
         """Commit accepted shares and optional block intents in one transaction.
 
         Replaying the exact same payload is idempotent.  Reusing a share ID or
@@ -1745,6 +1797,7 @@ SELECT CASE
     WHEN EXISTS (SELECT 1 FROM share_mismatch) THEN
         json_build_object(
             'error', 'duplicate share_id payload mismatch',
+            'error_kind', 'share_replay_conflict',
             'share_ids', (SELECT json_agg(share_id ORDER BY share_id) FROM share_mismatch)
         )
     WHEN EXISTS (SELECT 1 FROM candidate_mismatch) THEN
@@ -1779,6 +1832,8 @@ END;
         with self._lock:
             result = self._run_json(sql)
             if "error" in result:
+                if result.get("error_kind") == "share_replay_conflict":
+                    raise ShareReplayConflict(str(result["error"]))
                 raise RuntimeError(str(result["error"]))
             records = result.get("records")
             if not isinstance(records, list) or len(records) != len(entries):
@@ -1794,7 +1849,33 @@ END;
                         record,
                         new_miner=bool(payload.get("new_miner", False)),
                     )
-            return parsed
+            return [
+                ShareReplayResult(
+                    (
+                        "inserted"
+                        if bool(payload.get("newly_inserted", True))
+                        else "exact_existing"
+                    ),
+                    record,
+                )
+                for payload, record in zip(records, parsed, strict=True)
+            ]
+
+    def append_batch(
+        self,
+        entries: list[tuple[PendingShare, dict[str, Any] | None]],
+    ) -> list[AcceptedShareRecord]:
+        return [
+            outcome.record
+            for outcome in self._append_batch_with_replay_outcomes(entries)
+        ]
+
+    def append_recovered_share(self, pending: PendingShare) -> ShareReplayResult:
+        """Use the exact batch comparator for one typed recovery outcome."""
+        outcomes = self._append_batch_with_replay_outcomes([(pending, None)])
+        if len(outcomes) != 1:
+            raise RuntimeError("Postgres recovery append returned an incomplete result")
+        return outcomes[0]
 
     def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
         """Persist candidate work that is not yet eligible for share credit."""
@@ -5980,7 +6061,7 @@ SELECT json_build_object(
         return state
 
     def reorg_watch_blocks(self, *, active_tip_height: int) -> list[dict[str, object]]:
-        sql = f"""
+        sql = """
 SELECT COALESCE(json_agg(json_build_object(
     'block_hash', block_hash,
     'block_height', block_height,

@@ -26,7 +26,8 @@ from tests.prism_coordinator_test_support import (
 class ImmutableRefreshArtifactTests(unittest.TestCase):
     def test_fetched_snapshot_owns_exact_derived_artifacts(self) -> None:
         server, _ = coordinator()
-        original_store = server.store_template_artifacts
+        repository = server._ensure_job_bundle_service().template_repository
+        original_store = repository.store
         stored: list[CachedTemplateArtifacts | None] = []
 
         def recording_store(
@@ -38,7 +39,7 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
             stored.append(artifacts)
             return artifacts
 
-        server.store_template_artifacts = recording_store  # type: ignore[method-assign]
+        repository.store = recording_store  # type: ignore[method-assign]
 
         snapshot = server.fetch_qbit_tip_template_snapshot()
 
@@ -65,7 +66,8 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
 
     def test_fetch_fails_closed_when_exact_artifacts_cannot_be_derived(self) -> None:
         server, _ = coordinator()
-        server.store_template_artifacts = (  # type: ignore[method-assign]
+        repository = server._ensure_job_bundle_service().template_repository
+        repository.store = (  # type: ignore[method-assign]
             lambda _template, *, generation=None: None
         )
 
@@ -73,7 +75,9 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
             server.fetch_qbit_tip_template_snapshot()
 
         self.assertIsNone(server.tip_template_snapshot)
-        self.assertIsNone(server._template_artifacts)
+        self.assertIsNone(
+            server._ensure_job_bundle_service().template_repository.current_artifacts()
+        )
 
     def test_prepare_rejects_mismatched_snapshot_artifact_invariants(self) -> None:
         server, _ = coordinator()
@@ -144,7 +148,8 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
 
         build_entered = threading.Event()
         release_build = threading.Event()
-        original_shared_job_bundle = server.shared_job_bundle
+        job_bundles = server._ensure_job_bundle_service()
+        original_shared_job_bundle = job_bundles.shared_job_bundle
         bundles: list[CachedJobBundle] = []
         errors: list[BaseException] = []
 
@@ -165,7 +170,7 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
             except BaseException as exc:  # noqa: BLE001 - surfaced by the test
                 errors.append(exc)
 
-        server.shared_job_bundle = blocked_shared_job_bundle  # type: ignore[method-assign]
+        job_bundles.shared_job_bundle = blocked_shared_job_bundle  # type: ignore[method-assign]
         thread = threading.Thread(target=prepare)
         thread.start()
         try:
@@ -176,7 +181,10 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
             self.assertIsNotNone(artifacts_b)
             assert artifacts_b is not None
             self.assertNotEqual(artifacts_a.fingerprint, artifacts_b.fingerprint)
-            self.assertIs(server._template_artifacts, artifacts_b)
+            self.assertIs(
+                server._ensure_job_bundle_service().template_repository.current_artifacts(),
+                artifacts_b,
+            )
         finally:
             release_build.set()
             thread.join(5)
@@ -210,7 +218,7 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
         template_b = base_template(height=11, prevhash=tip_b)
         server, rpc = coordinator(template=template_a)
         install_fake_bundle_builder(server)
-        server._pool_ready_latched = True
+        server._ensure_job_bundle_service().set_ready_for_test(True)
         states = [client(1), client(2)]
         server.clients = set(states)
         sent_fingerprints: list[str] = []
@@ -231,7 +239,8 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
 
         first_build_entered = threading.Event()
         release_first_build = threading.Event()
-        original_shared_job_bundle = server.shared_job_bundle
+        job_bundles = server._ensure_job_bundle_service()
+        original_shared_job_bundle = job_bundles.shared_job_bundle
         build_count = 0
         build_count_lock = threading.Lock()
 
@@ -250,7 +259,7 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
                     raise AssertionError("superseded artifact build was not released")
             return original_shared_job_bundle(artifacts, identity, **kwargs)
 
-        server.shared_job_bundle = block_first_shared_job_bundle  # type: ignore[method-assign]
+        job_bundles.shared_job_bundle = block_first_shared_job_bundle  # type: ignore[method-assign]
         old_results: list[int] = []
         old_errors: list[BaseException] = []
         new_results: list[int] = []
@@ -284,11 +293,19 @@ class ImmutableRefreshArtifactTests(unittest.TestCase):
         self.assertEqual(len(old_errors), 1)
         self.assertIsInstance(old_errors[0], TemplateRefreshBlocked)
         self.assertEqual(new_errors, [])
+        # R2 owns the single heavy lane. The competing caller contributes the
+        # newer immutable requirement and returns without becoming another
+        # refresh owner; the scheduler drains that follow-up in the background.
         self.assertEqual(new_results, [0])
+        self.assertTrue(
+            server._ensure_tip_refresh_service().wait_for_scheduler_idle_for_test(
+                5.0
+            )
+        )
         try:
             self.assertEqual(
                 server.poll_qbit_tip_template_once(),
-                len(states),
+                0,
             )
         finally:
             server.shutdown_tip_refresh_executor()

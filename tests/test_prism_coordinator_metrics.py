@@ -604,19 +604,69 @@ class PrismStampedJobFloorTests(_VardiffSupportTestCase):
         state.minimum_advertised_difficulty = Decimal("500000")
         state.share_difficulty = Decimal("500000")
         return state
-    def test_post_block_notification_stamps_caller_heartbeat(self) -> None:
+    def test_post_block_refresh_runs_on_scheduler_worker(self) -> None:
         server, _state, _ledger = submit_coordinator()
-        seen: list[str] = []
-        server._record_heartbeat = seen.append  # type: ignore[method-assign]
-        server.refresh_jobs_after_accepted_block(
-            block_height=10, block_hash="bb" * 32, heartbeat_name="block_submitter"
-        )
-        self.assertEqual(seen, ["block_submitter"])
+        server.watchdog_timeout_seconds = 0.12
+        seen: list[tuple[str, tuple[int, str] | None]] = []
+        service = server._ensure_tip_refresh_service()
+        execute_started = threading.Event()
+        release_execute = threading.Event()
+        repeated_heartbeat = threading.Event()
+        caller_heartbeats: list[float] = []
 
-        # The client-thread pending refresh keeps the default poller heartbeat.
-        seen.clear()
+        def heartbeat(name: str) -> None:
+            server._record_heartbeat(name)
+            if name == "block_submitter":
+                caller_heartbeats.append(time.monotonic())
+                if len(caller_heartbeats) >= 5:
+                    repeated_heartbeat.set()
+
+        def fake_execute(trigger: object) -> int:
+            seen.append(
+                (
+                    threading.current_thread().name,
+                    getattr(trigger, "post_accept_block"),
+                )
+            )
+            execute_started.set()
+            self.assertTrue(release_execute.wait(2.0))
+            return 0
+
+        service.reconfigure_ports_for_test(heartbeat=heartbeat)
+        service._execute_refresh_trigger = fake_execute  # type: ignore[method-assign]
+        results: list[int] = []
+        caller = threading.Thread(
+            target=lambda: results.append(
+                server.refresh_jobs_after_accepted_block(
+                    block_height=10,
+                    block_hash="bb" * 32,
+                    heartbeat_name="block_submitter",
+                )
+            )
+        )
+        caller.start()
+        self.assertTrue(execute_started.wait(1.0))
+        self.assertTrue(repeated_heartbeat.wait(1.0))
+        self.assertGreaterEqual(
+            caller_heartbeats[-1] - caller_heartbeats[0],
+            server.watchdog_timeout_seconds,
+        )
+        self.assertNotIn(
+            "block_submitter",
+            server._overdue_heartbeats(time.monotonic()),
+        )
+        release_execute.set()
+        caller.join(1.0)
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(results, [0])
         server.refresh_jobs_after_accepted_block(block_height=11, block_hash="cc" * 32)
-        self.assertEqual(seen, ["qbit_blockpoll"])
+        self.assertEqual(
+            seen,
+            [
+                ("prism-tip-refresh-scheduler", (10, "bb" * 32)),
+                ("prism-tip-refresh-scheduler", (11, "cc" * 32)),
+            ],
+        )
 
 class HealthSnapshotTests(_JobSupportTestCase):
     def test_health_payload_uses_aggregate_stats_not_all_shares(self) -> None:

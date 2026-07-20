@@ -23,7 +23,12 @@ from unittest.mock import patch
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
-from lab.prism.share_ledger import PendingShare, SingleWriterShareLedger
+from lab.prism.share_ledger import (
+    PendingShare,
+    ShareReplayConflict,
+    ShareReplayResult,
+    SingleWriterShareLedger,
+)
 from lab.prism.prism_coordinator import (
     CachedJobBundle,
     CachedTemplateArtifacts,
@@ -189,6 +194,18 @@ class RecordingLedger(FakeLedger):
         self.pending.append(pending)
         self.shares += 1
         return SimpleNamespace(share_seq=self.shares, miner_id=getattr(pending, "miner_id", "miner-a"))
+
+    def append_recovered_share(self, pending: PendingShare) -> ShareReplayResult:
+        for index, existing in enumerate(self.pending, start=1):
+            if getattr(existing, "share_id", None) != pending.share_id:
+                continue
+            if existing != pending:
+                raise ShareReplayConflict(pending.share_id)
+            return ShareReplayResult(
+                "exact_existing",
+                SimpleNamespace(share_seq=index, miner_id=pending.miner_id),
+            )
+        return ShareReplayResult("inserted", self.append(pending))
 
     def persist_accepted_block(self, **kwargs: object) -> dict[str, object]:
         self.persisted.append({**kwargs, "submit_seen_at_persist": self.submit_seen})
@@ -590,8 +607,9 @@ def install_idle_job_cache(
     *,
     tip: str = "00" * 32,
 ) -> CachedJobBundle:
-    server._pool_ready_latched = True
+    server._ensure_job_bundle_service()._ready_latched = True
     server.job_bundle_cache_seconds = 60.0
+    server._ensure_job_bundle_service().set_cache_seconds_for_test(60.0)
     server.job_counter = 0
     server.share_weights_by_username = {}
     server.default_share_weight = 1
@@ -611,7 +629,7 @@ def install_idle_job_cache(
     key = server._job_bundle_key(
         artifacts,
         mode="ready",
-        payout_state_generation=server._payout_state_generation,
+        payout_state_generation=server._payout_state_service._generation,
         payout_artifact_generation=0,
         worker=None,
     )
@@ -639,7 +657,7 @@ def install_idle_job_cache(
     )
     bundle = CachedJobBundle(
         key=key,
-        template=template,
+        template=artifacts.template,
         template_fingerprint=fingerprint,
         coinbase_manifest={},
         shares_json=[],
@@ -655,20 +673,39 @@ def install_idle_job_cache(
             payout_artifact_sha256=payout_artifact_sha256,
         ),
     )
-    with server._job_cache_lock:
-        server._template_artifacts = artifacts
-        server._published_payout_state = dataclass_replace(
-            server._published_payout_state,
+    service = server._ensure_job_bundle_service()
+    service.template_repository.replace_for_test(artifacts)
+    now = time.monotonic()
+    tip_service = server._ensure_tip_refresh_service()
+    tip_service.seed_state_for_test(
+        latest_detected_tip=None,
+        observation_sequence=1,
+    )
+    tip_service.seed_published_for_test(
+        first_seen=(tip, now),
+        observation_sequence=1,
+        observed_monotonic=now,
+        template=QbitTipTemplateSnapshot(
+            bestblockhash=tip,
+            previousblockhash=tip,
+            template_fingerprint=artifacts.fingerprint,
+            template_generation=artifacts.generation,
+            template_artifacts=artifacts,
+        ),
+    )
+    with service._cache_lock:
+        server._payout_state_service._published = dataclass_replace(
+            server._payout_state_service._published,
             artifact=PayoutStateArtifact(
-                generation=server._payout_state_generation,
+                generation=server._payout_state_service._generation,
                 source_generation=0,
                 prior_balances_json="[]",
                 prior_balances_sha256=payout_artifact_sha256,
                 prepared_monotonic=time.monotonic(),
             ),
         )
-        server._job_bundle_cache.clear()
-        server._job_bundle_cache[bundle.key] = bundle
+        service._bundle_cache.clear()
+        service._bundle_cache[bundle.key] = bundle
     return bundle
 
 
@@ -718,7 +755,7 @@ def coordinator() -> PrismCoordinator:
     server.duplicate_share_count = 0
     server.low_difficulty_share_count = 0
     server.collection_block_submission_count = 0
-    server._pool_ready_latched = False
+    server._ensure_job_bundle_service()._ready_latched = False
     server.grace_credited_share_count = 0
     server.idle_retarget_count = 0
     server.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
@@ -742,8 +779,11 @@ def coordinator() -> PrismCoordinator:
     server.stale_grace_seconds = 3.0
     server.blockwait_enabled = True
     server.blockwait_timeout_seconds = 5.0
+    server._ensure_tip_refresh_service().reconfigure_for_test(
+        blockwait_timeout_seconds=server.blockwait_timeout_seconds,
+        failure_holdoff_seconds=0.0,
+    )
     server.vardiff_idle_sweep_seconds = 15.0
-    server.job_build_failure_count = 0
     server.tip_refresh_job_count = 0
     server.post_accept_refresh_failure_count = 0
     server.reorg_reconciler_enabled = False
@@ -758,13 +798,13 @@ def coordinator() -> PrismCoordinator:
     server.started_monotonic = time.monotonic() - 10
     server.ledger = FakeLedger(shares=5)
     server.latest_coinbase_size_bytes = 250
-    server.rpc = FakeRpc()
+    server.rpc = TipRpc("00" * 32)
     server.qbit_chain = "regtest"
     server.blockpoll_seconds = 2.0
-    # Failed-refresh spacing is opt-in per test: its holdoff waits on real
-    # time, which deadlocks tests that freeze time.monotonic around failing
-    # polls. Pacing behavior is covered by test_prism_refresh_retry_pacing.
-    server.tip_refresh_failure_holdoff_seconds = 0.0
+    server._ensure_tip_refresh_service().reconfigure_for_test(
+        blockpoll_seconds=server.blockpoll_seconds,
+        failure_holdoff_seconds=0.0,
+    )
     server.ctv_broadcaster_enabled = False
     server.ctv_broadcaster_wallet = None
     server.ctv_broadcaster_fee_sats = 0
@@ -773,7 +813,9 @@ def coordinator() -> PrismCoordinator:
     server.ctv_fanout_broadcast_daemon = None
     server._ctv_fanout_market_fee_rate_cache = {}
     server.tip_template_snapshot = None
-    server._tip_refresh_lock = threading.Lock()
+    server._ensure_tip_refresh_service().replace_refresh_lock_for_test(
+        threading.Lock()
+    )
     server.extranonce2_size = 8
     server.coinbase_tag_hex = default_prism_coinbase_tag_hex()
     server.version_mask = direct_stratum.QBIT_VERSION_ROLLING_MASK

@@ -201,13 +201,13 @@ class PrismCtvRefreshPriorityTests(unittest.TestCase):
         )
 
         self.assertIsNone(retained_token)
-        self.assertEqual(server._tip_refresh_pending_token, newer_token)
+        self.assertEqual(server._ensure_tip_refresh_service().snapshot().pending_token, newer_token)
         self.assertTrue(server._tip_refresh_pending())
 
     def test_routine_same_tip_observation_does_not_starve_ctv(self) -> None:
         server = coordinator()
         cancellations: list[bool] = []
-        server._active_tip_refresh = (  # type: ignore[assignment]
+        server._ensure_tip_refresh_service().seed_active_refresh_for_test(
             SimpleNamespace(tip_hash=OLD_TIP, observation_sequence=1),
             SimpleNamespace(cancel=lambda: cancellations.append(True)),
         )

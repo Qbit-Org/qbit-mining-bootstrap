@@ -10,8 +10,9 @@ from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 
+from lab.prism.coordinator_shutdown import ShutdownInProgress
+from lab.prism.job_bundle import JobBuildCancellation
 from lab.prism.prism_coordinator import (
-    ShutdownInProgress,
     TemplateRefreshBlocked,
     TipRefreshValidationToken,
     _FanoutCancellation,
@@ -201,7 +202,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         server.reorg_reconciler_enabled = True
         server._ensure_job_cache_state()
         ledger.assert_not_atomic = lambda: self.assertIsNone(  # type: ignore[attr-defined]
-            server._payout_state_delivery_gate._mutation_owner
+            server._payout_state_service._delivery_gate._mutation_owner
         )
         results: list[dict[str, object]] = []
         errors: list[BaseException] = []
@@ -218,25 +219,25 @@ class TipRefreshValidationTests(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(entered.wait(5))
-            with server._payout_state_delivery_gate.delivery_cancelable(
+            with server._payout_state_service._delivery_gate.delivery_cancelable(
                 lambda: False,
                 generation=0,
             ) as admission:
                 self.assertTrue(admission)
                 release.set()
-                with server._payout_state_delivery_gate._condition:
+                with server._payout_state_service._delivery_gate._condition:
                     self.assertTrue(
-                        server._payout_state_delivery_gate._condition.wait_for(
+                        server._payout_state_service._delivery_gate._condition.wait_for(
                             lambda: (
-                                server._payout_state_delivery_gate._publisher_waiting
+                                server._payout_state_service._delivery_gate._publisher_waiting
                             ),
                             timeout=5,
                         )
                     )
                 self.assertTrue(
-                    server._payout_state_prepare_lock.acquire(timeout=1)
+                    server._payout_state_service._prepare_lock.acquire(timeout=1)
                 )
-                server._payout_state_prepare_lock.release()
+                server._payout_state_service._prepare_lock.release()
         finally:
             release.set()
             thread.join(5)
@@ -244,7 +245,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(results[0]["inactive_blocks"], 1)
-        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_service._generation, 1)
 
     def test_payout_only_preparation_does_not_hold_delivery_gate(self) -> None:
         entered = threading.Event()
@@ -274,7 +275,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         server.reorg_reconciler_enabled = True
         server._ensure_job_cache_state()
         ledger.assert_not_atomic = lambda: self.assertIsNone(  # type: ignore[attr-defined]
-            server._payout_state_delivery_gate._mutation_owner
+            server._payout_state_service._delivery_gate._mutation_owner
         )
         results: list[dict[str, object]] = []
 
@@ -286,32 +287,32 @@ class TipRefreshValidationTests(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(entered.wait(5))
-            with server._payout_state_delivery_gate.delivery_cancelable(
+            with server._payout_state_service._delivery_gate.delivery_cancelable(
                 lambda: False,
                 generation=0,
             ) as admission:
                 self.assertTrue(admission)
                 release.set()
-                with server._payout_state_delivery_gate._condition:
+                with server._payout_state_service._delivery_gate._condition:
                     self.assertTrue(
-                        server._payout_state_delivery_gate._condition.wait_for(
+                        server._payout_state_service._delivery_gate._condition.wait_for(
                             lambda: (
-                                server._payout_state_delivery_gate._publisher_waiting
+                                server._payout_state_service._delivery_gate._publisher_waiting
                             ),
                             timeout=5,
                         )
                     )
                 self.assertTrue(
-                    server._payout_state_prepare_lock.acquire(timeout=1)
+                    server._payout_state_service._prepare_lock.acquire(timeout=1)
                 )
-                server._payout_state_prepare_lock.release()
+                server._payout_state_service._prepare_lock.release()
         finally:
             release.set()
             thread.join(5)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(results[0]["matured_payouts"], 1)
-        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_service._generation, 1)
 
     def test_tip_poll_reuses_reconciled_external_source(self) -> None:
         server, rpc = coordinator()
@@ -332,15 +333,15 @@ class TipRefreshValidationTests(unittest.TestCase):
         _advance_fake_tip(rpc, next_tip, 11)
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
-        self.assertEqual(server._payout_state_generation, 1)
-        self.assertEqual(server._payout_state_source[0], 1)
-        self.assertEqual(server._published_payout_state.source_generation, 1)
-        self.assertEqual(server._published_payout_state.source_tip_hash, next_tip)
+        self.assertEqual(server._payout_state_service._generation, 1)
+        self.assertEqual(server._payout_state_service._source[0], 1)
+        self.assertEqual(server._payout_state_service._published.source_generation, 1)
+        self.assertEqual(server._payout_state_service._published.source_tip_hash, next_tip)
         self.assertFalse(server.tip_refresh_is_pending())
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
-        self.assertEqual(server._payout_state_generation, 1)
-        self.assertEqual(server._payout_state_source[0], 1)
+        self.assertEqual(server._payout_state_service._generation, 1)
+        self.assertEqual(server._payout_state_service._source[0], 1)
 
     def test_newer_tip_discards_in_progress_payout_candidate(self) -> None:
         entered = threading.Event()
@@ -411,9 +412,9 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(server._payout_state_generation, 1)
-        self.assertEqual(server.payout_state_candidates_discarded, 1)
-        self.assertEqual(server._published_payout_state.source_tip_hash, new_tip)
+        self.assertEqual(server._payout_state_service._generation, 1)
+        self.assertEqual(server._payout_state_service.metrics_snapshot()["discarded_candidates"], 1)
+        self.assertEqual(server._payout_state_service._published.source_tip_hash, new_tip)
         self.assertEqual(server.current_tip_first_seen, published_tip)
 
     def test_supersession_retry_preserves_durable_reorg_counts(self) -> None:
@@ -478,8 +479,8 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(summary["inactive_blocks"], 1)
         self.assertEqual(server.reorg_inactive_block_count, 1)
         self.assertEqual(summary["published_generation"], 1)
-        self.assertEqual(server.payout_state_candidates_discarded, 1)
-        self.assertEqual(server._published_payout_state.source_tip_hash, new_tip)
+        self.assertEqual(server._payout_state_service.metrics_snapshot()["discarded_candidates"], 1)
+        self.assertEqual(server._payout_state_service._published.source_tip_hash, new_tip)
 
     def test_failed_superseded_reconcile_does_not_publish_latest_source(self) -> None:
         newer_tip = "79" * 32
@@ -530,19 +531,20 @@ class TipRefreshValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "maturity RPC failed"):
             server.reconcile_prism_pool_blocks_once(tip_hash=rpc.tip)
 
-        self.assertEqual(server._payout_state_generation, 0)
-        self.assertIsNone(server._published_payout_state.source_tip_hash)
-        self.assertTrue(server._payout_state_publication_blocked)
-        self.assertEqual(server.payout_state_candidates_discarded, 1)
+        self.assertEqual(server._payout_state_service._generation, 0)
+        self.assertIsNone(server._payout_state_service._published.source_tip_hash)
+        self.assertTrue(server._payout_state_service._publication_blocked)
+        self.assertEqual(server._payout_state_service.metrics_snapshot()["discarded_candidates"], 1)
         self.assertEqual(server.reorg_inactive_block_count, 1)
         self.assertTrue(server.tip_refresh_is_pending())
 
     def test_tip_churn_bounds_reconcile_retries_and_fences_job_builds(self) -> None:
         server, rpc = coordinator()
         server.reorg_reconciler_enabled = True
-        server.payout_reconcile_supersession_retries = 2
+        service = server._payout_state_service
+        service.set_reconcile_retries_for_test(2)
         server.qbit_chain_view_untrusted = lambda: True  # type: ignore[method-assign]
-        real_publish = server._publish_payout_state_candidate
+        real_publish = service.publish_candidate
         publish_attempts = 0
 
         def supersede_before_publish(candidate: object) -> int | None:
@@ -555,7 +557,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             )
             return real_publish(candidate)  # type: ignore[arg-type]
 
-        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+        service.publish_candidate = supersede_before_publish  # type: ignore[method-assign]
 
         summary = server.reconcile_prism_pool_blocks_once(
             tip_hash=rpc.tip,
@@ -565,9 +567,9 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertTrue(summary["superseded"])
         self.assertEqual(publish_attempts, 3)
         self.assertEqual(server.reorg_reconcile_skip_count, 1)
-        self.assertEqual(server._payout_state_generation, 0)
-        self.assertEqual(server.payout_state_candidates_discarded, 3)
-        self.assertTrue(server._payout_state_publication_blocked)
+        self.assertEqual(server._payout_state_service._generation, 0)
+        self.assertEqual(server._payout_state_service.metrics_snapshot()["discarded_candidates"], 3)
+        self.assertTrue(server._payout_state_service._publication_blocked)
         state = client(1)
         assert state.worker is not None
         with self.assertRaisesRegex(
@@ -692,7 +694,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         server, _rpc = coordinator()
         server._reserve_payout_state_source("payout_only")
         original_publish_generation = (
-            server._payout_state_delivery_gate.publish_generation
+            server._payout_state_service._delivery_gate.publish_generation
         )
         lock_snapshots: list[tuple[bool, bool]] = []
 
@@ -703,7 +705,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         ) -> None:
             lock_snapshots.append(
                 (
-                    server._job_cache_lock.locked(),
+                    server._ensure_job_bundle_service()._cache_lock.locked(),
                     server.lock._is_owned(),  # type: ignore[attr-defined]
                 )
             )
@@ -712,7 +714,7 @@ class TipRefreshValidationTests(unittest.TestCase):
                 prioritize_delivery=prioritize_delivery,
             )
 
-        server._payout_state_delivery_gate.publish_generation = observe_locks  # type: ignore[method-assign]
+        server._payout_state_service._delivery_gate.publish_generation = observe_locks  # type: ignore[method-assign]
 
         self.assertEqual(
             server._publish_payout_state_candidate(
@@ -736,12 +738,14 @@ class TipRefreshValidationTests(unittest.TestCase):
         with server.lock:
             server.tip_template_snapshot = snapshot
         server._reserve_payout_state_source("payout_only")
-        self.assertEqual(
-            server._publish_payout_state_candidate(
-                server._current_payout_state_candidate()
-            ),
-            1,
-        )
+        with server._ensure_tip_refresh_service().suppress_trigger_callbacks_for_test():
+            self.assertEqual(
+                server._publish_payout_state_candidate(
+                    server._current_payout_state_candidate()
+                ),
+                1,
+            )
+        server._mark_tip_refresh_pending(1)
         pending_token = server._claim_tip_refresh_pending()
         self.assertIsNotNone(pending_token)
 
@@ -754,16 +758,16 @@ class TipRefreshValidationTests(unittest.TestCase):
             )
         )
         self.assertEqual(
-            server._payout_state_delivery_gate._priority_generation,
+            server._payout_state_service._delivery_gate._priority_generation,
             1,
         )
-        with server._payout_state_delivery_gate.delivery_cancelable(
+        with server._payout_state_service._delivery_gate.delivery_cancelable(
             lambda: False,
             generation=1,
             priority=False,
         ) as routine_admission:
             self.assertFalse(routine_admission)
-        with server._payout_state_delivery_gate.delivery_cancelable(
+        with server._payout_state_service._delivery_gate.delivery_cancelable(
             lambda: False,
             generation=1,
             priority=True,
@@ -771,7 +775,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             self.assertTrue(first_delivery)
             first_delivery.mark_delivered()
         self.assertIsNone(
-            server._payout_state_delivery_gate._priority_generation
+            server._payout_state_service._delivery_gate._priority_generation
         )
 
     def test_collection_refresh_stops_when_chain_becomes_untrusted(self) -> None:
@@ -806,7 +810,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(notifications, [first.connection_id])
         self.assertIsNotNone(first.active_job)
         self.assertIsNone(second.active_job)
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
     def test_orphan_reconciliation_rebuilds_bundle_from_post_reorg_balances(self) -> None:
         orphaned_balance = {
@@ -891,6 +895,9 @@ class TipRefreshValidationTests(unittest.TestCase):
             return bundle
 
         server.build_audit_bundle = record_signed_balances  # type: ignore[method-assign]
+        server._ensure_bundle_compiler().build_audit_bundle = (  # type: ignore[method-assign]
+            record_signed_balances
+        )
 
         artifacts = server.store_template_artifacts(dict(rpc.template))
         self.assertIsNotNone(artifacts)
@@ -932,12 +939,12 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(state.active_job.prior_balances, [])
         self.assertFalse(hasattr(state.active_job, "bundle"))
         self.assertFalse(hasattr(stale_bundle, "bundle"))
-        refreshed_bundle = next(iter(server._job_bundle_cache.values()))
+        refreshed_bundle = next(iter(server._ensure_job_bundle_service()._bundle_cache.values()))
         self.assertEqual(refreshed_bundle.prior_balances, [])
         self.assertIsNot(refreshed_bundle.coinbase_manifest, stale_bundle.coinbase_manifest)
         self.assertIn("coinbase_tx_hex", refreshed_bundle.coinbase_manifest)
         self.assertEqual(stale_bundle.payout_state_generation, 0)
-        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_service._generation, 1)
         self.assertEqual(state.active_job.payout_state_generation, 1)
         self.assertEqual(clean_notifications, [True])
         self.assertNotIn(stale_context.job.job_id, state.active_job_ids)
@@ -947,6 +954,9 @@ class TipRefreshValidationTests(unittest.TestCase):
         install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
         server.tip_refresh_max_workers = 4
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         clients = [client(index + 1) for index in range(100)]
         notifications: set[int] = set()
         notifications_lock = threading.Lock()
@@ -991,7 +1001,8 @@ class TipRefreshValidationTests(unittest.TestCase):
                 f"for {expected_tip_hash}"
             )
 
-        original_validate = server._validate_prepared_tip_refresh
+        tip_refresh = server._ensure_tip_refresh_service()
+        original_validate = tip_refresh.validate_prepared
 
         def record_validation(
             bundle: object,
@@ -1007,7 +1018,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
             reject_per_client_validation
         )
-        server._validate_prepared_tip_refresh = record_validation  # type: ignore[method-assign]
+        tip_refresh.validate_prepared = record_validation  # type: ignore[method-assign]
 
         try:
             refreshed = server.poll_qbit_tip_template_once()
@@ -1034,7 +1045,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         )
         self.assertEqual(
             token.payout_state_generation,
-            server._payout_state_generation,
+            server._payout_state_service._generation,
         )
         self.assertEqual(
             token.observation_sequence,
@@ -1084,7 +1095,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(chain_view_checks, 1)
         self.assertEqual(sent, [])
         self.assertTrue(all(state.active_job is None for state in clients))
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
     def test_untrusted_post_fanout_does_not_report_refresh_success(self) -> None:
         server, _rpc = coordinator()
@@ -1125,7 +1136,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             set(notifications),
             {state.connection_id for state in clients},
         )
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
         self.assertIsNone(
             getattr(server, "last_successful_template_refresh_monotonic", None)
         )
@@ -1160,11 +1171,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             with self.assertRaises(ShutdownInProgress):
                 server.poll_qbit_tip_template_once()
             self.assertTrue(notification_started.is_set())
-            self.assertFalse(server._tip_refresh_retry.is_set())
-            self.assertTrue(
-                server._tip_refresh_singleflight_lock.acquire(blocking=False)
-            )
-            server._tip_refresh_singleflight_lock.release()
+            self.assertFalse(server._ensure_tip_refresh_service().snapshot().retry_requested)
         finally:
             release_notification.set()
             server.shutdown_tip_refresh_executor()
@@ -1194,7 +1201,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         ):
             server._validate_prepared_tip_refresh(bundle, snapshot, 1)
 
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
     def test_prevalidation_trust_check_failure_schedules_immediate_retry(self) -> None:
         server, _rpc = coordinator()
@@ -1216,7 +1223,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         ):
             server._validate_prepared_tip_refresh(bundle, snapshot, 1)
 
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
     def test_reconciliation_failure_before_fanout_sends_zero_jobs(self) -> None:
         server, _rpc = coordinator()
@@ -1257,6 +1264,9 @@ class TipRefreshValidationTests(unittest.TestCase):
         install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first, second, third = client(1), client(2), client(3)
         clients = [first, second, third]
         server.clients = clients  # type: ignore[assignment]
@@ -1316,11 +1326,14 @@ class TipRefreshValidationTests(unittest.TestCase):
             errors,
         )
 
-    def test_waiting_poll_observes_new_tip_then_retries_after_owner_exits(self) -> None:
+    def test_waiting_poll_observes_new_tip_and_supersedes_slow_fanout(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first, second = client(1), client(2)
         server.clients = [first, second]  # type: ignore[assignment]
         server._ensure_tip_refresh_state()
@@ -1330,7 +1343,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             lambda **_kwargs: True
         )
         self.assertTrue(server.observe_tip_first_seen(rpc.tip))
-        server._tip_refresh_retry.clear()
+        server._ensure_tip_refresh_service().clear_retry_for_test()
 
         tip_a = rpc.tip
         tip_b = "33" * 32
@@ -1359,7 +1372,8 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         first.send = record_first_send  # type: ignore[method-assign]
         second.send = record_second_send  # type: ignore[method-assign]
-        original_observe = server.observe_tip_for_refresh
+        tip_refresh = server._ensure_tip_refresh_service()
+        original_observe = tip_refresh.observe_tip
 
         def record_observation(*args: object, **kwargs: object) -> bool:
             observed = original_observe(*args, **kwargs)  # type: ignore[arg-type]
@@ -1367,13 +1381,14 @@ class TipRefreshValidationTests(unittest.TestCase):
                 tip_b_observed.set()
             return observed
 
-        server.observe_tip_for_refresh = record_observation  # type: ignore[method-assign]
+        tip_refresh.observe_tip = record_observation  # type: ignore[method-assign]
         # Park the replacement build so the detected-but-unpublished window
         # can be asserted deterministically before tip B is published.
         replacement_build_started = threading.Event()
         release_replacement_build = threading.Event()
         build_calls = 0
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
 
         def gated_build(*args: object, **kwargs: object) -> object:
             nonlocal build_calls
@@ -1384,7 +1399,7 @@ class TipRefreshValidationTests(unittest.TestCase):
                     raise AssertionError("test did not release replacement build")
             return original_build(*args, **kwargs)  # type: ignore[arg-type]
 
-        server.build_shared_job_bundle = gated_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = gated_build  # type: ignore[method-assign]
         results: dict[str, list[int]] = {"old": [], "new": []}
         errors: dict[str, list[BaseException]] = {"old": [], "new": []}
 
@@ -1400,49 +1415,54 @@ class TipRefreshValidationTests(unittest.TestCase):
         try:
             self.assertTrue(first_send_started.wait(5))
             with server.lock:
-                active = server._active_tip_refresh
+                active = server._ensure_tip_refresh_service().active_refresh_snapshot()
             self.assertIsNotNone(active)
-            assert active is not None
 
             _advance_fake_tip(rpc, tip_b, 11)
             new_poll.start()
 
             self.assertTrue(tip_b_observed.wait(5))
-            self.assertTrue(active[1].is_set())
-            self.assertFalse(replacement_build_started.wait(0.1))
+            self.assertFalse(replacement_build_started.is_set())
+            active = server._ensure_tip_refresh_service().active_refresh_snapshot()
+            self.assertIsNotNone(active)
+            assert active is not None
+            self.assertTrue(active.cancelling)
             self.assertEqual(server.latest_detected_tip[0], tip_b)
             self.assertEqual(server.current_tip_first_seen[0], tip_a)
-            pending_tip_b = server._tip_refresh_pending_token
+            pending_tip_b = server._ensure_tip_refresh_service().snapshot().pending_token
             self.assertIsNotNone(pending_tip_b)
-        finally:
+            scheduler = server._ensure_tip_refresh_service().scheduler_snapshot()
+            self.assertEqual(scheduler.active.tip_hash, tip_a)  # type: ignore[union-attr]
+            self.assertEqual(scheduler.pending.tip_hash, tip_b)  # type: ignore[union-attr]
+            self.assertEqual(scheduler.pending_capacity, 1)
             release_first_send.set()
             old_poll.join(5)
 
-        self.assertFalse(old_poll.is_alive())
-        self.assertEqual(results["old"], [])
-        self.assertEqual(len(errors["old"]), 1)
-        self.assertIsInstance(errors["old"][0], TemplateRefreshBlocked)
-        if server._tip_refresh_pending_token is not None:
-            self.assertEqual(server._tip_refresh_pending_token, pending_tip_b)
+            self.assertFalse(old_poll.is_alive())
+            self.assertEqual(results["old"], [])
+            self.assertEqual(len(errors["old"]), 1)
+            self.assertIsInstance(errors["old"][0], TemplateRefreshBlocked)
+            self.assertTrue(replacement_build_started.wait(5))
+            self.assertEqual(server.current_tip_first_seen[0], tip_a)
+            release_replacement_build.set()
+            new_poll.join(5)
+            self.assertTrue(tip_refresh.wait_for_scheduler_idle_for_test(5.0))
+        finally:
+            release_replacement_build.set()
+            release_first_send.set()
+            old_poll.join(5)
+            new_poll.join(5)
+            tip_refresh.wait_for_scheduler_idle_for_test(5.0)
+            server.shutdown_tip_refresh_executor()
 
-        new_poll.join(5)
         self.assertFalse(new_poll.is_alive())
         self.assertEqual(errors["new"], [])
         self.assertEqual(results["new"], [0])
-        self.assertFalse(replacement_build_started.is_set())
-
-        release_replacement_build.set()
-        try:
-            self.assertEqual(server.poll_qbit_tip_template_once(), 2)
-        finally:
-            server.shutdown_tip_refresh_executor()
-
-        self.assertTrue(replacement_build_started.is_set())
         self.assertEqual(sent_tips, {1: [tip_a, tip_b], 2: [tip_b]})
         self.assertEqual(server.current_tip_first_seen[0], tip_b)
         self.assertFalse(server.tip_refresh_is_pending())
 
-    def test_replacement_build_waits_until_obsolete_owner_is_released(self) -> None:
+    def test_replacement_build_waits_for_single_refresh_scheduler(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         state = client(1)
@@ -1451,7 +1471,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
         server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
         self.assertTrue(server.observe_tip_first_seen(rpc.tip))
-        server._tip_refresh_retry.clear()
+        server._ensure_tip_refresh_service().clear_retry_for_test()
 
         bundle_started = threading.Event()
         replacement_started = threading.Event()
@@ -1460,7 +1480,8 @@ class TipRefreshValidationTests(unittest.TestCase):
         active_builders = 0
         max_active_builders = 0
         build_calls = 0
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
 
         def blocking_build(*args: object, **kwargs: object) -> object:
             nonlocal active_builders, max_active_builders, build_calls
@@ -1481,7 +1502,7 @@ class TipRefreshValidationTests(unittest.TestCase):
                 with builder_lock:
                     active_builders -= 1
 
-        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
         sent_generations: list[int] = []
 
         def record_send(payload: dict[str, object]) -> None:
@@ -1509,14 +1530,19 @@ class TipRefreshValidationTests(unittest.TestCase):
             # qbit confirms a direct PRISM block, before final audit/payout
             # publication completes.
             server._cancel_obsolete_job_builds("direct PRISM block accepted")
-            with server._job_build_scheduler_lock:
-                active = server._job_build_active
+            with server._ensure_job_bundle_service()._scheduler_lock:
+                active = server._ensure_job_bundle_service()._active
                 self.assertIsNotNone(active)
                 assert active is not None
                 self.assertTrue(active.request.cancellation.is_set())
             self.assertEqual(server._advance_payout_state_generation(), 1)
             new_poll.start()
-            self.assertFalse(replacement_started.wait(0.1))
+            self.assertFalse(replacement_started.is_set())
+            scheduler = server._ensure_tip_refresh_service().scheduler_snapshot()
+            self.assertIsNotNone(scheduler.active)
+            self.assertIsNotNone(scheduler.pending)
+            self.assertEqual(scheduler.pending.payout_state_generation, 1)  # type: ignore[union-attr]
+            self.assertEqual(scheduler.pending_capacity, 1)
             new_poll.join(5)
             self.assertFalse(new_poll.is_alive())
             self.assertEqual(errors["new"], [])
@@ -1526,9 +1552,9 @@ class TipRefreshValidationTests(unittest.TestCase):
             release_bundle.set()
             old_poll.join(5)
             new_poll.join(5)
+            server.shutdown_tip_refresh_executor()
 
         self.assertFalse(old_poll.is_alive())
-        server.shutdown_tip_refresh_executor()
         self.assertEqual(errors["old"], [])
         self.assertEqual(results["old"], [1])
         self.assertTrue(replacement_started.is_set())
@@ -1537,7 +1563,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertTrue(
             all(
                 bundle.payout_state_generation == 1
-                for bundle in server._job_bundle_cache.values()
+                for bundle in server._ensure_job_bundle_service()._bundle_cache.values()
             )
         )
         self.assertFalse(server.tip_refresh_is_pending())
@@ -1564,15 +1590,15 @@ class TipRefreshValidationTests(unittest.TestCase):
                 server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
                 server._ensure_tip_refresh_state()
                 self.assertTrue(server.observe_tip_first_seen(rpc.tip))
-                server._tip_refresh_retry.clear()
+                server._ensure_tip_refresh_service().clear_retry_for_test()
 
                 phase_entered = threading.Event()
                 release_phase = threading.Event()
-                original_checkpoint = server._job_build_checkpoint
+                original_checkpoint = JobBuildCancellation.raise_if_cancelled
 
                 def blocking_checkpoint(
+                    cancellation: JobBuildCancellation,
                     phase: str,
-                    cancellation: object,
                 ) -> None:
                     if phase == blocked_phase and not phase_entered.is_set():
                         phase_entered.set()
@@ -1580,9 +1606,8 @@ class TipRefreshValidationTests(unittest.TestCase):
                             raise AssertionError(
                                 f"test did not release {blocked_phase}"
                             )
-                    original_checkpoint(phase, cancellation)  # type: ignore[arg-type]
+                    original_checkpoint(cancellation, phase)
 
-                server._job_build_checkpoint = blocking_checkpoint  # type: ignore[method-assign]
                 errors: list[BaseException] = []
 
                 def poll() -> None:
@@ -1591,17 +1616,22 @@ class TipRefreshValidationTests(unittest.TestCase):
                     except BaseException as exc:  # noqa: BLE001 - asserted below
                         errors.append(exc)
 
-                poll_thread = threading.Thread(target=poll)
-                poll_thread.start()
-                try:
-                    self.assertTrue(phase_entered.wait(5))
-                    next_tip = f"{index + 120:02x}" * 32
-                    _advance_fake_tip(rpc, next_tip, 10 + index)
-                    self.assertTrue(server.observe_tip_first_seen(next_tip))
-                finally:
-                    release_phase.set()
-                    poll_thread.join(5)
-                    server.shutdown_tip_refresh_executor()
+                with patch.object(
+                    JobBuildCancellation,
+                    "raise_if_cancelled",
+                    blocking_checkpoint,
+                ):
+                    poll_thread = threading.Thread(target=poll)
+                    poll_thread.start()
+                    try:
+                        self.assertTrue(phase_entered.wait(5))
+                        next_tip = f"{index + 120:02x}" * 32
+                        _advance_fake_tip(rpc, next_tip, 10 + index)
+                        self.assertTrue(server.observe_tip_first_seen(next_tip))
+                    finally:
+                        release_phase.set()
+                        poll_thread.join(5)
+                        server.shutdown_tip_refresh_executor()
 
                 self.assertFalse(poll_thread.is_alive())
                 self.assertEqual(len(errors), 1)
@@ -1611,343 +1641,151 @@ class TipRefreshValidationTests(unittest.TestCase):
                 self.assertTrue(
                     all(
                         entry.template["previousblockhash"] == next_tip
-                        for entry in server._job_bundle_cache.values()
+                        for entry in server._ensure_job_bundle_service()._bundle_cache.values()
                     )
                 )
 
-    def test_new_tip_during_ledger_snapshot_retries_and_publishes_latest(self) -> None:
+    def test_rapid_contention_observations_are_latest_wins(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         state = client(1)
         server.clients = [state]  # type: ignore[assignment]
+        server._ensure_tip_refresh_state()
         server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
         server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
         self.assertTrue(server.observe_tip_first_seen(rpc.tip))
+        server._ensure_tip_refresh_service().clear_retry_for_test()
 
-        snapshot_complete = threading.Event()
-        release_snapshot = threading.Event()
-        original_checkpoint = server._job_build_checkpoint
-
-        def slow_snapshot_checkpoint(
-            phase: str,
-            cancellation: object,
-        ) -> None:
-            if phase == "ledger_snapshot_complete" and not snapshot_complete.is_set():
-                snapshot_complete.set()
-                if not release_snapshot.wait(5):
-                    raise AssertionError("test did not release ledger snapshot")
-            original_checkpoint(phase, cancellation)  # type: ignore[arg-type]
-
-        server._job_build_checkpoint = slow_snapshot_checkpoint  # type: ignore[method-assign]
-        notifications: list[str] = []
-
-        def record_send(payload: dict[str, object]) -> None:
-            if payload["method"] == "mining.notify":
-                assert state.active_job is not None
-                notifications.append(
-                    str(state.active_job.template["previousblockhash"])
-                )
-
-        state.send = record_send  # type: ignore[method-assign]
-        errors: list[BaseException] = []
-
-        def poll() -> None:
-            try:
-                server.poll_qbit_tip_template_once()
-            except BaseException as exc:  # noqa: BLE001 - asserted below
-                errors.append(exc)
-
-        owner = threading.Thread(target=poll)
-        owner.start()
-        try:
-            self.assertTrue(snapshot_complete.wait(5))
-            latest_tip = "88" * 32
-            _advance_fake_tip(rpc, latest_tip, 11)
-            self.assertTrue(server.observe_tip_for_refresh(latest_tip))
-        finally:
-            release_snapshot.set()
-            owner.join(5)
-
-        self.assertFalse(owner.is_alive())
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], TemplateRefreshBlocked)
-        self.assertEqual(notifications, [])
-        self.assertTrue(server._consume_tip_refresh_retry())
-        self.assertFalse(server._consume_tip_refresh_retry())
-
-        try:
-            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
-        finally:
-            server.shutdown_tip_refresh_executor()
-
-        self.assertEqual(notifications, ["88" * 32])
-        self.assertEqual(server.current_tip_first_seen[0], "88" * 32)
-        self.assertFalse(server.tip_refresh_is_pending())
-
-    def test_refresh_exception_releases_owner_and_coalesces_one_retry(self) -> None:
-        server, _rpc = coordinator()
-        original_fetch = server.fetch_qbit_tip_template_snapshot
-        fetch_started = threading.Event()
-        release_fetch = threading.Event()
-        fetches = 0
-        errors: list[BaseException] = []
-
-        def fail_once() -> object:
-            nonlocal fetches
-            fetches += 1
-            if fetches == 1:
-                fetch_started.set()
-                if not release_fetch.wait(5):
-                    raise AssertionError("test did not release failing fetch")
-                raise RuntimeError("transient template failure")
-            return original_fetch()
-
-        server.fetch_qbit_tip_template_snapshot = fail_once  # type: ignore[method-assign]
-
-        def run_owner() -> None:
-            try:
-                server.poll_qbit_tip_template_once()
-            except BaseException as exc:
-                errors.append(exc)
-
-        owner = threading.Thread(target=run_owner)
-        owner.start()
-        self.assertTrue(fetch_started.wait(5))
-        try:
-            self.assertEqual(server.poll_qbit_tip_template_once(), 0)
-        finally:
-            release_fetch.set()
-        owner.join(5)
-
-        self.assertFalse(owner.is_alive())
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], RuntimeError)
-        self.assertEqual(str(errors[0]), "transient template failure")
-        self.assertTrue(server._tip_refresh_singleflight_lock.acquire(blocking=False))
-        server._tip_refresh_singleflight_lock.release()
-        self.assertTrue(server._consume_tip_refresh_retry())
-        self.assertFalse(server._consume_tip_refresh_retry())
-        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
-        self.assertEqual(fetches, 2)
-        self.assertIsNone(server.template_refresh_failure_started_monotonic)
-
-    def test_refresh_exception_does_not_self_schedule_immediate_retry(self) -> None:
-        server, _rpc = coordinator()
-
-        def fail_fetch() -> object:
-            raise RuntimeError("persistent template failure")
-
-        server.fetch_qbit_tip_template_snapshot = fail_fetch  # type: ignore[method-assign]
-
-        with self.assertRaisesRegex(RuntimeError, "persistent template failure"):
-            server.poll_qbit_tip_template_once()
-
-        self.assertTrue(server._tip_refresh_singleflight_lock.acquire(blocking=False))
-        server._tip_refresh_singleflight_lock.release()
-        self.assertFalse(server._consume_tip_refresh_retry())
-        self.assertIsNotNone(server.template_refresh_failure_started_monotonic)
-
-    def test_post_accept_rpc_failure_still_wakes_refresh_driver(self) -> None:
-        server, rpc = coordinator()
-        original_call = rpc.call
-
-        def fail_best_tip(method: str, *args: object) -> object:
-            if method == "getbestblockhash":
-                raise RuntimeError("temporary best-tip failure")
-            return original_call(method, *args)
-
-        rpc.call = fail_best_tip  # type: ignore[method-assign]
-
-        with patch("lab.prism.prism_coordinator.traceback.print_exc"):
-            self.assertEqual(
-                server.refresh_jobs_after_accepted_block(
-                    block_height=14,
-                    block_hash="88" * 32,
-                    heartbeat_name="block_submitter",
-                ),
-                0,
-            )
-
-        self.assertEqual(server.post_accept_refresh_failure_count, 1)
-        self.assertTrue(server._consume_tip_refresh_retry())
-        self.assertFalse(server._consume_tip_refresh_retry())
-
-    def test_post_accept_supersession_is_not_counted_as_failure(self) -> None:
-        server, _rpc = coordinator()
-        server.observe_tip_for_refresh = (  # type: ignore[method-assign]
-            lambda *_args, **_kwargs: False
-        )
-
-        with patch("lab.prism.prism_coordinator.traceback.print_exc") as print_exc:
-            self.assertEqual(
-                server.refresh_jobs_after_accepted_block(
-                    block_height=15,
-                    block_hash="99" * 32,
-                    heartbeat_name="block_submitter",
-                ),
-                0,
-            )
-
-        self.assertEqual(server.post_accept_refresh_failure_count, 0)
-        print_exc.assert_not_called()
-        self.assertTrue(server._consume_tip_refresh_retry())
-        self.assertFalse(server._consume_tip_refresh_retry())
-
-    def test_tip_flicker_back_to_published_work_clears_watchdog(self) -> None:
-        server, rpc = coordinator()
-        install_fake_bundle_builder(server)
-        server.template_refresh_failure_exit_seconds = 10.0
-        server.min_ready_miners = 10_000
-        state = client(1)
-        state.send = lambda _payload: None  # type: ignore[method-assign]
-        server.clients = [state]  # type: ignore[assignment]
-        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
-        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
-        original_tip = rpc.tip
-        original_template = rpc.template
-
-        self.assertEqual(server.poll_qbit_tip_template_once(), 1)
-        published_job = state.active_job
-        self.assertIsNotNone(published_job)
-
-        _advance_fake_tip(rpc, "aa" * 32, 11)
-        self.assertTrue(server.observe_tip_for_refresh(rpc.tip))
-        rpc.tip = original_tip
-        rpc.template = original_template
-        self.assertTrue(server.observe_tip_for_refresh(original_tip))
-        divergence_started = (
-            server._progress_publication_divergence_since_monotonic
-        )
-        self.assertIsNotNone(divergence_started)
-        assert divergence_started is not None
-        self.assertTrue(
-            server.publication_progress_failure_expired(
-                divergence_started + 10.001
-            )
-        )
-
-        # The coherent A poll has no replacement delivery to make because the
-        # existing A job is already current. Completion itself must close the
-        # A -> B -> A publication-divergence epoch.
-        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
-
-        self.assertIs(state.active_job, published_job)
-        self.assertIsNone(
-            server._progress_publication_divergence_since_monotonic
-        )
-        self.assertFalse(
-            server.publication_progress_failure_expired(10_000_000_000.0)
-        )
-
-    def test_rapid_contention_coalesces_one_latest_tip_retry(self) -> None:
-        server, rpc = coordinator()
-        install_fake_bundle_builder(server)
-        state = client(1)
-        server.clients = [state]  # type: ignore[assignment]
-        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
-        server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
-        self.assertTrue(server.observe_tip_first_seen(rpc.tip))
-
-        build_started = threading.Event()
-        release_build = threading.Event()
-        original_build = server.build_shared_job_bundle
-        build_lock = threading.Lock()
+        tip_a = rpc.tip
+        tip_b = "55" * 32
+        tip_c = "66" * 32
+        tip_d = "77" * 32
+        build_started = [threading.Event() for _index in range(2)]
+        release_old = threading.Event()
+        release_latest = threading.Event()
+        trigger_submitted = {
+            tip_b: threading.Event(),
+            tip_c: threading.Event(),
+            tip_d: threading.Event(),
+        }
+        tip_refresh = server._ensure_tip_refresh_service()
+        original_submit = tip_refresh.submit_trigger
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
+        builder_lock = threading.Lock()
+        build_calls = 0
         active_builders = 0
-        maximum_builders = 0
+        max_active_builders = 0
 
-        def blocked_first_build(*args: object, **kwargs: object) -> object:
-            nonlocal active_builders, maximum_builders
-            with build_lock:
+        def record_submit(trigger: object) -> Future[int]:
+            completion = original_submit(trigger)  # type: ignore[arg-type]
+            submitted = trigger_submitted.get(getattr(trigger, "tip_hash"))
+            if submitted is not None:
+                submitted.set()
+            return completion
+
+        def blocking_build(*args: object, **kwargs: object) -> object:
+            nonlocal active_builders, build_calls, max_active_builders
+            with builder_lock:
+                call_index = build_calls
+                build_calls += 1
                 active_builders += 1
-                maximum_builders = max(maximum_builders, active_builders)
+                max_active_builders = max(max_active_builders, active_builders)
+            build_started[call_index].set()
             try:
-                if not build_started.is_set():
-                    build_started.set()
-                    if not release_build.wait(5):
-                        raise AssertionError("test did not release obsolete build")
+                if call_index == 0 and not release_old.wait(5):
+                    raise AssertionError("test did not release oldest build")
+                if call_index == 1 and not release_latest.wait(5):
+                    raise AssertionError("test did not release latest build")
                 return original_build(*args, **kwargs)  # type: ignore[arg-type]
             finally:
-                with build_lock:
+                with builder_lock:
                     active_builders -= 1
 
-        server.build_shared_job_bundle = blocked_first_build  # type: ignore[method-assign]
+        tip_refresh.submit_trigger = record_submit  # type: ignore[method-assign]
+        service.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
         sent_tips: list[str] = []
 
         def record_send(payload: dict[str, object]) -> None:
-            if payload["method"] == "mining.notify":
-                assert state.active_job is not None
-                sent_tips.append(str(state.active_job.template["previousblockhash"]))
+            if payload["method"] != "mining.notify":
+                return
+            assert state.active_job is not None
+            sent_tips.append(str(state.active_job.template["previousblockhash"]))
 
         state.send = record_send  # type: ignore[method-assign]
-        owner_errors: list[BaseException] = []
+        results = {label: [] for label in ("old", "b", "c", "d")}
+        errors: dict[str, list[BaseException]] = {
+            label: [] for label in ("old", "b", "c", "d")
+        }
 
-        def own_refresh() -> None:
+        def poll(label: str) -> None:
             try:
-                server.poll_qbit_tip_template_once()
-            except BaseException as exc:  # noqa: BLE001 - asserted below
-                owner_errors.append(exc)
+                results[label].append(server.poll_qbit_tip_template_once())
+            except BaseException as exc:  # noqa: BLE001 - surface thread errors
+                errors[label].append(exc)
 
-        owner = threading.Thread(target=own_refresh)
-        owner.start()
+        polls = {
+            label: threading.Thread(target=poll, args=(label,))
+            for label in ("old", "b", "c", "d")
+        }
+        polls["old"].start()
         try:
-            self.assertTrue(build_started.wait(5))
-            # blockpoll observes B while the A owner is still building.
-            _advance_fake_tip(rpc, "55" * 32, 11)
-            self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+            self.assertTrue(build_started[0].wait(5))
 
-            # blockwait observes C and only wakes the driver; it never enters
-            # the heavy lane itself.
-            blockwait_calls = 0
+            _advance_fake_tip(rpc, tip_b, 11)
+            polls["b"].start()
+            self.assertTrue(trigger_submitted[tip_b].wait(5))
+            self.assertFalse(build_started[1].is_set())
 
-            def blockwait_once(known_tip: str) -> str:
-                nonlocal blockwait_calls
-                blockwait_calls += 1
-                if blockwait_calls == 1:
-                    _advance_fake_tip(rpc, "66" * 32, 12)
-                    return rpc.tip
-                server.stop_event.set()
-                return known_tip
+            _advance_fake_tip(rpc, tip_c, 12)
+            polls["c"].start()
+            self.assertTrue(trigger_submitted[tip_c].wait(5))
+            self.assertFalse(build_started[1].is_set())
 
-            server.blockwait_once = blockwait_once  # type: ignore[method-assign]
-            blockwait = threading.Thread(target=server.blockwait_loop)
-            blockwait.start()
-            blockwait.join(5)
-            self.assertFalse(blockwait.is_alive())
-            server.stop_event.clear()
+            _advance_fake_tip(rpc, tip_d, 13)
+            polls["d"].start()
+            self.assertTrue(trigger_submitted[tip_d].wait(5))
+            self.assertFalse(build_started[1].is_set())
 
-            # Accepted-block finalization observes D and also only wakes the
-            # same driver.
-            _advance_fake_tip(rpc, "77" * 32, 13)
-            self.assertEqual(
-                server.refresh_jobs_after_accepted_block(
-                    block_height=13,
-                    block_hash=rpc.tip,
-                    heartbeat_name="block_submitter",
-                ),
-                0,
-            )
+            scheduler = tip_refresh.scheduler_snapshot()
+            self.assertIsNotNone(scheduler.active)
+            self.assertIsNotNone(scheduler.pending)
+            self.assertEqual(scheduler.active.tip_hash, tip_a)  # type: ignore[union-attr]
+            self.assertEqual(scheduler.pending.tip_hash, tip_d)  # type: ignore[union-attr]
+            self.assertEqual(scheduler.pending_capacity, 1)
+            self.assertEqual(build_calls, 1)
+            self.assertEqual(max_active_builders, 1)
 
-            self.assertEqual(server.latest_detected_tip[0], "77" * 32)
-            self.assertEqual(maximum_builders, 1)
-            self.assertEqual(sent_tips, [])
+            release_old.set()
+            self.assertTrue(build_started[1].wait(5))
+            self.assertEqual(server.current_tip_first_seen[0], tip_a)
+            release_latest.set()
+            self.assertTrue(tip_refresh.wait_for_scheduler_idle_for_test(5.0))
         finally:
-            release_build.set()
-            owner.join(5)
-
-        self.assertFalse(owner.is_alive())
-        self.assertEqual(len(owner_errors), 1)
-        self.assertIsInstance(owner_errors[0], TemplateRefreshBlocked)
-        self.assertTrue(server._consume_tip_refresh_retry())
-        self.assertFalse(server._consume_tip_refresh_retry())
-
-        try:
-            self.assertEqual(server.poll_qbit_tip_template_once(), 1)
-        finally:
+            release_old.set()
+            release_latest.set()
+            for poll_thread in polls.values():
+                poll_thread.join(5)
+            tip_refresh.wait_for_scheduler_idle_for_test(5.0)
             server.shutdown_tip_refresh_executor()
 
-        self.assertEqual(maximum_builders, 1)
-        self.assertEqual(sent_tips, ["77" * 32])
-        self.assertEqual(server.current_tip_first_seen[0], "77" * 32)
+        self.assertTrue(all(not thread.is_alive() for thread in polls.values()))
+        self.assertEqual(results["old"], [])
+        self.assertEqual(len(errors["old"]), 1)
+        self.assertIsInstance(errors["old"][0], TemplateRefreshBlocked)
+        for label in ("b", "c", "d"):
+            self.assertEqual(results[label], [0])
+            self.assertEqual(errors[label], [])
+        self.assertEqual(build_calls, 2)
+        self.assertEqual(max_active_builders, 1)
+        self.assertEqual(sent_tips, [tip_d])
+        scheduler_metrics = tip_refresh.metrics_snapshot()
+        self.assertEqual(scheduler_metrics["trigger_supersessions"], 3)
+        self.assertEqual(scheduler_metrics["trigger_coalesces"], 2)
+        with server._ensure_job_bundle_service()._scheduler_lock:
+            self.assertIsNone(server._ensure_job_bundle_service()._active)
+            self.assertIsNone(server._ensure_job_bundle_service()._retiring)
+            self.assertIsNone(server._ensure_job_bundle_service()._pending)
         self.assertFalse(server.tip_refresh_is_pending())
 
     def _legacy_rapid_contention_observations_are_latest_wins(self) -> None:
@@ -1957,11 +1795,11 @@ class TipRefreshValidationTests(unittest.TestCase):
         server.clients = [state]  # type: ignore[assignment]
         server._ensure_tip_refresh_state()
         refresh_lock = _ControlledTipRefreshLock()
-        server._tip_refresh_lock = refresh_lock  # type: ignore[assignment]
+        server._ensure_tip_refresh_service().replace_refresh_lock_for_test(refresh_lock)
         server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
         server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
         self.assertTrue(server.observe_tip_first_seen(rpc.tip))
-        server._tip_refresh_retry.clear()
+        server._ensure_tip_refresh_service().clear_retry_for_test()
 
         tip_a = rpc.tip
         published_tip_a_sequence = server.current_tip_observation_sequence
@@ -2012,7 +1850,8 @@ class TipRefreshValidationTests(unittest.TestCase):
             return original_rpc_call(method, params)
 
         rpc.call = ordered_rpc_call  # type: ignore[method-assign]
-        original_observe = server.observe_tip_for_refresh
+        tip_refresh = server._ensure_tip_refresh_service()
+        original_observe = tip_refresh.observe_tip
 
         def record_observation(*args: object, **kwargs: object) -> bool:
             observed = original_observe(*args, **kwargs)  # type: ignore[arg-type]
@@ -2027,7 +1866,7 @@ class TipRefreshValidationTests(unittest.TestCase):
                     tip_c_observed.set()
             return observed
 
-        server.observe_tip_for_refresh = record_observation  # type: ignore[method-assign]
+        tip_refresh.observe_tip = record_observation  # type: ignore[method-assign]
         sent_tips: list[str] = []
 
         def record_send(payload: dict[str, object]) -> None:
@@ -2077,7 +1916,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             tip_c_poll.start()
             refresh_lock.next_probe_gate().set()
             self.assertTrue(tip_c_observed.wait(5))
-            pending_tip_c = server._tip_refresh_pending_token
+            pending_tip_c = server._ensure_tip_refresh_service().snapshot().pending_token
             detected_tip_c_sequence = server.latest_detected_tip[1]
             self.assertEqual(server.latest_detected_tip[0], tip_c)
             self.assertEqual(server.current_tip_first_seen[0], tip_a)
@@ -2099,7 +1938,7 @@ class TipRefreshValidationTests(unittest.TestCase):
                 server.current_tip_observation_sequence,
                 published_tip_a_sequence,
             )
-            self.assertEqual(server._tip_refresh_pending_token, pending_tip_c)
+            self.assertEqual(server._ensure_tip_refresh_service().snapshot().pending_token, pending_tip_c)
         finally:
             release_stale_probe.set()
             release_bundle.set()
@@ -2109,7 +1948,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(results["old"], [])
         self.assertEqual(len(errors["old"]), 1)
         self.assertIsInstance(errors["old"][0], TemplateRefreshBlocked)
-        self.assertEqual(server._tip_refresh_pending_token, pending_tip_c)
+        self.assertEqual(server._ensure_tip_refresh_service().snapshot().pending_token, pending_tip_c)
         self.assertEqual(sent_tips, [])
 
         refresh_lock.allow_waiters_to_acquire.set()
@@ -2176,7 +2015,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         )
         self.assertEqual(state.active_job.template["previousblockhash"], rpc.tip)
         self.assertGreaterEqual(
-            server.tip_refresh_cancellation_counts["client_lock"],
+            server._ensure_tip_refresh_service().metrics_snapshot()["cancellation_counts"]["client_lock"],
             1,
         )
 
@@ -2187,8 +2026,8 @@ class TipRefreshValidationTests(unittest.TestCase):
         notifications: list[dict[str, object]] = []
         state.send = notifications.append  # type: ignore[method-assign]
         server.clients = [state]  # type: ignore[assignment]
-        gate = ObservedPayoutGate(server._payout_state_delivery_gate)
-        server._payout_state_delivery_gate = gate  # type: ignore[assignment]
+        gate = ObservedPayoutGate(server._payout_state_service._delivery_gate)
+        server._payout_state_service._delivery_gate = gate  # type: ignore[assignment]
         poll_done = threading.Event()
         errors: list[BaseException] = []
 
@@ -2224,12 +2063,15 @@ class TipRefreshValidationTests(unittest.TestCase):
             1,
         )
         self.assertEqual(state.active_job.template["previousblockhash"], rpc.tip)
-        self.assertEqual(server.tip_refresh_cancellation_counts["payout_gate"], 0)
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["cancellation_counts"]["payout_gate"], 0)
 
     def test_obsolete_backlog_never_starts_the_unsubmitted_fleet(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 2
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         clients = [client(index + 1) for index in range(8)]
         observed_locks = [ObservedRLock(), ObservedRLock()]
         for state, observed_lock in zip(clients, observed_locks):
@@ -2292,7 +2134,7 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         self.assertEqual(notifications, {state.connection_id for state in clients})
         self.assertGreaterEqual(
-            server.tip_refresh_cancellation_counts["client_lock"],
+            server._ensure_tip_refresh_service().metrics_snapshot()["cancellation_counts"]["client_lock"],
             2,
         )
 
@@ -2300,6 +2142,9 @@ class TipRefreshValidationTests(unittest.TestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 2
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         server._ensure_tip_refresh_state()
 
         class ObservedExecutor:
@@ -2319,7 +2164,9 @@ class TipRefreshValidationTests(unittest.TestCase):
                 self.delegate.shutdown(**kwargs)  # type: ignore[arg-type]
 
         observed_executor = ObservedExecutor()
-        server._tip_refresh_executor = observed_executor  # type: ignore[assignment]
+        server._ensure_tip_refresh_service().replace_executor_for_test(
+            observed_executor
+        )
         admitted = client(1)
         queued = client(2)
         server.clients = [admitted, queued]  # type: ignore[assignment]
@@ -2335,14 +2182,15 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         admitted.send = block_notify  # type: ignore[method-assign]
         queued.send = queued_notifications.append  # type: ignore[method-assign]
-        original_record_cancellation = server._record_tip_refresh_cancellation
+        tip_refresh = server._ensure_tip_refresh_service()
+        original_record_cancellation = tip_refresh.record_cancellation
 
         def record_cancellation(stage: str) -> None:
             original_record_cancellation(stage)
             if stage == "executor_queue":
                 queued_canceled.set()
 
-        server._record_tip_refresh_cancellation = record_cancellation  # type: ignore[method-assign]
+        tip_refresh.record_cancellation = record_cancellation  # type: ignore[method-assign]
         errors: list[BaseException] = []
 
         def poll() -> None:
@@ -2369,7 +2217,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], TemplateRefreshBlocked)
         self.assertEqual(
-            server.tip_refresh_cancellation_counts["executor_queue"],
+            server._ensure_tip_refresh_service().metrics_snapshot()["cancellation_counts"]["executor_queue"],
             1,
         )
 
@@ -2404,12 +2252,12 @@ class TipRefreshValidationTests(unittest.TestCase):
             self.assertTrue(observed_lock.acquire_attempted.wait(5))
             self.advance_tip(server, rpc, tip_b, height=11)
             self.advance_tip(server, rpc, tip_c, height=12)
-            newest_pending_token = server._tip_refresh_pending_token
+            newest_pending_token = server._ensure_tip_refresh_service().snapshot().pending_token
             self.assertEqual(server.latest_detected_tip[0], tip_c)
             self.assertEqual(server.current_tip_first_seen[0], tip_a)
             self.assertTrue(poll_done.wait(5))
             self.assertTrue(server.tip_refresh_is_pending())
-            self.assertEqual(server._tip_refresh_pending_token, newest_pending_token)
+            self.assertEqual(server._ensure_tip_refresh_service().snapshot().pending_token, newest_pending_token)
             self.assertEqual(server.latest_detected_tip[0], tip_c)
             self.assertEqual(server.current_tip_first_seen[0], tip_a)
             self.assertEqual(notifications, [])
@@ -2436,6 +2284,9 @@ class TipRefreshValidationTests(unittest.TestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 2
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         admitted = client(1)
         waiting = client(2)
         waiting_lock = ObservedRLock()
@@ -2574,7 +2425,7 @@ class TipRefreshValidationTests(unittest.TestCase):
                 yield self.Admission()
 
         state.job_update_lock = AdvancingLock()  # type: ignore[assignment]
-        server._payout_state_delivery_gate = AdvancingGate()  # type: ignore[assignment]
+        server._payout_state_service._delivery_gate = AdvancingGate()  # type: ignore[assignment]
         original_stamp = server.stamp_job_for_client
 
         def advancing_stamp(*args: object, **kwargs: object) -> object:
@@ -2609,10 +2460,10 @@ class TipRefreshValidationTests(unittest.TestCase):
         }
         for phase, expected in expected_phases.items():
             self.assertAlmostEqual(
-                server.job_build_phase_seconds[phase],
+                server._ensure_job_bundle_service()._phase_seconds[phase],
                 expected,
             )
-        self.assertAlmostEqual(server.job_build_seconds_sum, 20.0)
+        self.assertAlmostEqual(server._ensure_job_bundle_service()._build_seconds_sum, 20.0)
         self.assertAlmostEqual(sum(expected_phases.values()), 20.0)
         metrics = server.metrics_payload()
         self.assertIn(
@@ -2679,6 +2530,9 @@ class TipRefreshValidationTests(unittest.TestCase):
         install_fake_bundle_builder(server)
         server.reorg_reconciler_enabled = True
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first, second, third = client(1), client(2), client(3)
         clients = [first, second, third]
         server.clients = clients  # type: ignore[assignment]
@@ -2742,12 +2596,15 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(results, [3])
         self.assertEqual(notifications, {1, 2, 3})
-        self.assertFalse(server._tip_refresh_retry.is_set())
+        self.assertFalse(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
-    def test_repeated_same_tip_contenders_do_not_supersede_active_fanout(self) -> None:
+    def test_same_tip_contention_probe_keeps_active_fanout_valid(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first, second = client(1), client(2)
         server.clients = [first, second]  # type: ignore[assignment]
         server._ensure_tip_refresh_state()
@@ -2757,7 +2614,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             lambda **_kwargs: True
         )
         self.assertTrue(server.observe_tip_first_seen(rpc.tip))
-        server._tip_refresh_retry.clear()
+        server._ensure_tip_refresh_service().clear_retry_for_test()
 
         first_send_started = threading.Event()
         release_first_send = threading.Event()
@@ -2799,17 +2656,16 @@ class TipRefreshValidationTests(unittest.TestCase):
         try:
             self.assertTrue(first_send_started.wait(5))
             with server.lock:
-                active = server._active_tip_refresh
+                active = server._ensure_tip_refresh_service().active_refresh_snapshot()
                 active_sequence = server.current_tip_observation_sequence
             self.assertIsNotNone(active)
             assert active is not None
 
-            contender_results = [
-                server.poll_qbit_tip_template_once()
-                for _attempt in range(10)
-            ]
-            self.assertEqual(contender_results, [0] * 10)
-            self.assertFalse(active[1].is_set())
+            server._probe_tip_while_refresh_waiting()
+            active = server._ensure_tip_refresh_service().active_refresh_snapshot()
+            self.assertIsNotNone(active)
+            assert active is not None
+            self.assertFalse(active.cancelling)
             self.assertEqual(
                 server.current_tip_observation_sequence,
                 active_sequence,
@@ -2818,36 +2674,33 @@ class TipRefreshValidationTests(unittest.TestCase):
         finally:
             release_first_send.set()
             active_poll.join(5)
+            server.shutdown_tip_refresh_executor()
 
         self.assertFalse(active_poll.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(results, [2])
         self.assertEqual(notifications, [1, 2])
         self.assertFalse(server.tip_refresh_is_pending())
-        self.assertTrue(server._consume_tip_refresh_retry())
-        self.assertFalse(server._consume_tip_refresh_retry())
-        try:
-            self.assertEqual(server.poll_qbit_tip_template_once(), 0)
-        finally:
-            server.shutdown_tip_refresh_executor()
-        self.assertEqual(notifications, [1, 2])
 
     def _legacy_same_tip_contention_probe_keeps_active_fanout_valid(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first, second = client(1), client(2)
         server.clients = [first, second]  # type: ignore[assignment]
         server._ensure_tip_refresh_state()
         refresh_lock = _ControlledTipRefreshLock()
-        server._tip_refresh_lock = refresh_lock  # type: ignore[assignment]
+        server._ensure_tip_refresh_service().replace_refresh_lock_for_test(refresh_lock)
         server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
         server.qbit_chain_view_untrusted = lambda: False  # type: ignore[method-assign]
         server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
             lambda **_kwargs: True
         )
         self.assertTrue(server.observe_tip_first_seen(rpc.tip))
-        server._tip_refresh_retry.clear()
+        server._ensure_tip_refresh_service().clear_retry_for_test()
 
         first_send_started = threading.Event()
         release_first_send = threading.Event()
@@ -2898,7 +2751,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         try:
             self.assertTrue(first_send_started.wait(5))
             with server.lock:
-                active = server._active_tip_refresh
+                active = server._ensure_tip_refresh_service().active_refresh_snapshot()
                 active_sequence = server.current_tip_observation_sequence
             self.assertIsNotNone(active)
             assert active is not None
@@ -2906,7 +2759,10 @@ class TipRefreshValidationTests(unittest.TestCase):
             waiting_poll.start()
             refresh_lock.next_probe_gate().set()
             self.assertTrue(contention_probe_finished.wait(5))
-            self.assertFalse(active[1].is_set())
+            active = server._ensure_tip_refresh_service().active_refresh_snapshot()
+            self.assertIsNotNone(active)
+            assert active is not None
+            self.assertFalse(active.cancelling)
             self.assertEqual(
                 server.current_tip_observation_sequence,
                 active_sequence,
@@ -2960,8 +2816,8 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         self.assertIsNotNone(state.active_job)
         self.assertEqual(state.active_job.payout_state_generation, 0)
-        self.assertEqual(server._payout_state_generation, 1)
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertEqual(server._payout_state_service._generation, 1)
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
     def test_payout_mutation_waits_for_prepared_network_delivery(self) -> None:
         server, _rpc = coordinator()
@@ -3001,18 +2857,18 @@ class TipRefreshValidationTests(unittest.TestCase):
             mutation_thread.start()
             self.assertTrue(mutation_started.wait(5))
             self.assertFalse(mutation_completed.wait(0.1))
-            self.assertEqual(server._payout_state_generation, 0)
-            with server._payout_state_delivery_gate._condition:
+            self.assertEqual(server._payout_state_service._generation, 0)
+            with server._payout_state_service._delivery_gate._condition:
                 self.assertTrue(
-                    server._payout_state_delivery_gate._publisher_waiting
+                    server._payout_state_service._delivery_gate._publisher_waiting
                 )
                 self.assertIsNone(
-                    server._payout_state_delivery_gate._mutation_owner
+                    server._payout_state_service._delivery_gate._mutation_owner
                 )
             self.assertTrue(
-                server._payout_state_prepare_lock.acquire(timeout=1)
+                server._payout_state_service._prepare_lock.acquire(timeout=1)
             )
-            server._payout_state_prepare_lock.release()
+            server._payout_state_service._prepare_lock.release()
         finally:
             release_send.set()
             mutation_thread.join(5)
@@ -3022,13 +2878,13 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertFalse(mutation_thread.is_alive())
         self.assertFalse(poll_thread.is_alive())
         self.assertTrue(mutation_completed.is_set())
-        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_service._generation, 1)
         self.assertEqual(len(poll_results) + len(poll_errors), 1)
         if poll_errors:
             self.assertIsInstance(poll_errors[0], TemplateRefreshBlocked)
         else:
             self.assertEqual(poll_results, [1])
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
     def test_prepared_disconnection_after_admission_releases_cancellation_gate(self) -> None:
         server, _rpc = coordinator()
@@ -3053,7 +2909,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             sequence,
         )
         cancellation = _FanoutCancellation()
-        original_gate = server._payout_state_delivery_gate
+        original_gate = server._payout_state_service._delivery_gate
 
         class RemoveClientAtAdmission:
             @contextmanager
@@ -3076,7 +2932,7 @@ class TipRefreshValidationTests(unittest.TestCase):
             def mutation(self) -> object:
                 return original_gate.mutation()
 
-        server._payout_state_delivery_gate = RemoveClientAtAdmission()
+        server._payout_state_service._delivery_gate = RemoveClientAtAdmission()
 
         result = server.send_prepared_job(
             state,
@@ -3139,13 +2995,13 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(result.result, "skipped")
         self.assertEqual(sent, [])
         self.assertIsNone(state.active_job)
-        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertTrue(server._payout_state_service._delivery_gate._delivery_blocked)
 
         published = server._publish_payout_state_candidate(
             server._current_payout_state_candidate()
         )
         self.assertEqual(published, 1)
-        with server._payout_state_delivery_gate.delivery_cancelable(
+        with server._payout_state_service._delivery_gate.delivery_cancelable(
             lambda: False,
             generation=1,
             priority=True,
@@ -3187,7 +3043,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertIsNotNone(second.active_job)
         self.assertEqual(first.active_job.payout_state_generation, 0)
         self.assertEqual(second.active_job.payout_state_generation, 1)
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
     def test_payout_change_after_client_selection_coalesces_full_same_tip_set(
         self,
@@ -3208,7 +3064,8 @@ class TipRefreshValidationTests(unittest.TestCase):
             self.assertEqual(second.active_job.payout_state_generation, 0)
 
             server.clients = [first, second]  # type: ignore[assignment]
-            original_prepare = server.prepare_tip_refresh_bundle
+            tip_refresh = server._ensure_tip_refresh_service()
+            original_prepare = tip_refresh.prepare_bundle
             advanced = False
 
             def advance_before_prepare(*args: object, **kwargs: object) -> object:
@@ -3218,7 +3075,7 @@ class TipRefreshValidationTests(unittest.TestCase):
                     server._advance_payout_state_generation()
                 return original_prepare(*args, **kwargs)  # type: ignore[arg-type]
 
-            server.prepare_tip_refresh_bundle = advance_before_prepare  # type: ignore[method-assign]
+            tip_refresh.prepare_bundle = advance_before_prepare  # type: ignore[method-assign]
 
             self.assertEqual(server.poll_qbit_tip_template_once(), 2)
         finally:
@@ -3247,13 +3104,12 @@ class TipRefreshValidationTests(unittest.TestCase):
         def record_send(payload: dict[str, object]) -> None:
             if payload["method"] == "mining.notify":
                 assert state.active_job is not None
-                sent_generations.append(
-                    state.active_job.payout_state_generation
-                )
+                sent_generations.append(state.active_job.payout_state_generation)
 
         state.send = record_send  # type: ignore[method-assign]
         server.clients = [state]  # type: ignore[assignment]
-        original_build = server.build_shared_job_bundle
+        job_bundles = server._ensure_job_bundle_service()
+        original_build = job_bundles.build_shared_job_bundle
         build_calls = 0
 
         def advance_first_build(*args: object, **kwargs: object) -> object:
@@ -3263,7 +3119,7 @@ class TipRefreshValidationTests(unittest.TestCase):
                 self.assertEqual(server._advance_payout_state_generation(), 1)
             return original_build(*args, **kwargs)  # type: ignore[arg-type]
 
-        server.build_shared_job_bundle = advance_first_build  # type: ignore[method-assign]
+        job_bundles.build_shared_job_bundle = advance_first_build  # type: ignore[method-assign]
 
         try:
             self.assertEqual(server.poll_qbit_tip_template_once(), 1)
@@ -3277,7 +3133,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertTrue(
             all(
                 bundle.payout_state_generation == 1
-                for bundle in server._job_bundle_cache.values()
+                for bundle in job_bundles.bundle_cache_snapshot()
             )
         )
         self.assertFalse(server.tip_refresh_is_pending())
@@ -3319,7 +3175,9 @@ class TipRefreshValidationTests(unittest.TestCase):
                     return future
                 raise RuntimeError("executor rejected queued fanout task")
 
-        server.tip_refresh_executor = lambda: RejectSecondSubmission()  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().executor = (  # type: ignore[method-assign]
+            lambda: RejectSecondSubmission()
+        )
         errors: list[BaseException] = []
 
         def poll() -> None:
@@ -3340,8 +3198,8 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(later_notifications, [])
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], RuntimeError)
-        self.assertIsNone(server._active_tip_refresh)
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertIsNone(server._ensure_tip_refresh_service().active_refresh_snapshot())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
 
 if __name__ == "__main__":

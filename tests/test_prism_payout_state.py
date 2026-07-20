@@ -38,8 +38,8 @@ class JobBundleCacheTests(unittest.TestCase):
         assert artifacts is not None
         parent_hash = str(rpc.template["previousblockhash"])
         preview_condition = ObservedCondition()
-        server._accepted_block_payout_preview_condition = preview_condition
-        server.accepted_block_payout_preview_wait_seconds = 10
+        server._payout_state_service.preview_condition = preview_condition
+        server._payout_state_service.set_preview_wait_seconds_for_test(10)
         preview = [
             {
                 "recipient_id": "miner-a",
@@ -85,7 +85,7 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(ledger.current_balance_reads, 1)
         self.assertEqual(  # type: ignore[union-attr]
             bundle.payout_state_generation,
-            server._payout_state_generation,
+            server._payout_state_service.snapshot().generation,
         )
 
         self.assertEqual(server._prior_balances_for_job_parent(parent_hash), [])
@@ -109,13 +109,13 @@ class JobBundleCacheTests(unittest.TestCase):
             server._publish_accepted_block_payout_preview(parent_hash, preview),
             preview,
         )
-        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_service.snapshot().generation, 1)
 
         self.assertEqual(
             server._publish_accepted_block_payout_preview(parent_hash, preview),
             preview,
         )
-        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_service.snapshot().generation, 1)
         with self.assertRaisesRegex(RuntimeError, "changed during retry"):
             server._publish_accepted_block_payout_preview(
                 parent_hash,
@@ -126,21 +126,21 @@ class JobBundleCacheTests(unittest.TestCase):
             parent_hash,
             invalidate_published=True,
         )
-        self.assertEqual(server._payout_state_generation, 2)
-        self.assertEqual(server._accepted_block_payout_previews, {})
+        self.assertEqual(server._payout_state_service.snapshot().generation, 2)
+        self.assertEqual(server._payout_state_service.previews, {})
         self.assertEqual(
-            server._invalidated_accepted_block_payout_previews,
+            server._payout_state_service.invalidated_previews,
             {parent_hash: None},
         )
         with self.assertRaisesRegex(TemplateRefreshBlocked, "was withdrawn"):
             server._prior_balances_for_job_parent(parent_hash)
 
         server._begin_accepted_block_payout_preview(parent_hash)
-        self.assertEqual(server._invalidated_accepted_block_payout_previews, {})
+        self.assertEqual(server._payout_state_service.invalidated_previews, {})
         server._clear_accepted_block_payout_preview(parent_hash)
     def test_unpublished_parent_preview_retries_and_reopens_delivery(self) -> None:
         server, _rpc = coordinator()
-        server.payout_reconcile_supersession_retries = 2
+        server._payout_state_service.set_reconcile_retries_for_test(2)
         parent_hash = "ac" * 32
         preview = [
             {
@@ -153,8 +153,8 @@ class JobBundleCacheTests(unittest.TestCase):
 
         server._begin_accepted_block_payout_preview(parent_hash)
         with patch.object(
-            server,
-            "_publish_payout_state_candidate",
+            server._payout_state_service,
+            "publish_candidate",
             return_value=None,
         ) as publish_candidate:
             self.assertEqual(
@@ -162,24 +162,24 @@ class JobBundleCacheTests(unittest.TestCase):
                 preview,
             )
 
-        transition = server._accepted_block_payout_previews[parent_hash]
+        transition = server._payout_state_service.previews[parent_hash]
         self.assertEqual(publish_candidate.call_count, 3)
         self.assertIsNotNone(transition.preview)
         self.assertIsNone(transition.published_generation)
-        self.assertEqual(server._payout_state_generation, 0)
+        self.assertEqual(server._payout_state_service.snapshot().generation, 0)
         self.assertTrue(server._payout_state_publication_fenced())
-        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertTrue(server._payout_state_service.delivery_gate._delivery_blocked)
 
         self.assertEqual(
             server._publish_accepted_block_payout_preview(parent_hash, preview),
             preview,
         )
 
-        transition = server._accepted_block_payout_previews[parent_hash]
+        transition = server._payout_state_service.previews[parent_hash]
         self.assertEqual(transition.published_generation, 1)
-        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_service.snapshot().generation, 1)
         self.assertFalse(server._payout_state_publication_fenced())
-        self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertFalse(server._payout_state_service.delivery_gate._delivery_blocked)
     def test_withdrawn_landed_transition_blocks_active_descendant_fallback(
         self,
     ) -> None:
@@ -227,7 +227,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 parent_height=11,
             )
         self.assertEqual(ledger.current_balance_reads, 0)
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
     def test_inactive_landed_ancestor_rejects_preview_patched_artifact(
         self,
     ) -> None:
@@ -257,8 +257,8 @@ class JobBundleCacheTests(unittest.TestCase):
             block_height=10,
         )
         server._publish_accepted_block_payout_preview(accepted_hash, preview)
-        with server._job_cache_lock:
-            artifact = server._payout_ledger_artifact
+        with server._ensure_job_bundle_service()._cache_lock:
+            artifact = server._payout_state_service.snapshot().ledger_artifact
         self.assertIsNotNone(artifact)
         assert artifact is not None
         self.assertEqual(list(artifact.prior_balances), preview)
@@ -283,7 +283,7 @@ class JobBundleCacheTests(unittest.TestCase):
             server.shared_job_bundle(artifacts, mode="ready")
 
         self.assertEqual(recorded["calls"], 0)
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
     def test_waiting_child_does_not_fall_back_after_transition_withdrawal(
         self,
     ) -> None:
@@ -309,8 +309,8 @@ class JobBundleCacheTests(unittest.TestCase):
         server, _rpc = coordinator(ledger=ledger)
         parent_hash = "be" * 32
         preview_condition = ObservedCondition()
-        server._accepted_block_payout_preview_condition = preview_condition
-        server.accepted_block_payout_preview_wait_seconds = 10
+        server._payout_state_service.preview_condition = preview_condition
+        server._payout_state_service.set_preview_wait_seconds_for_test(10)
         server._begin_accepted_block_payout_preview(
             parent_hash,
             block_height=10,
@@ -350,13 +350,13 @@ class JobBundleCacheTests(unittest.TestCase):
     def test_pending_parent_preview_wait_is_bounded_and_retryable(self) -> None:
         server, _rpc = coordinator()
         parent_hash = "ac" * 32
-        server.accepted_block_payout_preview_wait_seconds = 0.01
+        server._payout_state_service.set_preview_wait_seconds_for_test(0.01)
         server._begin_accepted_block_payout_preview(parent_hash)
 
         with self.assertRaisesRegex(TemplateRefreshBlocked, "not ready"):
             server._prior_balances_for_job_parent(parent_hash)
 
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
         server._clear_accepted_block_payout_preview(parent_hash)
     def test_replayed_active_ancestor_blocks_descendant_until_preview(self) -> None:
         class PreviewLedger(FakeLedger):
@@ -402,8 +402,8 @@ class JobBundleCacheTests(unittest.TestCase):
 
         rpc.call = active_chain_call  # type: ignore[method-assign]
         preview_condition = ObservedCondition()
-        server._accepted_block_payout_preview_condition = preview_condition
-        server.accepted_block_payout_preview_wait_seconds = 10
+        server._payout_state_service.preview_condition = preview_condition
+        server._payout_state_service.set_preview_wait_seconds_for_test(10)
         server._begin_accepted_block_payout_preview(accepted_hash, block_height=10)
         balances: list[list[dict[str, object]]] = []
         errors: list[BaseException] = []
@@ -456,7 +456,8 @@ class JobBundleCacheTests(unittest.TestCase):
         assert artifacts is not None
         first_lookup_entered = threading.Event()
         release_first_lookup = threading.Event()
-        original_lookup = server._lookup_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_lookup = service.lookup_bundle
         lookup_calls = 0
 
         def block_first_lookup(key: tuple[object, ...]) -> object:
@@ -467,7 +468,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 self.assertTrue(release_first_lookup.wait(2.0))
             return original_lookup(key)
 
-        server._lookup_job_bundle = block_first_lookup  # type: ignore[method-assign]
+        service.lookup_bundle = block_first_lookup  # type: ignore[method-assign]
         bundles: list[object] = []
         errors: list[BaseException] = []
 
@@ -504,23 +505,18 @@ class JobBundleCacheTests(unittest.TestCase):
             def cancel(self) -> None:
                 cancellations.append("cancelled")
 
-        class InjectCurrentFanoutLock:
-            def __enter__(self) -> object:
-                server._active_tip_refresh = (CurrentToken(), Cancellation())
-                return self
-
-            def __exit__(self, *_args: object) -> None:
-                return None
-
-        # Model a new-generation refresh registering after the cache-state
-        # increment but before the invalidator reaches the coordinator lock.
-        server.lock = InjectCurrentFanoutLock()  # type: ignore[assignment]
+        # Model a new-generation refresh already registered when the payout
+        # invalidation callback reaches the R1 owner.
+        server._ensure_tip_refresh_service().seed_active_refresh_for_test(
+            CurrentToken(),  # type: ignore[arg-type]
+            Cancellation(),  # type: ignore[arg-type]
+        )
 
         self.assertEqual(server._advance_payout_state_generation(), 1)
         self.assertEqual(cancellations, [])
         self.assertFalse(server.tip_refresh_is_pending())
-        self.assertFalse(server._tip_refresh_retry.is_set())
-    def test_payout_generation_retry_marks_tip_refresh_pending(self) -> None:
+        self.assertFalse(server._ensure_tip_refresh_service().snapshot().retry_requested)
+    def test_payout_generation_marks_pending_without_duplicate_retry(self) -> None:
         server, _rpc = coordinator()
         server._ensure_tip_refresh_state()
 
@@ -528,14 +524,18 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(server._advance_payout_state_generation(), 1)
 
         self.assertTrue(server.tip_refresh_is_pending())
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertFalse(server._ensure_tip_refresh_service().snapshot().retry_requested)
+        scheduler = server._ensure_tip_refresh_service().scheduler_snapshot()
+        self.assertIsNone(scheduler.active)
+        self.assertIsNone(scheduler.pending)
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         self.assertFalse(server.tip_refresh_is_pending())
     def test_payout_only_advance_bounds_publish_supersession(self) -> None:
         server, _rpc = coordinator()
-        server.payout_reconcile_supersession_retries = 2
-        real_publish = server._publish_payout_state_candidate
+        service = server._payout_state_service
+        service.set_reconcile_retries_for_test(2)
+        real_publish = service.publish_candidate
         publish_attempts = 0
 
         def supersede_before_publish(candidate: object) -> int | None:
@@ -547,7 +547,7 @@ class JobBundleCacheTests(unittest.TestCase):
             )
             return real_publish(candidate)  # type: ignore[arg-type]
 
-        server._publish_payout_state_candidate = supersede_before_publish  # type: ignore[method-assign]
+        service.publish_candidate = supersede_before_publish  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(
             TemplateRefreshBlocked,
@@ -556,9 +556,9 @@ class JobBundleCacheTests(unittest.TestCase):
             server._advance_payout_state_generation()
 
         self.assertEqual(publish_attempts, 3)
-        self.assertEqual(server._payout_state_generation, 0)
-        self.assertTrue(server._payout_state_publication_blocked)
-        self.assertTrue(server._payout_state_delivery_gate._delivery_blocked)
+        self.assertEqual(server._payout_state_service.snapshot().generation, 0)
+        self.assertTrue(server._payout_state_service.snapshot().publication_blocked)
+        self.assertTrue(server._payout_state_service.delivery_gate._delivery_blocked)
         self.assertTrue(server.tip_refresh_is_pending())
     def test_payout_publication_fence_is_not_a_job_build_failure(self) -> None:
         server, _rpc = coordinator()
@@ -566,7 +566,7 @@ class JobBundleCacheTests(unittest.TestCase):
         state = client(1)
         state.send = lambda _payload: None  # type: ignore[method-assign]
         server.clients = {state}
-        server._pool_ready_latched = True
+        server._ensure_job_bundle_service().set_ready_for_test(True)
         server._reserve_payout_state_source("payout_only")
         server._block_payout_state_publication()
 
@@ -574,9 +574,9 @@ class JobBundleCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(TemplateRefreshBlocked, "pending publication"):
             server.poll_qbit_tip_template_once()
 
-        self.assertEqual(server.job_build_failure_count, 0)
-        self.assertEqual(server.tip_refresh_client_counts["failed"], 0)
-        self.assertEqual(server.tip_refresh_client_counts["skipped"], 1)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 0)
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["client_counts"]["failed"], 0)
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["client_counts"]["skipped"], 1)
     def test_successful_poll_clears_payout_pending_created_during_reconcile(self) -> None:
         server, _rpc = coordinator()
         server._ensure_tip_refresh_state()
@@ -611,7 +611,7 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(poll_thread.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(results, [0])
-        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_service.snapshot().generation, 1)
         self.assertIsNotNone(server.last_successful_template_refresh_monotonic)
         self.assertFalse(server.tip_refresh_is_pending())
     def test_failed_poll_preserves_pending_signal_until_successful_retry(self) -> None:
@@ -631,12 +631,12 @@ class JobBundleCacheTests(unittest.TestCase):
         ):
             server.poll_qbit_tip_template_once()
 
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
         self.assertTrue(server.tip_refresh_is_pending())
-        self.assertEqual(server._tip_refresh_pending_token, pending_token)
+        self.assertEqual(server._ensure_tip_refresh_service().snapshot().pending_token, pending_token)
 
         # Model blockpoll claiming the immediate wake and completing the retry.
-        server._tip_refresh_retry.clear()
+        server._ensure_tip_refresh_service().clear_retry_for_test()
         server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
@@ -669,9 +669,12 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         with server.lock:
             server.tip_template_snapshot = snapshot
-        completed_generation = server._payout_state_generation
-        self.assertEqual(server._advance_payout_state_generation(), 1)
-        newer_token = server._tip_refresh_pending_token
+        completed_generation = server._payout_state_service.snapshot().generation
+        tip_refresh = server._ensure_tip_refresh_service()
+        with tip_refresh.suppress_trigger_callbacks_for_test():
+            self.assertEqual(server._advance_payout_state_generation(), 1)
+        server._mark_tip_refresh_pending(1)
+        newer_token = server._ensure_tip_refresh_service().snapshot().pending_token
 
         self.assertFalse(
             server._clear_tip_refresh_pending_for_completed_refresh(
@@ -680,7 +683,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 completed_generation,
             )
         )
-        self.assertEqual(server._tip_refresh_pending_token, newer_token)
+        self.assertEqual(server._ensure_tip_refresh_service().snapshot().pending_token, newer_token)
         self.assertTrue(server.tip_refresh_is_pending())
     @staticmethod
     def _capture_error(

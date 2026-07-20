@@ -44,23 +44,28 @@ class FailedTipRefreshSpacingTests(unittest.TestCase):
         server.clients = set()
         server.blockpoll_seconds = 30.0
         server.tip_refresh_failure_holdoff_seconds = 0.3
+        service = server._ensure_tip_refresh_service()
+        service.reconfigure_for_test(
+            blockpoll_seconds=30.0,
+            failure_holdoff_seconds=0.3,
+        )
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
-        self.assertEqual(server._tip_refresh_failure_holdoff_remaining(), 0.0)
+        self.assertEqual(service.failure_holdoff_remaining(), 0.0)
 
         _block_refreshes(server)
-        with patch("lab.prism.prism_coordinator.random.uniform", return_value=0.0):
+        with patch("lab.prism.tip_refresh.random.uniform", return_value=0.0):
             self._fail_one_poll(server)
-        deadline = server._tip_refresh_failure_holdoff_until
+        deadline = service._failure_holdoff_until
         self.assertIsNotNone(deadline)
         assert deadline is not None
-        self.assertGreater(server._tip_refresh_failure_holdoff_remaining(), 0.0)
+        self.assertGreater(service.failure_holdoff_remaining(), 0.0)
 
         server._schedule_tip_refresh_retry()
         self.assertTrue(server._wait_for_blockpoll_trigger())
         # The trigger only released after the spacing window, never before.
         self.assertGreaterEqual(time.monotonic(), deadline)
-        self.assertFalse(server._tip_refresh_retry.is_set())
+        self.assertFalse(service._retry_event.is_set())
 
     def test_holdoff_wait_keeps_blockpoll_heartbeat_alive(self) -> None:
         server, _rpc = coordinator()
@@ -68,10 +73,14 @@ class FailedTipRefreshSpacingTests(unittest.TestCase):
         server.clients = set()
         server.blockpoll_seconds = 30.0
         server.tip_refresh_failure_holdoff_seconds = 0.4
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=30.0,
+            failure_holdoff_seconds=0.4,
+        )
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         _block_refreshes(server)
-        with patch("lab.prism.prism_coordinator.random.uniform", return_value=0.0):
+        with patch("lab.prism.tip_refresh.random.uniform", return_value=0.0):
             self._fail_one_poll(server)
 
         server._schedule_tip_refresh_retry()
@@ -88,6 +97,9 @@ class FailedTipRefreshSpacingTests(unittest.TestCase):
     def test_trigger_without_prior_failure_stays_immediate(self) -> None:
         server, _rpc = coordinator()
         server.blockpoll_seconds = 30.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=30.0
+        )
 
         server._schedule_tip_refresh_retry()
         started = time.monotonic()
@@ -100,17 +112,22 @@ class FailedTipRefreshSpacingTests(unittest.TestCase):
         server.clients = set()
         server.blockpoll_seconds = 30.0
         server.tip_refresh_failure_holdoff_seconds = 30.0
+        service = server._ensure_tip_refresh_service()
+        service.reconfigure_for_test(
+            blockpoll_seconds=30.0,
+            failure_holdoff_seconds=30.0,
+        )
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         _block_refreshes(server)
         self._fail_one_poll(server)
-        self.assertGreater(server._tip_refresh_failure_holdoff_remaining(), 0.0)
+        self.assertGreater(service.failure_holdoff_remaining(), 0.0)
 
         # Blockwait's push path: record the detection, then arm the poller
         # trigger. The armed holdoff must not delay that wake even though the
         # newer tip is not yet published as share-validation authority.
         self.assertTrue(server.observe_tip_for_refresh(NEW_TIP))
-        self.assertEqual(server._tip_refresh_failure_holdoff_remaining(), 0.0)
+        self.assertEqual(service.failure_holdoff_remaining(), 0.0)
         server._schedule_tip_refresh_retry()
         started = time.monotonic()
         self.assertTrue(server._wait_for_blockpoll_trigger())
@@ -123,6 +140,14 @@ class FailedTipRefreshSpacingTests(unittest.TestCase):
         server.blockpoll_seconds = 30.0
         server.tip_refresh_failure_holdoff_seconds = 30.0
         server.template_cache_seconds = 0.0
+        server._ensure_job_bundle_service().template_repository.set_cache_seconds_for_test(
+            0.0
+        )
+        service = server._ensure_tip_refresh_service()
+        service.reconfigure_for_test(
+            blockpoll_seconds=30.0,
+            failure_holdoff_seconds=30.0,
+        )
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
 
@@ -148,45 +173,51 @@ class FailedTipRefreshSpacingTests(unittest.TestCase):
 
         # The failed pass recorded its discovery, so the newer tip's retry
         # is not held for the spacing window.
-        self.assertEqual(server._tip_refresh_failure_holdoff_remaining(), 0.0)
+        self.assertEqual(service.failure_holdoff_remaining(), 0.0)
 
     def test_successful_pass_clears_the_holdoff(self) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)
         server.clients = set()
         server.tip_refresh_failure_holdoff_seconds = 30.0
+        service = server._ensure_tip_refresh_service()
+        service.reconfigure_for_test(failure_holdoff_seconds=30.0)
         original_reconcile = server.ensure_reorg_reconciled_for_tip
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         _block_refreshes(server)
         self._fail_one_poll(server)
-        self.assertGreater(server._tip_refresh_failure_holdoff_remaining(), 0.0)
+        self.assertGreater(service.failure_holdoff_remaining(), 0.0)
 
         server.ensure_reorg_reconciled_for_tip = original_reconcile  # type: ignore[method-assign]
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
-        self.assertIsNone(server._tip_refresh_failure_holdoff_until)
-        self.assertEqual(server._tip_refresh_failure_holdoff_remaining(), 0.0)
+        self.assertIsNone(service._failure_holdoff_until)
+        self.assertEqual(service.failure_holdoff_remaining(), 0.0)
 
     def test_zero_holdoff_restores_unspaced_retries(self) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)
         server.clients = set()
         server.tip_refresh_failure_holdoff_seconds = 0.0
+        service = server._ensure_tip_refresh_service()
+        service.reconfigure_for_test(failure_holdoff_seconds=0.0)
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         _block_refreshes(server)
         self._fail_one_poll(server)
 
-        self.assertIsNone(server._tip_refresh_failure_holdoff_until)
-        self.assertEqual(server._tip_refresh_failure_holdoff_remaining(), 0.0)
+        self.assertIsNone(service._failure_holdoff_until)
+        self.assertEqual(service.failure_holdoff_remaining(), 0.0)
 
     def test_holdoff_includes_bounded_jitter(self) -> None:
         server, _rpc = coordinator()
         server.tip_refresh_failure_holdoff_seconds = 1.0
+        service = server._ensure_tip_refresh_service()
+        service.reconfigure_for_test(failure_holdoff_seconds=1.0)
 
         before = time.monotonic()
-        server._note_tip_refresh_attempt_failed()
-        deadline = server._tip_refresh_failure_holdoff_until
+        service.note_attempt_failed()
+        deadline = service._failure_holdoff_until
 
         self.assertIsNotNone(deadline)
         assert deadline is not None
@@ -212,7 +243,8 @@ class SameTipTemplateReuseTests(unittest.TestCase):
             server.shutdown_tip_refresh_executor()
 
         self.assertEqual(rpc.count("getblocktemplate"), 1)
-        self.assertEqual(server.job_cache_hit_counts["template"], 1)
+        metrics = server._ensure_job_bundle_service().metrics_snapshot()
+        self.assertEqual(metrics["hit_counts"]["template"], 1)
         # The reused pass rebuilt nothing: the client's job is still the one
         # delivered from the originally fetched template.
         self.assertEqual(
@@ -234,7 +266,8 @@ class SameTipTemplateReuseTests(unittest.TestCase):
                 server.poll_qbit_tip_template_once()
 
         self.assertEqual(rpc.count("getblocktemplate"), 1)
-        self.assertEqual(server.job_cache_hit_counts["template"], 5)
+        metrics = server._ensure_job_bundle_service().metrics_snapshot()
+        self.assertEqual(metrics["hit_counts"]["template"], 5)
 
     def test_tip_change_bypasses_template_reuse(self) -> None:
         server, rpc = coordinator()
@@ -257,18 +290,25 @@ class SameTipTemplateReuseTests(unittest.TestCase):
         install_fake_bundle_builder(server)
         server.clients = set()
         server.template_cache_seconds = 0.0
+        server._ensure_job_bundle_service().template_repository.set_cache_seconds_for_test(
+            0.0
+        )
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
 
         self.assertEqual(rpc.count("getblocktemplate"), 2)
-        self.assertEqual(server.job_cache_hit_counts["template"], 0)
+        metrics = server._ensure_job_bundle_service().metrics_snapshot()
+        self.assertEqual(metrics["hit_counts"]["template"], 0)
 
     def test_expired_window_refetches_the_template(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.clients = set()
         server.template_cache_seconds = 0.05
+        server._ensure_job_bundle_service().template_repository.set_cache_seconds_for_test(
+            0.05
+        )
 
         self.assertEqual(server.poll_qbit_tip_template_once(), 0)
         time.sleep(0.06)

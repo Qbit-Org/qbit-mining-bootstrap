@@ -35,16 +35,14 @@ def wait_until(predicate: object, *, timeout: float = 10.0) -> None:
 class PrismInitialJobDeliveryTests(unittest.TestCase):
     def test_blocked_startup_prewarm_defers_to_background_refresh(self) -> None:
         server, _rpc = coordinator()
-        retry_scheduled = threading.Event()
-
         def blocked() -> object:
             raise TemplateRefreshBlocked("template raced startup")
 
-        server.prewarm_current_tip_ready_bundle = blocked  # type: ignore[method-assign]
-        server._schedule_tip_refresh_retry = retry_scheduled.set  # type: ignore[method-assign]
+        tip_refresh = server._ensure_tip_refresh_service()
+        tip_refresh.prewarm_current_tip_ready_bundle = blocked  # type: ignore[method-assign]
 
         self.assertIsNone(server.prewarm_startup_jobs())
-        self.assertTrue(retry_scheduled.is_set())
+        self.assertTrue(tip_refresh.snapshot().retry_requested)
 
     def test_startup_prewarm_builds_worker_independent_ready_bundle(self) -> None:
         server, rpc = coordinator()
@@ -68,7 +66,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertEqual(recorded["calls"], 1)
         self.assertEqual(server.ledger.snapshot_calls, 1)
         self.assertEqual(server.tip_template_snapshot.bestblockhash, rpc.tip)
-        self.assertIs(server._prepared_ready_bundle, bundle)
+        self.assertIs(server._ensure_job_bundle_service()._prepared_ready_bundle, bundle)
         self.assertEqual(
             recorded["suffixes"],
             [
@@ -142,7 +140,8 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             return reorg_attempts > 1
 
         artifact_attempts = 0
-        original_artifacts = server.current_template_artifacts
+        repository = server._ensure_job_bundle_service().template_repository
+        original_artifacts = repository.current
 
         def transient_artifacts() -> object:
             nonlocal artifact_attempts
@@ -152,7 +151,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             return original_artifacts()
 
         server.ensure_reorg_reconciled_for_current_tip = transient_reorg  # type: ignore[method-assign]
-        server.current_template_artifacts = transient_artifacts  # type: ignore[method-assign]
+        repository.current = transient_artifacts  # type: ignore[method-assign]
 
         server.request_initial_job_delivery(state)
         try:
@@ -162,7 +161,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
 
         self.assertEqual(reorg_attempts, 3)
         self.assertEqual(artifact_attempts, 2)
-        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 1)
         self.assertIn(state, server.clients)
         self.assertEqual(
             server.progress_health_snapshot()["eligible_clients_requiring_refresh"],
@@ -188,6 +187,9 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             - 1.0
         )
         server.template_refresh_failure_exit_seconds = 0.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         request = PendingInitialJob(
             client=state,
             authorization_generation=1,
@@ -220,8 +222,9 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
 
         deliveries = iter((None, True))
         rpc.call = tip_churn_once  # type: ignore[method-assign]
-        server.current_template_artifacts = lambda: artifacts  # type: ignore[method-assign]
-        server.shared_job_bundle = lambda *_args, **_kwargs: bundle  # type: ignore[method-assign]
+        service = server._ensure_job_bundle_service()
+        service.template_repository.current = lambda: artifacts  # type: ignore[method-assign]
+        service.shared_job_bundle = lambda *_args, **_kwargs: bundle  # type: ignore[method-assign]
         server._deliver_initial_bundle = (  # type: ignore[method-assign]
             lambda *_args: next(deliveries)
         )
@@ -269,8 +272,9 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             return original_call(method, params)
 
         rpc.call = churned_tip  # type: ignore[method-assign]
-        server.current_template_artifacts = lambda: artifacts  # type: ignore[method-assign]
-        server.shared_job_bundle = lambda *_args, **_kwargs: bundle  # type: ignore[method-assign]
+        service = server._ensure_job_bundle_service()
+        service.template_repository.current = lambda: artifacts  # type: ignore[method-assign]
+        service.shared_job_bundle = lambda *_args, **_kwargs: bundle  # type: ignore[method-assign]
         server._deliver_initial_bundle = (  # type: ignore[method-assign]
             lambda *_args: True
         )
@@ -290,16 +294,19 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         server, _rpc = coordinator()
         recorded = install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 8
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         server.stratum_max_pending_initial_jobs = 250
         server.prewarm_current_tip_ready_bundle()
-        with server._job_cache_lock:
-            server._job_bundle_cache.clear()
-            server._prepared_ready_bundle = None
-            server._prepared_ready_snapshot = None
+        service = server._ensure_job_bundle_service()
+        with service._cache_lock:
+            service._bundle_cache.clear()
+        service.clear_prepared_ready()
 
         build_entered = threading.Event()
         release_build = threading.Event()
-        original_build = server.build_shared_job_bundle
+        original_build = service.build_shared_job_bundle
         build_calls = 0
         build_calls_lock = threading.Lock()
 
@@ -311,7 +318,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             self.assertTrue(release_build.wait(10))
             return original_build(*args, **kwargs)  # type: ignore[arg-type]
 
-        server.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
         clients = [client(index + 1) for index in range(250)]
         now = time.monotonic()
         for state in clients:
@@ -375,19 +382,20 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)
         server.prewarm_current_tip_ready_bundle()
-        with server._job_cache_lock:
-            server._job_bundle_cache.clear()
+        with server._ensure_job_bundle_service()._cache_lock:
+            server._ensure_job_bundle_service()._bundle_cache.clear()
 
         build_entered = threading.Event()
         release_build = threading.Event()
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
 
         def blocked_build(*args: object, **kwargs: object) -> object:
             build_entered.set()
             self.assertTrue(release_build.wait(5))
             return original_build(*args, **kwargs)  # type: ignore[arg-type]
 
-        server.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
         state = client(1, worker(username="old-worker"))
         state.authorization_generation = 1
         state.authorized_monotonic = time.monotonic()
@@ -419,12 +427,13 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)
         server.prewarm_current_tip_ready_bundle()
-        with server._job_cache_lock:
-            server._job_bundle_cache.clear()
+        with server._ensure_job_bundle_service()._cache_lock:
+            server._ensure_job_bundle_service()._bundle_cache.clear()
 
         build_entered = threading.Event()
         release_build = threading.Event()
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
         build_calls = 0
 
         def blocked_build(*args: object, **kwargs: object) -> object:
@@ -435,7 +444,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
                 self.assertTrue(release_build.wait(5))
             return original_build(*args, **kwargs)  # type: ignore[arg-type]
 
-        server.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
         state = client(1)
         state.authorization_generation = 1
         state.authorized_monotonic = time.monotonic()
@@ -486,7 +495,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertNotEqual(first.active_job.worker, second.active_job.worker)
         collection_keys = {
             key
-            for key in server._job_bundle_cache
+            for key in server._ensure_job_bundle_service()._bundle_cache
             if len(key) >= 8 and key[2] == "collection"
         }
         self.assertEqual(
@@ -500,12 +509,13 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         server, rpc = coordinator(template=base_template(prevhash=tip_a))
         install_fake_bundle_builder(server)
         server.prewarm_current_tip_ready_bundle()
-        with server._job_cache_lock:
-            server._job_bundle_cache.clear()
+        with server._ensure_job_bundle_service()._cache_lock:
+            server._ensure_job_bundle_service()._bundle_cache.clear()
 
         first_build_entered = threading.Event()
         release_first_build = threading.Event()
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
         build_count = 0
         build_lock = threading.Lock()
 
@@ -519,7 +529,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
                 self.assertTrue(release_first_build.wait(10))
             return original_build(*args, **kwargs)  # type: ignore[arg-type]
 
-        server.build_shared_job_bundle = block_first_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = block_first_build  # type: ignore[method-assign]
         state = client(1)
         state.authorization_generation = 1
         state.authorized_monotonic = time.monotonic()
@@ -546,7 +556,10 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
 
         self.assertGreaterEqual(build_count, 2)
         self.assertEqual(state.active_job.template["previousblockhash"], tip_b)
-        self.assertGreaterEqual(server.shared_bundle_build_counts["superseded"], 1)
+        build_counts = server._ensure_job_bundle_service().shared_preparation_metrics()[
+            "build_counts"
+        ]
+        self.assertGreaterEqual(build_counts["superseded"], 1)
 
     def test_health_turns_non_green_after_stalled_delivery_deadline(self) -> None:
         server, _rpc = coordinator()

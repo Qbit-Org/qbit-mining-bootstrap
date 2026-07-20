@@ -44,8 +44,8 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
         # The issued time is frozen per template generation; drop the frozen
         # entry so the rebuild stamps a fresh anchor now that no commit is
         # pending.
-        with server._job_cache_lock:
-            server._job_build_issued_at_ms.clear()
+        with server._ensure_job_bundle_service()._cache_lock:
+            server._ensure_job_bundle_service()._issued_at_ms.clear()
         rebuilt = server.build_shared_job_bundle(
             server.current_template_artifacts(),
             worker(),
@@ -79,8 +79,8 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
         server._finish_pending_share_commit(share)
         # Construction re-validates that the passed artifact is the installed
         # current one.
-        with server._job_cache_lock:
-            server._payout_ledger_artifact = artifact
+        with server._payout_state_service._lock:
+            server._payout_state_service._ledger_artifact = artifact
         bundle = server.build_shared_job_bundle(
             artifacts,
             worker(),
@@ -153,7 +153,7 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertTrue(
             all(context.prospective_prior_balances == () for context in contexts)
         )
-        cached = next(iter(server._job_bundle_cache.values()))
+        cached = next(iter(server._ensure_job_bundle_service()._bundle_cache.values()))
         self.assertFalse(hasattr(cached, "bundle"))
         self.assertEqual(cached.prospective_prior_balances, ())
         self.assertEqual(
@@ -250,13 +250,14 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(context.template_fingerprint, qbit_template_fingerprint(new_template))
         # Bundles for the old fingerprint are evicted.
         self.assertEqual(
-            {entry.template_fingerprint for entry in server._job_bundle_cache.values()},
+            {entry.template_fingerprint for entry in server._ensure_job_bundle_service()._bundle_cache.values()},
             {qbit_template_fingerprint(new_template)},
         )
     def test_bundle_cache_ttl_expiry_rebuilds(self) -> None:
         server, _ = coordinator()
         recorded = install_fake_bundle_builder(server)
         server.job_bundle_cache_seconds = 0.05
+        server._ensure_job_bundle_service().set_cache_seconds_for_test(0.05)
 
         server.build_job_for_client(client(1), clean_jobs=True)
         time.sleep(0.06)
@@ -276,17 +277,18 @@ class JobBundleCacheTests(unittest.TestCase):
             template_fingerprint="expired-template",
             built_monotonic=time.monotonic() - 60,
         )
-        server._job_bundle_cache[expired_key] = expired
+        server._ensure_job_bundle_service()._bundle_cache[expired_key] = expired
 
         looked_up = server._lookup_job_bundle(current.key)
 
         self.assertIs(looked_up, current)
-        self.assertNotIn(expired_key, server._job_bundle_cache)
-        self.assertEqual(list(server._job_bundle_cache.values()), [current])
+        self.assertNotIn(expired_key, server._ensure_job_bundle_service()._bundle_cache)
+        self.assertEqual(list(server._ensure_job_bundle_service()._bundle_cache.values()), [current])
     def test_zero_ttl_disables_bundle_cache(self) -> None:
         server, _ = coordinator()
         recorded = install_fake_bundle_builder(server)
         server.job_bundle_cache_seconds = 0.0
+        server._ensure_job_bundle_service().set_cache_seconds_for_test(0.0)
 
         server.build_job_for_client(client(1), clean_jobs=True)
         server.build_job_for_client(client(2), clean_jobs=True)
@@ -299,7 +301,8 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertIsNotNone(artifacts)
         assert artifacts is not None
         identity = worker()
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
         built_generations: list[int] = []
 
         def mutate_after_first_build(
@@ -317,7 +320,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 server._advance_payout_state_generation()
             return bundle
 
-        server.build_shared_job_bundle = mutate_after_first_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = mutate_after_first_build  # type: ignore[method-assign]
 
         bundle = server.shared_job_bundle(artifacts, identity)
         cached = server.shared_job_bundle(artifacts, identity)
@@ -349,8 +352,8 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
         self.assertEqual(sent, [])
         self.assertIsNone(state.active_job)
-        self.assertEqual(server._payout_state_generation, 1)
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertEqual(server._payout_state_service._generation, 1)
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
 
         self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
         self.assertIsNotNone(state.active_job)
@@ -372,7 +375,7 @@ class JobBundleCacheTests(unittest.TestCase):
         server.build_job_for_client = (  # type: ignore[method-assign]
             lambda *_args, **_kwargs: context
         )
-        original_lock = server._job_cache_lock
+        original_lock = server._payout_state_service._lock
 
         class PublishAfterPrioritySnapshot:
             advanced = False
@@ -390,7 +393,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 original_lock.release()
                 if not self.advanced:
                     self.advanced = True
-                    server._payout_state_generation = 1
+                    server._payout_state_service._generation = 1
 
         priorities: list[bool] = []
 
@@ -406,16 +409,17 @@ class JobBundleCacheTests(unittest.TestCase):
                 priorities.append(priority)
                 yield False
 
-        server._job_cache_lock = PublishAfterPrioritySnapshot()  # type: ignore[assignment]
-        server._payout_state_delivery_gate = RecordingGate()  # type: ignore[assignment]
+        server._payout_state_service._lock = PublishAfterPrioritySnapshot()  # type: ignore[assignment]
+        server._payout_state_service._delivery_gate = RecordingGate()  # type: ignore[assignment]
 
         self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
         self.assertEqual(priorities, [True])
-        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._payout_state_service._generation, 1)
     def test_zero_template_ttl_fetches_template_per_build(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.template_cache_seconds = 0.0
+        server._ensure_job_bundle_service().template_repository.set_cache_seconds_for_test(0.0)
 
         server.build_job_for_client(client(1), clean_jobs=True)
         server.build_job_for_client(client(2), clean_jobs=True)
@@ -424,6 +428,7 @@ class JobBundleCacheTests(unittest.TestCase):
     def test_late_stale_template_fetch_cannot_replace_newer_artifacts(self) -> None:
         server, rpc = coordinator()
         server.template_cache_seconds = 0.0
+        server._ensure_job_bundle_service().template_repository.set_cache_seconds_for_test(0.0)
         stale_template = dict(rpc.template)
         current_template = base_template(height=11, prevhash="22" * 32)
         fetch_started = threading.Event()
@@ -466,7 +471,10 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(results, [current_artifacts])
-        self.assertIs(server._template_artifacts, current_artifacts)
+        self.assertIs(
+            server._ensure_job_bundle_service().template_repository.current_artifacts(),
+            current_artifacts,
+        )
         self.assertEqual(
             current_artifacts.fingerprint,
             qbit_template_fingerprint(current_template),
@@ -475,6 +483,7 @@ class JobBundleCacheTests(unittest.TestCase):
         server, _ = coordinator(ledger=FakeLedger(miners=["solo"]))
         recorded = install_fake_bundle_builder(server)
         server.min_ready_miners = 3
+        server._ensure_job_bundle_service().set_min_ready_miners_for_test(3)
 
         worker_a = worker(payout="tq1worker-a")
         worker_b = worker(payout="tq1worker-b")
@@ -616,6 +625,9 @@ class JobBundleCacheTests(unittest.TestCase):
             return original_builder(**kwargs)
 
         server.build_audit_bundle = slow_builder  # type: ignore[method-assign]
+        server._ensure_bundle_compiler().build_audit_bundle = (  # type: ignore[method-assign]
+            slow_builder
+        )
         errors: list[BaseException] = []
 
         def build(connection_id: int) -> None:
@@ -677,11 +689,11 @@ class JobBundleCacheTests(unittest.TestCase):
         build_thread.start()
         try:
             self.assertTrue(entered_snapshot.wait(2))
-            mutation_acquired = server._payout_state_prepare_lock.acquire(
+            mutation_acquired = server._payout_state_service._prepare_lock.acquire(
                 blocking=False
             )
             if mutation_acquired:
-                server._payout_state_prepare_lock.release()
+                server._payout_state_service._prepare_lock.release()
             self.assertFalse(mutation_acquired)
         finally:
             release_snapshot.set()
@@ -698,7 +710,7 @@ class JobBundleCacheTests(unittest.TestCase):
         assert first is not None and second is not None
         self.assertEqual(first.fingerprint, second.fingerprint)
         self.assertNotEqual(first.generation, second.generation)
-        payout_generation = server._payout_state_generation
+        payout_generation = server._payout_state_service._generation
 
         with patch(
             "lab.prism.prism_coordinator.now_ms",
@@ -745,10 +757,10 @@ class JobBundleCacheTests(unittest.TestCase):
 
         with patch("lab.prism.prism_coordinator.now_ms", return_value=1_700_000_123_000):
             inline = server.shared_job_bundle(artifacts, mode="ready")
-            with server._job_cache_lock:
-                server._job_bundle_cache.clear()
+            with server._ensure_job_bundle_service()._cache_lock:
+                server._ensure_job_bundle_service()._bundle_cache.clear()
             server._prepare_payout_ledger_artifact(
-                server._payout_state_generation,
+                server._payout_state_service._generation,
                 artifacts.network_difficulty,
             )
             prepared = server.shared_job_bundle(artifacts, mode="ready")
@@ -782,7 +794,7 @@ class JobBundleCacheTests(unittest.TestCase):
         recorded = install_fake_bundle_builder(server)
         artifacts = server.store_template_artifacts(dict(rpc.template))
         assert artifacts is not None
-        server._pool_ready_latched = True
+        server._ensure_job_bundle_service().set_ready_for_test(True)
         parent_hash = str(rpc.template["previousblockhash"])
         parent_height = int(rpc.template["height"]) - 1
         preview = [
@@ -800,13 +812,13 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         server._publish_accepted_block_payout_preview(parent_hash, preview)
 
-        artifact = server._payout_ledger_artifact
+        artifact = server._payout_state_service._ledger_artifact
         self.assertIsNotNone(artifact)
         assert artifact is not None
         self.assertEqual(artifact.prior_balances, tuple(preview))
         self.assertEqual(
             artifact.payout_state_generation,
-            server._payout_state_generation,
+            server._payout_state_service._generation,
         )
         self.assertGreater(artifact.generation, 0)
 
@@ -821,18 +833,18 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         self.assertEqual(ledger.prior_balance_reads, 0)
 
-        payout_generation = server._payout_state_generation
+        payout_generation = server._payout_state_service._generation
         ledger.database_balances = [dict(balance) for balance in preview]
         server._clear_accepted_block_payout_preview(parent_hash)
-        self.assertEqual(server._payout_state_generation, payout_generation)
-        self.assertIs(server._payout_ledger_artifact, artifact)
-        self.assertNotIn(parent_hash, server._accepted_block_payout_previews)
+        self.assertEqual(server._payout_state_service._generation, payout_generation)
+        self.assertIs(server._payout_state_service._ledger_artifact, artifact)
+        self.assertNotIn(parent_hash, server._payout_state_service._previews)
         self.assertNotIn(
             parent_hash,
-            server._invalidated_accepted_block_payout_previews,
+            server._payout_state_service._invalidated_previews,
         )
-        with server._job_cache_lock:
-            server._job_bundle_cache.clear()
+        with server._ensure_job_bundle_service()._cache_lock:
+            server._ensure_job_bundle_service()._bundle_cache.clear()
 
         post_clear_bundle = server.shared_job_bundle(artifacts, mode="ready")
 
@@ -849,7 +861,7 @@ class JobBundleCacheTests(unittest.TestCase):
         snapshot = server.fetch_qbit_tip_template_snapshot()
         assert snapshot.template_artifacts is not None
         server._prepare_payout_ledger_artifact(
-            server._payout_state_generation,
+            server._payout_state_service._generation,
             snapshot.template_artifacts.network_difficulty,
         )
         server.ledger.snapshot_calls = 0
@@ -866,14 +878,14 @@ class JobBundleCacheTests(unittest.TestCase):
         assert artifacts is not None
         server._current_payout_state_artifact()
         server._prepare_payout_ledger_artifact(
-            server._payout_state_generation,
+            server._payout_state_service._generation,
             artifacts.network_difficulty,
         )
-        with server._job_cache_lock:
-            published = server._published_payout_state
+        with server._payout_state_service._lock:
+            published = server._payout_state_service._published
             assert published.artifact is not None
             changed_balances = [{"miner_id": "miner-z", "balance_sats": 1}]
-            server._published_payout_state = dataclass_replace(
+            server._payout_state_service._published = dataclass_replace(
                 published,
                 artifact=dataclass_replace(
                     published.artifact,
@@ -884,11 +896,11 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertIsNone(
             server._usable_payout_ledger_artifact(
-                server._payout_state_generation,
+                server._payout_state_service._generation,
                 artifacts.network_difficulty,
             )
         )
-        self.assertIsNone(server._payout_ledger_artifact)
+        self.assertIsNone(server._payout_state_service._ledger_artifact)
         server.ledger.snapshot_calls = 0
 
         bundle = server.shared_job_bundle(artifacts, mode="ready")
@@ -904,12 +916,15 @@ class JobBundleCacheTests(unittest.TestCase):
         build_started = threading.Event()
 
         def cancelable_builder(**kwargs: object) -> dict[str, object]:
-            control = server._job_build_phase_local.bundle_build_control
+            control = server._ensure_job_bundle_service()._phase_local.bundle_build_control
             build_started.set()
             self.assertTrue(control.cancel_event.wait(2))
             return original_builder(**kwargs)
 
         server.build_audit_bundle = cancelable_builder  # type: ignore[method-assign]
+        server._ensure_bundle_compiler().build_audit_bundle = (  # type: ignore[method-assign]
+            cancelable_builder
+        )
         artifacts = server.store_template_artifacts(dict(rpc.template))
         assert artifacts is not None
         server.observe_tip_first_seen(old_tip, observation_sequence=1)
@@ -930,13 +945,13 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], TemplateRefreshBlocked)
         self.assertEqual(recorded["calls"], 1)
-        self.assertEqual(server._active_job_bundle_builds, {})
-        self.assertEqual(server.tip_refresh_build_inflight, 0)
+        self.assertEqual(server._ensure_job_bundle_service()._active_bundle_builds, {})
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["build_inflight"], 0)
         self.assertFalse(any(
             entry.template_fingerprint == artifacts.fingerprint
-            for entry in server._job_bundle_cache.values()
+            for entry in server._ensure_job_bundle_service()._bundle_cache.values()
         ))
-        self.assertEqual(server.tip_refresh_superseded_results, 1)
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["superseded_results"], 1)
     def test_builder_crash_and_timeout_fail_closed_then_recover(self) -> None:
         server, _rpc = coordinator()
         server.prism_ctv_settlement_config = lambda **_kwargs: None  # type: ignore[method-assign]
@@ -955,7 +970,7 @@ class JobBundleCacheTests(unittest.TestCase):
         }
 
         with patch(
-            "lab.prism.prism_coordinator.prism_tool_command",
+            "lab.prism.bundle_compiler.prism_tool_command",
             return_value=[sys.executable, "-c", "raise SystemExit(7)"],
         ):
             with self.assertRaisesRegex(RuntimeError, "failed"):
@@ -963,7 +978,7 @@ class JobBundleCacheTests(unittest.TestCase):
 
         server.bundle_build_timeout_seconds = 0.01
         with patch(
-            "lab.prism.prism_coordinator.prism_tool_command",
+            "lab.prism.bundle_compiler.prism_tool_command",
             return_value=[
                 sys.executable,
                 "-c",
@@ -979,7 +994,7 @@ class JobBundleCacheTests(unittest.TestCase):
             "json.dump({'recovered': True}, sys.stdout)"
         )
         with patch(
-            "lab.prism.prism_coordinator.prism_tool_command",
+            "lab.prism.bundle_compiler.prism_tool_command",
             return_value=[sys.executable, "-c", recovery_script],
         ):
             recovered = server.build_audit_bundle(**build_kwargs)
@@ -999,7 +1014,7 @@ class JobBundleCacheTests(unittest.TestCase):
         with socket.socket() as parent_socket:
             parent_socket.set_inheritable(True)
             with patch(
-                "lab.prism.prism_coordinator.prism_tool_command",
+                "lab.prism.bundle_compiler.prism_tool_command",
                 return_value=[
                     sys.executable,
                     "-c",
@@ -1026,12 +1041,15 @@ class JobBundleCacheTests(unittest.TestCase):
         starts: queue.Queue[None] = queue.Queue()
 
         def cancelable_builder(**kwargs: object) -> dict[str, object]:
-            control = server._job_build_phase_local.bundle_build_control
+            control = server._ensure_job_bundle_service()._phase_local.bundle_build_control
             starts.put(None)
             self.assertTrue(control.cancel_event.wait(2))
             return original_builder(**kwargs)
 
         server.build_audit_bundle = cancelable_builder  # type: ignore[method-assign]
+        server._ensure_bundle_compiler().build_audit_bundle = (  # type: ignore[method-assign]
+            cancelable_builder
+        )
         current_tip = str(rpc.tip)
         server.observe_tip_first_seen(current_tip, observation_sequence=1)
         errors: list[BaseException] = []
@@ -1058,14 +1076,14 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(len(errors), 8)
         self.assertTrue(all(isinstance(exc, TemplateRefreshBlocked) for exc in errors))
-        self.assertEqual(server._active_job_bundle_builds, {})
-        self.assertEqual(server.tip_refresh_build_inflight, 0)
-        self.assertEqual(server.tip_refresh_build_queue_depth, 0)
+        self.assertEqual(server._ensure_job_bundle_service()._active_bundle_builds, {})
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["build_inflight"], 0)
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["build_queue_depth"], 0)
         self.assertLessEqual(
-            len(server._job_bundle_cache),
+            len(server._ensure_job_bundle_service()._bundle_cache),
             MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
         )
-        self.assertEqual(server.tip_refresh_superseded_results, 8)
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["superseded_results"], 8)
     @staticmethod
     def _capture_error(
         errors: list[BaseException],
@@ -1101,7 +1119,8 @@ class JobBundleCacheTests(unittest.TestCase):
         assert first is not None
         build_entered = threading.Event()
         release_build = threading.Event()
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
         build_calls = 0
         build_calls_lock = threading.Lock()
 
@@ -1113,7 +1132,7 @@ class JobBundleCacheTests(unittest.TestCase):
             self.assertTrue(release_build.wait(5))
             return original_build(*args, **kwargs)  # type: ignore[arg-type]
 
-        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
         results: list[list[object]] = [[], []]
         errors: list[list[BaseException]] = [[], []]
 
@@ -1195,12 +1214,12 @@ class JobBundleCacheTests(unittest.TestCase):
             server._cache_job_bundle_if_current(candidate, artifacts)
 
         self.assertEqual(
-            len(server._job_bundle_cache),
+            len(server._ensure_job_bundle_service()._bundle_cache),
             MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
         )
         self.assertNotIn(
             (artifacts.fingerprint, "test", 0),
-            server._job_bundle_cache,
+            server._ensure_job_bundle_service()._bundle_cache,
         )
     def test_job_bundle_cache_preserves_coordinator_lock_order(self) -> None:
         server, _ = coordinator()
@@ -1209,7 +1228,7 @@ class JobBundleCacheTests(unittest.TestCase):
         assert artifacts is not None
         bundle = server.shared_job_bundle(artifacts, mode="ready")
         observed_cache_lock = ObservedRLock()
-        server._job_cache_lock = observed_cache_lock  # type: ignore[assignment]
+        server._ensure_job_bundle_service()._cache_lock = observed_cache_lock  # type: ignore[assignment]
         errors: list[BaseException] = []
 
         def cache_bundle() -> None:
@@ -1242,7 +1261,7 @@ class JobBundleCacheTests(unittest.TestCase):
         second_template["coinbasevalue"] = int(second_template["coinbasevalue"]) + 1
         second = server.store_template_artifacts(second_template)
         assert first is not None and second is not None
-        payout_generation = server._payout_state_generation
+        payout_generation = server._payout_state_service._generation
 
         def request_for(artifacts: object) -> object:
             return server._new_job_build_request(
@@ -1260,564 +1279,32 @@ class JobBundleCacheTests(unittest.TestCase):
 
         pending = request_for(first)
         newest = request_for(second)
-        server._job_build_active = None
-        server._job_build_retiring = SimpleNamespace(request=pending)
-        server._job_build_pending = pending
-        server._start_job_build_locked = (  # type: ignore[method-assign]
+        server._ensure_job_bundle_service()._active = None
+        server._ensure_job_bundle_service()._retiring = SimpleNamespace(request=pending)
+        server._ensure_job_bundle_service()._pending = pending
+        server._ensure_job_bundle_service()._start_locked = (  # type: ignore[method-assign]
             lambda request: SimpleNamespace(request=request, future=None)
         )
-        server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
+        server._ensure_job_bundle_service()._arm_locked = lambda _flight: None  # type: ignore[method-assign]
 
         promise = server._request_job_build(newest)  # type: ignore[arg-type]
 
         self.assertIs(promise, newest.promise)  # type: ignore[union-attr]
-        self.assertIsNone(server._job_build_pending)
-        assert server._job_build_active is not None
-        self.assertIs(server._job_build_active.request, newest)
+        self.assertIsNone(server._ensure_job_bundle_service()._pending)
+        assert server._ensure_job_bundle_service()._active is not None
+        self.assertIs(server._ensure_job_bundle_service()._active.request, newest)
         self.assertTrue(pending.promise.done())  # type: ignore[union-attr]
         self.assertIsInstance(
             pending.promise.exception(),  # type: ignore[union-attr]
             JobBuildSuperseded,
         )
-
-    def test_publication_critical_build_cannot_be_displaced_by_initial_work(
-        self,
-    ) -> None:
-        server, rpc = coordinator()
-        old_artifacts = server.store_template_artifacts(dict(rpc.template))
-        new_artifacts = server.store_template_artifacts(
-            base_template(height=11, prevhash="22" * 32)
-        )
-        assert old_artifacts is not None and new_artifacts is not None
-        payout_generation = server._payout_state_generation
-
-        def request_for(
-            artifacts: object,
-            *,
-            publication_critical: bool,
-            request_source: str,
-        ) -> object:
-            return server._new_job_build_request(
-                artifacts,  # type: ignore[arg-type]
-                None,
-                mode="ready",
-                payout_state_generation=payout_generation,
-                cache_key=server._job_bundle_key(
-                    artifacts,  # type: ignore[arg-type]
-                    mode="ready",
-                    payout_state_generation=payout_generation,
-                    worker=None,
-                ),
-                publication_critical=publication_critical,
-                request_source=request_source,
-            )
-
-        latest = request_for(
-            new_artifacts,
-            publication_critical=True,
-            request_source="tip_refresh",
-        )
-        reconnect = request_for(
-            old_artifacts,
-            publication_critical=False,
-            request_source="initial",
-        )
-        same_tip_reconnect = request_for(
-            new_artifacts,
-            publication_critical=False,
-            request_source="initial",
-        )
-        latest_flight = SimpleNamespace(request=latest)
-        server._job_build_active = latest_flight
-        server._job_build_retiring = None
-        server._job_build_pending = None
-
-        deferred = server._request_job_build(reconnect)  # type: ignore[arg-type]
-        coalesced = server._request_job_build(  # type: ignore[arg-type]
-            same_tip_reconnect
-        )
-
-        self.assertIs(server._job_build_active, latest_flight)
-        self.assertIs(coalesced, latest.promise)  # type: ignore[union-attr]
-        self.assertFalse(latest.cancellation.is_set())  # type: ignore[union-attr]
-        self.assertFalse(deferred.done())
-        self.assertEqual(
-            server.job_build_priority_counts["routine_deferred"],
-            1,
-        )
-        self.assertEqual(
-            server.initial_job_prepared_work_counts["deferred"],
-            1,
-        )
-        self.assertEqual(
-            server.initial_job_prepared_work_counts["singleflight"],
-            1,
-        )
-
-        latest.promise.set_result(object())  # type: ignore[union-attr]
-        with self.assertRaises(JobBuildSuperseded):
-            deferred.result()
-
-        metrics = "\n".join(server.job_build_metrics_lines())
-        self.assertIn(
-            'qbit_prism_job_build_priority_events_total{result="routine_deferred"} 1',
-            metrics,
-        )
-        self.assertIn(
-            'qbit_prism_initial_job_prepared_work_total{result="deferred"} 1',
-            metrics,
-        )
-        self.assertIn(
-            'qbit_prism_initial_job_prepared_work_total{result="singleflight"} 1',
-            metrics,
-        )
-
-    def test_publication_critical_build_preempts_routine_builder_capacity(
-        self,
-    ) -> None:
-        server, rpc = coordinator()
-        old_artifacts = server.store_template_artifacts(dict(rpc.template))
-        new_artifacts = server.store_template_artifacts(
-            base_template(height=11, prevhash="22" * 32)
-        )
-        assert old_artifacts is not None and new_artifacts is not None
-        payout_generation = server._payout_state_generation
-
-        def request_for(
-            artifacts: object,
-            *,
-            publication_critical: bool,
-            request_source: str,
-        ) -> object:
-            return server._new_job_build_request(
-                artifacts,  # type: ignore[arg-type]
-                None,
-                mode="ready",
-                payout_state_generation=payout_generation,
-                cache_key=server._job_bundle_key(
-                    artifacts,  # type: ignore[arg-type]
-                    mode="ready",
-                    payout_state_generation=payout_generation,
-                    worker=None,
-                ),
-                publication_critical=publication_critical,
-                request_source=request_source,
-            )
-
-        routine = request_for(
-            old_artifacts,
-            publication_critical=False,
-            request_source="initial",
-        )
-        latest = request_for(
-            new_artifacts,
-            publication_critical=True,
-            request_source="tip_refresh",
-        )
-        routine_flight = SimpleNamespace(request=routine)
-        server._job_build_active = routine_flight
-        server._job_build_retiring = None
-        server._job_build_pending = None
-        server._start_job_build_locked = (  # type: ignore[method-assign]
-            lambda request: SimpleNamespace(request=request, future=None)
-        )
-        server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
-
-        promise = server._request_job_build(latest)  # type: ignore[arg-type]
-
-        self.assertIs(promise, latest.promise)  # type: ignore[union-attr]
-        self.assertTrue(routine.cancellation.is_set())  # type: ignore[union-attr]
-        self.assertIs(server._job_build_retiring, routine_flight)
-        assert server._job_build_active is not None
-        self.assertIs(server._job_build_active.request, latest)
-        self.assertEqual(
-            server.job_build_priority_counts["routine_preempted"],
-            1,
-        )
-
-    def test_publication_critical_build_restarts_unhealthy_exact_flight(
-        self,
-    ) -> None:
-        for unhealthy in ("almost_expired", "stalled"):
-            with self.subTest(unhealthy=unhealthy):
-                server, rpc = coordinator()
-                artifacts = server.store_template_artifacts(dict(rpc.template))
-                assert artifacts is not None
-                payout_generation = server._payout_state_generation
-
-                def request_for(
-                    *,
-                    publication_critical: bool,
-                    priority_requested_monotonic: float | None = None,
-                ) -> object:
-                    return server._new_job_build_request(
-                        artifacts,
-                        None,
-                        mode="ready",
-                        payout_state_generation=payout_generation,
-                        cache_key=server._job_bundle_key(
-                            artifacts,
-                            mode="ready",
-                            payout_state_generation=payout_generation,
-                            worker=None,
-                        ),
-                        publication_critical=publication_critical,
-                        request_source=(
-                            "tip_refresh"
-                            if publication_critical
-                            else "initial"
-                        ),
-                        priority_requested_monotonic=(
-                            priority_requested_monotonic
-                        ),
-                    )
-
-                routine = request_for(publication_critical=False)
-                now = time.monotonic()
-                if unhealthy == "almost_expired":
-                    routine.cancellation.started_monotonic = now - 59.99
-                    routine.cancellation.deadline_monotonic = now + 0.01
-                    routine.cancellation.last_checkpoint_monotonic = now
-                else:
-                    routine.cancellation.started_monotonic = now - 1.0
-                    routine.cancellation.deadline_monotonic = now + 59.0
-                    routine.cancellation.last_checkpoint_monotonic = (
-                        now - server.job_build_cancel_grace_seconds - 0.01
-                    )
-                priority_requested = now - 59.0
-                latest = request_for(
-                    publication_critical=True,
-                    priority_requested_monotonic=priority_requested,
-                )
-                routine_flight = SimpleNamespace(request=routine)
-                server._job_build_active = routine_flight
-                server._job_build_retiring = None
-                server._job_build_pending = None
-                server._start_job_build_locked = (  # type: ignore[method-assign]
-                    lambda request: SimpleNamespace(request=request, future=None)
-                )
-                server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
-
-                promise = server._request_job_build(latest)  # type: ignore[arg-type]
-
-                self.assertIs(promise, latest.promise)
-                self.assertIsNot(promise, routine.promise)
-                self.assertTrue(routine.cancellation.is_set())
-                self.assertIs(server._job_build_retiring, routine_flight)
-                assert server._job_build_active is not None
-                self.assertIs(server._job_build_active.request, latest)
-                self.assertEqual(
-                    latest.requested_monotonic,
-                    priority_requested,
-                )
-                self.assertGreater(
-                    latest.cancellation.deadline_monotonic
-                    - time.monotonic(),
-                    server.job_build_timeout_seconds - 1.0,
-                )
-                self.assertEqual(
-                    server.job_build_priority_counts["routine_preempted"],
-                    1,
-                )
-
-    def test_publication_priority_precedes_immutable_request_preparation(
-        self,
-    ) -> None:
-        server, rpc = coordinator()
-        install_fake_bundle_builder(server)
-        artifacts = server.store_template_artifacts(dict(rpc.template))
-        assert artifacts is not None
-        critical_preparation_entered = threading.Event()
-        release_critical_preparation = threading.Event()
-        initial_preparation_entered = threading.Event()
-        original_new_request = server._new_job_build_request
-
-        def observed_new_request(*args: object, **kwargs: object) -> object:
-            request_source = str(kwargs.get("request_source", "routine"))
-            if request_source == "tip_refresh":
-                critical_preparation_entered.set()
-                if not release_critical_preparation.wait(5):
-                    raise AssertionError("test did not release priority preparation")
-            elif request_source == "initial":
-                initial_preparation_entered.set()
-            return original_new_request(*args, **kwargs)  # type: ignore[arg-type]
-
-        server._new_job_build_request = observed_new_request  # type: ignore[method-assign]
-        results: dict[str, list[object]] = {"critical": [], "initial": []}
-        errors: list[BaseException] = []
-
-        def build(label: str, *, publication_critical: bool) -> None:
-            try:
-                results[label].append(
-                    server.shared_job_bundle(
-                        artifacts,
-                        mode="ready",
-                        publication_critical=publication_critical,
-                        request_source=(
-                            "tip_refresh" if publication_critical else "initial"
-                        ),
-                    )
-                )
-            except BaseException as exc:  # noqa: BLE001 - surfaced below
-                errors.append(exc)
-
-        critical_thread = threading.Thread(
-            target=build,
-            args=("critical",),
-            kwargs={"publication_critical": True},
-        )
-        initial_thread = threading.Thread(
-            target=build,
-            args=("initial",),
-            kwargs={"publication_critical": False},
-        )
-        critical_thread.start()
-        try:
-            self.assertTrue(critical_preparation_entered.wait(5))
-            initial_thread.start()
-            self.assertFalse(initial_preparation_entered.wait(0.1))
-            metrics = "\n".join(server.job_build_metrics_lines())
-            self.assertIn("qbit_prism_job_build_priority_active 1", metrics)
-        finally:
-            release_critical_preparation.set()
-            critical_thread.join(5)
-            initial_thread.join(5)
-
-        self.assertFalse(critical_thread.is_alive())
-        self.assertFalse(initial_thread.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual([len(results[label]) for label in results], [1, 1])
-        self.assertIs(results["critical"][0], results["initial"][0])
-        self.assertFalse(initial_preparation_entered.is_set())
-        self.assertEqual(
-            server.initial_job_prepared_work_counts["deferred"],
-            1,
-        )
-        self.assertEqual(
-            server.initial_job_prepared_work_counts["cache_hit"],
-            1,
-        )
-        self.assertEqual(
-            server.job_build_priority_admission_seconds["count"],
-            1,
-        )
-        self.assertGreaterEqual(
-            server.job_build_priority_admission_seconds["sum"],
-            0.1,
-        )
-
-    def test_priority_reservation_cancels_admitted_routine_preparation(
-        self,
-    ) -> None:
-        server, rpc = coordinator()
-        install_fake_bundle_builder(server)
-        artifacts = server.store_template_artifacts(dict(rpc.template))
-        assert artifacts is not None
-        routine_in_payout_lookup = threading.Event()
-        release_routine_lookup = threading.Event()
-        routine_request_constructed = threading.Event()
-        original_usable_artifact = server._usable_payout_ledger_artifact
-        original_new_request = server._new_job_build_request
-        routine_thread: threading.Thread
-
-        def blocked_usable_artifact(*args: object, **kwargs: object) -> object:
-            if threading.current_thread() is routine_thread:
-                routine_in_payout_lookup.set()
-                if not release_routine_lookup.wait(5):
-                    raise AssertionError("test did not release payout lookup")
-            return original_usable_artifact(*args, **kwargs)  # type: ignore[arg-type]
-
-        def observed_new_request(*args: object, **kwargs: object) -> object:
-            if kwargs.get("request_source") == "initial":
-                routine_request_constructed.set()
-            return original_new_request(*args, **kwargs)  # type: ignore[arg-type]
-
-        server._usable_payout_ledger_artifact = blocked_usable_artifact  # type: ignore[method-assign]
-        server._new_job_build_request = observed_new_request  # type: ignore[method-assign]
-        errors: list[BaseException] = []
-
-        def build_routine() -> None:
-            try:
-                server.shared_job_bundle(
-                    artifacts,
-                    mode="ready",
-                    retry_superseded=False,
-                    request_source="initial",
-                )
-            except BaseException as exc:  # noqa: BLE001 - surfaced below
-                errors.append(exc)
-
-        routine_thread = threading.Thread(target=build_routine)
-        routine_thread.start()
-        priority_token: int | None = None
-        try:
-            self.assertTrue(routine_in_payout_lookup.wait(5))
-            with server._job_build_scheduler_lock:
-                routine_cancellations = tuple(
-                    cancellation_ref()
-                    for cancellation_ref in (
-                        server._job_build_routine_preparations.values()
-                    )
-                )
-            self.assertEqual(len(routine_cancellations), 1)
-            self.assertIsNotNone(routine_cancellations[0])
-            priority_token, _requested = (
-                server._begin_job_build_priority_preparation()
-            )
-            assert routine_cancellations[0] is not None
-            self.assertTrue(routine_cancellations[0].is_set())
-        finally:
-            release_routine_lookup.set()
-            routine_thread.join(5)
-            if priority_token is not None:
-                server._finish_job_build_priority_preparation(priority_token)
-
-        self.assertFalse(routine_thread.is_alive())
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], JobBuildSuperseded)
-        self.assertFalse(routine_request_constructed.is_set())
-        with server._job_build_scheduler_lock:
-            self.assertEqual(len(server._job_build_routine_preparations), 0)
-
-    def test_publication_critical_collection_promotes_past_ready_work(self) -> None:
-        server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
-        old_artifacts = server.store_template_artifacts(dict(rpc.template))
-        new_artifacts = server.store_template_artifacts(
-            base_template(height=11, prevhash="22" * 32)
-        )
-        assert old_artifacts is not None and new_artifacts is not None
-        payout_generation = server._payout_state_generation
-        ready = server._new_job_build_request(
-            old_artifacts,
-            None,
-            mode="ready",
-            payout_state_generation=payout_generation,
-            cache_key=server._job_bundle_key(
-                old_artifacts,
-                mode="ready",
-                payout_state_generation=payout_generation,
-                worker=None,
-            ),
-            request_source="initial",
-        )
-        latest_identity = worker("tq1latest", "tq1latest.rig")
-        latest = server._new_job_build_request(
-            new_artifacts,
-            latest_identity,
-            mode="collection",
-            payout_state_generation=payout_generation,
-            cache_key=server._job_bundle_key(
-                new_artifacts,
-                mode="collection",
-                payout_state_generation=payout_generation,
-                worker=latest_identity,
-            ),
-            publication_critical=True,
-            request_source="tip_refresh",
-        )
-        ready_flight = SimpleNamespace(request=ready)
-        server._job_build_active = ready_flight
-        server._job_build_retiring = None
-        server._job_build_pending = latest
-        armed: list[object] = []
-        server._start_job_build_locked = (  # type: ignore[method-assign]
-            lambda request: SimpleNamespace(request=request, future=None)
-        )
-        server._arm_job_build_locked = armed.append  # type: ignore[method-assign]
-
-        server._promote_pending_job_build_locked()
-
-        self.assertTrue(ready.cancellation.is_set())
-        self.assertIs(server._job_build_retiring, ready_flight)
-        self.assertIsNone(server._job_build_pending)
-        assert server._job_build_active is not None
-        self.assertIs(server._job_build_active.request, latest)
-        self.assertEqual(armed, [server._job_build_active])
-        self.assertEqual(
-            server.job_build_priority_counts["routine_preempted"],
-            1,
-        )
-
-    def test_routine_pending_never_promotes_over_publication_critical_flight(
-        self,
-    ) -> None:
-        for placement in ("active", "retiring"):
-            with self.subTest(placement=placement):
-                server, rpc = coordinator()
-                critical_artifacts = server.store_template_artifacts(
-                    dict(rpc.template)
-                )
-                routine_artifacts = server.store_template_artifacts(
-                    base_template(height=11, prevhash="22" * 32)
-                )
-                assert critical_artifacts is not None
-                assert routine_artifacts is not None
-                payout_generation = server._payout_state_generation
-
-                def request_for(
-                    artifacts: object,
-                    *,
-                    publication_critical: bool,
-                ) -> object:
-                    return server._new_job_build_request(
-                        artifacts,  # type: ignore[arg-type]
-                        None,
-                        mode="ready",
-                        payout_state_generation=payout_generation,
-                        cache_key=server._job_bundle_key(
-                            artifacts,  # type: ignore[arg-type]
-                            mode="ready",
-                            payout_state_generation=payout_generation,
-                            worker=None,
-                        ),
-                        publication_critical=publication_critical,
-                        request_source=(
-                            "tip_refresh" if publication_critical else "initial"
-                        ),
-                    )
-
-                critical = request_for(
-                    critical_artifacts,
-                    publication_critical=True,
-                )
-                routine = request_for(
-                    routine_artifacts,
-                    publication_critical=False,
-                )
-                critical_flight = SimpleNamespace(request=critical)
-                server._job_build_active = (
-                    critical_flight if placement == "active" else None
-                )
-                server._job_build_retiring = (
-                    critical_flight if placement == "retiring" else None
-                )
-                server._job_build_pending = routine
-                server._start_job_build_locked = (  # type: ignore[method-assign]
-                    lambda _request: self.fail(
-                        "routine pending work displaced publication-critical work"
-                    )
-                )
-
-                server._promote_pending_job_build_locked()
-
-                self.assertIs(server._job_build_pending, routine)
-                self.assertFalse(critical.cancellation.is_set())
-                self.assertIs(
-                    (
-                        server._job_build_active
-                        if placement == "active"
-                        else server._job_build_retiring
-                    ),
-                    critical_flight,
-                )
-
     def test_cancelled_ready_does_not_block_collection_promotion(self) -> None:
         for placement in ("active", "retiring"):
             with self.subTest(placement=placement):
                 server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
                 artifacts = server.store_template_artifacts(dict(rpc.template))
                 assert artifacts is not None
-                payout_generation = server._payout_state_generation
+                payout_generation = server._payout_state_service._generation
 
                 def request_for(
                     mode: str,
@@ -1846,30 +1333,30 @@ class JobBundleCacheTests(unittest.TestCase):
                 )
                 ready_flight = SimpleNamespace(request=ready)
                 if placement == "active":
-                    server._job_build_active = ready_flight
-                    server._job_build_retiring = None
+                    server._ensure_job_bundle_service()._active = ready_flight
+                    server._ensure_job_bundle_service()._retiring = None
                 else:
-                    server._job_build_active = None
-                    server._job_build_retiring = ready_flight
-                server._job_build_pending = collection
+                    server._ensure_job_bundle_service()._active = None
+                    server._ensure_job_bundle_service()._retiring = ready_flight
+                server._ensure_job_bundle_service()._pending = collection
                 armed: list[object] = []
-                server._start_job_build_locked = (  # type: ignore[method-assign]
+                server._ensure_job_bundle_service()._start_locked = (  # type: ignore[method-assign]
                     lambda request: SimpleNamespace(request=request, future=None)
                 )
-                server._arm_job_build_locked = armed.append  # type: ignore[method-assign]
+                server._ensure_job_bundle_service()._arm_locked = armed.append  # type: ignore[method-assign]
 
                 server._promote_pending_job_build_locked()
 
-                self.assertIsNone(server._job_build_pending)
-                assert server._job_build_active is not None
-                self.assertIs(server._job_build_active.request, collection)
-                self.assertIs(server._job_build_retiring, ready_flight)
-                self.assertEqual(armed, [server._job_build_active])
+                self.assertIsNone(server._ensure_job_bundle_service()._pending)
+                assert server._ensure_job_bundle_service()._active is not None
+                self.assertIs(server._ensure_job_bundle_service()._active.request, collection)
+                self.assertIs(server._ensure_job_bundle_service()._retiring, ready_flight)
+                self.assertEqual(armed, [server._ensure_job_bundle_service()._active])
     def test_immediate_collection_completion_does_not_reoccupy_slot(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
         artifacts = server.store_template_artifacts(dict(rpc.template))
         assert artifacts is not None
-        payout_generation = server._payout_state_generation
+        payout_generation = server._payout_state_service._generation
         identities = [
             worker(f"tq1worker-{index}", f"tq1worker-{index}.rig")
             for index in range(2)
@@ -1900,8 +1387,8 @@ class JobBundleCacheTests(unittest.TestCase):
             future.set_result(result)
             return SimpleNamespace(request=request, future=future)
 
-        server._job_build_pending = pending
-        server._start_job_build_locked = completed_flight  # type: ignore[method-assign]
+        server._ensure_job_bundle_service()._pending = pending
+        server._ensure_job_bundle_service()._start_locked = completed_flight  # type: ignore[method-assign]
 
         promise = server._request_job_build(incoming)  # type: ignore[arg-type]
 
@@ -1910,9 +1397,9 @@ class JobBundleCacheTests(unittest.TestCase):
             pending.promise.result(),
             results[id(pending)],
         )
-        self.assertIsNone(server._job_build_active)
-        self.assertIsNone(server._job_build_retiring)
-        self.assertIsNone(server._job_build_pending)
+        self.assertIsNone(server._ensure_job_bundle_service()._active)
+        self.assertIsNone(server._ensure_job_bundle_service()._retiring)
+        self.assertIsNone(server._ensure_job_bundle_service()._pending)
     def test_independent_collection_workers_do_not_supersede_each_other(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
         recorded = install_fake_bundle_builder(server)
@@ -1924,7 +1411,8 @@ class JobBundleCacheTests(unittest.TestCase):
         ]
         entered = [threading.Event() for _identity in identities]
         releases = [threading.Event() for _identity in identities]
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
         active_builds = 0
         max_active_builds = 0
         active_lock = threading.Lock()
@@ -1951,7 +1439,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 with active_lock:
                     active_builds -= 1
 
-        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
         results: list[list[object]] = [[] for _identity in identities]
         errors: list[list[BaseException]] = [[] for _identity in identities]
 
@@ -1979,20 +1467,20 @@ class JobBundleCacheTests(unittest.TestCase):
             threads[2].start()
             pending_deadline = time.monotonic() + 5
             while time.monotonic() < pending_deadline:
-                with server._job_build_scheduler_lock:
-                    pending = server._job_build_pending
+                with server._ensure_job_bundle_service()._scheduler_lock:
+                    pending = server._ensure_job_bundle_service()._pending
                     if pending is not None and pending.worker == identities[2]:
                         break
                 time.sleep(0.01)
             else:
                 self.fail("third collection build was not queued")
             threads[3].start()
-            self.assertEqual(server.job_build_scheduler_counts["starts"], 2)
+            self.assertEqual(server._ensure_job_bundle_service()._scheduler_counts["starts"], 2)
             releases[0].set()
             self.assertTrue(entered[2].wait(5))
             releases[1].set()
             self.assertTrue(entered[3].wait(5))
-            self.assertEqual(server.job_build_scheduler_counts["starts"], 4)
+            self.assertEqual(server._ensure_job_bundle_service()._scheduler_counts["starts"], 4)
         finally:
             for release in releases:
                 release.set()
@@ -2004,7 +1492,7 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual([len(items) for items in results], [1, 1, 1, 1])
         self.assertEqual(recorded["calls"], 4)
         self.assertLessEqual(max_active_builds, 2)
-        self.assertEqual(server.job_build_scheduler_counts["supersessions"], 0)
+        self.assertEqual(server._ensure_job_bundle_service()._scheduler_counts["supersessions"], 0)
     def test_collection_independence_requires_one_immutable_cohort(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
         first = server.store_template_artifacts(dict(rpc.template))
@@ -2013,7 +1501,7 @@ class JobBundleCacheTests(unittest.TestCase):
         second_template["curtime"] = int(second_template["curtime"]) + 1
         second = server.store_template_artifacts(second_template)
         assert second is not None
-        payout_generation = server._payout_state_generation
+        payout_generation = server._payout_state_service._generation
         first_worker = worker("tq1worker-1", "tq1worker-1.rig")
         second_worker = worker("tq1worker-2", "tq1worker-2.rig")
 
@@ -2063,7 +1551,8 @@ class JobBundleCacheTests(unittest.TestCase):
         entered = [threading.Event(), threading.Event()]
         cancellation_observed = [threading.Event(), threading.Event()]
         release_cancelled = threading.Event()
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
 
         def blocking_build(
             build_artifacts: object,
@@ -2088,8 +1577,8 @@ class JobBundleCacheTests(unittest.TestCase):
                 **kwargs,
             )
 
-        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
-        payout_generation = server._payout_state_generation
+        service.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        payout_generation = server._payout_state_service._generation
 
         def request_for(
             mode: str,
@@ -2132,7 +1621,7 @@ class JobBundleCacheTests(unittest.TestCase):
             self.assertFalse(collection_promises[0].done())
             self.assertFalse(collection_promises[1].done())
             self.assertFalse(ready_promise.done())
-            self.assertEqual(server.job_build_scheduler_counts["starts"], 2)
+            self.assertEqual(server._ensure_job_bundle_service()._scheduler_counts["starts"], 2)
         finally:
             release_cancelled.set()
 
@@ -2145,7 +1634,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 promise.exception(timeout=5),
                 JobBuildSuperseded,
             )
-        self.assertEqual(server.job_build_scheduler_counts["starts"], 3)
+        self.assertEqual(server._ensure_job_bundle_service()._scheduler_counts["starts"], 3)
     def test_ready_build_cancels_retiring_only_collection_flight(self) -> None:
         server, rpc = coordinator(ledger=FakeLedger(miners=["miner-a"]))
         server._ensure_tip_refresh_state()
@@ -2160,7 +1649,8 @@ class JobBundleCacheTests(unittest.TestCase):
         release_active = threading.Event()
         retiring_cancelled = threading.Event()
         release_retiring = threading.Event()
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
 
         def blocking_build(
             build_artifacts: object,
@@ -2187,8 +1677,8 @@ class JobBundleCacheTests(unittest.TestCase):
                 **kwargs,
             )
 
-        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
-        payout_generation = server._payout_state_generation
+        service.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        payout_generation = server._payout_state_service._generation
 
         def request_for(
             mode: str,
@@ -2221,11 +1711,11 @@ class JobBundleCacheTests(unittest.TestCase):
             release_active.set()
             second_bundle = second_promise.result(timeout=5)
             self.assertTrue(second_bundle.collection_only)
-            with server._job_build_scheduler_lock:
-                self.assertIsNone(server._job_build_active)
-                assert server._job_build_retiring is not None
+            with server._ensure_job_bundle_service()._scheduler_lock:
+                self.assertIsNone(server._ensure_job_bundle_service()._active)
+                assert server._ensure_job_bundle_service()._retiring is not None
                 self.assertIs(
-                    server._job_build_retiring.request,
+                    server._ensure_job_bundle_service()._retiring.request,
                     first_request,
                 )
 
@@ -2263,7 +1753,8 @@ class JobBundleCacheTests(unittest.TestCase):
         stop_collections = threading.Event()
         ready_requests: list[object] = []
         collection_requests: list[object | None] = [None, None]
-        original_build = server.build_shared_job_bundle
+        service = server._ensure_job_bundle_service()
+        original_build = service.build_shared_job_bundle
 
         def blocking_build(
             build_artifacts: object,
@@ -2293,7 +1784,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 **kwargs,
             )
 
-        server.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
+        service.build_shared_job_bundle = blocking_build  # type: ignore[method-assign]
         collection_results: list[list[object]] = [[], []]
         collection_errors: list[list[BaseException]] = [[], []]
         ready_results: list[object] = []
@@ -2337,21 +1828,21 @@ class JobBundleCacheTests(unittest.TestCase):
             ready_thread.start()
             self.assertTrue(collection_cancelled[0].wait(5))
             self.assertTrue(collection_cancelled[1].wait(5))
-            self.assertEqual(server.job_build_scheduler_counts["starts"], 2)
+            self.assertEqual(server._ensure_job_bundle_service()._scheduler_counts["starts"], 2)
 
             release_cancelled.set()
             self.assertTrue(ready_entered.wait(5))
             retry_deadline = time.monotonic() + 5
             while (
-                server.job_build_scheduler_counts["requests"] < 5
+                server._ensure_job_bundle_service()._scheduler_counts["requests"] < 5
                 and time.monotonic() < retry_deadline
             ):
                 time.sleep(0.01)
             self.assertGreaterEqual(
-                server.job_build_scheduler_counts["requests"],
+                server._ensure_job_bundle_service()._scheduler_counts["requests"],
                 5,
             )
-            self.assertEqual(server.job_build_scheduler_counts["starts"], 3)
+            self.assertEqual(server._ensure_job_bundle_service()._scheduler_counts["starts"], 3)
             self.assertEqual(len(ready_requests), 1)
             self.assertFalse(
                 ready_requests[0].cancellation.is_set()  # type: ignore[union-attr]
@@ -2388,7 +1879,7 @@ class JobBundleCacheTests(unittest.TestCase):
         server.ledger_attestation_signing_seed_hex = "43" * 32
         artifacts = server.store_template_artifacts(dict(rpc.template))
         assert artifacts is not None
-        payout_generation = server._payout_state_generation
+        payout_generation = server._payout_state_service._generation
         request = server._new_job_build_request(
             artifacts,
             None,
@@ -2432,7 +1923,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 cancellation=build_request.cancellation,  # type: ignore[union-attr]
             )
 
-        server.build_shared_job_bundle = fill_helper_pipe  # type: ignore[method-assign]
+        server._ensure_job_bundle_service().build_shared_job_bundle = fill_helper_pipe  # type: ignore[method-assign]
         shutdown_finished = threading.Event()
         shutdown_errors: list[BaseException] = []
 
@@ -2445,10 +1936,10 @@ class JobBundleCacheTests(unittest.TestCase):
                 shutdown_finished.set()
 
         with patch(
-            "lab.prism.prism_coordinator.prism_tool_command",
+            "lab.prism.bundle_compiler.prism_tool_command",
             return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
         ), patch(
-            "lab.prism.prism_coordinator.subprocess.Popen",
+            "lab.prism.bundle_compiler.subprocess.Popen",
             side_effect=capture_popen,
         ):
             promise = server._request_job_build(request)
@@ -2508,7 +1999,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 cancellation=build_request.cancellation,  # type: ignore[union-attr]
             )
 
-        server.build_shared_job_bundle = fill_helper_pipe  # type: ignore[method-assign]
+        server._ensure_job_bundle_service().build_shared_job_bundle = fill_helper_pipe  # type: ignore[method-assign]
         errors: list[BaseException] = []
 
         def build() -> None:
@@ -2522,17 +2013,17 @@ class JobBundleCacheTests(unittest.TestCase):
                 errors.append(exc)
 
         with patch(
-            "lab.prism.prism_coordinator.prism_tool_command",
+            "lab.prism.bundle_compiler.prism_tool_command",
             return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
         ), patch(
-            "lab.prism.prism_coordinator.subprocess.Popen",
+            "lab.prism.bundle_compiler.subprocess.Popen",
             side_effect=capture_popen,
         ):
             build_thread = threading.Thread(target=build)
             build_thread.start()
             self.assertTrue(helper_started.wait(5))
-            with server._job_cache_lock:
-                controls = list(server._active_job_bundle_builds.values())
+            with server._ensure_job_bundle_service()._cache_lock:
+                controls = list(server._ensure_job_bundle_service()._active_bundle_builds.values())
             self.assertEqual(len(controls), 1)
             controls[0].cancel_event.set()
             build_thread.join(2)
@@ -2545,9 +2036,87 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(build_thread.is_alive())
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], JobBuildSuperseded)
-        self.assertEqual(server.shared_bundle_build_counts["superseded"], 1)
-        self.assertEqual(server.shared_bundle_build_counts["failed"], 0)
-        self.assertEqual(server.tip_refresh_superseded_results, 1)
+        build_counts = server._ensure_job_bundle_service().shared_preparation_metrics()[
+            "build_counts"
+        ]
+        self.assertEqual(build_counts["superseded"], 1)
+        self.assertEqual(build_counts["failed"], 0)
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["superseded_results"], 1)
+
+    def test_externally_terminated_superseded_builder_is_not_a_crash(self) -> None:
+        server, rpc = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        real_popen = subprocess.Popen
+
+        def build_with_control(*_args: object, **kwargs: object) -> object:
+            build_request = kwargs["build_request"]
+            return server.build_audit_bundle(
+                shares=[],
+                found_block={
+                    "block_height": 10,
+                    "coinbase_value_sats": 50_00000000,
+                    "network_difficulty": 1,
+                    "anchor_job_issued_at_ms": 1_700_000_000_000,
+                },
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                cancellation=build_request.cancellation,  # type: ignore[union-attr]
+            )
+
+        server._ensure_job_bundle_service().build_shared_job_bundle = (  # type: ignore[method-assign]
+            build_with_control
+        )
+
+        def cancel_then_exit(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[str]:
+            process = real_popen(*args, **kwargs)  # type: ignore[arg-type]
+            original_poll = process.poll
+            original_wait = process.wait
+            first_poll = True
+
+            def poll() -> int | None:
+                nonlocal first_poll
+                if not first_poll:
+                    return original_poll()
+                first_poll = False
+                service = server._ensure_job_bundle_service()
+                with service._cache_lock:
+                    controls = list(service._active_bundle_builds.values())
+                self.assertEqual(len(controls), 1)
+                controls[0].cancel_event.set()
+                process.kill()
+                return original_wait()
+
+            process.poll = poll  # type: ignore[method-assign]
+            return process
+
+        with patch(
+            "lab.prism.bundle_compiler.prism_tool_command",
+            return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
+        ), patch(
+            "lab.prism.bundle_compiler.subprocess.Popen",
+            side_effect=cancel_then_exit,
+        ):
+            with self.assertRaises(JobBuildSuperseded):
+                server.shared_job_bundle(
+                    artifacts,
+                    mode="ready",
+                    retry_superseded=False,
+                )
+
+        metrics = server._ensure_job_bundle_service().shared_preparation_metrics()
+        self.assertEqual(metrics["build_counts"]["superseded"], 1)
+        self.assertEqual(metrics["build_counts"]["failed"], 0)
+        worker_counts = server._ensure_job_bundle_service().metrics_snapshot()[
+            "worker_counts"
+        ]
+        self.assertEqual(worker_counts["crashes"], 0)
+
     def test_full_helper_input_pipe_obeys_builder_timeout(self) -> None:
         server, _rpc = coordinator()
         server.signing_seed_hex = "42" * 32
@@ -2588,10 +2157,10 @@ class JobBundleCacheTests(unittest.TestCase):
                 errors.append(exc)
 
         with patch(
-            "lab.prism.prism_coordinator.prism_tool_command",
+            "lab.prism.bundle_compiler.prism_tool_command",
             return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
         ), patch(
-            "lab.prism.prism_coordinator.subprocess.Popen",
+            "lab.prism.bundle_compiler.subprocess.Popen",
             side_effect=capture_popen,
         ):
             build_thread = threading.Thread(target=build)

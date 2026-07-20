@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import unittest
+
+from lab.prism.coordinator_config import env_decimal
 from tests.prism_vardiff_test_support import *
 
 
@@ -862,6 +864,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         env = {
             "PRISM_POSTGRES_PSQL_COMMAND": "psql postgresql://example.invalid/qbit",
             "PRISM_LEDGER_WRITER_SESSION_TOKEN": "fixed-session",
+            "PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS": "47",
         }
 
         with patch.dict(os.environ, env, clear=True):
@@ -875,6 +878,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(ledger.backend_name, "postgres-psql")
         self.assertEqual(fake_ledger.call_args.kwargs["writer_session_token"], "fixed-session")
+        self.assertEqual(
+            fake_ledger.call_args.kwargs["reward_window_cache_seconds"],
+            47.0,
+        )
     def test_same_tip_retention_requires_connection_derived_production_bound(self) -> None:
         with self.assertRaisesRegex(
             SystemExit,
@@ -1242,7 +1249,6 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 class PrismCoordinatorReliabilityTests(unittest.TestCase):
     def _bare_coordinator(self) -> PrismCoordinator:
         server = PrismCoordinator.__new__(PrismCoordinator)
-        server.lock = threading.RLock()
         server.stop_event = threading.Event()
         server._heartbeats = {}
         server._watchdog_pauses = {}
@@ -1257,6 +1263,16 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(SystemExit, "PRISM_WATCHDOG_TIMEOUT_SECONDS must be finite"):
                     env_positive_float("PRISM_WATCHDOG_TIMEOUT_SECONDS", 120.0)
+
+    def test_decimal_env_rejects_invalid_and_non_finite_values(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "TEST_DECIMAL must be a decimal number"):
+            env_decimal("TEST_DECIMAL", "1", environ={"TEST_DECIMAL": "not-decimal"})
+        for raw in ("NaN", "sNaN", "Infinity", "-Infinity"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                SystemExit,
+                "TEST_DECIMAL must be finite",
+            ):
+                env_decimal("TEST_DECIMAL", "1", environ={"TEST_DECIMAL": raw})
 
 class PrismListenerProfileTests(unittest.TestCase):
     def test_highdiff_listener_disabled_without_port(self) -> None:

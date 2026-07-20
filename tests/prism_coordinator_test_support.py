@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
+from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.prism_coordinator import (
     ClientState,
     JobBuildSuperseded,
@@ -27,7 +28,6 @@ from lab.prism.prism_coordinator import (
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     PRISM_REJECTION_REASON_IDS,
     PrismCoordinator,
-    ShutdownInProgress,
     TemplateRefreshBlocked,
     WorkerIdentity,
     canonical_json_sha256,
@@ -231,7 +231,6 @@ def coordinator(*, ledger: object | None = None, template: dict[str, object] | N
     server.duplicate_share_count = 0
     server.low_difficulty_share_count = 0
     server.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
-    server.job_build_failure_count = 0
     server.tip_refresh_job_count = 0
     server.post_accept_refresh_failure_count = 0
     server.reorg_reconciler_enabled = False
@@ -266,10 +265,10 @@ def coordinator(*, ledger: object | None = None, template: dict[str, object] | N
     server.min_ready_miners = 3
     server.ledger = ledger if ledger is not None else FakeLedger()
     server.blockpoll_seconds = 2.0
-    # Failed-refresh spacing is opt-in per test: its holdoff waits on real
-    # time, which deadlocks tests that freeze time.monotonic around failing
-    # polls. Pacing behavior is covered by test_prism_refresh_retry_pacing.
-    server.tip_refresh_failure_holdoff_seconds = 0.0
+    server._ensure_tip_refresh_service().reconfigure_for_test(
+        blockpoll_seconds=server.blockpoll_seconds,
+        failure_holdoff_seconds=0.0,
+    )
     server.job_bundle_cache_seconds = 10.0
     server.template_cache_seconds = 2.0
     server.reorg_reconcile_cache_seconds = 5.0
@@ -300,6 +299,9 @@ def install_fake_bundle_builder(server: PrismCoordinator) -> dict[str, object]:
         }
 
     server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
+    server._ensure_bundle_compiler().build_audit_bundle = (  # type: ignore[method-assign]
+        fake_build_audit_bundle
+    )
     return recorded
 
 
@@ -339,7 +341,7 @@ def mark_progress_healthy(server: PrismCoordinator) -> None:
     server._record_progress_tip_poll(snapshot)
     server._record_progress_publication(
         snapshot,
-        int(getattr(server, "_payout_state_generation", 0)),
+        int(server._payout_state_service._generation),
     )
 
 

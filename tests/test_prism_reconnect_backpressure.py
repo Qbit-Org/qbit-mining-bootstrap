@@ -119,6 +119,9 @@ def coordinator(*, connection_limit: int = 3, pending_limit: int = 2) -> PrismCo
     server.stratum_initial_job_timeout_seconds = 30.0
     server.mining_health_startup_grace_seconds = 30.0
     server.tip_refresh_max_workers = 1
+    server._ensure_tip_refresh_service().reconfigure_for_test(
+        max_workers=server.tip_refresh_max_workers
+    )
     server.tip_template_snapshot = None
     server.started_monotonic = 0.0
     server.submitted_share_count = 0
@@ -884,6 +887,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         any_worker_passed_priority = threading.Event()
         contend = threading.Event()
         release_workers = threading.Event()
+        job_bundles = server._ensure_job_bundle_service()
 
         def build_request(
             key: str,
@@ -922,7 +926,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
                 if workers_contending == server.initial_job_max_workers:
                     all_workers_contending.set()
             preparation_token, _preparation_cancellation = (
-                server._begin_routine_job_build_preparation(
+                job_bundles.begin_routine_preparation(
                     request_source="initial",
                     cancelled=_request.cancelled.is_set,
                 )
@@ -933,9 +937,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
                     any_worker_passed_priority.set()
                 release_workers.wait(5)
             finally:
-                server._finish_routine_job_build_preparation(
-                    preparation_token
-                )
+                job_bundles.finish_routine_preparation(preparation_token)
             return False
 
         server._run_initial_job = contending_initial  # type: ignore[method-assign]
@@ -950,18 +952,18 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertEqual(server.initial_job_executor().stats(), (124, 4))
 
         def start_without_execution(request: object) -> SimpleNamespace:
-            server.job_build_scheduler_counts["starts"] += 1
-            server._record_priority_admission_locked(  # type: ignore[arg-type]
+            job_bundles._scheduler_counts["starts"] += 1
+            job_bundles.record_priority_admission_locked(  # type: ignore[arg-type]
                 request,
                 "started",
             )
             return SimpleNamespace(request=request, future=Future())
 
-        server._start_job_build_locked = start_without_execution  # type: ignore[method-assign]
-        server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
+        job_bundles._start_locked = start_without_execution  # type: ignore[method-assign]
+        job_bundles._arm_locked = lambda _flight: None  # type: ignore[method-assign]
         admission_started = time.monotonic()
         priority_token, priority_requested = (
-            server._begin_job_build_priority_preparation()
+            job_bundles.begin_priority_preparation()
         )
         latest = build_request(
             "latest-tip",
@@ -970,9 +972,9 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             requested_monotonic=priority_requested,
         )
         try:
-            latest_promise = server._request_job_build(latest)  # type: ignore[arg-type]
+            latest_promise = job_bundles.request_build(latest)  # type: ignore[arg-type]
         finally:
-            server._finish_job_build_priority_preparation(priority_token)
+            job_bundles.finish_priority_preparation(priority_token)
         admission_elapsed = time.monotonic() - admission_started
         contend.set()
 
@@ -982,24 +984,24 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             self.assertLess(admission_elapsed, 0.1)
             self.assertIs(latest_promise, latest.promise)
             self.assertFalse(latest.cancellation.is_set())
-            assert server._job_build_active is not None
-            self.assertIs(server._job_build_active.request, latest)
+            assert job_bundles._active is not None
+            self.assertIs(job_bundles._active.request, latest)
             self.assertEqual(
-                server.job_build_priority_counts["routine_deferred"],
+                job_bundles._priority_counts["routine_deferred"],
                 4,
             )
             self.assertEqual(
-                server.initial_job_prepared_work_counts["deferred"],
+                job_bundles._initial_prepared_work_counts["deferred"],
                 4,
             )
             self.assertEqual(
-                server.job_build_priority_admission_seconds["count"],
+                job_bundles._priority_admission_seconds["count"],
                 1,
             )
         finally:
-            with server._job_build_scheduler_lock:
-                server._job_build_active = None
-                server._job_build_priority_changed.set()
+            with job_bundles._scheduler_lock:
+                job_bundles._active = None
+                job_bundles._priority_changed.set()
             release_workers.set()
             server.shutdown_initial_job_executor()
         self.assertEqual(workers_passed_priority, 4)

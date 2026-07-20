@@ -19,8 +19,9 @@ from lab.prism.ctv_broadcaster_daemon import (
     CtvFanoutDaemonResult,
     MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE,
 )
+from lab.prism.coordinator_config import env, env_bool, env_int, env_positive_float
+from lab.prism.rpc import JsonRpc
 from lab.prism.share_ledger import PsqlShareLedger, SingleWriterShareLedger
-from lab.prism.prism_coordinator import JsonRpc, env, env_bool, env_int, env_positive_float
 
 
 def env_positive_int(name: str, default: int | None = None) -> int:
