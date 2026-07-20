@@ -373,6 +373,9 @@ class PublicDashboardApiContractTests(unittest.TestCase):
         self.assertIn("SharedCacheControl:", openapi_text)
         self.assertIn("Cache-Control: no-store", readme_text)
         self.assertIn("PRISM_PUBLIC_CACHE_TTL_SECONDS", readme_text)
+        self.assertIn("PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS", readme_text)
+        self.assertIn("PRISM_PUBLIC_AGGREGATE_CACHE_STALE_WHILE_REVALIDATE_SECONDS", readme_text)
+        self.assertIn("PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS", readme_text)
         self.assertIn("PRISM_PUBLIC_CACHE_MAX_ENTRIES", readme_text)
         self.assertIn("PRISM_PUBLIC_STRATUM_HIGHDIFF_URL", readme_text)
 

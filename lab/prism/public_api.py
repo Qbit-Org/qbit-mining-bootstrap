@@ -193,6 +193,22 @@ def public_cache_key(path: str, query: dict[str, list[str]]) -> tuple[str, tuple
     return _canonical_cache_path(path), tuple(sorted((key, tuple(values)) for key, values in query.items()))
 
 
+def _is_public_aggregate_path(path: str) -> bool:
+    """Pool-wide aggregate read models that are expensive to recompute.
+
+    Pool summary and the hashrate series scan large share-ledger ranges, and
+    the worker list aggregates a miner's recent share history, so these
+    endpoints carry a longer default shared-cache TTL than the cheap row
+    reads.
+    """
+    if path in {"/public/v1/pool-summary", "/public/v1/hashrate-series"}:
+        return True
+    if path.startswith("/public/v1/miners/"):
+        parts = path.removeprefix("/public/v1/miners/").split("/")
+        return len(parts) == 2 and parts[1] == "workers"
+    return False
+
+
 def public_cache_policy(path: str) -> PublicCachePolicy:
     if not env_bool("PRISM_PUBLIC_CACHE_ENABLED", default=True):
         return PublicCachePolicy(ttl_seconds=0, stale_while_revalidate_seconds=0)
@@ -212,6 +228,14 @@ def public_cache_policy(path: str) -> PublicCachePolicy:
                 86400,
             ),
             immutable=True,
+        )
+    if _is_public_aggregate_path(path):
+        return PublicCachePolicy(
+            ttl_seconds=env_nonnegative_int("PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS", 30),
+            stale_while_revalidate_seconds=env_nonnegative_int(
+                "PRISM_PUBLIC_AGGREGATE_CACHE_STALE_WHILE_REVALIDATE_SECONDS",
+                30,
+            ),
         )
     return PublicCachePolicy(
         ttl_seconds=env_nonnegative_int("PRISM_PUBLIC_CACHE_TTL_SECONDS", 5),
