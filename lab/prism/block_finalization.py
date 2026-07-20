@@ -975,8 +975,9 @@ class BlockFinalizationService:
                     # before A1 publication. Confirmation-time state or a raw
                     # sequence value cannot fence rollback gaps and restart
                     # replays. P1's local serializer plus A1's process guard
-                    # prevent another confirmation/reactivation from allocating
-                    # between this read and the durable publication decision.
+                    # prevent another confirmation from allocating between this
+                    # read and the durable publication decision. Reactivation
+                    # preserves its block's already-published ordinal.
                     publication_floor_sequence = publication_floor_reader()
                 else:
                     # Compatibility-only ledgers used by legacy embeddings/tests
