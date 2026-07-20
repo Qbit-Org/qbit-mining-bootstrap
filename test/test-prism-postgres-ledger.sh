@@ -48,7 +48,12 @@ else
     "${POSTGRES_IMAGE}" >/dev/null
 
   deadline=$((SECONDS + 60))
-  until docker exec "${POSTGRES_CONTAINER}" pg_isready -U qbit -d qbit >/dev/null 2>&1; do
+  # A fresh official image briefly accepts connections on its bootstrap server
+  # before restarting into the durable server. Require readiness across that
+  # handoff so schema initialization cannot race the bootstrap shutdown.
+  until docker exec "${POSTGRES_CONTAINER}" pg_isready -U qbit -d qbit >/dev/null 2>&1 \
+    && sleep 1 \
+    && docker exec "${POSTGRES_CONTAINER}" pg_isready -U qbit -d qbit >/dev/null 2>&1; do
     if [[ "${SECONDS}" -ge "${deadline}" ]]; then
       echo "timed out waiting for PRISM Postgres container" >&2
       docker logs "${POSTGRES_CONTAINER}" >&2 || true
@@ -57,6 +62,14 @@ else
     sleep 1
   done
   PSQL_COMMAND="docker exec -i ${POSTGRES_CONTAINER} psql -U qbit -d qbit"
+fi
+
+if [[ -n "${EXTERNAL_PSQL}" ]]; then
+  GATE_IMAGE="external-postgres"
+  GATE_IMAGE_DIGEST="not-applicable"
+else
+  GATE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${POSTGRES_CONTAINER}")"
+  GATE_IMAGE_DIGEST="$(docker inspect --format '{{.Image}}' "${POSTGRES_CONTAINER}")"
 fi
 
 (
@@ -72,7 +85,12 @@ import os
 import tempfile
 from pathlib import Path
 
-from lab.prism.share_ledger import PendingShare, PsqlShareLedger, ShareReplayConflict
+from lab.prism.share_ledger import (
+    PendingShare,
+    PsqlShareLedger,
+    ShareReplayConflict,
+    SingleWriterShareLedger,
+)
 
 
 def pending(
@@ -732,8 +750,39 @@ WHERE miner_id LIKE 'miner-unanchored-%';
 """
 )
 assert_equal(unanchored_balances, [], "unanchored carry rows require a confirmed pool block")
+unknown_confirmation = replacement.confirm_accepted_block(
+    block_hash="ff" * 32,
+    active_tip_height=7,
+)
+assert_equal(
+    unknown_confirmation,
+    {"backend": "postgres-psql", "confirmed_count": 0},
+    "unknown block confirmation exposes no publication ordinal",
+)
+wrong_height_confirmation = replacement.confirm_accepted_block(
+    block_hash="44" * 32,
+    active_tip_height=8,
+)
+assert_equal(
+    wrong_height_confirmation,
+    {"backend": "postgres-psql", "confirmed_count": 0},
+    "wrong-height confirmation exposes no publication ordinal",
+)
 confirmed = replacement.confirm_accepted_block(block_hash="44" * 32, active_tip_height=7)
 assert_equal(confirmed["confirmed_count"], 1, "confirmed block count")
+first_publication_sequence = int(confirmed["audit_publication_sequence"])
+if first_publication_sequence <= 0:
+    raise SystemExit("first confirmed block received a non-positive publication ordinal")
+confirmed_replay = replacement.confirm_accepted_block(
+    block_hash="44" * 32,
+    active_tip_height=7,
+)
+assert_equal(confirmed_replay["confirmed_count"], 1, "exact confirmation replay count")
+assert_equal(
+    int(confirmed_replay["audit_publication_sequence"]),
+    first_publication_sequence,
+    "exact confirmation replay preserves publication ordinal",
+)
 assert_equal(
     replacement.dashboard_miner_pending_maturity_bits(recipient_id="miner-b"),
     49500,
@@ -757,14 +806,16 @@ INSERT INTO qbit_pool_blocks (
     parent_hash,
     coinbase_txid,
     payout_manifest_sha256,
-    chain_state
+    chain_state,
+    audit_publication_sequence
 ) VALUES (
     '""" + alias_block_hash + """',
     72,
     '""" + "44" * 32 + """',
     '""" + "46" * 32 + """',
     '""" + "47" * 32 + """',
-    'confirmed'
+    'confirmed',
+    nextval('qbit_audit_publication_sequence_seq')
 );
 
 INSERT INTO qbit_payout_carry_forward (
@@ -865,7 +916,13 @@ replacement.persist_accepted_block(
     audit_report=zero_net_report,
 )
 force_expired_idle_lease(replacement)
-replacement.confirm_accepted_block(block_hash="45" * 32, active_tip_height=8)
+second_confirmation = replacement.confirm_accepted_block(
+    block_hash="45" * 32,
+    active_tip_height=8,
+)
+second_publication_sequence = int(second_confirmation["audit_publication_sequence"])
+if second_publication_sequence == first_publication_sequence:
+    raise SystemExit("distinct confirmed blocks shared a publication ordinal")
 zero_net_balances = replacement._run_json(
     """
 SELECT COALESCE(json_agg(json_build_object(
@@ -915,9 +972,31 @@ else:
 
 inactive_count = replacement.mark_pool_block_inactive(block_hash="44" * 32, active_tip_height=7)["inactive_count"]
 assert_equal(inactive_count, 1, "inactive block quarantine count")
+assert_equal(
+    replacement.mark_pool_block_inactive(
+        block_hash="44" * 32,
+        active_tip_height=7,
+    )["inactive_count"],
+    0,
+    "repeated inactive transition is count-zero",
+)
+assert_equal(
+    replacement.confirm_accepted_block(
+        block_hash="44" * 32,
+        active_tip_height=7,
+    ),
+    {"backend": "postgres-psql", "confirmed_count": 0},
+    "inactive block confirmation exposes no publication ordinal",
+)
 assert_equal(replacement.current_owed_balances(), [], "inactive owed balances are excluded")
-reactivated_count = replacement.reactivate_pool_block(block_hash="44" * 32, active_tip_height=7)["reactivated_count"]
-assert_equal(reactivated_count, 1, "inactive block reactivation count")
+reactivated = replacement.reactivate_pool_block(block_hash="44" * 32, active_tip_height=7)
+assert_equal(reactivated["reactivated_count"], 1, "inactive block reactivation count")
+reactivated_publication_sequence = int(reactivated["audit_publication_sequence"])
+assert_equal(
+    reactivated_publication_sequence,
+    first_publication_sequence,
+    "reactivated block preserves its published ordinal",
+)
 if not replacement.current_owed_balances():
     raise SystemExit("reactivated block did not restore owed balances")
 inactive_count = replacement.mark_pool_block_inactive(block_hash="44" * 32, active_tip_height=7)["inactive_count"]
@@ -1356,6 +1435,19 @@ WHERE block_hash = '""" + external_block_hash + """';
         "externalized conflicting duplicate does not write an orphan body file",
     )
 
+external_successor.release_writer_lease()
+
 print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity")
 PY
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+    python3 -m tests.prism_postgres_a1_gate
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+    python3 -m tests.prism_postgres_a1_migration_gate
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+  QBIT_PRISM_GATE_IMAGE="${GATE_IMAGE}" \
+  QBIT_PRISM_GATE_IMAGE_DIGEST="${GATE_IMAGE_DIGEST}" \
+    python3 -m tests.prism_postgres_a1_process_gate
 )

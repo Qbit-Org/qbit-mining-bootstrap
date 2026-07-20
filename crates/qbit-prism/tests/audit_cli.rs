@@ -85,6 +85,27 @@ fn canonical_share_segment_bytes(
     .into_bytes()
 }
 
+fn canonicalize_cli_value(value: &serde_json::Value, label: &str) -> Vec<u8> {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "qbit-prism-audit-canonicalize-{label}-{}.json",
+        std::process::id()
+    ));
+    fs::write(&bundle_path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-canonicalize"))
+        .arg("--input")
+        .arg(&bundle_path)
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&bundle_path);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
 #[test]
 fn verifier_cli_accepts_exported_power_law_bundle() {
     let fixture: Fixture = serde_json::from_str(include_str!(
@@ -154,6 +175,43 @@ fn verifier_cli_accepts_exported_power_law_bundle() {
 }
 
 #[test]
+fn canonicalizer_restores_typed_bytes_for_reordered_unicode_and_optional_input() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    let bundle = build_audit_bundle(
+        fixture.shares,
+        fixture.found_block,
+        power_law_prior_balances(),
+        PayoutPolicy::day_one_default(),
+        &manifest_signing_key(),
+        &ledger_signing_key(),
+    )
+    .unwrap();
+    let canonical = canonical_audit_bundle_bytes(&bundle).unwrap();
+
+    // Value serialization uses map order rather than AuditBundle's typed field
+    // order. The adapter must restore the typed canonical representation.
+    let mut reordered = serde_json::to_value(&bundle).unwrap();
+    assert_eq!(canonicalize_cli_value(&reordered, "reordered"), canonical);
+
+    reordered["shares"][0]["credit_policy"] = serde_json::Value::Null;
+    assert_eq!(
+        canonicalize_cli_value(&reordered, "explicit-optional-null"),
+        canonical
+    );
+
+    reordered["shares"][0]["miner_id"] = serde_json::Value::String("miner-é".into());
+    let unicode_bundle: AuditBundle = serde_json::from_value(reordered.clone()).unwrap();
+    let unicode_canonical = canonical_audit_bundle_bytes(&unicode_bundle).unwrap();
+    let unicode_output = canonicalize_cli_value(&reordered, "unicode");
+    assert_eq!(unicode_output, unicode_canonical);
+    assert!(unicode_output.windows("miner-é".len()).any(|window| window == "miner-é".as_bytes()));
+
+}
+
+#[test]
 fn verifier_cli_accepts_live_testnet_scale_legacy_bundle() {
     let bundle = live_testnet_scale_bundle();
     let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
@@ -173,8 +231,6 @@ fn verifier_cli_accepts_live_testnet_scale_legacy_bundle() {
         .arg(report.coinbase_value_sats.to_string())
         .output()
         .unwrap();
-    let _ = fs::remove_file(&bundle_path);
-
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -184,6 +240,18 @@ fn verifier_cli_accepts_live_testnet_scale_legacy_bundle() {
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("qbit.prism.audit-verification-report.v1")
     );
+    let canonical_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-canonicalize"))
+        .arg("--input")
+        .arg(&bundle_path)
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&bundle_path);
+    assert!(canonical_output.status.success());
+    assert_eq!(
+        canonical_output.stdout,
+        canonical_audit_bundle_bytes(&bundle).unwrap()
+    );
+    assert!(bundle.found_block.network_difficulty > u64::MAX as u128);
 }
 
 #[test]

@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
+import threading
 import unittest
 from tests import prism_coordinator_test_support as _job_support
 from tests import prism_vardiff_test_support as _vardiff_support
@@ -599,6 +602,29 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             ]
         )
         server.ledger = ledger
+        temporary_audit = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_audit.cleanup)
+        server.audit_dir = Path(temporary_audit.name) / "audit"
+        server.evidence_path = (
+            Path(temporary_audit.name) / "state" / "evidence.json"
+        )
+        audit_store = server._ensure_audit_artifact_store()
+        self.addCleanup(audit_store.close)
+        payout_service = server._ensure_payout_state_service()
+        real_reactivate = ledger.reactivate_pool_block
+
+        def guarded_reactivate(**kwargs: object) -> dict[str, object]:
+            self.assertTrue(
+                payout_service.balance_mutation_lock._is_owned(),  # type: ignore[attr-defined]
+                "P1 balance lock must be outermost during reactivation",
+            )
+            self.assertEqual(
+                audit_store._publication_guard_owner,
+                threading.get_ident(),
+            )
+            return real_reactivate(**kwargs)
+
+        ledger.reactivate_pool_block = guarded_reactivate  # type: ignore[method-assign]
         server.rpc = ReorgRpc(
             tip=pool_block_hash,
             template=gbt_template(pool_block_hash, height=13),

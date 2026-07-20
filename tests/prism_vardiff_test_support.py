@@ -189,6 +189,7 @@ class RecordingLedger(FakeLedger):
         self.reversed: list[dict[str, object]] = []
         self.rejected: list[dict[str, object]] = []
         self.submit_seen = False
+        self._audit_publication_sequences: dict[str, int] = {}
 
     def append(self, pending: object) -> object:
         self.pending.append(pending)
@@ -229,7 +230,19 @@ class RecordingLedger(FakeLedger):
 
     def confirm_accepted_block(self, **kwargs: object) -> dict[str, object]:
         self.confirmed.append({**kwargs, "submit_seen_at_confirm": self.submit_seen})
-        return {"backend": "fake", "confirmed_count": 1}
+        block_hash = str(kwargs.get("block_hash") or "")
+        sequence = self._audit_publication_sequences.get(block_hash)
+        if sequence is None:
+            sequence = len(self._audit_publication_sequences) + 1
+            self._audit_publication_sequences[block_hash] = sequence
+        return {
+            "backend": "fake",
+            "confirmed_count": 1,
+            "audit_publication_sequence": sequence,
+        }
+
+    def audit_publication_sequence_floor(self) -> int:
+        return max(self._audit_publication_sequences.values(), default=0)
 
     def all_shares(self) -> list[object]:
         return [
@@ -725,10 +738,18 @@ def verified_block_bundle(coinbase_tx_hex: str = "c0ffee") -> dict[str, object]:
 
 def verified_audit_report(coinbase_tx_hex: str = "c0ffee") -> dict[str, object]:
     return {
+        "reward_manifest_sha256_hex": "44" * 32,
+        "payout_policy_manifest_sha256_hex": "55" * 32,
+        "prism_audit_commitment_leaf_hex": "66" * 32,
+        "audit_commitment_root_hex": "77" * 32,
         "coinbase_txid": "11" * 32,
+        "coinbase_wtxid": "88" * 32,
         "coinbase_manifest_sha256_hex": "22" * 32,
         "audit_bundle_sha256_hex": "33" * 32,
         "coinbase_tx_hex": coinbase_tx_hex,
+        "min_output_sats": 1,
+        "onchain_output_count": 0,
+        "accrued_account_count": 0,
     }
 
 

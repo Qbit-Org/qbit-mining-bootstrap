@@ -7,9 +7,11 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 import time
+import uuid
 from typing import Any, Callable, Protocol
 
 from lab.prism.prism_tools import prism_tool_command
@@ -17,6 +19,26 @@ from lab.prism.prism_tools import prism_tool_command
 
 PRISM_BUILDER_PHASE_METRICS_PREFIX = "qbit-prism-build-phase-metrics "
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
+
+
+def canonical_bundle_bytes(bundle: dict[str, Any]) -> bytes:
+    """Use J1's typed Rust adapter for canonical audit-bundle bytes.
+
+    Generic compact JSON is not equivalent: serde restores typed field order,
+    emits UTF-8, and omits optional defaults. Keep those digest semantics in J1.
+    """
+
+    completed = subprocess.run(
+        prism_tool_command("qbit-prism-audit-canonicalize") + ["--input", "-"],
+        input=json.dumps(bundle).encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"qbit-prism-audit-canonicalize failed: {stderr}")
+    return completed.stdout
 
 
 class CancellationPort(Protocol):
@@ -73,6 +95,8 @@ class BundleCompiler:
         witness_merkle_leaves_hex: list[str] | None = None,
         ctv_fee_parent_hash: str | None = None,
         canonical_output_path: Path | None = None,
+        canonical_output_parent_fd: int | None = None,
+        canonical_output_adopter: Callable[[Path, os.stat_result], None] | None = None,
         summary_only: bool = False,
         payout_policy: dict[str, object] | None = None,
         ctv_settlement: dict[str, object] | None = None,
@@ -148,10 +172,14 @@ class BundleCompiler:
         command.append("--job-summary-output" if summary_only else "--canonical-output")
         if record_phase_metrics:
             command.append("--phase-metrics")
-        if canonical_output_path is not None:
+        if (
+            canonical_output_path is not None
+            and canonical_output_parent_fd is None
+        ):
             canonical_output_path.parent.mkdir(parents=True, exist_ok=True)
         succeeded = False
         created_output = False
+        created_output_fd: int | None = None
         try:
             with ExitStack() as stack:
                 if canonical_output_path is None:
@@ -159,10 +187,28 @@ class BundleCompiler:
                         tempfile.TemporaryFile(mode="w+", encoding="utf-8")
                     )
                 else:
-                    output = stack.enter_context(
-                        canonical_output_path.open("x+", encoding="utf-8")
-                    )
+                    if canonical_output_parent_fd is None:
+                        output = stack.enter_context(
+                            canonical_output_path.open("x+", encoding="utf-8")
+                        )
+                    else:
+                        output_fd = os.open(
+                            canonical_output_path.name,
+                            os.O_RDWR
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            0o666,
+                            dir_fd=canonical_output_parent_fd,
+                        )
+                        output = stack.enter_context(
+                            os.fdopen(output_fd, "w+", encoding="utf-8")
+                        )
                     created_output = True
+                    # Keep the created inode allocated until cleanup compares
+                    # it with the published name. This closes the Linux inode-
+                    # reuse window after an adopter replaces the path.
+                    created_output_fd = os.dup(output.fileno())
                 stderr = stack.enter_context(
                     tempfile.TemporaryFile(mode="w+", encoding="utf-8")
                 )
@@ -382,14 +428,119 @@ class BundleCompiler:
                     )
                 if cancellation is not None:
                     cancellation.raise_if_cancelled("builder verification")
+                if canonical_output_path is not None and canonical_output_adopter is not None:
+                    canonical_output_adopter(
+                        canonical_output_path,
+                        os.fstat(output.fileno()),
+                    )
             succeeded = True
             return bundle
         finally:
-            if canonical_output_path is not None and created_output and not succeeded:
-                try:
-                    canonical_output_path.unlink()
-                except FileNotFoundError:
-                    pass
+            try:
+                if (
+                    canonical_output_path is not None
+                    and created_output
+                    and not succeeded
+                ):
+                    created_output_identity = (
+                        None
+                        if created_output_fd is None
+                        else os.fstat(created_output_fd)
+                    )
+                    self._remove_created_output_if_same(
+                        canonical_output_path,
+                        created_output_identity,
+                        parent_fd=canonical_output_parent_fd,
+                    )
+            finally:
+                if created_output_fd is not None:
+                    os.close(created_output_fd)
+
+    @staticmethod
+    def _remove_created_output_if_same(
+        path: Path,
+        identity: os.stat_result | None,
+        *,
+        parent_fd: int | None = None,
+    ) -> None:
+        if identity is None:
+            return
+        try:
+            current = (
+                path.lstat()
+                if parent_fd is None
+                else os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            )
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(current.st_mode):
+            # Cleanup has no portable no-replace restore primitive for a
+            # directory/symlink.  Reject it before moving an unowned path.
+            return
+        if not BundleCompiler._output_identity_matches(identity, current):
+            # Preserve a replacement already visible at the canonical name.
+            return
+        quarantine = path.with_name(f".{path.name}.{uuid.uuid4().hex}.cleanup")
+        try:
+            if parent_fd is None:
+                os.replace(path, quarantine)
+            else:
+                os.replace(
+                    path.name,
+                    quarantine.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+        except FileNotFoundError:
+            return
+        moved = (
+            quarantine.lstat()
+            if parent_fd is None
+            else os.stat(
+                quarantine.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        )
+        if BundleCompiler._output_identity_matches(identity, moved):
+            if parent_fd is None:
+                quarantine.unlink()
+            else:
+                os.unlink(quarantine.name, dir_fd=parent_fd)
+            return
+        try:
+            if parent_fd is None:
+                os.link(quarantine, path, follow_symlinks=False)
+            else:
+                os.link(
+                    quarantine.name,
+                    path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+        except OSError:
+            # A second replacement won after quarantine. Keep both artifacts;
+            # an unowned non-regular replacement is likewise preserved there.
+            return
+        if parent_fd is None:
+            quarantine.unlink()
+        else:
+            os.unlink(quarantine.name, dir_fd=parent_fd)
+
+    @staticmethod
+    def _output_identity_matches(
+        identity: os.stat_result,
+        value: os.stat_result,
+    ) -> bool:
+        return bool(
+            value.st_dev == identity.st_dev
+            and value.st_ino == identity.st_ino
+            and value.st_mode == identity.st_mode
+            and value.st_size == identity.st_size
+            and value.st_mtime_ns == identity.st_mtime_ns
+            and stat.S_ISREG(value.st_mode)
+        )
 
     def _record_phase_metrics(
         self,
