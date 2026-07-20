@@ -18,6 +18,7 @@ import json
 import math
 import os
 import queue
+import random
 import shlex
 import signal
 import socket
@@ -79,6 +80,10 @@ DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS = 12_000
 TESTNET_QBIT_CHAINS = {"testnet", "testnet3", "testnet4", "signet"}
 DEFAULT_PRISM_BLOCKPOLL_SECONDS = 2.0
 DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS = 5.0
+DEFAULT_PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS = 1.0
+# Fraction of the holdoff added as random jitter so coordinators sharing one
+# qbitd do not phase-lock their blocked-refresh re-attempts.
+PRISM_TIP_REFRESH_FAILURE_HOLDOFF_JITTER_FRACTION = 0.25
 DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS = 10.0
 DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS = 60.0
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
@@ -2161,6 +2166,16 @@ class PrismCoordinator:
             "PRISM_BLOCKWAIT_TIMEOUT_SECONDS",
             DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS,
         )
+        # After a FAILED refresh pass, the fallback poller re-attempts no
+        # sooner than this many seconds (plus jitter) while the tip the failed
+        # pass worked against is still current, so a persistent blockage or
+        # sustained payout churn costs ~1 attempt/second instead of one per
+        # 0.25s trigger slice. A successful pass or a newly observed tip
+        # re-arms immediately. Zero restores unspaced retries.
+        self.tip_refresh_failure_holdoff_seconds = env_nonnegative_float(
+            "PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS",
+            DEFAULT_PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS,
+        )
         # Zero disables stale-grace crediting (every prior-tip share rejects,
         # the pre-grace behavior).
         self.stale_grace_seconds = env_nonnegative_float(
@@ -2531,6 +2546,9 @@ class PrismCoordinator:
         )
         self.block_candidate_retry_max_seconds = DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS
         self.block_candidate_retry_delays: dict[str, float] = {}
+        # Terminal candidates whose durable outbox update failed; replays for
+        # these run finalize-only (see _finalize_block_candidate).
+        self._block_candidate_finalize_retries: dict[str, tuple[bool, str]] = {}
         # A block candidate that loses its tip race (or fails to submit) is a
         # BLOCK-path event, not a share rejection: under the async model the
         # share was already accepted and credited, so it must not touch the
@@ -2597,6 +2615,8 @@ class PrismCoordinator:
         self._tip_refresh_retry = threading.Event()
         self._tip_refresh_retry_counter = 0
         self._tip_refresh_retry_consumed = 0
+        self._tip_refresh_failure_holdoff_until: float | None = None
+        self._tip_refresh_failure_tip: str | None = None
         self._active_tip_refresh: tuple[
             TipRefreshValidationToken,
             _FanoutCancellation,
@@ -7088,6 +7108,10 @@ class PrismCoordinator:
             self._tip_refresh_retry_counter = 0
         if not hasattr(self, "_tip_refresh_retry_consumed"):
             self._tip_refresh_retry_consumed = 0
+        if not hasattr(self, "_tip_refresh_failure_holdoff_until"):
+            self._tip_refresh_failure_holdoff_until: float | None = None
+        if not hasattr(self, "_tip_refresh_failure_tip"):
+            self._tip_refresh_failure_tip: str | None = None
         if not hasattr(self, "_active_tip_refresh"):
             self._active_tip_refresh: tuple[
                 TipRefreshValidationToken,
@@ -7351,6 +7375,61 @@ class PrismCoordinator:
             self._tip_refresh_retry_consumed = generation
             self._tip_refresh_retry.clear()
             return True
+
+    def _note_tip_refresh_attempt_failed(
+        self,
+        observed_tip: str | None = None,
+    ) -> None:
+        """Stamp a failed refresh pass so the poller spaces its re-attempt.
+
+        ``observed_tip`` is the tip the failed pass worked against; a pass
+        that failed before learning one stamps the current observation so an
+        RPC outage with a static tip still gets spaced.
+        """
+        self._ensure_tip_refresh_state()
+        holdoff = float(
+            getattr(
+                self,
+                "tip_refresh_failure_holdoff_seconds",
+                DEFAULT_PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS,
+            )
+        )
+        if holdoff <= 0:
+            return
+        holdoff += random.uniform(
+            0.0,
+            holdoff * PRISM_TIP_REFRESH_FAILURE_HOLDOFF_JITTER_FRACTION,
+        )
+        with self.lock:
+            if observed_tip is None:
+                observed_tip = self._newest_observed_tip_locked()
+            self._tip_refresh_failure_tip = observed_tip
+            self._tip_refresh_failure_holdoff_until = time.monotonic() + holdoff
+
+    def _clear_tip_refresh_failure_holdoff(self) -> None:
+        self._ensure_tip_refresh_state()
+        with self.lock:
+            self._tip_refresh_failure_holdoff_until = None
+            self._tip_refresh_failure_tip = None
+
+    def _tip_refresh_failure_holdoff_remaining(self) -> float:
+        """Seconds the poller must still wait before re-running a failed pass.
+
+        Zero as soon as the newest known tip differs from the one the failed
+        pass worked against: spacing throttles re-attempts against an
+        unchanged, blocked or churning view, never the reaction to a
+        genuinely new tip (including one detected but not yet published).
+        """
+        self._ensure_tip_refresh_state()
+        with self.lock:
+            deadline = self._tip_refresh_failure_holdoff_until
+            failed_tip = self._tip_refresh_failure_tip
+            current_hash = self._newest_observed_tip_locked()
+        if deadline is None:
+            return 0.0
+        if current_hash != failed_tip:
+            return 0.0
+        return max(0.0, deadline - time.monotonic())
 
     def _observe_tip_refresh_seconds(self, name: str, elapsed_seconds: float) -> None:
         self._ensure_tip_refresh_state()
@@ -8894,11 +8973,36 @@ class PrismCoordinator:
         while remaining > 0:
             if self.stop_event.is_set():
                 return False
-            if self._consume_tip_refresh_retry():
+            # After a failed pass, leave retry signals unconsumed until the
+            # spacing window closes. Re-checked per slice: a newly observed
+            # tip zeroes the holdoff immediately, and signals arriving during
+            # the hold stay coalesced for the attempt that eventually runs.
+            holdoff = self._tip_refresh_failure_holdoff_remaining()
+            if holdoff <= 0 and self._consume_tip_refresh_retry():
                 return not self.stop_event.is_set()
             wait_seconds = min(remaining, 0.25)
-            self._tip_refresh_retry.wait(wait_seconds)
+            if holdoff > 0:
+                # The retry event may already be set; pace on the stop event
+                # so the spacing window cannot be spun through instantly.
+                # Short slices keep a newly detected tip's release prompt.
+                # Beat per slice: a deliberately held poller is idle, not
+                # hung, and must not trip the watchdog when the configured
+                # holdoff exceeds its timeout.
+                self._record_heartbeat("qbit_blockpoll")
+                wait_seconds = min(wait_seconds, holdoff, 0.05)
+                self.stop_event.wait(wait_seconds)
+            else:
+                self._tip_refresh_retry.wait(wait_seconds)
             remaining -= wait_seconds
+        # Interval-driven attempts respect the same spacing so a sub-holdoff
+        # blockpoll interval cannot re-run a failed pass early.
+        while not self.stop_event.is_set():
+            holdoff = self._tip_refresh_failure_holdoff_remaining()
+            if holdoff <= 0:
+                break
+            self._record_heartbeat("qbit_blockpoll")
+            self.stop_event.wait(min(holdoff, 0.05))
+        self._consume_tip_refresh_retry()
         return not self.stop_event.is_set()
 
     def blockpoll_loop(self) -> None:
@@ -10193,6 +10297,7 @@ class PrismCoordinator:
         progress_refresh_active = False
         observation_sequence = 0
         pending_signal_token: int | None = None
+        observed_best_tip: str | None = None
         try:
             observation_sequence = self._reserve_tip_observation_sequence()
             # The interval poller has no push notification to mark priority for
@@ -10237,7 +10342,10 @@ class PrismCoordinator:
                     pending_signal_token,
                     observation_sequence,
                 )
-            snapshot = self.fetch_qbit_tip_template_snapshot()
+            snapshot = self._reuse_current_tip_template_snapshot(observed_best_tip)
+            if snapshot is None:
+                self._record_job_cache_event("template", hit=False)
+                snapshot = self.fetch_qbit_tip_template_snapshot()
             if not self.observe_tip_for_refresh(
                 snapshot.bestblockhash,
                 observation_sequence=observation_sequence,
@@ -10777,6 +10885,7 @@ class PrismCoordinator:
                 )
             self.last_successful_template_refresh_monotonic = time.monotonic()
             self.template_refresh_failure_started_monotonic = None
+            self._clear_tip_refresh_failure_holdoff()
             # A completed pass reconfirms that the coherent snapshot remained
             # current through publication and fanout. Refresh the liveness
             # stamp so a legitimately long, progressing pass does not become
@@ -10794,9 +10903,14 @@ class PrismCoordinator:
             # stays budgeted below: it also wraps genuine failures (job builds
             # failing, malformed template artifacts, untrusted chain views)
             # whose persistence must still take the budgeted restart path.
+            # The retry-spacing stamp still applies: churn against an
+            # unchanged tip re-arms the poller no faster than the holdoff,
+            # while a genuinely newer tip zeroes it immediately.
+            self._note_tip_refresh_attempt_failed(observed_best_tip)
             raise
         except Exception:
             self._record_template_refresh_failure(time.monotonic())
+            self._note_tip_refresh_attempt_failed(observed_best_tip)
             raise
         finally:
             try:
@@ -11629,6 +11743,43 @@ class PrismCoordinator:
         )
         return 0
 
+    def _reuse_current_tip_template_snapshot(
+        self,
+        observed_best_tip: str,
+    ) -> QbitTipTemplateSnapshot | None:
+        """Rebuild a snapshot from cached artifacts while their tip holds.
+
+        Honors the PRISM_TEMPLATE_CACHE_SECONDS window that per-client job
+        builds already use: within it, a poll pass whose observed best tip
+        still equals the cached template's parent issues no getblocktemplate.
+        Rapid failed-refresh re-attempts then cost one cheap best-hash probe
+        each, while a changed tip or an expired window falls through to the
+        full fetch, so same-tip template rotation still lands on the normal
+        cadence.
+        """
+        self._ensure_job_cache_state()
+        ttl = float(
+            getattr(self, "template_cache_seconds", DEFAULT_PRISM_BLOCKPOLL_SECONDS)
+        )
+        if ttl <= 0:
+            return None
+        with self._job_cache_lock:
+            cached = self._template_artifacts
+        if cached is None:
+            return None
+        if time.monotonic() - cached.fetched_monotonic > ttl:
+            return None
+        if str(observed_best_tip) != cached.previousblockhash:
+            return None
+        self._record_job_cache_event("template", hit=True)
+        return QbitTipTemplateSnapshot(
+            bestblockhash=cached.previousblockhash,
+            previousblockhash=cached.previousblockhash,
+            template_fingerprint=cached.fingerprint,
+            template_generation=cached.generation,
+            template_artifacts=cached,
+        )
+
     def fetch_qbit_tip_template_snapshot(self) -> QbitTipTemplateSnapshot:
         # Reserve ordering before either RPC: a fetch that started on an older
         # view must not become "newer" merely because its template arrived last.
@@ -11649,6 +11800,12 @@ class PrismCoordinator:
         # drive tip observation/graveyard pruning.
         bestblockhash = str(self.rpc.call("getbestblockhash"))
         if bestblockhash != previousblockhash:
+            # Record the discovery before failing: the retry-spacing gate
+            # releases on a newer DETECTED tip, and without blockwait this
+            # mismatch is the only place the new tip becomes known. An
+            # unrecorded discovery would hold the immediate new-tip retry
+            # for the full failure holdoff.
+            self.observe_tip_for_refresh(bestblockhash)
             self._schedule_tip_refresh_retry()
             raise TemplateRefreshSuperseded(
                 "qbit tip changed while fetching block template "
@@ -15733,13 +15890,34 @@ class PrismCoordinator:
         candidate: PrismBlockCandidate,
     ) -> bool:
         """Land one dequeued block candidate inside writer admission."""
-        accepted = False
-        error = "candidate became stale or submission failed"
         outcome = getattr(self, "_block_candidate_outcome", None)
         if outcome is None:
             outcome = threading.local()
             self._block_candidate_outcome = outcome
         outcome.reason = None
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        with self.lock:
+            registry = getattr(self, "_block_candidate_finalize_retries", None)
+            pending_finalize = (
+                registry.get(block_hash) if registry is not None else None
+            )
+        if pending_finalize is not None:
+            # Finalize-only replay: submission, terminal accounting, and
+            # payout persistence already completed on the pass that armed
+            # this entry; only the durable outbox update remains. Re-running
+            # submit_block_candidate here would recount terminal
+            # abandonments and redo the accepted-path audit/persist work
+            # once per paced retry.
+            accepted, error = pending_finalize
+            return self._finalize_block_candidate(
+                candidate,
+                block_hash=block_hash,
+                accepted=accepted,
+                error=error,
+                outcome=outcome,
+            )
+        accepted = False
+        error = "candidate became stale or submission failed"
         try:
             accepted = self.submit_block_candidate(candidate)
         except Exception:
@@ -15750,7 +15928,6 @@ class PrismCoordinator:
                 flush=True,
             )
             traceback.print_exc()
-        block_hash = str(candidate.submission.block_hash_hex).lower()
         abandon_reason = getattr(outcome, "reason", None) if outcome is not None else None
         retryable = not accepted and (
             abandon_reason is None
@@ -15790,11 +15967,34 @@ class PrismCoordinator:
                 self._retain_block_candidate_for_retry(candidate)
                 self.stop_event.wait(self._next_block_candidate_retry_delay(block_hash))
                 return True
+        return self._finalize_block_candidate(
+            candidate,
+            block_hash=block_hash,
+            accepted=accepted,
+            error=error,
+            outcome=outcome,
+        )
+
+    def _finalize_block_candidate(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        block_hash: str,
+        accepted: bool,
+        error: str,
+        outcome: threading.local,
+    ) -> bool:
+        """Drive a terminal candidate's durable outbox update, with backoff.
+
+        Failure retains the candidate as a finalize-only replay: the next
+        paced attempt re-enters here directly, never submit_block_candidate,
+        so terminal abandonment accounting stays once-per-candidate and an
+        accepted candidate's audit/persist work is not redone per retry.
+        """
         self._clear_accepted_block_payout_preview(
             block_hash,
             invalidate_published=not accepted,
         )
-        self._clear_block_candidate_retry_state(block_hash)
         finish_name = (
             "mark_block_candidate_submitted"
             if accepted
@@ -15813,18 +16013,50 @@ class PrismCoordinator:
                     # replay source left for this process to guard.
                     self._clear_accepted_block_payout_preview(block_hash)
             except Exception:
-                # Keep the coordinator alive. If the terminal-state update
-                # failed, restart replay is exact-idempotent and will retry.
+                # Keep the coordinator alive. The terminal-state update
+                # failed, so the durable row stays pending and its replay
+                # must pace like any other retained retry.
                 print(
                     "prism coordinator: could not finalize durable block candidate "
                     f"hash={block_hash}",
                     flush=True,
                 )
                 traceback.print_exc()
+                with self.lock:
+                    registry = getattr(
+                        self, "_block_candidate_finalize_retries", None
+                    )
+                    if registry is None:
+                        registry = {}
+                        self._block_candidate_finalize_retries = registry
+                    first_failure = block_hash not in registry
+                    registry[block_hash] = (accepted, error)
+                # The share row already reached its terminal outcome in this
+                # process; only the outbox mark is pending. Release the
+                # snapshot anchor floor now (idempotent) -- holding it across
+                # paced retries would clamp job snapshot anchors and
+                # under-count already-durable shares in reward windows.
+                self._finish_pending_share_commit(candidate.pending_share)
+                self._retain_block_candidate_for_retry(candidate)
+                if accepted and first_failure:
+                    # The block is active regardless of the outbox update;
+                    # post-accept fleet refresh must wait for neither ledger
+                    # recovery nor the first backoff. Return unpaced so the
+                    # caller refreshes immediately; the paced ladder starts
+                    # from the first finalize-only replay.
+                    outcome.refresh_client = candidate.client
+                    return True
+                self.stop_event.wait(self._next_block_candidate_retry_delay(block_hash))
+                return True
         elif not accepted:
             # Compatibility ledgers without a durable candidate outbox have
             # no restart replay source that could require the tombstone.
             self._clear_accepted_block_payout_preview(block_hash)
+        with self.lock:
+            registry = getattr(self, "_block_candidate_finalize_retries", None)
+            if registry is not None:
+                registry.pop(block_hash, None)
+        self._clear_block_candidate_retry_state(block_hash)
         # Terminal for this process either way: an accepted candidate credited
         # its share during the success tail (a no-op release here), and an
         # abandoned one can only be credited by restart replay, which stamps a

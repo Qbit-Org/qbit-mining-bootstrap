@@ -758,6 +758,10 @@ def coordinator() -> PrismCoordinator:
     server.rpc = FakeRpc()
     server.qbit_chain = "regtest"
     server.blockpoll_seconds = 2.0
+    # Failed-refresh spacing is opt-in per test: its holdoff waits on real
+    # time, which deadlocks tests that freeze time.monotonic around failing
+    # polls. Pacing behavior is covered by test_prism_refresh_retry_pacing.
+    server.tip_refresh_failure_holdoff_seconds = 0.0
     server.ctv_broadcaster_enabled = False
     server.ctv_broadcaster_wallet = None
     server.ctv_broadcaster_fee_sats = 0
@@ -6775,6 +6779,199 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             [intent["block_hash_hex"] for intent in ledger.pending_block_candidates()],
             [block_hash],
         )
+
+    def test_finalize_failure_replays_with_candidate_backoff(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        pending = self._pending_append("f1").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="f1" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        candidate_intent = server.block_candidate_intent(candidate)
+        ledger.append_batch([(pending, candidate_intent)])
+        server.block_candidate_retry_initial_seconds = 0.1
+        server.block_candidate_retry_max_seconds = 0.4
+        # The block itself lands once; only the terminal outbox update fails.
+        # Replays must pace like any other candidate retry AND run finalize-
+        # only, never re-entering submission.
+        submit_calls = 0
+
+        def accepting_submit(_candidate: PrismBlockCandidate) -> bool:
+            nonlocal submit_calls
+            submit_calls += 1
+            return True
+
+        server.submit_block_candidate = accepting_submit  # type: ignore[method-assign]
+        original_finish = ledger.mark_block_candidate_submitted
+        finish_attempts = 0
+
+        def flaky_finish(*, block_hash: str) -> bool:
+            nonlocal finish_attempts
+            finish_attempts += 1
+            if finish_attempts <= 4:
+                raise RuntimeError("ledger unavailable")
+            return original_finish(block_hash=block_hash)
+
+        ledger.mark_block_candidate_submitted = flaky_finish  # type: ignore[method-assign]
+        waits: list[float] = []
+        with patch.object(
+            server.stop_event,
+            "wait",
+            side_effect=lambda delay: waits.append(delay) or False,
+        ):
+            for _attempt in range(4):
+                server.enqueue_block_candidate(candidate)
+                self.assertTrue(server.submit_next_block_candidate())
+                self.assertEqual(ledger.pending_block_candidates(), [candidate_intent])
+            server.enqueue_block_candidate(candidate)
+            self.assertTrue(server.submit_next_block_candidate())
+
+        # The first accepted finalize failure returns unpaced so the caller
+        # can refresh the fleet immediately; the ladder starts at the first
+        # finalize-only replay.
+        self.assertEqual(waits, [0.1, 0.2, 0.4])
+        self.assertEqual(finish_attempts, 5)
+        self.assertEqual(submit_calls, 1)
+        self.assertNotIn(candidate.submission.block_hash_hex, server.block_candidate_retry_delays)
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
+        self.assertEqual(ledger.pending_block_candidates(), [])
+        self.assertEqual(server._block_candidate_finalize_retries, {})
+        self.assertIn(
+            "qbit_prism_block_candidate_retries_total 4",
+            server.metrics_payload(),
+        )
+
+    def test_abandon_finalize_failure_counts_one_abandonment(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        pending = self._pending_append("f2").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="f2" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        ledger.append_batch([(pending, server.block_candidate_intent(candidate))])
+        server.block_candidate_retry_initial_seconds = 0.1
+        server.block_candidate_retry_max_seconds = 0.4
+        submit_calls = 0
+
+        def terminal_submit(_candidate: PrismBlockCandidate) -> bool:
+            nonlocal submit_calls
+            submit_calls += 1
+            server._abandon_block_candidate(
+                PRISM_REJECTION_STALE_JOB,
+                "tip moved",
+                worker="miner-a",
+            )
+            return False
+
+        server.submit_block_candidate = terminal_submit  # type: ignore[method-assign]
+        original_finish = ledger.mark_block_candidate_abandoned
+        finish_attempts = 0
+
+        def flaky_finish(*, block_hash: str, error: str) -> bool:
+            nonlocal finish_attempts
+            finish_attempts += 1
+            if finish_attempts <= 2:
+                raise RuntimeError("ledger unavailable")
+            return original_finish(block_hash=block_hash, error=error)
+
+        ledger.mark_block_candidate_abandoned = flaky_finish  # type: ignore[method-assign]
+        waits: list[float] = []
+        with patch.object(
+            server.stop_event,
+            "wait",
+            side_effect=lambda delay: waits.append(delay) or False,
+        ):
+            for _attempt in range(3):
+                server.enqueue_block_candidate(candidate)
+                self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(waits, [0.1, 0.2])
+        self.assertEqual(submit_calls, 1)
+        self.assertEqual(finish_attempts, 3)
+        # Finalize-only replays must not recount the terminal abandonment.
+        self.assertEqual(
+            server.block_candidate_abandoned_counts,
+            {PRISM_REJECTION_STALE_JOB: 1},
+        )
+        self.assertEqual(ledger.pending_block_candidates(), [])
+        self.assertEqual(server._block_candidate_finalize_retries, {})
+
+    def test_accepted_finalize_failure_still_triggers_post_accept_refresh(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        pending = self._pending_append("f3").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="f3" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        ledger.append_batch([(pending, server.block_candidate_intent(candidate))])
+        server.block_candidate_retry_initial_seconds = 0.1
+        server.block_candidate_retry_max_seconds = 0.4
+        server.submit_block_candidate = lambda _candidate: True  # type: ignore[method-assign]
+
+        def failing_finish(*, block_hash: str) -> bool:
+            raise RuntimeError("ledger unavailable")
+
+        ledger.mark_block_candidate_submitted = failing_finish  # type: ignore[method-assign]
+        refreshed_clients: list[object] = []
+        server.refresh_jobs_after_pending_accepted_block = (  # type: ignore[method-assign]
+            lambda client, **_kwargs: refreshed_clients.append(client) or 0
+        )
+        released_shares: list[object] = []
+        original_release = server._finish_pending_share_commit
+
+        def recording_release(pending_share: object) -> None:
+            released_shares.append(pending_share)
+            original_release(pending_share)
+
+        server._finish_pending_share_commit = recording_release  # type: ignore[method-assign]
+        waits: list[float] = []
+        with patch.object(
+            server.stop_event,
+            "wait",
+            side_effect=lambda delay: waits.append(delay) or False,
+        ):
+            server.enqueue_block_candidate(candidate)
+            self.assertTrue(server.submit_next_block_candidate())
+            # The block is active on-chain; the fleet refresh fires on the
+            # first finalize failure without waiting out a backoff, and the
+            # snapshot anchor floor is released despite the pending outbox
+            # mark.
+            self.assertEqual(refreshed_clients, [state])
+            self.assertEqual(waits, [])
+            self.assertIn(pending, released_shares)
+            self.assertTrue(server.submit_next_block_candidate())
+            self.assertEqual(refreshed_clients, [state])
+            self.assertEqual(waits, [0.1])
 
     def test_invalid_durable_candidate_is_quarantined_by_outbox_row_key(self) -> None:
         for payload_hash in (None, "ff" * 32):
