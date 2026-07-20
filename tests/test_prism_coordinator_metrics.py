@@ -376,7 +376,7 @@ class PrismCoordinatorReliabilityTests(_VardiffSupportTestCase):
 
         server.stop_event = AdvancingStopEvent()  # type: ignore[assignment]
         with patch(
-            "lab.prism.prism_coordinator.time.monotonic",
+            "lab.prism.block_candidates.time.monotonic",
             side_effect=lambda: clock["now"],
         ):
             self.assertFalse(server._wait_for_block_candidate_retry(1.0))
