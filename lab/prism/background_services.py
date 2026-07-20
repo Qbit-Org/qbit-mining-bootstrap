@@ -53,6 +53,58 @@ class _BackgroundServiceRecord:
 ThreadFactory = Callable[..., threading.Thread]
 
 
+@dataclass(frozen=True, slots=True)
+class WatchdogPorts:
+    """Dynamic process-supervision capabilities used by the watchdog loop."""
+
+    wait_for_stop: Callable[[float], bool]
+    interval_seconds: Callable[[], float]
+    monotonic: Callable[[], float]
+    publication_failure_expired: Callable[[float], bool]
+    publication_budget_seconds: Callable[[], float]
+    liveness_enabled: Callable[[], bool]
+    overdue_heartbeats: Callable[[float], list[str]]
+    liveness_timeout_seconds: Callable[[], float]
+    log: Callable[[str], None]
+    exit_process: Callable[[int], None]
+
+
+class WatchdogService:
+    """Own the bounded-wait process supervision loop."""
+
+    def __init__(self, ports: WatchdogPorts) -> None:
+        self.ports = ports
+
+    def run(self) -> None:
+        while not self.ports.wait_for_stop(self.ports.interval_seconds()):
+            now = self.ports.monotonic()
+            if self.ports.publication_failure_expired(now):
+                publication_budget = self.ports.publication_budget_seconds()
+                self.ports.log(
+                    "prism coordinator: publication-progress watchdog firing; "
+                    "current tip/generation remained unpublished past the "
+                    "template refresh failure budget="
+                    f"{publication_budget:g}s. "
+                    "Exiting non-zero so the restart policy recovers the process."
+                )
+                self.ports.exit_process(1)
+                return
+            overdue = (
+                self.ports.overdue_heartbeats(now)
+                if self.ports.liveness_enabled()
+                else []
+            )
+            if overdue:
+                self.ports.log(
+                    "prism coordinator: liveness watchdog firing; unresponsive "
+                    f"subsystems={overdue} "
+                    f"timeout={self.ports.liveness_timeout_seconds():g}s. "
+                    "Exiting non-zero so the restart policy recovers the process."
+                )
+                self.ports.exit_process(1)
+                return
+
+
 class BackgroundServiceRegistry:
     """Start named process services once and retain their drain handles."""
 

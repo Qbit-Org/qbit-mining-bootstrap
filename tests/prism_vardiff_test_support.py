@@ -23,6 +23,22 @@ from unittest.mock import patch
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
+from lab.prism.coordinator_config import (
+    DEFAULT_TESTNET_USERNAME_FALLBACK_ADDRESS,
+    default_prism_coinbase_tag_hex,
+    default_prism_username_fallback_address,
+    env_positive_float,
+    load_prism_highdiff_listener,
+    load_prism_vardiff_config,
+    validate_prism_production_gate,
+    validate_same_tip_job_retention_limits,
+)
+from lab.prism.job_bundle import JobBuildCancelled
+from lab.prism.job_delivery import MAX_ACTIVE_PRISM_JOBS_PER_CLIENT
+from lab.prism.payout_state import (
+    PayoutStatePublicationBlocked as _PayoutStatePublicationBlocked,
+)
+from lab.prism.stratum_session import parse_stratum_password_options
 from lab.prism.share_ledger import (
     PendingShare,
     ShareReplayConflict,
@@ -33,8 +49,6 @@ from lab.prism.prism_coordinator import (
     CachedJobBundle,
     CachedTemplateArtifacts,
     ClientState,
-    DEFAULT_TESTNET_USERNAME_FALLBACK_ADDRESS,
-    MAX_ACTIVE_PRISM_JOBS_PER_CLIENT,
     MAX_PENDING_SHARE_APPENDS,
     PRISM_CREDIT_POLICY_STALE_GRACE,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
@@ -56,7 +70,6 @@ from lab.prism.prism_coordinator import (
     QbitTipTemplateSnapshot,
     StratumError,
     StratumListenerProfile,
-    JobBuildCancelled,
     JobBuildSuperseded,
     TemplateRefreshBlocked,
     TemplateRefreshSuperseded,
@@ -64,20 +77,11 @@ from lab.prism.prism_coordinator import (
     WorkerIdentity,
     _FanoutCancellation,
     _ObservedRLock,
-    _PayoutStatePublicationBlocked,
     _JobBuildCancellation,
-    default_prism_coinbase_tag_hex,
-    default_prism_username_fallback_address,
-    load_prism_highdiff_listener,
-    load_prism_vardiff_config,
-    parse_stratum_password_options,
     qbit_template_fingerprint,
     qbit_gbt_rules,
-    env_positive_float,
     scaled_target_difficulty,
     target_from_compact,
-    validate_prism_production_gate,
-    validate_same_tip_job_retention_limits,
 )
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"

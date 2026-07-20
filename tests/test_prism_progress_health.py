@@ -142,9 +142,6 @@ def progress_coordinator() -> tuple[object, FakeMonotonicClock]:
         started_monotonic=clock.now,
         monotonic=clock,
     )
-    server._health_snapshot = None
-    server._health_snapshot_monotonic = None
-    server._health_refresh_loop_running = False
     return server, clock
 
 

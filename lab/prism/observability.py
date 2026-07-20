@@ -182,34 +182,23 @@ class ObservabilityService:
                 metrics_last_failure_class=self._metrics_last_failure_class,
             )
 
-    @property
-    def lock(self) -> threading.RLock:
-        return self._lock
-
     def replace_lock_for_test(self, lock: threading.RLock) -> None:
         self._lock = lock
 
-    def set_health_snapshot_for_compatibility(
-        self,
-        snapshot: dict[str, object] | None,
-    ) -> None:
+    def clear_health_snapshot_for_test(self) -> None:
         with self._lock:
-            self._health_snapshot = snapshot
+            self._health_snapshot = None
 
-    def set_health_snapshot_monotonic_for_compatibility(
+    def set_health_snapshot_monotonic_for_test(
         self,
         value: float | None,
     ) -> None:
         with self._lock:
             self._health_snapshot_monotonic = value
 
-    def set_loop_running_for_compatibility(self, value: bool) -> None:
+    def set_loop_running_for_test(self, value: bool) -> None:
         with self._lock:
             self._health_refresh_loop_running = bool(value)
-
-    def set_refresh_failure_count_for_compatibility(self, value: int) -> None:
-        with self._lock:
-            self._health_snapshot_refresh_failure_count = int(value)
 
     def set_delivery_failure_started_monotonic_for_test(
         self,
