@@ -61,6 +61,23 @@ from lab.prism.block_candidates import (
     block_candidate_intent as encode_block_candidate_intent,
     compatibility_default as candidate_compatibility_default,
 )
+from lab.prism.share_submission import (
+    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+    PRISM_REJECTION_DUPLICATE_SHARE,
+    PRISM_REJECTION_INVALID_EXTRANONCE,
+    PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
+    PRISM_REJECTION_LOW_DIFFICULTY,
+    PRISM_REJECTION_MALFORMED_SUBMIT,
+    PRISM_REJECTION_POOL_CLOSED,
+    PRISM_REJECTION_STALE_JOB,
+    PRISM_REJECTION_UNAUTHORIZED_WORKER,
+    PRISM_REJECTION_UNKNOWN_JOB,
+    RecentShareCompatibilityField,
+    RecentShareIndex,
+    ShareSubmissionPorts,
+    ShareSubmissionService,
+    SubmitControlSnapshot,
+)
 from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
 from lab.prism.coordinator_config import (
     CoordinatorConfig,
@@ -385,19 +402,9 @@ PRISM_JOB_BUILD_PHASES = (
 )
 PRISM_JOB_CACHE_KINDS = ("template", "bundle")
 PRISM_PROGRESS_HEALTH_REASONS = PROGRESS_HEALTH_REASONS
-PRISM_REJECTION_STALE_JOB = "stale-job"
-PRISM_REJECTION_DUPLICATE_SHARE = "duplicate-share"
-PRISM_REJECTION_LOW_DIFFICULTY = "low-difficulty"
-PRISM_REJECTION_MALFORMED_SUBMIT = "malformed-submit"
-PRISM_REJECTION_UNAUTHORIZED_WORKER = "unauthorized-worker"
-PRISM_REJECTION_UNKNOWN_JOB = "unknown-job"
-PRISM_REJECTION_INVALID_EXTRANONCE = "invalid-extranonce"
-PRISM_REJECTION_INVALID_NTIME_OR_NONCE = "invalid-ntime-or-nonce"
 PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH = "candidate-audit-mismatch"
 PRISM_REJECTION_SUBMITBLOCK_REJECTED = "submitblock-rejected"
-PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE = "backend-rpc-unavailable"
 PRISM_REJECTION_INTERNAL_ERROR = "internal-error"
-PRISM_REJECTION_POOL_CLOSED = "pool-closed"
 PRISM_REJECTION_BLOCK_STALE = "block-stale"
 PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED = "ledger-confirmation-failed"
 PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
@@ -1390,6 +1397,8 @@ class _RetainedStateCompatibility:
 
 
 class PrismCoordinator:
+    recent_share_keys = RecentShareCompatibilityField()
+
     pending_initial_jobs = _InitialJobPendingCompatibility()
     stratum_max_pending_initial_jobs = _InitialJobConfigCompatibility(
         "max_pending",
@@ -1795,10 +1804,9 @@ class PrismCoordinator:
         ] = OrderedDict()
         self._p2mr_address_validation_inflight: dict[str, object] = {}
         self.jobs: dict[str, PrismJobContext] = {}
-        # Share-path ownership is deliberately disjoint from the coordinator
-        # control-plane lock. Deduplication remains process-wide so an exact
-        # header replay across reauthorization/connections is still rejected.
-        self._recent_share_lock = threading.Lock()
+        # Share-path accounting is deliberately disjoint from the coordinator
+        # control-plane lock. The submission owner holds the process-wide
+        # deduplication index for exact replays across sessions.
         self.recent_share_keys: set[tuple[object, ...]] = set()
         self._share_accounting_lock = threading.Lock()
         self.connection_counter = 0
@@ -1920,20 +1928,12 @@ class PrismCoordinator:
         self._background_services = self._make_background_service_registry()
 
     def _ensure_share_hot_path_state(self) -> None:
-        """Backfill dedicated hot-path locks for lightweight test embedders."""
-        if (
-            hasattr(self, "_recent_share_lock")
-            and hasattr(self, "_share_accounting_lock")
-            and hasattr(self, "recent_share_keys")
-        ):
+        """Backfill dedicated accounting state for lightweight embedders."""
+        if hasattr(self, "_share_accounting_lock"):
             return
         with _HOT_PATH_LOCK_INITIALIZATION_LOCK:
-            if not hasattr(self, "_recent_share_lock"):
-                self._recent_share_lock = threading.Lock()
             if not hasattr(self, "_share_accounting_lock"):
                 self._share_accounting_lock = threading.Lock()
-            if not hasattr(self, "recent_share_keys"):
-                self.recent_share_keys = set()
 
     @staticmethod
     def _client_vardiff_lock(client: ClientState) -> threading.RLock:
@@ -1941,18 +1941,14 @@ class PrismCoordinator:
 
     def _reserve_recent_share_key(self, share_key: tuple[object, ...]) -> bool:
         self._ensure_share_hot_path_state()
-        with self._recent_share_lock:
-            if share_key in self.recent_share_keys:
-                return False
-            if len(self.recent_share_keys) > 50_000:
-                self.recent_share_keys.clear()
-            self.recent_share_keys.add(share_key)
-            return True
+        return self._ensure_share_submission_service().recent_shares.reserve(
+            share_key  # type: ignore[arg-type]
+        )
 
     def _forget_recent_share_key(self, share_key: tuple[object, ...]) -> None:
-        self._ensure_share_hot_path_state()
-        with self._recent_share_lock:
-            self.recent_share_keys.discard(share_key)
+        self._ensure_share_submission_service().recent_shares.release(
+            share_key  # type: ignore[arg-type]
+        )
 
     def record_rejection(self, reason: str, *, worker: str | None = None) -> None:
         if reason not in PRISM_REJECTION_REASON_IDS:
@@ -2844,6 +2840,153 @@ class PrismCoordinator:
                 "_block_candidate_outcome",
             ):
                 self.__dict__.pop(name, None)
+            return service
+
+    def _share_submit_control_snapshot(
+        self,
+        client: ClientState,
+        job_id: str,
+    ) -> SubmitControlSnapshot:
+        pool_closed, context, published_tip = self._submit_control_snapshot(
+            client,
+            job_id,
+        )
+        return SubmitControlSnapshot(
+            pool_open=not pool_closed,
+            active_context=context,
+            published_tip=published_tip,
+        )
+
+    def _release_submit_share_key(self, share_key: tuple[str, str]) -> None:
+        self._ensure_share_submission_service().recent_shares.release(share_key)
+
+    def _note_collection_block_candidate(
+        self,
+        context: PrismJobContext,
+        submission: Any,
+    ) -> None:
+        self._ensure_share_hot_path_state()
+        with self._share_accounting_lock:
+            self.collection_block_submission_count = (
+                getattr(self, "collection_block_submission_count", 0) + 1
+            )
+        print(
+            "prism coordinator: collection-mode block candidate settles "
+            f"solver-pays-all miner={context.worker.payout_address} "
+            f"hash={submission.block_hash_hex}",
+            flush=True,
+        )
+
+    def _note_submit_accounting(
+        self,
+        worker_name: str,
+        client: ClientState,
+    ) -> None:
+        self.note_worker_submitted_share(worker_name)
+        self.note_vardiff_submitted_share(client)
+
+    def _ensure_share_submission_service(self) -> ShareSubmissionService:
+        service = self.__dict__.get("_share_submission_service")
+        if service is not None:
+            return service
+        init_lock = self.__dict__.setdefault(
+            "_share_submission_service_init_lock",
+            threading.Lock(),
+        )
+        with init_lock:
+            service = self.__dict__.get("_share_submission_service")
+            if service is not None:
+                return service
+            initial_recent_shares = self.__dict__.pop("recent_share_keys", set())
+            service = ShareSubmissionService(
+                ShareSubmissionPorts(
+                reject=lambda rejected, worker: self.reject_stratum(
+                    rejected.code,
+                    rejected.reason,
+                    rejected.message,
+                    worker=worker,
+                ),
+                control_snapshot=self._share_submit_control_snapshot,
+                note_submitted=self._note_submit_accounting,
+                retained_entry=lambda client, job_id: self.evicted_job_entry(
+                    client,
+                    job_id,
+                ),
+                live_tip=lambda: str(self.rpc.call("getbestblockhash")),
+                stale_grace_eligible=(
+                    lambda client, context, current_tip: (
+                        self.context_eligible_for_stale_grace(
+                            client,
+                            context,
+                            current_tip,
+                        )
+                    )
+                ),
+                assemble=lambda client, context, request: (
+                    direct_stratum.assemble_submission(
+                        context.job,
+                        extranonce2_hex=request.extranonce2_hex,
+                        ntime_hex=request.ntime_hex,
+                        nonce_hex=request.nonce_hex,
+                        version_bits_hex=request.version_bits_hex,
+                        version_mask=client.version_mask,
+                    )
+                ),
+                pending_share=lambda context, submission, ntime_hex, credit_policy: (
+                    self.pending_share_from_submission(
+                        context=context,
+                        submission=submission,
+                        ntime_hex=ntime_hex,
+                        credit_policy=credit_policy,
+                    )
+                ),
+                append_share=(
+                    lambda client, context, submission, pending, policy, intent: (
+                        self.append_accepted_share(
+                            client,
+                            context,
+                            submission,
+                            pending,
+                            credit_policy=policy,
+                            candidate_intent=intent,
+                        )
+                    )
+                ),
+                note_retained_submit=lambda policy: self.note_evicted_job_submit(
+                    policy
+                ),
+                note_collection_candidate=(
+                    lambda context, submission: self._note_collection_block_candidate(
+                        context,
+                        submission,
+                    )
+                ),
+                ledger=lambda: self.ledger,
+                share_writer=lambda: self._ensure_share_writer_service(),
+                finish_pending_attempt=lambda pending: self._finish_pending_share_attempt(
+                    pending
+                ),
+                submit_synchronous_candidate=(
+                    lambda candidate, share_key, worker, retained, policy: (
+                        self._submit_synchronous_credit_candidate(
+                            candidate,
+                            share_key=share_key,
+                            worker_name=worker,
+                            evicted_entry=retained,
+                            credit_policy=policy,
+                        )
+                    )
+                ),
+                enqueue_candidate=lambda candidate: self.enqueue_block_candidate(
+                    candidate
+                ),
+                log=lambda message: print(message, flush=True),
+                log_exception=traceback.print_exc,
+                ),
+                extranonce2_size=int(self.extranonce2_size),
+                recent_shares=RecentShareIndex(initial=initial_recent_shares),
+            )
+            self.__dict__["_share_submission_service"] = service
             return service
 
     def _ensure_job_cache_state(self) -> None:
@@ -7391,296 +7534,7 @@ class PrismCoordinator:
 
     @ledger_writer_operation("share_submission")
     def handle_submit(self, client: ClientState, params: list[object]) -> bool:
-        if len(params) < 5:
-            self.reject_stratum(
-                20,
-                PRISM_REJECTION_MALFORMED_SUBMIT,
-                "submit params are incomplete",
-                worker=client.username or None,
-            )
-        worker_name, job_id, extranonce2_hex, ntime_hex, nonce_hex = [str(item) for item in params[:5]]
-        version_bits_hex = str(params[5]) if len(params) > 5 else None
-        if worker_name != client.username:
-            self.reject_stratum(
-                20,
-                PRISM_REJECTION_UNAUTHORIZED_WORKER,
-                "submit username does not match authorized username",
-                worker=client.username or None,
-            )
-        # Normal submits cross the coordinator lock once: pool admission, job
-        # membership, and published-tip authority are copied atomically. All
-        # miner bookkeeping and any live-tip RPC fallback stay outside it.
-        pool_closed, context, published_tip = self._submit_control_snapshot(
-            client,
-            job_id,
-        )
-        # A closed pool rejects before any share accounting: post-close submits
-        # must not inflate global/per-worker submitted totals (the stale-percent
-        # denominator) or vardiff windows they can never contribute to.
-        if pool_closed:
-            self.reject_stratum(
-                21,
-                PRISM_REJECTION_POOL_CLOSED,
-                "pool is no longer accepting shares",
-                worker=worker_name,
-            )
-        if len(extranonce2_hex) != self.extranonce2_size * 2:
-            self.reject_stratum(
-                20,
-                PRISM_REJECTION_INVALID_EXTRANONCE,
-                "unexpected extranonce2 size",
-                worker=worker_name,
-            )
-        if len(ntime_hex) != 8 or len(nonce_hex) != 8:
-            self.reject_stratum(
-                20,
-                PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
-                "ntime and nonce must be 4-byte hex strings",
-                worker=worker_name,
-            )
-        # Count submitted shares once, after the format checks, so the
-        # per-worker counter and the aggregate qbit_prism_submitted_shares_total
-        # (via note_vardiff_submitted_share) cover the same population; malformed
-        # extranonce/ntime submits are recorded only as rejections, not submits.
-        self.note_worker_submitted_share(worker_name)
-        self.note_vardiff_submitted_share(client)
-        credit_policy: str | None = None
-        evicted_entry: EvictedJobEntry | None = None
-        if context is None:
-            evicted_entry = self.evicted_job_entry(client, job_id)
-            if evicted_entry is None:
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_UNKNOWN_JOB,
-                    "stale job",
-                    worker=worker_name,
-                )
-        current_tip = (
-            published_tip
-            if published_tip is not None
-            else str(self.rpc.call("getbestblockhash"))
-        )
-        # Share classification (normal and stale-grace alike) is deliberately
-        # point-in-time against this single tip read: a tip that advances
-        # between here and the ledger append does not retroactively invalidate
-        # the share, exactly as a normal current-tip share stays credited when
-        # the tip moves during processing. Re-checking would add an RPC per
-        # share during post-block bursts only to reject valid work over
-        # processing latency. Block submission is different (chain state):
-        # submit_block_candidate re-checks the tip under lock before
-        # submitblock, and stale-grace shares never reach it.
-        if context is None:
-            try:
-                evicted_context = self.evicted_submit_context(client, evicted_entry, current_tip)
-            except Exception:
-                print("prism coordinator: failed to classify evicted submit context", flush=True)
-                traceback.print_exc()
-                self.reject_stratum(
-                    20,
-                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                    "failed to classify stale-grace parent tip",
-                    worker=worker_name,
-                )
-            if evicted_context is None:
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_STALE_JOB,
-                    "stale job",
-                    worker=worker_name,
-                )
-            context, credit_policy = evicted_context
-        elif str(context.template["previousblockhash"]) != current_tip:
-            try:
-                eligible_for_grace = self.context_eligible_for_stale_grace(client, context, current_tip)
-            except Exception:
-                print("prism coordinator: failed to classify stale-grace parent tip", flush=True)
-                traceback.print_exc()
-                self.reject_stratum(
-                    20,
-                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                    "failed to classify stale-grace parent tip",
-                    worker=worker_name,
-                )
-            if eligible_for_grace:
-                credit_policy = PRISM_CREDIT_POLICY_STALE_GRACE
-            else:
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_STALE_JOB,
-                    "stale job",
-                    worker=worker_name,
-                )
-
-        try:
-            submission = direct_stratum.assemble_submission(
-                context.job,
-                extranonce2_hex=extranonce2_hex,
-                ntime_hex=ntime_hex,
-                nonce_hex=nonce_hex,
-                version_bits_hex=version_bits_hex,
-                version_mask=client.version_mask,
-            )
-        except ValueError as exc:
-            self.reject_stratum(
-                20,
-                PRISM_REJECTION_MALFORMED_SUBMIT,
-                f"malformed submit: {exc}",
-                worker=worker_name,
-            )
-        # A retained job keeps its original worker even if the connection is
-        # later re-authorized. Deduplication must use that immutable identity:
-        # otherwise the same header can be replayed under each new username.
-        share_key = (context.worker.username, submission.header_hex)
-        if not self._reserve_recent_share_key(share_key):
-            self.reject_stratum(
-                22,
-                PRISM_REJECTION_DUPLICATE_SHARE,
-                "duplicate share",
-                worker=worker_name,
-            )
-        # A floor-bearing listener holds the advertised share target above the
-        # qbit network target while network difficulty sits below the floor,
-        # so a submission can solve a block yet miss the share target. Never
-        # discard a block over share bookkeeping: reject as low-difficulty
-        # only when the hash is not block-worthy. Collection-mode jobs are
-        # block-worthy too: their signed bootstrap manifest already commits
-        # the whole coinbase to the submitting worker, so the solve settles
-        # solver-pays-all instead of being silently ledgered as a share -- a
-        # fresh ledger would otherwise withhold every solved block until some
-        # later job delivery, stalling a bootstrapping chain.
-        block_worthy = (
-            submission.block_pass
-            and credit_policy != PRISM_CREDIT_POLICY_STALE_GRACE
-        )
-        if block_worthy and context.collection_only:
-            self._ensure_share_hot_path_state()
-            with self._share_accounting_lock:
-                self.collection_block_submission_count = (
-                    getattr(self, "collection_block_submission_count", 0) + 1
-                )
-            print(
-                f"prism coordinator: collection-mode block candidate settles "
-                f"solver-pays-all miner={context.worker.payout_address} "
-                f"hash={submission.block_hash_hex}",
-                flush=True,
-            )
-        if not submission.share_pass and not block_worthy:
-            self.reject_stratum(
-                23,
-                PRISM_REJECTION_LOW_DIFFICULTY,
-                "low difficulty share",
-                worker=worker_name,
-            )
-
-        pending_share = self.pending_share_from_submission(
-            context=context,
-            submission=submission,
-            ntime_hex=ntime_hex,
-            credit_policy=credit_policy,
-        )
-        if not block_worthy:
-            try:
-                self.append_accepted_share(
-                    client,
-                    context,
-                    submission,
-                    pending_share,
-                    credit_policy=credit_policy,
-                )
-                if evicted_entry is not None:
-                    self.note_evicted_job_submit(credit_policy)
-            except BaseException:
-                self._forget_recent_share_key(share_key)
-                raise
-            return False
-        candidate = PrismBlockCandidate(
-            context=context,
-            submission=submission,
-            extranonce1_hex=client.extranonce1_hex,
-            extranonce2_hex=extranonce2_hex,
-            pending_share=pending_share,
-            client=client,
-            credit_share_on_accept=not submission.share_pass,
-        )
-        if candidate.credit_share_on_accept:
-            # The hash solved a block but missed the assigned share target
-            # (possible only while the listener floor sits above network
-            # difficulty). It is a valid share ONLY if the block lands, so land
-            # it synchronously: the miner's accept/reject and the ledger credit
-            # then both reflect the real outcome -- never an "accepted" ack with
-            # no ledger row. This path is rare (an honest miner does not submit
-            # below its assigned target), so it does not affect the async
-        # common-path latency. On failure the submitter already recorded
-            # the specific block-failure reason; reject the miner as
-            # low-difficulty (the share was, after all, below its target). The
-            # submitter already recorded the specific block-failure reason in
-            # block_candidate_abandoned_counts; reject_stratum additionally counts
-            # the miner-facing rejection (globally and per worker) so this rare
-            # synchronous path is not missing from the rejection metrics.
-            persist_intent = getattr(self.ledger, "persist_block_candidate_intent", None)
-            candidate_intent_durable = False
-            share_writer = self._ensure_share_writer_service()
-            try:
-                candidate_intent = self.block_candidate_intent(candidate)
-                if callable(persist_intent):
-                    persist_intent(candidate_intent)
-                    candidate_intent_durable = True
-                # Move this exact stamped attempt into independent active-actor
-                # ownership and ensure the stable retry/outbox holder before
-                # submission can fail or another same-hash actor can finish.
-                share_writer.begin_candidate_actor(candidate.pending_share)
-            except BaseException:
-                # No retry slot is safe until the pre-submit outbox boundary is
-                # durable. If persistence itself failed, release only this
-                # attempt. Once persistence returned, however, a later dynamic
-                # actor-promotion failure must conservatively keep the attempt
-                # floor: the durable row is replayable even if wiring failed.
-                if not candidate_intent_durable:
-                    self._finish_pending_share_attempt(pending_share)
-                self._forget_recent_share_key(share_key)
-                raise
-            try:
-                return self._submit_synchronous_credit_candidate(
-                    candidate,
-                    share_key=share_key,
-                    worker_name=worker_name,
-                    evicted_entry=evicted_entry,
-                    credit_policy=credit_policy,
-                )
-            finally:
-                # The helper either committed credit, reached durable terminal
-                # noncredit, or published a stable retry before returning.
-                share_writer.finish_candidate_actor(candidate.pending_share)
-        # A block-worthy submission that met the share target is a valid share
-        # regardless of the block's fate: credit it now, acknowledge the miner
-        # immediately, and land the block from the dedicated submitter thread
-        # (ckpool/btcpool/StratumV2 semantics). An orphaned candidate keeps its
-        # share credit.
-        try:
-            candidate_intent = self.block_candidate_intent(candidate)
-        except BaseException:
-            self._finish_pending_share_attempt(pending_share)
-            self._forget_recent_share_key(share_key)
-            raise
-        try:
-            self.append_accepted_share(
-                client,
-                context,
-                submission,
-                pending_share,
-                credit_policy=credit_policy,
-                candidate_intent=candidate_intent,
-            )
-            if evicted_entry is not None:
-                self.note_evicted_job_submit(credit_policy)
-        except BaseException:
-            # Once append begins, S3's pre-visibility rollback, queue-visible
-            # writer, or synchronous append owns this attempt holder. Do not
-            # race that owner by releasing the floor from the client thread.
-            self._forget_recent_share_key(share_key)
-            raise
-        self.enqueue_block_candidate(candidate)
-        return False
+        return self._ensure_share_submission_service().handle(client, params)
 
     def _submit_synchronous_credit_candidate(
         self,
@@ -7697,7 +7551,7 @@ class PrismCoordinator:
             block_landed = self.submit_block_candidate(candidate)
         except BaseException:
             self._retain_block_candidate_for_retry(candidate)
-            self._forget_recent_share_key(share_key)
+            self._release_submit_share_key(share_key)
             raise
         if not block_landed:
             outcome = getattr(self, "_block_candidate_outcome", None)
@@ -7708,7 +7562,7 @@ class PrismCoordinator:
                 # Close without a Stratum result instead of issuing a false
                 # definitive rejection for an uncertain outcome.
                 self._retain_block_candidate_for_retry(candidate)
-                self._forget_recent_share_key(share_key)
+                self._release_submit_share_key(share_key)
                 raise RuntimeError("block candidate outcome is pending durable retry")
             # This process will never credit the candidate share only after the
             # durable outbox update becomes terminal. The actor remains held
@@ -7727,7 +7581,7 @@ class PrismCoordinator:
             # Once the durable outbox cannot replay this candidate, its landed
             # transition tombstone no longer protects a crash seam.
             self._clear_accepted_block_payout_preview(submission.block_hash_hex)
-            self._forget_recent_share_key(share_key)
+            self._release_submit_share_key(share_key)
             self.reject_stratum(
                 23,
                 PRISM_REJECTION_LOW_DIFFICULTY,
