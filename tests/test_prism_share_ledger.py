@@ -327,6 +327,29 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="ab" * 32))
         self.assertEqual(ledger.pending_block_candidates(), [])
 
+    def test_pending_candidate_age_distinguishes_first_attempt(self) -> None:
+        ledger = SingleWriterShareLedger()
+        block_hash = "ac" * 32
+        intent = {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": block_hash,
+            "block_hex": "00",
+        }
+        ledger.persist_block_candidate_intent(intent)
+
+        pending = ledger.block_candidate_pending_metrics()
+        self.assertEqual(pending["pending_count"], 1)
+        self.assertGreaterEqual(pending["oldest_pending_age_seconds"], 0)
+        self.assertGreaterEqual(pending["oldest_unattempted_age_seconds"], 0)
+
+        self.assertTrue(ledger.mark_block_candidate_attempted(block_hash=block_hash))
+        attempted = ledger.block_candidate_pending_metrics()
+        self.assertEqual(attempted["oldest_unattempted_age_seconds"], 0)
+        self.assertEqual(
+            ledger._block_candidate_outbox[block_hash]["attempt_count"],
+            1,
+        )
+
     def test_batch_validation_is_all_or_nothing(self) -> None:
         ledger = SingleWriterShareLedger()
         first = pending_share(1)
@@ -883,6 +906,47 @@ class PrismShareLedgerTests(unittest.TestCase):
         query = ledger.lease_queries[-1]
         self.assertIn("json_build_object('block_hash', block_hash, 'candidate', candidate)", query)
         self.assertIn("ORDER BY created_at, block_hash", query)
+
+    def test_postgres_pending_candidate_metrics_are_aggregate_and_indexable(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "pending_count": 2,
+                    "oldest_pending_age_seconds": "7.5",
+                    "oldest_unattempted_age_seconds": "3.25",
+                },
+            ]
+        )
+
+        self.assertEqual(
+            ledger.block_candidate_pending_metrics(),
+            {
+                "pending_count": 2,
+                "oldest_pending_age_seconds": 7.5,
+                "oldest_unattempted_age_seconds": 3.25,
+            },
+        )
+        query = ledger.lease_queries[-1]
+        self.assertIn("min(created_at)", query)
+        self.assertIn("FILTER (WHERE attempt_count = 0)", query)
+        self.assertIn("WHERE state = 'pending'", query)
+
+    def test_postgres_candidate_attempt_is_writer_fenced(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease(), {"updated": 1}],
+            writer_id="writer-a",
+            writer_epoch=7,
+        )
+
+        self.assertTrue(
+            ledger.mark_block_candidate_attempted(block_hash="ad" * 32)
+        )
+        query = ledger.lease_queries[-1]
+        self.assertIn("qbit_ledger_writer_lease", query)
+        self.assertIn("writer_id = 'writer-a'", query)
+        self.assertIn("writer_epoch = 7", query)
+        self.assertIn("attempt_count = attempt_count + 1", query)
 
     def test_writer_lease_ttl_defaults_to_sixty_seconds(self) -> None:
         ledger = FakeLeasePsqlShareLedger([acquired_lease()])

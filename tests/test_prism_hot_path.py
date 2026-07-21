@@ -15,6 +15,7 @@ Covers the coordinator-side commitments:
 from __future__ import annotations
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import threading
 import time
@@ -204,6 +205,7 @@ def client(connection_id: int) -> ClientState:
     state.vardiff_window_submitted = 0
     state.vardiff_window_work = Decimal("0")
     state.vardiff_difficulty_estimate = None
+    state.vardiff_lock = threading.RLock()
     state.active_job_ids = set()
     state.post_accept_refresh_block = None
     state.tip_work_delivered = None
@@ -587,6 +589,106 @@ class HotPathLoggingTests(unittest.TestCase):
         self.assertIn("building job connection=1", output)
         self.assertIn("sent job connection=1", output)
         self.assertIn("accepted share seq=1", output)
+
+
+class HotPathLockIsolationTests(unittest.TestCase):
+    def test_share_bookkeeping_finishes_while_control_plane_lock_is_held(self) -> None:
+        """600 clients at 100 share events cannot queue on tip authority."""
+        server, _rpc = coordinator()
+        clients = [client(index + 1) for index in range(600)]
+        fake_job = type("FakeJob", (), {"share_difficulty": Decimal("1")})()
+        completed = 0
+        completed_lock = threading.Lock()
+        start = threading.Event()
+
+        def account_share(index: int) -> None:
+            nonlocal completed
+            state = clients[index % len(clients)]
+            self.assertTrue(start.wait(2))
+            server.note_vardiff_submitted_share(state)
+            server.note_vardiff_accepted_share(state, fake_job)  # type: ignore[arg-type]
+            self.assertTrue(server._reserve_recent_share_key(("miner", index)))
+            with completed_lock:
+                completed += 1
+
+        # Holding tip/publication authority would block all 100 workers before
+        # the fix because every Vardiff increment and dedup reservation also
+        # acquired this lock. They now complete on per-client/dedicated locks.
+        executor = ThreadPoolExecutor(max_workers=100)
+        futures = []
+        try:
+            with server.lock:
+                futures = [executor.submit(account_share, index) for index in range(100)]
+                start.set()
+                deadline = time.monotonic() + 2
+                while completed < 100 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                self.assertEqual(completed, 100)
+            for future in futures:
+                future.result(timeout=1)
+        finally:
+            # Release of server.lock precedes worker shutdown even when the
+            # regression assertion fires, so the failing pre-fix test exits.
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        tip_progress = threading.Event()
+
+        def publish_tip_state() -> None:
+            with server.lock:
+                server.current_tip_first_seen = (NEW_TIP, time.monotonic())
+            tip_progress.set()
+
+        tip_thread = threading.Thread(target=publish_tip_state)
+        tip_thread.start()
+        self.assertTrue(tip_progress.wait(1))
+        tip_thread.join(1)
+        self.assertEqual(server.submitted_share_count, 100)
+
+    def test_concurrent_vardiff_accounting_is_exact_without_coordinator_lock(self) -> None:
+        server, _rpc = coordinator()
+        state = client(1)
+        state.vardiff_window_started_monotonic = time.monotonic()
+        fake_job = type("FakeJob", (), {"share_difficulty": Decimal("2")})()
+
+        def account(_index: int) -> None:
+            server.note_vardiff_submitted_share(state)
+            server.note_vardiff_accepted_share(state, fake_job)  # type: ignore[arg-type]
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            list(executor.map(account, range(1_000)))
+
+        with state.vardiff_lock:
+            self.assertEqual(state.vardiff_window_submitted, 1_000)
+            self.assertEqual(state.vardiff_window_accepted, 1_000)
+            self.assertEqual(state.vardiff_window_work, Decimal("2000"))
+        self.assertEqual(server.submitted_share_count, 1_000)
+
+    def test_slow_stratum_socket_cannot_hold_coordinator_lock(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        send_started = threading.Event()
+        release_send = threading.Event()
+
+        def slow_send(_payload: dict[str, object]) -> None:
+            send_started.set()
+            self.assertTrue(release_send.wait(2))
+
+        state.send = slow_send  # type: ignore[method-assign]
+        sender = threading.Thread(
+            target=lambda: server.maybe_send_job(state, clean_jobs=True)
+        )
+        sender.start()
+        try:
+            self.assertTrue(send_started.wait(2))
+            acquired = server.lock.acquire(timeout=0.25)
+            self.assertTrue(acquired)
+            if acquired:
+                server.lock.release()
+        finally:
+            release_send.set()
+            sender.join(5)
+        self.assertFalse(sender.is_alive())
 
 
 class FanOutRpcEconomyTests(unittest.TestCase):
