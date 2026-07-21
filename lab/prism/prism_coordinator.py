@@ -8252,23 +8252,28 @@ class PrismCoordinator:
                     )
                 if not payout_current or not self._issuance_artifacts_current(artifacts):
                     return None
-                with self.lock:
-                    if not self._initial_request_current_locked(request):
-                        return False
-                    context = self.stamp_job_for_client(
-                        client,
-                        bundle,
-                        clean_jobs=True,
-                    )
-                    client.active_job = context
-                    for job_id in tuple(client.active_job_ids):
-                        self.bury_evicted_job(client, job_id, prune=False)
-                        self.jobs.pop(job_id, None)
-                    client.active_job_ids.clear()
-                    self.prune_evicted_job_graveyard(force=False)
-                    self.jobs[context.job.job_id] = context
-                    client.active_job_ids.add(context.job.job_id)
-                    self.prune_client_active_jobs(client)
+                # Difficulty state precedes coordinator admission everywhere.
+                # A share holding this client's Vardiff lock may delay only
+                # this delivery; it must never make initial-job delivery hold
+                # the global control-plane lock while waiting.
+                with self._client_vardiff_lock(client):
+                    with self.lock:
+                        if not self._initial_request_current_locked(request):
+                            return False
+                        context = self.stamp_job_for_client(
+                            client,
+                            bundle,
+                            clean_jobs=True,
+                        )
+                        client.active_job = context
+                        for job_id in tuple(client.active_job_ids):
+                            self.bury_evicted_job(client, job_id, prune=False)
+                            self.jobs.pop(job_id, None)
+                        client.active_job_ids.clear()
+                        self.prune_evicted_job_graveyard(force=False)
+                        self.jobs[context.job.job_id] = context
+                        client.active_job_ids.add(context.job.job_id)
+                        self.prune_client_active_jobs(client)
 
                 self.send_job_update(client, context.job)
                 mark_delivered = getattr(admitted, "mark_delivered", None)
@@ -10050,55 +10055,60 @@ class PrismCoordinator:
                     # exact observed artifact object. Fanout tasks consult only
                     # in-memory publication/cancellation state, never RPC or
                     # the mutable cache.
-                    with self.lock:
-                        token_current = self._tip_refresh_token_current_locked(
-                            validation_token,
-                            bundle,
-                            snapshot,
-                        )
-                        if not token_current:
-                            if cancel_event is not None:
-                                cancel_event.cancel()
-                            return RefreshResult("skipped")
-                        if (
-                            client not in self.clients
-                            or client.connection_id != expected_connection_id
-                        ):
-                            return RefreshResult("disconnected")
-                        if (
-                            not self.client_can_receive_jobs(client)
-                            or self.intervening_job_supersedes_snapshot(
-                                client.active_job,
-                                expected_active_job,
+                    # Preserve one coherent difficulty snapshot through stamp
+                    # and commit, but acquire it before global control-plane
+                    # admission so a concurrent share cannot form the inverse
+                    # coordinator -> Vardiff edge.
+                    with self._client_vardiff_lock(client):
+                        with self.lock:
+                            token_current = self._tip_refresh_token_current_locked(
+                                validation_token,
+                                bundle,
                                 snapshot,
                             )
-                            or not self.client_needs_tip_template_refresh(
+                            if not token_current:
+                                if cancel_event is not None:
+                                    cancel_event.cancel()
+                                return RefreshResult("skipped")
+                            if (
+                                client not in self.clients
+                                or client.connection_id != expected_connection_id
+                            ):
+                                return RefreshResult("disconnected")
+                            if (
+                                not self.client_can_receive_jobs(client)
+                                or self.intervening_job_supersedes_snapshot(
+                                    client.active_job,
+                                    expected_active_job,
+                                    snapshot,
+                                )
+                                or not self.client_needs_tip_template_refresh(
+                                    client,
+                                    snapshot,
+                                )
+                            ):
+                                return RefreshResult("skipped")
+                            clean_jobs = self.client_tip_changed_for_snapshot(
                                 client,
                                 snapshot,
                             )
-                        ):
-                            return RefreshResult("skipped")
-                        clean_jobs = self.client_tip_changed_for_snapshot(
-                            client,
-                            snapshot,
-                        )
-                        stamp_started = time.monotonic()
-                        context = self.stamp_job_for_client(
-                            client,
-                            bundle,
-                            clean_jobs=clean_jobs,
-                        )
-                        phases["stamp"] = time.monotonic() - stamp_started
-                        client.active_job = context
-                        if clean_jobs:
-                            for job_id in tuple(client.active_job_ids):
-                                self.bury_evicted_job(client, job_id, prune=False)
-                                self.jobs.pop(job_id, None)
-                            client.active_job_ids.clear()
-                            self.prune_evicted_job_graveyard(force=False)
-                        self.jobs[context.job.job_id] = context
-                        client.active_job_ids.add(context.job.job_id)
-                        self.prune_client_active_jobs(client)
+                            stamp_started = time.monotonic()
+                            context = self.stamp_job_for_client(
+                                client,
+                                bundle,
+                                clean_jobs=clean_jobs,
+                            )
+                            phases["stamp"] = time.monotonic() - stamp_started
+                            client.active_job = context
+                            if clean_jobs:
+                                for job_id in tuple(client.active_job_ids):
+                                    self.bury_evicted_job(client, job_id, prune=False)
+                                    self.jobs.pop(job_id, None)
+                                client.active_job_ids.clear()
+                                self.prune_evicted_job_graveyard(force=False)
+                            self.jobs[context.job.job_id] = context
+                            client.active_job_ids.add(context.job.job_id)
+                            self.prune_client_active_jobs(client)
 
                     socket_send_started = time.monotonic()
                     try:
