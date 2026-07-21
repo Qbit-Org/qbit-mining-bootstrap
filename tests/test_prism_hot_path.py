@@ -15,6 +15,7 @@ Covers the coordinator-side commitments:
 from __future__ import annotations
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import threading
 import time
@@ -156,6 +157,57 @@ class FakeSock:
         return None
 
 
+class CountingRLock:
+    """RLock test double that counts acquisitions by the calling thread."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._local = threading.local()
+        self.first_acquisition = threading.Event()
+
+    def acquire(self, *args: object, **kwargs: object) -> bool:
+        acquired = self._lock.acquire(*args, **kwargs)
+        if acquired:
+            self._local.acquisitions = self.acquisitions_for_current_thread() + 1
+            self.first_acquisition.set()
+        return acquired
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> CountingRLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
+
+    def acquisitions_for_current_thread(self) -> int:
+        return int(getattr(self._local, "acquisitions", 0))
+
+
+class NotifyingRLock:
+    """RLock test double that exposes when another path attempts admission."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.attempted = threading.Event()
+
+    def acquire(self, *args: object, **kwargs: object) -> bool:
+        self.attempted.set()
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> NotifyingRLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
+
+
 def base_template(height: int = 10, prevhash: str = OLD_TIP) -> dict[str, object]:
     return {
         "height": height,
@@ -204,6 +256,7 @@ def client(connection_id: int) -> ClientState:
     state.vardiff_window_submitted = 0
     state.vardiff_window_work = Decimal("0")
     state.vardiff_difficulty_estimate = None
+    state.vardiff_lock = threading.RLock()
     state.active_job_ids = set()
     state.post_accept_refresh_block = None
     state.tip_work_delivered = None
@@ -222,6 +275,8 @@ def coordinator(
     server.rpc = rpc
     server.qbit_chain = "regtest"
     server.lock = threading.RLock()
+    server._recent_share_lock = threading.Lock()
+    server._share_accounting_lock = threading.Lock()
     server.stop_event = threading.Event()
     server.clients = set()
     server.jobs = {}
@@ -587,6 +642,234 @@ class HotPathLoggingTests(unittest.TestCase):
         self.assertIn("building job connection=1", output)
         self.assertIn("sent job connection=1", output)
         self.assertIn("accepted share seq=1", output)
+
+
+class HotPathLockIsolationTests(unittest.TestCase):
+    def test_first_touch_installs_one_hot_path_lock_set(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        state = ClientState.__new__(ClientState)
+        start = threading.Barrier(32)
+
+        def initialize(_index: int) -> tuple[object, object, object, bool]:
+            start.wait(timeout=2)
+            vardiff_lock = server._client_vardiff_lock(state)
+            reserved = server._reserve_recent_share_key(("same", "header"))
+            return (
+                vardiff_lock,
+                server._recent_share_lock,
+                server._share_accounting_lock,
+                reserved,
+            )
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            results = list(executor.map(initialize, range(32)))
+
+        first = results[0]
+        self.assertTrue(all(result[0] is first[0] for result in results))
+        self.assertTrue(all(result[1] is first[1] for result in results))
+        self.assertTrue(all(result[2] is first[2] for result in results))
+        self.assertEqual(sum(result[3] for result in results), 1)
+
+    def test_idle_vardiff_wait_cannot_hold_coordinator_lock(self) -> None:
+        server, _rpc = coordinator()
+        state = client(1)
+        vardiff_lock = NotifyingRLock()
+        state.vardiff_lock = vardiff_lock  # type: ignore[assignment]
+        active_job = object()
+        state.active_job = active_job
+        server.clients.add(state)
+        server.latest_detected_tip = None
+        request = type("IdleRequest", (), {})()
+        request.client = state
+        request.connection_id = state.connection_id
+        request.worker = state.worker
+        request.active_job = active_job
+        request.current_difficulty = state.share_difficulty
+        request.window_started_monotonic = state.vardiff_window_started_monotonic
+        attempting = threading.Event()
+
+        def validate_idle_request() -> None:
+            attempting.set()
+            server._idle_request_skip_reason(request)
+
+        with vardiff_lock:
+            vardiff_lock.attempted.clear()
+            validator = threading.Thread(target=validate_idle_request)
+            validator.start()
+            self.assertTrue(attempting.wait(1))
+            self.assertTrue(vardiff_lock.attempted.wait(1))
+            acquired = server.lock.acquire(timeout=0.25)
+            self.assertTrue(acquired)
+            if acquired:
+                server.lock.release()
+        validator.join(1)
+        self.assertFalse(validator.is_alive())
+
+    def test_job_delivery_vardiff_wait_cannot_hold_coordinator_lock(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        vardiff_lock = NotifyingRLock()
+        state.vardiff_lock = vardiff_lock  # type: ignore[assignment]
+
+        with vardiff_lock:
+            vardiff_lock.attempted.clear()
+            sender = threading.Thread(
+                target=lambda: server.maybe_send_job(state, clean_jobs=True),
+            )
+            sender.start()
+            self.assertTrue(vardiff_lock.attempted.wait(2))
+            acquired = server.lock.acquire(timeout=0.25)
+            self.assertTrue(acquired)
+            if acquired:
+                server.lock.release()
+        sender.join(2)
+        self.assertFalse(sender.is_alive())
+
+    def test_real_submissions_cannot_starve_tip_publication(self) -> None:
+        """A 600-client/100-submit burst admits tip publication promptly."""
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        clients = [client(index + 1) for index in range(600)]
+        contexts = [register_job(server, state) for state in clients]
+        with server.lock:
+            server.clients.update(clients)
+        params = [
+            submit_params(state, context)
+            for state, context in zip(clients[:100], contexts[:100], strict=True)
+        ]
+        counting_lock = CountingRLock()
+        server.lock = counting_lock  # type: ignore[assignment]
+
+        # Hold accepted submissions after their single control snapshot so tip
+        # publication is guaranteed to compete with a live submit burst, not
+        # merely start after fast in-memory ledger commits have all finished.
+        ledger_entered = threading.Event()
+        release_ledger = threading.Event()
+        append_batch = server.ledger.append_batch
+
+        def blocking_append_batch(
+            entries: list[tuple[PendingShare, dict[str, object] | None]],
+        ) -> list[AcceptedShareRecord]:
+            ledger_entered.set()
+            if not release_ledger.wait(2):
+                raise AssertionError("tip publication did not release share commits")
+            return append_batch(entries)
+
+        server.ledger.append_batch = blocking_append_batch  # type: ignore[method-assign]
+
+        start = threading.Event()
+        ready = threading.Event()
+        active_lock = threading.Lock()
+        ready_count = 0
+        active_count = 0
+        active_during_publication = 0
+        publication_wait = float("inf")
+
+        def submit_share(index: int) -> int:
+            nonlocal ready_count, active_count
+            with active_lock:
+                ready_count += 1
+                active_count += 1
+                if ready_count == 64:
+                    ready.set()
+            self.assertTrue(start.wait(2))
+            before = counting_lock.acquisitions_for_current_thread()
+            try:
+                try:
+                    server.handle_submit(clients[index], params[index])
+                except StratumError as exc:
+                    # Submits whose admission snapshot follows the publication
+                    # correctly observe the old job as stale.
+                    if exc.reason != PRISM_REJECTION_STALE_JOB:
+                        raise
+                return counting_lock.acquisitions_for_current_thread() - before
+            finally:
+                with active_lock:
+                    active_count -= 1
+
+        def publish_tip_state() -> None:
+            nonlocal active_during_publication, publication_wait
+            try:
+                self.assertTrue(ledger_entered.wait(2))
+                started = time.monotonic()
+                with counting_lock:
+                    publication_wait = time.monotonic() - started
+                    server.current_tip_first_seen = (NEW_TIP, time.monotonic())
+                    server.current_tip_observed_monotonic = time.monotonic()
+                    with active_lock:
+                        active_during_publication = active_count
+            finally:
+                release_ledger.set()
+
+        with ThreadPoolExecutor(
+            max_workers=64,
+            thread_name_prefix="share-submit",
+        ) as executor:
+            futures = [executor.submit(submit_share, index) for index in range(100)]
+            self.assertTrue(ready.wait(2))
+            tip_thread = threading.Thread(
+                target=publish_tip_state,
+                name="tip-publication",
+            )
+            tip_thread.start()
+            start.set()
+            acquisitions_per_submit = [future.result(timeout=5) for future in futures]
+            tip_thread.join(2)
+
+        self.assertFalse(tip_thread.is_alive())
+        self.assertGreater(active_during_publication, 0)
+        self.assertLess(publication_wait, 0.5)
+        # Before the consolidated snapshot, every normal handle_submit crossed
+        # this lock separately for pool state, job lookup, and tip selection.
+        self.assertEqual(acquisitions_per_submit, [1] * 100)
+        self.assertEqual(server.submitted_share_count, 100)
+
+    def test_concurrent_vardiff_accounting_is_exact_without_coordinator_lock(self) -> None:
+        server, _rpc = coordinator()
+        state = client(1)
+        state.vardiff_window_started_monotonic = time.monotonic()
+        fake_job = type("FakeJob", (), {"share_difficulty": Decimal("2")})()
+
+        def account(_index: int) -> None:
+            server.note_vardiff_submitted_share(state)
+            server.note_vardiff_accepted_share(state, fake_job)  # type: ignore[arg-type]
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            list(executor.map(account, range(1_000)))
+
+        with state.vardiff_lock:
+            self.assertEqual(state.vardiff_window_submitted, 1_000)
+            self.assertEqual(state.vardiff_window_accepted, 1_000)
+            self.assertEqual(state.vardiff_window_work, Decimal("2000"))
+        self.assertEqual(server.submitted_share_count, 1_000)
+
+    def test_slow_stratum_socket_cannot_hold_coordinator_lock(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        send_started = threading.Event()
+        release_send = threading.Event()
+
+        def slow_send(_payload: dict[str, object]) -> None:
+            send_started.set()
+            self.assertTrue(release_send.wait(2))
+
+        state.send = slow_send  # type: ignore[method-assign]
+        sender = threading.Thread(
+            target=lambda: server.maybe_send_job(state, clean_jobs=True)
+        )
+        sender.start()
+        try:
+            self.assertTrue(send_started.wait(2))
+            acquired = server.lock.acquire(timeout=0.25)
+            self.assertTrue(acquired)
+            if acquired:
+                server.lock.release()
+        finally:
+            release_send.set()
+            sender.join(5)
+        self.assertFalse(sender.is_alive())
 
 
 class FanOutRpcEconomyTests(unittest.TestCase):

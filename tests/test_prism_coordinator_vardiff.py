@@ -56,6 +56,7 @@ from lab.prism.prism_coordinator import (
     PrismCoordinator,
     WorkerIdentity,
     _FanoutCancellation,
+    _ObservedRLock,
     _PayoutStatePublicationBlocked,
     _JobBuildCancellation,
     default_prism_coinbase_tag_hex,
@@ -2034,6 +2035,52 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_vardiff_enabled 1", metrics)
         self.assertIn("qbit_prism_qbitd_initial_block_download 0", metrics)
         self.assertIn("qbit_prism_qbitd_peers 4", metrics)
+
+    def test_hot_lock_and_pending_candidate_metrics_are_bounded(self) -> None:
+        server = coordinator()
+        server.lock = _ObservedRLock()
+        lock_wait_started = threading.Event()
+
+        def contend() -> None:
+            lock_wait_started.set()
+            with server.lock:
+                pass
+
+        with server.lock:
+            waiter = threading.Thread(target=contend)
+            waiter.start()
+            self.assertTrue(lock_wait_started.wait(1))
+            time.sleep(0.02)
+        waiter.join(1)
+        self.assertFalse(waiter.is_alive())
+
+        ledger = SingleWriterShareLedger()
+        block_hash = "bc" * 32
+        ledger.persist_block_candidate_intent(
+            {
+                "schema": "qbit.prism.block-candidate-intent.v1",
+                "block_hash_hex": block_hash,
+                "block_hex": "00",
+            }
+        )
+        server.ledger = ledger
+        before_attempt = "\n".join(
+            server.coordinator_lock_metrics_lines()
+            + server.block_submitter_metrics_lines()
+        )
+        self.assertIn("qbit_prism_coordinator_lock_contentions_total 1", before_attempt)
+        self.assertIn("qbit_prism_block_candidates_pending 1", before_attempt)
+        self.assertRegex(
+            before_attempt,
+            r"qbit_prism_block_candidate_oldest_unattempted_seconds 0\.\d+",
+        )
+
+        self.assertTrue(ledger.mark_block_candidate_attempted(block_hash=block_hash))
+        after_attempt = "\n".join(server.block_submitter_metrics_lines())
+        self.assertIn(
+            "qbit_prism_block_candidate_oldest_unattempted_seconds 0.000000",
+            after_attempt,
+        )
 
     def test_metrics_include_bounded_worker_share_and_rejection_counters(self) -> None:
         server = coordinator()
@@ -6673,7 +6720,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 server.enqueue_block_candidate(candidate)
                 self.assertTrue(server.submit_next_block_candidate())
 
-        self.assertEqual(waits, [0.1, 0.2, 0.4, 0.4])
+        self.assertEqual(len(waits), 6)
+        for observed, expected in zip(
+            waits,
+            [0.1, 0.2, 0.25, 0.15, 0.25, 0.15],
+            strict=True,
+        ):
+            self.assertAlmostEqual(observed, expected)
         self.assertNotIn(candidate.submission.block_hash_hex, server.block_candidate_retry_delays)
         self.assertEqual(server.block_candidate_abandoned_counts, {})
         self.assertEqual(ledger.pending_block_candidates(), [])
@@ -6847,7 +6900,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         # The first accepted finalize failure returns unpaced so the caller
         # can refresh the fleet immediately; the ladder starts at the first
         # finalize-only replay.
-        self.assertEqual(waits, [0.1, 0.2, 0.4])
+        self.assertEqual(len(waits), 4)
+        for observed, expected in zip(
+            waits,
+            [0.1, 0.2, 0.25, 0.15],
+            strict=True,
+        ):
+            self.assertAlmostEqual(observed, expected)
         self.assertEqual(finish_attempts, 5)
         self.assertEqual(submit_calls, 1)
         self.assertNotIn(candidate.submission.block_hash_hex, server.block_candidate_retry_delays)
@@ -8727,6 +8786,79 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             server._heartbeats["qbit_blockpoll"] = now - 1_000.0
 
         self.assertEqual(server._overdue_heartbeats(now), ["qbit_blockpoll"])
+
+    def test_block_submitter_retry_wait_heartbeats_in_bounded_slices(self) -> None:
+        server = self._bare_coordinator()
+        server.watchdog_timeout_seconds = 0.3
+        clock = {"now": 0.0}
+        waits: list[float] = []
+        overdue_samples: list[list[str]] = []
+
+        class AdvancingStopEvent:
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                clock["now"] += timeout
+                overdue_samples.append(server._overdue_heartbeats(clock["now"]))
+                return False
+
+        server.stop_event = AdvancingStopEvent()  # type: ignore[assignment]
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            self.assertFalse(server._wait_for_block_candidate_retry(1.0))
+
+        self.assertEqual(waits, [0.25, 0.25, 0.25, 0.25])
+        self.assertEqual(overdue_samples, [[], [], [], []])
+        self.assertEqual(
+            server._heartbeats["block_submitter"],
+            1.0,
+        )
+
+    def test_blocked_candidate_phase_remains_watchdog_eligible(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server._heartbeats = {}
+        server._watchdog_pauses = {}
+        server._heartbeats_lock = threading.Lock()
+        server.watchdog_timeout_seconds = 0.05
+        entered_submission = threading.Event()
+        release_submission = threading.Event()
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="fa" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+
+        def blocked_submission(_candidate: PrismBlockCandidate) -> bool:
+            entered_submission.set()
+            release_submission.wait(2)
+            return True
+
+        server.submit_block_candidate = blocked_submission  # type: ignore[method-assign]
+        server.enqueue_block_candidate(candidate)
+        server._record_heartbeat("block_submitter")
+        submitter = threading.Thread(target=server.submit_next_block_candidate)
+        submitter.start()
+        try:
+            self.assertTrue(entered_submission.wait(1))
+            time.sleep(0.08)
+            self.assertEqual(
+                server._overdue_heartbeats(time.monotonic()),
+                ["block_submitter"],
+            )
+        finally:
+            release_submission.set()
+            submitter.join(2)
+        self.assertFalse(submitter.is_alive())
 
     def test_progressing_ctv_pass_longer_than_watchdog_timeout_stays_healthy(self) -> None:
         server = self._bare_coordinator()

@@ -271,6 +271,7 @@ class SingleWriterShareLedger:
                             "state": "pending",
                             "attempt_count": 0,
                             "last_error": None,
+                            "created_monotonic": time.monotonic(),
                         },
                     )
                     self._block_candidate_outbox[block_hash]["share_id"] = pending.share_id
@@ -296,6 +297,7 @@ class SingleWriterShareLedger:
                 "state": "pending",
                 "attempt_count": 0,
                 "last_error": None,
+                "created_monotonic": time.monotonic(),
             }
             return True
 
@@ -321,6 +323,43 @@ class SingleWriterShareLedger:
                 if row["state"] == "pending"
             ][:limit]
 
+    def block_candidate_pending_metrics(self) -> dict[str, int | float]:
+        """Return bounded pending-candidate age gauges without exposing hashes."""
+        now = time.monotonic()
+        with self._lock:
+            pending = [
+                row
+                for row in self._block_candidate_outbox.values()
+                if row["state"] == "pending"
+            ]
+            unattempted = [
+                row for row in pending if int(row["attempt_count"]) == 0
+            ]
+
+            def oldest_age(rows: list[dict[str, Any]]) -> float:
+                return max(
+                    (
+                        max(0.0, now - float(row.get("created_monotonic", now)))
+                        for row in rows
+                    ),
+                    default=0.0,
+                )
+
+            return {
+                "pending_count": len(pending),
+                "oldest_pending_age_seconds": oldest_age(pending),
+                "oldest_unattempted_age_seconds": oldest_age(unattempted),
+            }
+
+    def mark_block_candidate_attempted(self, *, block_hash: str) -> bool:
+        """Record admission to a real processing phase for one durable row."""
+        with self._lock:
+            row = self._block_candidate_outbox.get(block_hash.lower())
+            if row is None or row["state"] != "pending":
+                return False
+            row["attempt_count"] = int(row["attempt_count"]) + 1
+            return True
+
     def mark_block_candidate_submitted(self, *, block_hash: str) -> bool:
         return self._finish_block_candidate(block_hash=block_hash, state="submitted", error=None)
 
@@ -334,7 +373,6 @@ class SingleWriterShareLedger:
                 return False
             row["state"] = state
             row["last_error"] = error
-            row["attempt_count"] = int(row["attempt_count"]) + 1
             row["candidate"] = None
             return True
 
@@ -1843,6 +1881,72 @@ FROM (
         with self._lock:
             return list(self._run_retry_safe_read_json(sql))
 
+    def block_candidate_pending_metrics(self) -> dict[str, int | float]:
+        """Return aggregate pending ages using the existing outbox index."""
+        sql = """
+SELECT json_build_object(
+    'pending_count', count(*),
+    'oldest_pending_age_seconds', COALESCE(
+        EXTRACT(EPOCH FROM clock_timestamp() - min(created_at)),
+        0
+    ),
+    'oldest_unattempted_age_seconds', COALESCE(
+        EXTRACT(
+            EPOCH FROM clock_timestamp()
+            - min(created_at) FILTER (WHERE attempt_count = 0)
+        ),
+        0
+    )
+)
+FROM qbit_block_candidate_outbox
+WHERE state = 'pending';
+"""
+        with self._lock:
+            metrics = self._run_retry_safe_read_json(sql)
+        return {
+            "pending_count": int(metrics.get("pending_count", 0)),
+            "oldest_pending_age_seconds": float(
+                metrics.get("oldest_pending_age_seconds", 0.0)
+            ),
+            "oldest_unattempted_age_seconds": float(
+                metrics.get("oldest_unattempted_age_seconds", 0.0)
+            ),
+        }
+
+    def mark_block_candidate_attempted(self, *, block_hash: str) -> bool:
+        """Fence and count entry into a candidate processing attempt."""
+        sql = f"""
+WITH lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+updated AS (
+    UPDATE qbit_block_candidate_outbox
+    SET attempt_count = attempt_count + 1,
+        updated_at = clock_timestamp()
+    FROM lease
+    WHERE block_hash = {self._text_literal(block_hash.lower())}
+      AND state = 'pending'
+    RETURNING block_hash
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object('updated', (SELECT count(*) FROM updated))
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return int(result.get("updated", 0)) > 0
+
     def mark_block_candidate_submitted(self, *, block_hash: str) -> bool:
         return self._finish_block_candidate(block_hash=block_hash, state="submitted", error=None)
 
@@ -1866,7 +1970,6 @@ WITH lease AS (
 updated AS (
     UPDATE qbit_block_candidate_outbox
     SET state = {self._text_literal(state)},
-        attempt_count = attempt_count + 1,
         last_error = {self._text_literal(error) if error is not None else 'NULL'},
         updated_at = clock_timestamp(),
         completed_at = clock_timestamp(),

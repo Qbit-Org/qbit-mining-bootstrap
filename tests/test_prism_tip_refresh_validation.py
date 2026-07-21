@@ -2624,6 +2624,56 @@ class TipRefreshValidationTests(unittest.TestCase):
             metrics,
         )
 
+    def test_prepared_fanout_vardiff_wait_does_not_hold_coordinator_lock(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = [state]  # type: ignore[assignment]
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        sequence = server._reserve_tip_observation_sequence()
+        self.assertTrue(
+            server.observe_tip_first_seen(
+                snapshot.bestblockhash,
+                observation_sequence=sequence,
+                publish_refresh_observation=True,
+            )
+        )
+        with server.lock:
+            server.tip_template_snapshot = snapshot
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
+        token = server._validate_prepared_tip_refresh(bundle, snapshot, sequence)
+        vardiff_lock = ObservedRLock()
+        state.vardiff_lock = vardiff_lock  # type: ignore[assignment]
+        results: list[object] = []
+
+        with vardiff_lock:
+            vardiff_lock.acquire_attempted.clear()
+            delivery = threading.Thread(
+                target=lambda: results.append(
+                    server.send_prepared_job(
+                        state,
+                        bundle,
+                        snapshot,
+                        token,
+                        state.connection_id,
+                        None,
+                        _FanoutCancellation(),
+                    )
+                )
+            )
+            delivery.start()
+            self.assertTrue(vardiff_lock.acquire_attempted.wait(2))
+            acquired = server.lock.acquire(timeout=0.25)
+            self.assertTrue(acquired)
+            if acquired:
+                server.lock.release()
+
+        delivery.join(2)
+        self.assertFalse(delivery.is_alive())
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].result, "sent")
+
     def test_routine_same_tip_observation_keeps_active_fanout_valid(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
