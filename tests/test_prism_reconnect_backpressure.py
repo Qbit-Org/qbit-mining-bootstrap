@@ -206,6 +206,110 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertEqual(advanced_tip["clients_with_current_tip_jobs"], 0)
         self.assertEqual(advanced_tip["current_tip_job_coverage"], 0.0)
 
+    def test_long_authorized_previous_tip_work_gets_fresh_coverage_grace(self) -> None:
+        server = coordinator(connection_limit=2)
+        server.mining_health_startup_grace_seconds = 0.0
+        server.stratum_initial_job_timeout_seconds = 5.0
+        state = client(server, 1, with_job=True)
+        state.authorized_monotonic = 1.0
+        state.tip_work_delivered = ("aa" * 32, 2.0)
+        server.current_tip_first_seen = ("bb" * 32, 100.0)
+
+        snapshot = server.mining_delivery_snapshot(now=100.0)
+
+        self.assertTrue(snapshot["mining_ready"])
+        self.assertFalse(snapshot["initial_delivery_stalled"])
+        self.assertEqual(snapshot["current_tip_coverage_gap_age_seconds"], 0.0)
+        self.assertEqual(
+            snapshot["oldest_genuinely_pending_initial_job_age_seconds"],
+            0.0,
+        )
+        self.assertEqual(snapshot["oldest_initial_job_pending_seconds"], 0.0)
+
+    def test_sustained_tip_coverage_gap_fails_closed_and_delivery_resets_it(self) -> None:
+        server = coordinator(connection_limit=2)
+        server.mining_health_startup_grace_seconds = 0.0
+        server.stratum_initial_job_timeout_seconds = 5.0
+        state = client(server, 1, with_job=True)
+        state.authorized_monotonic = 1.0
+        state.tip_work_delivered = ("aa" * 32, 2.0)
+        server.current_tip_first_seen = ("bb" * 32, 100.0)
+
+        self.assertTrue(server.mining_delivery_snapshot(now=100.0)["mining_ready"])
+        grace = server.mining_delivery_snapshot(now=104.999)
+        self.assertTrue(grace["mining_ready"])
+        self.assertEqual(grace["current_tip_coverage_gap_age_seconds"], 4.999)
+
+        failed = server.mining_delivery_snapshot(now=105.0)
+        self.assertFalse(failed["mining_ready"])
+        self.assertIn("initial-delivery-stalled", failed["unhealthy_reasons"])
+
+        state.active_job = SimpleNamespace(
+            template={"previousblockhash": "bb" * 32},
+            payout_state_generation=0,
+        )
+        server.note_tip_work_delivered(state, "bb" * 32)
+        recovered = server.mining_delivery_snapshot(now=106.0)
+        self.assertTrue(recovered["mining_ready"])
+        self.assertEqual(recovered["current_tip_coverage_gap_age_seconds"], 0.0)
+
+        server.current_tip_first_seen = ("cc" * 32, 107.0)
+        next_gap = server.mining_delivery_snapshot(now=107.0)
+        self.assertTrue(next_gap["mining_ready"])
+        self.assertEqual(next_gap["current_tip_coverage_gap_age_seconds"], 0.0)
+
+    def test_never_delivered_initial_job_uses_authorization_deadline(self) -> None:
+        server = coordinator(connection_limit=2)
+        server.mining_health_startup_grace_seconds = 0.0
+        server.stratum_initial_job_timeout_seconds = 5.0
+        state = client(server, 1)
+        state.authorized_monotonic = 90.0
+        server.current_tip_first_seen = ("aa" * 32, None)
+
+        grace = server.mining_delivery_snapshot(now=94.999)
+        self.assertTrue(grace["mining_ready"])
+        self.assertEqual(
+            grace["oldest_genuinely_pending_initial_job_age_seconds"],
+            4.999,
+        )
+
+        failed = server.mining_delivery_snapshot(now=95.0)
+        self.assertFalse(failed["mining_ready"])
+        self.assertTrue(failed["initial_delivery_stalled"])
+        self.assertIn("initial-delivery-stalled", failed["unhealthy_reasons"])
+        self.assertEqual(failed["oldest_initial_job_pending_seconds"], 5.0)
+
+    def test_tip_churn_with_successful_deliveries_does_not_inherit_old_gap(self) -> None:
+        server = coordinator(connection_limit=2)
+        server.mining_health_startup_grace_seconds = 0.0
+        server.stratum_initial_job_timeout_seconds = 5.0
+        state = client(server, 1, with_job=True)
+        state.authorized_monotonic = 1.0
+        state.tip_work_delivered = ("aa" * 32, 2.0)
+
+        server.current_tip_first_seen = ("bb" * 32, 100.0)
+        self.assertTrue(server.mining_delivery_snapshot(now=100.0)["mining_ready"])
+
+        state.active_job = SimpleNamespace(
+            template={"previousblockhash": "bb" * 32},
+            payout_state_generation=0,
+        )
+        server.note_tip_work_delivered(state, "bb" * 32)
+        server.current_tip_first_seen = ("cc" * 32, 106.0)
+        second_gap = server.mining_delivery_snapshot(now=106.0)
+        self.assertTrue(second_gap["mining_ready"])
+        self.assertEqual(second_gap["current_tip_coverage_gap_age_seconds"], 0.0)
+
+        state.active_job = SimpleNamespace(
+            template={"previousblockhash": "cc" * 32},
+            payout_state_generation=0,
+        )
+        server.note_tip_work_delivered(state, "cc" * 32)
+        server.current_tip_first_seen = ("dd" * 32, 112.0)
+        third_gap = server.mining_delivery_snapshot(now=112.0)
+        self.assertTrue(third_gap["mining_ready"])
+        self.assertEqual(third_gap["current_tip_coverage_gap_age_seconds"], 0.0)
+
     def test_pending_initial_jobs_are_bounded_and_duplicate_requests_coalesce(self) -> None:
         server = coordinator(connection_limit=5, pending_limit=2)
         server.initial_job_max_workers = 1

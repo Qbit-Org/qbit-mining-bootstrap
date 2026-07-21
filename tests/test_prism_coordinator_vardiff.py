@@ -1994,6 +1994,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn("qbit_prism_stratum_peak_active_connections 0", metrics)
         self.assertIn("qbit_prism_stratum_pending_initial_jobs 0", metrics)
         self.assertIn("qbit_prism_stratum_pending_initial_job_limit 128", metrics)
+        self.assertIn(
+            "qbit_prism_stratum_oldest_genuinely_pending_initial_job_seconds 0.0",
+            metrics,
+        )
+        self.assertIn(
+            "qbit_prism_stratum_current_tip_coverage_gap_seconds 0.0",
+            metrics,
+        )
         self.assertIn("qbit_prism_stratum_current_tip_job_coverage 1.0", metrics)
         self.assertIn("qbit_prism_stratum_handler_threads 0", metrics)
         self.assertIn("qbit_prism_job_delivery_queue_depth 0", metrics)

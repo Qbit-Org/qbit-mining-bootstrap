@@ -557,6 +557,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         for state in clients:
             state.authorization_generation = 1
             state.authorized_monotonic = old
+            state.tip_work_delivered = ("ff" * 32, old)
         clients[0].active_job = server.stamp_job_for_client(
             clients[0], bundle, clean_jobs=True
         )
@@ -564,6 +565,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         server.started_monotonic = old
         server.mining_health_startup_grace_seconds = 5
         server.stratum_initial_job_timeout_seconds = 5
+        server._mining_delivery_failure_started_monotonic = time.monotonic() - 5
 
         status, payload = server.cached_health_payload()
 
