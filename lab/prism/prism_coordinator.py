@@ -277,6 +277,11 @@ PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
 DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS = 0.25
 DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS = 0.25
+# Used only by lightweight embedders that bypass dataclass/coordinator
+# construction. Production instances install these locks eagerly in __init__.
+# Serializing the fallback prevents concurrent first-touch callers from ever
+# publishing different lock objects for the same state.
+_HOT_PATH_LOCK_INITIALIZATION_LOCK = threading.Lock()
 DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS = 5.0
 # Credit policies recorded on accepted ledger rows. Normal shares carry no
 # policy; a policy marks a share that was credited by an explicit pool rule
@@ -2712,12 +2717,19 @@ class PrismCoordinator:
 
     def _ensure_share_hot_path_state(self) -> None:
         """Backfill dedicated hot-path locks for lightweight test embedders."""
-        if not hasattr(self, "_recent_share_lock"):
-            self._recent_share_lock = threading.Lock()
-        if not hasattr(self, "_share_accounting_lock"):
-            self._share_accounting_lock = threading.Lock()
-        if not hasattr(self, "recent_share_keys"):
-            self.recent_share_keys = set()
+        if (
+            hasattr(self, "_recent_share_lock")
+            and hasattr(self, "_share_accounting_lock")
+            and hasattr(self, "recent_share_keys")
+        ):
+            return
+        with _HOT_PATH_LOCK_INITIALIZATION_LOCK:
+            if not hasattr(self, "_recent_share_lock"):
+                self._recent_share_lock = threading.Lock()
+            if not hasattr(self, "_share_accounting_lock"):
+                self._share_accounting_lock = threading.Lock()
+            if not hasattr(self, "recent_share_keys"):
+                self.recent_share_keys = set()
 
     @staticmethod
     def _client_vardiff_lock(client: ClientState) -> threading.RLock:
@@ -2725,9 +2737,13 @@ class PrismCoordinator:
         # fallback preserves focused tests and embedders that construct a
         # ClientState with __new__ and populate only the attributes they use.
         lock = getattr(client, "vardiff_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            client.vardiff_lock = lock
+        if lock is not None:
+            return lock
+        with _HOT_PATH_LOCK_INITIALIZATION_LOCK:
+            lock = getattr(client, "vardiff_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                client.vardiff_lock = lock
         return lock
 
     def _reserve_recent_share_key(self, share_key: tuple[object, ...]) -> bool:
@@ -11396,24 +11412,40 @@ class PrismCoordinator:
         first unpublished divergence; failed refreshes therefore still fall
         back to the live RPC instead of accepting frozen work indefinitely.
         """
-        max_age = float(
-            getattr(
-                self,
-                "submit_tip_max_age_seconds",
-                DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS,
-            )
-        )
-        if max_age > 0:
-            with self.lock:
-                # Keep the freshness decision and selected hash in the same
-                # critical section as tip observation. Otherwise a poller can
-                # publish a newer tip after these fields are copied but before
-                # this method returns the superseded hash.
-                observed = getattr(self, "current_tip_first_seen", None)
-                if self._published_tip_authoritative_locked(time.monotonic()):
-                    assert observed is not None
-                    return observed[0]
+        with self.lock:
+            published_tip = self._submit_stale_check_tip_locked(time.monotonic())
+        if published_tip is not None:
+            return published_tip
         return str(self.rpc.call("getbestblockhash"))
+
+    def _submit_stale_check_tip_locked(self, now: float) -> str | None:
+        """Return the authoritative published submit tip while holding self.lock."""
+        if not self._published_tip_authoritative_locked(now):
+            return None
+        observed = getattr(self, "current_tip_first_seen", None)
+        assert observed is not None
+        return str(observed[0])
+
+    def _submit_control_snapshot(
+        self,
+        client: ClientState,
+        job_id: str,
+    ) -> tuple[bool, PrismJobContext | None, str | None]:
+        """Snapshot normal-submit control state in one bounded lock hold.
+
+        Pool closure, active-job membership, and published-tip authority must
+        each be point-in-time consistent with their control-plane writers, but
+        they do not need three separate admissions through the same lock. The
+        caller performs live-tip RPC fallback, stale-grace classification,
+        hashing, persistence, and accounting only after this lock is released.
+        """
+        with self.lock:
+            pool_closed = self.accepted_block_count >= self.max_blocks
+            context = self.jobs.get(job_id)
+            if context is not None and job_id not in client.active_job_ids:
+                context = None
+            published_tip = self._submit_stale_check_tip_locked(time.monotonic())
+        return pool_closed, context, published_tip
 
     def _published_tip_authoritative_locked(self, now: float) -> bool:
         """True while the published tip still owns share classification.
@@ -13013,6 +13045,7 @@ class PrismCoordinator:
         tip_refresh_observation_sequence: int | None = None,
         prepared_bundle: CachedJobBundle | None = None,
         commit_guard: Callable[[], bool] | None = None,
+        commit_guard_lock: threading.RLock | None = None,
         prepared_bundle_allow_uncached: bool = False,
     ) -> bool:
         if not client.subscribed or not client.authorized or client.worker is None:
@@ -13287,25 +13320,34 @@ class PrismCoordinator:
                 self.prune_client_active_jobs(client)
                 return True
 
-            if prepared_bundle is not None:
-                # Exact cache identity and the client/window guard are one
-                # commit boundary. A tip or payout publication that wins this
-                # race makes the idle task a no-op instead of delivering stale
-                # work.
-                with self._job_cache_lock:
-                    if not self._idle_bundle_current_locked(
-                        client,
-                        prepared_bundle,
-                        allow_uncached=prepared_bundle_allow_uncached,
-                    ):
-                        return False
-                    with self.lock:
-                        if not commit_context_locked():
+            def commit_context() -> bool:
+                if prepared_bundle is not None:
+                    # Exact cache identity and the client/window guard are one
+                    # commit boundary. A tip or payout publication that wins
+                    # this race makes the idle task a no-op instead of
+                    # delivering stale work.
+                    with self._job_cache_lock:
+                        if not self._idle_bundle_current_locked(
+                            client,
+                            prepared_bundle,
+                            allow_uncached=prepared_bundle_allow_uncached,
+                        ):
                             return False
-            else:
+                        with self.lock:
+                            return commit_context_locked()
                 with self.lock:
-                    if not commit_context_locked():
-                        return False
+                    return commit_context_locked()
+
+            if commit_guard_lock is None:
+                committed = commit_context()
+            else:
+                # Per-client state is acquired before coordinator admission.
+                # A busy share can delay only this delivery; it cannot hold
+                # self.lock while the delivery waits for Vardiff state.
+                with commit_guard_lock:
+                    committed = commit_context()
+            if not committed:
+                return False
             phase_started = time.monotonic()
             self.send_job_update(client, context.job)
             payout_admitted.mark_delivered()
@@ -14115,17 +14157,23 @@ class PrismCoordinator:
                 "submit username does not match authorized username",
                 worker=client.username or None,
             )
+        # Normal submits cross the coordinator lock once: pool admission, job
+        # membership, and published-tip authority are copied atomically. All
+        # miner bookkeeping and any live-tip RPC fallback stay outside it.
+        pool_closed, context, published_tip = self._submit_control_snapshot(
+            client,
+            job_id,
+        )
         # A closed pool rejects before any share accounting: post-close submits
         # must not inflate global/per-worker submitted totals (the stale-percent
         # denominator) or vardiff windows they can never contribute to.
-        with self.lock:
-            if self.accepted_block_count >= self.max_blocks:
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_POOL_CLOSED,
-                    "pool is no longer accepting shares",
-                    worker=worker_name,
-                )
+        if pool_closed:
+            self.reject_stratum(
+                21,
+                PRISM_REJECTION_POOL_CLOSED,
+                "pool is no longer accepting shares",
+                worker=worker_name,
+            )
         if len(extranonce2_hex) != self.extranonce2_size * 2:
             self.reject_stratum(
                 20,
@@ -14147,10 +14195,6 @@ class PrismCoordinator:
         self.note_worker_submitted_share(worker_name)
         self.note_vardiff_submitted_share(client)
         credit_policy: str | None = None
-        with self.lock:
-            context = self.jobs.get(job_id)
-            if context is not None and job_id not in client.active_job_ids:
-                context = None
         evicted_entry: EvictedJobEntry | None = None
         if context is None:
             evicted_entry = self.evicted_job_entry(client, job_id)
@@ -14161,7 +14205,11 @@ class PrismCoordinator:
                     "stale job",
                     worker=worker_name,
                 )
-        current_tip = self.submit_stale_check_tip()
+        current_tip = (
+            published_tip
+            if published_tip is not None
+            else str(self.rpc.call("getbestblockhash"))
+        )
         # Share classification (normal and stale-grace alike) is deliberately
         # point-in-time against this single tip read: a tip that advances
         # between here and the ledger append does not retroactively invalidate
@@ -15272,37 +15320,39 @@ class PrismCoordinator:
             and (published is None or latest_detected[0] != published[0])
         )
 
-    def _idle_request_skip_reason_locked(
+    def _idle_request_skip_reason(
         self,
         request: _IdleRetargetRequest,
     ) -> str | None:
         client = request.client
-        if self._vardiff_idle_tip_divergence_locked():
-            return "superseded"
-        if (
-            client not in self.clients
-            or getattr(client, "closing", False)
-            or not self.client_can_receive_jobs(client)
-        ):
-            return "disconnected"
-        # Lock order is coordinator control plane -> per-client Vardiff. Share
-        # handlers never hold vardiff_lock while acquiring self.lock.
+        # Take the per-client lock before coordinator admission. A share can
+        # delay this client's idle retarget, but it can never make the retarget
+        # hold the coordinator lock while waiting and convoy tip publication.
         with self._client_vardiff_lock(client):
-            if (
-                client.connection_id != request.connection_id
-                or client.worker != request.worker
-                or client.active_job is not request.active_job
-                or (client.pending_share_difficulty or client.share_difficulty)
-                != request.current_difficulty
-            ):
-                return "superseded"
-            if (
-                client.vardiff_window_started_monotonic
-                != request.window_started_monotonic
-                or client.vardiff_window_accepted != 0
-                or client.vardiff_window_submitted != 0
-            ):
-                return "not_idle"
+            with self.lock:
+                if self._vardiff_idle_tip_divergence_locked():
+                    return "superseded"
+                if (
+                    client not in self.clients
+                    or getattr(client, "closing", False)
+                    or not self.client_can_receive_jobs(client)
+                ):
+                    return "disconnected"
+                if (
+                    client.connection_id != request.connection_id
+                    or client.worker != request.worker
+                    or client.active_job is not request.active_job
+                    or (client.pending_share_difficulty or client.share_difficulty)
+                    != request.current_difficulty
+                ):
+                    return "superseded"
+                if (
+                    client.vardiff_window_started_monotonic
+                    != request.window_started_monotonic
+                    or client.vardiff_window_accepted != 0
+                    or client.vardiff_window_submitted != 0
+                ):
+                    return "not_idle"
         return None
 
     def _idle_request_pending(self, request: _IdleRetargetRequest) -> bool:
@@ -15356,8 +15406,7 @@ class PrismCoordinator:
         client = request.client
         delivery_attempted = False
         try:
-            with self.lock:
-                reason = self._idle_request_skip_reason_locked(request)
+            reason = self._idle_request_skip_reason(request)
             if reason is not None:
                 self._record_vardiff_idle_skip(reason)
                 return
@@ -15371,8 +15420,7 @@ class PrismCoordinator:
             # key and rebinds a ready heavy bundle to the latest same-tip
             # template observation; a miss may build here, never on the sweep.
             bundle = self._build_idle_job_bundle(request)
-            with self.lock:
-                reason = self._idle_request_skip_reason_locked(request)
+            reason = self._idle_request_skip_reason(request)
             if reason is not None:
                 self._record_vardiff_idle_skip(reason)
                 return
@@ -15386,8 +15434,7 @@ class PrismCoordinator:
                 self._record_vardiff_idle_skip("busy")
                 return
             try:
-                with self.lock:
-                    reason = self._idle_request_skip_reason_locked(request)
+                reason = self._idle_request_skip_reason(request)
                 if reason is not None:
                     self._record_vardiff_idle_skip(reason)
                     return
@@ -15428,8 +15475,7 @@ class PrismCoordinator:
                         getattr(self, "idle_retarget_count", 0)
                     ) + 1
                 return
-            with self.lock:
-                reason = self._idle_request_skip_reason_locked(request)
+            reason = self._idle_request_skip_reason(request)
             if reason is not None:
                 self._record_vardiff_idle_skip(reason)
                 return
@@ -15543,7 +15589,7 @@ class PrismCoordinator:
                 self.vardiff_idle_clients_inspected += len(clients)
             for client in clients:
                 self._record_heartbeat("vardiff_idle_sweep")
-                with self.lock, self._client_vardiff_lock(client):
+                with self._client_vardiff_lock(client), self.lock:
                     if self._vardiff_idle_tip_divergence_locked():
                         reason = "superseded"
                         request = None
@@ -15610,8 +15656,7 @@ class PrismCoordinator:
                     self._record_vardiff_idle_skip("busy")
                     continue
                 try:
-                    with self.lock:
-                        reason = self._idle_request_skip_reason_locked(request)
+                    reason = self._idle_request_skip_reason(request)
                 finally:
                     client.job_update_lock.release()
                 if reason is not None:
@@ -15700,7 +15745,7 @@ class PrismCoordinator:
         if require_idle:
             if prepared_bundle is None:
                 return False
-            with self.lock, self._client_vardiff_lock(client):
+            with self._client_vardiff_lock(client), self.lock:
                 if expected_connection_id is None:
                     expected_connection_id = client.connection_id
                 if expected_worker is None:
@@ -15757,7 +15802,7 @@ class PrismCoordinator:
             return False
         idle_window_state: tuple[float, int, int, Decimal] | None = None
         idle_window_reset_at: float | None = None
-        with self.lock, self._client_vardiff_lock(client):
+        with self._client_vardiff_lock(client), self.lock:
             previous_difficulty = client.pending_share_difficulty or client.share_difficulty
             if previous_difficulty != current_difficulty:
                 return False
@@ -15794,31 +15839,33 @@ class PrismCoordinator:
             nonlocal idle_window_reset_at
             if not require_idle:
                 return True
-            with self._client_vardiff_lock(client):
-                if (
-                    self.stop_event.is_set()
-                    or client not in self.clients
-                    or getattr(client, "closing", False)
-                    or not self.client_can_receive_jobs(client)
-                    or client.connection_id != expected_connection_id
-                    or client.worker != expected_worker
-                    or client.active_job is not expected_active_job
-                    or client.vardiff_window_started_monotonic
-                    != expected_window_started
-                    or client.vardiff_window_accepted != 0
-                    or client.vardiff_window_submitted != 0
-                    or client.pending_share_difficulty != next_difficulty
-                ):
-                    return False
-                idle_window_reset_at = time.monotonic()
-                client.vardiff_window_started_monotonic = idle_window_reset_at
-                client.vardiff_window_accepted = 0
-                client.vardiff_window_submitted = 0
-                client.vardiff_window_work = Decimal("0")
-                return True
+            # _maybe_send_job_locked holds vardiff_lock before entering the
+            # coordinator commit section, so this guard never waits under
+            # self.lock.
+            if (
+                self.stop_event.is_set()
+                or client not in self.clients
+                or getattr(client, "closing", False)
+                or not self.client_can_receive_jobs(client)
+                or client.connection_id != expected_connection_id
+                or client.worker != expected_worker
+                or client.active_job is not expected_active_job
+                or client.vardiff_window_started_monotonic
+                != expected_window_started
+                or client.vardiff_window_accepted != 0
+                or client.vardiff_window_submitted != 0
+                or client.pending_share_difficulty != next_difficulty
+            ):
+                return False
+            idle_window_reset_at = time.monotonic()
+            client.vardiff_window_started_monotonic = idle_window_reset_at
+            client.vardiff_window_accepted = 0
+            client.vardiff_window_submitted = 0
+            client.vardiff_window_work = Decimal("0")
+            return True
 
         def restore_speculative_retarget() -> None:
-            with self.lock, self._client_vardiff_lock(client):
+            with self._client_vardiff_lock(client), self.lock:
                 if client.pending_share_difficulty == next_difficulty:
                     client.pending_share_difficulty = prior_pending
                 self._restore_idle_window_state(
@@ -15835,6 +15882,7 @@ class PrismCoordinator:
                     raise_on_build_failure=True,
                     prepared_bundle=prepared_bundle,
                     commit_guard=idle_commit_guard,
+                    commit_guard_lock=self._client_vardiff_lock(client),
                     prepared_bundle_allow_uncached=(
                         prepared_bundle_allow_uncached
                     ),

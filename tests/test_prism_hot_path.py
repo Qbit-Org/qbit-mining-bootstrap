@@ -157,6 +157,57 @@ class FakeSock:
         return None
 
 
+class CountingRLock:
+    """RLock test double that counts acquisitions by the calling thread."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._local = threading.local()
+        self.first_acquisition = threading.Event()
+
+    def acquire(self, *args: object, **kwargs: object) -> bool:
+        acquired = self._lock.acquire(*args, **kwargs)
+        if acquired:
+            self._local.acquisitions = self.acquisitions_for_current_thread() + 1
+            self.first_acquisition.set()
+        return acquired
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> CountingRLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
+
+    def acquisitions_for_current_thread(self) -> int:
+        return int(getattr(self._local, "acquisitions", 0))
+
+
+class NotifyingRLock:
+    """RLock test double that exposes when another path attempts admission."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.attempted = threading.Event()
+
+    def acquire(self, *args: object, **kwargs: object) -> bool:
+        self.attempted.set()
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> NotifyingRLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
+
+
 def base_template(height: int = 10, prevhash: str = OLD_TIP) -> dict[str, object]:
     return {
         "height": height,
@@ -224,6 +275,8 @@ def coordinator(
     server.rpc = rpc
     server.qbit_chain = "regtest"
     server.lock = threading.RLock()
+    server._recent_share_lock = threading.Lock()
+    server._share_accounting_lock = threading.Lock()
     server.stop_event = threading.Event()
     server.clients = set()
     server.jobs = {}
@@ -592,56 +645,184 @@ class HotPathLoggingTests(unittest.TestCase):
 
 
 class HotPathLockIsolationTests(unittest.TestCase):
-    def test_share_bookkeeping_finishes_while_control_plane_lock_is_held(self) -> None:
-        """600 clients at 100 share events cannot queue on tip authority."""
+    def test_first_touch_installs_one_hot_path_lock_set(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        state = ClientState.__new__(ClientState)
+        start = threading.Barrier(32)
+
+        def initialize(_index: int) -> tuple[object, object, object, bool]:
+            start.wait(timeout=2)
+            vardiff_lock = server._client_vardiff_lock(state)
+            reserved = server._reserve_recent_share_key(("same", "header"))
+            return (
+                vardiff_lock,
+                server._recent_share_lock,
+                server._share_accounting_lock,
+                reserved,
+            )
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            results = list(executor.map(initialize, range(32)))
+
+        first = results[0]
+        self.assertTrue(all(result[0] is first[0] for result in results))
+        self.assertTrue(all(result[1] is first[1] for result in results))
+        self.assertTrue(all(result[2] is first[2] for result in results))
+        self.assertEqual(sum(result[3] for result in results), 1)
+
+    def test_idle_vardiff_wait_cannot_hold_coordinator_lock(self) -> None:
         server, _rpc = coordinator()
+        state = client(1)
+        vardiff_lock = NotifyingRLock()
+        state.vardiff_lock = vardiff_lock  # type: ignore[assignment]
+        active_job = object()
+        state.active_job = active_job
+        server.clients.add(state)
+        server.latest_detected_tip = None
+        request = type("IdleRequest", (), {})()
+        request.client = state
+        request.connection_id = state.connection_id
+        request.worker = state.worker
+        request.active_job = active_job
+        request.current_difficulty = state.share_difficulty
+        request.window_started_monotonic = state.vardiff_window_started_monotonic
+        attempting = threading.Event()
+
+        def validate_idle_request() -> None:
+            attempting.set()
+            server._idle_request_skip_reason(request)
+
+        with vardiff_lock:
+            vardiff_lock.attempted.clear()
+            validator = threading.Thread(target=validate_idle_request)
+            validator.start()
+            self.assertTrue(attempting.wait(1))
+            self.assertTrue(vardiff_lock.attempted.wait(1))
+            acquired = server.lock.acquire(timeout=0.25)
+            self.assertTrue(acquired)
+            if acquired:
+                server.lock.release()
+        validator.join(1)
+        self.assertFalse(validator.is_alive())
+
+    def test_job_delivery_vardiff_wait_cannot_hold_coordinator_lock(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        vardiff_lock = NotifyingRLock()
+        state.vardiff_lock = vardiff_lock  # type: ignore[assignment]
+
+        with vardiff_lock:
+            vardiff_lock.attempted.clear()
+            sender = threading.Thread(
+                target=lambda: server.maybe_send_job(state, clean_jobs=True),
+            )
+            sender.start()
+            self.assertTrue(vardiff_lock.attempted.wait(2))
+            acquired = server.lock.acquire(timeout=0.25)
+            self.assertTrue(acquired)
+            if acquired:
+                server.lock.release()
+        sender.join(2)
+        self.assertFalse(sender.is_alive())
+
+    def test_real_submissions_cannot_starve_tip_publication(self) -> None:
+        """A 600-client/100-submit burst admits tip publication promptly."""
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
         clients = [client(index + 1) for index in range(600)]
-        fake_job = type("FakeJob", (), {"share_difficulty": Decimal("1")})()
-        completed = 0
-        completed_lock = threading.Lock()
+        contexts = [register_job(server, state) for state in clients]
+        with server.lock:
+            server.clients.update(clients)
+        params = [
+            submit_params(state, context)
+            for state, context in zip(clients[:100], contexts[:100], strict=True)
+        ]
+        counting_lock = CountingRLock()
+        server.lock = counting_lock  # type: ignore[assignment]
+
+        # Hold accepted submissions after their single control snapshot so tip
+        # publication is guaranteed to compete with a live submit burst, not
+        # merely start after fast in-memory ledger commits have all finished.
+        ledger_entered = threading.Event()
+        release_ledger = threading.Event()
+        append_batch = server.ledger.append_batch
+
+        def blocking_append_batch(
+            entries: list[tuple[PendingShare, dict[str, object] | None]],
+        ) -> list[AcceptedShareRecord]:
+            ledger_entered.set()
+            if not release_ledger.wait(2):
+                raise AssertionError("tip publication did not release share commits")
+            return append_batch(entries)
+
+        server.ledger.append_batch = blocking_append_batch  # type: ignore[method-assign]
+
         start = threading.Event()
+        ready = threading.Event()
+        active_lock = threading.Lock()
+        ready_count = 0
+        active_count = 0
+        active_during_publication = 0
+        publication_wait = float("inf")
 
-        def account_share(index: int) -> None:
-            nonlocal completed
-            state = clients[index % len(clients)]
+        def submit_share(index: int) -> int:
+            nonlocal ready_count, active_count
+            with active_lock:
+                ready_count += 1
+                active_count += 1
+                if ready_count == 64:
+                    ready.set()
             self.assertTrue(start.wait(2))
-            server.note_vardiff_submitted_share(state)
-            server.note_vardiff_accepted_share(state, fake_job)  # type: ignore[arg-type]
-            self.assertTrue(server._reserve_recent_share_key(("miner", index)))
-            with completed_lock:
-                completed += 1
-
-        # Holding tip/publication authority would block all 100 workers before
-        # the fix because every Vardiff increment and dedup reservation also
-        # acquired this lock. They now complete on per-client/dedicated locks.
-        executor = ThreadPoolExecutor(max_workers=100)
-        futures = []
-        try:
-            with server.lock:
-                futures = [executor.submit(account_share, index) for index in range(100)]
-                start.set()
-                deadline = time.monotonic() + 2
-                while completed < 100 and time.monotonic() < deadline:
-                    time.sleep(0.005)
-                self.assertEqual(completed, 100)
-            for future in futures:
-                future.result(timeout=1)
-        finally:
-            # Release of server.lock precedes worker shutdown even when the
-            # regression assertion fires, so the failing pre-fix test exits.
-            executor.shutdown(wait=True, cancel_futures=True)
-
-        tip_progress = threading.Event()
+            before = counting_lock.acquisitions_for_current_thread()
+            try:
+                try:
+                    server.handle_submit(clients[index], params[index])
+                except StratumError as exc:
+                    # Submits whose admission snapshot follows the publication
+                    # correctly observe the old job as stale.
+                    if exc.reason != PRISM_REJECTION_STALE_JOB:
+                        raise
+                return counting_lock.acquisitions_for_current_thread() - before
+            finally:
+                with active_lock:
+                    active_count -= 1
 
         def publish_tip_state() -> None:
-            with server.lock:
-                server.current_tip_first_seen = (NEW_TIP, time.monotonic())
-            tip_progress.set()
+            nonlocal active_during_publication, publication_wait
+            try:
+                self.assertTrue(ledger_entered.wait(2))
+                started = time.monotonic()
+                with counting_lock:
+                    publication_wait = time.monotonic() - started
+                    server.current_tip_first_seen = (NEW_TIP, time.monotonic())
+                    server.current_tip_observed_monotonic = time.monotonic()
+                    with active_lock:
+                        active_during_publication = active_count
+            finally:
+                release_ledger.set()
 
-        tip_thread = threading.Thread(target=publish_tip_state)
-        tip_thread.start()
-        self.assertTrue(tip_progress.wait(1))
-        tip_thread.join(1)
+        with ThreadPoolExecutor(
+            max_workers=64,
+            thread_name_prefix="share-submit",
+        ) as executor:
+            futures = [executor.submit(submit_share, index) for index in range(100)]
+            self.assertTrue(ready.wait(2))
+            tip_thread = threading.Thread(
+                target=publish_tip_state,
+                name="tip-publication",
+            )
+            tip_thread.start()
+            start.set()
+            acquisitions_per_submit = [future.result(timeout=5) for future in futures]
+            tip_thread.join(2)
+
+        self.assertFalse(tip_thread.is_alive())
+        self.assertGreater(active_during_publication, 0)
+        self.assertLess(publication_wait, 0.5)
+        # Before the consolidated snapshot, every normal handle_submit crossed
+        # this lock separately for pool state, job lookup, and tip selection.
+        self.assertEqual(acquisitions_per_submit, [1] * 100)
         self.assertEqual(server.submitted_share_count, 100)
 
     def test_concurrent_vardiff_accounting_is_exact_without_coordinator_lock(self) -> None:
