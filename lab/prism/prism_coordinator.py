@@ -7662,6 +7662,32 @@ class PrismCoordinator:
             == int(getattr(client, "difficulty_generation", 0))
         )
 
+    @staticmethod
+    def _client_has_delivered_work_locked(client: ClientState) -> bool:
+        """Return whether a socket write completed for any usable job."""
+
+        return bool(
+            client.tip_work_delivered is not None
+            or client._progress_delivered_context is not None
+        )
+
+    def _reset_delivery_failure_if_coverage_restored_locked(self) -> None:
+        authorized_clients = [
+            client
+            for client in self.clients
+            if client.subscribed and client.authorized and client.worker is not None
+        ]
+        if not authorized_clients:
+            self._mining_delivery_failure_started_monotonic = None
+            return
+        current = sum(
+            1
+            for client in authorized_clients
+            if self._client_has_current_tip_job_locked(client)
+        )
+        if current / len(authorized_clients) >= 0.95:
+            self._mining_delivery_failure_started_monotonic = None
+
     def note_initial_job_delivered(
         self,
         client: ClientState,
@@ -11386,6 +11412,9 @@ class PrismCoordinator:
             delivered = client.tip_work_delivered
             if delivered is None or delivered[0] != job_parent_hash:
                 client.tip_work_delivered = (job_parent_hash, now)
+            self._ensure_initial_job_state()
+            if job_parent_hash == self._current_published_tip_hash_locked():
+                self._reset_delivery_failure_if_coverage_restored_locked()
 
     def _ensure_evicted_job_state(self) -> None:
         graveyard = getattr(self, "evicted_job_graveyard", None)
@@ -17647,24 +17676,41 @@ class PrismCoordinator:
                 if client.subscribed and client.authorized and client.worker is not None
             ]
             authorized = len(authorized_clients)
-            current = sum(
-                1
+            clients_with_current_work = [
+                client
                 for client in authorized_clients
                 if self._client_has_current_tip_job_locked(client)
-            )
-            oldest_missing_age = max(
-                (
-                    now - client.authorized_monotonic
-                    for client in authorized_clients
-                    if not self._client_has_current_tip_job_locked(client)
-                    and client.authorized_monotonic is not None
-                ),
-                default=0.0,
-            )
+            ]
+            current = len(clients_with_current_work)
             pending_requests = list(self.pending_initial_jobs.values())
             pending = len(pending_requests)
             oldest_age = max(
-                (now - request.requested_monotonic for request in pending_requests),
+                (
+                    max(0.0, now - request.requested_monotonic)
+                    for request in pending_requests
+                ),
+                default=0.0,
+            )
+            genuinely_pending_initial_clients = [
+                client
+                for client in authorized_clients
+                if not self._client_has_delivered_work_locked(client)
+            ]
+            genuine_initial_started = [
+                started
+                for client in genuinely_pending_initial_clients
+                for started in (
+                    client.authorized_monotonic,
+                    (
+                        self.pending_initial_jobs[client].requested_monotonic
+                        if client in self.pending_initial_jobs
+                        else None
+                    ),
+                )
+                if started is not None
+            ]
+            oldest_genuine_initial_age = max(
+                (max(0.0, now - started) for started in genuine_initial_started),
                 default=0.0,
             )
             connection_limit = int(
@@ -17703,7 +17749,6 @@ class PrismCoordinator:
                 if self._mining_overload_started_monotonic is not None
                 else 0.0
             )
-            last_delivery = self.last_initial_job_delivery_monotonic
             timeout = float(self.stratum_initial_job_timeout_seconds)
             timeout_disconnects = self.initial_job_timeout_count
             queue_rejections = self.initial_job_queue_rejection_count
@@ -17748,23 +17793,18 @@ class PrismCoordinator:
             )
         )
         in_startup_grace = startup_age < startup_grace
-        no_delivery_progress = bool(
+        initial_job_starved = bool(
+            deadline is not None
+            and oldest_genuine_initial_age >= deadline
+            and genuinely_pending_initial_clients
+        )
+        current_tip_coverage_stalled = bool(
             deadline is not None
             and poor_coverage
-            and (
-                delivery_failure_age >= deadline
-                or oldest_missing_age >= deadline
-                or (
-                    pending > 0
-                    and (
-                        (last_delivery is None and oldest_age >= deadline)
-                        or (
-                            last_delivery is not None
-                            and now - last_delivery >= deadline
-                        )
-                    )
-                )
-            )
+            and delivery_failure_age >= deadline
+        )
+        no_delivery_progress = bool(
+            initial_job_starved or current_tip_coverage_stalled
         )
         stale_unknown = int(
             getattr(self, "rejection_counts_by_reason", {}).get(
@@ -17786,7 +17826,7 @@ class PrismCoordinator:
         persistent_overload = deadline is not None and overload_age >= deadline
         unhealthy_reasons: list[str] = []
         if not in_startup_grace:
-            if poor_coverage and no_delivery_progress:
+            if no_delivery_progress:
                 unhealthy_reasons.append("initial-delivery-stalled")
             if pending_saturated and persistent_overload:
                 unhealthy_reasons.append("pending-initial-jobs-saturated")
@@ -17809,8 +17849,16 @@ class PrismCoordinator:
             "pending_initial_jobs": pending,
             "pending_initial_job_capacity": pending_limit,
             "oldest_pending_initial_job_age_seconds": round(oldest_age, 3),
+            "oldest_genuinely_pending_initial_job_age_seconds": round(
+                oldest_genuine_initial_age,
+                3,
+            ),
             "clients_with_current_tip_jobs": current,
             "current_tip_job_coverage": round(coverage, 6),
+            "current_tip_coverage_gap_age_seconds": round(
+                delivery_failure_age,
+                3,
+            ),
             "connection_capacity_saturated": cap_saturated,
             "pending_initial_jobs_saturated": pending_saturated,
             "initial_delivery_stalled": no_delivery_progress,
@@ -17837,8 +17885,11 @@ class PrismCoordinator:
             "clients_with_current_tip_job": current,
             "clients_pending_initial_job": pending,
             "current_tip_job_coverage_ratio": coverage,
+            # Compatibility alias: this now reports only genuine first-job
+            # starvation. Current-tip fanout lag has its own age above.
             "oldest_initial_job_pending_seconds": round(
-                max(oldest_age, oldest_missing_age), 3
+                oldest_genuine_initial_age,
+                3,
             ),
             "job_preparation_pending": preparation_pending,
             "current_observed_tip": current_tip,
@@ -18137,6 +18188,12 @@ class PrismCoordinator:
             "# HELP qbit_prism_stratum_oldest_pending_initial_job_seconds Age of the oldest pending first-job request.",
             "# TYPE qbit_prism_stratum_oldest_pending_initial_job_seconds gauge",
             f"qbit_prism_stratum_oldest_pending_initial_job_seconds {mining_metrics['oldest_pending_initial_job_age_seconds']}",
+            "# HELP qbit_prism_stratum_oldest_genuinely_pending_initial_job_seconds Age of the oldest authorized client that has never received usable work.",
+            "# TYPE qbit_prism_stratum_oldest_genuinely_pending_initial_job_seconds gauge",
+            f"qbit_prism_stratum_oldest_genuinely_pending_initial_job_seconds {mining_metrics['oldest_genuinely_pending_initial_job_age_seconds']}",
+            "# HELP qbit_prism_stratum_current_tip_coverage_gap_seconds Continuous age of current-tip job coverage below 95 percent.",
+            "# TYPE qbit_prism_stratum_current_tip_coverage_gap_seconds gauge",
+            f"qbit_prism_stratum_current_tip_coverage_gap_seconds {mining_metrics['current_tip_coverage_gap_age_seconds']}",
             "# HELP qbit_prism_stratum_initial_job_queue_rejections_total Sessions closed because bounded first-job delivery was full.",
             "# TYPE qbit_prism_stratum_initial_job_queue_rejections_total counter",
             f"qbit_prism_stratum_initial_job_queue_rejections_total {mining_metrics['initial_job_queue_rejections']}",
