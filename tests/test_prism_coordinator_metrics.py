@@ -4,9 +4,37 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 from tests import prism_coordinator_test_support as _job_support
 from tests import prism_vardiff_test_support as _vardiff_support
+
+
+def install_isolated_coordinator(
+    test_case: unittest.TestCase,
+    factory: object,
+) -> None:
+    assert callable(factory)
+
+    def isolated(*args: object, **kwargs: object) -> object:
+        result = factory(*args, **kwargs)
+        server = result[0] if isinstance(result, tuple) else result
+        temporary = tempfile.TemporaryDirectory()
+        server.audit_dir = Path(temporary.name) / "audit"
+        server.evidence_path = Path(temporary.name) / "state" / "evidence.json"
+
+        def cleanup() -> None:
+            store = server.__dict__.get("_audit_artifact_store")
+            if store is not None:
+                store.close()
+            temporary.cleanup()
+
+        test_case.addCleanup(cleanup)
+        return result
+
+    globals()["coordinator"] = isolated
 
 
 class _VardiffSupportTestCase(unittest.TestCase):
@@ -14,6 +42,7 @@ class _VardiffSupportTestCase(unittest.TestCase):
         globals().update(
             {name: getattr(_vardiff_support, name) for name in _vardiff_support.__all__}
         )
+        install_isolated_coordinator(self, _vardiff_support.coordinator)
 
 
 class _JobSupportTestCase(unittest.TestCase):
@@ -21,6 +50,7 @@ class _JobSupportTestCase(unittest.TestCase):
         globals().update(
             {name: getattr(_job_support, name) for name in _job_support.__all__}
         )
+        install_isolated_coordinator(self, _job_support.coordinator)
 
 
 class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
@@ -260,6 +290,25 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         self.assertIn('qbit_prism_audit_artifact_files{kind="candidate"} 2', metrics)
         self.assertIn('qbit_prism_audit_artifact_bytes{kind="other"} 6', metrics)
         self.assertIn('qbit_prism_audit_artifact_files{kind="other"} 1', metrics)
+        self.assertIn("qbit_prism_audit_artifact_scan_error 0", metrics)
+    def test_metrics_payload_reads_one_a1_snapshot(self) -> None:
+        server = coordinator()
+        snapshot = {
+            "body": {"files": 1, "bytes": 2},
+            "share_segment": {"files": 3, "bytes": 4},
+            "live_bundle": {"files": 5, "bytes": 6},
+            "candidate": {"files": 7, "bytes": 8},
+            "other": {"files": 9, "bytes": 10},
+            "scan_error": 0,
+        }
+        reader = mock.Mock(return_value=snapshot)
+        server.audit_artifact_metrics = reader  # type: ignore[method-assign]
+
+        metrics = server.metrics_payload()
+
+        reader.assert_called_once_with()
+        self.assertIn('qbit_prism_audit_artifact_files{kind="body"} 1', metrics)
+        self.assertIn('qbit_prism_audit_artifact_bytes{kind="other"} 10', metrics)
         self.assertIn("qbit_prism_audit_artifact_scan_error 0", metrics)
     def _pending_append(self, tag: str, accepted_at_ms: int = 2) -> PendingShareAppend:
         from lab.prism.share_ledger import PendingShare

@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+import copy
 import dataclasses
 import hashlib
 import json
@@ -20,7 +21,6 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
-import uuid
 from types import SimpleNamespace
 from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal, ROUND_CEILING
@@ -45,7 +45,12 @@ from lab.prism.bounded_executor import (
     _BoundedPriorityExecutor,  # noqa: F401 - compatibility re-export
     _DeliveryQueueFull,  # noqa: F401 - compatibility re-export
 )
-from lab.prism.prism_tools import prism_tool_command
+from lab.prism.audit_artifacts import (
+    AuditArtifactConfig,
+    AuditArtifactStore,
+    AuditPublicationIdentity,
+)
+from lab.prism.bundle_compiler import canonical_bundle_bytes
 from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
 from lab.prism.coordinator_config import (
     CoordinatorConfig,
@@ -1721,7 +1726,6 @@ class PrismCoordinator:
         self.ledger_writer_public_key_hex = ledger_config.writer_public_key_hex
         self.evidence_path = audit_config.evidence_path
         self.audit_dir = audit_config.directory
-        self.audit_dir.mkdir(parents=True, exist_ok=True)
         self.audit_share_segment_size = audit_config.share_segment_size
         self.audit_live_bundle_retention = audit_config.live_bundle_retention
         self.audit_candidate_retention_seconds = audit_config.candidate_retention_seconds
@@ -1739,6 +1743,7 @@ class PrismCoordinator:
             lifecycle_config.writer_quiescence_timeout_seconds
         )
         self.ledger = self.make_ledger()
+        self._upgrade_legacy_audit_evidence()
         self._ctv_fanout_market_fee_rate_cache: dict[tuple[int | None, str | None], int] = {}
         self.lock = _ObservedRLock()
         self.clients: set[ClientState] = set()
@@ -1855,7 +1860,6 @@ class PrismCoordinator:
         self.reorg_reconcile_skip_count = 0
         self.reorg_reconcile_error_count = 0
         self.matured_payout_count = 0
-        self.latest_evidence: dict[str, Any] | None = None
         # The full accepted-block bundle is durable in the audit store.  Keeping
         # it here only to derive one metric pinned the complete share window for
         # the lifetime of the coordinator.
@@ -2032,6 +2036,166 @@ class PrismCoordinator:
             self.share_weights_by_username.get(worker.payout_address, self.default_share_weight),
         )
 
+    def _ensure_audit_artifact_store(self) -> AuditArtifactStore:
+        init_lock = self.__dict__.setdefault(
+            "_audit_artifact_store_init_lock",
+            threading.Lock(),
+        )
+        assert isinstance(init_lock, type(threading.Lock()))
+        with init_lock:
+            audit_dir = Path(
+                self.__dict__.get("audit_dir", Path("prism-audit"))
+            )
+            evidence_path = Path(
+                self.__dict__.get(
+                    "evidence_path",
+                    audit_dir / "prism-live-stratum-evidence.json",
+                )
+            )
+            live_retention = int(
+                self.__dict__.get("audit_live_bundle_retention", 5)
+            )
+            candidate_retention = int(
+                self.__dict__.get(
+                    "audit_candidate_retention_seconds",
+                    24 * 60 * 60,
+                )
+            )
+            share_segment_size = int(
+                self.__dict__.get(
+                    "audit_share_segment_size",
+                    DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
+                )
+            )
+            store = self.__dict__.get("_audit_artifact_store")
+            if not isinstance(store, AuditArtifactStore):
+                store = AuditArtifactStore(
+                    AuditArtifactConfig(
+                        root=audit_dir,
+                        evidence_path=evidence_path,
+                        live_bundle_retention=live_retention,
+                        candidate_retention_seconds=candidate_retention,
+                        share_segment_size=share_segment_size,
+                    ),
+                    canonicalizer=canonical_bundle_bytes,
+                )
+                self.__dict__["_audit_artifact_store"] = store
+                if "_audit_latest_evidence_seed" in self.__dict__:
+                    store.set_latest_evidence_for_compatibility(
+                        self.__dict__.pop("_audit_latest_evidence_seed")
+                    )
+            else:
+                updates: dict[str, Any] = {}
+                if store.root != audit_dir.expanduser().absolute().resolve():
+                    updates["root"] = audit_dir
+                expected_evidence = (
+                    evidence_path.expanduser().absolute().parent.resolve()
+                    / evidence_path.name
+                )
+                if store.evidence_path != expected_evidence:
+                    updates["evidence_path"] = evidence_path
+                if store.live_bundle_retention != live_retention:
+                    updates["live_bundle_retention"] = live_retention
+                if store.candidate_retention_seconds != candidate_retention:
+                    updates["candidate_retention_seconds"] = candidate_retention
+                if store.share_segment_size != share_segment_size:
+                    updates["share_segment_size"] = share_segment_size
+                if updates:
+                    store.reconfigure(**updates)
+            return store
+
+    def _upgrade_legacy_audit_evidence(self) -> None:
+        store = self._ensure_audit_artifact_store()
+        with self._ensure_payout_state_service().balance_mutation_lock:
+            with store.publication_order_guard():
+                legacy = store.legacy_evidence_identity()
+                if legacy is None:
+                    return
+                reader = getattr(self.ledger, "pool_block_state", None)
+                floor_reader = getattr(
+                    self.ledger,
+                    "audit_publication_sequence_floor",
+                    None,
+                )
+                if not callable(reader) or not callable(floor_reader):
+                    store.invalidate_unprovable_legacy_evidence()
+                    return
+                state = reader(block_hash=legacy.block_hash)
+                if not isinstance(state, dict):
+                    store.invalidate_unprovable_legacy_evidence()
+                    return
+                sequence = state.get("audit_publication_sequence")
+                state_block_hash = state.get("block_hash")
+                state_block_height = state.get("block_height")
+                if (
+                    sequence is None
+                    or isinstance(sequence, bool)
+                    or not isinstance(sequence, int)
+                    or sequence <= 0
+                    or not isinstance(state_block_hash, str)
+                    or state_block_hash != legacy.block_hash
+                    or isinstance(state_block_height, bool)
+                    or not isinstance(state_block_height, int)
+                    or state_block_height != legacy.block_height
+                    or str(state.get("chain_state") or "") != "confirmed"
+                    or str(state.get("maturity_state") or "")
+                    not in {"immature", "mature"}
+                ):
+                    store.invalidate_unprovable_legacy_evidence()
+                    return
+                publication_floor_sequence = floor_reader()
+                store.adopt_legacy_publication_identity(
+                    AuditPublicationIdentity(
+                        int(sequence),
+                        legacy.block_height,
+                        legacy.block_hash,
+                    ),
+                    publication_floor_sequence=publication_floor_sequence,
+                )
+
+    def _audit_publication_identity(
+        self,
+        *,
+        block_hash: str,
+        block_height: int,
+        confirmation: Mapping[str, Any],
+    ) -> AuditPublicationIdentity:
+        sequence = confirmation.get("audit_publication_sequence")
+        if sequence is None:
+            # Compatibility-only fake ledgers in unit tests predate the durable
+            # ordinal.  Production Postgres and the memory ledger always return
+            # it; never synthesize for an identified durable backend.
+            if str(confirmation.get("backend") or "") not in {"", "fake"}:
+                raise RuntimeError(
+                    "ledger confirmation omitted audit publication sequence"
+                )
+            sequences = self.__dict__.setdefault(
+                "_compat_audit_publication_sequences",
+                {},
+            )
+            assert isinstance(sequences, dict)
+            sequence = sequences.get(block_hash)
+            if sequence is None:
+                sequence = max(
+                    [
+                        self._ensure_audit_artifact_store().publication_sequence_floor(),
+                        *(int(value) for value in sequences.values()),
+                    ]
+                ) + 1
+                sequences[block_hash] = sequence
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            raise RuntimeError("ledger confirmation returned invalid publication sequence")
+        if isinstance(block_height, bool) or not isinstance(block_height, int):
+            raise RuntimeError("ledger confirmation returned invalid block height")
+        canonical_block_hash = str(block_hash).lower()
+        if canonical_block_hash != block_hash:
+            raise RuntimeError("ledger confirmation returned non-canonical block hash")
+        return AuditPublicationIdentity(
+            sequence,
+            block_height,
+            canonical_block_hash,
+        )
+
     def make_ledger(self) -> SingleWriterShareLedger | PsqlShareLedger:
         config = getattr(self, "config", None)
         ledger_config = config.ledger if config is not None else None
@@ -2084,7 +2248,7 @@ class PrismCoordinator:
                 "PRISM_LEDGER_WRITER_SESSION_TOKEN requires "
                 "PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN=1 for local tests"
             )
-        audit_body_dir = getattr(self, "audit_dir", None)
+        audit_store = self._ensure_audit_artifact_store()
         return PsqlShareLedger(
             psql_command=psql_command,
             database_url=database_url or None,
@@ -2132,8 +2296,7 @@ class PrismCoordinator:
                     30.0,
                 )
             ),
-            audit_body_dir=str(audit_body_dir) if audit_body_dir is not None else None,
-            audit_share_segment_size=getattr(self, "audit_share_segment_size", DEFAULT_AUDIT_SHARE_SEGMENT_SIZE),
+            audit_artifact_store=audit_store,
             ctv_broadcast_attempt_detail_limit=getattr(
                 self,
                 "ctv_broadcast_attempt_detail_limit",
@@ -6584,12 +6747,11 @@ class PrismCoordinator:
                                         on_active_chain
                                         and chain_state == "inactive"
                                     ):
-                                        reactivated = (
-                                            self.ledger.reactivate_pool_block(
+                                        with self._ensure_audit_artifact_store().publication_order_guard():
+                                            reactivated = self.ledger.reactivate_pool_block(
                                                 block_hash=block_hash,
                                                 active_tip_height=active_tip_height,
                                             )
-                                        )
                                         reactivated_count = int(
                                             reactivated.get(
                                                 "reactivated_count",
@@ -7039,6 +7201,8 @@ class PrismCoordinator:
         witness_merkle_leaves_hex: list[str] | None = None,
         ctv_fee_parent_hash: str | None = None,
         canonical_output_path: Path | None = None,
+        canonical_output_parent_fd: int | None = None,
+        canonical_output_adopter: Callable[[Path, os.stat_result], None] | None = None,
         summary_only: bool = False,
         payout_policy: dict[str, object] | None = None,
         ctv_settlement: dict[str, object] | None = None,
@@ -7053,6 +7217,8 @@ class PrismCoordinator:
             witness_merkle_leaves_hex=witness_merkle_leaves_hex,
             ctv_fee_parent_hash=ctv_fee_parent_hash,
             canonical_output_path=canonical_output_path,
+            canonical_output_parent_fd=canonical_output_parent_fd,
+            canonical_output_adopter=canonical_output_adopter,
             summary_only=summary_only,
             payout_policy=payout_policy,
             ctv_settlement=ctv_settlement,
@@ -9268,6 +9434,8 @@ class PrismCoordinator:
         dict[str, Any],
         dict[str, Any],
         dict[str, Any],
+        AuditPublicationIdentity,
+        dict[str, Any],
     ] | None:
         """Land, verify, publish, persist, and confirm one candidate.
 
@@ -9475,35 +9643,62 @@ class PrismCoordinator:
                 self._publish_accepted_block_payout_preview(block_hash, preview)
 
             self._record_heartbeat("block_submitter")
-            candidate_bundle_path = self.temporary_audit_bundle_path(
+            audit_store = self._ensure_audit_artifact_store()
+            candidate_artifact = audit_store.issue_candidate(
                 block_hash=submission.block_hash_hex
             )
-            final_bundle = self.build_audit_bundle(
-                shares=context.shares_json,
-                found_block=context.found_block,
-                prior_balances=context.prior_balances,
-                coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
-                    candidate.extranonce1_hex,
-                    candidate.extranonce2_hex,
-                ),
-                witness_merkle_leaves_hex=list(
-                    getattr(context.job, "witness_merkle_leaves_hex", ())
+            candidate_bundle_path = candidate_artifact.path
+            compiler_transferred_candidate = False
+
+            def adopt_compiler_output(path: Path, value: os.stat_result) -> None:
+                nonlocal compiler_transferred_candidate
+                audit_store.adopt_compiler_candidate(
+                    candidate_artifact,
+                    path=path,
+                    value=value,
                 )
-                or direct_stratum.witness_merkle_leaves_hex(
-                    getattr(context.job, "transaction_hexes", ())
-                ),
-                ctv_fee_parent_hash=parent_hash,
-                canonical_output_path=candidate_bundle_path,
-            )
+                compiler_transferred_candidate = True
+
+            compiler_parent_fd = audit_store.duplicate_root_directory_fd()
+            try:
+                final_bundle = self.build_audit_bundle(
+                    shares=context.shares_json,
+                    found_block=context.found_block,
+                    prior_balances=context.prior_balances,
+                    coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
+                        candidate.extranonce1_hex,
+                        candidate.extranonce2_hex,
+                    ),
+                    witness_merkle_leaves_hex=list(
+                        getattr(context.job, "witness_merkle_leaves_hex", ())
+                    )
+                    or direct_stratum.witness_merkle_leaves_hex(
+                        getattr(context.job, "transaction_hexes", ())
+                    ),
+                    ctv_fee_parent_hash=parent_hash,
+                    canonical_output_path=candidate_bundle_path,
+                    canonical_output_parent_fd=compiler_parent_fd,
+                    canonical_output_adopter=adopt_compiler_output,
+                )
+            except BaseException:
+                audit_store.discard_candidate(candidate_artifact)
+                raise
+            finally:
+                os.close(compiler_parent_fd)
             # Compatibility builders used by tests and older integrations may
             # ignore canonical_output_path. Persist their logical bundle via
             # the normal canonicalization fallback without mislabeling bytes.
-            if not candidate_bundle_path.exists():
-                candidate_bundle_path = self.write_temporary_audit_bundle(
-                    final_bundle,
-                    block_hash=submission.block_hash_hex,
-                )
             try:
+                if not candidate_bundle_path.exists():
+                    candidate_bundle_path = audit_store.write_compatibility_candidate(
+                        candidate_artifact,
+                        final_bundle,
+                    )
+                else:
+                    if not compiler_transferred_candidate:
+                        raise RuntimeError(
+                            "audit builder created an output path without exact inode transfer"
+                        )
                 final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
                 final_coinbase_tx_hex_raw = final_manifest["coinbase_tx_hex"]
                 if not isinstance(final_coinbase_tx_hex_raw, str):
@@ -9512,16 +9707,10 @@ class PrismCoordinator:
                     )
                 final_coinbase_tx_hex = final_coinbase_tx_hex_raw.lower()
             except BaseException:
-                try:
-                    candidate_bundle_path.unlink()
-                except FileNotFoundError:
-                    pass
+                audit_store.discard_candidate(candidate_artifact)
                 raise
             if final_coinbase_tx_hex != submission.coinbase_tx_hex.lower():
-                try:
-                    candidate_bundle_path.unlink()
-                except FileNotFoundError:
-                    pass
+                audit_store.discard_candidate(candidate_artifact)
                 self.request_shutdown()
                 self._clear_accepted_block_payout_preview(
                     block_hash,
@@ -9536,17 +9725,40 @@ class PrismCoordinator:
             payout_commit_started: float | None = None
             payout_commit_source: int | None = None
             try:
-                report = self.verify_bundle(
-                    candidate_bundle_path,
-                    submission.coinbase_tx_hex,
-                    self.trusted_ledger_writer_public_key_hex(final_bundle),
-                    expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
+                verifier_override = self.__dict__.get("verify_bundle")
+                configured_writer_key = getattr(
+                    self,
+                    "ledger_writer_public_key_hex",
+                    None,
                 )
+                verified_audit = audit_store.verify_candidate(
+                    candidate_artifact,
+                    coinbase_tx_hex=submission.coinbase_tx_hex,
+                    expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
+                    expected_block_height=expected_height,
+                    trusted_writer_public_key_hex=(
+                        self.trusted_ledger_writer_public_key_hex(final_bundle)
+                    ),
+                    trust_source=(
+                        "configured"
+                        if configured_writer_key is not None
+                        else "embedded_test_only"
+                    ),
+                    verifier=(
+                        verifier_override
+                        if callable(verifier_override)
+                        else None
+                    ),
+                )
+                audit_store.require_current_verified_candidate(
+                    verified_audit,
+                    candidate_artifact,
+                )
+                report = dict(verified_audit.report)
                 persistence_canonical_bundle_path = (
-                    self.verified_canonical_bundle_path(
-                        candidate_bundle_path,
-                        report,
-                    )
+                    candidate_bundle_path
+                    if verified_audit.canonical_copy_eligible
+                    else None
                 )
                 self._record_heartbeat("block_submitter")
                 verified_preview = self._accepted_block_payout_preview_from_bundle(
@@ -9633,15 +9845,24 @@ class PrismCoordinator:
                         worker=worker,
                     )
                     return None
-                confirmation = self.ledger.confirm_accepted_block(
-                    block_hash=block_hash,
-                    # The ledger confirmation function matches this value
-                    # against the candidate row's own height. An accepted
-                    # ancestor can be finalized after newer blocks arrive.
-                    active_tip_height=expected_height,
-                )
-                confirmed_count = int(confirmation.get("confirmed_count", 0))
-                if confirmed_count not in {0, 1}:
+                with audit_store.publication_order_guard():
+                    confirmation = self.ledger.confirm_accepted_block(
+                        block_hash=block_hash,
+                        # The ledger confirmation function matches this value
+                        # against the candidate row's own height. An accepted
+                        # ancestor can be finalized after newer blocks arrive.
+                        active_tip_height=expected_height,
+                    )
+                    confirmed_count = int(confirmation.get("confirmed_count", 0))
+                    if confirmed_count == 1:
+                        audit_publication_identity = (
+                            self._audit_publication_identity(
+                                block_hash=block_hash,
+                                block_height=expected_height,
+                                confirmation=confirmation,
+                            )
+                        )
+                if confirmed_count != 1:
                     self.request_shutdown()
                     self._clear_accepted_block_payout_preview(
                         block_hash,
@@ -9748,7 +9969,14 @@ class PrismCoordinator:
                             f"scheduled refresh hash={block_hash}",
                             flush=True,
                         )
-                return final_bundle, report, persistence, confirmation
+                return (
+                    final_bundle,
+                    report,
+                    persistence,
+                    confirmation,
+                    audit_publication_identity,
+                    dict(verified_audit.verification_identity),
+                )
             except Exception:
                 if payout_commit_started is not None and payout_commit_source is not None:
                     # Persistence/confirmation can report failure after a
@@ -9770,10 +9998,7 @@ class PrismCoordinator:
                         "preparation",
                         max(0.0, time.monotonic() - payout_commit_started),
                     )
-                try:
-                    candidate_bundle_path.unlink()
-                except FileNotFoundError:
-                    pass
+                audit_store.discard_candidate(candidate_artifact)
 
     @ledger_writer_operation("accepted_block_handling")
     def submit_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
@@ -9868,7 +10093,14 @@ class PrismCoordinator:
         )
         if landed is None:
             return False
-        final_bundle, report, persistence, confirmation = landed
+        (
+            final_bundle,
+            report,
+            persistence,
+            confirmation,
+            audit_publication_identity,
+            audit_verification_identity,
+        ) = landed
         with self.lock:
             already_accounted = block_hash in self._accounted_accepted_block_hashes
         if already_accounted:
@@ -9885,19 +10117,6 @@ class PrismCoordinator:
                 manifest_set=ctv_manifest_set,
                 manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
             )
-        final_bundle_path = (
-            self.audit_dir
-            / f"prism-live-audit-bundle-{expected_height}-{block_hash}.json"
-        )
-        self.write_audit_bundle_envelope(
-            final_bundle_path,
-            block_hash=block_hash,
-            block_height=expected_height,
-            report=report,
-            persistence=persistence,
-        )
-        self.prune_audit_artifacts(keep_live_path=final_bundle_path)
-        bundle_path = final_bundle_path
         if candidate.credit_share_on_accept:
             self.append_accepted_share(
                 candidate.client,
@@ -9915,17 +10134,56 @@ class PrismCoordinator:
             "block_hash": block_hash,
             "block_height": expected_height,
             "coinbase_tx_hex": submission.coinbase_tx_hex,
-            "audit_bundle_path": str(bundle_path),
             "audit_report": report,
             "ledger_backend": self.ledger.backend_name,
             "persistence": persistence,
             "confirmation": confirmation,
+            "audit_verification_identity": audit_verification_identity,
             "ctv_persistence": ctv_persistence,
             "accepted_share_count": evidence_share_count,
             "distinct_miner_count": evidence_distinct_miners,
             "job_share_count": len(context.shares_json),
         }
-        self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        publication_persistence = dict(persistence)
+        publication_persistence.setdefault(
+            "audit_bundle_sha256",
+            report.get("audit_bundle_sha256_hex"),
+        )
+        publication_persistence.setdefault("body_uri", "")
+        evidence["persistence"] = publication_persistence
+        audit_store = self._ensure_audit_artifact_store()
+        with self._ensure_payout_state_service().balance_mutation_lock:
+            with audit_store.publication_order_guard():
+                publication_floor_reader = getattr(
+                    self.ledger,
+                    "audit_publication_sequence_floor",
+                    None,
+                )
+                if callable(publication_floor_reader):
+                    # This is deliberately a fresh durable-row read immediately
+                    # before A1 publication. Confirmation-time state or a raw
+                    # sequence value cannot fence rollback gaps and restart
+                    # replays. P1's local serializer plus A1's process guard
+                    # prevent another confirmation/reactivation from allocating
+                    # between this read and the durable publication decision.
+                    publication_floor_sequence = publication_floor_reader()
+                else:
+                    # Compatibility-only ledgers used by legacy embeddings/tests
+                    # do not own durable ordinal state. Production memory/Postgres
+                    # backends implement the reader above.
+                    publication_floor_sequence = (
+                        audit_publication_identity.sequence
+                    )
+                publication = audit_store.publish_success(
+                    identity=audit_publication_identity,
+                    publication_floor_sequence=publication_floor_sequence,
+                    report=report,
+                    persistence=publication_persistence,
+                    evidence=evidence,
+                    verification_identity=audit_verification_identity,
+                    created_at=public_api.utc_now_iso(),
+                )
+        evidence = dict(publication.evidence)
         with self.lock:
             newly_accounted = block_hash not in self._accounted_accepted_block_hashes
             if newly_accounted:
@@ -9938,7 +10196,6 @@ class PrismCoordinator:
                     ]
                 )
             ) // 2
-            self.latest_evidence = evidence
             should_stop = (
                 newly_accounted
                 and (self.stop_after_block or self.accepted_block_count >= self.max_blocks)
@@ -9973,119 +10230,20 @@ class PrismCoordinator:
             active_tip_height=active_tip_height,
         )
 
-    def temporary_audit_bundle_path(self, *, block_hash: str) -> Path:
-        self.audit_dir.mkdir(parents=True, exist_ok=True)
-        return self.audit_dir / (
-            f".prism-live-audit-bundle-candidate-{block_hash}-{uuid.uuid4().hex}.json.tmp"
-        )
-
     @staticmethod
     def verified_canonical_bundle_path(
         candidate_bundle_path: Path,
         report: dict[str, Any],
     ) -> Path | None:
-        expected_sha256 = str(report["audit_bundle_sha256_hex"]).lower()
-        digest = hashlib.sha256()
-        with candidate_bundle_path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-        if digest.hexdigest() != expected_sha256:
-            return None
-        return candidate_bundle_path
-
-    def write_temporary_audit_bundle(self, bundle: dict[str, Any], *, block_hash: str) -> Path:
-        path = self.temporary_audit_bundle_path(block_hash=block_hash)
-        with path.open("x", encoding="utf-8") as handle:
-            json.dump(bundle, handle, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        return path
-
-    def write_audit_bundle_envelope(
-        self,
-        path: Path,
-        *,
-        block_hash: str,
-        block_height: int,
-        report: dict[str, Any],
-        persistence: dict[str, Any],
-    ) -> None:
-        audit_bundle_sha256 = str(
-            persistence.get("audit_bundle_sha256")
-            or report.get("audit_bundle_sha256_hex")
-            or ""
-        ).lower()
-        body_uri = str(persistence.get("body_uri") or "")
-        envelope = {
-            "schema": "qbit.prism.live-audit-bundle-envelope.v1",
-            "block_hash": block_hash,
-            "block_height": block_height,
-            "audit_bundle_sha256": audit_bundle_sha256,
-            "body_uri": body_uri,
-            "body_filename": Path(body_uri).name if body_uri else None,
-            "coinbase_txid": report.get("coinbase_txid"),
-            "coinbase_manifest_sha256": report.get("coinbase_manifest_sha256_hex"),
-            "coinbase_tx_hex": report.get("coinbase_tx_hex"),
-            "created_at": public_api.utc_now_iso(),
-        }
-        self.write_json_atomically(path, envelope)
-
-    def write_json_atomically(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            with tmp_path.open("xb") as handle:
-                handle.write(body)
-                handle.flush()
-                os.fsync(handle.fileno())
-            tmp_path.replace(path)
-        finally:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
+        return AuditArtifactStore.verified_canonical_bundle_path(
+            candidate_bundle_path,
+            report,
+        )
 
     def prune_audit_artifacts(self, *, keep_live_path: Path | None = None) -> None:
-        self.prune_live_audit_envelopes(keep_path=keep_live_path)
-        self.prune_candidate_audit_bundles()
-
-    def prune_live_audit_envelopes(self, *, keep_path: Path | None = None) -> None:
-        retention = int(getattr(self, "audit_live_bundle_retention", 5))
-        if retention < 0:
-            return
-        keep_resolved = keep_path.resolve() if keep_path is not None else None
-        retained_non_keep = max(retention - 1, 0) if keep_resolved is not None else retention
-        paths = sorted(
-            self.audit_dir.glob("prism-live-audit-bundle-[0-9]*.json"),
-            key=lambda path: path.stat().st_mtime if path.exists() else 0,
-            reverse=True,
+        self._ensure_audit_artifact_store().prune_best_effort(
+            keep_live_path=keep_live_path
         )
-        retained_count = 0
-        for path in paths:
-            if keep_resolved is not None and path.resolve() == keep_resolved:
-                continue
-            if retained_count < retained_non_keep:
-                retained_count += 1
-                continue
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-
-    def prune_candidate_audit_bundles(self) -> None:
-        retention_seconds = int(getattr(self, "audit_candidate_retention_seconds", 24 * 60 * 60))
-        now = time.time()
-        for pattern in (
-            "prism-live-audit-bundle-candidate-*.json",
-            ".prism-live-audit-bundle-candidate-*.json.tmp",
-        ):
-            for path in self.audit_dir.glob(pattern):
-                try:
-                    if retention_seconds == 0 or now - path.stat().st_mtime > retention_seconds:
-                        path.unlink()
-                except FileNotFoundError:
-                    pass
 
     def verify_bundle(
         self,
@@ -10094,34 +10252,23 @@ class PrismCoordinator:
         ledger_writer_public_key_hex: str,
         *,
         expected_coinbase_value_sats: int,
+        expected_block_height: int | None = None,
     ) -> dict[str, Any]:
-        completed = subprocess.run(
-            prism_tool_command("qbit-prism-audit-verify")
-            + [
-                str(bundle_path),
-                "--coinbase-tx-hex",
-                coinbase_tx_hex,
-                "--ledger-writer-public-key-hex",
-                ledger_writer_public_key_hex,
-                "--expected-coinbase-value-sats",
-                str(expected_coinbase_value_sats),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+        return self._ensure_audit_artifact_store().verify_bundle(
+            bundle_path,
+            coinbase_tx_hex,
+            ledger_writer_public_key_hex,
+            expected_coinbase_value_sats=expected_coinbase_value_sats,
+            expected_block_height=expected_block_height,
         )
-        if completed.returncode != 0:
-            raise RuntimeError(f"qbit-prism-audit-verify failed: {completed.stderr}")
-        return json.loads(completed.stdout)
 
     def trusted_ledger_writer_public_key_hex(self, bundle: dict[str, Any]) -> str:
-        if self.ledger_writer_public_key_hex is not None:
-            return self.ledger_writer_public_key_hex
-        return validate_hex(
-            str(bundle["ledger_window_attestation"]["signature"]["public_key_hex"]),
-            name="bundle ledger public key",
-            expected_bytes=32,
+        return AuditArtifactStore.trusted_writer_key(
+            getattr(self, "ledger_writer_public_key_hex", None),
+            bundle,
+            allow_embedded_test_key=(
+                getattr(self, "ledger_writer_public_key_hex", None) is None
+            ),
         )
 
     @staticmethod
@@ -10702,13 +10849,34 @@ class PrismCoordinator:
             registry.register(self._health_snapshot_service_spec())
         self._start_background_service("health_snapshot_refresher")
 
+    @property
+    def latest_evidence(self) -> dict[str, Any] | None:
+        if (
+            "_audit_artifact_store" not in self.__dict__
+            and "audit_dir" not in self.__dict__
+            and "evidence_path" not in self.__dict__
+        ):
+            value = self.__dict__.get("_audit_latest_evidence_seed")
+            return copy.deepcopy(value) if isinstance(value, dict) else None
+        return self._ensure_audit_artifact_store().latest_evidence()
+
+    @latest_evidence.setter
+    def latest_evidence(self, payload: Mapping[str, Any] | None) -> None:
+        if (
+            "_audit_artifact_store" not in self.__dict__
+            and "audit_dir" not in self.__dict__
+            and "evidence_path" not in self.__dict__
+        ):
+            self.__dict__["_audit_latest_evidence_seed"] = (
+                copy.deepcopy(dict(payload)) if payload is not None else None
+            )
+            return
+        self._ensure_audit_artifact_store().set_latest_evidence_for_compatibility(
+            payload
+        )
+
     def latest_evidence_payload(self) -> dict[str, object] | None:
-        with self.lock:
-            if self.latest_evidence is not None:
-                return dict(self.latest_evidence)
-        if self.evidence_path.exists():
-            return json.loads(self.evidence_path.read_text(encoding="utf-8"))
-        return None
+        return self._ensure_audit_artifact_store().latest_evidence()
 
     def owed_balances_payload(self) -> dict[str, object]:
         return {
@@ -11260,48 +11428,11 @@ class PrismCoordinator:
         ]
 
     def audit_artifact_metrics(self) -> dict[str, dict[str, int] | int]:
-        metrics: dict[str, dict[str, int] | int] = {
-            kind: {"files": 0, "bytes": 0}
-            for kind in ("body", "share_segment", "live_bundle", "candidate", "other")
-        }
-        metrics["scan_error"] = 0
-        audit_dir = getattr(self, "audit_dir", None)
-        if audit_dir is None:
-            metrics["scan_error"] = 1
-            return metrics
-        try:
-            paths = list(Path(audit_dir).iterdir())
-        except OSError:
-            metrics["scan_error"] = 1
-            return metrics
-        for path in paths:
-            try:
-                if not path.is_file():
-                    continue
-                size = path.stat().st_size
-            except OSError:
-                metrics["scan_error"] = 1
-                continue
-            kind = self.audit_artifact_kind(path.name)
-            bucket = metrics[kind]
-            assert isinstance(bucket, dict)
-            bucket["files"] += 1
-            bucket["bytes"] += size
-        return metrics
+        return self._ensure_audit_artifact_store().metrics_snapshot()
 
     @staticmethod
     def audit_artifact_kind(name: str) -> str:
-        if name.startswith("prism-audit-bundle-body-") and name.endswith(".json"):
-            return "body"
-        if name.startswith("prism-audit-share-segment-") and name.endswith(".json"):
-            return "share_segment"
-        if name.startswith("prism-live-audit-bundle-candidate-") or name.startswith(
-            ".prism-live-audit-bundle-candidate-"
-        ):
-            return "candidate"
-        if name.startswith("prism-live-audit-bundle-") and name.endswith(".json"):
-            return "live_bundle"
-        return "other"
+        return AuditArtifactStore.artifact_kind(name)
 
     def ctv_fanout_broadcaster_metrics_lines(self) -> list[str]:
         return self._ensure_ctv_runtime().metrics_lines()
