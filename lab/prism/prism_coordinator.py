@@ -63,6 +63,13 @@ from lab.prism.share_ledger import (
     SingleWriterShareLedger,
     sha256_json_hex,
 )
+from lab.prism.share_submission import (
+    PRISM_CREDIT_POLICY_FANOUT_TRANSITION,
+    PRISM_CREDIT_POLICY_STALE_GRACE,
+    SubmitContextInput,
+    classify_submit_context,
+    classify_submit_work,
+)
 
 DEFAULT_P2MR_SPEND_INPUT_BYTES = 3_680
 DEFAULT_MIN_OUTPUT_FEERATE_SATS_PER_BYTE = 1
@@ -110,6 +117,8 @@ DEFAULT_PRISM_STRATUM_BIND_RETRY_SECONDS = 10.0
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES = 4_096
 DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS = 3_600.0
 DEFAULT_PRISM_STALE_GRACE_SECONDS = 3.0
+DEFAULT_PRISM_FANOUT_TRANSITION_LEASE_SECONDS = 0.0
+DEFAULT_PRISM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION = 1
 # How old the refresh-published tip may be before mining.submit stops trusting
 # it and falls back to a live getbestblockhash per share. Healthy coordinators
 # republish/reconfirm it every blockpoll interval; a bounded divergence lease
@@ -266,6 +275,8 @@ PRISM_REJECTION_INTERNAL_ERROR = "internal-error"
 PRISM_REJECTION_POOL_CLOSED = "pool-closed"
 PRISM_REJECTION_BLOCK_STALE = "block-stale"
 PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED = "ledger-confirmation-failed"
+PRISM_REJECTION_TRANSITION_LEASE_EXPIRED = "transition-lease-expired"
+PRISM_REJECTION_TRANSITION_LEASE_REVOKED = "transition-lease-revoked"
 PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
     {
         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
@@ -283,10 +294,6 @@ BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS = 0.25
 # publishing different lock objects for the same state.
 _HOT_PATH_LOCK_INITIALIZATION_LOCK = threading.Lock()
 DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS = 5.0
-# Credit policies recorded on accepted ledger rows. Normal shares carry no
-# policy; a policy marks a share that was credited by an explicit pool rule
-# (documented in docs/prism-rejections.md) so audits can distinguish them.
-PRISM_CREDIT_POLICY_STALE_GRACE = "stale-grace"
 # Aggregation bucket for per-worker share metrics once the distinct-worker
 # label budget is exhausted.
 PRISM_WORKER_METRICS_OVERFLOW_LABEL = "_other"
@@ -306,6 +313,8 @@ PRISM_REJECTION_REASON_IDS = (
     PRISM_REJECTION_POOL_CLOSED,
     PRISM_REJECTION_BLOCK_STALE,
     PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+    PRISM_REJECTION_TRANSITION_LEASE_EXPIRED,
+    PRISM_REJECTION_TRANSITION_LEASE_REVOKED,
 )
 PRISM_TEMPLATE_FINGERPRINT_VOLATILE_KEYS = frozenset(
     {
@@ -512,6 +521,27 @@ def validate_same_tip_job_retention_limits(
         )
 
 
+def validate_fanout_transition_lease_limits(
+    *,
+    lease_seconds: float,
+    max_jobs_per_connection: int,
+    max_connections: int,
+    production: bool,
+) -> None:
+    if lease_seconds <= 0:
+        return
+    if max_jobs_per_connection <= 0:
+        raise SystemExit(
+            "PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION must be "
+            "positive when fanout transition leasing is enabled"
+        )
+    if production and max_connections <= 0:
+        raise SystemExit(
+            "production mode requires a positive PRISM_STRATUM_MAX_CONNECTIONS "
+            "when fanout transition leasing is enabled"
+        )
+
+
 def require_production_env(name: str) -> str:
     value = env_optional(name)
     if value is None:
@@ -628,6 +658,21 @@ def validate_prism_production_gate() -> None:
         per_connection=env_nonnegative_int(
             "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION",
             DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION,
+        ),
+        max_connections=env_nonnegative_int(
+            "PRISM_STRATUM_MAX_CONNECTIONS",
+            DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS,
+        ),
+        production=True,
+    )
+    validate_fanout_transition_lease_limits(
+        lease_seconds=env_nonnegative_float(
+            "PRISM_STRATUM_FANOUT_TRANSITION_LEASE_SECONDS",
+            DEFAULT_PRISM_FANOUT_TRANSITION_LEASE_SECONDS,
+        ),
+        max_jobs_per_connection=env_nonnegative_int(
+            "PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION",
+            DEFAULT_PRISM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION,
         ),
         max_connections=env_nonnegative_int(
             "PRISM_STRATUM_MAX_CONNECTIONS",
@@ -1016,6 +1061,7 @@ class PrismJobContext:
     connection_id: int = 0
     authorization_generation: int = 0
     difficulty_generation: int = 0
+    tip_generation: int = 0
 
 
 @dataclass
@@ -1220,6 +1266,52 @@ class EvictedJobEntry:
     evicted_monotonic: float
     previousblockhash: str
     client: ClientState | None = None
+
+
+@dataclass(frozen=True)
+class DeliveredJobAuthority:
+    """Proof that an exact job completed its connection-local socket write."""
+
+    context: PrismJobContext
+    connection_id: int
+    authorization_generation: int
+    job_id: str
+    tip_hash: str
+    tip_generation: int
+    template_generation: int
+    payout_state_generation: int
+    difficulty_generation: int
+    delivered_monotonic: float
+
+    def identity(self) -> tuple[object, ...]:
+        return (
+            self.connection_id,
+            self.authorization_generation,
+            self.job_id,
+            self.tip_hash,
+            self.tip_generation,
+            self.template_generation,
+            self.payout_state_generation,
+            self.difficulty_generation,
+        )
+
+
+@dataclass
+class TransitionSubmitLease:
+    """Bounded submit authority retained while replacement delivery is pending."""
+
+    authority: DeliveredJobAuthority
+    target_tip_hash: str
+    target_tip_generation: int
+    armed_monotonic: float
+    armed_at_ms: int
+    duration_seconds: float
+    revoked_reason: str | None = None
+    revoked_monotonic: float | None = None
+
+    @property
+    def expires_monotonic(self) -> float:
+        return self.armed_monotonic + self.duration_seconds
 
 
 @dataclass(frozen=True)
@@ -1762,6 +1854,16 @@ class ClientState:
     # or slow socket from convoying tip publication for the whole coordinator.
     vardiff_lock: threading.RLock = field(default_factory=threading.RLock)
     active_job_ids: set[str] = field(default_factory=set)
+    # Only contexts whose socket writes completed are eligible to seed a
+    # fanout-transition lease. Both maps are capped by the configured
+    # per-connection limit; revoked entries are bounded tombstones used for
+    # precise rejection classification, not submit authority.
+    delivered_job_authorities: OrderedDict[str, DeliveredJobAuthority] = field(
+        default_factory=OrderedDict
+    )
+    transition_submit_leases: OrderedDict[str, TransitionSubmitLease] = field(
+        default_factory=OrderedDict
+    )
     post_accept_refresh_block: tuple[int, str] | None = None
     # (job previousblockhash, monotonic) of the FIRST job this connection was
     # sent for that tip. Anchors the per-connection stale-grace window: a
@@ -2246,6 +2348,17 @@ class PrismCoordinator:
             "PRISM_STRATUM_STALE_GRACE_SECONDS",
             DEFAULT_PRISM_STALE_GRACE_SECONDS,
         )
+        # Independent, receipt-bearing protection for a connection that has
+        # not completed its replacement socket write. Zero preserves the
+        # existing accounting behavior on every deployment.
+        self.fanout_transition_lease_seconds = env_nonnegative_float(
+            "PRISM_STRATUM_FANOUT_TRANSITION_LEASE_SECONDS",
+            DEFAULT_PRISM_FANOUT_TRANSITION_LEASE_SECONDS,
+        )
+        self.fanout_transition_max_jobs_per_connection = env_nonnegative_int(
+            "PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION",
+            DEFAULT_PRISM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION,
+        )
         # Per-share/per-job stdout logging is debug-only: at production share
         # rates each print is a journald flush on the Stratum hot path.
         self.hot_path_log_enabled = env_bool("PRISM_HOT_PATH_LOG", "0")
@@ -2371,6 +2484,14 @@ class PrismCoordinator:
         validate_same_tip_job_retention_limits(
             retention_seconds=self.same_tip_job_retention_seconds,
             per_connection=self.same_tip_job_retention_per_connection,
+            max_connections=self.stratum_max_connections,
+            production=production_mode(),
+        )
+        validate_fanout_transition_lease_limits(
+            lease_seconds=self.fanout_transition_lease_seconds,
+            max_jobs_per_connection=(
+                self.fanout_transition_max_jobs_per_connection
+            ),
             max_connections=self.stratum_max_connections,
             production=production_mode(),
         )
@@ -2557,6 +2678,15 @@ class PrismCoordinator:
         self.collection_block_submission_count = 0
         self._pool_ready_latched = False
         self.grace_credited_share_count = 0
+        self.fanout_transition_credited_share_count = 0
+        self.fanout_transition_lease_counts = {
+            "armed": 0,
+            "accepted": 0,
+            "expired": 0,
+            "revoked_delivery": 0,
+            "revoked_authorization": 0,
+            "capacity_evicted": 0,
+        }
         self.idle_retarget_count = 0
         self._ensure_vardiff_idle_state()
         self.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
@@ -2589,6 +2719,8 @@ class PrismCoordinator:
         # The flip stamp is None for the startup baseline, which never opens
         # the stale-grace window.
         self.current_tip_first_seen: tuple[str, float | None] | None = None
+        self.current_tip_generation = 0
+        self.current_tip_published_at_ms = 0
         self.current_tip_parent: tuple[str, str] | None = None
         self.latest_detected_tip: tuple[str, int] | None = None
         # Start of the current detected-vs-published divergence epoch. Unlike
@@ -2771,7 +2903,13 @@ class PrismCoordinator:
                 counts = {reason_id: 0 for reason_id in PRISM_REJECTION_REASON_IDS}
                 self.rejection_counts_by_reason = counts
             counts[reason] = int(counts.get(reason, 0)) + 1
-            if reason in {PRISM_REJECTION_STALE_JOB, PRISM_REJECTION_UNKNOWN_JOB, PRISM_REJECTION_BLOCK_STALE}:
+            if reason in {
+                PRISM_REJECTION_STALE_JOB,
+                PRISM_REJECTION_UNKNOWN_JOB,
+                PRISM_REJECTION_BLOCK_STALE,
+                PRISM_REJECTION_TRANSITION_LEASE_EXPIRED,
+                PRISM_REJECTION_TRANSITION_LEASE_REVOKED,
+            }:
                 self.stale_share_count += 1
             elif reason == PRISM_REJECTION_DUPLICATE_SHARE:
                 self.duplicate_share_count += 1
@@ -2812,7 +2950,10 @@ class PrismCoordinator:
         limit = getattr(self, "worker_metrics_limit", DEFAULT_PRISM_WORKER_METRICS_LIMIT)
         if len(share_counts) >= max(0, int(limit)):
             label = PRISM_WORKER_METRICS_OVERFLOW_LABEL
-        share_counts.setdefault(label, {"submitted": 0, "accepted": 0, "grace": 0})
+        share_counts.setdefault(
+            label,
+            {"submitted": 0, "accepted": 0, "grace": 0, "transition": 0},
+        )
         return label
 
     def note_worker_submitted_share(self, worker: str) -> None:
@@ -2828,12 +2969,27 @@ class PrismCoordinator:
             counts = self.worker_share_counts[label]
             counts["accepted"] += 1
             if credit_policy == PRISM_CREDIT_POLICY_STALE_GRACE:
-                counts["grace"] += 1
+                counts["grace"] = int(counts.get("grace", 0)) + 1
+            elif credit_policy == PRISM_CREDIT_POLICY_FANOUT_TRANSITION:
+                counts["transition"] = int(counts.get("transition", 0)) + 1
         if credit_policy == PRISM_CREDIT_POLICY_STALE_GRACE:
             self._ensure_share_hot_path_state()
             with self._share_accounting_lock:
                 self.grace_credited_share_count = (
                     int(getattr(self, "grace_credited_share_count", 0)) + 1
+                )
+        elif credit_policy == PRISM_CREDIT_POLICY_FANOUT_TRANSITION:
+            self._ensure_share_hot_path_state()
+            with self._share_accounting_lock:
+                self.fanout_transition_credited_share_count = (
+                    int(
+                        getattr(
+                            self,
+                            "fanout_transition_credited_share_count",
+                            0,
+                        )
+                    )
+                    + 1
                 )
 
     @staticmethod
@@ -6986,6 +7142,7 @@ class PrismCoordinator:
             difficulty_generation=int(
                 getattr(client, "difficulty_generation", 0)
             ),
+            tip_generation=int(getattr(self, "current_tip_generation", 0)),
         )
 
     def accepted_share_stats(self) -> tuple[int, int]:
@@ -9829,6 +9986,7 @@ class PrismCoordinator:
     ) -> _FanoutCancellation:
         """Atomically publish prepared work and register its cancellation token."""
         now = time.monotonic()
+        published_at_ms = now_ms()
         cancel_event = _FanoutCancellation()
         # Admit a synchronization-only reader of this payout generation. Do
         # not mark it delivered: the gate's priority reservation belongs to
@@ -9869,6 +10027,14 @@ class PrismCoordinator:
                     tip_changed = (
                         first_seen is not None and first_seen[0] != token.tip_hash
                     )
+                    prior_tip_generation = int(
+                        getattr(self, "current_tip_generation", 0)
+                    )
+                    target_tip_generation = (
+                        max(1, prior_tip_generation + 1)
+                        if first_seen is None or tip_changed
+                        else max(1, prior_tip_generation)
+                    )
                     flip_stamp = (
                         now
                         if tip_changed
@@ -9876,6 +10042,17 @@ class PrismCoordinator:
                         if first_seen is not None
                         else None
                     )
+                    if tip_changed:
+                        self._arm_fanout_transition_leases_locked(
+                            source_tip_hash=str(first_seen[0]),
+                            target_tip_hash=token.tip_hash,
+                            target_tip_generation=target_tip_generation,
+                            now=now,
+                            armed_at_ms=published_at_ms,
+                        )
+                    self.current_tip_generation = target_tip_generation
+                    if first_seen is None or tip_changed:
+                        self.current_tip_published_at_ms = published_at_ms
                     self.current_tip_first_seen = (
                         token.tip_hash,
                         flip_stamp,
@@ -11268,6 +11445,7 @@ class PrismCoordinator:
         ):
             return False
         now = time.monotonic()
+        published_at_ms = now_ms()
         with self.lock:
             current_sequence = int(
                 getattr(self, "current_tip_observation_sequence", 0)
@@ -11282,6 +11460,10 @@ class PrismCoordinator:
                 return False
             first_seen = getattr(self, "current_tip_first_seen", None)
             if first_seen is not None and first_seen[0] == tip_hash:
+                self.current_tip_generation = max(
+                    1,
+                    int(getattr(self, "current_tip_generation", 0)),
+                )
                 # A same-tip re-observation proves the tip view is live; the
                 # freshness stamp bounds submit_stale_check_tip reuse.
                 self.current_tip_observed_monotonic = now
@@ -11322,6 +11504,10 @@ class PrismCoordinator:
                 return False
             first_seen = getattr(self, "current_tip_first_seen", None)
             if first_seen is not None and first_seen[0] == tip_hash:
+                self.current_tip_generation = max(
+                    1,
+                    int(getattr(self, "current_tip_generation", 0)),
+                )
                 self.current_tip_observed_monotonic = now
                 active = getattr(self, "_active_tip_refresh", None)
                 if publish_refresh_observation and (
@@ -11334,6 +11520,20 @@ class PrismCoordinator:
                 return True
 
             tip_changed = first_seen is not None
+            prior_tip_generation = int(
+                getattr(self, "current_tip_generation", 0)
+            )
+            target_tip_generation = max(1, prior_tip_generation + 1)
+            if tip_changed:
+                self._arm_fanout_transition_leases_locked(
+                    source_tip_hash=str(first_seen[0]),
+                    target_tip_hash=tip_hash,
+                    target_tip_generation=target_tip_generation,
+                    now=now,
+                    armed_at_ms=published_at_ms,
+                )
+            self.current_tip_generation = target_tip_generation
+            self.current_tip_published_at_ms = published_at_ms
             # The first tip this process publishes is a startup baseline, not
             # a tip flip: a None stamp keeps stale grace closed.
             self.current_tip_first_seen = (
@@ -11440,7 +11640,15 @@ class PrismCoordinator:
         self,
         client: ClientState,
         job_id: str,
-    ) -> tuple[bool, PrismJobContext | None, str | None]:
+    ) -> tuple[
+        bool,
+        PrismJobContext | None,
+        str | None,
+        str,
+        TransitionSubmitLease | None,
+        float,
+        int,
+    ]:
         """Snapshot normal-submit control state in one bounded lock hold.
 
         Pool closure, active-job membership, and published-tip authority must
@@ -11450,12 +11658,35 @@ class PrismCoordinator:
         hashing, persistence, and accounting only after this lock is released.
         """
         with self.lock:
+            snapshot_monotonic = time.monotonic()
             pool_closed = self.accepted_block_count >= self.max_blocks
             context = self.jobs.get(job_id)
             if context is not None and job_id not in client.active_job_ids:
                 context = None
-            published_tip = self._submit_stale_check_tip_locked(time.monotonic())
-        return pool_closed, context, published_tip
+            published_tip = self._submit_stale_check_tip_locked(
+                snapshot_monotonic
+            )
+            published_tip_generation = (
+                int(getattr(self, "current_tip_generation", 0))
+                if published_tip is not None
+                else 0
+            )
+            transition_status, transition_lease = (
+                self._transition_submit_lease_locked(
+                    client,
+                    job_id,
+                    now=snapshot_monotonic,
+                )
+            )
+        return (
+            pool_closed,
+            context,
+            published_tip,
+            transition_status,
+            transition_lease,
+            snapshot_monotonic,
+            published_tip_generation,
+        )
 
     def _published_tip_authoritative_locked(self, now: float) -> bool:
         """True while the published tip still owns share classification.
@@ -11564,6 +11795,336 @@ class PrismCoordinator:
             self._ensure_initial_job_state()
             if job_parent_hash == self._current_published_tip_hash_locked():
                 self._reset_delivery_failure_if_coverage_restored_locked()
+
+    def _ensure_fanout_transition_state(self) -> None:
+        if not hasattr(self, "fanout_transition_lease_seconds"):
+            self.fanout_transition_lease_seconds = (
+                DEFAULT_PRISM_FANOUT_TRANSITION_LEASE_SECONDS
+            )
+        if not hasattr(self, "fanout_transition_max_jobs_per_connection"):
+            self.fanout_transition_max_jobs_per_connection = (
+                DEFAULT_PRISM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION
+            )
+        if not hasattr(self, "current_tip_generation"):
+            self.current_tip_generation = 0
+        if not hasattr(self, "current_tip_published_at_ms"):
+            self.current_tip_published_at_ms = 0
+        if not hasattr(self, "fanout_transition_lease_counts"):
+            self.fanout_transition_lease_counts = {
+                "armed": 0,
+                "accepted": 0,
+                "expired": 0,
+                "revoked_delivery": 0,
+                "revoked_authorization": 0,
+                "capacity_evicted": 0,
+            }
+
+    @staticmethod
+    def _ensure_client_fanout_transition_state(client: ClientState) -> None:
+        if not hasattr(client, "delivered_job_authorities"):
+            client.delivered_job_authorities = OrderedDict()
+        if not hasattr(client, "transition_submit_leases"):
+            client.transition_submit_leases = OrderedDict()
+
+    def _enforce_client_fanout_transition_capacity_locked(
+        self,
+        client: ClientState,
+    ) -> None:
+        self._ensure_fanout_transition_state()
+        self._ensure_client_fanout_transition_state(client)
+        cap = int(self.fanout_transition_max_jobs_per_connection)
+        while len(client.delivered_job_authorities) > max(0, cap):
+            client.delivered_job_authorities.popitem(last=False)
+        while len(client.transition_submit_leases) > max(0, cap):
+            client.transition_submit_leases.popitem(last=False)
+            self.fanout_transition_lease_counts["capacity_evicted"] += 1
+
+    def _record_delivered_job_authority_locked(
+        self,
+        client: ClientState,
+        context: PrismJobContext,
+        delivered_monotonic: float,
+    ) -> None:
+        """Commit delivery proof and revoke prior authority under self.lock."""
+
+        self._ensure_fanout_transition_state()
+        self._ensure_client_fanout_transition_state(client)
+        if (
+            float(self.fanout_transition_lease_seconds) <= 0
+            or int(self.fanout_transition_max_jobs_per_connection) <= 0
+        ):
+            client.delivered_job_authorities.clear()
+            client.transition_submit_leases.clear()
+            return
+        delivered_tip = str(context.template.get("previousblockhash", ""))
+        if (
+            client.connection_id != int(getattr(context, "connection_id", -1))
+            or int(getattr(client, "authorization_generation", 0))
+            != int(getattr(context, "authorization_generation", -1))
+        ):
+            return
+        authority = DeliveredJobAuthority(
+            context=context,
+            connection_id=client.connection_id,
+            authorization_generation=int(
+                getattr(context, "authorization_generation", 0)
+            ),
+            job_id=str(context.job.job_id),
+            tip_hash=delivered_tip,
+            tip_generation=int(getattr(context, "tip_generation", 0)),
+            template_generation=int(getattr(context, "template_generation", 0)),
+            payout_state_generation=int(
+                getattr(context, "payout_state_generation", 0)
+            ),
+            difficulty_generation=int(
+                getattr(context, "difficulty_generation", 0)
+            ),
+            delivered_monotonic=delivered_monotonic,
+        )
+        for lease in client.transition_submit_leases.values():
+            if (
+                lease.revoked_reason is None
+                and lease.authority.identity() != authority.identity()
+            ):
+                lease.revoked_reason = "replacement-delivered"
+                lease.revoked_monotonic = delivered_monotonic
+                self.fanout_transition_lease_counts["revoked_delivery"] += 1
+
+        current_tip = self._current_published_tip_hash_locked()
+        current_tip_generation = int(
+            getattr(self, "current_tip_generation", 0)
+        )
+        if current_tip is None:
+            return
+        current_delivery = delivered_tip == current_tip
+        late_prior_delivery = bool(
+            not current_delivery
+            and authority.tip_generation > 0
+            and authority.tip_generation + 1 == current_tip_generation
+        )
+        if not current_delivery and not late_prior_delivery:
+            # A job older than the immediately prior generation can finish a
+            # blocked write, but it cannot gain new authority or renew an
+            # older lease.
+            return
+        if bool(getattr(context.job, "clean_jobs", False)):
+            client.delivered_job_authorities.clear()
+        client.delivered_job_authorities.pop(authority.job_id, None)
+        client.delivered_job_authorities[authority.job_id] = authority
+        if late_prior_delivery:
+            first_seen = getattr(self, "current_tip_first_seen", None)
+            transition_started = (
+                first_seen[1]
+                if first_seen is not None and first_seen[0] == current_tip
+                else None
+            )
+            transition_started_at_ms = int(
+                getattr(self, "current_tip_published_at_ms", 0)
+            )
+            if transition_started is not None and transition_started_at_ms > 0:
+                self._install_fanout_transition_lease_locked(
+                    client,
+                    authority=authority,
+                    target_tip_hash=current_tip,
+                    target_tip_generation=current_tip_generation,
+                    armed_monotonic=transition_started,
+                    armed_at_ms=transition_started_at_ms,
+                )
+        self._enforce_client_fanout_transition_capacity_locked(client)
+
+    def _install_fanout_transition_lease_locked(
+        self,
+        client: ClientState,
+        *,
+        authority: DeliveredJobAuthority,
+        target_tip_hash: str,
+        target_tip_generation: int,
+        armed_monotonic: float,
+        armed_at_ms: int,
+    ) -> None:
+        if (
+            float(self.fanout_transition_lease_seconds) <= 0
+            or int(self.fanout_transition_max_jobs_per_connection) <= 0
+        ):
+            return
+        if (
+            authority.tip_hash == target_tip_hash
+            or authority.tip_generation <= 0
+            or target_tip_generation <= authority.tip_generation
+        ):
+            return
+        existing = client.transition_submit_leases.get(authority.job_id)
+        if existing is not None and (
+            existing.authority.identity() == authority.identity()
+        ):
+            return
+        client.transition_submit_leases.pop(authority.job_id, None)
+        client.transition_submit_leases[authority.job_id] = (
+            TransitionSubmitLease(
+                authority=authority,
+                target_tip_hash=target_tip_hash,
+                target_tip_generation=target_tip_generation,
+                armed_monotonic=armed_monotonic,
+                armed_at_ms=armed_at_ms,
+                duration_seconds=float(self.fanout_transition_lease_seconds),
+            )
+        )
+        self.fanout_transition_lease_counts["armed"] += 1
+
+    def _arm_fanout_transition_leases_locked(
+        self,
+        *,
+        source_tip_hash: str,
+        target_tip_hash: str,
+        target_tip_generation: int,
+        now: float,
+        armed_at_ms: int | None = None,
+    ) -> None:
+        """Arm exact delivered contexts without renewing an existing source."""
+
+        self._ensure_fanout_transition_state()
+        duration = float(self.fanout_transition_lease_seconds)
+        cap = int(self.fanout_transition_max_jobs_per_connection)
+        if duration <= 0 or cap <= 0:
+            return
+        armed_at_ms = now_ms() if armed_at_ms is None else armed_at_ms
+        for client in tuple(self.clients):
+            self._ensure_client_fanout_transition_state(client)
+            if getattr(client, "closing", False):
+                continue
+            for authority in tuple(client.delivered_job_authorities.values()):
+                if (
+                    authority.tip_hash != source_tip_hash
+                    or authority.connection_id != client.connection_id
+                    or authority.authorization_generation
+                    != int(getattr(client, "authorization_generation", 0))
+                ):
+                    continue
+                self._install_fanout_transition_lease_locked(
+                    client,
+                    authority=authority,
+                    target_tip_hash=target_tip_hash,
+                    target_tip_generation=target_tip_generation,
+                    armed_monotonic=now,
+                    armed_at_ms=armed_at_ms,
+                )
+            self._enforce_client_fanout_transition_capacity_locked(client)
+
+    def _revoke_client_fanout_transition_authority_locked(
+        self,
+        client: ClientState,
+        *,
+        reason: str,
+        now: float | None = None,
+    ) -> None:
+        self._ensure_fanout_transition_state()
+        self._ensure_client_fanout_transition_state(client)
+        now = time.monotonic() if now is None else now
+        for lease in client.transition_submit_leases.values():
+            if lease.revoked_reason is None:
+                lease.revoked_reason = reason
+                lease.revoked_monotonic = now
+                if reason == "authorization-changed":
+                    self.fanout_transition_lease_counts[
+                        "revoked_authorization"
+                    ] += 1
+        client.delivered_job_authorities.clear()
+
+    def _transition_submit_lease_locked(
+        self,
+        client: ClientState,
+        job_id: str,
+        *,
+        now: float,
+    ) -> tuple[str, TransitionSubmitLease | None]:
+        self._ensure_fanout_transition_state()
+        self._ensure_client_fanout_transition_state(client)
+        lease = client.transition_submit_leases.get(job_id)
+        if lease is None:
+            return "missing", None
+        authority = lease.authority
+        context = authority.context
+        identity_matches = bool(
+            authority.connection_id == client.connection_id
+            and authority.authorization_generation
+            == int(getattr(client, "authorization_generation", 0))
+            and authority.job_id == job_id
+            and str(context.job.job_id) == job_id
+            and int(getattr(context, "connection_id", -1))
+            == authority.connection_id
+            and int(getattr(context, "authorization_generation", -1))
+            == authority.authorization_generation
+            and str(context.template.get("previousblockhash", ""))
+            == authority.tip_hash
+            and int(getattr(context, "template_generation", 0))
+            == authority.template_generation
+            and int(getattr(context, "payout_state_generation", 0))
+            == authority.payout_state_generation
+            and int(getattr(context, "difficulty_generation", 0))
+            == authority.difficulty_generation
+            and int(getattr(context, "tip_generation", 0))
+            == authority.tip_generation
+            and lease.target_tip_hash != authority.tip_hash
+            and lease.target_tip_generation > authority.tip_generation
+        )
+        if not identity_matches:
+            # Treat corruption or job-ID reuse as no authority and do not
+            # disclose the presence of a connection-local tombstone.
+            return "missing", None
+        if lease.revoked_reason == "absolute-expiry":
+            return "expired", dataclass_replace(lease)
+        if lease.revoked_reason is not None:
+            return "revoked", dataclass_replace(lease)
+        if now > lease.expires_monotonic:
+            lease.revoked_reason = "absolute-expiry"
+            lease.revoked_monotonic = now
+            self.fanout_transition_lease_counts["expired"] += 1
+            return "expired", dataclass_replace(lease)
+        return "eligible", dataclass_replace(lease)
+
+    def fanout_transition_receipt(
+        self,
+        lease: TransitionSubmitLease,
+        *,
+        classified_tip_hash: str,
+        classified_monotonic: float,
+        classified_tip_generation: int,
+    ) -> dict[str, object]:
+        """Return the immutable audit explanation for one lease decision."""
+
+        authority = lease.authority
+        classified_from_published = classified_tip_generation > 0
+        duration_ms = max(1, int(round(lease.duration_seconds * 1000)))
+        age_ms = max(
+            0,
+            int(round((classified_monotonic - lease.armed_monotonic) * 1000)),
+        )
+        classified_at_ms = lease.armed_at_ms + age_ms
+        return {
+            "schema": "qbit.prism.fanout-transition-receipt.v1",
+            "connection_id": authority.connection_id,
+            "authorization_generation": authority.authorization_generation,
+            "job_id": authority.job_id,
+            "source_tip_hash": authority.tip_hash,
+            "source_tip_generation": authority.tip_generation,
+            "target_tip_hash": lease.target_tip_hash,
+            "target_tip_generation": lease.target_tip_generation,
+            "classified_tip_hash": classified_tip_hash,
+            "classified_tip_generation": (
+                classified_tip_generation if classified_from_published else 0
+            ),
+            "classified_tip_source": (
+                "published" if classified_from_published else "live-rpc"
+            ),
+            "template_generation": authority.template_generation,
+            "payout_state_generation": authority.payout_state_generation,
+            "difficulty_generation": authority.difficulty_generation,
+            "lease_armed_at_ms": lease.armed_at_ms,
+            "lease_duration_ms": duration_ms,
+            "lease_age_ms": age_ms,
+            "lease_expires_at_ms": lease.armed_at_ms + duration_ms,
+            "classified_at_ms": classified_at_ms,
+        }
 
     def _ensure_evicted_job_state(self) -> None:
         graveyard = getattr(self, "evicted_job_graveyard", None)
@@ -11860,6 +12421,11 @@ class PrismCoordinator:
         with self.lock:
             self._ensure_evicted_job_state()
             self.evicted_job_submit_counts[outcome] += 1
+
+    def note_fanout_transition_submit(self) -> None:
+        with self.lock:
+            self._ensure_fanout_transition_state()
+            self.fanout_transition_lease_counts["accepted"] += 1
 
     def refresh_jobs_after_pending_accepted_block(
         self,
@@ -12728,6 +13294,9 @@ class PrismCoordinator:
                         self.evicted_jobs_by_connection.get(client.connection_id, ())
                     ):
                         self._remove_evicted_job_locked(job_id)
+                    self._ensure_client_fanout_transition_state(client)
+                    client.delivered_job_authorities.clear()
+                    client.transition_submit_leases.clear()
                     client.authorized = False
                     client.worker = None
                     client.username = ""
@@ -12835,6 +13404,12 @@ class PrismCoordinator:
                             client.difficulty_generation = int(
                                 getattr(client, "difficulty_generation", 0)
                             ) + 1
+                if was_authorized:
+                    with self.lock:
+                        self._revoke_client_fanout_transition_authority_locked(
+                            client,
+                            reason="authorization-changed",
+                        )
                 client.authorization_generation = int(
                     getattr(client, "authorization_generation", 0)
                 ) + 1
@@ -13810,6 +14385,8 @@ class PrismCoordinator:
                         share["job_issued_at_ms"],
                         share["accepted_at_ms"],
                         share.get("credit_policy"),
+                        share["job_id"],
+                        share.get("transition_receipt"),
                     )
                 )
             payload["compact_share_identities"] = identities
@@ -14170,10 +14747,15 @@ class PrismCoordinator:
         # Normal submits cross the coordinator lock once: pool admission, job
         # membership, and published-tip authority are copied atomically. All
         # miner bookkeeping and any live-tip RPC fallback stay outside it.
-        pool_closed, context, published_tip = self._submit_control_snapshot(
-            client,
-            job_id,
-        )
+        (
+            pool_closed,
+            context,
+            published_tip,
+            transition_status,
+            transition_lease,
+            classified_monotonic,
+            classified_tip_generation,
+        ) = self._submit_control_snapshot(client, job_id)
         # A closed pool rejects before any share accounting: post-close submits
         # must not inflate global/per-worker submitted totals (the stale-percent
         # denominator) or vardiff windows they can never contribute to.
@@ -14205,10 +14787,11 @@ class PrismCoordinator:
         self.note_worker_submitted_share(worker_name)
         self.note_vardiff_submitted_share(client)
         credit_policy: str | None = None
+        transition_receipt: dict[str, object] | None = None
         evicted_entry: EvictedJobEntry | None = None
         if context is None:
             evicted_entry = self.evicted_job_entry(client, job_id)
-            if evicted_entry is None:
+            if evicted_entry is None and transition_status == "missing":
                 self.reject_stratum(
                     21,
                     PRISM_REJECTION_UNKNOWN_JOB,
@@ -14229,29 +14812,30 @@ class PrismCoordinator:
         # processing latency. Block submission is different (chain state):
         # submit_block_candidate re-checks the tip under lock before
         # submitblock, and stale-grace shares never reach it.
-        if context is None:
+        retained_context = (
+            evicted_entry.context if evicted_entry is not None else None
+        )
+        ordinary_context = context or retained_context
+        transition_context = None
+        if (
+            transition_status == "eligible"
+            and transition_lease is not None
+            and transition_lease.authority.tip_hash != current_tip
+        ):
+            transition_context = transition_lease.authority.context
+        eligible_for_grace = False
+        if (
+            ordinary_context is not None
+            and str(ordinary_context.template["previousblockhash"])
+            != current_tip
+            and transition_context is None
+        ):
             try:
-                evicted_context = self.evicted_submit_context(client, evicted_entry, current_tip)
-            except Exception:
-                print("prism coordinator: failed to classify evicted submit context", flush=True)
-                traceback.print_exc()
-                self.reject_stratum(
-                    20,
-                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                    "failed to classify stale-grace parent tip",
-                    worker=worker_name,
+                eligible_for_grace = self.context_eligible_for_stale_grace(
+                    client,
+                    ordinary_context,
+                    current_tip,
                 )
-            if evicted_context is None:
-                self.reject_stratum(
-                    21,
-                    PRISM_REJECTION_STALE_JOB,
-                    "stale job",
-                    worker=worker_name,
-                )
-            context, credit_policy = evicted_context
-        elif str(context.template["previousblockhash"]) != current_tip:
-            try:
-                eligible_for_grace = self.context_eligible_for_stale_grace(client, context, current_tip)
             except Exception:
                 print("prism coordinator: failed to classify stale-grace parent tip", flush=True)
                 traceback.print_exc()
@@ -14261,15 +14845,53 @@ class PrismCoordinator:
                     "failed to classify stale-grace parent tip",
                     worker=worker_name,
                 )
-            if eligible_for_grace:
-                credit_policy = PRISM_CREDIT_POLICY_STALE_GRACE
-            else:
+        decision = classify_submit_context(
+            SubmitContextInput(
+                active_context=context,
+                retained_context=retained_context,
+                transition_context=transition_context,
+                current_tip=current_tip,
+                stale_grace_eligible=eligible_for_grace,
+            )
+        )
+        if decision is None:
+            if transition_status == "expired":
                 self.reject_stratum(
                     21,
-                    PRISM_REJECTION_STALE_JOB,
+                    PRISM_REJECTION_TRANSITION_LEASE_EXPIRED,
+                    "fanout transition submit lease expired",
+                    worker=worker_name,
+                )
+            if transition_status == "revoked":
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_TRANSITION_LEASE_REVOKED,
+                    "fanout transition submit lease was revoked",
+                    worker=worker_name,
+                )
+            if ordinary_context is None:
+                self.reject_stratum(
+                    21,
+                    PRISM_REJECTION_UNKNOWN_JOB,
                     "stale job",
                     worker=worker_name,
                 )
+            self.reject_stratum(
+                21,
+                PRISM_REJECTION_STALE_JOB,
+                "stale job",
+                worker=worker_name,
+            )
+        context = decision.context
+        credit_policy = decision.credit_policy
+        if credit_policy == PRISM_CREDIT_POLICY_FANOUT_TRANSITION:
+            assert transition_lease is not None
+            transition_receipt = self.fanout_transition_receipt(
+                transition_lease,
+                classified_tip_hash=current_tip,
+                classified_monotonic=classified_monotonic,
+                classified_tip_generation=classified_tip_generation,
+            )
 
         try:
             submission = direct_stratum.assemble_submission(
@@ -14308,10 +14930,11 @@ class PrismCoordinator:
         # solver-pays-all instead of being silently ledgered as a share -- a
         # fresh ledger would otherwise withhold every solved block until some
         # later job delivery, stalling a bootstrapping chain.
-        block_worthy = (
-            submission.block_pass
-            and credit_policy != PRISM_CREDIT_POLICY_STALE_GRACE
+        work_decision = classify_submit_work(
+            submission,
+            credit_policy=credit_policy,
         )
+        block_worthy = work_decision.block_worthy
         if block_worthy and context.collection_only:
             self._ensure_share_hot_path_state()
             with self._share_accounting_lock:
@@ -14337,6 +14960,7 @@ class PrismCoordinator:
             submission=submission,
             ntime_hex=ntime_hex,
             credit_policy=credit_policy,
+            transition_receipt=transition_receipt,
         )
         if not block_worthy:
             try:
@@ -14347,7 +14971,9 @@ class PrismCoordinator:
                     pending_share,
                     credit_policy=credit_policy,
                 )
-                if evicted_entry is not None:
+                if credit_policy == PRISM_CREDIT_POLICY_FANOUT_TRANSITION:
+                    self.note_fanout_transition_submit()
+                elif evicted_entry is not None:
                     self.note_evicted_job_submit(credit_policy)
             except BaseException:
                 self._forget_recent_share_key(share_key)
@@ -14360,7 +14986,7 @@ class PrismCoordinator:
             extranonce2_hex=extranonce2_hex,
             pending_share=pending_share,
             client=client,
-            credit_share_on_accept=not submission.share_pass,
+            credit_share_on_accept=work_decision.credit_share_on_accept,
         )
         if candidate.credit_share_on_accept:
             # The hash solved a block but missed the assigned share target
@@ -14438,7 +15064,9 @@ class PrismCoordinator:
                 finish = getattr(self.ledger, "mark_block_candidate_submitted", None)
                 if callable(finish):
                     finish(block_hash=submission.block_hash_hex)
-                if evicted_entry is not None:
+                if credit_policy == PRISM_CREDIT_POLICY_FANOUT_TRANSITION:
+                    self.note_fanout_transition_submit()
+                elif evicted_entry is not None:
                     self.note_evicted_job_submit(credit_policy)
             return False
         # A block-worthy submission that met the share target is a valid share
@@ -14456,7 +15084,9 @@ class PrismCoordinator:
                 credit_policy=credit_policy,
                 candidate_intent=candidate_intent,
             )
-            if evicted_entry is not None:
+            if credit_policy == PRISM_CREDIT_POLICY_FANOUT_TRANSITION:
+                self.note_fanout_transition_submit()
+            elif evicted_entry is not None:
                 self.note_evicted_job_submit(credit_policy)
         except BaseException:
             # Idempotent with append_accepted_share's own release; also covers
@@ -14645,6 +15275,7 @@ class PrismCoordinator:
         submission: direct_stratum.DirectQbitSubmission,
         ntime_hex: str,
         credit_policy: str | None = None,
+        transition_receipt: dict[str, object] | None = None,
     ) -> PendingShare:
         share_difficulty = self.accepted_share_difficulty(context)
         self._ensure_pending_share_commit_state()
@@ -14666,6 +15297,7 @@ class PrismCoordinator:
                 accepted_at_ms=now_ms(),
                 ntime=int(ntime_hex, 16),
                 credit_policy=credit_policy,
+                transition_receipt=transition_receipt,
             )
             self._pending_share_commit_floor[id(pending)] = [
                 pending,
@@ -17563,6 +18195,11 @@ class PrismCoordinator:
         delivered_tip = str(context.template.get("previousblockhash", ""))
         recorded = False
         with self.lock, self._progress_health_lock:
+            self._record_delivered_job_authority_locked(
+                client,
+                context,
+                delivered_monotonic,
+            )
             client._progress_delivered_context = context
             client._progress_delivered_template_fingerprint = fingerprint
             client._progress_delivered_template_generation = int(
@@ -18427,6 +19064,9 @@ class PrismCoordinator:
             grace_credited_share_count = int(
                 getattr(self, "grace_credited_share_count", 0)
             )
+            fanout_transition_credited_share_count = int(
+                getattr(self, "fanout_transition_credited_share_count", 0)
+            )
         stale_percent = 0.0
         if submitted_share_count > 0:
             stale_percent = (stale_share_count / submitted_share_count) * 100.0
@@ -18455,6 +19095,27 @@ class PrismCoordinator:
             evicted_job_capacity_eviction_counts = dict(
                 self.evicted_job_capacity_eviction_counts
             )
+            self._ensure_fanout_transition_state()
+            transition_now = time.monotonic()
+            fanout_transition_lease_counts = dict(
+                self.fanout_transition_lease_counts
+            )
+            active_fanout_transition_leases = 0
+            retained_fanout_transition_entries = 0
+            for client in self.clients:
+                self._ensure_client_fanout_transition_state(client)
+                retained_fanout_transition_entries += len(
+                    client.transition_submit_leases
+                )
+                retained_fanout_transition_entries += len(
+                    client.delivered_job_authorities
+                )
+                active_fanout_transition_leases += sum(
+                    1
+                    for lease in client.transition_submit_leases.values()
+                    if lease.revoked_reason is None
+                    and transition_now <= lease.expires_monotonic
+                )
         self._ensure_worker_metrics_state()
         with self.worker_metrics_lock:
             worker_share_counts = {
@@ -18597,6 +19258,28 @@ class PrismCoordinator:
             "# HELP qbit_prism_grace_credited_shares_total Accepted shares credited by the stale-grace policy.",
             "# TYPE qbit_prism_grace_credited_shares_total counter",
             f"qbit_prism_grace_credited_shares_total {grace_credited_share_count}",
+            "# HELP qbit_prism_fanout_transition_credited_shares_total Accepted shares credited by exact per-connection fanout transition authority.",
+            "# TYPE qbit_prism_fanout_transition_credited_shares_total counter",
+            f"qbit_prism_fanout_transition_credited_shares_total {fanout_transition_credited_share_count}",
+            "# HELP qbit_prism_fanout_transition_leases Active unexpired per-connection transition leases.",
+            "# TYPE qbit_prism_fanout_transition_leases gauge",
+            f"qbit_prism_fanout_transition_leases {active_fanout_transition_leases}",
+            "# HELP qbit_prism_fanout_transition_retained_entries Retained transition authorities and bounded rejection tombstones.",
+            "# TYPE qbit_prism_fanout_transition_retained_entries gauge",
+            f"qbit_prism_fanout_transition_retained_entries {retained_fanout_transition_entries}",
+            "# HELP qbit_prism_fanout_transition_events_total Fanout transition lease lifecycle events.",
+            "# TYPE qbit_prism_fanout_transition_events_total counter",
+            *[
+                f'qbit_prism_fanout_transition_events_total{{event="{event}"}} {int(fanout_transition_lease_counts.get(event, 0))}'
+                for event in (
+                    "armed",
+                    "accepted",
+                    "expired",
+                    "revoked_delivery",
+                    "revoked_authorization",
+                    "capacity_evicted",
+                )
+            ],
             "# HELP qbit_prism_rejections_total PRISM share or block rejections by canonical reason ID.",
             "# TYPE qbit_prism_rejections_total counter",
             *[
@@ -18619,6 +19302,12 @@ class PrismCoordinator:
             "# TYPE qbit_prism_worker_grace_credited_shares_total counter",
             *[
                 f'qbit_prism_worker_grace_credited_shares_total{{worker="{self.prometheus_label_value(label)}"}} {int(counts.get("grace", 0))}'
+                for label, counts in sorted(worker_share_counts.items())
+            ],
+            "# HELP qbit_prism_worker_fanout_transition_credited_shares_total Fanout-transition credited shares by bounded worker label.",
+            "# TYPE qbit_prism_worker_fanout_transition_credited_shares_total counter",
+            *[
+                f'qbit_prism_worker_fanout_transition_credited_shares_total{{worker="{self.prometheus_label_value(label)}"}} {int(counts.get("transition", 0))}'
                 for label, counts in sorted(worker_share_counts.items())
             ],
             "# HELP qbit_prism_worker_rejections_total PRISM share or block rejections by bounded worker label and reason ID.",

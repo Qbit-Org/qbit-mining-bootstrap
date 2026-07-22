@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS qbit_share_ledger (
     ntime bigint NOT NULL CHECK (ntime >= 0),
     accepted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     accepted boolean NOT NULL DEFAULT true,
-    reject_reason text CHECK (
+    reject_reason text CONSTRAINT qbit_share_ledger_reject_reason_check CHECK (
         reject_reason IS NULL OR reject_reason IN (
             'stale-job',
             'duplicate-share',
@@ -53,14 +53,36 @@ CREATE TABLE IF NOT EXISTS qbit_share_ledger (
             'internal-error',
             'pool-closed',
             'block-stale',
-            'ledger-confirmation-failed'
+            'ledger-confirmation-failed',
+            'transition-lease-expired',
+            'transition-lease-revoked'
         )
     ),
     writer_id text NOT NULL,
     writer_epoch bigint NOT NULL CHECK (writer_epoch >= 0),
     credit_policy text,
+    transition_receipt jsonb,
     CONSTRAINT qbit_share_ledger_credit_policy_check
-        CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace')),
+        CHECK (
+            credit_policy IS NULL
+            OR credit_policy IN ('stale-grace', 'fanout-transition')
+        ),
+    CONSTRAINT qbit_share_ledger_transition_receipt_check
+        CHECK (
+            (
+                credit_policy IS NOT DISTINCT FROM 'fanout-transition'
+                AND transition_receipt IS NOT NULL
+                AND jsonb_typeof(transition_receipt) = 'object'
+                AND transition_receipt->>'schema'
+                    IS NOT DISTINCT FROM
+                        'qbit.prism.fanout-transition-receipt.v1'
+                AND transition_receipt->>'job_id' IS NOT DISTINCT FROM job_id
+            )
+            OR (
+                credit_policy IS DISTINCT FROM 'fanout-transition'
+                AND transition_receipt IS NULL
+            )
+        ),
     CHECK (accepted OR reject_reason IS NOT NULL)
 );
 
@@ -97,21 +119,69 @@ CREATE INDEX IF NOT EXISTS qbit_block_candidate_outbox_pending_idx
 ALTER TABLE qbit_share_ledger
     ADD COLUMN IF NOT EXISTS credit_policy text;
 
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conrelid = 'qbit_share_ledger'::regclass
-          AND conname = 'qbit_share_ledger_credit_policy_check'
-    ) THEN
-        ALTER TABLE qbit_share_ledger
-            ADD CONSTRAINT qbit_share_ledger_credit_policy_check
-            CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace'))
-            NOT VALID;
-    END IF;
-END
-$$;
+ALTER TABLE qbit_share_ledger
+    ADD COLUMN IF NOT EXISTS transition_receipt jsonb;
+
+ALTER TABLE qbit_share_ledger
+    DROP CONSTRAINT IF EXISTS qbit_share_ledger_reject_reason_check;
+ALTER TABLE qbit_share_ledger
+    ADD CONSTRAINT qbit_share_ledger_reject_reason_check
+    CHECK (
+        reject_reason IS NULL OR reject_reason IN (
+            'stale-job',
+            'duplicate-share',
+            'low-difficulty',
+            'malformed-submit',
+            'unauthorized-worker',
+            'unknown-job',
+            'invalid-extranonce',
+            'invalid-ntime-or-nonce',
+            'candidate-audit-mismatch',
+            'submitblock-rejected',
+            'backend-rpc-unavailable',
+            'internal-error',
+            'pool-closed',
+            'block-stale',
+            'ledger-confirmation-failed',
+            'transition-lease-expired',
+            'transition-lease-revoked'
+        )
+    ) NOT VALID;
+ALTER TABLE qbit_share_ledger
+    VALIDATE CONSTRAINT qbit_share_ledger_reject_reason_check;
+
+ALTER TABLE qbit_share_ledger
+    DROP CONSTRAINT IF EXISTS qbit_share_ledger_credit_policy_check;
+ALTER TABLE qbit_share_ledger
+    ADD CONSTRAINT qbit_share_ledger_credit_policy_check
+    CHECK (
+        credit_policy IS NULL
+        OR credit_policy IN ('stale-grace', 'fanout-transition')
+    ) NOT VALID;
+ALTER TABLE qbit_share_ledger
+    VALIDATE CONSTRAINT qbit_share_ledger_credit_policy_check;
+
+ALTER TABLE qbit_share_ledger
+    DROP CONSTRAINT IF EXISTS qbit_share_ledger_transition_receipt_check;
+ALTER TABLE qbit_share_ledger
+    ADD CONSTRAINT qbit_share_ledger_transition_receipt_check
+    CHECK (
+        (
+            credit_policy IS NOT DISTINCT FROM 'fanout-transition'
+            AND transition_receipt IS NOT NULL
+            AND jsonb_typeof(transition_receipt) = 'object'
+            AND transition_receipt->>'schema'
+                IS NOT DISTINCT FROM
+                    'qbit.prism.fanout-transition-receipt.v1'
+            AND transition_receipt->>'job_id' IS NOT DISTINCT FROM job_id
+        )
+        OR (
+            credit_policy IS DISTINCT FROM 'fanout-transition'
+            AND transition_receipt IS NULL
+        )
+    ) NOT VALID;
+ALTER TABLE qbit_share_ledger
+    VALIDATE CONSTRAINT qbit_share_ledger_transition_receipt_check;
 
 CREATE TABLE IF NOT EXISTS qbit_payout_carry_forward (
     carry_forward_seq bigserial PRIMARY KEY,
@@ -483,7 +553,8 @@ RETURNS TABLE (
     counted_difficulty numeric,
     job_issued_at timestamptz,
     accepted_at timestamptz,
-    credit_policy text
+    credit_policy text,
+    transition_receipt jsonb
 )
 LANGUAGE sql
 STABLE
@@ -530,7 +601,8 @@ AS $$
         END AS counted_difficulty,
         eligible.job_issued_at,
         eligible.accepted_at,
-        eligible.credit_policy
+        eligible.credit_policy,
+        eligible.transition_receipt
     FROM eligible
     WHERE eligible.cumulative_difficulty - eligible.share_difficulty < window_weight
     ORDER BY eligible.share_seq DESC;
@@ -766,7 +838,8 @@ RETURNS TABLE (
     counted_difficulty numeric,
     job_issued_at timestamptz,
     accepted_at timestamptz,
-    credit_policy text
+    credit_policy text,
+    transition_receipt jsonb
 )
 LANGUAGE sql
 STABLE
@@ -783,7 +856,8 @@ AS $$
         ledger_window.counted_difficulty,
         ledger_window.job_issued_at,
         ledger_window.accepted_at,
-        ledger_window.credit_policy
+        ledger_window.credit_policy,
+        ledger_window.transition_receipt
     FROM qbit_prism_window(anchor_job_issued_at, network_difficulty * 8::numeric) AS ledger_window;
 $$;
 

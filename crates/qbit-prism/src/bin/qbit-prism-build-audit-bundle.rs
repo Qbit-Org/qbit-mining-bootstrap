@@ -2,7 +2,7 @@ use qbit_pool_builder::{ManifestSigningKey, SignedPayoutManifest};
 use qbit_prism::{
     build_audit_bundle_with_coinbase_options, build_audit_bundle_with_ctv_settlement_options,
     profile_audit_build, AcceptedShare, AuditBundle, CarryForwardBalance, FanoutFeeRatePolicy,
-    FoundBlock, PayoutPolicy, PayoutPolicyManifest, SettlementModeConfig,
+    FanoutTransitionReceipt, FoundBlock, PayoutPolicy, PayoutPolicyManifest, SettlementModeConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -37,7 +37,17 @@ struct BuildAuditBundleInput {
 struct CompactShareIdentity(String, String, String);
 
 #[derive(Debug, Deserialize)]
-struct CompactAcceptedShare(u64, String, usize, u128, i64, i64, Option<String>);
+struct CompactAcceptedShare(
+    u64,
+    String,
+    usize,
+    u128,
+    i64,
+    i64,
+    Option<String>,
+    #[serde(default)] String,
+    #[serde(default)] Option<FanoutTransitionReceipt>,
+);
 
 #[derive(Debug, Deserialize)]
 struct CtvSettlementInput {
@@ -122,6 +132,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     job_issued_at_ms,
                     accepted_at_ms,
                     credit_policy,
+                    job_id,
+                    transition_receipt,
                 )| {
                     let CompactShareIdentity(miner_id, order_key, p2mr_program_hex) = input
                         .compact_share_identities
@@ -134,18 +146,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                         order_key: order_key.clone(),
                         p2mr_program_hex: p2mr_program_hex.clone(),
                         share_difficulty,
-                        // These accepted-share fields are deliberately absent
+                        // Most accepted-share fields are deliberately absent
                         // from the job-summary artifact: neither reward-window
                         // selection, payout derivation, nor its signed
                         // commitments consume them. Canonical audit builds
                         // continue to require and retain the full values.
                         network_difficulty: 1,
                         template_height: 0,
-                        job_id: String::new(),
+                        job_id,
                         job_issued_at_ms,
                         accepted_at_ms,
                         ntime: 0,
                         credit_policy,
+                        transition_receipt,
                     })
                 },
             )

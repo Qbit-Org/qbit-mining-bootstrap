@@ -69,6 +69,7 @@ fn share(
         accepted_at_ms: acc_ms,
         ntime: 1_800_000_000,
         credit_policy: None,
+        transition_receipt: None,
     }
 }
 

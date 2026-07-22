@@ -55,6 +55,7 @@ fn live_testnet_scale_bundle() -> AuditBundle {
         accepted_at_ms: 1_800_000_000_000,
         ntime: 1_800_000_000,
         credit_policy: None,
+        transition_receipt: None,
     };
     build_audit_bundle(
         vec![share],
@@ -353,6 +354,11 @@ fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
                 .get("credit_policy")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
+            share["job_id"],
+            share
+                .get("transition_receipt")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         ]));
     }
     compact_input["shares"] = serde_json::json!([]);
@@ -370,6 +376,29 @@ fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
         .arg("--phase-metrics")
         .output()
         .unwrap();
+    let mut legacy_compact_input = compact_input;
+    for share in legacy_compact_input["compact_shares"]
+        .as_array_mut()
+        .unwrap()
+    {
+        share.as_array_mut().unwrap().truncate(7);
+    }
+    fs::write(
+        &input_path,
+        serde_json::to_vec(&legacy_compact_input).unwrap(),
+    )
+    .unwrap();
+    let legacy_compact_summary_output =
+        Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+            .arg("--input")
+            .arg(&input_path)
+            .arg("--signing-key-seed-hex")
+            .arg("42".repeat(32))
+            .arg("--ledger-signing-key-seed-hex")
+            .arg("43".repeat(32))
+            .arg("--job-summary-output")
+            .output()
+            .unwrap();
     let _ = fs::remove_file(&input_path);
 
     assert!(
@@ -419,6 +448,16 @@ fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&compact_summary_output.stdout),
         String::from_utf8_lossy(&compact_summary_output.stderr)
+    );
+    assert!(
+        legacy_compact_summary_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&legacy_compact_summary_output.stdout),
+        String::from_utf8_lossy(&legacy_compact_summary_output.stderr)
+    );
+    assert_eq!(
+        legacy_compact_summary_output.stdout,
+        compact_summary_output.stdout
     );
     assert_eq!(compact_summary_output.stdout, summary_output.stdout);
     assert!(String::from_utf8_lossy(&compact_summary_output.stderr)

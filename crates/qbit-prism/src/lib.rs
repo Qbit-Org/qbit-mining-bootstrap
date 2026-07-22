@@ -91,6 +91,8 @@ pub const QBIT_COINBASE_MATURITY_BLOCKS: u64 = 1_000;
 pub const PRISM_AUDIT_COMMITMENT_LEAF_TAG: &str = "qbit.prism.audit.commitment.v1";
 pub const AUDIT_BUNDLE_SCHEMA_V1: &str = "qbit.prism.audit-bundle.v1";
 pub const AUDIT_BUNDLE_SCHEMA_V1_1: &str = "qbit.prism.audit-bundle.v1.1";
+pub const AUDIT_BUNDLE_SCHEMA_V1_2: &str = "qbit.prism.audit-bundle.v1.2";
+pub const FANOUT_TRANSITION_RECEIPT_SCHEMA_V1: &str = "qbit.prism.fanout-transition-receipt.v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrismError {
@@ -159,8 +161,34 @@ pub enum PrismError {
     InvalidCtvFanoutManifest { reason: String },
     #[error("invalid audit commitment: {reason}")]
     InvalidAuditCommitment { reason: String },
+    #[error("invalid share credit receipt for {share_id}: {reason}")]
+    InvalidShareCreditReceipt { share_id: String, reason: String },
     #[error("cannot select a settlement mode: {reason}")]
     SettlementModeSelection { reason: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FanoutTransitionReceipt {
+    pub schema: String,
+    pub connection_id: u64,
+    pub authorization_generation: u64,
+    pub job_id: String,
+    pub source_tip_hash: String,
+    pub source_tip_generation: u64,
+    pub target_tip_hash: String,
+    pub target_tip_generation: u64,
+    pub classified_tip_hash: String,
+    pub classified_tip_generation: u64,
+    pub classified_tip_source: String,
+    pub template_generation: u64,
+    pub payout_state_generation: u64,
+    pub difficulty_generation: u64,
+    pub lease_armed_at_ms: i64,
+    pub lease_duration_ms: u64,
+    pub lease_age_ms: u64,
+    pub lease_expires_at_ms: i64,
+    pub classified_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -179,6 +207,8 @@ pub struct AcceptedShare {
     pub ntime: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credit_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_receipt: Option<FanoutTransitionReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -407,6 +437,8 @@ pub struct CountedShare {
     pub accepted_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credit_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_receipt: Option<FanoutTransitionReceipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -460,6 +492,91 @@ impl PayoutPolicy {
     }
 }
 
+fn valid_lower_hex_hash(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value == value.to_ascii_lowercase()
+}
+
+fn validate_share_credit_receipt(share: &AcceptedShare) -> Result<(), PrismError> {
+    let invalid = |reason: &str| PrismError::InvalidShareCreditReceipt {
+        share_id: share.share_id.clone(),
+        reason: reason.to_string(),
+    };
+    match (share.credit_policy.as_deref(), &share.transition_receipt) {
+        (None | Some("stale-grace"), None) => Ok(()),
+        (Some("fanout-transition"), Some(receipt)) => {
+            if receipt.schema != FANOUT_TRANSITION_RECEIPT_SCHEMA_V1 {
+                return Err(invalid("unsupported receipt schema"));
+            }
+            if receipt.job_id != share.job_id {
+                return Err(invalid("receipt job_id mismatch"));
+            }
+            if receipt.connection_id == 0 || receipt.authorization_generation == 0 {
+                return Err(invalid(
+                    "connection and authorization generations must be positive",
+                ));
+            }
+            if !valid_lower_hex_hash(&receipt.source_tip_hash)
+                || !valid_lower_hex_hash(&receipt.target_tip_hash)
+                || !valid_lower_hex_hash(&receipt.classified_tip_hash)
+            {
+                return Err(invalid("tip hashes must be lowercase 32-byte hex"));
+            }
+            if receipt.source_tip_hash == receipt.target_tip_hash
+                || receipt.source_tip_hash == receipt.classified_tip_hash
+            {
+                return Err(invalid("receipt did not cross a tip"));
+            }
+            if receipt.source_tip_generation == 0
+                || receipt.target_tip_generation <= receipt.source_tip_generation
+            {
+                return Err(invalid("target generation must follow source"));
+            }
+            match receipt.classified_tip_source.as_str() {
+                "published"
+                    if receipt.classified_tip_generation >= receipt.target_tip_generation => {}
+                "live-rpc" if receipt.classified_tip_generation == 0 => {}
+                "published" | "live-rpc" => {
+                    return Err(invalid("classified generation does not match its source"));
+                }
+                _ => return Err(invalid("unsupported classified tip source")),
+            }
+            if receipt.lease_armed_at_ms <= 0
+                || receipt.lease_duration_ms == 0
+                || receipt.lease_age_ms > receipt.lease_duration_ms
+                || receipt.classified_at_ms <= 0
+            {
+                return Err(invalid("invalid lease timing"));
+            }
+            let duration_ms = i64::try_from(receipt.lease_duration_ms)
+                .map_err(|_| invalid("lease duration does not fit signed milliseconds"))?;
+            let expected_expiry = receipt
+                .lease_armed_at_ms
+                .checked_add(duration_ms)
+                .ok_or_else(|| invalid("lease expiry overflow"))?;
+            if receipt.lease_expires_at_ms != expected_expiry {
+                return Err(invalid("lease expiry does not match duration"));
+            }
+            let age_ms = i64::try_from(receipt.lease_age_ms)
+                .map_err(|_| invalid("lease age does not fit signed milliseconds"))?;
+            let expected_classified_at = receipt
+                .lease_armed_at_ms
+                .checked_add(age_ms)
+                .ok_or_else(|| invalid("classification time overflow"))?;
+            if receipt.classified_at_ms != expected_classified_at {
+                return Err(invalid("classification time does not match lease age"));
+            }
+            Ok(())
+        }
+        (Some("fanout-transition"), None) => {
+            Err(invalid("fanout-transition policy requires a receipt"))
+        }
+        (_, Some(_)) => Err(invalid("receipt requires fanout-transition policy")),
+        (Some(_), None) => Err(invalid("unsupported credit policy")),
+    }
+}
+
 pub fn compute_prism_window(
     shares: &[AcceptedShare],
     found_block: &FoundBlock,
@@ -470,6 +587,7 @@ pub fn compute_prism_window(
     let mut seen_share_ids = HashSet::with_capacity(shares.len());
     let mut eligible = Vec::with_capacity(shares.len());
     for share in shares {
+        validate_share_credit_receipt(share)?;
         if share.share_difficulty == 0 {
             return Err(PrismError::ZeroShareDifficulty {
                 share_seq: share.share_seq,
@@ -524,6 +642,7 @@ pub fn compute_prism_window(
             job_issued_at_ms: share.job_issued_at_ms,
             accepted_at_ms: share.accepted_at_ms,
             credit_policy: share.credit_policy.clone(),
+            transition_receipt: share.transition_receipt.clone(),
         });
         remaining -= counted;
     }
@@ -1155,7 +1274,12 @@ pub fn canonical_ledger_window_attestation_bytes(
 }
 
 fn audit_bundle_schema_for_shares(shares: &[AcceptedShare]) -> &'static str {
-    if shares.iter().any(|share| share.credit_policy.is_some()) {
+    if shares
+        .iter()
+        .any(|share| share.transition_receipt.is_some())
+    {
+        AUDIT_BUNDLE_SCHEMA_V1_2
+    } else if shares.iter().any(|share| share.credit_policy.is_some()) {
         AUDIT_BUNDLE_SCHEMA_V1_1
     } else {
         AUDIT_BUNDLE_SCHEMA_V1
@@ -1676,6 +1800,9 @@ pub fn verify_audit_bundle(
     bundle: &AuditBundle,
     ledger_writer_public_key_hex: &str,
 ) -> Result<AuditVerificationReport, PrismError> {
+    for share in &bundle.shares {
+        validate_share_credit_receipt(share)?;
+    }
     if bundle.schema != audit_bundle_schema_for_shares(&bundle.shares) {
         return Err(PrismError::AuditMismatch { artifact: "schema" });
     }
@@ -1954,6 +2081,28 @@ fn share_slice_digest_hex(shares: &[CountedShare]) -> String {
         if let Some(credit_policy) = &share.credit_policy {
             update_string(&mut hasher, "credit_policy");
             update_string(&mut hasher, credit_policy);
+        }
+        if let Some(receipt) = &share.transition_receipt {
+            update_string(&mut hasher, "transition_receipt");
+            update_string(&mut hasher, &receipt.schema);
+            update_u64(&mut hasher, receipt.connection_id);
+            update_u64(&mut hasher, receipt.authorization_generation);
+            update_string(&mut hasher, &receipt.job_id);
+            update_string(&mut hasher, &receipt.source_tip_hash);
+            update_u64(&mut hasher, receipt.source_tip_generation);
+            update_string(&mut hasher, &receipt.target_tip_hash);
+            update_u64(&mut hasher, receipt.target_tip_generation);
+            update_string(&mut hasher, &receipt.classified_tip_hash);
+            update_u64(&mut hasher, receipt.classified_tip_generation);
+            update_string(&mut hasher, &receipt.classified_tip_source);
+            update_u64(&mut hasher, receipt.template_generation);
+            update_u64(&mut hasher, receipt.payout_state_generation);
+            update_u64(&mut hasher, receipt.difficulty_generation);
+            update_i64(&mut hasher, receipt.lease_armed_at_ms);
+            update_u64(&mut hasher, receipt.lease_duration_ms);
+            update_u64(&mut hasher, receipt.lease_age_ms);
+            update_i64(&mut hasher, receipt.lease_expires_at_ms);
+            update_i64(&mut hasher, receipt.classified_at_ms);
         }
     }
     hex::encode(hasher.finalize())
@@ -2316,6 +2465,31 @@ mod tests {
             accepted_at_ms: job_issued_at_ms,
             ntime: 1_800_000_000,
             credit_policy: None,
+            transition_receipt: None,
+        }
+    }
+
+    fn fanout_transition_receipt(job_id: &str) -> FanoutTransitionReceipt {
+        FanoutTransitionReceipt {
+            schema: FANOUT_TRANSITION_RECEIPT_SCHEMA_V1.to_string(),
+            connection_id: 41,
+            authorization_generation: 3,
+            job_id: job_id.to_string(),
+            source_tip_hash: "11".repeat(32),
+            source_tip_generation: 7,
+            target_tip_hash: "22".repeat(32),
+            target_tip_generation: 8,
+            classified_tip_hash: "22".repeat(32),
+            classified_tip_generation: 8,
+            classified_tip_source: "published".to_string(),
+            template_generation: 12,
+            payout_state_generation: 5,
+            difficulty_generation: 2,
+            lease_armed_at_ms: 1_000,
+            lease_duration_ms: 120_000,
+            lease_age_ms: 5,
+            lease_expires_at_ms: 121_000,
+            classified_at_ms: 1_005,
         }
     }
 
@@ -2419,6 +2593,89 @@ mod tests {
         assert!(matches!(
             verify_audit_bundle(&mislabeled, &ledger_public_key_hex()),
             Err(PrismError::AuditMismatch { artifact: "schema" })
+        ));
+    }
+
+    #[test]
+    fn fanout_transition_receipt_is_preserved_and_uses_v1_2_schema() {
+        let mut shares = vec![share(1, "miner-a", "01", 0x11, 10, 1000)];
+        shares[0].credit_policy = Some("fanout-transition".to_string());
+        let job_id = shares[0].job_id.clone();
+        shares[0].transition_receipt = Some(fanout_transition_receipt(&job_id));
+
+        let window = compute_prism_window(&shares, &found_block(10, 1000)).unwrap();
+        assert_eq!(
+            window.shares[0]
+                .transition_receipt
+                .as_ref()
+                .map(|receipt| receipt.connection_id),
+            Some(41)
+        );
+
+        let bundle = build_audit_bundle(
+            shares,
+            found_block(10, 1000),
+            vec![],
+            PayoutPolicy::day_one_default(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+
+        assert_eq!(bundle.schema, AUDIT_BUNDLE_SCHEMA_V1_2);
+        verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+
+        let mut mislabeled = bundle.clone();
+        mislabeled.schema = AUDIT_BUNDLE_SCHEMA_V1_1.to_string();
+        assert!(matches!(
+            verify_audit_bundle(&mislabeled, &ledger_public_key_hex()),
+            Err(PrismError::AuditMismatch { artifact: "schema" })
+        ));
+
+        let mut tampered_receipt = bundle.clone();
+        tampered_receipt.shares[0]
+            .transition_receipt
+            .as_mut()
+            .unwrap()
+            .connection_id = 42;
+        assert!(verify_audit_bundle(&tampered_receipt, &ledger_public_key_hex()).is_err());
+    }
+
+    #[test]
+    fn fanout_transition_receipt_is_required_and_strictly_validated() {
+        let mut missing = share(1, "miner-a", "01", 0x11, 10, 1000);
+        missing.credit_policy = Some("fanout-transition".to_string());
+        assert!(matches!(
+            compute_prism_window(&[missing], &found_block(10, 1000)),
+            Err(PrismError::InvalidShareCreditReceipt { .. })
+        ));
+
+        let mut mismatched = share(2, "miner-a", "01", 0x11, 10, 1000);
+        mismatched.credit_policy = Some("fanout-transition".to_string());
+        mismatched.transition_receipt = Some(fanout_transition_receipt("reused-job-id"));
+        assert!(matches!(
+            compute_prism_window(&[mismatched], &found_block(10, 1000)),
+            Err(PrismError::InvalidShareCreditReceipt { .. })
+        ));
+
+        let mut expired = share(3, "miner-a", "01", 0x11, 10, 1000);
+        expired.credit_policy = Some("fanout-transition".to_string());
+        let mut receipt = fanout_transition_receipt(&expired.job_id);
+        receipt.lease_age_ms = receipt.lease_duration_ms + 1;
+        expired.transition_receipt = Some(receipt);
+        assert!(matches!(
+            compute_prism_window(&[expired], &found_block(10, 1000)),
+            Err(PrismError::InvalidShareCreditReceipt { .. })
+        ));
+
+        let mut inconsistent_time = share(4, "miner-a", "01", 0x11, 10, 1000);
+        inconsistent_time.credit_policy = Some("fanout-transition".to_string());
+        let mut receipt = fanout_transition_receipt(&inconsistent_time.job_id);
+        receipt.classified_at_ms += 1;
+        inconsistent_time.transition_receipt = Some(receipt);
+        assert!(matches!(
+            compute_prism_window(&[inconsistent_time], &found_block(10, 1000)),
+            Err(PrismError::InvalidShareCreditReceipt { .. })
         ));
     }
 
