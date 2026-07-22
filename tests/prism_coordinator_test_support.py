@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
+from lab.prism.coordinator_config import default_prism_coinbase_tag_hex
 from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.prism_coordinator import (
     ClientState,
@@ -32,7 +33,6 @@ from lab.prism.prism_coordinator import (
     WorkerIdentity,
     canonical_json_sha256,
     canonical_json_text,
-    default_prism_coinbase_tag_hex,
     now_ms,
     qbit_template_fingerprint,
 )

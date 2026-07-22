@@ -582,7 +582,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertEqual(payload["clients_with_current_tip_job"], 0)
 
         server.clients.clear()
-        server._health_snapshot = None
+        server._ensure_observability_service().clear_health_snapshot_for_test()
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])

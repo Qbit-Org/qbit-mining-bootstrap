@@ -10,6 +10,8 @@ from unittest.mock import patch
 from lab.prism.background_services import (
     BackgroundServiceRegistry,
     BackgroundServiceSpec,
+    WatchdogPorts,
+    WatchdogService,
 )
 from lab.prism.prism_coordinator import PrismCoordinator
 
@@ -53,6 +55,50 @@ class FlakyThreadFactory:
         thread = FlakyDormantThread(**kwargs)  # type: ignore[arg-type]
         self.threads.append(thread)
         return thread
+
+
+class WatchdogServiceTests(unittest.TestCase):
+    def test_publication_failure_exits_after_one_bounded_wait(self) -> None:
+        events: list[object] = []
+        service = WatchdogService(
+            WatchdogPorts(
+                wait_for_stop=lambda timeout: events.append(("wait", timeout))
+                or False,
+                interval_seconds=lambda: 2.0,
+                monotonic=lambda: 10.0,
+                publication_failure_expired=lambda now: now == 10.0,
+                publication_budget_seconds=lambda: 30.0,
+                liveness_enabled=lambda: True,
+                overdue_heartbeats=lambda _now: ["worker"],
+                liveness_timeout_seconds=lambda: 60.0,
+                log=lambda message: events.append(message),
+                exit_process=lambda code: events.append(("exit", code)),
+            )
+        )
+
+        service.run()
+
+        self.assertEqual(events[0], ("wait", 2.0))
+        self.assertIn("publication-progress watchdog firing", str(events[1]))
+        self.assertEqual(events[2], ("exit", 1))
+
+    def test_requested_stop_does_not_sample_or_exit(self) -> None:
+        service = WatchdogService(
+            WatchdogPorts(
+                wait_for_stop=lambda _timeout: True,
+                interval_seconds=lambda: 1.0,
+                monotonic=lambda: self.fail("stopped watchdog sampled time"),
+                publication_failure_expired=lambda _now: False,
+                publication_budget_seconds=lambda: 1.0,
+                liveness_enabled=lambda: True,
+                overdue_heartbeats=lambda _now: [],
+                liveness_timeout_seconds=lambda: 1.0,
+                log=lambda _message: self.fail("stopped watchdog logged"),
+                exit_process=lambda _code: self.fail("stopped watchdog exited"),
+            )
+        )
+
+        service.run()
 
 
 class ContentionObservedLock:
@@ -544,12 +590,13 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
         server = self.coordinator_with_optional_services(False)
         server.stop_event = threading.Event()
         server.stop_event.set()
-        server._health_snapshot_lock = threading.RLock()
-        server._health_refresh_loop_running = True
+        service = server._ensure_observability_service()
+        service.replace_lock_for_test(threading.RLock())
+        service.set_loop_running_for_test(True)
 
         server.health_snapshot_loop()
 
-        self.assertFalse(server._health_refresh_loop_running)
+        self.assertFalse(service.state().health_refresh_loop_running)
 
 
 if __name__ == "__main__":

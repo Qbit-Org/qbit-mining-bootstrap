@@ -737,7 +737,7 @@ class HealthSnapshotTests(_JobSupportTestCase):
         server, _ = coordinator()
         mark_progress_healthy(server)
         server.refresh_health_snapshot()
-        server._health_refresh_loop_running = True
+        server._ensure_observability_service().set_loop_running_for_test(True)
 
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 200)
@@ -748,7 +748,9 @@ class HealthSnapshotTests(_JobSupportTestCase):
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 200)
 
-        server._health_snapshot_monotonic = time.monotonic() - 1_000
+        server._ensure_observability_service().set_health_snapshot_monotonic_for_test(
+            time.monotonic() - 1_000
+        )
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 503)
         self.assertFalse(payload["ok"])

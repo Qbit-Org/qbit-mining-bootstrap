@@ -12,11 +12,11 @@ from unittest.mock import patch
 
 from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.job_bundle import JobBuildCancellation
+from lab.prism.payout_state import PayoutStateDeliveryGate as _PayoutStateDeliveryGate
 from lab.prism.prism_coordinator import (
     TemplateRefreshBlocked,
     TipRefreshValidationToken,
     _FanoutCancellation,
-    _PayoutStateDeliveryGate,
 )
 from tests.prism_coordinator_test_support import (
     FakeLedger,
