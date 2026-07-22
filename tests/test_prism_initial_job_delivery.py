@@ -12,7 +12,7 @@ from lab.prism.prism_coordinator import (
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     TemplateRefreshBlocked,
 )
-from tests.test_prism_coordinator_job_cache import (
+from tests.prism_coordinator_test_support import (
     EXTRANONCE2_SIZE,
     ObservedRLock,
     base_template,
@@ -458,7 +458,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertNotEqual(state.active_job.payout_state_generation, 0)
 
     def test_collection_mode_initial_bundles_remain_identity_specific(self) -> None:
-        from tests.test_prism_coordinator_job_cache import FakeLedger
+        from tests.prism_coordinator_test_support import FakeLedger
 
         server, _rpc = coordinator(ledger=FakeLedger(miners=["solo"]))
         install_fake_bundle_builder(server)

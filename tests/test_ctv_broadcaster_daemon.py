@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 import threading
-import urllib.request
 import unittest
 from unittest.mock import patch
 
