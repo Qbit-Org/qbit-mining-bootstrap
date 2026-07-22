@@ -20,7 +20,7 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, replace as dataclass_replace
+from dataclasses import replace as dataclass_replace
 from decimal import Decimal, ROUND_CEILING
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -60,6 +60,13 @@ from lab.prism.block_candidates import (
     block_candidate_from_intent as decode_block_candidate_intent,
     block_candidate_intent as encode_block_candidate_intent,
     compatibility_default as candidate_compatibility_default,
+)
+from lab.prism.block_finalization import (
+    PRISM_REJECTION_BLOCK_STALE,
+    PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
+    PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
+    PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+    BlockFinalizationService,
 )
 from lab.prism.share_submission import (
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
@@ -271,6 +278,14 @@ from lab.prism.tip_refresh import (
     TipRefreshService,
     TipRefreshValidationToken,
 )
+from lab.prism.vardiff_service import (
+    PRISM_VARDIFF_IDLE_SECONDS_BUCKETS,
+    PRISM_VARDIFF_IDLE_SKIP_REASONS,
+    VARDIFF_COMPATIBILITY_FIELDS,
+    IdleRetargetRequest as _IdleRetargetRequest,
+    VardiffCompatibilityField,
+    VardiffService,
+)
 # Compatibility re-exports; new callers should import lab.prism.progress_health.
 from lab.prism.progress_health import (
     BundleBuildToken,  # noqa: F401 - compatibility re-export
@@ -327,13 +342,10 @@ from lab.prism.share_ledger import (
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
-    sha256_json_hex,
 )
 
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
 PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
-PRISM_VARDIFF_IDLE_RETARGET_MAX_WORKERS = 2
-MAX_PENDING_VARDIFF_IDLE_RETARGETS = 8
 # Block candidates queue to a dedicated submitter thread so the miner's share
 # ack never waits on audit/submitblock after the share and intent commit. The
 # bound limits RAM; overflow only coalesces a wakeup because Postgres retains
@@ -368,15 +380,6 @@ PRISM_JOB_BUILD_SECONDS_BUCKETS = (
     30.0,
 )
 PRISM_BUILDER_PHASE_METRICS_PREFIX = "qbit-prism-build-phase-metrics "
-PRISM_VARDIFF_IDLE_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
-PRISM_VARDIFF_IDLE_SKIP_REASONS = (
-    "busy",
-    "disconnected",
-    "not_idle",
-    "cache_miss",
-    "queue_full",
-    "superseded",
-)
 PRISM_PAYOUT_DELIVERY_GENERATIONS = ("current", "stale", "future")
 DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES = 8
 PRISM_JOB_BUILD_PHASES = (
@@ -402,11 +405,7 @@ PRISM_JOB_BUILD_PHASES = (
 )
 PRISM_JOB_CACHE_KINDS = ("template", "bundle")
 PRISM_PROGRESS_HEALTH_REASONS = PROGRESS_HEALTH_REASONS
-PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH = "candidate-audit-mismatch"
-PRISM_REJECTION_SUBMITBLOCK_REJECTED = "submitblock-rejected"
 PRISM_REJECTION_INTERNAL_ERROR = "internal-error"
-PRISM_REJECTION_BLOCK_STALE = "block-stale"
-PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED = "ledger-confirmation-failed"
 PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
     {
         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
@@ -540,19 +539,6 @@ def canonical_json_text(value: object) -> str:
 
 def canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_text(value).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class _IdleRetargetRequest:
-    """Immutable idle-window identity captured by one bounded sweep."""
-
-    client: ClientState
-    connection_id: int
-    worker: WorkerIdentity
-    active_job: PrismJobContext
-    window_started_monotonic: float
-    current_difficulty: Decimal
-    elapsed_seconds: Decimal
 
 
 class _BundlePreparationSuperseded(TemplateRefreshSuperseded):
@@ -1398,6 +1384,66 @@ class _RetainedStateCompatibility:
 
 class PrismCoordinator:
     recent_share_keys = RecentShareCompatibilityField()
+    idle_retarget_count = VardiffCompatibilityField(
+        "idle_retarget_count",
+        lambda: 0,
+    )
+    _vardiff_idle_lock = VardiffCompatibilityField(
+        "_vardiff_idle_lock",
+        threading.Lock,
+    )
+    _vardiff_idle_executor = VardiffCompatibilityField(
+        "_vardiff_idle_executor",
+        lambda: None,
+    )
+    _vardiff_idle_executor_shutdown = VardiffCompatibilityField(
+        "_vardiff_idle_executor_shutdown",
+        lambda: False,
+    )
+    _vardiff_idle_pending = VardiffCompatibilityField(
+        "_vardiff_idle_pending",
+        set,
+    )
+    vardiff_idle_queue_depth = VardiffCompatibilityField(
+        "vardiff_idle_queue_depth",
+        lambda: 0,
+    )
+    vardiff_idle_inflight = VardiffCompatibilityField(
+        "vardiff_idle_inflight",
+        lambda: 0,
+    )
+    vardiff_idle_clients_inspected = VardiffCompatibilityField(
+        "vardiff_idle_clients_inspected",
+        lambda: 0,
+    )
+    vardiff_idle_skip_counts = VardiffCompatibilityField(
+        "vardiff_idle_skip_counts",
+        lambda: {reason: 0 for reason in PRISM_VARDIFF_IDLE_SKIP_REASONS},
+    )
+    vardiff_idle_task_failures = VardiffCompatibilityField(
+        "vardiff_idle_task_failures",
+        lambda: 0,
+    )
+    vardiff_idle_sweep_histogram = VardiffCompatibilityField(
+        "vardiff_idle_sweep_histogram",
+        lambda: {
+            "buckets": {
+                bucket: 0 for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS
+            },
+            "sum": 0.0,
+            "count": 0,
+        },
+    )
+    vardiff_idle_task_histogram = VardiffCompatibilityField(
+        "vardiff_idle_task_histogram",
+        lambda: {
+            "buckets": {
+                bucket: 0 for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS
+            },
+            "sum": 0.0,
+            "count": 0,
+        },
+    )
 
     pending_initial_jobs = _InitialJobPendingCompatibility()
     stratum_max_pending_initial_jobs = _InitialJobConfigCompatibility(
@@ -1925,6 +1971,7 @@ class PrismCoordinator:
             CtvRuntimeConfig.from_coordinator_config(ctv_config)
         )
         self._ensure_block_candidate_service()
+        self._ensure_block_finalization_service()
         self._background_services = self._make_background_service_registry()
 
     def _ensure_share_hot_path_state(self) -> None:
@@ -2840,6 +2887,44 @@ class PrismCoordinator:
                 "_block_candidate_outcome",
             ):
                 self.__dict__.pop(name, None)
+            return service
+
+    def _ensure_vardiff_service(self) -> VardiffService:
+        service = self.__dict__.get("_vardiff_service")
+        if service is not None:
+            return service
+        init_lock = self.__dict__.setdefault(
+            "_vardiff_service_init_lock",
+            threading.RLock(),
+        )
+        with init_lock:
+            service = self.__dict__.get("_vardiff_service")
+            if service is not None:
+                return service
+            initial = {
+                name: self.__dict__.pop(name)
+                for name in VARDIFF_COMPATIBILITY_FIELDS
+                if name in self.__dict__
+            }
+            service = VardiffService(self)
+            for name, value in initial.items():
+                setattr(service, name, value)
+            self.__dict__["_vardiff_service"] = service
+            return service
+
+    def _ensure_block_finalization_service(self) -> BlockFinalizationService:
+        service = self.__dict__.get("_block_finalization_service")
+        if service is not None:
+            return service
+        init_lock = self.__dict__.setdefault(
+            "_block_finalization_service_init_lock",
+            threading.Lock(),
+        )
+        with init_lock:
+            service = self.__dict__.get("_block_finalization_service")
+            if service is None:
+                service = BlockFinalizationService(self)
+                self.__dict__["_block_finalization_service"] = service
             return service
 
     def _share_submit_control_snapshot(
@@ -7333,49 +7418,16 @@ class PrismCoordinator:
         return stratum_difficulty_payload(difficulty)
 
     def client_vardiff_config(self, client: ClientState) -> vardiff.VardiffConfig:
-        """The difficulty policy for one client: its per-client specialization
-        if any, else its listener profile, else the default listener's config
-        (clients created without one: tests, legacy callers)."""
-        with self._client_vardiff_lock(client):
-            return client.vardiff_config or client.listener_vardiff_config or self.vardiff_config
+        return self._ensure_vardiff_service().client_config(client)
 
     def client_startup_difficulty(self, profile: StratumListenerProfile | None = None) -> Decimal:
-        config = profile.vardiff_config if profile is not None else self.vardiff_config
-        fixed_difficulty = profile.share_difficulty if profile is not None else self.share_difficulty
-        if not config.enabled:
-            return fixed_difficulty
-        return vardiff.clamp(
-            config.startup_difficulty,
-            config.min_difficulty,
-            config.max_difficulty,
-        )
+        return self._ensure_vardiff_service().startup_difficulty(profile)
 
     def desired_client_share_difficulty(self, client: ClientState) -> Decimal:
-        # pending_share_difficulty is set by vardiff retargets and by explicit
-        # difficulty requests (d=/suggest_difficulty); either way it applies to
-        # the next stamped job regardless of whether vardiff is enabled.
-        with self._client_vardiff_lock(client):
-            return client.pending_share_difficulty or client.share_difficulty
+        return self._ensure_vardiff_service().desired_difficulty(client)
 
     def client_minimum_advertised_difficulty(self, client: ClientState) -> Decimal:
-        """The difficulty stamped jobs never advertise below for this client.
-
-        Zero everywhere except floor-bearing listeners (the high-diff port),
-        where the effective policy floor governs: the listener minimum, raised
-        by any md= specialization. The floor overrides the network-difficulty
-        cap because the listener's marketplace contract is checked against the
-        first advertised difficulty, even while qbit network difficulty sits
-        below the floor.
-        """
-        with self._client_vardiff_lock(client):
-            if client.minimum_advertised_difficulty <= 0:
-                return Decimal("0")
-            config = (
-                client.vardiff_config
-                or client.listener_vardiff_config
-                or self.vardiff_config
-            )
-            return max(client.minimum_advertised_difficulty, config.min_difficulty)
+        return self._ensure_vardiff_service().minimum_advertised_difficulty(client)
 
     def apply_job_difficulty(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
         self._ensure_job_delivery_service().apply_job_difficulty(
@@ -7775,106 +7827,19 @@ class PrismCoordinator:
         self._ensure_share_hot_path_state()
         with self._share_accounting_lock:
             self.submitted_share_count += 1
-        with self._client_vardiff_lock(client):
-            config = (
-                client.vardiff_config
-                or client.listener_vardiff_config
-                or self.vardiff_config
-            )
-            if not config.enabled:
-                return
-            client.vardiff_window_submitted += 1
+        self._ensure_vardiff_service().note_submitted(client)
 
     def note_vardiff_accepted_share(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
-        now = time.monotonic()
-        with self._client_vardiff_lock(client):
-            config = (
-                client.vardiff_config
-                or client.listener_vardiff_config
-                or self.vardiff_config
-            )
-            if not config.enabled:
-                return
-            client.vardiff_window_accepted += 1
-            client.vardiff_window_work += job.share_difficulty
-            elapsed_seconds = Decimal(str(max(0.001, now - client.vardiff_window_started_monotonic)))
-            if elapsed_seconds < config.retarget_interval_seconds:
-                return
-            accepted_shares = client.vardiff_window_accepted
-            submitted_shares = client.vardiff_window_submitted
-            accepted_difficulty = client.vardiff_window_work
-            current_difficulty = client.pending_share_difficulty or client.share_difficulty
-            client.vardiff_window_started_monotonic = now
-            client.vardiff_window_accepted = 0
-            client.vardiff_window_submitted = 0
-            client.vardiff_window_work = Decimal("0")
-        self.retarget_client(
-            client,
-            current_difficulty=current_difficulty,
-            accepted_shares=accepted_shares,
-            submitted_shares=submitted_shares,
-            accepted_difficulty=accepted_difficulty,
-            elapsed_seconds=elapsed_seconds,
-        )
+        self._ensure_vardiff_service().note_accepted(client, job.share_difficulty)
 
     def _ensure_vardiff_idle_state(self) -> None:
-        if not hasattr(self, "_vardiff_idle_lock"):
-            self._vardiff_idle_lock = threading.Lock()
-        if not hasattr(self, "_vardiff_idle_executor"):
-            self._vardiff_idle_executor: ThreadPoolExecutor | None = None
-        if not hasattr(self, "_vardiff_idle_executor_shutdown"):
-            self._vardiff_idle_executor_shutdown = False
-        if not hasattr(self, "_vardiff_idle_pending"):
-            self._vardiff_idle_pending: set[tuple[ClientState, int]] = set()
-        if not hasattr(self, "vardiff_idle_queue_depth"):
-            self.vardiff_idle_queue_depth = 0
-        if not hasattr(self, "vardiff_idle_inflight"):
-            self.vardiff_idle_inflight = 0
-        if not hasattr(self, "vardiff_idle_clients_inspected"):
-            self.vardiff_idle_clients_inspected = 0
-        if not hasattr(self, "vardiff_idle_skip_counts"):
-            self.vardiff_idle_skip_counts = {
-                reason: 0 for reason in PRISM_VARDIFF_IDLE_SKIP_REASONS
-            }
-        if not hasattr(self, "vardiff_idle_task_failures"):
-            self.vardiff_idle_task_failures = 0
-        for attribute in (
-            "vardiff_idle_sweep_histogram",
-            "vardiff_idle_task_histogram",
-        ):
-            if not hasattr(self, attribute):
-                setattr(
-                    self,
-                    attribute,
-                    {
-                        "buckets": {
-                            bucket: 0
-                            for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS
-                        },
-                        "sum": 0.0,
-                        "count": 0,
-                    },
-                )
+        self._ensure_vardiff_service()
 
     def _record_vardiff_idle_skip(self, reason: str) -> None:
-        if reason not in PRISM_VARDIFF_IDLE_SKIP_REASONS:
-            raise ValueError(f"unknown vardiff idle skip reason: {reason}")
-        self._ensure_vardiff_idle_state()
-        with self._vardiff_idle_lock:
-            self.vardiff_idle_skip_counts[reason] += 1
+        self._ensure_vardiff_service().record_idle_skip(reason)
 
     def _observe_vardiff_idle_seconds(self, name: str, elapsed_seconds: float) -> None:
-        self._ensure_vardiff_idle_state()
-        if name not in {"sweep", "task"}:
-            raise ValueError(f"unknown vardiff idle histogram: {name}")
-        with self._vardiff_idle_lock:
-            histogram = getattr(self, f"vardiff_idle_{name}_histogram")
-            histogram["count"] = int(histogram["count"]) + 1
-            histogram["sum"] = float(histogram["sum"]) + elapsed_seconds
-            buckets = histogram["buckets"]
-            for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS:
-                if elapsed_seconds <= bucket:
-                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+        self._ensure_vardiff_service().observe_idle_seconds(name, elapsed_seconds)
 
     def _idle_bundle_cache_key(
         self,
@@ -8102,372 +8067,22 @@ class PrismCoordinator:
         )
 
     def _vardiff_idle_tip_divergence_locked(self) -> bool:
-        """Whether detected tip work still lacks published submit authority."""
-        published = getattr(self, "current_tip_first_seen", None)
-        latest_detected = getattr(self, "latest_detected_tip", None)
-        return bool(
-            latest_detected is not None
-            and (published is None or latest_detected[0] != published[0])
-        )
+        return self._ensure_vardiff_service().idle_tip_diverged_locked()
 
     def _idle_request_skip_reason(
         self,
         request: _IdleRetargetRequest,
     ) -> str | None:
-        client = request.client
-        # Take the per-client lock before coordinator admission. A share can
-        # delay this client's idle retarget, but it can never make the retarget
-        # hold the coordinator lock while waiting and convoy tip publication.
-        with self._client_vardiff_lock(client):
-            with self.lock:
-                if self._vardiff_idle_tip_divergence_locked():
-                    return "superseded"
-                if (
-                    client not in self.clients
-                    or getattr(client, "closing", False)
-                    or not self.client_can_receive_jobs(client)
-                ):
-                    return "disconnected"
-                if (
-                    client.connection_id != request.connection_id
-                    or client.worker != request.worker
-                    or client.active_job is not request.active_job
-                    or (client.pending_share_difficulty or client.share_difficulty)
-                    != request.current_difficulty
-                ):
-                    return "superseded"
-                if (
-                    client.vardiff_window_started_monotonic
-                    != request.window_started_monotonic
-                    or client.vardiff_window_accepted != 0
-                    or client.vardiff_window_submitted != 0
-                ):
-                    return "not_idle"
-        return None
-
-    def _idle_request_pending(self, request: _IdleRetargetRequest) -> bool:
-        self._ensure_vardiff_idle_state()
-        with self._vardiff_idle_lock:
-            return (
-                request.client,
-                request.connection_id,
-            ) in self._vardiff_idle_pending
-
-    def _finish_idle_retarget_task(
-        self,
-        key: tuple[ClientState, int],
-        queued_monotonic: float,
-        *,
-        started: bool,
-    ) -> None:
-        self._ensure_vardiff_idle_state()
-        with self._vardiff_idle_lock:
-            if key not in self._vardiff_idle_pending:
-                return
-            self._vardiff_idle_pending.discard(key)
-            if started:
-                self.vardiff_idle_inflight = max(0, self.vardiff_idle_inflight - 1)
-            else:
-                self.vardiff_idle_queue_depth = max(
-                    0,
-                    self.vardiff_idle_queue_depth - 1,
-                )
-        self._observe_vardiff_idle_seconds(
-            "task",
-            max(0.0, time.monotonic() - queued_monotonic),
-        )
-
-    def _run_idle_retarget_task(
-        self,
-        request: _IdleRetargetRequest,
-        bundle: CachedJobBundle | None,
-        queued_monotonic: float,
-    ) -> None:
-        key = (request.client, request.connection_id)
-        self._ensure_vardiff_idle_state()
-        with self._vardiff_idle_lock:
-            if key not in self._vardiff_idle_pending:
-                return
-            self.vardiff_idle_queue_depth = max(
-                0,
-                self.vardiff_idle_queue_depth - 1,
-            )
-            self.vardiff_idle_inflight += 1
-        client = request.client
-        delivery_attempted = False
-        try:
-            reason = self._idle_request_skip_reason(request)
-            if reason is not None:
-                self._record_vardiff_idle_skip(reason)
-                return
-            # Readiness may have crossed in the ledger after the sweep's
-            # cache-only snapshot. Refresh it on this bounded worker so a
-            # cached collection bundle cannot be delivered after the pool is
-            # ready for normal payout work.
-            self.pool_readiness_latched()
-            # Canonicalize the sweep's cache-only snapshot on the dedicated
-            # worker. shared_job_bundle() selects the current payout-artifact
-            # key and rebinds a ready heavy bundle to the latest same-tip
-            # template observation; a miss may build here, never on the sweep.
-            bundle = self._build_idle_job_bundle(request)
-            reason = self._idle_request_skip_reason(request)
-            if reason is not None:
-                self._record_vardiff_idle_skip(reason)
-                return
-            # Prepared bundles bypass _maybe_send_job_locked's normal build
-            # admission, so preserve its live reorg/headers/IBD trust guard on
-            # the dedicated worker before taking the client lock or sending.
-            if not self.ensure_reorg_reconciled_for_current_tip():
-                self._record_vardiff_idle_skip("superseded")
-                return
-            if not client.job_update_lock.acquire(blocking=False):
-                self._record_vardiff_idle_skip("busy")
-                return
-            try:
-                reason = self._idle_request_skip_reason(request)
-                if reason is not None:
-                    self._record_vardiff_idle_skip(reason)
-                    return
-                bundle_current = self._idle_bundle_current_locked(
-                    client,
-                    bundle,
-                    allow_uncached=True,
-                )
-                if not bundle_current:
-                    self._record_vardiff_idle_skip("superseded")
-                    return
-                # Everything above this point is coordinator preparation. An
-                # OSError there belongs to qbit RPC/ledger I/O, not the miner
-                # socket. Only retire the connection after entering the paired
-                # client delivery path below.
-                delivery_attempted = True
-                retargeted = self._retarget_client_locked(
-                    client,
-                    current_difficulty=request.current_difficulty,
-                    accepted_shares=0,
-                    submitted_shares=0,
-                    accepted_difficulty=Decimal("0"),
-                    elapsed_seconds=request.elapsed_seconds,
-                    require_idle=True,
-                    prepared_bundle=bundle,
-                    expected_connection_id=request.connection_id,
-                    expected_worker=request.worker,
-                    expected_active_job=request.active_job,
-                    expected_window_started=request.window_started_monotonic,
-                    prepared_bundle_allow_uncached=True,
-                )
-            finally:
-                client.job_update_lock.release()
-            if retargeted:
-                with self.lock:
-                    self.idle_retarget_count = int(
-                        getattr(self, "idle_retarget_count", 0)
-                    ) + 1
-                return
-            reason = self._idle_request_skip_reason(request)
-            if reason is not None:
-                self._record_vardiff_idle_skip(reason)
-                return
-            bundle_current = self._idle_bundle_current_locked(
-                client,
-                bundle,
-                allow_uncached=True,
-            )
-            if not bundle_current:
-                self._record_vardiff_idle_skip("superseded")
-        except JobBuildSuperseded:
-            self._record_vardiff_idle_skip("superseded")
-        except OSError:
-            with self._vardiff_idle_lock:
-                self.vardiff_idle_task_failures += 1
-            if delivery_attempted:
-                self.disconnect_client(client)
-                return
-            print(
-                "prism coordinator: idle vardiff retarget preparation failed; "
-                "keeping client connected",
-                flush=True,
-            )
-            traceback.print_exc()
-        except Exception:
-            with self._vardiff_idle_lock:
-                self.vardiff_idle_task_failures += 1
-            print("prism coordinator: idle vardiff retarget task failed", flush=True)
-            traceback.print_exc()
-
-    def _enqueue_idle_retarget(
-        self,
-        request: _IdleRetargetRequest,
-        bundle: CachedJobBundle | None,
-    ) -> str | None:
-        self._ensure_vardiff_idle_state()
-        key = (request.client, request.connection_id)
-        queued_monotonic = time.monotonic()
-        with self._vardiff_idle_lock:
-            if self._vardiff_idle_executor_shutdown or key in self._vardiff_idle_pending:
-                return "superseded"
-            if len(self._vardiff_idle_pending) >= MAX_PENDING_VARDIFF_IDLE_RETARGETS:
-                return "queue_full"
-            executor = self._vardiff_idle_executor
-            if executor is None:
-                executor = ThreadPoolExecutor(
-                    max_workers=PRISM_VARDIFF_IDLE_RETARGET_MAX_WORKERS,
-                    thread_name_prefix="prism-vardiff-idle",
-                )
-                self._vardiff_idle_executor = executor
-            self._vardiff_idle_pending.add(key)
-            self.vardiff_idle_queue_depth += 1
-            try:
-                future = executor.submit(
-                    self._run_idle_retarget_task,
-                    request,
-                    bundle,
-                    queued_monotonic,
-                )
-            except RuntimeError:
-                self._vardiff_idle_pending.discard(key)
-                self.vardiff_idle_queue_depth = max(
-                    0,
-                    self.vardiff_idle_queue_depth - 1,
-                )
-                return "queue_full"
-
-        def finish_task(completed: Future[None]) -> None:
-            self._finish_idle_retarget_task(
-                key,
-                queued_monotonic,
-                started=not completed.cancelled(),
-            )
-
-        future.add_done_callback(finish_task)
-        return None
+        return self._ensure_vardiff_service().request_skip_reason(request)
 
     def shutdown_vardiff_idle_executor(self) -> None:
-        self._ensure_vardiff_idle_state()
-        with self._vardiff_idle_lock:
-            executor = self._vardiff_idle_executor
-            self._vardiff_idle_executor = None
-            self._vardiff_idle_executor_shutdown = True
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+        self._ensure_vardiff_service().shutdown_idle_executor()
 
     def vardiff_idle_sweep_loop(self) -> None:
-        while not self.stop_event.wait(self.vardiff_idle_sweep_seconds):
-            self._record_heartbeat("vardiff_idle_sweep")
-            try:
-                queued = self.vardiff_idle_sweep_once()
-                if queued:
-                    print(
-                        f"prism coordinator: idle vardiff sweep queued {queued} client(s)",
-                        flush=True,
-                    )
-            except Exception:
-                print("prism coordinator: idle vardiff sweep failed", flush=True)
-                traceback.print_exc()
+        self._ensure_vardiff_service().idle_sweep_loop()
 
     def vardiff_idle_sweep_once(self) -> int:
-        sweep_started = time.monotonic()
-        now = time.monotonic()
-        queued = 0
-        try:
-            with self.lock:
-                clients = tuple(self.clients)
-            self._ensure_vardiff_idle_state()
-            with self._vardiff_idle_lock:
-                self.vardiff_idle_clients_inspected += len(clients)
-            for client in clients:
-                self._record_heartbeat("vardiff_idle_sweep")
-                with self._client_vardiff_lock(client), self.lock:
-                    if self._vardiff_idle_tip_divergence_locked():
-                        reason = "superseded"
-                        request = None
-                    elif (
-                        client not in self.clients
-                        or not self.client_can_receive_jobs(client)
-                    ):
-                        reason = "disconnected"
-                        request = None
-                    else:
-                        active_job = client.active_job
-                        worker = client.worker
-                        config = (
-                            client.vardiff_config
-                            or client.listener_vardiff_config
-                            or self.vardiff_config
-                        )
-                        if not config.enabled:
-                            continue
-                        if active_job is None or worker is None:
-                            reason = "superseded"
-                            request = None
-                        else:
-                            elapsed = Decimal(
-                                str(
-                                    max(
-                                        0.001,
-                                        now
-                                        - client.vardiff_window_started_monotonic,
-                                    )
-                                )
-                            )
-                            if (
-                                elapsed < config.retarget_interval_seconds
-                                or client.vardiff_window_accepted != 0
-                                or client.vardiff_window_submitted != 0
-                            ):
-                                reason = "not_idle"
-                                request = None
-                            else:
-                                reason = None
-                                request = _IdleRetargetRequest(
-                                    client=client,
-                                    connection_id=client.connection_id,
-                                    worker=worker,
-                                    active_job=active_job,
-                                    window_started_monotonic=(
-                                        client.vardiff_window_started_monotonic
-                                    ),
-                                    current_difficulty=(
-                                        client.pending_share_difficulty
-                                        or client.share_difficulty
-                                    ),
-                                    elapsed_seconds=elapsed,
-                                )
-                if reason is not None:
-                    self._record_vardiff_idle_skip(reason)
-                    continue
-                assert request is not None
-                if self._idle_request_pending(request):
-                    self._record_vardiff_idle_skip("superseded")
-                    continue
-                if not client.job_update_lock.acquire(blocking=False):
-                    self._record_vardiff_idle_skip("busy")
-                    continue
-                try:
-                    reason = self._idle_request_skip_reason(request)
-                finally:
-                    client.job_update_lock.release()
-                if reason is not None:
-                    self._record_vardiff_idle_skip(reason)
-                    continue
-                bundle = self._cached_idle_job_bundle(client)
-                if bundle is None:
-                    # The sweep itself stays cache-only. A missing/expired
-                    # bundle is rebuilt only by the dedicated bounded worker,
-                    # so the client still makes eventual vardiff progress.
-                    self._record_vardiff_idle_skip("cache_miss")
-                reason = self._enqueue_idle_retarget(request, bundle)
-                if reason is not None:
-                    self._record_vardiff_idle_skip(reason)
-                    continue
-                queued += 1
-            return queued
-        finally:
-            self._record_heartbeat("vardiff_idle_sweep")
-            self._observe_vardiff_idle_seconds(
-                "sweep",
-                max(0.0, time.monotonic() - sweep_started),
-            )
+        return self._ensure_vardiff_service().idle_sweep_once()
 
     def retarget_client(
         self,
@@ -8485,230 +8100,20 @@ class PrismCoordinator:
         expected_active_job: PrismJobContext | None = None,
         expected_window_started: float | None = None,
     ) -> bool:
-        acquired = client.job_update_lock.acquire(blocking=not require_idle)
-        if not acquired:
-            return False
-        try:
-            if require_idle and prepared_bundle is None:
-                prepared_bundle = self._cached_idle_job_bundle(client)
-                if prepared_bundle is None:
-                    return False
-            return self._retarget_client_locked(
-                client,
-                current_difficulty=current_difficulty,
-                accepted_shares=accepted_shares,
-                submitted_shares=submitted_shares,
-                accepted_difficulty=accepted_difficulty,
-                elapsed_seconds=elapsed_seconds,
-                require_idle=require_idle,
-                prepared_bundle=prepared_bundle,
-                expected_connection_id=expected_connection_id,
-                expected_worker=expected_worker,
-                expected_active_job=expected_active_job,
-                expected_window_started=expected_window_started,
-            )
-        finally:
-            client.job_update_lock.release()
-
-    def _retarget_client_locked(
-        self,
-        client: ClientState,
-        *,
-        current_difficulty: Decimal,
-        accepted_shares: int,
-        submitted_shares: int,
-        accepted_difficulty: Decimal,
-        elapsed_seconds: Decimal,
-        require_idle: bool = False,
-        prepared_bundle: CachedJobBundle | None = None,
-        expected_connection_id: int | None = None,
-        expected_worker: WorkerIdentity | None = None,
-        expected_active_job: PrismJobContext | None = None,
-        expected_window_started: float | None = None,
-        prepared_bundle_allow_uncached: bool = False,
-    ) -> bool:
-        config = self.client_vardiff_config(client)
-        if not config.enabled:
-            return False
-        if require_idle:
-            if prepared_bundle is None:
-                return False
-            with self._client_vardiff_lock(client), self.lock:
-                if expected_connection_id is None:
-                    expected_connection_id = client.connection_id
-                if expected_worker is None:
-                    expected_worker = client.worker
-                if expected_active_job is None:
-                    expected_active_job = client.active_job
-                if expected_window_started is None:
-                    expected_window_started = client.vardiff_window_started_monotonic
-                if (
-                    client not in self.clients
-                    or getattr(client, "closing", False)
-                    or not self.client_can_receive_jobs(client)
-                    or client.connection_id != expected_connection_id
-                    or client.worker != expected_worker
-                    or client.active_job is not expected_active_job
-                    or client.vardiff_window_started_monotonic
-                    != expected_window_started
-                    or client.vardiff_window_accepted != 0
-                    or client.vardiff_window_submitted != 0
-                ):
-                    return False
-        observed_difficulty = vardiff.observed_difficulty(
-            accepted_difficulty=accepted_difficulty,
-            elapsed_seconds=elapsed_seconds,
-            target_share_interval_seconds=config.target_share_interval_seconds,
-        )
-        with self._client_vardiff_lock(client):
-            previous_estimate = client.vardiff_difficulty_estimate
-        if observed_difficulty is None:
-            difficulty_estimate = None
-            with self._client_vardiff_lock(client):
-                client.vardiff_difficulty_estimate = None
-        else:
-            difficulty_estimate = vardiff.smooth_difficulty_estimate(
-                observed=observed_difficulty,
-                previous=previous_estimate,
-                config=config,
-            )
-            with self._client_vardiff_lock(client):
-                client.vardiff_difficulty_estimate = difficulty_estimate
-        next_difficulty = vardiff.calculate_next_difficulty(
+        return self._ensure_vardiff_service().retarget(
+            client,
             current_difficulty=current_difficulty,
             accepted_shares=accepted_shares,
-            elapsed_seconds=elapsed_seconds,
-            config=config,
+            submitted_shares=submitted_shares,
             accepted_difficulty=accepted_difficulty,
-            difficulty_estimate=difficulty_estimate,
+            elapsed_seconds=elapsed_seconds,
+            require_idle=require_idle,
+            prepared_bundle=prepared_bundle,
+            expected_connection_id=expected_connection_id,
+            expected_worker=expected_worker,
+            expected_active_job=expected_active_job,
+            expected_window_started=expected_window_started,
         )
-        if not vardiff.should_retarget(
-            current_difficulty,
-            next_difficulty,
-            config.retarget_tolerance,
-        ):
-            return False
-        idle_window_state: tuple[float, int, int, Decimal] | None = None
-        idle_window_reset_at: float | None = None
-        with self._client_vardiff_lock(client), self.lock:
-            previous_difficulty = client.pending_share_difficulty or client.share_difficulty
-            if previous_difficulty != current_difficulty:
-                return False
-            if require_idle and (
-                client not in self.clients
-                or getattr(client, "closing", False)
-                or not self.client_can_receive_jobs(client)
-                or client.connection_id != expected_connection_id
-                or client.worker != expected_worker
-                or client.active_job is not expected_active_job
-                or client.vardiff_window_started_monotonic
-                != expected_window_started
-                or client.vardiff_window_accepted != 0
-                or client.vardiff_window_submitted != 0
-            ):
-                # A share landed since the idle snapshot; the accept path owns
-                # this window. Abort the speculative step-down rather than
-                # overriding a client that just resumed submitting.
-                return False
-            if require_idle:
-                idle_window_state = (
-                    client.vardiff_window_started_monotonic,
-                    client.vardiff_window_accepted,
-                    client.vardiff_window_submitted,
-                    client.vardiff_window_work,
-                )
-            prior_pending = client.pending_share_difficulty
-            client.pending_share_difficulty = next_difficulty
-        idle_authority = (
-            IdleDeliveryAuthority(
-                connection_id=expected_connection_id,
-                worker=expected_worker,
-                expected_active_job=expected_active_job,
-                expected_window_started=expected_window_started,
-                pending_difficulty=next_difficulty,
-            )
-            if require_idle
-            else None
-        )
-        # Advertise the new difficulty only with its corresponding job. Idle
-        # retargets stamp an already-cached bundle; normal share-driven
-        # retargets retain the existing build path. Either path sends the pair
-        # together or restores the prior pending difficulty/window state.
-        def restore_speculative_retarget() -> None:
-            reset_at = idle_window_reset_at
-            if reset_at is None and idle_authority is not None:
-                reset_at = idle_authority.committed_reset_monotonic
-            with self.lock:
-                if client.pending_share_difficulty == next_difficulty:
-                    client.pending_share_difficulty = prior_pending
-                self._restore_idle_window_state(
-                    client,
-                    idle_window_state,
-                    reset_at,
-                )
-
-        try:
-            if require_idle:
-                sent = self._maybe_send_job_locked(
-                    client,
-                    clean_jobs=True,
-                    raise_on_build_failure=True,
-                    prepared_bundle=prepared_bundle,
-                    idle_authority=idle_authority,
-                    prepared_bundle_allow_uncached=(
-                        prepared_bundle_allow_uncached
-                    ),
-                )
-                if idle_authority is not None:
-                    idle_window_reset_at = (
-                        idle_authority.committed_reset_monotonic
-                    )
-            else:
-                sent = bool(
-                    client.authorized
-                    and client.subscribed
-                    and not self.stop_event.is_set()
-                    and self.maybe_send_job(client, clean_jobs=True)
-                )
-            # A completed paired send is the commit point. Shutdown may race
-            # immediately afterward, but it cannot make already-delivered work
-            # speculative again.
-            if sent:
-                return True
-        except Exception:
-            # Cached stamping can surface _JobBuildFailed before delivery, and
-            # socket errors can surface during the paired send. Both must undo
-            # every speculative client mutation before the task reports failure.
-            restore_speculative_retarget()
-            raise
-        restore_speculative_retarget()
-        return False
-
-    @staticmethod
-    def _restore_idle_window_state(
-        client: ClientState,
-        idle_window_state: tuple[float, int, int, Decimal] | None,
-        idle_window_reset_at: float | None,
-    ) -> None:
-        """Un-restart the idle vardiff window after a step-down that never
-        reached the miner (skipped build/send), so the next sweep can retry
-        immediately instead of waiting out another full retarget interval.
-        Caller must hold the client's vardiff_lock. No-op unless this retarget did the reset
-        and nothing else has restarted the window since."""
-        if idle_window_reset_at is None or idle_window_state is None:
-            return
-        if (
-            client.vardiff_window_started_monotonic == idle_window_reset_at
-            and client.vardiff_window_accepted == 0
-            and client.vardiff_window_submitted == 0
-            and client.vardiff_window_work == 0
-        ):
-            (
-                client.vardiff_window_started_monotonic,
-                client.vardiff_window_accepted,
-                client.vardiff_window_submitted,
-                client.vardiff_window_work,
-            ) = idle_window_state
 
     def enqueue_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
         return self._ensure_block_candidate_service().enqueue(candidate)
@@ -8875,803 +8280,11 @@ class PrismCoordinator:
         )
         return True
 
-    def _land_and_confirm_block_candidate(
-        self,
-        candidate: PrismBlockCandidate,
-        *,
-        current_tip: str,
-        already_active: bool,
-        worker: str | None,
-    ) -> tuple[
-        dict[str, Any],
-        dict[str, Any],
-        dict[str, Any],
-        dict[str, Any],
-        AuditPublicationIdentity,
-        dict[str, Any],
-    ] | None:
-        """Land, verify, publish, persist, and confirm one candidate.
-
-        The balance serializer spans the last prior-state check through durable
-        confirmation. Reconciliation therefore cannot change the base beneath
-        the accepted coinbase, while ordinary job delivery remains unblocked.
-        """
-        context = candidate.context
-        submission = candidate.submission
-        expected_height = int(context.template["height"])
-        block_hash = str(submission.block_hash_hex).lower()
-        parent_hash = str(context.template["previousblockhash"])
-        self._ensure_job_cache_state()
-        durable_payout_state = bool(
-            getattr(self.ledger, "durable_payout_state", False)
-        )
-        with self._ensure_payout_state_service().balance_mutation_lock:
-            if self._defer_for_pending_parent_payout_transition(
-                parent_hash=parent_hash,
-                parent_height=expected_height - 1,
-                worker=worker,
-                active_candidate_hash=block_hash if already_active else None,
-                active_candidate_height=expected_height if already_active else None,
-            ):
-                return None
-            block_state: dict[str, object] | None = None
-            block_state_reader = getattr(self.ledger, "pool_block_state", None)
-            transition_already_landed = self._accepted_block_payout_transition_landed(
-                block_hash
-            )
-            reorg_reconciled: bool | None = None
-            if already_active and not transition_already_landed:
-                # A replayed active ancestor may coexist with balances from an
-                # orphaned pool block. Reconcile that global state before this
-                # transition becomes a landed barrier and before validating its
-                # payout base.
-                try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
-                except Exception:
-                    traceback.print_exc()
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                        "reorg reconciliation failed before block replay",
-                        worker=worker,
-                    )
-                    return None
-                if not reorg_reconciled:
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                        "reorg reconciliation reported an untrusted chain view",
-                        worker=worker,
-                    )
-                    return None
-            if already_active and callable(block_state_reader):
-                block_state = block_state_reader(block_hash=block_hash)
-            already_confirmed = bool(
-                block_state is not None
-                and str(block_state.get("chain_state", "")) == "confirmed"
-                and str(block_state.get("maturity_state", "")) != "reversed"
-            )
-            if already_confirmed:
-                # The outbox terminal update can fail after a fully durable
-                # confirmation. Do not replace later global balances with an
-                # ancestor-only preview during exact-idempotent replay.
-                self._clear_accepted_block_payout_preview(block_hash)
-                reorg_reconciled = True
-            elif already_active:
-                self._begin_accepted_block_payout_preview(
-                    block_hash,
-                    block_height=expected_height,
-                )
-                self._mark_accepted_block_payout_landed(
-                    block_hash,
-                    block_height=expected_height,
-                )
-                reorg_reconciled = True
-            elif transition_already_landed:
-                # A prior attempt reached submitblock while holding this
-                # serializer. External reconciliation is barred until it
-                # confirms or is withdrawn, so retry its durable steps directly.
-                reorg_reconciled = True
-            else:
-                try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
-                except Exception:
-                    traceback.print_exc()
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                        "reorg reconciliation failed before block submit",
-                        worker=worker,
-                    )
-                    return None
-            if not reorg_reconciled:
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                    "reorg reconciliation reported an untrusted chain view",
-                    worker=worker,
-                )
-                return None
-            if (
-                already_active
-                and not already_confirmed
-                and self._defer_for_pending_parent_payout_transition(
-                    parent_hash=parent_hash,
-                    parent_height=expected_height - 1,
-                    worker=worker,
-                )
-            ):
-                return None
-            if (
-                durable_payout_state
-                and not already_active
-                and not self.prior_balances_match_current(context.prior_balances)
-            ):
-                self._clear_accepted_block_payout_preview(
-                    block_hash,
-                    invalidate_published=True,
-                )
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_STALE_JOB,
-                    "prior balances changed since the job was issued",
-                    worker=worker,
-                )
-                return None
-            if not already_active:
-                before_height = int(self.rpc.call("getblockcount"))
-                if before_height + 1 != expected_height:
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_BLOCK_STALE,
-                        f"stale block height: template={expected_height} tip={before_height}",
-                        worker=worker,
-                    )
-                    return None
-                # Register before submitblock can expose this hash as the new
-                # tip. Child builders will wait for the verified preview rather
-                # than reading balances that omit their new parent.
-                self._begin_accepted_block_payout_preview(
-                    block_hash,
-                    block_height=expected_height,
-                )
-                # Treat the submit outcome as uncertain before entering RPC.
-                # If transport fails after qbitd accepted the block, this
-                # conservative barrier preserves the coinbase's payout base.
-                self._mark_accepted_block_payout_landed(
-                    block_hash,
-                    block_height=expected_height,
-                )
-                self._record_heartbeat("block_submitter")
-                result = self.rpc.call("submitblock", [submission.block_hex])
-                self._record_heartbeat("block_submitter")
-                if result not in (None, "duplicate"):
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                        f"submitblock rejected candidate: {result}",
-                        worker=worker,
-                    )
-                    return None
-                active_hash = str(
-                    self.rpc.call("getblockhash", [expected_height])
-                ).lower()
-                if active_hash != block_hash:
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_SUBMITBLOCK_REJECTED,
-                        f"submitted block is not active at height {expected_height}",
-                        worker=worker,
-                    )
-                    return None
-                self._cancel_obsolete_job_builds("direct PRISM block accepted")
-                self._mark_tip_refresh_pending(block_hash)
-                self._schedule_tip_refresh_retry()
-
-            preview: list[dict[str, object]] | None = None
-            issued_preview = getattr(context, "prospective_prior_balances", None)
-            if not already_confirmed and issued_preview is not None:
-                # The compact preview came from the immutable issued job
-                # summary. Publish it before rebuilding/canonicalizing the full
-                # audit bundle, without retaining that bundle's shares tree.
-                preview = self._materialize_prior_balance_preview(issued_preview)
-                if durable_payout_state and not self.prior_balances_match_current(
-                    context.prior_balances
-                ):
-                    self.request_shutdown()
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
-                        "accepted block payout base changed before preview publication",
-                        worker=worker,
-                    )
-                    return None
-                self._publish_accepted_block_payout_preview(block_hash, preview)
-
-            self._record_heartbeat("block_submitter")
-            audit_store = self._ensure_audit_artifact_store()
-            candidate_artifact = audit_store.issue_candidate(
-                block_hash=submission.block_hash_hex
-            )
-            candidate_bundle_path = candidate_artifact.path
-            compiler_transferred_candidate = False
-
-            def adopt_compiler_output(path: Path, value: os.stat_result) -> None:
-                nonlocal compiler_transferred_candidate
-                audit_store.adopt_compiler_candidate(
-                    candidate_artifact,
-                    path=path,
-                    value=value,
-                )
-                compiler_transferred_candidate = True
-
-            compiler_parent_fd = audit_store.duplicate_root_directory_fd()
-            try:
-                final_bundle = self.build_audit_bundle(
-                    shares=context.shares_json,
-                    found_block=context.found_block,
-                    prior_balances=context.prior_balances,
-                    coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
-                        candidate.extranonce1_hex,
-                        candidate.extranonce2_hex,
-                    ),
-                    witness_merkle_leaves_hex=list(
-                        getattr(context.job, "witness_merkle_leaves_hex", ())
-                    )
-                    or direct_stratum.witness_merkle_leaves_hex(
-                        getattr(context.job, "transaction_hexes", ())
-                    ),
-                    ctv_fee_parent_hash=parent_hash,
-                    canonical_output_path=candidate_bundle_path,
-                    canonical_output_parent_fd=compiler_parent_fd,
-                    canonical_output_adopter=adopt_compiler_output,
-                )
-            except BaseException:
-                audit_store.discard_candidate(candidate_artifact)
-                raise
-            finally:
-                os.close(compiler_parent_fd)
-            # Compatibility builders used by tests and older integrations may
-            # ignore canonical_output_path. Persist their logical bundle via
-            # the normal canonicalization fallback without mislabeling bytes.
-            try:
-                if not candidate_bundle_path.exists():
-                    candidate_bundle_path = audit_store.write_compatibility_candidate(
-                        candidate_artifact,
-                        final_bundle,
-                    )
-                else:
-                    if not compiler_transferred_candidate:
-                        raise RuntimeError(
-                            "audit builder created an output path without exact inode transfer"
-                        )
-                final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
-                final_coinbase_tx_hex_raw = final_manifest["coinbase_tx_hex"]
-                if not isinstance(final_coinbase_tx_hex_raw, str):
-                    raise ValueError(
-                        "final audit bundle coinbase_tx_hex is not a string"
-                    )
-                final_coinbase_tx_hex = final_coinbase_tx_hex_raw.lower()
-            except BaseException:
-                audit_store.discard_candidate(candidate_artifact)
-                raise
-            if final_coinbase_tx_hex != submission.coinbase_tx_hex.lower():
-                audit_store.discard_candidate(candidate_artifact)
-                self.request_shutdown()
-                self._clear_accepted_block_payout_preview(
-                    block_hash,
-                    invalidate_published=True,
-                )
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
-                    "final audit bundle coinbase does not match submitted coinbase",
-                    worker=worker,
-                )
-                return None
-            payout_commit_started: float | None = None
-            payout_commit_source: int | None = None
-            try:
-                verifier_override = self.__dict__.get("verify_bundle")
-                configured_writer_key = getattr(
-                    self,
-                    "ledger_writer_public_key_hex",
-                    None,
-                )
-                verified_audit = audit_store.verify_candidate(
-                    candidate_artifact,
-                    coinbase_tx_hex=submission.coinbase_tx_hex,
-                    expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
-                    expected_block_height=expected_height,
-                    trusted_writer_public_key_hex=(
-                        self.trusted_ledger_writer_public_key_hex(final_bundle)
-                    ),
-                    trust_source=(
-                        "configured"
-                        if configured_writer_key is not None
-                        else "embedded_test_only"
-                    ),
-                    verifier=(
-                        verifier_override
-                        if callable(verifier_override)
-                        else None
-                    ),
-                )
-                audit_store.require_current_verified_candidate(
-                    verified_audit,
-                    candidate_artifact,
-                )
-                report = dict(verified_audit.report)
-                persistence_canonical_bundle_path = (
-                    candidate_bundle_path
-                    if verified_audit.canonical_copy_eligible
-                    else None
-                )
-                self._record_heartbeat("block_submitter")
-                verified_preview = self._accepted_block_payout_preview_from_bundle(
-                    final_bundle,
-                    prior_balances=context.prior_balances,
-                )
-                if not already_confirmed:
-                    if preview is None and durable_payout_state:
-                        live_prior_balances = self.normalized_prior_balances(
-                            self.ledger.current_prior_balances()
-                        )
-                        expected_prior_balances = self.normalized_prior_balances(
-                            context.prior_balances
-                        )
-                        if live_prior_balances != expected_prior_balances:
-                            self.request_shutdown()
-                            self._clear_accepted_block_payout_preview(
-                                block_hash,
-                                invalidate_published=True,
-                            )
-                            self._abandon_block_candidate(
-                                PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
-                                "accepted block payout base changed before preview publication",
-                                worker=worker,
-                            )
-                            return None
-                    try:
-                        self._publish_accepted_block_payout_preview(
-                            block_hash,
-                            verified_preview,
-                        )
-                    except RuntimeError as exc:
-                        self.request_shutdown()
-                        self._clear_accepted_block_payout_preview(
-                            block_hash,
-                            invalidate_published=True,
-                        )
-                        self._abandon_block_candidate(
-                            PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
-                            "verified final payout preview does not match the "
-                            f"issued block job: {exc}",
-                            worker=worker,
-                        )
-                        return None
-                preview = verified_preview
-
-                # The verified preview is now the effective balance snapshot,
-                # so persistence can do canonicalization, body writes, copies,
-                # and bulk SQL without owning the delivery gate.
-                payout_commit_started = time.monotonic()
-                payout_commit_source = self._capture_payout_state_source()[1]
-                persistence = self.ledger.persist_accepted_block(
-                    block_hash=submission.block_hash_hex,
-                    block_height=expected_height,
-                    parent_hash=parent_hash,
-                    final_bundle=final_bundle,
-                    audit_report=report,
-                    canonical_bundle_path=persistence_canonical_bundle_path,
-                )
-                self._record_heartbeat("block_submitter")
-                active_hash = str(
-                    self.rpc.call("getblockhash", [expected_height])
-                ).lower()
-                if active_hash != block_hash:
-                    if already_confirmed:
-                        self._abandon_block_candidate(
-                            PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                            "accepted ancestor left the active chain during replay",
-                            worker=worker,
-                        )
-                        return None
-                    active_tip_height = int(self.rpc.call("getblockcount"))
-                    self.reject_prepared_block(
-                        block_hash=block_hash,
-                        active_tip_height=active_tip_height,
-                    )
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_BLOCK_STALE,
-                        "accepted block left the active chain before ledger confirmation",
-                        worker=worker,
-                    )
-                    return None
-                with audit_store.publication_order_guard():
-                    confirmation = self.ledger.confirm_accepted_block(
-                        block_hash=block_hash,
-                        # The ledger confirmation function matches this value
-                        # against the candidate row's own height. An accepted
-                        # ancestor can be finalized after newer blocks arrive.
-                        active_tip_height=expected_height,
-                    )
-                    confirmed_count = int(confirmation.get("confirmed_count", 0))
-                    if confirmed_count == 1:
-                        audit_publication_identity = (
-                            self._audit_publication_identity(
-                                block_hash=block_hash,
-                                block_height=expected_height,
-                                confirmation=confirmation,
-                            )
-                        )
-                if confirmed_count != 1:
-                    self.request_shutdown()
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
-                        f"ledger did not confirm accepted block {block_hash}",
-                        worker=worker,
-                    )
-                    return None
-
-                if durable_payout_state:
-                    # Compare the durable active-chain view as of this block,
-                    # not the global latest view: an exact replay may finalize
-                    # ancestor A after later pool block B is already confirmed.
-                    # This also preserves the invariant across restart after a
-                    # prior post-confirm mismatch instead of silently accepting
-                    # the already-confirmed row on the next attempt.
-                    as_of_reader = getattr(
-                        self.ledger,
-                        "prior_balances_after_pool_block",
-                        None,
-                    )
-                    confirmed_balances = self.normalized_prior_balances(
-                        as_of_reader(block_hash=block_hash)
-                        if callable(as_of_reader)
-                        else self.ledger.current_prior_balances()
-                    )
-                    if confirmed_balances != preview:
-                        self.request_shutdown()
-                        self._clear_accepted_block_payout_preview(
-                            block_hash,
-                            invalidate_published=True,
-                        )
-                        self._abandon_block_candidate(
-                            PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
-                            "confirmed payout balances do not match the published "
-                            f"preview for accepted block {block_hash}",
-                            worker=worker,
-                        )
-                        return None
-                # Durability caught up to the already-published logical state;
-                # clearing the parent override needs no second generation bump.
-                self._clear_accepted_block_payout_preview(block_hash)
-                self._schedule_current_payout_ledger_artifact_if_missing()
-                payout_publication_required = (
-                    self._payout_source_requires_publication()
-                )
-                payout_publication_fenced = (
-                    self._payout_state_publication_fenced()
-                )
-                if payout_publication_required or payout_publication_fenced:
-                    # A covered replay normally has no publication work. The
-                    # exception is a leaked delivery fence whose source already
-                    # published: force one republish so the replay heals it.
-                    covered_replay_fence = (
-                        payout_publication_fenced
-                        and not payout_publication_required
-                    )
-                    with self.lock:
-                        pending_cause = self._ensure_payout_state_service().snapshot().source[2]
-                    # A bounded preview-publication loss already left the gate
-                    # fenced and its retry scheduled. Do not monopolize the
-                    # submitter with a second retry budget. Uncertain commits,
-                    # ordinary unfenced tip sources, and a covered replay's
-                    # leaked fence still reconcile now.
-                    publish_now = (
-                        covered_replay_fence
-                        or pending_cause == "direct_block_uncertain"
-                        or not payout_publication_fenced
-                    )
-                    published: int | None = None
-                    if publish_now and getattr(
-                        self,
-                        "reorg_reconciler_enabled",
-                        True,
-                    ):
-                        with self.lock:
-                            latest_tip = self._ensure_payout_state_service().snapshot().source[1]
-                        summary = self.reconcile_prism_pool_blocks_once(
-                            tip_hash=latest_tip,
-                            _force_publish=True,
-                            _source_reserved=True,
-                        )
-                        reconciled_generation = summary.get("published_generation")
-                        if isinstance(reconciled_generation, int):
-                            published = reconciled_generation
-                    elif publish_now:
-                        published = (
-                            self._publish_current_payout_state_with_retry_budget()
-                        )
-                    if publish_now and published is None:
-                        # The block is durably confirmed; only the payout
-                        # publication lost its race. Aborting would keep the
-                        # outbox row pending and replay persist/confirm churn
-                        # for an already-final block. Keep delivery fenced and
-                        # let the scheduled tip refresh publish the newest
-                        # source; this candidate's durable work is complete.
-                        self._block_payout_state_publication()
-                        print(
-                            "prism coordinator: accepted block confirmed "
-                            "durably; payout publication deferred to the "
-                            f"scheduled refresh hash={block_hash}",
-                            flush=True,
-                        )
-                return (
-                    final_bundle,
-                    report,
-                    persistence,
-                    confirmation,
-                    audit_publication_identity,
-                    dict(verified_audit.verification_identity),
-                )
-            except Exception:
-                if payout_commit_started is not None and payout_commit_source is not None:
-                    # Persistence/confirmation can report failure after a
-                    # durable partial commit. Supersede every prepared source
-                    # and keep all delivery fenced until replay/reconciliation
-                    # proves the resulting ledger state.
-                    self._block_payout_state_publication(
-                        supersede_with=(
-                            payout_commit_source,
-                            block_hash,
-                            "direct_block_uncertain",
-                            payout_commit_started,
-                        )
-                    )
-                raise
-            finally:
-                if payout_commit_started is not None:
-                    self._observe_payout_state_seconds(
-                        "preparation",
-                        max(0.0, time.monotonic() - payout_commit_started),
-                    )
-                audit_store.discard_candidate(candidate_artifact)
-
     @ledger_writer_operation("accepted_block_handling")
     def submit_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
-        """Land one block candidate, then finalize its audit and payout state.
-
-        Runs on the block-submitter thread (tests call it synchronously). It
-        never raises for a lost race and holds self.lock only for short
-        in-memory state mutation -- never across RPC, psql, subprocess, or
-        file I/O -- so share acks and job pushes stay fast while a block
-        lands. The durable candidate outbox is the pre-submit recovery boundary;
-        full audit and payout persistence happens after the latency-sensitive
-        ``submitblock`` call and is replayable after a crash. Returns True only
-        after that finalization completes.
-        """
-        outcome = getattr(self, "_block_candidate_outcome", None)
-        if outcome is None:
-            outcome = threading.local()
-            self._block_candidate_outcome = outcome
-        outcome.reason = None
-        context = candidate.context
-        submission = candidate.submission
-        worker = candidate.client.username or None
-        expected_height = int(context.template["height"])
-        block_hash = str(submission.block_hash_hex).lower()
-        parent_hash = str(context.template["previousblockhash"])
-        self._ensure_job_cache_state()
-        with self.lock:
-            pool_closed = (
-                self.accepted_block_count >= self.max_blocks
-                and block_hash not in self._accounted_accepted_block_hashes
-            )
-        if pool_closed:
-            self._clear_accepted_block_payout_preview(
-                block_hash,
-                invalidate_published=True,
-            )
-            self._abandon_block_candidate(
-                PRISM_REJECTION_POOL_CLOSED,
-                "pool is no longer accepting blocks",
-                worker=worker,
-            )
-            return False
-        current_tip = str(self.rpc.call("getbestblockhash"))
-        landed_height: int | None = None
-        if current_tip.lower() == block_hash:
-            landed_height = expected_height
-        elif current_tip != parent_hash:
-            try:
-                landed_height = self.active_block_candidate_height(block_hash)
-            except Exception:
-                traceback.print_exc()
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                    "could not determine whether a prior candidate is active",
-                    worker=worker,
-                )
-                return False
-        already_active = landed_height == expected_height
-        if landed_height is not None and not already_active:
-            self._clear_accepted_block_payout_preview(
-                block_hash,
-                invalidate_published=True,
-            )
-            self._abandon_block_candidate(
-                PRISM_REJECTION_BLOCK_STALE,
-                f"candidate active at unexpected height {landed_height}",
-                worker=worker,
-            )
-            return False
-        if already_active:
-            print(
-                "prism coordinator: resuming finalization for active block candidate "
-                f"height={landed_height} hash={submission.block_hash_hex}",
-                flush=True,
-            )
-        elif parent_hash != current_tip:
-            self._clear_accepted_block_payout_preview(
-                block_hash,
-                invalidate_published=True,
-            )
-            self._abandon_block_candidate(
-                PRISM_REJECTION_STALE_JOB,
-                f"tip moved before submit: {current_tip}",
-                worker=worker,
-            )
-            return False
-        landed = self._land_and_confirm_block_candidate(
-            candidate,
-            current_tip=current_tip,
-            already_active=already_active,
-            worker=worker,
+        return self._ensure_block_finalization_service().submit_block_candidate(
+            candidate
         )
-        if landed is None:
-            return False
-        (
-            final_bundle,
-            report,
-            persistence,
-            confirmation,
-            audit_publication_identity,
-            audit_verification_identity,
-        ) = landed
-        with self.lock:
-            already_accounted = block_hash in self._accounted_accepted_block_hashes
-        if already_accounted:
-            # The previous attempt completed every success side effect but its
-            # durable outbox terminal update failed. submit_next will retry that
-            # update after this exact-idempotent confirmation without double
-            # counting the block or replacing newer evidence/work.
-            return True
-        ctv_persistence = None
-        ctv_manifest_set = final_bundle.get("ctv_fanout_manifest_set")
-        if isinstance(ctv_manifest_set, dict):
-            ctv_persistence = self.ledger.persist_ctv_fanout_manifest_set(
-                block_hash=block_hash,
-                manifest_set=ctv_manifest_set,
-                manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
-            )
-        if candidate.credit_share_on_accept:
-            self.append_accepted_share(
-                candidate.client,
-                context,
-                submission,
-                candidate.pending_share,
-                candidate_intent=self.block_candidate_intent(candidate),
-            )
-        # Aggregate counts only: materializing the whole share history
-        # (all_shares) here would scan the full ledger twice per block,
-        # and would grow without bound as the ledger grows.
-        evidence_share_count, evidence_distinct_miners = self.accepted_share_stats()
-        evidence = {
-            "schema": "qbit.prism.live-stratum-evidence.v1",
-            "block_hash": block_hash,
-            "block_height": expected_height,
-            "coinbase_tx_hex": submission.coinbase_tx_hex,
-            "audit_report": report,
-            "ledger_backend": self.ledger.backend_name,
-            "persistence": persistence,
-            "confirmation": confirmation,
-            "audit_verification_identity": audit_verification_identity,
-            "ctv_persistence": ctv_persistence,
-            "accepted_share_count": evidence_share_count,
-            "distinct_miner_count": evidence_distinct_miners,
-            "job_share_count": len(context.shares_json),
-        }
-        publication_persistence = dict(persistence)
-        publication_persistence.setdefault(
-            "audit_bundle_sha256",
-            report.get("audit_bundle_sha256_hex"),
-        )
-        publication_persistence.setdefault("body_uri", "")
-        evidence["persistence"] = publication_persistence
-        audit_store = self._ensure_audit_artifact_store()
-        with self._ensure_payout_state_service().balance_mutation_lock:
-            with audit_store.publication_order_guard():
-                publication_floor_reader = getattr(
-                    self.ledger,
-                    "audit_publication_sequence_floor",
-                    None,
-                )
-                if callable(publication_floor_reader):
-                    # This is deliberately a fresh durable-row read immediately
-                    # before A1 publication. Confirmation-time state or a raw
-                    # sequence value cannot fence rollback gaps and restart
-                    # replays. P1's local serializer plus A1's process guard
-                    # prevent another confirmation/reactivation from allocating
-                    # between this read and the durable publication decision.
-                    publication_floor_sequence = publication_floor_reader()
-                else:
-                    # Compatibility-only ledgers used by legacy embeddings/tests
-                    # do not own durable ordinal state. Production memory/Postgres
-                    # backends implement the reader above.
-                    publication_floor_sequence = (
-                        audit_publication_identity.sequence
-                    )
-                publication = audit_store.publish_success(
-                    identity=audit_publication_identity,
-                    publication_floor_sequence=publication_floor_sequence,
-                    report=report,
-                    persistence=publication_persistence,
-                    evidence=evidence,
-                    verification_identity=audit_verification_identity,
-                    created_at=public_api.utc_now_iso(),
-                )
-        evidence = dict(publication.evidence)
-        with self.lock:
-            newly_accounted = block_hash not in self._accounted_accepted_block_hashes
-            if newly_accounted:
-                self._accounted_accepted_block_hashes.add(block_hash)
-                self.accepted_block_count += 1
-            self.latest_coinbase_size_bytes = len(
-                str(
-                    final_bundle["signed_coinbase_manifest"]["manifest"][
-                        "coinbase_tx_hex"
-                    ]
-                )
-            ) // 2
-            should_stop = (
-                newly_accounted
-                and (self.stop_after_block or self.accepted_block_count >= self.max_blocks)
-            )
-        if not newly_accounted:
-            return True
-        print(
-            "prism coordinator: qbit accepted direct PRISM block "
-            f"height={expected_height} hash={block_hash}",
-            flush=True,
-        )
-        if should_stop:
-            self.request_shutdown()
-        else:
-            # The public submitter wrapper performs this fanout only after its
-            # writer scope (including outbox finalization) exits. The rare
-            # synchronous share path consumes the same marker after sending
-            # the Stratum result.
-            candidate.client.post_accept_refresh_block = (
-                expected_height,
-                block_hash,
-            )
-        return True
 
     @ledger_writer_operation("accepted_block_handling")
     def reject_prepared_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
@@ -10812,6 +9425,7 @@ class PrismCoordinator:
         lines.extend(self.block_submitter_metrics_lines())
         lines.extend(self.ctv_fanout_broadcaster_metrics_lines())
         lines.extend(self.vardiff_idle_metrics_lines())
+        lines.extend(self.block_finalization_metrics_lines())
         lines.extend(self.job_build_metrics_lines())
         lines.extend(self.tip_refresh_metrics_lines())
         lines.extend(self.payout_state_metrics_lines())
@@ -10969,70 +9583,11 @@ class PrismCoordinator:
         ]
 
     def vardiff_idle_metrics_lines(self) -> list[str]:
-        self._ensure_vardiff_idle_state()
-        with self._vardiff_idle_lock:
-            sweep = {
-                "buckets": dict(self.vardiff_idle_sweep_histogram["buckets"]),
-                "sum": float(self.vardiff_idle_sweep_histogram["sum"]),
-                "count": int(self.vardiff_idle_sweep_histogram["count"]),
-            }
-            task = {
-                "buckets": dict(self.vardiff_idle_task_histogram["buckets"]),
-                "sum": float(self.vardiff_idle_task_histogram["sum"]),
-                "count": int(self.vardiff_idle_task_histogram["count"]),
-            }
-            inspected = self.vardiff_idle_clients_inspected
-            skip_counts = dict(self.vardiff_idle_skip_counts)
-            queue_depth = self.vardiff_idle_queue_depth
-            inflight = self.vardiff_idle_inflight
-            failures = self.vardiff_idle_task_failures
+        return self._ensure_vardiff_service().metrics_lines()
 
-        lines = [
-            "# HELP qbit_prism_vardiff_idle_clients_inspected_total Clients inspected by bounded vardiff idle sweeps.",
-            "# TYPE qbit_prism_vardiff_idle_clients_inspected_total counter",
-            f"qbit_prism_vardiff_idle_clients_inspected_total {inspected}",
-            "# HELP qbit_prism_vardiff_idle_skips_total Idle retargets skipped by a bounded reason.",
-            "# TYPE qbit_prism_vardiff_idle_skips_total counter",
-            *[
-                f'qbit_prism_vardiff_idle_skips_total{{reason="{reason}"}} {int(skip_counts.get(reason, 0))}'
-                for reason in PRISM_VARDIFF_IDLE_SKIP_REASONS
-            ],
-            "# HELP qbit_prism_vardiff_idle_queue_depth Cache-only idle retarget tasks waiting for a dedicated worker.",
-            "# TYPE qbit_prism_vardiff_idle_queue_depth gauge",
-            f"qbit_prism_vardiff_idle_queue_depth {queue_depth}",
-            "# HELP qbit_prism_vardiff_idle_inflight Cache-only idle retarget tasks currently running.",
-            "# TYPE qbit_prism_vardiff_idle_inflight gauge",
-            f"qbit_prism_vardiff_idle_inflight {inflight}",
-            "# HELP qbit_prism_vardiff_idle_task_failures_total Idle retarget tasks that failed during cached delivery.",
-            "# TYPE qbit_prism_vardiff_idle_task_failures_total counter",
-            f"qbit_prism_vardiff_idle_task_failures_total {failures}",
-        ]
-        for metric_name, description, histogram in (
-            (
-                "qbit_prism_vardiff_idle_sweep_seconds",
-                "Wall time of one bounded vardiff idle sweep.",
-                sweep,
-            ),
-            (
-                "qbit_prism_vardiff_idle_retarget_task_seconds",
-                "Queue plus execution latency for cache-only idle retarget tasks.",
-                task,
-            ),
-        ):
-            lines.extend(
-                [
-                    f"# HELP {metric_name} {description}",
-                    f"# TYPE {metric_name} histogram",
-                    *[
-                        f'{metric_name}_bucket{{le="{bucket:g}"}} {histogram["buckets"].get(bucket, 0)}'
-                        for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS
-                    ],
-                    f'{metric_name}_bucket{{le="+Inf"}} {histogram["count"]}',
-                    f'{metric_name}_sum {float(histogram["sum"]):.6f}',
-                    f'{metric_name}_count {histogram["count"]}',
-                ]
-            )
-        return lines
+    def block_finalization_metrics_lines(self) -> list[str]:
+        return self._ensure_block_finalization_service().metrics_lines()
+
     def tip_refresh_metrics_lines(self) -> list[str]:
         return self._ensure_tip_refresh_service().metrics_lines()
 
