@@ -4364,6 +4364,15 @@ class PrismCoordinator:
                     )
         except BaseException as exc:  # noqa: BLE001 - delivered to all waiters
             error = exc
+        if error is None and isinstance(result, CachedJobBundle):
+            # Publish through the normal exact-current guard before retiring
+            # the single-flight owner. Otherwise a caller can arrive after the
+            # active slot is cleared but before a waiter caches the completed
+            # result, causing a duplicate build for the same immutable work.
+            try:
+                self._cache_job_bundle_if_current(result, request.artifacts)
+            except BaseException as exc:  # noqa: BLE001 - delivered to waiters
+                error = exc
         with self._job_build_scheduler_lock:
             self.job_build_scheduler_counts["completions"] += 1
             self.shared_bundle_preparation_count += 1
