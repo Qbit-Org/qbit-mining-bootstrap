@@ -461,7 +461,7 @@ def main() -> int:
         if not server.ensure_reorg_reconciled_for_tip(rpc.template["previousblockhash"]):
             raise RuntimeError("benchmark payout reconciliation failed")
         server._prepare_payout_ledger_artifact(
-            server._payout_state_generation,
+            server._ensure_payout_state_service().snapshot().generation,
             artifacts.network_difficulty,
         )
         # The benchmark's timed path models an already-published artifact, not
@@ -500,6 +500,8 @@ def main() -> int:
     finally:
         pool.close()
 
+    tip_refresh_metrics = server._ensure_tip_refresh_service().metrics_snapshot()
+    job_bundle_metrics = server._ensure_job_bundle_service().metrics_snapshot()
     report = {
         "schema": "qbit.prism.job-build-benchmark.v1",
         "mode": args.mode,
@@ -514,23 +516,19 @@ def main() -> int:
         "sent_job_elapsed_seconds": summarize(samples),
         "full_refresh_wall_seconds": summarize(flip_wall_times),
         "tip_to_first_delivery_seconds": summarize_histogram(
-            server.tip_refresh_histograms["first_delivery"]
+            tip_refresh_metrics["histograms"]["first_delivery"]
         ),
         "tip_to_last_delivery_seconds": summarize_histogram(
-            server.tip_refresh_histograms["last_delivery"]
+            tip_refresh_metrics["histograms"]["last_delivery"]
         ),
         "phase_totals_seconds": {k: round(v, 3) for k, v in sorted(phase_totals.items())},
         "bundle_phase_totals_seconds": {
             phase: round(float(histogram["sum"]), 4)
-            for phase, histogram in getattr(
-                server,
-                "tip_refresh_build_phase_histograms",
-                {},
-            ).items()
+            for phase, histogram in tip_refresh_metrics["phase_histograms"].items()
         },
-        "builder_ipc_bytes": dict(getattr(server, "tip_refresh_ipc_bytes", {})),
-        "cache_hits": dict(server.job_cache_hit_counts),
-        "cache_misses": dict(server.job_cache_miss_counts),
+        "builder_ipc_bytes": dict(tip_refresh_metrics["ipc_bytes"]),
+        "cache_hits": dict(job_bundle_metrics["hit_counts"]),
+        "cache_misses": dict(job_bundle_metrics["miss_counts"]),
         "getblocktemplate_calls": rpc.calls.get("getblocktemplate", 0),
     }
     text = json.dumps(report, indent=2)

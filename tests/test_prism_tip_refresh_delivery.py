@@ -152,7 +152,9 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         # maps, or the published tip state.
         self.assertEqual(server.latest_detected_tip[0], old_tip)
         self.assertIsNone(server.current_tip_first_seen)
-        self.assertIsNone(server._template_artifacts)
+        self.assertIsNone(
+            server._ensure_job_bundle_service().template_repository.current_artifacts()
+        )
     def test_slow_tip_poll_cannot_regress_newer_blockwait_observation(self) -> None:
         old_tip = "00" * 32
         new_tip = "11" * 32
@@ -169,10 +171,12 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             self.assertTrue(server.observe_tip_for_refresh(new_tip))
             return old_snapshot
 
-        server.fetch_qbit_tip_template_snapshot = overtake_poll  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            fetch_snapshot=overtake_poll
+        )
 
         with self.assertRaisesRegex(
-            TemplateRefreshSuperseded,
+            TemplateRefreshBlocked,
             "tip/template poll was superseded during template fetch",
         ):
             server.poll_qbit_tip_template_once()
@@ -180,11 +184,6 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         self.assertEqual(server.latest_detected_tip[0], new_tip)
         self.assertEqual(server.current_tip_first_seen[0], old_tip)
         self.assertIsNone(server.tip_template_snapshot)
-        self.assertIsNone(
-            getattr(server, "template_refresh_failure_started_monotonic", None)
-        )
-        self.assertTrue(server._consume_tip_refresh_retry())
-        self.assertFalse(server._consume_tip_refresh_retry())
     def test_same_tip_template_refresh_sends_non_clean_job_and_keeps_old_job_submittable(self) -> None:
         tip = "00" * 32
         server = coordinator()
@@ -345,7 +344,7 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         with self.assertRaisesRegex(TemplateRefreshBlocked, "no refreshed work was issued"):
             server.poll_qbit_tip_template_once()
 
-        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 1)
         self.assertEqual(server.tip_refresh_job_count, 0)
         self.assertIn(state, server.clients)
         self.assertEqual(state.active_job_ids, {"old-job"})
@@ -407,7 +406,7 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         with self.assertRaisesRegex(TemplateRefreshBlocked, "no refreshed work was issued"):
             server.poll_qbit_tip_template_once()
 
-        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 1)
         self.assertEqual(disconnected_clients, [disconnected])
         self.assertIn(build_failed, server.clients)
     def test_tip_reconciliation_quarantines_disconnected_block_before_refresh_job(self) -> None:
@@ -565,7 +564,7 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
 
         self.assertFalse(sent_job)
         self.assertEqual(server.reorg_reconcile_error_count, 1)
-        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 0)
     def test_reconciliation_runs_again_for_same_tip_hash(self) -> None:
         tip = "5a" * 32
         server = coordinator()
@@ -583,8 +582,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         self.assertTrue(server.ensure_reorg_reconciled_for_tip(tip))
 
         self.assertEqual(ledger.events, [("watch", 10), ("mature", 10), ("watch", 10), ("mature", 10)])
-        self.assertEqual(server._payout_state_generation, 1)
-        self.assertEqual(server._payout_state_source[0], 1)
+        self.assertEqual(server._payout_state_service._generation, 1)
+        self.assertEqual(server._payout_state_service._source[0], 1)
     def test_reconciliation_reactivates_inactive_block_that_returns_to_active_chain(self) -> None:
         pool_block_hash = "cc" * 32
         server = coordinator()
@@ -662,6 +661,9 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
     def test_template_refresh_failure_budget_starts_at_first_failure(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
         server.template_refresh_failure_exit_seconds = 120
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server.last_successful_template_refresh_monotonic = 100.0
 
         server._record_template_refresh_failure(500.0)
@@ -672,10 +674,15 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
     def test_disabled_template_refresh_failure_budget_does_not_start_or_expire(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
         server.template_refresh_failure_exit_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
 
         server._record_template_refresh_failure(500.0)
         self.assertFalse(server.template_refresh_failure_expired(500.0))
-        self.assertFalse(hasattr(server, "template_refresh_failure_started_monotonic"))
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
     def test_coordination_blocked_refresh_does_not_start_failure_budget(self) -> None:
         for blocked_error in (
             TemplateRefreshSuperseded("qbit tip changed during sequential refresh"),
@@ -684,13 +691,21 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             with self.subTest(blocked=type(blocked_error).__name__):
                 server = coordinator()
                 server.template_refresh_failure_exit_seconds = 10.0
+                server._ensure_tip_refresh_service().reconfigure_for_test(
+                    failure_exit_seconds=server.template_refresh_failure_exit_seconds
+                )
                 server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+                server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+                    heartbeat=server._record_heartbeat
+                )
                 server.rpc = TipRpc("11" * 32)
 
                 def raise_blocked(error: Exception = blocked_error) -> QbitTipTemplateSnapshot:
                     raise error
 
-                server.fetch_qbit_tip_template_snapshot = raise_blocked  # type: ignore[method-assign]
+                server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+                    fetch_snapshot=raise_blocked
+                )
                 with self.assertRaises(type(blocked_error)):
                     server.poll_qbit_tip_template_once()
 
@@ -704,7 +719,13 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         # the TemplateRefreshSuperseded/payout-fence subclasses are exempt.
         server = coordinator()
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         server.rpc = TipRpc("11" * 32)
 
         def raise_blocked() -> QbitTipTemplateSnapshot:
@@ -712,7 +733,9 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
                 "unable to derive exact artifacts for observed qbit template"
             )
 
-        server.fetch_qbit_tip_template_snapshot = raise_blocked  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            fetch_snapshot=raise_blocked
+        )
         with (
             patch("lab.prism.prism_coordinator.time.monotonic", return_value=100.0),
             self.assertRaises(TemplateRefreshBlocked),
@@ -724,8 +747,17 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
     def test_sustained_blocked_refresh_storm_never_exhausts_failure_budget(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         server.rpc = TipRpc("11" * 32)
         clock = {"now": 100.0}
         blocked_polls = 0
@@ -744,13 +776,15 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
                 "payout state invalidation is pending publication"
             )
 
-        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            fetch_snapshot=blocked_fetch
+        )
         with (
             patch(
                 "lab.prism.prism_coordinator.time.monotonic",
                 side_effect=lambda: clock["now"],
             ),
-            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
             patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
         ):
             server.blockpoll_loop()
@@ -768,9 +802,18 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         # budgeted failure, and the clock clears on the next completed refresh.
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server.template_refresh_failure_started_monotonic = 100.0
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         server.rpc = TipRpc("11" * 32)
         clock = {"now": 100.0}
         blocked_polls = 0
@@ -785,13 +828,15 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
                 "qbit tip changed during sequential refresh; immediate retry scheduled"
             )
 
-        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            fetch_snapshot=blocked_fetch
+        )
         with (
             patch(
                 "lab.prism.prism_coordinator.time.monotonic",
                 side_effect=lambda: clock["now"],
             ),
-            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
             patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
         ):
             server.blockpoll_loop()
@@ -807,8 +852,17 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
     def test_rpc_outage_arms_and_exhausts_failure_budget(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         clock = {"now": 100.0}
 
         class OutageRpc:
@@ -822,7 +876,7 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
                 "lab.prism.prism_coordinator.time.monotonic",
                 side_effect=lambda: clock["now"],
             ),
-            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
             patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
             self.assertRaises(SystemExit),
         ):
@@ -837,8 +891,17 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         # first such failure and take the budgeted restart path.
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         server.rpc = TipRpc("11" * 32)
         clock = {"now": 100.0}
 
@@ -848,13 +911,15 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
                 "unable to derive exact artifacts for observed qbit template"
             )
 
-        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            fetch_snapshot=blocked_fetch
+        )
         with (
             patch(
                 "lab.prism.prism_coordinator.time.monotonic",
                 side_effect=lambda: clock["now"],
             ),
-            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
             patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
             self.assertRaises(SystemExit),
         ):
@@ -865,10 +930,19 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
     def test_healthy_noop_template_poll_resets_refresh_failure_clock(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.last_successful_template_refresh_monotonic = 100.0
         server.template_refresh_failure_started_monotonic = 190.0
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         snapshot = QbitTipTemplateSnapshot(
             bestblockhash="11" * 32,
             previousblockhash="11" * 32,
@@ -876,7 +950,9 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         )
         server.tip_template_snapshot = snapshot
         server.rpc = TipRpc(snapshot.bestblockhash)
-        server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            fetch_snapshot=lambda: snapshot
+        )
 
         def trusted_chain_view(_tip: str) -> bool:
             server.stop_event.set()
@@ -901,7 +977,9 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             template_fingerprint="22" * 32,
         )
         server.rpc = TipRpc(snapshot.bestblockhash)
-        server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            fetch_snapshot=lambda: snapshot
+        )
         server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
 
         with patch("lab.prism.prism_coordinator.time.monotonic", return_value=200.0):
@@ -912,22 +990,33 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
     def test_untrusted_reconciliation_exhausts_template_refresh_failure_budget(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.last_successful_template_refresh_monotonic = 100.0
         server.template_refresh_failure_started_monotonic = 100.0
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         snapshot = QbitTipTemplateSnapshot(
             bestblockhash="11" * 32,
             previousblockhash="11" * 32,
             template_fingerprint="22" * 32,
         )
         server.rpc = TipRpc(snapshot.bestblockhash)
-        server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            fetch_snapshot=lambda: snapshot
+        )
         server.ensure_reorg_reconciled_for_tip = lambda _tip: False  # type: ignore[method-assign]
 
         with (
             patch("lab.prism.prism_coordinator.time.monotonic", return_value=110.0),
-            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
             patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
             self.assertRaises(SystemExit),
         ):
@@ -940,10 +1029,19 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         new_tip = "33" * 32
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.last_successful_template_refresh_monotonic = 100.0
         server.template_refresh_failure_started_monotonic = 100.0
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         state = client()
         state.username = "miner-a"
         state.worker = worker_identity()
@@ -962,21 +1060,23 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             template_fingerprint="44" * 32,
         )
         server.rpc = TipRpc(new_tip)
-        server.fetch_qbit_tip_template_snapshot = lambda: snapshot  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            fetch_snapshot=lambda: snapshot
+        )
         server.build_job_for_client = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
             RuntimeError("template build unavailable")
         )
 
         with (
             patch("lab.prism.prism_coordinator.time.monotonic", return_value=110.0),
-            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
             patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
             self.assertRaises(SystemExit),
         ):
             server.blockpoll_loop()
 
         exit_process.assert_called_once_with(1)
-        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 1)
         self.assertEqual(server.last_successful_template_refresh_monotonic, 100.0)
     def test_guarded_sequential_build_supersession_does_not_arm_failure_budget(self) -> None:
         # Non-ready/collection mode: the sequential loop's guarded client
@@ -988,8 +1088,17 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         new_tip = "33" * 32
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         state = client()
         state.username = "miner-a"
         state.worker = worker_identity()
@@ -1019,9 +1128,10 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
                 server.stop_event.set()
             return snapshot
 
-        server.fetch_qbit_tip_template_snapshot = fetch_snapshot  # type: ignore[method-assign]
+        tip_refresh = server._ensure_tip_refresh_service()
+        tip_refresh.reconfigure_ports_for_test(fetch_snapshot=fetch_snapshot)
         # The guarded pre-build currency check loses the race on every pass.
-        server._tip_refresh_snapshot_current_locked = (  # type: ignore[method-assign]
+        tip_refresh.snapshot_current = (  # type: ignore[method-assign]
             lambda *_args, **_kwargs: False
         )
 
@@ -1030,7 +1140,7 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
                 "lab.prism.prism_coordinator.time.monotonic",
                 side_effect=lambda: clock["now"],
             ),
-            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
             patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
         ):
             server.blockpoll_loop()
@@ -1044,9 +1154,18 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
     def test_transient_template_refresh_failure_recovers_on_healthy_noop(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.last_successful_template_refresh_monotonic = 100.0
         server.template_refresh_failure_exit_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            heartbeat=server._record_heartbeat
+        )
         poll_count = 0
 
         def fail_then_noop() -> int:
@@ -1058,10 +1177,11 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             server.stop_event.set()
             return 0
 
-        server.poll_qbit_tip_template_once = fail_then_noop  # type: ignore[method-assign]
+        tip_refresh = server._ensure_tip_refresh_service()
+        tip_refresh.poll_once = fail_then_noop  # type: ignore[method-assign]
         with (
             patch("lab.prism.prism_coordinator.time.monotonic", side_effect=[105.0, 106.0]),
-            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
         ):
             server.blockpoll_loop()
 
@@ -1113,6 +1233,9 @@ class PrismCoordinatorReliabilityTests(_VardiffSupportTestCase):
         tip_b = "bb" * 32
         server.rpc = SimpleNamespace(call=lambda method: tip_a)
         server.blockpoll_seconds = 1.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         known_tips: list[str] = []
         detected_tips: list[str] = []
 
@@ -1122,7 +1245,8 @@ class PrismCoordinatorReliabilityTests(_VardiffSupportTestCase):
                 server.stop_event.set()
             return tip_b
 
-        server.blockwait_once = blockwait_once  # type: ignore[method-assign]
+        tip_refresh = server._ensure_tip_refresh_service()
+        tip_refresh.blockwait_once = blockwait_once  # type: ignore[method-assign]
 
         def observe_tip_for_refresh(tip_hash: str, **_kwargs: object) -> bool:
             detected_tips.append(tip_hash)
@@ -1130,14 +1254,10 @@ class PrismCoordinatorReliabilityTests(_VardiffSupportTestCase):
                 raise TemplateRefreshBlocked("notification failed")
             return True
 
-        def reject_premature_publication(*_args: object, **_kwargs: object) -> bool:
-            raise AssertionError("blockwait must not publish submit authority")
-
-        server.observe_tip_for_refresh = observe_tip_for_refresh  # type: ignore[method-assign]
-        server.observe_tip_first_seen = reject_premature_publication  # type: ignore[method-assign]
+        tip_refresh.observe_tip = observe_tip_for_refresh  # type: ignore[method-assign]
 
         with patch("builtins.print"), patch(
-            "lab.prism.prism_coordinator.traceback.print_exc"
+            "lab.prism.tip_refresh.traceback.print_exc"
         ), patch.object(
             server.stop_event,
             "wait",
@@ -1147,6 +1267,38 @@ class PrismCoordinatorReliabilityTests(_VardiffSupportTestCase):
 
         self.assertEqual(known_tips, [tip_a, tip_b])
         self.assertEqual(detected_tips, [tip_a, tip_b])
+    def test_blockwait_failure_loop_reuses_existing_stop_event(self) -> None:
+        server = self._bare_coordinator()
+        tip = "aa" * 32
+        server.rpc = SimpleNamespace(call=lambda method: tip)
+        server.blockpoll_seconds = 1.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
+        attempts = 0
+        tip_refresh = server._ensure_tip_refresh_service()
+
+        def fail_blockwait(_known_tip: str) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 3:
+                server.stop_event.set()
+            raise RuntimeError("transient waitfornewblock failure")
+
+        tip_refresh.blockwait_once = fail_blockwait  # type: ignore[method-assign]
+        tip_refresh.reconfigure_ports_for_test(wait_for_stop=lambda _seconds: False)
+
+        with (
+            patch("builtins.print"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
+            patch(
+                "lab.prism.prism_coordinator.threading.Event",
+                side_effect=AssertionError("allocated fallback stop event"),
+            ),
+        ):
+            server.blockwait_loop()
+
+        self.assertEqual(attempts, 3)
     def test_blockwait_unsupported_removes_watchdog_heartbeat(self) -> None:
         server = coordinator()
         server.rpc = UnsupportedBlockwaitRpc("00" * 32)
@@ -1235,6 +1387,7 @@ class PrismStampedJobFloorTests(_VardiffSupportTestCase):
         state.active_job = context
 
         server.min_ready_miners = 1
+        server._ensure_job_bundle_service().set_min_ready_miners_for_test(1)
         server.accepted_share_stats = lambda: (0, 0)  # type: ignore[method-assign]
         self.assertFalse(server.pool_readiness_latched())
         self.assertFalse(server.client_needs_tip_template_refresh(state, snapshot))
@@ -1334,7 +1487,7 @@ class JobBundleCacheTests(_JobSupportTestCase):
 
         self.assertEqual(refreshed, 250)
         self.assertEqual(recorded["calls"], 1)
-        cached = next(iter(server._job_bundle_cache.values()))
+        cached = next(iter(server._ensure_job_bundle_service()._bundle_cache.values()))
         self.assertEqual(
             len({id(state.active_job.shares_json) for state in clients}),
             1,
@@ -1354,7 +1507,10 @@ class JobBundleCacheTests(_JobSupportTestCase):
     def test_supersession_retry_wakes_blockpoll_without_full_interval(self) -> None:
         server, _ = coordinator()
         server.blockpoll_seconds = 60.0
-        server._ensure_tip_refresh_state()
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
+        tip_refresh = server._ensure_tip_refresh_service()
         poll_called = threading.Event()
 
         def poll_once() -> int:
@@ -1362,7 +1518,7 @@ class JobBundleCacheTests(_JobSupportTestCase):
             server.stop_event.set()
             return 0
 
-        server.poll_qbit_tip_template_once = poll_once  # type: ignore[method-assign]
+        tip_refresh.poll_once = poll_once  # type: ignore[method-assign]
         thread = threading.Thread(target=server.blockpoll_loop)
         thread.start()
         try:
@@ -1378,6 +1534,9 @@ class JobBundleCacheTests(_JobSupportTestCase):
         server, _ = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 2
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         clients = [client(index + 1) for index in range(6)]
         server.clients = set(clients)
         release = threading.Event()
@@ -1421,6 +1580,9 @@ class JobBundleCacheTests(_JobSupportTestCase):
         server, _ = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 2
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         blocked = client(1)
         healthy = client(2)
         server.clients = {blocked, healthy}
@@ -1455,6 +1617,9 @@ class JobBundleCacheTests(_JobSupportTestCase):
         server, _ = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         state = client(1)
         server.clients = {state}
         worker_started = threading.Event()
@@ -1502,7 +1667,7 @@ class JobBundleCacheTests(_JobSupportTestCase):
         self.assertTrue(shutdown_complete.is_set())
         self.assertTrue(worker_send_finished.is_set())
         self.assertEqual(poll_errors, [])
-        self.assertEqual(server.tip_refresh_inflight, 0)
+        self.assertEqual(server._ensure_tip_refresh_service().metrics_snapshot()["inflight"], 0)
         with self.assertRaisesRegex(RuntimeError, "executor is shut down"):
             server.tip_refresh_executor()
     def test_queued_fanout_stops_when_chain_view_becomes_untrusted(self) -> None:
@@ -1538,6 +1703,9 @@ class JobBundleCacheTests(_JobSupportTestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first = client(1)
         second = client(2)
         server.clients = [first, second]  # type: ignore[assignment]
@@ -1576,7 +1744,7 @@ class JobBundleCacheTests(_JobSupportTestCase):
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], TemplateRefreshBlocked)
         self.assertIn("immediate retry scheduled", str(errors[0]))
-        self.assertTrue(server._tip_refresh_retry.is_set())
+        self.assertTrue(server._ensure_tip_refresh_service().snapshot().retry_requested)
         self.assertIsNotNone(first.active_job)
         self.assertIsNotNone(second.active_job)
         self.assertEqual(
@@ -1587,6 +1755,9 @@ class JobBundleCacheTests(_JobSupportTestCase):
         server, _ = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         admitted = client(1)
         queued = client(2)
         server.clients = [admitted, queued]  # type: ignore[assignment]
@@ -1639,6 +1810,9 @@ class JobBundleCacheTests(_JobSupportTestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first = client(1)
         second = client(2)
         # Preserve task order so the cache replacement happens after one
@@ -1657,6 +1831,7 @@ class JobBundleCacheTests(_JobSupportTestCase):
         second.send = second_sent.append  # type: ignore[method-assign]
         refreshed: list[int] = []
         errors: list[BaseException] = []
+        followup_drained = False
 
         def poll() -> None:
             try:
@@ -1679,20 +1854,44 @@ class JobBundleCacheTests(_JobSupportTestCase):
         finally:
             release_first.set()
             thread.join(5)
+            followup_drained = (
+                server._ensure_tip_refresh_service().wait_for_scheduler_idle_for_test()
+            )
             server.shutdown_tip_refresh_executor()
 
         self.assertFalse(thread.is_alive())
+        self.assertTrue(followup_drained)
         self.assertEqual(errors, [])
         self.assertEqual(refreshed, [2])
         self.assertIsNotNone(server.last_successful_template_refresh_monotonic)
         self.assertEqual(
             [payload["method"] for payload in second_sent],
-            ["mining.set_difficulty", "mining.notify"],
+            [
+                "mining.set_difficulty",
+                "mining.notify",
+                "mining.set_difficulty",
+                "mining.notify",
+            ],
         )
+        assert replacement_artifacts is not None
+        for state in (first, second):
+            self.assertIsNotNone(state.active_job)
+            self.assertIs(state.active_job.template, replacement_artifacts.template)
+            self.assertEqual(
+                state.active_job.template_fingerprint,
+                replacement_artifacts.fingerprint,
+            )
+            self.assertEqual(
+                state.active_job.template_generation,
+                replacement_artifacts.generation,
+            )
     def test_queued_fanout_does_not_overwrite_intervening_job(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first = client(1)
         second = client(2)
         server.clients = [first, second]  # type: ignore[assignment]
@@ -1751,10 +1950,14 @@ class JobBundleCacheTests(_JobSupportTestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
-        # The poll must observe the same-tip template rotation immediately for
-        # the queued-fanout replacement race below; disable the same-tip
-        # template reuse window so the rotation is fetched, not deferred.
+        # This race requires the same-tip template rotation to be fetched now.
         server.template_cache_seconds = 0.0
+        server._ensure_job_bundle_service().template_repository.set_cache_seconds_for_test(
+            0.0
+        )
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first = client(1)
         second = client(2)
         server.clients = [first, second]  # type: ignore[assignment]
@@ -1850,7 +2053,7 @@ class JobBundleCacheTests(_JobSupportTestCase):
         )
         current_intervening_job = dataclass_replace(
             stale_intervening_job,
-            payout_state_generation=server._payout_state_generation,
+            payout_state_generation=server._payout_state_service._generation,
         )
         self.assertTrue(
             server.intervening_job_supersedes_snapshot(
@@ -1919,6 +2122,9 @@ class JobBundleCacheTests(_JobSupportTestCase):
         server, _ = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         first = client(1)
         removed = client(2)
         clients = [first, removed]
@@ -1970,7 +2176,8 @@ class JobBundleCacheTests(_JobSupportTestCase):
         for state in states:
             state.send = sent.append  # type: ignore[method-assign]
         server.clients = set(states)
-        original_shared_job_bundle = server.shared_job_bundle
+        job_bundles = server._ensure_job_bundle_service()
+        original_shared_job_bundle = job_bundles.shared_job_bundle
         race_calls = 0
 
         def race_artifacts(
@@ -1981,14 +2188,15 @@ class JobBundleCacheTests(_JobSupportTestCase):
             nonlocal race_calls
             race_calls += 1
             bundle = original_shared_job_bundle(artifacts, identity, **kwargs)
-            with server._job_cache_lock:
-                server._template_artifacts = dataclass_replace(
-                    server._template_artifacts,
-                    fingerprint="ff" * 32,
-                )
+            repository = server._ensure_job_bundle_service().template_repository
+            current = repository.current_artifacts()
+            assert current is not None
+            repository.replace_for_test(
+                dataclass_replace(current, fingerprint="ff" * 32)
+            )
             return bundle
 
-        server.shared_job_bundle = race_artifacts  # type: ignore[method-assign]
+        job_bundles.shared_job_bundle = race_artifacts  # type: ignore[method-assign]
 
         refreshed = server.poll_qbit_tip_template_once()
 

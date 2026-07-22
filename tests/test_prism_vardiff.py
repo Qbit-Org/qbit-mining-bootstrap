@@ -76,7 +76,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.note_vardiff_submitted_share(state)
         server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
 
-        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 1)
         self.assertIsNone(state.pending_share_difficulty)  # rolled back, not left at the new value
         self.assertEqual(state.share_difficulty, Decimal("1"))  # unchanged
         self.assertEqual(state.active_job_ids, {"old-job"})  # old job retained, still submittable
@@ -284,7 +284,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             ),
             window_state,
         )
-        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 1)
         self.assertEqual(server.vardiff_idle_task_failures, 1)
     def test_idle_cached_bundle_requires_live_reorg_trust(self) -> None:
         server = coordinator()
@@ -323,8 +323,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         state = client()
         prepare_idle_client(server, state, tip=old_tip)
         install_idle_job_cache(server, tip=old_tip)
-        with server._job_cache_lock:
-            published_artifacts = server._template_artifacts
+        repository = server._ensure_job_bundle_service().template_repository
+        published_artifacts = repository.current_artifacts()
         assert published_artifacts is not None
         detected_template = gbt_template(new_tip, height=11)
         detected_artifacts = CachedTemplateArtifacts(
@@ -349,10 +349,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             template_generation=published_artifacts.generation,
             template_artifacts=published_artifacts,
         )
-        with server._job_cache_lock:
-            server._template_artifacts = detected_artifacts
-            server._published_payout_state = dataclass_replace(
-                server._published_payout_state,
+        repository.replace_for_test(detected_artifacts)
+        with server._payout_state_service._lock:
+            server._payout_state_service._published = dataclass_replace(
+                server._payout_state_service._published,
                 source_tip_hash=new_tip,
             )
         window_state = (
@@ -391,8 +391,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         state = client()
         prepare_idle_client(server, state, tip=old_tip)
         install_idle_job_cache(server, tip=old_tip)
-        with server._job_cache_lock:
-            published_artifacts = server._template_artifacts
+        repository = server._ensure_job_bundle_service().template_repository
+        published_artifacts = repository.current_artifacts()
         assert published_artifacts is not None
         detected_template = gbt_template(new_tip, height=11)
         detected_artifacts = CachedTemplateArtifacts(
@@ -417,8 +417,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             template_generation=published_artifacts.generation,
             template_artifacts=published_artifacts,
         )
-        with server._job_cache_lock:
-            server._template_artifacts = detected_artifacts
+        repository.replace_for_test(detected_artifacts)
         server._ensure_job_cache_state()
         replacement_cancellation = _JobBuildCancellation(timeout_seconds=60.0)
         replacement_request = SimpleNamespace(
@@ -426,8 +425,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             cancellation=replacement_cancellation,
         )
         replacement_flight = SimpleNamespace(request=replacement_request)
-        with server._job_build_scheduler_lock:
-            server._job_build_active = replacement_flight
+        with server._ensure_job_bundle_service()._scheduler_lock:
+            server._ensure_job_bundle_service()._active = replacement_flight
         build_called = threading.Event()
         window_started = state.vardiff_window_started_monotonic
 
@@ -453,15 +452,15 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with self.assertRaises(JobBuildCancelled):
             racing_idle_promise.result()
 
-        with server._job_build_scheduler_lock:
-            self.assertIs(server._job_build_active, replacement_flight)
+        with server._ensure_job_bundle_service()._scheduler_lock:
+            self.assertIs(server._ensure_job_bundle_service()._active, replacement_flight)
         self.assertFalse(replacement_cancellation.is_set())
         self.assertTrue(racing_idle_cancellation.is_set())
         self.assertFalse(build_called.is_set())
         self.assertEqual(state.vardiff_window_started_monotonic, window_started)
         self.assertEqual(server.vardiff_idle_skip_counts["superseded"], 4)
-        with server._job_build_scheduler_lock:
-            server._job_build_active = None
+        with server._ensure_job_bundle_service()._scheduler_lock:
+            server._ensure_job_bundle_service()._active = None
         server.shutdown_vardiff_idle_executor()
     def test_idle_shared_build_does_not_retry_scheduler_divergence_race(
         self,
@@ -472,9 +471,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         state = client()
         prepare_idle_client(server, state, tip=old_tip)
         install_idle_job_cache(server, tip=old_tip)
-        with server._job_cache_lock:
-            old_artifacts = server._template_artifacts
-            server._job_bundle_cache.clear()
+        repository = server._ensure_job_bundle_service().template_repository
+        old_artifacts = repository.current_artifacts()
+        with server._ensure_job_bundle_service()._cache_lock:
+            server._ensure_job_bundle_service()._bundle_cache.clear()
         assert old_artifacts is not None
         now = time.monotonic()
         server.current_tip_first_seen = (old_tip, now)
@@ -495,12 +495,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 cancellation=replacement_cancellation,
             )
         )
-        with server._job_build_scheduler_lock:
-            server._job_build_active = replacement_flight
+        with server._ensure_job_bundle_service()._scheduler_lock:
+            server._ensure_job_bundle_service()._active = replacement_flight
         request_builds = 0
         admission_attempts = 0
         idle_cancellation: _JobBuildCancellation | None = None
-        original_request_job_build = server._request_job_build
+        service = server._ensure_job_bundle_service()
+        original_request_job_build = service.request_build
 
         def make_idle_request(
             _artifacts: CachedTemplateArtifacts,
@@ -525,8 +526,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 server.tip_refresh_divergence_started_monotonic = time.monotonic()
             return original_request_job_build(request)  # type: ignore[arg-type]
 
-        server._new_job_build_request = make_idle_request  # type: ignore[method-assign]
-        server._request_job_build = detect_before_admission  # type: ignore[method-assign]
+        service.new_build_request = make_idle_request  # type: ignore[method-assign]
+        service.request_build = detect_before_admission  # type: ignore[method-assign]
         server._schedule_tip_refresh_retry = lambda: None  # type: ignore[method-assign]
         assert state.worker is not None
 
@@ -535,14 +536,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(request_builds, 1)
         self.assertEqual(admission_attempts, 1)
-        self.assertIs(server._template_artifacts, old_artifacts)
+        self.assertIs(repository.current_artifacts(), old_artifacts)
         self.assertIsNotNone(idle_cancellation)
         assert idle_cancellation is not None
         self.assertTrue(idle_cancellation.is_set())
         self.assertFalse(replacement_cancellation.is_set())
-        with server._job_build_scheduler_lock:
-            self.assertIs(server._job_build_active, replacement_flight)
-            server._job_build_active = None
+        with server._ensure_job_bundle_service()._scheduler_lock:
+            self.assertIs(server._ensure_job_bundle_service()._active, replacement_flight)
+            server._ensure_job_bundle_service()._active = None
         server.shutdown_vardiff_idle_executor()
     def test_idle_cached_collection_bundle_refreshes_readiness(self) -> None:
         server = coordinator()
@@ -550,13 +551,16 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         prepare_idle_client(server, state)
         ready_bundle = install_idle_job_cache(server)
         assert state.worker is not None
-        with server._job_cache_lock:
-            artifacts = server._template_artifacts
-            assert artifacts is not None
+        artifacts = (
+            server._ensure_job_bundle_service()
+            .template_repository.current_artifacts()
+        )
+        assert artifacts is not None
+        with server._ensure_job_bundle_service()._cache_lock:
             collection_key = server._job_bundle_key(
                 artifacts,
                 mode="collection",
-                payout_state_generation=server._payout_state_generation,
+                payout_state_generation=server._payout_state_service._generation,
                 payout_artifact_generation=0,
                 worker=state.worker,
             )
@@ -569,18 +573,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                     state.worker.p2mr_program_hex,
                 ),
             )
-            server._job_bundle_cache.clear()
-            server._job_bundle_cache[collection_key] = collection_bundle
-        server._pool_ready_latched = False
+            server._ensure_job_bundle_service()._bundle_cache.clear()
+            server._ensure_job_bundle_service()._bundle_cache[collection_key] = collection_bundle
+        server._ensure_job_bundle_service().set_ready_for_test(False)
         server.min_ready_miners = 3
+        server._ensure_job_bundle_service().set_min_ready_miners_for_test(3)
         server.accepted_share_stats = lambda: (3, 3)  # type: ignore[method-assign]
         rebuilt = threading.Event()
         sent: list[dict[str, object]] = []
 
         def build_ready(_request: object) -> CachedJobBundle:
             rebuilt.set()
-            with server._job_cache_lock:
-                server._job_bundle_cache[ready_bundle.key] = ready_bundle
+            with server._ensure_job_bundle_service()._cache_lock:
+                server._ensure_job_bundle_service()._bundle_cache[ready_bundle.key] = ready_bundle
             return ready_bundle
 
         state.send = sent.append  # type: ignore[method-assign]
@@ -589,7 +594,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.vardiff_idle_sweep_once(), 1)
         server.shutdown_vardiff_idle_executor()
 
-        self.assertTrue(server._pool_ready_latched)
+        self.assertTrue(server._ensure_job_bundle_service().ready_latched())
         self.assertTrue(rebuilt.is_set())
         self.assertEqual(
             [payload["method"] for payload in sent],
@@ -631,7 +636,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 delivered.set()
 
         state.send = record  # type: ignore[method-assign]
-        server._bind_cached_bundle_to_artifacts = (  # type: ignore[method-assign]
+        server._ensure_job_bundle_service().bind_cached_bundle = (  # type: ignore[method-assign]
             bind_current_observation
         )
 
@@ -721,8 +726,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         state = client()
         prepare_idle_client(server, state)
         bundle = install_idle_job_cache(server)
-        with server._job_cache_lock:
-            server._job_bundle_cache.clear()
+        with server._ensure_job_bundle_service()._cache_lock:
+            server._ensure_job_bundle_service()._bundle_cache.clear()
         state.send = lambda _payload: None  # type: ignore[method-assign]
         build_started = threading.Event()
         release_build = threading.Event()
@@ -736,7 +741,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 raise AssertionError("idle retarget bundle build was not released")
             return bundle
 
-        server.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
+        server._ensure_job_bundle_service().build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
         server._record_heartbeat("vardiff_idle_sweep")
         heartbeat_before = server._heartbeats["vardiff_idle_sweep"]
         started = time.monotonic()
@@ -760,12 +765,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         prepare_idle_client(server, state)
         bundle = install_idle_job_cache(server)
         server.job_bundle_cache_seconds = 10.0
+        server._ensure_job_bundle_service().set_cache_seconds_for_test(10.0)
         expired_bundle = dataclass_replace(
             bundle,
             built_monotonic=time.monotonic() - 11.0,
         )
-        with server._job_cache_lock:
-            server._job_bundle_cache[bundle.key] = expired_bundle
+        with server._ensure_job_bundle_service()._cache_lock:
+            server._ensure_job_bundle_service()._bundle_cache[bundle.key] = expired_bundle
         build_started = threading.Event()
         release_build = threading.Event()
         build_thread_ids: list[int] = []
@@ -782,7 +788,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             return bundle
 
         state.send = sent.append  # type: ignore[method-assign]
-        server.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
+        server._ensure_job_bundle_service().build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
         sweep_thread_id = threading.get_ident()
         started = time.monotonic()
         try:
@@ -818,8 +824,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         prepare_idle_client(server, state)
         bundle = install_idle_job_cache(server)
         server.job_bundle_cache_seconds = 0.0
-        with server._job_cache_lock:
-            server._job_bundle_cache.clear()
+        server._ensure_job_bundle_service().set_cache_seconds_for_test(0.0)
+        with server._ensure_job_bundle_service()._cache_lock:
+            server._ensure_job_bundle_service()._bundle_cache.clear()
         built = threading.Event()
         sent: list[dict[str, object]] = []
 
@@ -842,8 +849,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.idle_retarget_count, 1)
         self.assertEqual(state.share_difficulty, Decimal("4"))
         self.assertIsNone(state.pending_share_difficulty)
-        with server._job_cache_lock:
-            self.assertEqual(server._job_bundle_cache, {})
+        with server._ensure_job_bundle_service()._cache_lock:
+            self.assertEqual(server._ensure_job_bundle_service()._bundle_cache, {})
     def test_idle_preparation_oserror_keeps_client_connected(self) -> None:
         for failure_phase in ("bundle", "reorg"):
             with self.subTest(failure_phase=failure_phase):
@@ -1030,7 +1037,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         # It must now be swallowed so the client thread survives a single bad template.
         server.maybe_send_job(state, clean_jobs=True)
 
-        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 1)
         self.assertEqual(state.active_job_ids, set())
         self.assertEqual(server.jobs, {})
         self.assertEqual(sent, [])  # no difficulty / mining.notify pushed for the failed build
@@ -1051,7 +1058,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         server.maybe_send_job(state, clean_jobs=True)
 
-        self.assertEqual(server.job_build_failure_count, 1)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 1)
         self.assertEqual(state.active_job_ids, {"job-ok"})
         self.assertEqual(sent, ["notify"])
     def test_maybe_send_job_does_not_swallow_send_failures_as_build_failures(self) -> None:
@@ -1091,7 +1098,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         # The send failure is not a build failure, and handle_client (not us) owns
         # the disconnect/cleanup of the registered job for the dead connection.
-        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertEqual(server._ensure_job_bundle_service().metrics_snapshot()["failure_count"], 0)
     def _pending_append(self, tag: str, accepted_at_ms: int = 2) -> PendingShareAppend:
         from lab.prism.share_ledger import PendingShare
 

@@ -148,6 +148,9 @@ class ServeBindsBeforeRecoveryTest(unittest.TestCase):
         server.vardiff_config = make_vardiff_config()
         server.max_blocks = 1
         server.blockpoll_seconds = 0.1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            blockpoll_seconds=server.blockpoll_seconds
+        )
         server.version_mask = 0x1FFFE000
         server.version_mask_selection = types.SimpleNamespace(
             source="test", detail="fixed"

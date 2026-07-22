@@ -480,7 +480,13 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 server.current_tip_parent = (new_tip, new_parent)
             return old_parent
 
-        server._fetch_tip_parent_hash = overtake_parent_lookup  # type: ignore[method-assign]
+        server._ensure_tip_refresh_service().reconfigure_ports_for_test(
+            rpc_call=lambda method, params: {
+                "previousblockhash": overtake_parent_lookup(str(params[0]))
+            }
+            if method == "getblock" and params
+            else server.rpc.call(method, params)
+        )
 
         self.assertEqual(server.current_tip_parent_hash(old_tip), old_parent)
         self.assertEqual(server.current_tip_parent, (new_tip, new_parent))

@@ -72,7 +72,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from lab.prism.share_ledger import PendingShare, PsqlShareLedger
+from lab.prism.share_ledger import PendingShare, PsqlShareLedger, ShareReplayConflict
 
 
 def pending(
@@ -164,6 +164,16 @@ candidate_intent = {
 candidate_row = ledger.append_batch([(batch_c, candidate_intent)])[0]
 assert_equal(candidate_row.share_seq, 3, "candidate share sequence")
 assert_equal(ledger.append_batch([(batch_c, candidate_intent)])[0].share_seq, 3, "exact replay")
+recovery_exact = ledger.append_recovered_share(batch_c)
+assert_equal(recovery_exact.disposition, "exact_existing", "typed recovery exact replay")
+try:
+    ledger.append_recovered_share(
+        PendingShare(**{**batch_c.__dict__, "ntime": batch_c.ntime + 1})
+    )
+except ShareReplayConflict:
+    pass
+else:
+    raise SystemExit("typed recovery payload conflict was not rejected")
 assert_equal(ledger.pending_block_candidates(), [candidate_intent], "pending candidate replay")
 assert_equal(
     ledger.pending_block_candidate_rows(),

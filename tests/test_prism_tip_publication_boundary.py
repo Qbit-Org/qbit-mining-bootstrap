@@ -45,7 +45,9 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                 validation_reached = True
                 raise TemplateRefreshBlocked("forced final validation failure")
 
-            server._validate_prepared_tip_refresh = fail_final_validation  # type: ignore[method-assign]
+            server._ensure_tip_refresh_service().validate_prepared = (  # type: ignore[method-assign]
+                fail_final_validation
+            )
 
             with self.assertRaisesRegex(
                 TemplateRefreshBlocked,
@@ -58,7 +60,7 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             self.assertEqual(server.current_tip_first_seen, published_tip)
             self.assertIs(server.tip_template_snapshot, published_snapshot)
             self.assertEqual(server.latest_detected_tip[0], next_tip)
-            self.assertIsNone(server._active_tip_refresh)
+            self.assertIsNone(server._ensure_tip_refresh_service().active_refresh_snapshot())
         finally:
             server.shutdown_tip_refresh_executor()
 
@@ -96,7 +98,8 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                     mark_pending=False,
                 )
             )
-            snapshot = server.fetch_qbit_tip_template_snapshot()
+            with server._ensure_tip_refresh_service().suppress_trigger_callbacks_for_test():
+                snapshot = server.fetch_qbit_tip_template_snapshot()
             bundle = server.prepare_tip_refresh_bundle(snapshot)
             token = server._validate_prepared_tip_refresh(
                 bundle,
@@ -124,7 +127,7 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             self.assertIs(server.tip_template_snapshot, published_snapshot)
             self.assertEqual(server.latest_detected_tip[0], winning_tip)
             self.assertEqual(len(sent_tips), 1)
-            self.assertIsNone(server._active_tip_refresh)
+            self.assertIsNone(server._ensure_tip_refresh_service().active_refresh_snapshot())
         finally:
             server.shutdown_tip_refresh_executor()
 
@@ -148,14 +151,14 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             def fail_executor() -> object:
                 raise RuntimeError("executor unavailable")
 
-            server.tip_refresh_executor = fail_executor  # type: ignore[method-assign]
+            server._ensure_tip_refresh_service().executor = fail_executor  # type: ignore[method-assign]
             with self.assertRaisesRegex(RuntimeError, "executor unavailable"):
                 server.poll_qbit_tip_template_once()
 
             self.assertEqual(server.current_tip_first_seen, published_tip)
             self.assertIs(server.tip_template_snapshot, published_snapshot)
             self.assertEqual(server.latest_detected_tip[0], next_tip)
-            self.assertIsNone(server._active_tip_refresh)
+            self.assertIsNone(server._ensure_tip_refresh_service().active_refresh_snapshot())
         finally:
             server.shutdown_tip_refresh_executor()
 
@@ -183,7 +186,8 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                     mark_pending=False,
                 )
             )
-            snapshot = server.fetch_qbit_tip_template_snapshot()
+            with server._ensure_tip_refresh_service().suppress_trigger_callbacks_for_test():
+                snapshot = server.fetch_qbit_tip_template_snapshot()
             bundle = server.prepare_tip_refresh_bundle(snapshot)
             token = server._validate_prepared_tip_refresh(
                 bundle,
@@ -205,7 +209,7 @@ class TipPublicationBoundaryTests(unittest.TestCase):
 
             self.assertEqual(server.current_tip_first_seen, published_tip)
             self.assertIs(server.tip_template_snapshot, published_snapshot)
-            self.assertIsNone(server._active_tip_refresh)
+            self.assertIsNone(server._ensure_tip_refresh_service().active_refresh_snapshot())
         finally:
             server.shutdown_tip_refresh_executor()
 
@@ -233,7 +237,8 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                     mark_pending=False,
                 )
             )
-            snapshot = server.fetch_qbit_tip_template_snapshot()
+            with server._ensure_tip_refresh_service().suppress_trigger_callbacks_for_test():
+                snapshot = server.fetch_qbit_tip_template_snapshot()
             bundle = server.prepare_tip_refresh_bundle(snapshot)
             token = server._validate_prepared_tip_refresh(
                 bundle,
@@ -242,7 +247,7 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             )
 
             server._block_payout_state_publication()
-            self.assertTrue(server._payout_state_publication_blocked)
+            self.assertTrue(server._payout_state_service._publication_blocked)
             with self.assertRaisesRegex(
                 TemplateRefreshBlocked,
                 "superseded before atomic publication",
@@ -256,7 +261,7 @@ class TipPublicationBoundaryTests(unittest.TestCase):
 
             self.assertEqual(server.current_tip_first_seen, published_tip)
             self.assertIs(server.tip_template_snapshot, published_snapshot)
-            self.assertIsNone(server._active_tip_refresh)
+            self.assertIsNone(server._ensure_tip_refresh_service().active_refresh_snapshot())
         finally:
             server.shutdown_tip_refresh_executor()
 
@@ -271,14 +276,19 @@ class TipPublicationBoundaryTests(unittest.TestCase):
         try:
             self.assertEqual(server.poll_qbit_tip_template_once(), 1)
             server._reserve_payout_state_source("payout_only")
+            # This test manually drives publication below. Suppress the normal
+            # payout callback so its scheduler cannot legitimately consume the
+            # priority delivery while the manual token is being assembled.
+            tip_refresh = server._ensure_tip_refresh_service()
+            with tip_refresh.suppress_trigger_callbacks_for_test():
+                self.assertEqual(
+                    server._publish_payout_state_candidate(
+                        server._current_payout_state_candidate()
+                    ),
+                    1,
+                )
             self.assertEqual(
-                server._publish_payout_state_candidate(
-                    server._current_payout_state_candidate()
-                ),
-                1,
-            )
-            self.assertEqual(
-                server._payout_state_delivery_gate._priority_generation,
+                server._payout_state_service._delivery_gate._priority_generation,
                 1,
             )
 
@@ -305,10 +315,10 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             )
             try:
                 self.assertEqual(
-                    server._payout_state_delivery_gate._priority_generation,
+                    server._payout_state_service._delivery_gate._priority_generation,
                     1,
                 )
-                with server._payout_state_delivery_gate.delivery_cancelable(
+                with server._payout_state_service._delivery_gate.delivery_cancelable(
                     lambda: False,
                     generation=1,
                     priority=False,
@@ -382,12 +392,14 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                     mark_pending=False,
                 )
             )
-            server.fetch_qbit_tip_template_snapshot()
-            with server._job_cache_lock:
-                self.assertEqual(
-                    server._template_artifacts.previousblockhash,
-                    next_tip,
-                )
+            with server._ensure_tip_refresh_service().suppress_trigger_callbacks_for_test():
+                server.fetch_qbit_tip_template_snapshot()
+            current = (
+                server._ensure_job_bundle_service()
+                .template_repository.current_artifacts()
+            )
+            assert current is not None
+            self.assertEqual(current.previousblockhash, next_tip)
 
             # Direct issuance stays pinned to the published snapshot while the
             # published tip still owns share classification, so the issued job
@@ -409,8 +421,8 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             # A pruned bundle cache (payout mutation, LRU pressure) must not
             # strand pinned issuance either: published-parent work stays
             # buildable and cacheable while its authority holds.
-            with server._job_cache_lock:
-                server._job_bundle_cache.clear()
+            with server._ensure_job_bundle_service()._cache_lock:
+                server._ensure_job_bundle_service()._bundle_cache.clear()
             rebuilt = server.build_job_for_client(state, clean_jobs=False)
             self.assertEqual(
                 str(rebuilt.template["previousblockhash"]),
@@ -424,7 +436,9 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                 - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
                 - 1.0
             )
-            server.template_refresh_failure_exit_seconds = 0.0
+            server._ensure_tip_refresh_service().reconfigure_for_test(
+                failure_exit_seconds=0.0
+            )
             lapsed = server.job_issuance_template_artifacts()
             self.assertEqual(lapsed.previousblockhash, next_tip)
         finally:
@@ -483,13 +497,14 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             rpc.tip = next_tip
             rpc.template = base_template(height=11, prevhash=next_tip)
             self.assertTrue(server.observe_tip_for_refresh(next_tip))
-            server.fetch_qbit_tip_template_snapshot()
+            with server._ensure_tip_refresh_service().suppress_trigger_callbacks_for_test():
+                server.fetch_qbit_tip_template_snapshot()
 
             # Simulate cache pressure dropping the retained published bundle,
             # then issue twice: the first pinned rebuild re-enters the cache
             # so the second issuance is a hit instead of another heavy build.
-            with server._job_cache_lock:
-                server._job_bundle_cache.clear()
+            with server._ensure_job_bundle_service()._cache_lock:
+                server._ensure_job_bundle_service()._bundle_cache.clear()
             first = server.build_job_for_client(state, clean_jobs=False)
             builds_after_first = int(builds["calls"])
             second = server.build_job_for_client(state, clean_jobs=False)
@@ -618,7 +633,9 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                     - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
                     - 1.0
                 )
-                server.template_refresh_failure_exit_seconds = 0.0
+                server._ensure_tip_refresh_service().reconfigure_for_test(
+                    failure_exit_seconds=0.0
+                )
                 return context
 
             server.build_job_for_client = build_then_lapse  # type: ignore[method-assign]
@@ -666,7 +683,9 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                 - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
                 - 1.0
             )
-            server.template_refresh_failure_exit_seconds = 0.0
+            server._ensure_tip_refresh_service().reconfigure_for_test(
+                failure_exit_seconds=0.0
+            )
 
             state.active_job = None
             state.active_job_ids = set()
@@ -716,7 +735,9 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                     - float(getattr(server, "submit_tip_max_age_seconds", 10.0))
                     - 1.0
                 )
-                server.template_refresh_failure_exit_seconds = 0.0
+                server._ensure_tip_refresh_service().reconfigure_for_test(
+                    failure_exit_seconds=0.0
+                )
                 original_observe_admission(*args, **kwargs)
 
             server._observe_payout_gate_admission = lapse_during_gate  # type: ignore[method-assign]
@@ -760,8 +781,8 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                     superseded_monotonic=None,
                 )
             )
-            with server._job_build_scheduler_lock:
-                server._job_build_active = pinned_flight  # type: ignore[assignment]
+            with server._ensure_job_bundle_service()._scheduler_lock:
+                server._ensure_job_bundle_service()._active = pinned_flight  # type: ignore[assignment]
             try:
                 # The detected-tip store prunes fingerprints and sweeps stale
                 # builds, but an in-flight build for exactly the published
@@ -769,8 +790,8 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                 server.fetch_qbit_tip_template_snapshot()
                 self.assertFalse(pinned_cancellation.is_set())
             finally:
-                with server._job_build_scheduler_lock:
-                    server._job_build_active = None
+                with server._ensure_job_bundle_service()._scheduler_lock:
+                    server._ensure_job_bundle_service()._active = None
         finally:
             server.shutdown_tip_refresh_executor()
 
@@ -793,8 +814,9 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             next_tip = "cc" * 32
             rpc.tip = next_tip
             rpc.template = base_template(height=11, prevhash=next_tip)
-            with server._job_cache_lock:
-                server._template_artifacts = None
+            server._ensure_job_bundle_service().template_repository.replace_for_test(
+                None
+            )
 
             artifacts = server.job_issuance_template_artifacts()
             # The fetch is recorded as a detection and issuance stays on the
@@ -846,14 +868,14 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             # gate's first-delivery reservation exactly as a fresh payout
             # publication does, so a non-priority same-generation delivery
             # would be rejected rather than admitted.
-            with server._job_cache_lock:
-                server._published_payout_state = dataclasses.replace(
-                    server._published_payout_state,
+            with server._payout_state_service._lock:
+                server._payout_state_service._published = dataclasses.replace(
+                    server._payout_state_service._published,
                     source_tip_hash=next_tip,
                 )
-            gate = server._payout_state_delivery_gate
+            gate = server._payout_state_service._delivery_gate
             with gate._condition:
-                gate._priority_generation = int(server._payout_state_generation)
+                gate._priority_generation = int(server._payout_state_service._generation)
 
             state.active_job = None
             state.active_job_ids = set()
@@ -912,7 +934,7 @@ class TipPublicationBoundaryTests(unittest.TestCase):
             self.assertGreaterEqual(calls["count"], 2)
             self.assertEqual(sent_notifies[-1], published_tip[0])
             self.assertEqual(server.current_tip_first_seen[0], published_tip[0])
-            self.assertIsNone(server._active_tip_refresh)
+            self.assertIsNone(server._ensure_tip_refresh_service().active_refresh_snapshot())
         finally:
             server.shutdown_tip_refresh_executor()
 
@@ -942,7 +964,8 @@ class TipPublicationBoundaryTests(unittest.TestCase):
                     mark_pending=False,
                 )
             )
-            snapshot = server.fetch_qbit_tip_template_snapshot()
+            with server._ensure_tip_refresh_service().suppress_trigger_callbacks_for_test():
+                snapshot = server.fetch_qbit_tip_template_snapshot()
             bundle = server.prepare_tip_refresh_bundle(snapshot)
             token = server._validate_prepared_tip_refresh(bundle, snapshot, sequence)
             cancellation = server._publish_prepared_tip_refresh(

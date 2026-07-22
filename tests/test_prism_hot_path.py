@@ -290,7 +290,6 @@ def coordinator(
     server.duplicate_share_count = 0
     server.low_difficulty_share_count = 0
     server.rejection_counts_by_reason = {reason: 0 for reason in PRISM_REJECTION_REASON_IDS}
-    server.job_build_failure_count = 0
     server.tip_refresh_job_count = 0
     server.post_accept_refresh_failure_count = 0
     server.reorg_reconciler_enabled = False
@@ -326,10 +325,10 @@ def coordinator(
     server.min_ready_miners = 3
     server.ledger = FakeAppendLedger()
     server.blockpoll_seconds = 2.0
-    # Failed-refresh spacing is opt-in per test: its holdoff waits on real
-    # time, which deadlocks tests that freeze time.monotonic around failing
-    # polls. Pacing behavior is covered by test_prism_refresh_retry_pacing.
-    server.tip_refresh_failure_holdoff_seconds = 0.0
+    server._ensure_tip_refresh_service().reconfigure_for_test(
+        blockpoll_seconds=server.blockpoll_seconds,
+        failure_holdoff_seconds=0.0,
+    )
     server.job_bundle_cache_seconds = 10.0
     server.template_cache_seconds = 2.0
     server.reorg_reconcile_cache_seconds = 5.0
@@ -377,6 +376,9 @@ def install_fake_bundle_builder(server: PrismCoordinator) -> dict[str, object]:
         }
 
     server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
+    server._ensure_bundle_compiler().build_audit_bundle = (  # type: ignore[method-assign]
+        fake_build_audit_bundle
+    )
     return recorded
 
 
@@ -533,6 +535,9 @@ class SubmitTipCheckTests(unittest.TestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.submit_tip_max_age_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            submit_tip_max_age_seconds=server.submit_tip_max_age_seconds
+        )
         state = client(1)
         context = register_job(server, state)
         params = submit_params(state, context)
@@ -553,7 +558,13 @@ class SubmitTipCheckTests(unittest.TestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.submit_tip_max_age_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            submit_tip_max_age_seconds=server.submit_tip_max_age_seconds
+        )
         server.template_refresh_failure_exit_seconds = 120.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         state = client(1)
         context = register_job(server, state)
         params = submit_params(state, context)
@@ -574,7 +585,13 @@ class SubmitTipCheckTests(unittest.TestCase):
     def test_unpublished_divergence_lease_does_not_renew_and_expires(self) -> None:
         server, rpc = coordinator()
         server.submit_tip_max_age_seconds = 10.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            submit_tip_max_age_seconds=server.submit_tip_max_age_seconds
+        )
         server.template_refresh_failure_exit_seconds = 120.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            failure_exit_seconds=server.template_refresh_failure_exit_seconds
+        )
         observe_tip(server, OLD_TIP, age_seconds=11.0)
         rpc.tip = NEW_TIP
         self.assertTrue(server.observe_tip_for_refresh(NEW_TIP))
@@ -601,6 +618,9 @@ class SubmitTipCheckTests(unittest.TestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.submit_tip_max_age_seconds = 0.0
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            submit_tip_max_age_seconds=server.submit_tip_max_age_seconds
+        )
         state = client(1)
         context = register_job(server, state)
         params = submit_params(state, context)
@@ -909,6 +929,9 @@ class FanOutRpcEconomyTests(unittest.TestCase):
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
+        server._ensure_tip_refresh_service().reconfigure_for_test(
+            max_workers=server.tip_refresh_max_workers
+        )
         server.reorg_reconciler_enabled = True
 
         def reconcile_live_chain_view(tip_hash: str) -> bool:
