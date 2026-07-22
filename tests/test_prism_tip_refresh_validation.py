@@ -11,6 +11,7 @@ from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 
 from lab.prism.prism_coordinator import (
+    JobBuildSuperseded,
     ShutdownInProgress,
     TemplateRefreshBlocked,
     TipRefreshValidationToken,
@@ -1442,7 +1443,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(server.current_tip_first_seen[0], tip_b)
         self.assertFalse(server.tip_refresh_is_pending())
 
-    def test_replacement_build_waits_until_obsolete_owner_is_released(self) -> None:
+    def test_replacement_build_starts_before_obsolete_executor_exits(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         state = client(1)
@@ -1502,6 +1503,7 @@ class TipRefreshValidationTests(unittest.TestCase):
 
         old_poll = threading.Thread(target=poll, args=("old",))
         new_poll = threading.Thread(target=poll, args=("new",))
+        new_poll_started = False
         old_poll.start()
         try:
             self.assertTrue(bundle_started.wait(5))
@@ -1510,30 +1512,45 @@ class TipRefreshValidationTests(unittest.TestCase):
             # publication completes.
             server._cancel_obsolete_job_builds("direct PRISM block accepted")
             with server._job_build_scheduler_lock:
-                active = server._job_build_active
-                self.assertIsNotNone(active)
-                assert active is not None
-                self.assertTrue(active.request.cancellation.is_set())
+                self.assertIsNone(server._job_build_active)
+                retiring = server._job_build_retiring
+                self.assertIsNotNone(retiring)
+                assert retiring is not None
+                self.assertTrue(retiring.request.cancellation.is_set())
+                self.assertTrue(retiring.request.promise.done())
+                with self.assertRaises(JobBuildSuperseded):
+                    retiring.request.promise.result()
+
+            # Logical refresh ownership is released even though the first
+            # executor invocation remains blocked in physical teardown.
+            old_poll.join(5)
+            self.assertFalse(old_poll.is_alive())
+            self.assertEqual(results["old"], [])
+            self.assertEqual(len(errors["old"]), 1)
+            self.assertIsInstance(errors["old"][0], JobBuildSuperseded)
+
             self.assertEqual(server._advance_payout_state_generation(), 1)
             new_poll.start()
-            self.assertFalse(replacement_started.wait(0.1))
+            new_poll_started = True
+            self.assertTrue(replacement_started.wait(5))
             new_poll.join(5)
             self.assertFalse(new_poll.is_alive())
             self.assertEqual(errors["new"], [])
-            self.assertEqual(results["new"], [0])
-            self.assertEqual(sent_generations, [])
+            self.assertEqual(results["new"], [1])
+            self.assertEqual(sent_generations, [1])
+            with builder_lock:
+                self.assertEqual(active_builders, 1)
         finally:
             release_bundle.set()
             old_poll.join(5)
-            new_poll.join(5)
+            if new_poll_started:
+                new_poll.join(5)
 
         self.assertFalse(old_poll.is_alive())
         server.shutdown_tip_refresh_executor()
-        self.assertEqual(errors["old"], [])
-        self.assertEqual(results["old"], [1])
         self.assertTrue(replacement_started.is_set())
         self.assertEqual(sent_generations, [1])
-        self.assertEqual(max_active_builders, 1)
+        self.assertEqual(max_active_builders, 2)
         self.assertTrue(
             all(
                 bundle.payout_state_generation == 1
@@ -1945,7 +1962,7 @@ class TipRefreshValidationTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
-        self.assertEqual(maximum_builders, 1)
+        self.assertLessEqual(maximum_builders, 2)
         self.assertEqual(sent_tips, ["77" * 32])
         self.assertEqual(server.current_tip_first_seen[0], "77" * 32)
         self.assertFalse(server.tip_refresh_is_pending())

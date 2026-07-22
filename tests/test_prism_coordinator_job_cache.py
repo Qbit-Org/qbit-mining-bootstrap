@@ -2819,7 +2819,7 @@ class JobBundleCacheTests(unittest.TestCase):
                 )
             self.assertEqual(len(routine_cancellations), 1)
             self.assertIsNotNone(routine_cancellations[0])
-            priority_token, _requested = (
+            priority_token, _requested, _priority_cancellation = (
                 server._begin_job_build_priority_preparation()
             )
             assert routine_cancellations[0] is not None
@@ -3291,8 +3291,14 @@ class JobBundleCacheTests(unittest.TestCase):
             )
             self.assertTrue(cancellation_observed[0].wait(5))
             self.assertTrue(cancellation_observed[1].wait(5))
-            self.assertFalse(collection_promises[0].done())
-            self.assertFalse(collection_promises[1].done())
+            self.assertTrue(collection_promises[0].done())
+            self.assertTrue(collection_promises[1].done())
+            self.assertTrue(
+                all(
+                    isinstance(promise.exception(), JobBuildSuperseded)
+                    for promise in collection_promises
+                )
+            )
             self.assertFalse(ready_promise.done())
             self.assertEqual(server.job_build_scheduler_counts["starts"], 2)
         finally:
