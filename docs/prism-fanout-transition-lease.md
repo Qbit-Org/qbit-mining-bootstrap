@@ -30,8 +30,9 @@ safe default and preserves the current behavior on every deployment.
    `PRISM_STRATUM_FANOUT_TRANSITION_LEASE_SECONDS`; retained delivered jobs and
    lease/tombstone entries are bounded per connection by
    `PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION`. Production already
-   requires a positive global connection limit, so the pool-wide bound is the
-   product of both limits.
+   requires a positive global connection limit. Each of the two maps is capped,
+   so the pool-wide object bound is twice the product of the connection and
+   per-connection limits.
 5. **Replacement delivery is the revocation boundary.** The old lease remains
    usable while the replacement socket write is blocked. After that write
    succeeds, the connection atomically records the new delivered authority and
@@ -43,6 +44,8 @@ safe default and preserves the current behavior on every deployment.
    original B lease remains the only authority and retains its B->C deadline.
    Undelivered C work is never leased. Once a current replacement is delivered,
    B is revoked; a later transition can lease only the newly delivered context.
+   If a blocked C write completes after D publication, B is revoked and C may
+   receive only a C->D lease anchored at D's original publication time.
 7. **Disconnect is terminal.** Disconnect removes delivered-authority,
    lease, and tombstone state. A new connection ID cannot reuse any of it.
 8. **Transition work is never a block candidate.** Even when its header meets

@@ -339,6 +339,22 @@ audit consumer has demonstrated compatibility with stale-grace receipts.
 PRISM template-refresh outage; it must be shorter than the operator alert and
 response window.
 
+Fanout-transition credit is independently disabled by default. Before enabling
+it, apply `crates/qbit-prism/sql/001_share_ledger.sql` and qualify every audit
+builder, verifier, mirror, and downstream consumer for
+`qbit.prism.audit-bundle.v1.2` and
+`qbit.prism.fanout-transition-receipt.v1`. The later qbit-tools rollout for the
+current mainnet policy must render exactly:
+
+```dotenv
+PRISM_STRATUM_STALE_GRACE_SECONDS=0
+PRISM_STRATUM_FANOUT_TRANSITION_LEASE_SECONDS=120
+PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION=1
+```
+
+The 120-second value is an absolute, non-sliding per-connection deadline; it
+does not authorize arbitrary historical jobs or previous-tip block candidates.
+
 ### CTV At Genesis
 
 A chain with no confirmed transaction history cannot produce a useful

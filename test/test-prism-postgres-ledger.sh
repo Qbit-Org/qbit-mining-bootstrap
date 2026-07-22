@@ -1346,6 +1346,62 @@ WHERE block_hash = '""" + external_block_hash + """';
         "externalized conflicting duplicate does not write an orphan body file",
     )
 
-print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity")
+transition_base = pending(
+    120,
+    job_ms=1_000_000,
+    accepted_ms=1_000_005,
+    share_id="fanout-transition-share",
+)
+transition_receipt = {
+    "schema": "qbit.prism.fanout-transition-receipt.v1",
+    "connection_id": 41,
+    "authorization_generation": 3,
+    "job_id": transition_base.job_id,
+    "source_tip_hash": "11" * 32,
+    "source_tip_generation": 7,
+    "target_tip_hash": "22" * 32,
+    "target_tip_generation": 8,
+    "classified_tip_hash": "22" * 32,
+    "classified_tip_generation": 8,
+    "classified_tip_source": "published",
+    "template_generation": 12,
+    "payout_state_generation": 5,
+    "difficulty_generation": 2,
+    "lease_armed_at_ms": 1_000,
+    "lease_duration_ms": 120_000,
+    "lease_age_ms": 5,
+    "lease_expires_at_ms": 121_000,
+    "classified_at_ms": 1_005,
+}
+transition_share = PendingShare(
+    **{
+        **transition_base.__dict__,
+        "credit_policy": "fanout-transition",
+        "transition_receipt": transition_receipt,
+    }
+)
+transition_record = external_successor.append_batch([(transition_share, None)])[0]
+assert_equal(
+    transition_record.transition_receipt,
+    transition_receipt,
+    "transition receipt survives durable batch append",
+)
+assert_equal(
+    external_successor.append_batch([(transition_share, None)])[0].share_seq,
+    transition_record.share_seq,
+    "transition receipt participates in exact durable replay",
+)
+durable_transition = next(
+    share
+    for share in external_successor.all_shares()
+    if share.share_id == transition_share.share_id
+)
+assert_equal(
+    [durable_transition.credit_policy, durable_transition.transition_receipt],
+    ["fanout-transition", transition_receipt],
+    "transition classification and receipt round-trip from Postgres",
+)
+
+print("prism postgres ledger PASS shares=15 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity transition-receipt")
 PY
 )

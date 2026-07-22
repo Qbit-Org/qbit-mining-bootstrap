@@ -63,6 +63,8 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS": "23",
                 "PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS": "29",
                 "PRISM_STRATUM_STALE_GRACE_SECONDS": "4",
+                "PRISM_STRATUM_FANOUT_TRANSITION_LEASE_SECONDS": "47",
+                "PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION": "2",
                 "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS": "31",
                 "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION": "65",
                 "PRISM_TIP_REFRESH_MAX_WORKERS": "7",
@@ -156,6 +158,14 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS"], "23")
         self.assertEqual(env["PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS"], "29")
         self.assertEqual(env["PRISM_STRATUM_STALE_GRACE_SECONDS"], "4")
+        self.assertEqual(
+            env["PRISM_STRATUM_FANOUT_TRANSITION_LEASE_SECONDS"],
+            "47",
+        )
+        self.assertEqual(
+            env["PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION"],
+            "2",
+        )
         self.assertEqual(env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS"], "31")
         self.assertEqual(
             env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION"],
