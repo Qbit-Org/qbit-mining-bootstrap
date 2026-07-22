@@ -625,7 +625,9 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         server.started_monotonic = old
         server.mining_health_startup_grace_seconds = 5
         server.stratum_initial_job_timeout_seconds = 5
-        server._mining_delivery_failure_started_monotonic = time.monotonic() - 5
+        server._ensure_observability_service().set_delivery_failure_started_monotonic_for_test(
+            time.monotonic() - 5
+        )
 
         status, payload = server.cached_health_payload()
 

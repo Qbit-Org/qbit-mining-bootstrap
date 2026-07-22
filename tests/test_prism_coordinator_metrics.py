@@ -762,6 +762,22 @@ class HealthSnapshotTests(_JobSupportTestCase):
             {"accepted_share_count": 0, "distinct_miner_count": 0},
         )
 
+
+class MetricsSnapshotTests(_JobSupportTestCase):
+    def test_cached_metrics_do_not_reenter_complete_renderer(self) -> None:
+        server, _ = coordinator()
+        complete = server.refresh_metrics_snapshot()
+        server._render_metrics_payload = mock.Mock(  # type: ignore[method-assign]
+            side_effect=AssertionError("cached scrape reached live renderer")
+        )
+
+        status, cached = server.cached_metrics_payload()
+
+        self.assertEqual(status, 200)
+        self.assertTrue(cached.startswith(complete))
+        server._render_metrics_payload.assert_not_called()
+        self.assertIn("qbit_prism_metrics_snapshot_generation 1", cached)
+
 class JobBuildMetricsTests(_JobSupportTestCase):
     def test_metrics_include_job_build_histogram_and_cache_counters(self) -> None:
         server, _ = coordinator()

@@ -62,6 +62,7 @@ class CoordinatorConfigLoadingTests(unittest.TestCase):
             source = {
                 **minimal_environment(Path(temp_dir)),
                 "PRISM_HEALTH_REFRESH_SECONDS": "7",
+                "PRISM_METRICS_REFRESH_SECONDS": "11",
                 "PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS": "23",
                 "PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS": "29",
                 "PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS": "31",
@@ -73,6 +74,7 @@ class CoordinatorConfigLoadingTests(unittest.TestCase):
             replace(
                 config.lifecycle,
                 health_refresh_seconds=7.0,
+                metrics_refresh_seconds=11.0,
                 pending_refresh_health_deadline_seconds=23.0,
                 coherent_tip_poll_health_deadline_seconds=29.0,
                 mining_health_startup_grace_seconds=31.0,
@@ -110,6 +112,22 @@ class CoordinatorConfigLoadingTests(unittest.TestCase):
             coordinator.health_pending_refresh_max_age_seconds,
             config.lifecycle.pending_refresh_health_deadline_seconds,
         )
+        self.assertEqual(
+            coordinator.metrics_refresh_seconds,
+            config.lifecycle.metrics_refresh_seconds,
+        )
+
+    def test_metrics_refresh_interval_must_be_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = {
+                **minimal_environment(Path(temp_dir)),
+                "PRISM_METRICS_REFRESH_SECONDS": "0",
+            }
+            with self.assertRaisesRegex(
+                SystemExit,
+                "PRISM_METRICS_REFRESH_SECONDS must be positive",
+            ):
+                load_coordinator_config(source)
 
     def test_zero_argument_coordinator_still_loads_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
