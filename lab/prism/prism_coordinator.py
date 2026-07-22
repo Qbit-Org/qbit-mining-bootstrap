@@ -7,7 +7,6 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 import copy
-import dataclasses
 import hashlib
 import json
 import os
@@ -21,7 +20,6 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
-from types import SimpleNamespace
 from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal, ROUND_CEILING
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +49,18 @@ from lab.prism.audit_artifacts import (
     AuditPublicationIdentity,
 )
 from lab.prism.bundle_compiler import canonical_bundle_bytes
+from lab.prism.block_candidates import (
+    DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS,
+    DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS,
+    MAX_PENDING_BLOCK_CANDIDATES,
+    BlockCandidateCompatibilityField,
+    BlockCandidatePorts,
+    BlockCandidateService,
+    PrismBlockCandidate,
+    block_candidate_from_intent as decode_block_candidate_intent,
+    block_candidate_intent as encode_block_candidate_intent,
+    compatibility_default as candidate_compatibility_default,
+)
 from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
 from lab.prism.coordinator_config import (
     CoordinatorConfig,
@@ -311,7 +321,6 @@ MAX_PENDING_VARDIFF_IDLE_RETARGETS = 8
 # ack never waits on audit/submitblock after the share and intent commit. The
 # bound limits RAM; overflow only coalesces a wakeup because Postgres retains
 # the authoritative pending candidate.
-MAX_PENDING_BLOCK_CANDIDATES = 32
 # The reward window is 8x network difficulty (must match PRISM_WINDOW_MULTIPLIER
 # in crates/qbit-prism/src/lib.rs and the SQL). The job-build snapshot only needs
 # the shares that window can cover; requesting a margin above it returns a
@@ -399,9 +408,6 @@ PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
         PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
     }
 )
-DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS = 0.25
-DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
-BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS = 0.25
 # Used only by lightweight embedders that bypass dataclass/coordinator
 # construction. Production instances install these locks eagerly in __init__.
 # Serializing the fallback prevents concurrent first-touch callers from ever
@@ -527,28 +533,6 @@ def canonical_json_text(value: object) -> str:
 
 def canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_text(value).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class PrismBlockCandidate:
-    """A block-worthy submission queued for the block-submitter thread.
-
-    A share that met its target is acknowledged and credited on the client
-    thread, then queued here for the submitter to land the block off the hot
-    path. When the hash solved the block but missed the share target (floor
-    above network difficulty), credit_share_on_accept is set and the candidate
-    is instead submitted synchronously by handle_submit: that share is valid
-    only if the block lands, so its credit and the miner's accept/reject follow
-    the block outcome directly rather than being queued.
-    """
-
-    context: PrismJobContext
-    submission: direct_stratum.DirectQbitSubmission
-    extranonce1_hex: str
-    extranonce2_hex: str
-    pending_share: PendingShare
-    client: ClientState
-    credit_share_on_accept: bool = False
 
 
 @dataclass(frozen=True)
@@ -1452,6 +1436,51 @@ class PrismCoordinator:
     job_counter = _JobCounterCompatibility()
     jobs = _JobsCompatibility()
     clients = _ClientsCompatibility()
+    block_candidate_queue = BlockCandidateCompatibilityField(
+        "block_candidate_queue",
+        candidate_compatibility_default(
+            lambda: queue.Queue(maxsize=MAX_PENDING_BLOCK_CANDIDATES)
+        ),
+    )
+    block_candidates_dropped = BlockCandidateCompatibilityField(
+        "block_candidates_dropped", 0
+    )
+    block_candidate_wakeups_coalesced = BlockCandidateCompatibilityField(
+        "block_candidate_wakeups_coalesced", 0
+    )
+    block_candidate_retry_count = BlockCandidateCompatibilityField(
+        "block_candidate_retry_count", 0
+    )
+    block_candidate_poisoned_count = BlockCandidateCompatibilityField(
+        "block_candidate_poisoned_count", 0
+    )
+    block_candidate_retry_initial_seconds = BlockCandidateCompatibilityField(
+        "block_candidate_retry_initial_seconds",
+        DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS,
+    )
+    block_candidate_retry_max_seconds = BlockCandidateCompatibilityField(
+        "block_candidate_retry_max_seconds",
+        DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS,
+    )
+    block_candidate_retry_delays = BlockCandidateCompatibilityField(
+        "block_candidate_retry_delays",
+        candidate_compatibility_default(lambda: {}),
+    )
+    block_candidate_abandoned_counts = BlockCandidateCompatibilityField(
+        "block_candidate_abandoned_counts",
+        candidate_compatibility_default(lambda: {}),
+    )
+    _retry_block_candidate = BlockCandidateCompatibilityField(
+        "_retry_block_candidate", None
+    )
+    _block_candidate_outcome = BlockCandidateCompatibilityField(
+        "_block_candidate_outcome",
+        candidate_compatibility_default(lambda: threading.local()),
+    )
+    _block_candidate_finalize_retries = BlockCandidateCompatibilityField(
+        "_block_candidate_finalize_retries",
+        candidate_compatibility_default(lambda: {}),
+    )
     share_append_queue = ShareWriterCompatibilityField("share_append_queue", None)
     share_commit_batch_size = ShareWriterCompatibilityField(
         "share_commit_batch_size", DEFAULT_SHARE_COMMIT_BATCH_SIZE
@@ -1887,6 +1916,7 @@ class PrismCoordinator:
         self._ctv_runtime = self._make_ctv_runtime_service(
             CtvRuntimeConfig.from_coordinator_config(ctv_config)
         )
+        self._ensure_block_candidate_service()
         self._background_services = self._make_background_service_registry()
 
     def _ensure_share_hot_path_state(self) -> None:
@@ -2586,6 +2616,7 @@ class PrismCoordinator:
         service = self.__dict__.get("_share_writer_service")
         if service is not None:
             return service
+
         init_lock = self.__dict__.setdefault(
             "_share_writer_service_init_lock",
             threading.Lock(),
@@ -2683,6 +2714,134 @@ class PrismCoordinator:
                 "shares_replayed",
                 "_pending_share_commit_lock",
                 "_pending_share_commit_floor",
+            ):
+                self.__dict__.pop(name, None)
+            return service
+
+    def _ensure_block_candidate_service(self) -> BlockCandidateService:
+        service = self.__dict__.get("_block_candidate_service")
+        if service is not None:
+            return service
+        init_lock = self.__dict__.setdefault(
+            "_block_candidate_service_init_lock",
+            threading.Lock(),
+        )
+        with init_lock:
+            service = self.__dict__.get("_block_candidate_service")
+            if service is not None:
+                return service
+            candidate_queue = self.__dict__.get("block_candidate_queue")
+            if candidate_queue is None:
+                candidate_queue = queue.Queue(maxsize=MAX_PENDING_BLOCK_CANDIDATES)
+            stop_event = self.__dict__.get("stop_event")
+            if stop_event is None:
+                stop_event = threading.Event()
+                self.stop_event = stop_event
+            service = BlockCandidateService(
+                BlockCandidatePorts(
+                    ledger=lambda: self.ledger,
+                    stop_event=lambda: self.stop_event,
+                    writer_operation=lambda component: self._writer_operation(component),
+                    submit_candidate=lambda candidate: self.submit_block_candidate(
+                        candidate
+                    ),
+                    reject_terminal_prepared=(
+                        lambda candidate: self._reject_terminal_prepared_block_candidate(
+                            candidate
+                        )
+                    ),
+                    begin_preview=lambda block_hash, block_height: (
+                        self._begin_accepted_block_payout_preview(
+                            block_hash,
+                            block_height=block_height,
+                        )
+                    ),
+                    clear_preview=lambda block_hash, invalidate: (
+                        self._clear_accepted_block_payout_preview(
+                            block_hash,
+                            invalidate_published=invalidate,
+                        )
+                    ),
+                    share_writer=lambda: self._ensure_share_writer_service(),
+                    finish_pending_candidate=(
+                        lambda pending: self._finish_pending_share_candidate(pending)
+                    ),
+                    refresh_after_accept=lambda client: (
+                        self.refresh_jobs_after_pending_accepted_block(
+                            client,
+                            heartbeat_name="block_submitter",
+                        )
+                    ),
+                    record_heartbeat=lambda name: self._record_heartbeat(name),
+                    replay_entrypoint=lambda: self.replay_pending_block_candidates(),
+                    submit_next_entrypoint=(
+                        lambda timeout: self.submit_next_block_candidate(timeout=timeout)
+                    ),
+                    next_retry_delay=lambda block_hash: (
+                        self._next_block_candidate_retry_delay(block_hash)
+                    ),
+                    log=lambda message: print(message, flush=True),
+                ),
+                candidate_queue=candidate_queue,
+                retry_initial_seconds=float(
+                    self.__dict__.get(
+                        "block_candidate_retry_initial_seconds",
+                        DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS,
+                    )
+                ),
+                retry_max_seconds=float(
+                    self.__dict__.get(
+                        "block_candidate_retry_max_seconds",
+                        DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS,
+                    )
+                ),
+                retryable_reasons=PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS,
+            )
+            service.dropped = int(
+                self.__dict__.get("block_candidates_dropped", 0)
+            )
+            service.wakeups_coalesced = int(
+                self.__dict__.get("block_candidate_wakeups_coalesced", 0)
+            )
+            service.retries = int(
+                self.__dict__.get("block_candidate_retry_count", 0)
+            )
+            service.poisoned = int(
+                self.__dict__.get("block_candidate_poisoned_count", 0)
+            )
+            service.retry_delays = self.__dict__.get(
+                "block_candidate_retry_delays",
+                {},
+            )
+            service.finalize_retries = self.__dict__.get(
+                "_block_candidate_finalize_retries",
+                {},
+            )
+            service.abandoned_counts = self.__dict__.get(
+                "block_candidate_abandoned_counts",
+                {},
+            )
+            service.retry_candidate = self.__dict__.get(
+                "_retry_block_candidate"
+            )
+            service.outcome = self.__dict__.get(
+                "_block_candidate_outcome",
+                threading.local(),
+            )
+            self.__dict__["_block_candidate_service"] = service
+            for name in (
+                "block_candidate_queue",
+                "block_candidates_dropped",
+                "block_candidate_wakeups_coalesced",
+                "block_candidate_retry_count",
+                "block_candidate_poisoned_count",
+                "block_candidate_retry_initial_seconds",
+                "block_candidate_retry_max_seconds",
+                "block_candidate_retry_delays",
+                "_block_candidate_finalize_retries",
+                "block_candidate_abandoned_counts",
+                "_retry_block_candidate",
+                "_block_candidate_outcome",
             ):
                 self.__dict__.pop(name, None)
             return service
@@ -7585,50 +7744,7 @@ class PrismCoordinator:
 
     @staticmethod
     def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
-        """Return the immutable JSON needed to resume a candidate after restart."""
-        context = candidate.context
-        submission = candidate.submission
-        intent = {
-            "schema": "qbit.prism.block-candidate-intent.v1",
-            "block_hash_hex": str(submission.block_hash_hex).lower(),
-            "block_hex": str(getattr(submission, "block_hex", "")),
-            "coinbase_tx_hex": str(getattr(submission, "coinbase_tx_hex", "")),
-            "parent_hash": str(context.template["previousblockhash"]).lower(),
-            "expected_height": int(context.template["height"]),
-            "template": {
-                "previousblockhash": context.template["previousblockhash"],
-                "height": int(context.template["height"]),
-                "coinbasevalue": int(context.template["coinbasevalue"]),
-            },
-            "shares_json": context.shares_json,
-            "prior_balances": context.prior_balances,
-            "found_block": context.found_block,
-            "prospective_prior_balances": (
-                [
-                    list(row)
-                    for row in getattr(
-                        context,
-                        "prospective_prior_balances",
-                        (),
-                    )
-                ]
-                if getattr(context, "prospective_prior_balances", None) is not None
-                else None
-            ),
-            "witness_merkle_leaves_hex": direct_stratum.witness_merkle_leaves_hex(
-                getattr(context.job, "transaction_hexes", ())
-            ),
-            "extranonce1_hex": candidate.extranonce1_hex,
-            "extranonce2_hex": candidate.extranonce2_hex,
-            "username": context.worker.username,
-            "pending_share": dataclasses.asdict(candidate.pending_share),
-            "credit_share_on_accept": candidate.credit_share_on_accept,
-            "collection_only": bool(context.collection_only),
-        }
-        # Fail on the client thread before committing a share if a future field
-        # introduces a value that cannot survive the durable JSON boundary.
-        json.dumps(intent, separators=(",", ":"), sort_keys=True)
-        return intent
+        return encode_block_candidate_intent(candidate)
 
     def block_candidate_from_intent(
         self,
@@ -7645,71 +7761,14 @@ class PrismCoordinator:
             coordinator = None
         else:
             coordinator = self
-        if intent.get("schema") != "qbit.prism.block-candidate-intent.v1":
-            raise ValueError("unsupported block candidate intent schema")
-        block_hash = str(intent["block_hash_hex"]).lower()
-        template = dict(intent["template"])
-        if str(template.get("previousblockhash", "")).lower() != str(intent["parent_hash"]).lower():
-            raise ValueError("block candidate parent hash does not match template")
-        if int(template.get("height", -1)) != int(intent["expected_height"]):
-            raise ValueError("block candidate height does not match template")
-        submission = direct_stratum.DirectQbitSubmission(
-            coinbase_tx_hex=str(intent["coinbase_tx_hex"]),
-            coinbase_txid_preimage_hex="",
-            header_hex="",
-            block_hex=str(intent["block_hex"]),
-            block_hash_hex=block_hash,
-            block_hash_int=int(block_hash, 16),
-            share_pass=True,
-            block_pass=True,
-            applied_version_hex="",
-        )
-        context = PrismJobContext(
-            job=SimpleNamespace(
-                transaction_hexes=(),
-                witness_merkle_leaves_hex=tuple(
-                    intent.get("witness_merkle_leaves_hex", [])
-                ),
-            ),
-            template=template,
-            shares_json=list(intent["shares_json"]),
-            prior_balances=list(intent["prior_balances"]),
-            found_block=dict(intent["found_block"]),
-            share_weight=0,
-            collection_only=bool(intent.get("collection_only", False)),
-            worker=WorkerIdentity(
-                username=str(intent["username"]),
-                payout_address="",
-                worker_name=None,
-                script_pubkey_hex="",
-                p2mr_program_hex="",
-            ),
-            issued_at_ms=0,
-            prospective_prior_balances=(
-                tuple(
-                    (str(row[0]), str(row[1]), str(row[2]), int(row[3]))
-                    for row in intent["prospective_prior_balances"]
-                )
-                if isinstance(intent.get("prospective_prior_balances"), list)
-                else None
-            ),
-        )
-        candidate = PrismBlockCandidate(
-            context=context,
-            submission=submission,
-            extranonce1_hex=str(intent["extranonce1_hex"]),
-            extranonce2_hex=str(intent["extranonce2_hex"]),
-            pending_share=PendingShare(**dict(intent["pending_share"])),
-            client=SimpleNamespace(username=str(intent["username"])),
-            credit_share_on_accept=bool(intent.get("credit_share_on_accept", False)),
-        )
+        candidate = decode_block_candidate_intent(intent)
         if candidate.credit_share_on_accept and coordinator is not None:
             # A below-target candidate can credit this older accepted stamp
             # after durable replay. Adopt its stable logical floor before
             # startup prewarm/job issuance. Ordinary asynchronous candidates
             # already committed their share and need no floor.
-            coordinator._ensure_share_writer_service().adopt_pending_share(
-                candidate.pending_share
+            coordinator._ensure_block_candidate_service().adopt_replayed_candidate(
+                candidate
             )
         return candidate
 
@@ -8798,133 +8857,15 @@ class PrismCoordinator:
             ) = idle_window_state
 
     def enqueue_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
-        queue_obj = getattr(self, "block_candidate_queue", None)
-        if queue_obj is None:
-            queue_obj = queue.Queue(maxsize=MAX_PENDING_BLOCK_CANDIDATES)
-            self.block_candidate_queue = queue_obj
-        try:
-            queue_obj.put_nowait(candidate)
-            return True
-        except queue.Full:
-            # The candidate is already durable. A full queue merely coalesces
-            # this wakeup; the submitter re-reads pending outbox rows whenever
-            # it drains the queue, so no candidate is discarded.
-            with self.lock:
-                self.block_candidate_wakeups_coalesced = int(
-                    getattr(self, "block_candidate_wakeups_coalesced", 0)
-                ) + 1
-            print(
-                "prism coordinator: block candidate wakeup coalesced "
-                f"hash={candidate.submission.block_hash_hex} (submitter queue full)",
-                flush=True,
-            )
-            return False
+        return self._ensure_block_candidate_service().enqueue(candidate)
 
     @ledger_writer_operation("accepted_block_handling")
     def replay_pending_block_candidates(self) -> int:
-        """Queue durable candidate intents not completed by an earlier process."""
-        with self.lock:
-            if getattr(self, "_retry_block_candidate", None) is not None:
-                return 0
-        pending_rows = getattr(self.ledger, "pending_block_candidate_rows", None)
-        if callable(pending_rows):
-            durable_rows = pending_rows(limit=MAX_PENDING_BLOCK_CANDIDATES)
-        else:
-            pending = getattr(self.ledger, "pending_block_candidates", None)
-            if not callable(pending):
-                return 0
-            durable_rows = [
-                {
-                    "block_hash": (
-                        intent.get("block_hash_hex", "")
-                        if isinstance(intent, dict)
-                        else ""
-                    ),
-                    "candidate": intent,
-                }
-                for intent in pending(limit=MAX_PENDING_BLOCK_CANDIDATES)
-            ]
-        queue_obj = getattr(self, "block_candidate_queue", None)
-        if queue_obj is not None and not queue_obj.empty():
-            return 0
-        queued = 0
-        for durable_row in durable_rows:
-            durable_block_hash = ""
-            candidate: PrismBlockCandidate | None = None
-            try:
-                if not isinstance(durable_row, dict):
-                    raise ValueError("durable block candidate row is not an object")
-                durable_block_hash = str(durable_row["block_hash"]).lower()
-                intent = durable_row["candidate"]
-                if not isinstance(intent, dict):
-                    raise ValueError("durable block candidate intent is not an object")
-                intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
-                if not durable_block_hash or intent_block_hash != durable_block_hash:
-                    raise ValueError("durable block candidate row key does not match intent")
-                candidate = self.block_candidate_from_intent(intent)
-                # Startup replay runs before listeners start. Registering every
-                # durable hash here also closes the crash seam where submitblock
-                # landed but preview publication had not yet happened.
-                self._begin_accepted_block_payout_preview(
-                    durable_block_hash,
-                    block_height=int(intent["expected_height"]),
-                )
-                if self.enqueue_block_candidate(candidate):
-                    queued += 1
-            except Exception:
-                terminalized = False
-                if durable_block_hash:
-                    self._clear_accepted_block_payout_preview(
-                        durable_block_hash,
-                        invalidate_published=True,
-                    )
-                print("prism coordinator: invalid durable block candidate intent", flush=True)
-                traceback.print_exc()
-                quarantine = getattr(self.ledger, "mark_block_candidate_abandoned", None)
-                if durable_block_hash and callable(quarantine):
-                    try:
-                        quarantined = quarantine(
-                            block_hash=durable_block_hash,
-                            error="invalid durable candidate intent",
-                        )
-                        # A normal terminal update return (including already
-                        # terminal/missing) means this process has no pending
-                        # outbox source left that can credit the reconstructed
-                        # share. Release its stable S3 floor lease.
-                        terminalized = True
-                        self._clear_accepted_block_payout_preview(
-                            durable_block_hash
-                        )
-                        if quarantined:
-                            self._clear_block_candidate_retry_state(durable_block_hash)
-                            with self.lock:
-                                self.block_candidate_poisoned_count = int(
-                                    getattr(self, "block_candidate_poisoned_count", 0)
-                                ) + 1
-                    except Exception:
-                        traceback.print_exc()
-                if (
-                    terminalized
-                    and candidate is not None
-                    and candidate.credit_share_on_accept
-                ):
-                    self._finish_pending_share_candidate(candidate.pending_share)
-        if queued:
-            print(
-                f"prism coordinator: replayed {queued} pending block candidate(s)",
-                flush=True,
-            )
-        return queued
+        """Replay durable candidate intents through the B1 owner."""
+        return self._ensure_block_candidate_service().replay_pending()
 
     def _ensure_block_submitter_retry_state(self) -> None:
-        if not hasattr(self, "_block_submitter_retry_state_lock"):
-            self._block_submitter_retry_state_lock = threading.Lock()
-        if not hasattr(self, "_block_submitter_backoff_started_monotonic"):
-            self._block_submitter_backoff_started_monotonic = None
-        if not hasattr(self, "_block_submitter_backoff_deadline_monotonic"):
-            self._block_submitter_backoff_deadline_monotonic = None
-        if not hasattr(self, "_block_submitter_backoff_delay_seconds"):
-            self._block_submitter_backoff_delay_seconds = 0.0
+        self._ensure_block_candidate_service()
 
     def _wait_for_block_candidate_retry(self, delay_seconds: float) -> bool:
         """Wait for intentional backoff without impersonating stuck work.
@@ -8933,323 +8874,29 @@ class PrismCoordinator:
         RPC, audit/finalization, and socket phases call no helper here, so a
         genuinely blocked candidate phase remains watchdog-eligible.
         """
-        delay_seconds = max(0.0, float(delay_seconds))
-        if delay_seconds <= 0:
-            return self.stop_event.is_set()
-        self._ensure_block_submitter_retry_state()
-        started = time.monotonic()
-        with self._block_submitter_retry_state_lock:
-            self._block_submitter_backoff_started_monotonic = started
-            self._block_submitter_backoff_deadline_monotonic = started + delay_seconds
-            self._block_submitter_backoff_delay_seconds = delay_seconds
-        remaining = delay_seconds
-        try:
-            while remaining > 0:
-                self._record_heartbeat("block_submitter")
-                wait_slice = min(
-                    remaining,
-                    BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS,
-                )
-                if self.stop_event.wait(wait_slice):
-                    return True
-                remaining = max(0.0, remaining - wait_slice)
-            self._record_heartbeat("block_submitter")
-            return False
-        finally:
-            with self._block_submitter_retry_state_lock:
-                self._block_submitter_backoff_started_monotonic = None
-                self._block_submitter_backoff_deadline_monotonic = None
-                self._block_submitter_backoff_delay_seconds = 0.0
+        return self._ensure_block_candidate_service().wait_for_retry(delay_seconds)
 
     def _mark_block_candidate_attempted(self, block_hash: str) -> None:
-        mark_attempted = getattr(self.ledger, "mark_block_candidate_attempted", None)
-        if callable(mark_attempted):
-            mark_attempted(block_hash=block_hash)
+        self._ensure_block_candidate_service().mark_attempted(block_hash)
 
     def block_submit_loop(self) -> None:
-        while not self.stop_event.is_set():
-            self._record_heartbeat("block_submitter")
-            try:
-                self.replay_pending_block_candidates()
-                self.submit_next_block_candidate(timeout=1.0)
-            except ShutdownInProgress:
-                # Admission can close after the loop condition. Durable block
-                # candidates remain in the outbox for the replacement writer.
-                return
+        self._ensure_block_candidate_service().run()
 
     def submit_next_block_candidate(self, timeout: float | None = None) -> bool:
-        """Dequeue and land one block candidate; returns True when one ran.
-
-        The block-submitter loop calls this continuously; tests call it
-        directly to drain the queue deterministically.
-        """
-        with self.lock:
-            candidate = getattr(self, "_retry_block_candidate", None)
-            if candidate is not None:
-                self._retry_block_candidate = None
-        if candidate is None:
-            queue_obj = getattr(self, "block_candidate_queue", None)
-            if queue_obj is None:
-                return False
-            try:
-                if timeout is None:
-                    candidate = queue_obj.get_nowait()
-                else:
-                    candidate = queue_obj.get(timeout=timeout)
-            except queue.Empty:
-                return False
-
-        outcome = getattr(self, "_block_candidate_outcome", None)
-        if outcome is None:
-            outcome = threading.local()
-            self._block_candidate_outcome = outcome
-        outcome.refresh_client = None
-        try:
-            with self._writer_operation("accepted_block_handling"):
-                ran = self._submit_next_block_candidate_writer(candidate)
-                refresh_client = getattr(outcome, "refresh_client", None)
-                outcome.refresh_client = None
-        except ShutdownInProgress:
-            # The durable outbox remains pending and the replacement process
-            # will replay it. Dequeuing the in-memory wakeup during the
-            # admission-close race cannot lose candidate work.
-            return False
-        # Fresh-job fanout is deliberately outside the writer admission. Once
-        # the candidate outbox is finalized it cannot mutate the ledger, so a
-        # blocked client send must not hold the writer lease during shutdown.
-        if refresh_client is not None and not self.stop_event.is_set():
-            self.refresh_jobs_after_pending_accepted_block(
-                refresh_client,
-                heartbeat_name="block_submitter",
-            )
-        return ran
+        """Run one queued or retained candidate through the B1 owner."""
+        return self._ensure_block_candidate_service().submit_next(timeout).ran
 
     def _submit_next_block_candidate_writer(
         self,
         candidate: PrismBlockCandidate,
     ) -> bool:
         """Run one candidate with an independent active credit-floor actor."""
-        if not candidate.credit_share_on_accept:
-            return self._submit_next_block_candidate_writer_actor_owned(candidate)
-        share_writer = self._ensure_share_writer_service()
-        share_writer.begin_candidate_actor(candidate.pending_share)
-        try:
-            return self._submit_next_block_candidate_writer_actor_owned(candidate)
-        finally:
-            # The owned body either committed credit, reached terminal
-            # noncredit, or re-established the stable retry/outbox holder.
-            share_writer.finish_candidate_actor(candidate.pending_share)
-
-    def _submit_next_block_candidate_writer_actor_owned(
-        self,
-        candidate: PrismBlockCandidate,
-    ) -> bool:
-        """Land one dequeued block candidate inside writer admission."""
-        outcome = getattr(self, "_block_candidate_outcome", None)
-        if outcome is None:
-            outcome = threading.local()
-            self._block_candidate_outcome = outcome
-        outcome.reason = None
-        block_hash = str(candidate.submission.block_hash_hex).lower()
-        try:
-            self._mark_block_candidate_attempted(block_hash)
-        except Exception:
-            print(
-                "prism coordinator: could not record block candidate attempt "
-                f"hash={block_hash}",
-                flush=True,
-            )
-            traceback.print_exc()
-            self._retain_block_candidate_for_retry(candidate)
-            self._wait_for_block_candidate_retry(
-                self._next_block_candidate_retry_delay(block_hash)
-            )
-            return True
-        with self.lock:
-            registry = getattr(self, "_block_candidate_finalize_retries", None)
-            pending_finalize = (
-                registry.get(block_hash) if registry is not None else None
-            )
-        if pending_finalize is not None:
-            accepted, error = pending_finalize
-            return self._finalize_block_candidate(
-                candidate,
-                block_hash=block_hash,
-                accepted=accepted,
-                error=error,
-                outcome=outcome,
-            )
-        accepted = False
-        error = "candidate became stale or submission failed"
-        try:
-            accepted = self.submit_block_candidate(candidate)
-        except Exception:
-            error = "candidate submission raised an exception"
-            print(
-                "prism coordinator: block candidate submission failed "
-                f"hash={candidate.submission.block_hash_hex}",
-                flush=True,
-            )
-            traceback.print_exc()
-        abandon_reason = getattr(outcome, "reason", None) if outcome is not None else None
-        retryable = not accepted and (
-            abandon_reason is None
-            or abandon_reason in PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS
-        )
-        if retryable:
-            # Leave the outbox row pending. It will replay after a short pause
-            # or on process restart. Keep this parent ahead of queued children:
-            # a child built from its prospective balances cannot be validated
-            # against the database until the parent confirmation catches up.
-            print(
-                "prism coordinator: retained block candidate for retry "
-                f"hash={block_hash} reason={abandon_reason or 'exception'}",
-                flush=True,
-            )
-            self._retain_block_candidate_for_retry(candidate)
-            self._wait_for_block_candidate_retry(
-                self._next_block_candidate_retry_delay(block_hash)
-            )
-            return True
-        if not accepted:
-            try:
-                self._reject_terminal_prepared_block_candidate(candidate)
-            except Exception:
-                # Persistence may have committed before a later RPC/transport
-                # failure. Do not terminally discard the outbox row until its
-                # prepared balance deltas have also reached a terminal state.
-                print(
-                    "prism coordinator: prepared block cleanup failed "
-                    f"hash={block_hash}",
-                    flush=True,
-                )
-                traceback.print_exc()
-                self._defer_block_candidate(
-                    PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                    "could not reject prepared state for terminal candidate",
-                    worker=candidate.client.username or None,
-                )
-                self._retain_block_candidate_for_retry(candidate)
-                self._wait_for_block_candidate_retry(
-                    self._next_block_candidate_retry_delay(block_hash)
-                )
-                return True
-        return self._finalize_block_candidate(
-            candidate,
-            block_hash=block_hash,
-            accepted=accepted,
-            error=error,
-            outcome=outcome,
-        )
-
-    def _finalize_block_candidate(
-        self,
-        candidate: PrismBlockCandidate,
-        *,
-        block_hash: str,
-        accepted: bool,
-        error: str,
-        outcome: threading.local,
-    ) -> bool:
-        """Retry only a terminal candidate's durable outbox transition."""
-        self._clear_accepted_block_payout_preview(
-            block_hash,
-            invalidate_published=not accepted,
-        )
-        finish_name = (
-            "mark_block_candidate_submitted"
-            if accepted
-            else "mark_block_candidate_abandoned"
-        )
-        finish = getattr(self.ledger, finish_name, None)
-        if callable(finish):
-            try:
-                if accepted:
-                    finish(block_hash=block_hash)
-                else:
-                    finish(block_hash=block_hash, error=error)
-                    # The invalidation tombstone is needed until the durable
-                    # outbox becomes terminal. A normal return (including an
-                    # already-terminal/missing row) means there is no pending
-                    # replay source left for this process to guard.
-                    self._clear_accepted_block_payout_preview(block_hash)
-            except Exception:
-                print(
-                    "prism coordinator: could not finalize durable block candidate "
-                    f"hash={block_hash}",
-                    flush=True,
-                )
-                traceback.print_exc()
-                with self.lock:
-                    registry = getattr(
-                        self, "_block_candidate_finalize_retries", None
-                    )
-                    if registry is None:
-                        registry = {}
-                        self._block_candidate_finalize_retries = registry
-                    first_failure = block_hash not in registry
-                    registry[block_hash] = (accepted, error)
-                self._finish_pending_share_candidate(candidate.pending_share)
-                self._retain_block_candidate_for_retry(
-                    candidate,
-                    retain_share_floor=False,
-                )
-                if accepted and first_failure:
-                    outcome.refresh_client = candidate.client
-                    return True
-                self._wait_for_block_candidate_retry(
-                    self._next_block_candidate_retry_delay(block_hash)
-                )
-                return True
-        elif not accepted:
-            # Compatibility ledgers without a durable candidate outbox have
-            # no restart replay source that could require the tombstone.
-            self._clear_accepted_block_payout_preview(block_hash)
-        with self.lock:
-            registry = getattr(self, "_block_candidate_finalize_retries", None)
-            if registry is not None:
-                registry.pop(block_hash, None)
-        self._clear_block_candidate_retry_state(block_hash)
-        self._finish_pending_share_candidate(candidate.pending_share)
-        if accepted:
-            outcome.refresh_client = candidate.client
-        return True
-
+        return self._ensure_block_candidate_service().submit_writer(candidate)
     def _retain_block_candidate_for_retry(
         self,
         candidate: PrismBlockCandidate,
-        *,
-        retain_share_floor: bool = True,
     ) -> None:
-        """Keep the oldest unresolved candidate ahead of queued descendants."""
-        candidate_height = int(candidate.context.template["height"])
-        candidate_hash = str(candidate.submission.block_hash_hex).lower()
-        # Publish no retryable credit-bearing candidate until its stable floor
-        # lease exists. A submitter may pop and terminally finish immediately
-        # after the coordinator lock is released; adopting afterward could
-        # otherwise resurrect an already-finished lease.
-        if candidate.credit_share_on_accept and retain_share_floor:
-            self._ensure_share_writer_service().adopt_pending_share(
-                candidate.pending_share
-            )
-        with self.lock:
-            self.block_candidate_retry_count = int(
-                getattr(self, "block_candidate_retry_count", 0)
-            ) + 1
-            existing = getattr(self, "_retry_block_candidate", None)
-            if existing is None:
-                self._retry_block_candidate = candidate
-            else:
-                existing_height = int(existing.context.template["height"])
-                existing_hash = str(existing.submission.block_hash_hex).lower()
-                if candidate_hash == existing_hash or candidate_height < existing_height:
-                    # Replacing a descendant is safe because its durable outbox
-                    # row remains authoritative and replayable. Its stable S3
-                    # floor lease also remains terminally reachable by share ID.
-                    self._retry_block_candidate = candidate
-        # The selected and non-selected candidates were each adopted before
-        # their own first retry-slot publication. Their stable share-ID leases
-        # remain reachable without nesting the coordinator and S3 locks.
+        self._ensure_block_candidate_service().retain_for_retry(candidate)
 
     def _reject_terminal_prepared_block_candidate(
         self,
@@ -9277,81 +8924,33 @@ class PrismCoordinator:
             )
 
     def _next_block_candidate_retry_delay(self, block_hash: str) -> float:
-        initial = max(
-            0.0,
-            float(
-                getattr(
-                    self,
-                    "block_candidate_retry_initial_seconds",
-                    DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS,
-                )
-            ),
-        )
-        maximum = max(
-            initial,
-            float(
-                getattr(
-                    self,
-                    "block_candidate_retry_max_seconds",
-                    DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS,
-                )
-            ),
-        )
-        with self.lock:
-            delays = getattr(self, "block_candidate_retry_delays", None)
-            if delays is None:
-                delays = {}
-                self.block_candidate_retry_delays = delays
-            delay = float(delays.get(block_hash, initial))
-            delays[block_hash] = min(maximum, max(initial, delay * 2))
-        return min(delay, maximum)
+        return self._ensure_block_candidate_service().next_retry_delay(block_hash)
 
-    def _clear_block_candidate_retry_state(self, block_hash: str) -> None:
-        with self.lock:
-            delays = getattr(self, "block_candidate_retry_delays", None)
-            if delays is not None:
-                delays.pop(block_hash, None)
-
-    def _defer_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
-        """Record a retryable outcome without counting a terminal abandonment."""
-        outcome = getattr(self, "_block_candidate_outcome", None)
-        if outcome is None:
-            outcome = threading.local()
-            self._block_candidate_outcome = outcome
-        outcome.reason = reason
-        print(
-            f"prism coordinator: block candidate deferred reason={reason}: {message}",
-            flush=True,
+    def _defer_block_candidate(
+        self,
+        reason: str,
+        message: str,
+        *,
+        worker: str | None,
+    ) -> None:
+        self._ensure_block_candidate_service().record_deferred(
+            reason,
+            message,
+            worker=worker,
         )
 
-    def _abandon_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
-        """Record a lost/failed block candidate as a BLOCK-path event.
-
-        The share that produced the candidate was acknowledged and, when it met
-        the share target, credited at submit time; the block losing its race
-        afterwards does not un-earn it and is NOT a share rejection. It is
-        counted under a dedicated block-abandonment counter (by reason, so a
-        benign 'tip moved' race is distinguishable from a real
-        submitblock-rejected/ledger failure) rather than the share-reject
-        counters, which stay a true measure of shares refused to miners.
-        """
-        if reason in PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS:
-            self._defer_block_candidate(reason, message, worker=worker)
-            return
-        outcome = getattr(self, "_block_candidate_outcome", None)
-        if outcome is None:
-            outcome = threading.local()
-            self._block_candidate_outcome = outcome
-        outcome.reason = reason
-        with self.lock:
-            counts = getattr(self, "block_candidate_abandoned_counts", None)
-            if counts is None:
-                counts = {}
-                self.block_candidate_abandoned_counts = counts
-            counts[reason] = int(counts.get(reason, 0)) + 1
-        print(
-            f"prism coordinator: block candidate abandoned reason={reason}: {message}",
-            flush=True,
+    def _abandon_block_candidate(
+        self,
+        reason: str,
+        message: str,
+        *,
+        worker: str | None,
+    ) -> None:
+        """Record a terminal or retryable block-path outcome."""
+        self._ensure_block_candidate_service().record_abandoned(
+            reason,
+            message,
+            worker=worker,
         )
 
     def active_block_candidate_height(self, block_hash: str) -> int | None:
@@ -10958,15 +10557,9 @@ class PrismCoordinator:
                 # Metrics collection is diagnostic. Candidate processing and
                 # its watchdog remain authoritative when this read is down.
                 pass
-        self._ensure_block_submitter_retry_state()
-        now = time.monotonic()
-        with self._block_submitter_retry_state_lock:
-            deadline = self._block_submitter_backoff_deadline_monotonic
-            backoff_active = deadline is not None
-            backoff_remaining = (
-                max(0.0, float(deadline) - now) if deadline is not None else 0.0
-            )
-            backoff_delay = float(self._block_submitter_backoff_delay_seconds)
+        backoff_active, backoff_remaining, backoff_delay = (
+            self._ensure_block_candidate_service().backoff_snapshot()
+        )
         return [
             "# HELP qbit_prism_block_candidates_pending Durable block candidates awaiting a terminal outcome, or -1 if unavailable.",
             "# TYPE qbit_prism_block_candidates_pending gauge",
