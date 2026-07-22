@@ -33,6 +33,9 @@ This is useful for reviewers and operators who need implementation detail:
   writer-lease behavior, compaction contract, and readiness probes.
 - [prism-capacity-readiness.md](prism-capacity-readiness.md): optional
   Stratum-to-Postgres qualification artifact and standalone validator contract.
+- [prism-coordinator-refactor/README.md](prism-coordinator-refactor/README.md):
+  completed coordinator decomposition, ownership map, validation evidence, and
+  stacked-PR publication plan.
 
 ## Public-Site Guidance
 

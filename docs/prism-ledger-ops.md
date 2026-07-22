@@ -106,6 +106,11 @@ exponential delay starting at 250 milliseconds and capped at 30 seconds. They
 do not increment terminal abandonment counters. Replay carries the database
 row's block hash separately from candidate JSON, so malformed payloads can be
 quarantined by their authoritative outbox key instead of replaying forever.
+If qbit has already returned the candidate outcome but durable outbox
+finalization fails, replay resumes only that finalization step with the same
+bounded pacing. It does not call `submitblock` again, recount an accepted block,
+rebuild or republish audit evidence, or reacquire a share-writer floor already
+released after the known outcome.
 
 When a network-valid hash is below a listener's advertised share target, the
 coordinator first stores a candidate-only intent, submits it synchronously, and
@@ -144,9 +149,45 @@ shares. Audit bundles containing a credited row use
 enable stale-grace crediting.
 
 Deployments that run with `PRISM_POSTGRES_INIT_SCHEMA=0` must apply
-`crates/qbit-prism/sql/001_share_ledger.sql` before starting upgraded
-coordinators. Otherwise share inserts will fail because the `credit_policy`
-column and updated window function signatures are missing.
+`crates/qbit-prism/sql/001_share_ledger.sql` before starting any upgraded
+coordinator. The file is the cumulative, idempotent schema initializer and
+migration path, despite its `001` name. Skipping it can break share inserts,
+reward-window calls, pool-block confirmation/reactivation, and audit evidence
+publication because required columns, functions, and the durable publication
+ordinal will be missing.
+
+### Audit publication ordering migration
+
+Existing databases must receive the new `audit_publication_sequence` migration.
+It creates and validates a bigint sequence, adds the nullable pool-block column,
+deterministically backfills confirmed and inactive rows by `found_at` and
+`block_hash`, adds a unique index and state constraint, advances the allocator
+beyond every retained ordinal, and replaces confirmation/reactivation functions
+so each new durable confirmation receives an ordinal. Exact confirmation replay
+preserves its prior ordinal. Historical inactive rows are backfilled so later
+reactivation can retain that already-published ordinal without allocating a new
+audit publication.
+
+The migration includes `ALTER TABLE` operations that require PostgreSQL's
+`ACCESS EXCLUSIVE` table lock. They wait for existing readers and writers and
+can interrupt new reads as well as writes while held. A later serialized phase
+takes a transaction-scoped advisory lock and a `SHARE ROW EXCLUSIVE` lock on
+`qbit_pool_blocks`, and the unique index is built non-concurrently. Treat the
+whole migration as read-impacting: stop the old coordinator or use a reviewed
+maintenance window, take the normal database backup, and apply the file with
+`ON_ERROR_STOP` using the same database role and schema search path as PRISM.
+For example:
+
+```sh
+psql "$PRISM_DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f crates/qbit-prism/sql/001_share_ledger.sql
+```
+
+With `PRISM_POSTGRES_INIT_SCHEMA=1`, coordinator construction applies the same
+script before listeners open. The migration is rerunnable and tested across
+fresh, legacy, partial, concurrent, malformed, and bigint-boundary states; it
+fails closed instead of accepting a conflicting sequence, column, index, or
+constraint definition.
 
 `qbit_shares_since_template_height(min_template_height)` supports operational
 replay and frontend recovery. It returns accepted shares at or above the
