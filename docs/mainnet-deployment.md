@@ -343,8 +343,8 @@ Fanout-transition credit is independently disabled by default. Before enabling
 it, apply `crates/qbit-prism/sql/001_share_ledger.sql` and qualify every audit
 builder, verifier, mirror, and downstream consumer for
 `qbit.prism.audit-bundle.v1.2` and
-`qbit.prism.fanout-transition-receipt.v1`. The later qbit-tools rollout for the
-current mainnet policy must render exactly:
+`qbit.prism.fanout-transition-receipt.v1`. A later mainnet deployment rollout
+must render exactly:
 
 ```dotenv
 PRISM_STRATUM_STALE_GRACE_SECONDS=0

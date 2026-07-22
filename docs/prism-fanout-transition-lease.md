@@ -119,7 +119,7 @@ PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION=1
 ```
 
 After the ledger schema, coordinator, audit builder, and verifier have all been
-deployed and qualified, a later `qbit-tools` mainnet rollout should render:
+deployed and qualified, a later mainnet deployment rollout should render:
 
 ```dotenv
 PRISM_STRATUM_STALE_GRACE_SECONDS=0
@@ -132,4 +132,4 @@ operational margin and matches the existing default template-refresh failure
 budget. The one-job cap protects only the most recently delivered mining job,
 which is the job a conforming miner should be working, while keeping retained
 memory and prior-work authority minimal. These values are documented here only;
-this change does not edit any `qbit-tools` rollout configuration.
+this change does not edit any deployed rollout configuration.
