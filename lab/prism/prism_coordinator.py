@@ -10897,14 +10897,19 @@ class PrismCoordinator:
             if (
                 current_payout_generation
                 != payout_generation_after_reconciliation
-                or (
-                    bundle is not None
-                    and (
-                        current_payout_artifact is None
-                        or bundle.build_key is None
-                        or bundle.build_key.payout_artifact_sha256
-                        != current_payout_artifact.prior_balances_sha256
-                    )
+            ):
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshSuperseded(
+                    "payout state changed before refresh publication; "
+                    "immediate retry scheduled"
+                )
+            if (
+                bundle is not None
+                and (
+                    current_payout_artifact is None
+                    or bundle.build_key is None
+                    or bundle.build_key.payout_artifact_sha256
+                    != current_payout_artifact.prior_balances_sha256
                 )
             ):
                 self._schedule_tip_refresh_retry()
