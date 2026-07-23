@@ -212,6 +212,7 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_BLOCKWAIT_ENABLED` | `1` | enables a `waitfornewblock` thread so new tips trigger immediate clean-job refreshes |
 | `PRISM_BLOCKWAIT_TIMEOUT_SECONDS` | `5` | server-side timeout for each `waitfornewblock` call |
 | `PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS` | `60` | fail-closed timeout for one signed shared-bundle subprocess |
+| `PRISM_COORDINATION_BLOCKED_EXIT_SECONDS` | `900` | maximum continuous age of coordination-only template-refresh deferrals before the publication watchdog restarts the coordinator |
 | `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` | `15` | maximum monotonic age of a known tip/template/payout refresh before `/healthz` returns HTTP 503 |
 | `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | `15` | maximum monotonic age of the last coherent qbit tip/template poll before `/healthz` returns HTTP 503 |
 | `PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS` | `1` | minimum spacing (plus up to 25% jitter) between failed tip-refresh attempts while the observed tip is unchanged; success or a new tip re-arms immediately; set `0` for unspaced retries |

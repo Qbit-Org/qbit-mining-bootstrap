@@ -158,6 +158,7 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_START_DIFF"], "4096")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_MAX_DIFF"], "65536")
         self.assertEqual(env["PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS"], "120")
+        self.assertEqual(env["PRISM_COORDINATION_BLOCKED_EXIT_SECONDS"], "900")
 
     def test_prism_runtime_has_no_capacity_evidence_dependency(self) -> None:
         env = self._environment("prism-coordinator")
