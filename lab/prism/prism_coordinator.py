@@ -13609,10 +13609,34 @@ class PrismCoordinator:
         )
         return rows
 
+    @staticmethod
+    def settlement_balances_by_program(
+        balances: list[dict[str, object]],
+    ) -> dict[str, int]:
+        """Aggregate owed balances by P2MR program for settlement equality.
+
+        A miner may re-authorize the same payout address under any valid
+        spelling (bech32 permits an all-uppercase form), which changes the
+        recipient/order-key identity strings while committing to the same
+        payout program. Ledger and preview views can then label one program
+        with different identity strings while agreeing on every settled
+        amount, so settlement equality must be judged on the program and
+        amount alone. Identity strings stay display metadata. Zero totals
+        are dropped to match both the ledger reader (nonzero HAVING filter)
+        and the preview builder (zero balances skipped).
+        """
+        aggregated: dict[str, int] = {}
+        for balance in balances:
+            program = str(balance.get("p2mr_program_hex", "")).lower()
+            aggregated[program] = aggregated.get(program, 0) + int(
+                balance.get("balance_sats", 0)
+            )
+        return {program: total for program, total in aggregated.items() if total != 0}
+
     def prior_balances_match_current(self, prior_balances: list[dict[str, object]]) -> bool:
-        return self.normalized_prior_balances(prior_balances) == self.normalized_prior_balances(
-            self.ledger.current_prior_balances()
-        )
+        return self.settlement_balances_by_program(
+            prior_balances
+        ) == self.settlement_balances_by_program(self.ledger.current_prior_balances())
 
     def send_job(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
         client.send(self.job_payload(job))
@@ -16849,10 +16873,10 @@ class PrismCoordinator:
                 )
                 if not already_confirmed:
                     if preview is None and durable_payout_state:
-                        live_prior_balances = self.normalized_prior_balances(
+                        live_prior_balances = self.settlement_balances_by_program(
                             self.ledger.current_prior_balances()
                         )
-                        expected_prior_balances = self.normalized_prior_balances(
+                        expected_prior_balances = self.settlement_balances_by_program(
                             context.prior_balances
                         )
                         if live_prior_balances != expected_prior_balances:
@@ -16965,7 +16989,9 @@ class PrismCoordinator:
                         if callable(as_of_reader)
                         else self.ledger.current_prior_balances()
                     )
-                    if confirmed_balances != preview:
+                    if self.settlement_balances_by_program(
+                        confirmed_balances
+                    ) != self.settlement_balances_by_program(preview):
                         self.request_shutdown()
                         self._clear_accepted_block_payout_preview(
                             block_hash,
