@@ -2036,6 +2036,198 @@ class PrismShareLedgerTests(unittest.TestCase):
             self.assertEqual(segment_path.read_bytes(), expected_bytes)
             self.assertEqual(new_range_sha256, hashlib.sha256(expected_bytes).hexdigest())
 
+    def test_psql_segment_gap_backfills_missing_shares_from_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = SingleWriterShareLedger()
+            shares = [
+                source.append(pending_share(index)).to_prism_json()
+                for index in range(1, 5)
+            ]
+            backfill_rows = [
+                {
+                    **share,
+                    "share_difficulty": str(share["share_difficulty"]),
+                    "network_difficulty": str(share["network_difficulty"]),
+                    "credit_policy": None,
+                }
+                for share in shares[1:3]
+            ]
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease(), backfill_rows],
+                audit_body_dir=tmp,
+                audit_share_segment_size=10,
+            )
+            segment_uri, _old_range_sha256 = ledger._write_audit_share_segment_range(
+                segment_first_share_seq=1,
+                segment_last_share_seq=10,
+                first_share_seq=1,
+                last_share_seq=1,
+                shares=[shares[0]],
+            )
+            segment_path = Path(segment_uri)
+            incoming_bytes = ledger._storage_json_bytes(
+                ledger._audit_share_segment_payload(
+                    first_share_seq=4,
+                    last_share_seq=4,
+                    shares=[shares[3]],
+                )
+            )
+
+            reused_uri, incoming_range_sha256 = ledger._write_audit_share_segment_range(
+                segment_first_share_seq=1,
+                segment_last_share_seq=10,
+                first_share_seq=4,
+                last_share_seq=4,
+                shares=[shares[3]],
+            )
+
+            merged = json.loads(segment_path.read_text(encoding="utf-8"))
+            self.assertEqual(reused_uri, segment_uri)
+            self.assertEqual(merged["first_share_seq"], 1)
+            self.assertEqual(merged["last_share_seq"], 4)
+            self.assertEqual(merged["share_count"], 4)
+            self.assertEqual(merged["shares"], shares)
+            self.assertEqual(incoming_range_sha256, hashlib.sha256(incoming_bytes).hexdigest())
+            self.assertEqual(len(ledger.lease_queries), 2)
+            self.assertIn("FROM qbit_share_ledger", ledger.lease_queries[-1])
+            self.assertIn("WHERE accepted", ledger.lease_queries[-1])
+            self.assertIn("share_seq BETWEEN 2 AND 3", ledger.lease_queries[-1])
+            self.assertEqual(
+                list(Path(tmp).glob(f"{segment_path.name}.conflict-*")),
+                [],
+            )
+
+    def test_psql_segment_gap_without_ledger_rows_quarantines_existing_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = SingleWriterShareLedger()
+            shares = [
+                source.append(pending_share(index)).to_prism_json()
+                for index in range(1, 5)
+            ]
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease(), [], []],
+                audit_body_dir=tmp,
+                audit_share_segment_size=10,
+            )
+            segment_uri, old_range_sha256 = ledger._write_audit_share_segment_range(
+                segment_first_share_seq=1,
+                segment_last_share_seq=10,
+                first_share_seq=1,
+                last_share_seq=1,
+                shares=[shares[0]],
+            )
+            segment_path = Path(segment_uri)
+            old_bytes = segment_path.read_bytes()
+            old_stat = segment_path.stat()
+            incoming_bytes = ledger._storage_json_bytes(
+                ledger._audit_share_segment_payload(
+                    first_share_seq=4,
+                    last_share_seq=4,
+                    shares=[shares[3]],
+                )
+            )
+
+            fresh_uri, incoming_range_sha256 = ledger._write_audit_share_segment_range(
+                segment_first_share_seq=1,
+                segment_last_share_seq=10,
+                first_share_seq=4,
+                last_share_seq=4,
+                shares=[shares[3]],
+            )
+
+            quarantined = list(Path(tmp).glob(f"{segment_path.name}.conflict-*"))
+            fresh_path = Path(fresh_uri)
+            self.assertNotEqual(fresh_uri, segment_uri)
+            self.assertEqual(segment_path.read_bytes(), old_bytes)
+            self.assertEqual(segment_path.stat().st_ino, old_stat.st_ino)
+            self.assertEqual(segment_path.stat().st_mtime_ns, old_stat.st_mtime_ns)
+            self.assertEqual(fresh_path.read_bytes(), incoming_bytes)
+            self.assertEqual(incoming_range_sha256, hashlib.sha256(incoming_bytes).hexdigest())
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual(quarantined[0].read_bytes(), old_bytes)
+            self.assertEqual(len(ledger.lease_queries), 2)
+            self.assertIn("FROM qbit_share_ledger", ledger.lease_queries[-1])
+            self.assertIn("share_seq BETWEEN 2 AND 3", ledger.lease_queries[-1])
+            old_part = {
+                "kind": "segment_range",
+                "first_share_seq": 1,
+                "last_share_seq": 1,
+                "share_count": 1,
+                "range_sha256": old_range_sha256,
+                "body_uri": segment_uri,
+            }
+            incoming_part = {
+                "kind": "segment_range",
+                "first_share_seq": 4,
+                "last_share_seq": 4,
+                "share_count": 1,
+                "range_sha256": incoming_range_sha256,
+                "body_uri": fresh_uri,
+            }
+            self.assertEqual(
+                ledger._read_audit_share_segment(old_part, parent_body_uri="old-body"),
+                [shares[0]],
+            )
+            self.assertEqual(
+                ledger._read_audit_share_segment(incoming_part, parent_body_uri="new-body"),
+                [shares[3]],
+            )
+
+            retried_uri, retried_range_sha256 = ledger._write_audit_share_segment_range(
+                segment_first_share_seq=1,
+                segment_last_share_seq=10,
+                first_share_seq=4,
+                last_share_seq=4,
+                shares=[shares[3]],
+            )
+
+            self.assertEqual(retried_uri, fresh_uri)
+            self.assertEqual(retried_range_sha256, incoming_range_sha256)
+            self.assertEqual(segment_path.read_bytes(), old_bytes)
+            self.assertEqual(segment_path.stat().st_ino, old_stat.st_ino)
+            self.assertEqual(segment_path.stat().st_mtime_ns, old_stat.st_mtime_ns)
+            self.assertEqual(fresh_path.read_bytes(), incoming_bytes)
+            self.assertEqual(
+                len(list(Path(tmp).glob(f"{segment_path.name}.conflict-*"))),
+                1,
+            )
+            self.assertEqual(len(ledger.lease_queries), 3)
+
+    def test_psql_segment_conflicting_duplicate_still_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = SingleWriterShareLedger()
+            share = source.append(pending_share(1)).to_prism_json()
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                audit_body_dir=tmp,
+                audit_share_segment_size=10,
+            )
+            segment_uri, _range_sha256 = ledger._write_audit_share_segment_range(
+                segment_first_share_seq=1,
+                segment_last_share_seq=10,
+                first_share_seq=1,
+                last_share_seq=1,
+                shares=[share],
+            )
+            segment_path = Path(segment_uri)
+            old_bytes = segment_path.read_bytes()
+
+            with self.assertRaisesRegex(RuntimeError, "conflicts at share_seq 1"):
+                ledger._write_audit_share_segment_range(
+                    segment_first_share_seq=1,
+                    segment_last_share_seq=10,
+                    first_share_seq=1,
+                    last_share_seq=1,
+                    shares=[{**share, "share_id": "different"}],
+                )
+
+            self.assertEqual(segment_path.read_bytes(), old_bytes)
+            self.assertEqual(len(ledger.lease_queries), 1)
+            self.assertEqual(
+                list(Path(tmp).glob(f"{segment_path.name}.conflict-*")),
+                [],
+            )
+
     def test_psql_canonical_bundle_path_skips_canonicalizer_and_is_retry_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

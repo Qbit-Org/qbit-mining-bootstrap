@@ -33,6 +33,10 @@ DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
 VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
 
 
+class _AuditShareSegmentConflict(RuntimeError):
+    """A share sequence is bound to more than one audit payload."""
+
+
 def validate_credit_policy(credit_policy: str | None) -> str | None:
     if credit_policy is None:
         return None
@@ -4766,6 +4770,27 @@ FROM bucketed;
                 shares,
                 segment_path=segment_path,
             )
+            if merged_shares is None:
+                # Keep prior body_uri references valid at the stable slot path,
+                # while the new bundle uses an immutable incoming-only segment.
+                fresh_uri, fresh_sha256 = self._write_audit_share_segment(
+                    first_share_seq=first_share_seq,
+                    last_share_seq=last_share_seq,
+                    shares=shares,
+                )
+                if fresh_sha256 != range_sha256:
+                    raise RuntimeError("audit share segment range hash changed during fallback")
+                try:
+                    self._quarantine_audit_share_segment(
+                        segment_path,
+                        expected_bytes=existing_bytes,
+                    )
+                except OSError:
+                    # The stable slot already preserves the old range, and the
+                    # immutable file preserves the incoming one. A quarantine
+                    # snapshot failure must not wedge block finalization.
+                    pass
+                return fresh_uri, range_sha256
         segment_first = int(merged_shares[0]["share_seq"])
         segment_last = int(merged_shares[-1]["share_seq"])
         if (
@@ -4791,7 +4816,7 @@ FROM bucketed;
         incoming_shares: list[Any],
         *,
         segment_path: Path,
-    ) -> list[Any]:
+    ) -> list[Any] | None:
         if not existing_shares:
             return list(incoming_shares)
         existing_by_seq = self._audit_shares_by_seq(existing_shares, segment_path=segment_path)
@@ -4799,14 +4824,113 @@ FROM bucketed;
         for share_seq, incoming in incoming_by_seq.items():
             existing = existing_by_seq.get(share_seq)
             if existing is not None and existing != incoming:
-                raise RuntimeError(f"existing audit share segment conflicts at share_seq {share_seq} in {segment_path}")
+                raise _AuditShareSegmentConflict(
+                    f"existing audit share segment conflicts at share_seq {share_seq} in {segment_path}"
+                )
         merged_by_seq = {**existing_by_seq, **incoming_by_seq}
         ordered_seqs = sorted(merged_by_seq)
         if any(current + 1 != nxt for current, nxt in zip(ordered_seqs, ordered_seqs[1:])):
-            raise RuntimeError(f"existing audit share segment would become non-contiguous at {segment_path}")
+            # A skipped finalize can leave an otherwise valid slot behind the
+            # incoming range. Repair that hole from the append-only ledger.
+            gap_before, gap_after = next(
+                (current, nxt)
+                for current, nxt in zip(ordered_seqs, ordered_seqs[1:])
+                if current + 1 != nxt
+            )
+            missing_first = gap_before + 1
+            missing_last = gap_after - 1
+            try:
+                durable_shares = self._load_audit_share_ledger_range(
+                    first_share_seq=missing_first,
+                    last_share_seq=missing_last,
+                )
+            except _AuditShareSegmentConflict:
+                raise
+            except Exception:
+                # This read is a recovery aid; its failure must not turn the
+                # original slot gap into another permanent finalize failure.
+                durable_shares = None
+            if durable_shares is not None:
+                try:
+                    durable_by_seq = self._audit_shares_by_seq(
+                        durable_shares,
+                        segment_path=segment_path,
+                        require_contiguous=False,
+                    )
+                except _AuditShareSegmentConflict:
+                    raise
+                except RuntimeError:
+                    durable_by_seq = {}
+                if sorted(durable_by_seq) == list(range(missing_first, missing_last + 1)):
+                    merged_by_seq.update(durable_by_seq)
+                    ordered_seqs = sorted(merged_by_seq)
+                    if not any(
+                        current + 1 != nxt
+                        for current, nxt in zip(ordered_seqs, ordered_seqs[1:])
+                    ):
+                        return [merged_by_seq[share_seq] for share_seq in ordered_seqs]
+            # The incoming range is independently complete and remains usable.
+            # The caller preserves this slot and gives that range a fresh URI.
+            return None
         return [merged_by_seq[share_seq] for share_seq in ordered_seqs]
 
-    def _audit_shares_by_seq(self, shares: list[Any], *, segment_path: Path) -> dict[int, Any]:
+    def _load_audit_share_ledger_range(
+        self,
+        *,
+        first_share_seq: int,
+        last_share_seq: int,
+    ) -> list[dict[str, object]]:
+        sql = f"""
+SELECT COALESCE(json_agg(json_build_object(
+    'share_seq', share_seq,
+    'share_id', share_id,
+    'miner_id', miner_id,
+    'order_key', payout_order_key,
+    'p2mr_program_hex', encode(p2mr_program, 'hex'),
+    'share_difficulty', share_difficulty::text,
+    'network_difficulty', network_difficulty::text,
+    'template_height', template_height,
+    'job_id', job_id,
+    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
+    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
+    'ntime', ntime,
+    'credit_policy', credit_policy
+) ORDER BY share_seq ASC), '[]'::json)
+FROM qbit_share_ledger
+WHERE accepted
+  AND share_seq BETWEEN {int(first_share_seq)} AND {int(last_share_seq)};
+"""
+        rows = self._run_read_json(sql)
+        if not isinstance(rows, list):
+            raise RuntimeError("audit share ledger backfill did not return a list")
+        return [self._record_from_json(row).to_prism_json() for row in rows]
+
+    def _quarantine_audit_share_segment(
+        self,
+        segment_path: Path,
+        *,
+        expected_bytes: bytes,
+    ) -> Path:
+        for existing_path in segment_path.parent.glob(f"{segment_path.name}.conflict-*"):
+            if self._file_matches_bytes(existing_path, expected_bytes):
+                return existing_path
+        timestamp = time.time_ns()
+        quarantine_path = segment_path.with_name(f"{segment_path.name}.conflict-{timestamp}")
+        while quarantine_path.exists():
+            timestamp += 1
+            quarantine_path = segment_path.with_name(f"{segment_path.name}.conflict-{timestamp}")
+        # Snapshot rather than move: previously finalized bundles retain this
+        # stable slot URI, so it must remain readable across crashes and retries.
+        self._write_bytes_atomically(quarantine_path, expected_bytes)
+        return quarantine_path
+
+    def _audit_shares_by_seq(
+        self,
+        shares: list[Any],
+        *,
+        segment_path: Path,
+        require_contiguous: bool = True,
+    ) -> dict[int, Any]:
         by_seq: dict[int, Any] = {}
         for share in shares:
             if not isinstance(share, dict):
@@ -4817,10 +4941,12 @@ FROM bucketed;
                 raise RuntimeError(f"audit share segment has invalid share_seq at {segment_path}") from exc
             existing = by_seq.get(share_seq)
             if existing is not None and existing != share:
-                raise RuntimeError(f"audit share segment has duplicate conflicting share_seq {share_seq} at {segment_path}")
+                raise _AuditShareSegmentConflict(
+                    f"audit share segment has duplicate conflicting share_seq {share_seq} at {segment_path}"
+                )
             by_seq[share_seq] = share
         ordered = sorted(by_seq)
-        if any(current + 1 != nxt for current, nxt in zip(ordered, ordered[1:])):
+        if require_contiguous and any(current + 1 != nxt for current, nxt in zip(ordered, ordered[1:])):
             raise RuntimeError(f"audit share segment has non-contiguous share_seq values at {segment_path}")
         return by_seq
 
