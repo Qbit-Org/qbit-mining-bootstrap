@@ -960,7 +960,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         server._start_job_build_locked = start_without_execution  # type: ignore[method-assign]
         server._arm_job_build_locked = lambda _flight: None  # type: ignore[method-assign]
         admission_started = time.monotonic()
-        priority_token, priority_requested = (
+        priority_token, priority_requested, _priority_cancellation = (
             server._begin_job_build_priority_preparation()
         )
         latest = build_request(
