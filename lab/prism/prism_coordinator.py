@@ -1062,6 +1062,14 @@ class PrismBlockCandidate:
     credit_share_on_accept: bool = False
 
 
+@dataclass
+class _BlockCandidateDispositionFlight:
+    """One same-hash submission guard shared by its holder and waiters."""
+
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    users: int = 0
+
+
 @dataclass(frozen=True)
 class CachedTemplateArtifacts:
     """Template plus everything derivable from it alone, shared by all clients.
@@ -2606,6 +2614,10 @@ class PrismCoordinator:
         self.block_candidate_queue: queue.Queue[PrismBlockCandidate] = queue.Queue(
             maxsize=MAX_PENDING_BLOCK_CANDIDATES
         )
+        self._block_candidate_disposition_registry_lock = threading.Lock()
+        self._block_candidate_disposition_flights: dict[
+            str, _BlockCandidateDispositionFlight
+        ] = {}
         self.block_candidates_dropped = 0
         self.block_candidate_wakeups_coalesced = 0
         self.block_candidate_retry_count = 0
@@ -16124,6 +16136,55 @@ class PrismCoordinator:
         if callable(mark_attempted):
             mark_attempted(block_hash=block_hash)
 
+    def _ensure_block_candidate_disposition_state(self) -> None:
+        """Backfill same-hash submission guards for lightweight embedders."""
+        if (
+            hasattr(self, "_block_candidate_disposition_registry_lock")
+            and hasattr(self, "_block_candidate_disposition_flights")
+        ):
+            return
+        with _HOT_PATH_LOCK_INITIALIZATION_LOCK:
+            if not hasattr(self, "_block_candidate_disposition_registry_lock"):
+                self._block_candidate_disposition_registry_lock = threading.Lock()
+            if not hasattr(self, "_block_candidate_disposition_flights"):
+                self._block_candidate_disposition_flights: dict[
+                    str, _BlockCandidateDispositionFlight
+                ] = {}
+
+    @contextmanager
+    def _block_candidate_disposition(self, block_hash: str) -> Iterator[None]:
+        """Serialize the full accepted/abandoned decision for one hash.
+
+        A below-share-target solve submits synchronously while the durable
+        outbox can concurrently replay that same candidate. Keep both attempts
+        ordered until the accepted success tail records its process-local
+        completion; otherwise the replay can terminally abandon the outbox
+        during the gap after durable confirmation but before audit/share
+        evidence is complete.
+        """
+        key = block_hash.lower()
+        self._ensure_block_candidate_disposition_state()
+        with self._block_candidate_disposition_registry_lock:
+            flight = self._block_candidate_disposition_flights.get(key)
+            if flight is None:
+                flight = _BlockCandidateDispositionFlight()
+                self._block_candidate_disposition_flights[key] = flight
+            flight.users += 1
+        try:
+            # Never hold the registry lock while waiting on the hash-specific
+            # guard: unrelated candidates must remain independent.
+            with flight.lock:
+                yield
+        finally:
+            with self._block_candidate_disposition_registry_lock:
+                flight.users -= 1
+                if (
+                    flight.users == 0
+                    and self._block_candidate_disposition_flights.get(key)
+                    is flight
+                ):
+                    self._block_candidate_disposition_flights.pop(key, None)
+
     def block_submit_loop(self) -> None:
         while not self.stop_event.is_set():
             self._record_heartbeat("block_submitter")
@@ -17159,6 +17220,15 @@ class PrismCoordinator:
         ``submitblock`` call and is replayable after a crash. Returns True only
         after that finalization completes.
         """
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        with self._block_candidate_disposition(block_hash):
+            return self._submit_block_candidate_serialized(candidate)
+
+    def _submit_block_candidate_serialized(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> bool:
+        """Process a candidate while its same-hash disposition guard is held."""
         outcome = getattr(self, "_block_candidate_outcome", None)
         if outcome is None:
             outcome = threading.local()

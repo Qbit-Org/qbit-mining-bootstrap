@@ -10262,6 +10262,192 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         self.assertEqual(len(ledger), 1)
         self.assertEqual(ledger.pending_block_candidates(), [])
 
+    def test_below_target_accepted_tail_serializes_moved_tip_replay(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        block_hash = "b7" * 32
+        server, state, _recording = submit_coordinator(tip=old_tip)
+        server.max_blocks = 10
+        server.stop_after_block = False
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server.rpc = SubmitRpc(
+            tip=old_tip,
+            block_hash=block_hash,
+            ledger=ledger,
+        )
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+        server.ledger_writer_public_key_hex = "aa" * 32
+        server.refresh_jobs_after_pending_accepted_block = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: 0
+        )
+        submission = SimpleNamespace(
+            header_hex="b7" * 80,
+            coinbase_tx_hex="c0ffee",
+            block_hex="00",
+            block_hash_hex=block_hash,
+            share_pass=False,
+            block_pass=True,
+        )
+
+        durable_confirmation = threading.Event()
+        accepted_tail_paused = threading.Event()
+        release_accepted_tail = threading.Event()
+        replay_guard_blocked = threading.Event()
+        confirmation_calls: list[str] = []
+        submitted: list[str] = []
+        abandoned: list[str] = []
+        synchronous_results: list[bool] = []
+        replay_results: list[bool] = []
+        errors: list[BaseException] = []
+        replay_thread: threading.Thread | None = None
+        original_confirm = ledger.confirm_accepted_block
+        original_stats = server.accepted_share_stats
+        original_submitted = ledger.mark_block_candidate_submitted
+        original_abandoned = ledger.mark_block_candidate_abandoned
+
+        class ObservedDispositionLock:
+            def __init__(self) -> None:
+                self.lock = threading.RLock()
+
+            def __enter__(self) -> ObservedDispositionLock:
+                if threading.current_thread() is replay_thread:
+                    if self.lock.acquire(blocking=False):
+                        return self
+                    # A failed non-blocking acquisition proves the accepted
+                    # attempt still owns this exact same-hash guard.
+                    replay_guard_blocked.set()
+                self.lock.acquire()
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                self.lock.release()
+
+        server._ensure_block_candidate_disposition_state()
+        with server._block_candidate_disposition_registry_lock:
+            server._block_candidate_disposition_flights[block_hash] = (  # type: ignore[assignment]
+                SimpleNamespace(lock=ObservedDispositionLock(), users=0)
+            )
+
+        def confirm_accepted_block(
+            *,
+            block_hash: str,
+            active_tip_height: int,
+        ) -> dict[str, int | str]:
+            result = original_confirm(
+                block_hash=block_hash,
+                active_tip_height=active_tip_height,
+            )
+            confirmation_calls.append(block_hash)
+            durable_confirmation.set()
+            return result
+
+        def pause_in_accepted_tail() -> tuple[int, int]:
+            accepted_tail_paused.set()
+            if not release_accepted_tail.wait(10):
+                raise AssertionError("timed out waiting to release accepted success tail")
+            return original_stats()
+
+        def mark_submitted(*, block_hash: str) -> bool:
+            submitted.append(block_hash)
+            return original_submitted(block_hash=block_hash)
+
+        def mark_abandoned(*, block_hash: str, error: str) -> bool:
+            abandoned.append(block_hash)
+            return original_abandoned(block_hash=block_hash, error=error)
+
+        ledger.confirm_accepted_block = confirm_accepted_block  # type: ignore[method-assign]
+        ledger.mark_block_candidate_submitted = mark_submitted  # type: ignore[method-assign]
+        ledger.mark_block_candidate_abandoned = mark_abandoned  # type: ignore[method-assign]
+        server.accepted_share_stats = pause_in_accepted_tail  # type: ignore[method-assign]
+
+        def submit_synchronously() -> None:
+            try:
+                synchronous_results.append(
+                    server.handle_submit(
+                        state,
+                        [
+                            "miner-a",
+                            "job-1",
+                            "00" * 8,
+                            "00000001",
+                            "00000002",
+                        ],
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        def replay_pending_candidate() -> None:
+            try:
+                replay_results.append(server.submit_next_block_candidate())
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as tempdir, patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            synchronous_thread = threading.Thread(target=submit_synchronously)
+            synchronous_thread.start()
+            try:
+                self.assertTrue(accepted_tail_paused.wait(5))
+                self.assertTrue(durable_confirmation.is_set())
+                self.assertEqual(len(ledger), 1)
+                self.assertEqual(len(ledger.pending_block_candidates()), 1)
+                with server.lock:
+                    self.assertNotIn(
+                        block_hash,
+                        server._accounted_accepted_block_hashes,
+                    )
+
+                self.assertEqual(server.replay_pending_block_candidates(), 1)
+                server.rpc = TipRpc(new_tip)
+                replay_thread = threading.Thread(target=replay_pending_candidate)
+                replay_thread.start()
+                self.assertTrue(replay_guard_blocked.wait(5))
+                self.assertTrue(replay_thread.is_alive())
+                self.assertEqual(submitted, [])
+                self.assertEqual(abandoned, [])
+            finally:
+                release_accepted_tail.set()
+                synchronous_thread.join(10)
+                if replay_thread is not None:
+                    replay_thread.join(10)
+
+        self.assertFalse(synchronous_thread.is_alive())
+        self.assertIsNotNone(replay_thread)
+        assert replay_thread is not None
+        self.assertFalse(replay_thread.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(synchronous_results, [False])
+        self.assertEqual(replay_results, [True])
+        self.assertEqual(confirmation_calls, [block_hash])
+        self.assertGreaterEqual(len(submitted), 1)
+        self.assertEqual(abandoned, [])
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger.pending_block_candidates(), [])
+        self.assertEqual(server.accepted_block_count, 1)
+        self.assertIn(block_hash, server._accounted_accepted_block_hashes)
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
+        )
+        self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+        self.assertNotIn(
+            block_hash,
+            server._invalidated_accepted_block_payout_previews,
+        )
+        self.assertEqual(server._block_candidate_disposition_flights, {})
+
     def test_below_target_intent_failure_does_not_create_unsafe_retry_slot(self) -> None:
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
