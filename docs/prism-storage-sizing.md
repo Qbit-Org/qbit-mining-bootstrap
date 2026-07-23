@@ -148,7 +148,8 @@ The live coordinator stores accepted-block audit artifacts with these rules:
 
 1. Exact artifact externalization: Postgres stores hash/pointer metadata while
    every reader still resolves the body to the logical
-   `qbit.prism.audit-bundle.v1` expected by public API and verifier callers.
+   versioned `qbit.prism.audit-bundle.v1` family expected by public API and
+   verifier callers (including v1.1 and v1.2 credited-share bundles).
    New rows also store `audit_body_byte_len` so the canonical row has the
    artifact hash, stored byte size, schema version, and body pointer.
 2. Share-segment proof bodies: when `PRISM_AUDIT_SHARE_SEGMENT_SIZE` is
@@ -157,7 +158,7 @@ The live coordinator stores accepted-block audit artifacts with these rules:
    `qbit.prism.window-completeness-proof.v1`, and points at stable
    `qbit.prism.audit-share-segment.v1` segment-slot files with per-range hashes.
    This removes the old repeated inline tail/partial-window share arrays while
-   preserving the same reconstructed v1 bundle hash.
+   preserving the same reconstructed logical bundle hash.
 3. Legacy body refs: older compact files using `qbit.prism.audit-body-ref.v1`
    remain readable. The Rust `qbit-prism-audit-verify` and
    `qbit-prism-audit-canonicalize` tools accept full v1 bundles, legacy body

@@ -65,6 +65,7 @@ fn share(index: u64, difficulty: u128, network_difficulty: u128) -> AcceptedShar
         accepted_at_ms: ANCHOR_MS - 1,
         ntime: 1_800_000_000,
         credit_policy: None,
+        transition_receipt: None,
     }
 }
 

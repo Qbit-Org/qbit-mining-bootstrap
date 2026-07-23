@@ -550,6 +550,100 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(scheduled.base_job, direct.base_job)
         self.assertEqual(scheduled.build_key, direct.build_key)
 
+    def test_completed_build_is_cached_before_singleflight_retires(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        build_entered = threading.Event()
+        release_build = threading.Event()
+        admission_returned = threading.Event()
+        handoff_entered = threading.Event()
+        release_handoff = threading.Event()
+        original_new_request = server._new_job_build_request
+        request_count = 0
+
+        class BlockingResultFuture(Future[object]):
+            def set_result(self, result: object) -> None:
+                handoff_entered.set()
+                if not release_handoff.wait(10):
+                    raise AssertionError("result handoff was not released")
+                super().set_result(result)
+
+        def instrumented_new_request(*args: object, **kwargs: object) -> object:
+            nonlocal request_count
+            request = original_new_request(  # type: ignore[arg-type]
+                *args,
+                **kwargs,
+            )
+            request_count += 1
+            if request_count == 1:
+                request.promise = BlockingResultFuture()  # type: ignore[assignment]
+            return request
+
+        server._new_job_build_request = (  # type: ignore[method-assign]
+            instrumented_new_request
+        )
+        original_request_job_build = server._request_job_build
+
+        def instrumented_request_job_build(request: object) -> object:
+            promise = original_request_job_build(request)  # type: ignore[arg-type]
+            admission_returned.set()
+            return promise
+
+        server._request_job_build = (  # type: ignore[method-assign]
+            instrumented_request_job_build
+        )
+        original_build = server.build_shared_job_bundle
+        build_calls = 0
+        build_calls_lock = threading.Lock()
+
+        def counted_build(*args: object, **kwargs: object) -> object:
+            nonlocal build_calls
+            with build_calls_lock:
+                build_calls += 1
+                current_call = build_calls
+            if current_call == 1:
+                build_entered.set()
+                if not release_build.wait(5):
+                    raise AssertionError("initial build was not released")
+            return original_build(*args, **kwargs)  # type: ignore[arg-type]
+
+        server.build_shared_job_bundle = counted_build  # type: ignore[method-assign]
+        results: list[object] = []
+        errors: list[BaseException] = []
+
+        def request_bundle() -> None:
+            try:
+                results.append(server.shared_job_bundle(artifacts, mode="ready"))
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        first = threading.Thread(target=request_bundle)
+        second = threading.Thread(target=request_bundle)
+        first.start()
+        self.assertTrue(build_entered.wait(5))
+        self.assertTrue(admission_returned.wait(5))
+        release_build.set()
+        self.assertTrue(handoff_entered.wait(5))
+        second.start()
+        second.join(5)
+        try:
+            self.assertFalse(second.is_alive())
+        finally:
+            release_handoff.set()
+            first.join(5)
+            second.join(5)
+            server.shutdown_job_build_executor()
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(build_calls, 1)
+        self.assertEqual(request_count, 1)
+
     def test_stamped_job_reassembles_coinbase_with_client_extranonce(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)

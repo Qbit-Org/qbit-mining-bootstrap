@@ -137,16 +137,29 @@ difficulty and returns the counted difficulty for every included share.
 
 Accepted rows may carry a nullable `credit_policy`. Normal shares leave it
 empty; `stale-grace` marks a prior-tip share credited by the coordinator's short
-stale-grace policy. Reward-window queries still count these rows because they
-are accepted shares, while audits can distinguish them from normal current-tip
-shares. Audit bundles containing a credited row use
-`qbit.prism.audit-bundle.v1.1`; external auditors must upgrade before operators
-enable stale-grace crediting.
+stale-grace policy. `fanout-transition` marks an exact, connection-bound prior
+job credited while its replacement socket delivery was pending. Every
+fanout-transition row must carry a
+`qbit.prism.fanout-transition-receipt.v1` JSON object with connection and
+authorization generations, job ID, source/target/classified tips and
+generations, immutable template/payout/difficulty generations, and absolute
+lease timing. The Python ledger boundary validates that receipt before append,
+and the Rust builder/verifier validates it again.
+
+Reward-window queries count each such row once because it is an accepted share,
+while audits can distinguish it from normal current-tip and stale-grace shares.
+Bundles containing only stale-grace credited rows use
+`qbit.prism.audit-bundle.v1.1`; any fanout-transition receipt selects
+`qbit.prism.audit-bundle.v1.2` and commits the receipt into the share-slice
+digest. External auditors must support the applicable schema before operators
+enable either credit policy.
 
 Deployments that run with `PRISM_POSTGRES_INIT_SCHEMA=0` must apply
 `crates/qbit-prism/sql/001_share_ledger.sql` before starting upgraded
 coordinators. Otherwise share inserts will fail because the `credit_policy`
-column and updated window function signatures are missing.
+and `transition_receipt` columns, receipt constraint, and updated window
+function signatures are missing. Enabling fanout-transition credit before this
+migration is intentionally fail-closed at durable append.
 
 `qbit_shares_since_template_height(min_template_height)` supports operational
 replay and frontend recovery. It returns accepted shares at or above the

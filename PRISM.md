@@ -216,6 +216,8 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | `15` | maximum monotonic age of the last coherent qbit tip/template poll before `/healthz` returns HTTP 503 |
 | `PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS` | `1` | minimum spacing (plus up to 25% jitter) between failed tip-refresh attempts while the observed tip is unchanged; success or a new tip re-arms immediately; set `0` for unspaced retries |
 | `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | after a tip flip, credits same-connection prior-tip shares until this long after that connection receives new-tip work (shares stay creditable while delivery is still pending); set `0` to reject all prior-tip shares |
+| `PRISM_STRATUM_FANOUT_TRANSITION_LEASE_SECONDS` | `0` | opt-in absolute lease for the exact prior job delivered to a connection whose replacement socket write has not completed; revoked on successful replacement delivery, never renewed by later tips, and never block-submitted |
+| `PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION` | `1` | per-connection cap applied independently to the delivered-authority and transition-lease maps; must be positive when the transition lease is enabled |
 | `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` | `15` | cadence for checking zero-submitted, zero-accepted vardiff windows so over-diffed idle miners can step down; set `0` to disable |
 | `PRISM_WORKER_METRICS_LIMIT` | `100` | maximum distinct worker labels in private metrics before new workers aggregate into `_other` |
 
@@ -238,6 +240,21 @@ still satisfy the assigned share target, is marked with `credit_policy:
 stale-grace` in the accepted-share record, and participates in vardiff and the
 PRISM reward window like any other accepted share.
 
+Fanout-transition credit is a separate, disabled-by-default policy. At coherent
+tip publication, each connection may receive a non-sliding lease for only the
+exact prior job successfully written to that connection, bound to its
+connection, authorization, tip, template, payout, and difficulty generations.
+Successful replacement delivery revokes the lease; disconnect and
+reauthorization clear its authority. Rapid tip churn does not extend the
+original deadline; a late superseded delivery can move authority forward only
+to the immediately prior generation and inherits the current transition's
+original publication deadline. A credited share is marked `credit_policy:
+fanout-transition` and carries a
+`qbit.prism.fanout-transition-receipt.v1` record explaining the source and
+target generations and lease timing. It must satisfy the original assigned
+share target, participates once in Vardiff and the reward window, and is never
+routed to block submission even if its old header meets the network target.
+
 Block-worthy submissions are acknowledged like any other share and the block
 candidate is landed by a dedicated submitter thread (audit build, verify,
 persist, `submitblock`, confirm), so no miner's share acknowledgement ever
@@ -247,8 +264,10 @@ are still counted under the existing rejection reason IDs. The one exception
 is a hash that solves a block while missing the share target (possible while
 the listener floor sits above network difficulty): its share credit lands only
 when qbitd accepts the block, as before. Audit bundles containing any
-`credit_policy` row use `qbit.prism.audit-bundle.v1.1`; upgrade mirrors and
-verifiers before enabling a non-zero stale-grace window in production.
+stale-grace `credit_policy` row use `qbit.prism.audit-bundle.v1.1`; bundles with
+a fanout-transition receipt use `qbit.prism.audit-bundle.v1.2`. Apply the ledger
+schema and upgrade mirrors and verifiers before enabling either non-zero policy
+in production.
 
 ## How Reward Accounting Works
 
@@ -430,7 +449,8 @@ silently rewritten.
 
 The main per-block public artifact is `qbit.prism.audit-bundle.v1` for ordinary
 share windows and `qbit.prism.audit-bundle.v1.1` when the window contains
-`credit_policy` rows such as stale-grace shares. It contains:
+stale-grace credit. A window containing a fanout-transition receipt uses
+`qbit.prism.audit-bundle.v1.2`. It contains:
 
 - accepted shares in the reward window;
 - found-block anchor data;

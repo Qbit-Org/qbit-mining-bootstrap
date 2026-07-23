@@ -44,6 +44,7 @@ def pending_share(
     job_issued_at_ms: int | None = None,
     accepted_at_ms: int | None = None,
     credit_policy: str | None = None,
+    transition_receipt: dict[str, object] | None = None,
 ) -> PendingShare:
     return PendingShare(
         share_id=f"share-{index}",
@@ -58,7 +59,32 @@ def pending_share(
         accepted_at_ms=accepted_at_ms if accepted_at_ms is not None else 2_000 + index,
         ntime=1_700_000_000 + index,
         credit_policy=credit_policy,
+        transition_receipt=transition_receipt,
     )
+
+
+def fanout_transition_receipt(job_id: str) -> dict[str, object]:
+    return {
+        "schema": "qbit.prism.fanout-transition-receipt.v1",
+        "connection_id": 41,
+        "authorization_generation": 3,
+        "job_id": job_id,
+        "source_tip_hash": "11" * 32,
+        "source_tip_generation": 7,
+        "target_tip_hash": "22" * 32,
+        "target_tip_generation": 8,
+        "classified_tip_hash": "22" * 32,
+        "classified_tip_generation": 8,
+        "classified_tip_source": "published",
+        "template_generation": 12,
+        "payout_state_generation": 5,
+        "difficulty_generation": 2,
+        "lease_armed_at_ms": 1_000,
+        "lease_duration_ms": 120_000,
+        "lease_age_ms": 5,
+        "lease_expires_at_ms": 121_000,
+        "classified_at_ms": 1_005,
+    }
 
 
 def sample_ctv_manifest_set() -> dict[str, object]:
@@ -228,10 +254,83 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         normal = ledger.append(pending_share(1))
         grace = ledger.append(pending_share(2, credit_policy="stale-grace"))
+        receipt = fanout_transition_receipt("job-3")
+        transition = ledger.append(
+            pending_share(
+                3,
+                credit_policy="fanout-transition",
+                transition_receipt=receipt,
+            )
+        )
 
         self.assertNotIn("credit_policy", normal.to_prism_json())
+        self.assertNotIn("transition_receipt", normal.to_prism_json())
         self.assertEqual(grace.credit_policy, "stale-grace")
         self.assertEqual(grace.to_prism_json()["credit_policy"], "stale-grace")
+        self.assertNotIn("transition_receipt", grace.to_prism_json())
+        self.assertEqual(transition.credit_policy, "fanout-transition")
+        self.assertEqual(transition.transition_receipt, receipt)
+        self.assertEqual(transition.to_prism_json()["transition_receipt"], receipt)
+
+        receipt["connection_id"] = 99
+        self.assertEqual(transition.transition_receipt["connection_id"], 41)
+        transition.transition_receipt["connection_id"] = 77
+        self.assertEqual(
+            ledger.all_shares()[2].transition_receipt["connection_id"],
+            41,
+        )
+
+    def test_transition_credit_requires_an_exact_valid_receipt(self) -> None:
+        ledger = SingleWriterShareLedger()
+        receipt = fanout_transition_receipt("job-1")
+
+        invalid_shares = (
+            pending_share(1, credit_policy="fanout-transition"),
+            pending_share(1, transition_receipt=receipt),
+            pending_share(
+                1,
+                credit_policy="stale-grace",
+                transition_receipt=receipt,
+            ),
+            pending_share(
+                1,
+                credit_policy="fanout-transition",
+                transition_receipt={**receipt, "job_id": "job-reused"},
+            ),
+            pending_share(
+                1,
+                credit_policy="fanout-transition",
+                transition_receipt={**receipt, "lease_age_ms": 120_001},
+            ),
+        )
+
+        for share in invalid_shares:
+            with self.subTest(share=share), self.assertRaises(ValueError):
+                ledger.append(share)
+        self.assertEqual(len(ledger), 0)
+
+    def test_transition_receipt_participates_in_duplicate_idempotence(self) -> None:
+        ledger = SingleWriterShareLedger()
+        share = pending_share(
+            1,
+            credit_policy="fanout-transition",
+            transition_receipt=fanout_transition_receipt("job-1"),
+        )
+
+        self.assertEqual(ledger.append(share).share_seq, 1)
+        self.assertEqual(ledger.append(share).share_seq, 1)
+        changed = share.__class__(
+            **{
+                **share.__dict__,
+                "transition_receipt": {
+                    **share.transition_receipt,
+                    "lease_age_ms": 6,
+                    "classified_at_ms": 1_006,
+                },
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "payload mismatch"):
+            ledger.append(changed)
 
     def test_invalid_credit_policy_is_rejected_before_storage(self) -> None:
         ledger = SingleWriterShareLedger()
@@ -868,6 +967,10 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("inserted_candidates AS", query)
         self.assertIn("qbit_block_candidate_outbox", query)
         self.assertIn("duplicate share_id payload mismatch", query)
+        self.assertIn(
+            "NULLIF(data->'transition_receipt', 'null'::jsonb)",
+            query,
+        )
         self.assertEqual(query.count("SELECT CASE"), 1)
 
     def test_postgres_candidate_only_intent_forces_durable_fenced_commit(self) -> None:
@@ -1133,11 +1236,16 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("AND ledger.share_seq < eligible.share_seq", schema)
         self.assertIn("ON qbit_share_ledger ((lower(right(share_id, 64))), accepted_at DESC, share_seq DESC)", schema)
         self.assertIn("ALTER COLUMN anchor_vout DROP NOT NULL", schema)
-        self.assertIn("CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace'))", schema)
+        self.assertIn("credit_policy IN ('stale-grace', 'fanout-transition')", schema)
+        self.assertIn("transition_receipt jsonb", schema)
+        self.assertIn("qbit_share_ledger_transition_receipt_check", schema)
+        self.assertIn("qbit.prism.fanout-transition-receipt.v1", schema)
+        self.assertIn("jsonb_typeof(transition_receipt) = 'object'", schema)
         self.assertIn("NOT VALID", schema)
-        self.assertNotIn("DROP CONSTRAINT IF EXISTS qbit_share_ledger_credit_policy_check", schema)
+        self.assertIn("DROP CONSTRAINT IF EXISTS qbit_share_ledger_credit_policy_check", schema)
         self.assertLess(schema.index("writer_epoch bigint"), schema.index("credit_policy text"))
-        self.assertLess(schema.index("credit_policy text"), schema.index("CHECK (accepted OR reject_reason IS NOT NULL)"))
+        self.assertLess(schema.index("credit_policy text"), schema.index("transition_receipt jsonb"))
+        self.assertLess(schema.index("transition_receipt jsonb"), schema.index("CHECK (accepted OR reject_reason IS NOT NULL)"))
         self.assertNotIn("sum(ledger.share_difficulty) OVER", schema)
 
     def test_memory_pool_snapshot_reward_window_uses_anchor_eligible_shares(self) -> None:

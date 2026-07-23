@@ -30,7 +30,11 @@ AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA = "qbit.prism.window-completeness-proof.v
 DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
 DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
 DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
-VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
+FANOUT_TRANSITION_CREDIT_POLICY = "fanout-transition"
+FANOUT_TRANSITION_RECEIPT_SCHEMA = "qbit.prism.fanout-transition-receipt.v1"
+VALID_CREDIT_POLICIES = frozenset(
+    {"stale-grace", FANOUT_TRANSITION_CREDIT_POLICY}
+)
 
 
 def validate_credit_policy(credit_policy: str | None) -> str | None:
@@ -39,6 +43,121 @@ def validate_credit_policy(credit_policy: str | None) -> str | None:
     if credit_policy not in VALID_CREDIT_POLICIES:
         raise ValueError(f"unsupported credit_policy: {credit_policy!r}")
     return credit_policy
+
+
+_FANOUT_TRANSITION_RECEIPT_FIELDS = frozenset(
+    {
+        "schema",
+        "connection_id",
+        "authorization_generation",
+        "job_id",
+        "source_tip_hash",
+        "source_tip_generation",
+        "target_tip_hash",
+        "target_tip_generation",
+        "classified_tip_hash",
+        "classified_tip_generation",
+        "classified_tip_source",
+        "template_generation",
+        "payout_state_generation",
+        "difficulty_generation",
+        "lease_armed_at_ms",
+        "lease_duration_ms",
+        "lease_age_ms",
+        "lease_expires_at_ms",
+        "classified_at_ms",
+    }
+)
+
+
+def validate_transition_receipt(
+    *,
+    credit_policy: str | None,
+    transition_receipt: dict[str, object] | None,
+    job_id: str,
+) -> dict[str, object] | None:
+    """Validate and detach the receipt before it crosses a ledger boundary."""
+
+    if credit_policy != FANOUT_TRANSITION_CREDIT_POLICY:
+        if transition_receipt is not None:
+            raise ValueError(
+                "transition_receipt requires credit_policy='fanout-transition'"
+            )
+        return None
+    if not isinstance(transition_receipt, dict):
+        raise ValueError("fanout-transition credit requires transition_receipt")
+    if frozenset(transition_receipt) != _FANOUT_TRANSITION_RECEIPT_FIELDS:
+        raise ValueError("fanout transition receipt fields do not match v1 schema")
+    if transition_receipt.get("schema") != FANOUT_TRANSITION_RECEIPT_SCHEMA:
+        raise ValueError("unsupported fanout transition receipt schema")
+    if transition_receipt.get("job_id") != job_id:
+        raise ValueError("fanout transition receipt job_id mismatch")
+
+    def integer(name: str, *, positive: bool = False) -> int:
+        value = transition_receipt.get(name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"fanout transition receipt {name} must be an integer")
+        if value < (1 if positive else 0):
+            qualifier = "positive" if positive else "non-negative"
+            raise ValueError(
+                f"fanout transition receipt {name} must be {qualifier}"
+            )
+        return value
+
+    def tip_hash(name: str) -> str:
+        value = transition_receipt.get(name)
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError(
+                f"fanout transition receipt {name} must be a 32-byte hex hash"
+            )
+        try:
+            bytes.fromhex(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"fanout transition receipt {name} must be a 32-byte hex hash"
+            ) from exc
+        if value != value.lower():
+            raise ValueError(f"fanout transition receipt {name} must be lowercase")
+        return value
+
+    integer("connection_id", positive=True)
+    integer("authorization_generation", positive=True)
+    source_generation = integer("source_tip_generation", positive=True)
+    target_generation = integer("target_tip_generation", positive=True)
+    classified_generation = integer("classified_tip_generation")
+    integer("template_generation")
+    integer("payout_state_generation")
+    integer("difficulty_generation")
+    armed_at_ms = integer("lease_armed_at_ms", positive=True)
+    duration_ms = integer("lease_duration_ms", positive=True)
+    age_ms = integer("lease_age_ms")
+    expires_at_ms = integer("lease_expires_at_ms", positive=True)
+    classified_at_ms = integer("classified_at_ms", positive=True)
+    source_tip = tip_hash("source_tip_hash")
+    target_tip = tip_hash("target_tip_hash")
+    classified_tip = tip_hash("classified_tip_hash")
+    if source_tip in {target_tip, classified_tip}:
+        raise ValueError("fanout transition receipt did not cross a tip")
+    if target_generation <= source_generation:
+        raise ValueError("fanout transition target generation must follow source")
+    tip_source = transition_receipt.get("classified_tip_source")
+    if tip_source not in {"published", "live-rpc"}:
+        raise ValueError("unsupported fanout transition classified tip source")
+    if tip_source == "published" and classified_generation < target_generation:
+        raise ValueError(
+            "published classified generation precedes transition target"
+        )
+    if tip_source == "live-rpc" and classified_generation != 0:
+        raise ValueError("live-rpc classified generation must be zero")
+    if age_ms > duration_ms:
+        raise ValueError("fanout transition receipt was classified after expiry")
+    if expires_at_ms != armed_at_ms + duration_ms:
+        raise ValueError("fanout transition receipt expiry does not match duration")
+    if classified_at_ms != armed_at_ms + age_ms:
+        raise ValueError(
+            "fanout transition receipt classification time does not match age"
+        )
+    return copy.deepcopy(transition_receipt)
 
 
 @dataclass(frozen=True)
@@ -56,6 +175,7 @@ class AcceptedShareRecord:
     accepted_at_ms: int
     ntime: int
     credit_policy: str | None = None
+    transition_receipt: dict[str, object] | None = None
 
     def to_prism_json(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -74,6 +194,10 @@ class AcceptedShareRecord:
         }
         if self.credit_policy is not None:
             payload["credit_policy"] = self.credit_policy
+        if self.transition_receipt is not None:
+            payload["transition_receipt"] = copy.deepcopy(
+                self.transition_receipt
+            )
         return payload
 
 
@@ -97,6 +221,7 @@ class PendingShare:
     accepted_at_ms: int
     ntime: int
     credit_policy: str | None = None
+    transition_receipt: dict[str, object] | None = None
 
 
 class SingleWriterShareLedger:
@@ -140,11 +265,21 @@ class SingleWriterShareLedger:
         if pending.network_difficulty <= 0:
             raise ValueError("network_difficulty must be positive")
         credit_policy = validate_credit_policy(pending.credit_policy)
+        transition_receipt = validate_transition_receipt(
+            credit_policy=credit_policy,
+            transition_receipt=pending.transition_receipt,
+            job_id=pending.job_id,
+        )
         with self._lock:
             if pending.share_id in self._share_ids:
                 existing = self._shares_by_id[pending.share_id]
-                if self._pending_matches_record(pending, existing, credit_policy=credit_policy):
-                    return replace(existing)
+                if self._pending_matches_record(
+                    pending,
+                    existing,
+                    credit_policy=credit_policy,
+                    transition_receipt=transition_receipt,
+                ):
+                    return copy.deepcopy(existing)
                 raise ValueError("duplicate share_id payload mismatch")
             record = AcceptedShareRecord(
                 share_seq=self._next_share_seq,
@@ -160,12 +295,13 @@ class SingleWriterShareLedger:
                 accepted_at_ms=pending.accepted_at_ms,
                 ntime=pending.ntime,
                 credit_policy=credit_policy,
+                transition_receipt=transition_receipt,
             )
             self._shares.append(record)
             self._share_ids.add(pending.share_id)
             self._shares_by_id[pending.share_id] = record
             self._next_share_seq += 1
-            return record
+            return copy.deepcopy(record)
 
     @staticmethod
     def _pending_matches_record(
@@ -173,6 +309,7 @@ class SingleWriterShareLedger:
         record: AcceptedShareRecord,
         *,
         credit_policy: str | None,
+        transition_receipt: dict[str, object] | None,
     ) -> bool:
         return (
             pending.share_id == record.share_id
@@ -187,6 +324,7 @@ class SingleWriterShareLedger:
             and int(pending.accepted_at_ms) == int(record.accepted_at_ms)
             and int(pending.ntime) == int(record.ntime)
             and credit_policy == record.credit_policy
+            and transition_receipt == record.transition_receipt
         )
 
     def append_batch(
@@ -209,9 +347,17 @@ class SingleWriterShareLedger:
                     raise ValueError("duplicate share_id in append batch")
                 seen_ids.add(pending.share_id)
                 credit_policy = validate_credit_policy(pending.credit_policy)
+                transition_receipt = validate_transition_receipt(
+                    credit_policy=credit_policy,
+                    transition_receipt=pending.transition_receipt,
+                    job_id=pending.job_id,
+                )
                 existing = self._shares_by_id.get(pending.share_id)
                 if existing is not None and not self._pending_matches_record(
-                    pending, existing, credit_policy=credit_policy
+                    pending,
+                    existing,
+                    credit_policy=credit_policy,
+                    transition_receipt=transition_receipt,
                 ):
                     raise ValueError("duplicate share_id payload mismatch")
                 if candidate is not None:
@@ -239,6 +385,11 @@ class SingleWriterShareLedger:
                 existing = self._shares_by_id.get(pending.share_id)
                 if existing is None:
                     credit_policy = validate_credit_policy(pending.credit_policy)
+                    transition_receipt = validate_transition_receipt(
+                        credit_policy=credit_policy,
+                        transition_receipt=pending.transition_receipt,
+                        job_id=pending.job_id,
+                    )
                     existing = AcceptedShareRecord(
                         share_seq=self._next_share_seq,
                         share_id=pending.share_id,
@@ -253,12 +404,13 @@ class SingleWriterShareLedger:
                         accepted_at_ms=pending.accepted_at_ms,
                         ntime=pending.ntime,
                         credit_policy=credit_policy,
+                        transition_receipt=transition_receipt,
                     )
                     self._shares.append(existing)
                     self._share_ids.add(pending.share_id)
                     self._shares_by_id[pending.share_id] = existing
                     self._next_share_seq += 1
-                records.append(replace(existing))
+                records.append(copy.deepcopy(existing))
                 if candidate is not None:
                     block_hash = str(candidate["block_hash_hex"]).lower()
                     self._block_candidate_outbox.setdefault(
@@ -388,7 +540,7 @@ class SingleWriterShareLedger:
         del window_weight
         with self._lock:
             return [
-                replace(share)
+                copy.deepcopy(share)
                 for share in self._shares
                 if share.job_issued_at_ms <= anchor_job_issued_at_ms
                 and share.accepted_at_ms <= anchor_job_issued_at_ms
@@ -396,7 +548,7 @@ class SingleWriterShareLedger:
 
     def all_shares(self) -> list[AcceptedShareRecord]:
         with self._lock:
-            return [replace(share) for share in self._shares]
+            return [copy.deepcopy(share) for share in self._shares]
 
     def accepted_share_stats(self) -> dict[str, int]:
         with self._lock:
@@ -1446,9 +1598,15 @@ class PsqlShareLedger:
         if pending.network_difficulty <= 0:
             raise ValueError("network_difficulty must be positive")
         credit_policy = validate_credit_policy(pending.credit_policy)
+        transition_receipt = validate_transition_receipt(
+            credit_policy=credit_policy,
+            transition_receipt=pending.transition_receipt,
+            job_id=pending.job_id,
+        )
         payload = {
             **pending.__dict__,
             "credit_policy": credit_policy,
+            "transition_receipt": transition_receipt,
             "writer_id": self._writer_id,
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
@@ -1494,6 +1652,7 @@ inserted AS (
         ntime,
         accepted_at,
         credit_policy,
+        transition_receipt,
         accepted,
         writer_id,
         writer_epoch
@@ -1511,6 +1670,7 @@ inserted AS (
         (data->>'ntime')::bigint,
         to_timestamp(((data->>'accepted_at_ms')::double precision / 1000.0)),
         data->>'credit_policy',
+        NULLIF(data->'transition_receipt', 'null'::jsonb),
         true,
         data->>'writer_id',
         (data->>'writer_epoch')::bigint
@@ -1538,6 +1698,7 @@ SELECT CASE
             'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
             'ntime', ntime,
             'credit_policy', credit_policy,
+            'transition_receipt', transition_receipt,
             'new_miner', NOT EXISTS (SELECT 1 FROM existing_miner)
         ) FROM inserted)
 END;
@@ -1580,6 +1741,12 @@ END;
             if pending.share_id in share_ids:
                 raise ValueError("duplicate share_id in append batch")
             share_ids.add(pending.share_id)
+            credit_policy = validate_credit_policy(pending.credit_policy)
+            transition_receipt = validate_transition_receipt(
+                credit_policy=credit_policy,
+                transition_receipt=pending.transition_receipt,
+                job_id=pending.job_id,
+            )
             candidate_payload = candidate
             if candidate_payload is not None:
                 block_hash = str(candidate_payload.get("block_hash_hex", "")).lower()
@@ -1593,7 +1760,8 @@ END;
                 {
                     "share": {
                         **pending.__dict__,
-                        "credit_policy": validate_credit_policy(pending.credit_policy),
+                        "credit_policy": credit_policy,
+                        "transition_receipt": transition_receipt,
                     },
                     "candidate": candidate_payload,
                     "candidate_sha256": (
@@ -1650,6 +1818,8 @@ share_mismatch AS (
        OR ledger.accepted_at IS DISTINCT FROM to_timestamp((data->>'accepted_at_ms')::double precision / 1000.0)
        OR ledger.ntime IS DISTINCT FROM (data->>'ntime')::bigint
        OR ledger.credit_policy IS DISTINCT FROM data->>'credit_policy'
+       OR ledger.transition_receipt IS DISTINCT FROM
+          NULLIF(data->'transition_receipt', 'null'::jsonb)
 ),
 candidate_mismatch AS (
     SELECT payload.candidate->>'block_hash_hex' AS block_hash
@@ -1673,7 +1843,8 @@ inserted_shares AS (
     INSERT INTO qbit_share_ledger (
         share_id, miner_id, payout_order_key, p2mr_program,
         share_difficulty, network_difficulty, template_height, job_id,
-        job_issued_at, ntime, accepted_at, credit_policy, accepted,
+        job_issued_at, ntime, accepted_at, credit_policy,
+        transition_receipt, accepted,
         writer_id, writer_epoch
     )
     SELECT
@@ -1685,7 +1856,9 @@ inserted_shares AS (
         to_timestamp((data->>'job_issued_at_ms')::double precision / 1000.0),
         (data->>'ntime')::bigint,
         to_timestamp((data->>'accepted_at_ms')::double precision / 1000.0),
-        data->>'credit_policy', true, root->>'writer_id',
+        data->>'credit_policy',
+        NULLIF(data->'transition_receipt', 'null'::jsonb), true,
+        root->>'writer_id',
         (root->>'writer_epoch')::bigint
     FROM payload, input, batch_ok
     WHERE NOT EXISTS (
@@ -1768,6 +1941,7 @@ SELECT CASE
                 'accepted_at_ms', round(extract(epoch FROM records.accepted_at) * 1000)::bigint,
                 'ntime', records.ntime,
                 'credit_policy', records.credit_policy,
+                'transition_receipt', records.transition_receipt,
                 'newly_inserted', records.newly_inserted,
                 'new_miner', records.new_miner
             ) ORDER BY records.ordinality)
@@ -2096,7 +2270,8 @@ SELECT COALESCE(json_agg(json_build_object(
     'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
     'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
     'ntime', ntime,
-    'credit_policy', credit_policy
+    'credit_policy', credit_policy,
+    'transition_receipt', transition_receipt
 ) ORDER BY share_seq ASC), '[]'::json)
 FROM rows;
 """
@@ -2123,7 +2298,8 @@ SELECT COALESCE(json_agg(json_build_object(
     'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
     'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
     'ntime', ntime,
-    'credit_policy', credit_policy
+    'credit_policy', credit_policy,
+    'transition_receipt', transition_receipt
 ) ORDER BY share_seq ASC), '[]'::json)
 FROM qbit_share_ledger
 WHERE accepted;
@@ -2414,7 +2590,8 @@ SELECT COALESCE(json_agg(json_build_object(
     'counted_difficulty', counted_difficulty::text,
     'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
     'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
-    'credit_policy', credit_policy
+    'credit_policy', credit_policy,
+    'transition_receipt', transition_receipt
 ) ORDER BY share_seq DESC), '[]'::json)
 FROM qbit_audit_share_window(
     to_timestamp(({int(anchor_job_issued_at_ms)}::double precision / 1000.0)),
@@ -6340,6 +6517,11 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             credit_policy=(
                 str(payload["credit_policy"])
                 if payload.get("credit_policy") is not None
+                else None
+            ),
+            transition_receipt=(
+                copy.deepcopy(payload["transition_receipt"])
+                if isinstance(payload.get("transition_receipt"), dict)
                 else None
             ),
         )

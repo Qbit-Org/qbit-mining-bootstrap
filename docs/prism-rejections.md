@@ -6,7 +6,7 @@ dashboard/API surfaces should use these IDs instead of parsing human messages.
 
 | Reason ID | Meaning |
 | --- | --- |
-| `stale-job` | The submitted share or block candidate was built on an obsolete qbit tip/template outside the stale-grace credit window. |
+| `stale-job` | The submitted share or block candidate was built on an obsolete qbit tip/template outside every qualified prior-tip credit policy. |
 | `duplicate-share` | The same miner submitted a share with an already-seen header. |
 | `low-difficulty` | The submitted share did not satisfy the miner's assigned share target. |
 | `malformed-submit` | The `mining.submit` payload could not be parsed or assembled. |
@@ -21,6 +21,8 @@ dashboard/API surfaces should use these IDs instead of parsing human messages.
 | `pool-closed` | The coordinator was no longer accepting shares. |
 | `block-stale` | The block candidate height was stale against the active qbit tip. |
 | `ledger-confirmation-failed` | The ledger did not confirm a block that qbit appeared to accept. |
+| `transition-lease-expired` | The exact connection-bound prior job was known, but its absolute fanout-transition lease had expired. |
+| `transition-lease-revoked` | The exact prior job's fanout-transition lease was revoked by successful replacement delivery. |
 
 The coordinator exposes these IDs in:
 
@@ -51,6 +53,24 @@ stays creditable while the refresh pass has not reached its connection yet).
 The window only opens on an observed tip flip, never at coordinator startup. PRISM never submits the old-tip header as a block; the share still has
 to satisfy the assigned share target and is recorded with
 `credit_policy=stale-grace`.
+
+Fanout-transition credit is distinct from stale grace and is disabled when
+`PRISM_STRATUM_FANOUT_TRANSITION_LEASE_SECONDS=0`. When enabled, publication of
+a replacement tip arms an absolute lease only for the exact prior job already
+delivered to that connection. Authority is bound to the connection,
+authorization generation, job ID, source/target tip generations, template,
+payout state, and difficulty generation. A successful replacement write
+revokes it immediately; disconnect and reauthorization remove it; later tip
+flips cannot renew it. The retained maps are capped by
+`PRISM_STRATUM_FANOUT_TRANSITION_MAX_JOBS_PER_CONNECTION`.
+
+An eligible proof is validated against its original job target, credited once
+with `credit_policy=fanout-transition`, and written with a
+`qbit.prism.fanout-transition-receipt.v1` audit record. It participates normally
+in Vardiff and payout accounting but is unconditionally excluded from the block
+candidate path. Expired and revoked exact jobs use their dedicated reason IDs;
+unknown, cross-connection, reauthorized, and guessed job IDs remain
+`unknown-job`.
 
 Clean refreshes on the current tip are separate from stale grace. The
 coordinator retains their original immutable validation contexts for
@@ -106,6 +126,10 @@ round trips never return to the delivery path.
 Additional private metrics relevant to attribution and grace behavior:
 
 - `qbit_prism_grace_credited_shares_total`
+- `qbit_prism_fanout_transition_credited_shares_total`
+- `qbit_prism_fanout_transition_leases`
+- `qbit_prism_fanout_transition_retained_entries`
+- `qbit_prism_fanout_transition_events_total{event="armed|accepted|expired|revoked_delivery|revoked_authorization|capacity_evicted"}`
 - `qbit_prism_vardiff_idle_retargets_total`
 - `qbit_prism_worker_submitted_shares_total{worker="<bounded-label>"}`
 - `qbit_prism_worker_accepted_shares_total{worker="<bounded-label>"}`
