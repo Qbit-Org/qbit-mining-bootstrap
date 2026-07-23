@@ -4770,6 +4770,27 @@ FROM bucketed;
                 shares,
                 segment_path=segment_path,
             )
+            if merged_shares is None:
+                # Keep prior body_uri references valid at the stable slot path,
+                # while the new bundle uses an immutable incoming-only segment.
+                fresh_uri, fresh_sha256 = self._write_audit_share_segment(
+                    first_share_seq=first_share_seq,
+                    last_share_seq=last_share_seq,
+                    shares=shares,
+                )
+                if fresh_sha256 != range_sha256:
+                    raise RuntimeError("audit share segment range hash changed during fallback")
+                try:
+                    self._quarantine_audit_share_segment(
+                        segment_path,
+                        expected_bytes=existing_bytes,
+                    )
+                except OSError:
+                    # The stable slot already preserves the old range, and the
+                    # immutable file preserves the incoming one. A quarantine
+                    # snapshot failure must not wedge block finalization.
+                    pass
+                return fresh_uri, range_sha256
         segment_first = int(merged_shares[0]["share_seq"])
         segment_last = int(merged_shares[-1]["share_seq"])
         if (
@@ -4795,7 +4816,7 @@ FROM bucketed;
         incoming_shares: list[Any],
         *,
         segment_path: Path,
-    ) -> list[Any]:
+    ) -> list[Any] | None:
         if not existing_shares:
             return list(incoming_shares)
         existing_by_seq = self._audit_shares_by_seq(existing_shares, segment_path=segment_path)
@@ -4849,9 +4870,8 @@ FROM bucketed;
                     ):
                         return [merged_by_seq[share_seq] for share_seq in ordered_seqs]
             # The incoming range is independently complete and remains usable.
-            # Preserve the irreparable old slot for operator inspection.
-            self._quarantine_audit_share_segment(segment_path)
-            return list(incoming_shares)
+            # The caller preserves this slot and gives that range a fresh URI.
+            return None
         return [merged_by_seq[share_seq] for share_seq in ordered_seqs]
 
     def _load_audit_share_ledger_range(
@@ -4885,14 +4905,23 @@ WHERE accepted
             raise RuntimeError("audit share ledger backfill did not return a list")
         return [self._record_from_json(row).to_prism_json() for row in rows]
 
-    @staticmethod
-    def _quarantine_audit_share_segment(segment_path: Path) -> Path:
+    def _quarantine_audit_share_segment(
+        self,
+        segment_path: Path,
+        *,
+        expected_bytes: bytes,
+    ) -> Path:
+        for existing_path in segment_path.parent.glob(f"{segment_path.name}.conflict-*"):
+            if self._file_matches_bytes(existing_path, expected_bytes):
+                return existing_path
         timestamp = time.time_ns()
         quarantine_path = segment_path.with_name(f"{segment_path.name}.conflict-{timestamp}")
         while quarantine_path.exists():
             timestamp += 1
             quarantine_path = segment_path.with_name(f"{segment_path.name}.conflict-{timestamp}")
-        segment_path.rename(quarantine_path)
+        # Snapshot rather than move: previously finalized bundles retain this
+        # stable slot URI, so it must remain readable across crashes and retries.
+        self._write_bytes_atomically(quarantine_path, expected_bytes)
         return quarantine_path
 
     def _audit_shares_by_seq(
