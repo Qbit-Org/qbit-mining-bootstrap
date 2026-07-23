@@ -337,7 +337,13 @@ Production requires `PRISM_STRATUM_STALE_GRACE_SECONDS=0` until every published
 audit consumer has demonstrated compatibility with stale-grace receipts.
 `PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` similarly bounds a persistent
 PRISM template-refresh outage; it must be shorter than the operator alert and
-response window.
+response window. Coordination-only refresh deferrals remain outside that
+ordinary failure budget, but only for
+`PRISM_COORDINATION_BLOCKED_EXIT_SECONDS` (default 900 seconds). A continuous
+streak beyond that separate bound fires the publication-progress watchdog and
+restarts the coordinator. Alert on
+`qbit_prism_template_refresh_coordination_blocked_age_seconds` before it
+approaches the configured bound.
 
 ### CTV At Genesis
 

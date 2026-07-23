@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -263,6 +264,102 @@ class ProgressHealthTests(unittest.TestCase):
             server.watchdog_loop()
 
         exit_process.assert_called_once_with(1)
+
+    def test_brief_coordination_block_owns_publication_deadline(self) -> None:
+        server, clock = progress_coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        server.coordination_blocked_exit_seconds = 30.0
+        server.watchdog_enabled = False
+        server.watchdog_interval_seconds = 0.001
+        publish(server, snapshot(generation=1, fingerprint="aa" * 32))
+        server._record_progress_tip_poll(
+            snapshot(
+                generation=2,
+                fingerprint="bb" * 32,
+                tip="22" * 32,
+            )
+        )
+        server._record_coordination_blocked_refresh(clock.now)
+        clock.advance(10.0)
+
+        self.assertTrue(server.publication_progress_failure_expired(clock.now))
+        self.assertFalse(server.coordination_blocked_streak_expired(clock.now))
+        wait_results = iter((False, True))
+        server.stop_event = SimpleNamespace(
+            wait=lambda _seconds: next(wait_results)
+        )
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                return_value=clock.now,
+            ),
+            patch("lab.prism.prism_coordinator.os._exit") as exit_process,
+            patch("builtins.print"),
+        ):
+            server.watchdog_loop()
+
+        exit_process.assert_not_called()
+
+    def test_coordination_start_during_publication_check_wins_arbitration(
+        self,
+    ) -> None:
+        server, clock = progress_coordinator()
+        server.template_refresh_failure_exit_seconds = 10.0
+        server.coordination_blocked_exit_seconds = 30.0
+        server.watchdog_enabled = False
+        server.watchdog_interval_seconds = 0.001
+        publish(server, snapshot(generation=1, fingerprint="aa" * 32))
+        server._record_progress_tip_poll(
+            snapshot(
+                generation=2,
+                fingerprint="bb" * 32,
+                tip="22" * 32,
+            )
+        )
+        clock.advance(10.0)
+
+        publication_check_started = threading.Event()
+        resume_publication_check = threading.Event()
+        server.stop_event = threading.Event()
+        original_publication_check = server.publication_progress_failure_expired
+        thread_errors: list[BaseException] = []
+
+        def delayed_publication_check(now: float) -> bool:
+            publication_check_started.set()
+            if not resume_publication_check.wait(5.0):
+                raise AssertionError("publication watchdog interleave timed out")
+            server.stop_event.set()
+            return original_publication_check(now)
+
+        def run_watchdog() -> None:
+            try:
+                server.watchdog_loop()
+            except BaseException as exc:
+                thread_errors.append(exc)
+
+        with (
+            patch.object(
+                server,
+                "publication_progress_failure_expired",
+                side_effect=delayed_publication_check,
+            ),
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                return_value=clock.now,
+            ),
+            patch("lab.prism.prism_coordinator.os._exit") as exit_process,
+            patch("builtins.print"),
+        ):
+            watchdog = threading.Thread(target=run_watchdog)
+            watchdog.start()
+            self.assertTrue(publication_check_started.wait(5.0))
+            server._record_coordination_blocked_refresh(clock.now)
+            resume_publication_check.set()
+            watchdog.join(5.0)
+
+        self.assertFalse(watchdog.is_alive())
+        self.assertEqual(thread_errors, [])
+        exit_process.assert_not_called()
 
     def test_unchanged_tip_for_hours_with_valid_work_stays_healthy(self) -> None:
         server, clock = progress_coordinator()
@@ -648,8 +745,13 @@ class ProgressHealthTests(unittest.TestCase):
     def test_progress_metrics_have_bounded_state_and_age_gauges(self) -> None:
         server, _ = progress_coordinator()
         publish(server, snapshot(generation=1, fingerprint="aa" * 32))
+        server._record_coordination_blocked_refresh(100.0)
 
-        metrics = server.metrics_payload()
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            return_value=105.0,
+        ):
+            metrics = server.metrics_payload()
 
         for metric in (
             "qbit_prism_refresh_pending",
@@ -657,9 +759,22 @@ class ProgressHealthTests(unittest.TestCase):
             "qbit_prism_tip_poll_age_seconds",
             "qbit_prism_current_generation_delivery_age_seconds",
             "qbit_prism_bundle_build_oldest_age_seconds",
+            "# TYPE qbit_prism_template_refresh_coordination_blocked_age_seconds gauge",
+            "qbit_prism_template_refresh_coordination_blocked_age_seconds 5.000000",
             'qbit_prism_health_state{reason="healthy"} 1',
         ):
             self.assertIn(metric, metrics)
+
+        server._clear_coordination_blocked_streak()
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            return_value=106.0,
+        ):
+            cleared_metrics = server.metrics_payload()
+        self.assertIn(
+            "qbit_prism_template_refresh_coordination_blocked_age_seconds 0.000000",
+            cleared_metrics,
+        )
 
 
 if __name__ == "__main__":

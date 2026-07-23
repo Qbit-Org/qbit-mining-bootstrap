@@ -147,6 +147,7 @@ DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS = 5.0
 DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS = 15.0
 DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS = 15.0
 DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS = 120
+DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS = 900.0
 # The reward window is 8x network difficulty (must match PRISM_WINDOW_MULTIPLIER
 # in crates/qbit-prism/src/lib.rs and the SQL). The job-build snapshot only needs
 # the shares that window can cover; requesting a margin above it returns a
@@ -2090,9 +2091,10 @@ class TemplateRefreshSuperseded(TemplateRefreshBlocked):
     Raised only for coordination races that a scheduled retry resolves on its
     own: the tip advanced mid-refresh, the payout-state generation moved, or a
     newer observation superseded the prepared work. Unlike its parent, this
-    subclass never arms the template-refresh failure budget -- a genuine
-    RPC/build/trust failure must raise plain TemplateRefreshBlocked so
-    sustained unhealthiness still takes the budgeted restart path.
+    subclass never arms the ordinary template-refresh failure budget. Repeated
+    coordination blocks are tracked by their own longer deadline; a genuine
+    RPC/build/trust failure must raise plain TemplateRefreshBlocked so it still
+    takes the ordinary budgeted restart path.
     """
 
 
@@ -2317,6 +2319,10 @@ class PrismCoordinator:
             "PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS",
             DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
         )
+        self.coordination_blocked_exit_seconds = env_positive_float(
+            "PRISM_COORDINATION_BLOCKED_EXIT_SECONDS",
+            DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS,
+        )
         if production_mode() and self.template_refresh_failure_exit_seconds <= 0:
             raise SystemExit(
                 "production mode requires a positive "
@@ -2324,6 +2330,9 @@ class PrismCoordinator:
             )
         self.last_successful_template_refresh_monotonic: float | None = None
         self.template_refresh_failure_started_monotonic: float | None = None
+        self._coordination_blocked_lock = threading.Lock()
+        self._coordination_blocked_since_monotonic: float | None = None
+        self._publication_watchdog_exit_claimed = False
         self.reorg_reconcile_cache_seconds = env_nonnegative_float(
             "PRISM_REORG_RECONCILE_CACHE_SECONDS",
             DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
@@ -4648,7 +4657,7 @@ class PrismCoordinator:
                     for transition in self._accepted_block_payout_previews.values()
                 )
             if landed_transition:
-                raise TemplateRefreshBlocked(
+                raise _PayoutStatePublicationBlocked(
                     "accepted block payout confirmation is still pending"
                 )
             yield
@@ -8405,12 +8414,28 @@ class PrismCoordinator:
     def watchdog_loop(self) -> None:
         while not self.stop_event.wait(self.watchdog_interval_seconds):
             now = time.monotonic()
-            if self.publication_progress_failure_expired(now):
+            (
+                publication_failure,
+                coordination_age,
+                coordination_budget,
+                publication_budget,
+            ) = self._publication_watchdog_state(now)
+            if publication_failure == "coordination":
+                print(
+                    "prism coordinator: publication-progress watchdog firing; "
+                    "template refresh remained coordination-blocked past the "
+                    f"coordination budget={coordination_budget:g}s "
+                    f"streak_age={coordination_age:.3f}s. "
+                    "Exiting non-zero so the restart policy recovers the process.",
+                    flush=True,
+                )
+                os._exit(1)
+            if publication_failure == "publication":
                 print(
                     "prism coordinator: publication-progress watchdog firing; "
                     "current tip/generation remained unpublished past the "
                     f"template refresh failure budget="
-                    f"{self.template_refresh_failure_exit_seconds:g}s. "
+                    f"{publication_budget:g}s. "
                     "Exiting non-zero so the restart policy recovers the process.",
                     flush=True,
                 )
@@ -8822,6 +8847,7 @@ class PrismCoordinator:
                 "prism coordinator: liveness and publication-progress watchdog enabled "
                 f"timeout={self.watchdog_timeout_seconds:g}s "
                 f"publication_budget={self.template_refresh_failure_exit_seconds:g}s "
+                f"coordination_blocked_budget={self.coordination_blocked_exit_seconds:g}s "
                 f"interval={self.watchdog_interval_seconds:g}s",
                 flush=True,
             )
@@ -8829,6 +8855,7 @@ class PrismCoordinator:
             print(
                 "prism coordinator: publication-progress watchdog enabled "
                 f"budget={self.template_refresh_failure_exit_seconds:g}s "
+                f"coordination_blocked_budget={self.coordination_blocked_exit_seconds:g}s "
                 f"interval={self.watchdog_interval_seconds:g}s",
                 flush=True,
             )
@@ -9195,13 +9222,11 @@ class PrismCoordinator:
                 # intentional shutdown stop, not a template-health failure.
                 return
             except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked) as exc:
-                # Coordination-blocked attempts neither record into nor fire
-                # the failure budget. A clock armed by an earlier budgeted
-                # failure must wait for the next budgeted failure (or be
-                # cleared by the next completed refresh): exiting here would
-                # let a transient blip plus ordinary payout/tip churn restart
-                # a process whose qbitd RPC is healthy. The retry is already
-                # scheduled by the raise site.
+                # Coordination-blocked attempts remain outside the ordinary
+                # template failure budget. Their separate continuous-streak
+                # budget is recorded by poll_qbit_tip_template_once and
+                # enforced by the mandatory publication-progress watchdog.
+                # The retry is already scheduled by the raise site.
                 print(
                     f"prism coordinator: tip/template refresh superseded; retrying: {exc}",
                     flush=True,
@@ -9256,6 +9281,124 @@ class PrismCoordinator:
             divergence_since is not None
             and now - divergence_since >= budget
         )
+
+    def _ensure_coordination_blocked_state(self) -> None:
+        if not hasattr(self, "_coordination_blocked_lock"):
+            self._coordination_blocked_lock = threading.Lock()
+        if not hasattr(self, "_coordination_blocked_since_monotonic"):
+            self._coordination_blocked_since_monotonic: float | None = None
+        if not hasattr(self, "_publication_watchdog_exit_claimed"):
+            self._publication_watchdog_exit_claimed = False
+
+    def _record_coordination_blocked_refresh(self, now: float) -> None:
+        self._ensure_coordination_blocked_state()
+        with self._coordination_blocked_lock:
+            if self._publication_watchdog_exit_claimed:
+                return
+            if self._coordination_blocked_since_monotonic is None:
+                self._coordination_blocked_since_monotonic = now
+
+    def _clear_coordination_blocked_streak(self) -> None:
+        self._ensure_coordination_blocked_state()
+        with self._coordination_blocked_lock:
+            # Once the watchdog claims an expired generation, its hard exit is
+            # the terminal action. Otherwise a refresh completing between the
+            # deadline check and os._exit could appear to cancel an exit that
+            # already won the streak lock.
+            if not self._publication_watchdog_exit_claimed:
+                self._coordination_blocked_since_monotonic = None
+
+    def coordination_blocked_streak_age_seconds(
+        self,
+        now: float | None = None,
+    ) -> float:
+        self._ensure_coordination_blocked_state()
+        now = time.monotonic() if now is None else now
+        with self._coordination_blocked_lock:
+            started = self._coordination_blocked_since_monotonic
+        return 0.0 if started is None else max(0.0, now - started)
+
+    def coordination_blocked_streak_expired(self, now: float) -> bool:
+        budget = float(
+            getattr(
+                self,
+                "coordination_blocked_exit_seconds",
+                DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS,
+            )
+        )
+        self._ensure_coordination_blocked_state()
+        with self._coordination_blocked_lock:
+            started = self._coordination_blocked_since_monotonic
+        return bool(
+            started is not None
+            and (budget <= 0 or now - started >= budget)
+        )
+
+    def _publication_watchdog_state(
+        self,
+        now: float,
+    ) -> tuple[str | None, float, float, float]:
+        """Arbitrate coordination and ordinary publication deadlines.
+
+        The final decision is serialized with coordination streak changes.
+        A streak recorded while the ordinary publication check is in flight
+        therefore owns the longer coordination deadline; once either deadline
+        is claimed, later refresh results cannot cancel the terminal exit.
+        """
+        coordination_budget = float(
+            getattr(
+                self,
+                "coordination_blocked_exit_seconds",
+                DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS,
+            )
+        )
+        publication_budget = float(
+            getattr(
+                self,
+                "template_refresh_failure_exit_seconds",
+                DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
+            )
+        )
+        self._ensure_job_cache_state()
+        self._ensure_coordination_blocked_state()
+
+        # This preflight keeps the common healthy case cheap. Its result is
+        # revalidated under both state locks before an ordinary exit is
+        # claimed, so a concurrent publication cannot leave a stale verdict.
+        publication_expired = self.publication_progress_failure_expired(now)
+        with self._coordination_blocked_lock:
+            started = self._coordination_blocked_since_monotonic
+            if started is not None:
+                age = max(0.0, now - started)
+                if coordination_budget <= 0 or age >= coordination_budget:
+                    self._publication_watchdog_exit_claimed = True
+                    return (
+                        "coordination",
+                        age,
+                        coordination_budget,
+                        publication_budget,
+                    )
+                return None, age, coordination_budget, publication_budget
+
+            if publication_expired:
+                with self._progress_health_lock:
+                    divergence_since = (
+                        self._progress_publication_divergence_since_monotonic
+                    )
+                    publication_expired = bool(
+                        publication_budget > 0
+                        and divergence_since is not None
+                        and now - divergence_since >= publication_budget
+                    )
+                if publication_expired:
+                    self._publication_watchdog_exit_claimed = True
+                    return (
+                        "publication",
+                        0.0,
+                        coordination_budget,
+                        publication_budget,
+                    )
+            return None, 0.0, coordination_budget, publication_budget
 
     def _record_template_refresh_failure(self, now: float) -> None:
         budget = float(
@@ -10606,6 +10749,8 @@ class PrismCoordinator:
                 # the controlled shutdown proceed without consuming the
                 # template failure budget or taking the hard-exit path.
                 return 0
+            except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked):
+                raise
             except Exception as exc:
                 raise TemplateRefreshBlocked(
                     "qbit reorg reconciliation failed before refresh preparation"
@@ -10764,14 +10909,19 @@ class PrismCoordinator:
             if (
                 current_payout_generation
                 != payout_generation_after_reconciliation
-                or (
-                    bundle is not None
-                    and (
-                        current_payout_artifact is None
-                        or bundle.build_key is None
-                        or bundle.build_key.payout_artifact_sha256
-                        != current_payout_artifact.prior_balances_sha256
-                    )
+            ):
+                self._schedule_tip_refresh_retry()
+                raise TemplateRefreshSuperseded(
+                    "payout state changed before refresh publication; "
+                    "immediate retry scheduled"
+                )
+            if (
+                bundle is not None
+                and (
+                    current_payout_artifact is None
+                    or bundle.build_key is None
+                    or bundle.build_key.payout_artifact_sha256
+                    != current_payout_artifact.prior_balances_sha256
                 )
             ):
                 self._schedule_tip_refresh_retry()
@@ -11056,6 +11206,7 @@ class PrismCoordinator:
                 )
             self.last_successful_template_refresh_monotonic = time.monotonic()
             self.template_refresh_failure_started_monotonic = None
+            self._clear_coordination_blocked_streak()
             self._clear_tip_refresh_failure_holdoff()
             # A completed pass reconfirms that the coherent snapshot remained
             # current through publication and fanout. Refresh the liveness
@@ -11067,19 +11218,21 @@ class PrismCoordinator:
             # Coordination-blocked refreshes -- a superseded tip, a pending
             # payout publication fence, a refresh raced by payout mutation --
             # are churn between healthy components, not qbitd unhealthiness.
-            # They must not arm the restart budget: sustained payout churn
-            # would otherwise self-terminate a process whose RPC is fine, and
-            # each restart re-triggers the same churn. Re-raise so callers
-            # still schedule their immediate retry. Plain TemplateRefreshBlocked
-            # stays budgeted below: it also wraps genuine failures (job builds
-            # failing, malformed template artifacts, untrusted chain views)
-            # whose persistence must still take the budgeted restart path.
+            # They do not arm the ordinary failure budget, but their oldest
+            # continuous streak has its own longer restart deadline. Re-raise
+            # so callers still schedule their immediate retry. Plain
+            # TemplateRefreshBlocked stays budgeted below: it also wraps
+            # genuine failures (job builds failing, malformed template
+            # artifacts, untrusted chain views) whose persistence must still
+            # take the ordinary restart path.
             # The retry-spacing stamp still applies: churn against an
             # unchanged tip re-arms the poller no faster than the holdoff,
             # while a genuinely newer tip zeroes it immediately.
+            self._record_coordination_blocked_refresh(time.monotonic())
             self._note_tip_refresh_attempt_failed(observed_best_tip)
             raise
         except Exception:
+            self._clear_coordination_blocked_streak()
             self._record_template_refresh_failure(time.monotonic())
             self._note_tip_refresh_attempt_failed(observed_best_tip)
             raise
@@ -12229,7 +12382,7 @@ class PrismCoordinator:
                     transition.landed
                     for transition in self._accepted_block_payout_previews.values()
                 ):
-                    raise TemplateRefreshBlocked(
+                    raise _PayoutStatePublicationBlocked(
                         "accepted block payout confirmation is still pending"
                     )
             return self._reconcile_prism_pool_blocks_once(
@@ -18044,6 +18197,7 @@ class PrismCoordinator:
         progress = self.progress_health_snapshot()
         pending_age = progress["pending_refresh_age_seconds"]
         delivery_age = progress["last_valid_delivery_age_seconds"]
+        coordination_blocked_age = self.coordination_blocked_streak_age_seconds()
         active_reasons = set(progress["reasons"])
         return [
             "# HELP qbit_prism_refresh_pending Whether current template or payout work still requires publication or delivery.",
@@ -18061,6 +18215,9 @@ class PrismCoordinator:
             "# HELP qbit_prism_bundle_build_oldest_age_seconds Monotonic age of the oldest active bundle build.",
             "# TYPE qbit_prism_bundle_build_oldest_age_seconds gauge",
             f"qbit_prism_bundle_build_oldest_age_seconds {float(progress['bundle_build_oldest_age_seconds']):.6f}",
+            "# HELP qbit_prism_template_refresh_coordination_blocked_age_seconds Monotonic age of the continuous coordination-blocked template-refresh streak, or 0 when clear.",
+            "# TYPE qbit_prism_template_refresh_coordination_blocked_age_seconds gauge",
+            f"qbit_prism_template_refresh_coordination_blocked_age_seconds {coordination_blocked_age:.6f}",
             "# HELP qbit_prism_health_state Current progress-health state by bounded reason.",
             "# TYPE qbit_prism_health_state gauge",
             f'qbit_prism_health_state{{reason="healthy"}} {1 if progress["ok"] else 0}',

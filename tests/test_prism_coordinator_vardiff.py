@@ -4484,11 +4484,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
     def test_coordination_blocked_refresh_does_not_start_failure_budget(self) -> None:
         for blocked_error in (
             TemplateRefreshSuperseded("qbit tip changed during sequential refresh"),
-            _PayoutStatePublicationBlocked("payout state invalidation is pending publication"),
+            _PayoutStatePublicationBlocked(
+                "accepted block payout confirmation is still pending"
+            ),
         ):
             with self.subTest(blocked=type(blocked_error).__name__):
                 server = coordinator()
                 server.template_refresh_failure_exit_seconds = 10.0
+                server.coordination_blocked_exit_seconds = 30.0
                 server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
                 server.rpc = TipRpc("11" * 32)
 
@@ -4496,13 +4499,33 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                     raise error
 
                 server.fetch_qbit_tip_template_snapshot = raise_blocked  # type: ignore[method-assign]
-                with self.assertRaises(type(blocked_error)):
+                with (
+                    patch(
+                        "lab.prism.prism_coordinator.time.monotonic",
+                        return_value=100.0,
+                    ),
+                    self.assertRaises(type(blocked_error)),
+                ):
                     server.poll_qbit_tip_template_once()
 
                 self.assertIsNone(
                     getattr(server, "template_refresh_failure_started_monotonic", None)
                 )
                 self.assertFalse(server.template_refresh_failure_expired(10_000.0))
+                self.assertAlmostEqual(
+                    server.coordination_blocked_streak_age_seconds(109.999),
+                    9.999,
+                )
+                self.assertFalse(
+                    server.coordination_blocked_streak_expired(129.999)
+                )
+
+    def test_coordination_blocked_default_budget_is_fifteen_minutes(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server._record_coordination_blocked_refresh(100.0)
+
+        self.assertFalse(server.coordination_blocked_streak_expired(999.999))
+        self.assertTrue(server.coordination_blocked_streak_expired(1000.0))
 
     def test_non_coordination_blocked_refresh_still_starts_failure_budget(self) -> None:
         # Plain TemplateRefreshBlocked also wraps genuine failures (malformed
@@ -4510,6 +4533,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         # the TemplateRefreshSuperseded/payout-fence subclasses are exempt.
         server = coordinator()
         server.template_refresh_failure_exit_seconds = 10.0
+        server.coordination_blocked_exit_seconds = 10.0
+        server._record_coordination_blocked_refresh(90.0)
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         server.rpc = TipRpc("11" * 32)
 
@@ -4526,12 +4551,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server.poll_qbit_tip_template_once()
 
         self.assertEqual(server.template_refresh_failure_started_monotonic, 100.0)
+        self.assertEqual(server.coordination_blocked_streak_age_seconds(110.0), 0.0)
         self.assertTrue(server.template_refresh_failure_expired(110.0))
 
-    def test_sustained_blocked_refresh_storm_never_exhausts_failure_budget(self) -> None:
+    def test_sustained_blocked_refresh_storm_exits_via_coordination_budget(self) -> None:
         server = coordinator()
         server.blockpoll_seconds = 0
         server.template_refresh_failure_exit_seconds = 10.0
+        server.coordination_blocked_exit_seconds = 10.0
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         server.rpc = TipRpc("11" * 32)
         clock = {"now": 100.0}
@@ -4558,16 +4585,32 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 side_effect=lambda: clock["now"],
             ),
             patch("lab.prism.prism_coordinator.traceback.print_exc"),
-            patch("lab.prism.prism_coordinator.os._exit", side_effect=SystemExit(1)) as exit_process,
         ):
             server.blockpoll_loop()
 
         self.assertEqual(blocked_polls, 4)
-        self.assertGreater(clock["now"] - 100.0, server.template_refresh_failure_exit_seconds)
-        exit_process.assert_not_called()
+        self.assertTrue(server.coordination_blocked_streak_expired(clock["now"]))
         self.assertIsNone(
             getattr(server, "template_refresh_failure_started_monotonic", None)
         )
+        server.stop_event.clear()
+        server.watchdog_enabled = False
+        server.watchdog_interval_seconds = 0.001
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                return_value=clock["now"],
+            ),
+            patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=SystemExit(1),
+            ) as exit_process,
+            patch("builtins.print"),
+            self.assertRaises(SystemExit),
+        ):
+            server.watchdog_loop()
+
+        exit_process.assert_called_once_with(1)
 
     def test_armed_budget_is_not_fired_by_coordination_blocked_refresh(self) -> None:
         # A transient budgeted failure armed the clock, qbitd recovered, and
@@ -4679,6 +4722,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.last_successful_template_refresh_monotonic = 100.0
         server.template_refresh_failure_started_monotonic = 190.0
         server.template_refresh_failure_exit_seconds = 10.0
+        server.coordination_blocked_exit_seconds = 10.0
+        server._record_coordination_blocked_refresh(190.0)
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         snapshot = QbitTipTemplateSnapshot(
             bestblockhash="11" * 32,
@@ -4699,6 +4744,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(server.last_successful_template_refresh_monotonic, 200.0)
         self.assertIsNone(server.template_refresh_failure_started_monotonic)
+        self.assertEqual(server.coordination_blocked_streak_age_seconds(300.0), 0.0)
+        self.assertFalse(server.coordination_blocked_streak_expired(300.0))
         self.assertFalse(server.template_refresh_failure_expired(300.0))
         self.assertIsNone(server.template_refresh_failure_started_monotonic)
         server._record_template_refresh_failure(300.0)

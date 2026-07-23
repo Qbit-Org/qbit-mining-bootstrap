@@ -29,6 +29,7 @@ from lab.prism.prism_coordinator import (
     ShutdownInProgress,
     TemplateRefreshBlocked,
     WorkerIdentity,
+    _PayoutStatePublicationBlocked,
     canonical_json_sha256,
     canonical_json_text,
     default_prism_coinbase_tag_hex,
@@ -1109,13 +1110,48 @@ class JobBundleCacheTests(unittest.TestCase):
         server._begin_accepted_block_payout_preview(block_hash, block_height=10)
         server._mark_accepted_block_payout_landed(block_hash, block_height=10)
 
-        with self.assertRaisesRegex(TemplateRefreshBlocked, "confirmation is still pending"):
+        with self.assertRaisesRegex(
+            _PayoutStatePublicationBlocked,
+            "confirmation is still pending",
+        ):
             with server._payout_balance_mutation():
                 self.fail("landed transition must bar payout reconciliation")
+        with self.assertRaisesRegex(
+            _PayoutStatePublicationBlocked,
+            "confirmation is still pending",
+        ):
+            server.reconcile_prism_pool_blocks_once()
 
         server._clear_accepted_block_payout_preview(block_hash)
         with server._payout_balance_mutation():
             pass
+
+    def test_landed_transition_poll_uses_coordination_blocked_budget(self) -> None:
+        server, _rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        block_hash = "af" * 32
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                return_value=100.0,
+            ),
+            self.assertRaisesRegex(
+                _PayoutStatePublicationBlocked,
+                "confirmation is still pending",
+            ),
+        ):
+            server.poll_qbit_tip_template_once()
+
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+        self.assertEqual(
+            server.coordination_blocked_streak_age_seconds(105.0),
+            5.0,
+        )
 
     def test_readiness_latch_during_preparation_admission_reselects_ready_mode(self) -> None:
         ledger = FakeLedger(miners=["solo"])

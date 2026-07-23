@@ -13,6 +13,7 @@ from unittest.mock import patch
 from lab.prism.prism_coordinator import (
     ShutdownInProgress,
     TemplateRefreshBlocked,
+    TemplateRefreshSuperseded,
     TipRefreshValidationToken,
     _FanoutCancellation,
     _PayoutStateDeliveryGate,
@@ -2929,6 +2930,56 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertEqual(results["waiting"], [0])
         self.assertEqual(notifications, [1, 2])
         self.assertFalse(server.tip_refresh_is_pending())
+
+    def test_prepublication_payout_change_uses_coordination_budget(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server._ensure_tip_refresh_state()
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        server._pool_ready_latched = True
+        delegate = server._tip_refresh_lock
+        blocked_at = server.started_monotonic + 10.0
+
+        class AdvancePayoutBeforePublication:
+            def __init__(self) -> None:
+                self.advanced = False
+
+            def acquire(self, timeout: float = -1) -> bool:
+                if not self.advanced:
+                    self.advanced = True
+                    server._advance_payout_state_generation()
+                return delegate.acquire(timeout=timeout)
+
+            def release(self) -> None:
+                delegate.release()
+
+        server._tip_refresh_lock = AdvancePayoutBeforePublication()  # type: ignore[assignment]
+
+        try:
+            with (
+                patch(
+                    "lab.prism.prism_coordinator.time.monotonic",
+                    return_value=blocked_at,
+                ),
+                self.assertRaisesRegex(
+                    TemplateRefreshSuperseded,
+                    "payout state changed before refresh publication",
+                ),
+            ):
+                server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+        self.assertEqual(
+            server.coordination_blocked_streak_age_seconds(blocked_at + 5.0),
+            5.0,
+        )
+        self.assertTrue(server._tip_refresh_retry.is_set())
 
     def test_post_fanout_payout_change_schedules_immediate_retry(self) -> None:
         server, rpc = coordinator()
