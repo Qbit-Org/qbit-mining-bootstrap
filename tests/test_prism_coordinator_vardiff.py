@@ -6465,6 +6465,79 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertEqual(ledger.persisted, [])
 
+    def test_accepted_candidate_with_moved_tip_finalizes_as_submitted(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        block_hash = "cc" * 32
+        server, state, _recording = submit_coordinator(tip=old_tip)
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        pending = self._pending_append("accepted-tip-race").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex=block_hash,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        submitted: list[str] = []
+        abandoned: list[str] = []
+        original_submitted = ledger.mark_block_candidate_submitted
+        original_abandoned = ledger.mark_block_candidate_abandoned
+
+        def mark_submitted(*, block_hash: str) -> bool:
+            submitted.append(block_hash)
+            return original_submitted(block_hash=block_hash)
+
+        def mark_abandoned(*, block_hash: str, error: str) -> bool:
+            abandoned.append(block_hash)
+            return original_abandoned(block_hash=block_hash, error=error)
+
+        ledger.mark_block_candidate_submitted = mark_submitted  # type: ignore[method-assign]
+        ledger.mark_block_candidate_abandoned = mark_abandoned  # type: ignore[method-assign]
+        server._begin_accepted_block_payout_preview(
+            block_hash,
+            block_height=10,
+        )
+        server._mark_accepted_block_payout_landed(
+            block_hash,
+            block_height=10,
+        )
+        with server.lock:
+            # This is the process-local record written immediately before the
+            # "qbit accepted direct PRISM block" log.
+            server._accounted_accepted_block_hashes.add(block_hash)
+        server.rpc = TipRpc(new_tip)
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("an accounted candidate must not be rebuilt")
+            )
+        )
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(submitted, [block_hash])
+        self.assertEqual(abandoned, [])
+        self.assertEqual(ledger.pending_block_candidates(), [])
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
+        )
+        self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+        self.assertNotIn(
+            block_hash,
+            server._invalidated_accepted_block_payout_previews,
+        )
+
     def test_block_candidate_queue_overflow_coalesces_wakeup_without_drop(self) -> None:
         server, state, _ledger = submit_coordinator()
         server.block_candidate_queue = queue.Queue(maxsize=2)
@@ -6655,6 +6728,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 server._abandon_block_candidate(
                     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                     "temporary parent finalization failure",
+                    block_hash=block_hash,
                     worker="miner-a",
                 )
                 return False
@@ -6765,6 +6839,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
                 "tip moved",
+                block_hash=block_hash,
                 worker="miner-a",
             )
             return False
@@ -6783,6 +6858,117 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         self.assertNotIn(
             candidate.submission.block_hash_hex,
+            server._invalidated_accepted_block_payout_previews,
+        )
+
+    def test_terminal_abandon_immediately_clears_payout_preview(self) -> None:
+        server, _state, _ledger = submit_coordinator()
+        block_hash = "a4" * 32
+        server._begin_accepted_block_payout_preview(
+            block_hash,
+            block_height=10,
+        )
+        server._mark_accepted_block_payout_landed(
+            block_hash,
+            block_height=10,
+        )
+
+        accepted_race_won = server._abandon_block_candidate(
+            PRISM_REJECTION_STALE_JOB,
+            "tip moved",
+            block_hash=block_hash,
+            worker="miner-a",
+        )
+
+        self.assertFalse(accepted_race_won)
+        self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+        self.assertIn(
+            block_hash,
+            server._invalidated_accepted_block_payout_previews,
+        )
+        # The tombstone protects pending durable replay, but unlike the leaked
+        # landed transition it does not block payout reconciliation.
+        with server._payout_balance_mutation():
+            pass
+
+    def test_tip_moved_abandon_yields_to_acceptance_during_cleanup(self) -> None:
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        block_hash = "a5" * 32
+        server, state, _recording = submit_coordinator(tip=old_tip)
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        pending = self._pending_append("accepted-during-clear").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex=block_hash,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        submitted: list[str] = []
+        abandoned: list[str] = []
+        original_submitted = ledger.mark_block_candidate_submitted
+        original_abandoned = ledger.mark_block_candidate_abandoned
+        original_clear = server._clear_accepted_block_payout_preview
+
+        def mark_submitted(*, block_hash: str) -> bool:
+            submitted.append(block_hash)
+            return original_submitted(block_hash=block_hash)
+
+        def mark_abandoned(*, block_hash: str, error: str) -> bool:
+            abandoned.append(block_hash)
+            return original_abandoned(block_hash=block_hash, error=error)
+
+        def clear_while_accepting(
+            candidate_hash: str,
+            *,
+            invalidate_published: bool = False,
+        ) -> None:
+            original_clear(
+                candidate_hash,
+                invalidate_published=invalidate_published,
+            )
+            if invalidate_published:
+                with server.lock:
+                    server._accounted_accepted_block_hashes.add(
+                        candidate_hash.lower()
+                    )
+
+        ledger.mark_block_candidate_submitted = mark_submitted  # type: ignore[method-assign]
+        ledger.mark_block_candidate_abandoned = mark_abandoned  # type: ignore[method-assign]
+        server._clear_accepted_block_payout_preview = clear_while_accepting  # type: ignore[method-assign]
+        server._begin_accepted_block_payout_preview(
+            block_hash,
+            block_height=10,
+        )
+        server._mark_accepted_block_payout_landed(
+            block_hash,
+            block_height=10,
+        )
+        server.rpc = TipRpc(new_tip)
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(submitted, [block_hash])
+        self.assertEqual(abandoned, [])
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
+        )
+        self.assertEqual(ledger.pending_block_candidates(), [])
+        self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+        self.assertNotIn(
+            block_hash,
             server._invalidated_accepted_block_payout_previews,
         )
 
@@ -6821,6 +7007,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
                 "tip moved",
+                block_hash=block_hash,
                 worker="miner-a",
             )
             return False
@@ -6946,6 +7133,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
                 "tip moved",
+                block_hash=_candidate.submission.block_hash_hex,
                 worker="miner-a",
             )
             return False
@@ -10127,6 +10315,7 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             server._abandon_block_candidate(
                 PRISM_REJECTION_SUBMITBLOCK_REJECTED,
                 "rejected",
+                block_hash=_candidate.submission.block_hash_hex,
                 worker="miner-a",
             )
             return False
