@@ -1062,6 +1062,14 @@ class PrismBlockCandidate:
     credit_share_on_accept: bool = False
 
 
+@dataclass
+class _BlockCandidateDispositionFlight:
+    """One same-hash submission guard shared by its holder and waiters."""
+
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    users: int = 0
+
+
 @dataclass(frozen=True)
 class CachedTemplateArtifacts:
     """Template plus everything derivable from it alone, shared by all clients.
@@ -2606,6 +2614,10 @@ class PrismCoordinator:
         self.block_candidate_queue: queue.Queue[PrismBlockCandidate] = queue.Queue(
             maxsize=MAX_PENDING_BLOCK_CANDIDATES
         )
+        self._block_candidate_disposition_registry_lock = threading.Lock()
+        self._block_candidate_disposition_flights: dict[
+            str, _BlockCandidateDispositionFlight
+        ] = {}
         self.block_candidates_dropped = 0
         self.block_candidate_wakeups_coalesced = 0
         self.block_candidate_retry_count = 0
@@ -16124,6 +16136,55 @@ class PrismCoordinator:
         if callable(mark_attempted):
             mark_attempted(block_hash=block_hash)
 
+    def _ensure_block_candidate_disposition_state(self) -> None:
+        """Backfill same-hash submission guards for lightweight embedders."""
+        if (
+            hasattr(self, "_block_candidate_disposition_registry_lock")
+            and hasattr(self, "_block_candidate_disposition_flights")
+        ):
+            return
+        with _HOT_PATH_LOCK_INITIALIZATION_LOCK:
+            if not hasattr(self, "_block_candidate_disposition_registry_lock"):
+                self._block_candidate_disposition_registry_lock = threading.Lock()
+            if not hasattr(self, "_block_candidate_disposition_flights"):
+                self._block_candidate_disposition_flights: dict[
+                    str, _BlockCandidateDispositionFlight
+                ] = {}
+
+    @contextmanager
+    def _block_candidate_disposition(self, block_hash: str) -> Iterator[None]:
+        """Serialize the full accepted/abandoned decision for one hash.
+
+        A below-share-target solve submits synchronously while the durable
+        outbox can concurrently replay that same candidate. Keep both attempts
+        ordered until the accepted success tail records its process-local
+        completion; otherwise the replay can terminally abandon the outbox
+        during the gap after durable confirmation but before audit/share
+        evidence is complete.
+        """
+        key = block_hash.lower()
+        self._ensure_block_candidate_disposition_state()
+        with self._block_candidate_disposition_registry_lock:
+            flight = self._block_candidate_disposition_flights.get(key)
+            if flight is None:
+                flight = _BlockCandidateDispositionFlight()
+                self._block_candidate_disposition_flights[key] = flight
+            flight.users += 1
+        try:
+            # Never hold the registry lock while waiting on the hash-specific
+            # guard: unrelated candidates must remain independent.
+            with flight.lock:
+                yield
+        finally:
+            with self._block_candidate_disposition_registry_lock:
+                flight.users -= 1
+                if (
+                    flight.users == 0
+                    and self._block_candidate_disposition_flights.get(key)
+                    is flight
+                ):
+                    self._block_candidate_disposition_flights.pop(key, None)
+
     def block_submit_loop(self) -> None:
         while not self.stop_event.is_set():
             self._record_heartbeat("block_submitter")
@@ -16476,7 +16537,21 @@ class PrismCoordinator:
             flush=True,
         )
 
-    def _abandon_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
+    def _block_candidate_acceptance_recorded(self, block_hash: str) -> bool:
+        """Return whether this process completed the candidate success tail."""
+        self._ensure_job_cache_state()
+        with self.lock:
+            return block_hash.lower() in self._accounted_accepted_block_hashes
+
+    def _abandon_block_candidate(
+        self,
+        reason: str,
+        message: str,
+        *,
+        block_hash: str,
+        worker: str | None,
+        preserve_if_accepted: bool = False,
+    ) -> bool:
         """Record a lost/failed block candidate as a BLOCK-path event.
 
         The share that produced the candidate was acknowledged and, when it met
@@ -16486,25 +16561,61 @@ class PrismCoordinator:
         benign 'tip moved' race is distinguishable from a real
         submitblock-rejected/ledger failure) rather than the share-reject
         counters, which stay a true measure of shares refused to miners.
+
+        Every terminal abandonment withdraws its payout-preview transition
+        before the outcome becomes final. ``preserve_if_accepted`` closes the
+        moved-tip race: if another attempt completed this hash's accepted
+        success tail while withdrawal was in flight, the accepted disposition
+        wins and the caller must finalize the outbox as submitted. Returns
+        whether that accepted disposition won.
         """
         if reason in PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS:
             self._defer_block_candidate(reason, message, worker=worker)
-            return
+            return False
         outcome = getattr(self, "_block_candidate_outcome", None)
         if outcome is None:
             outcome = threading.local()
             self._block_candidate_outcome = outcome
-        outcome.reason = reason
+        if (
+            preserve_if_accepted
+            and self._block_candidate_acceptance_recorded(block_hash)
+        ):
+            # Durable accepted state already equals the prospective view, so
+            # any transition recreated by the losing attempt is a no-op
+            # override, not a withdrawal.
+            self._clear_accepted_block_payout_preview(block_hash)
+            outcome.reason = None
+            return True
+
+        # Own the cleanup invariant here rather than relying on every caller to
+        # remember it. Invalidation can block behind another candidate pass;
+        # recheck the accepted record afterward before committing abandonment.
+        self._clear_accepted_block_payout_preview(
+            block_hash,
+            invalidate_published=True,
+        )
         with self.lock:
-            counts = getattr(self, "block_candidate_abandoned_counts", None)
-            if counts is None:
-                counts = {}
-                self.block_candidate_abandoned_counts = counts
-            counts[reason] = int(counts.get(reason, 0)) + 1
+            accepted_race_won = bool(
+                preserve_if_accepted
+                and block_hash.lower() in self._accounted_accepted_block_hashes
+            )
+            if not accepted_race_won:
+                outcome.reason = reason
+                counts = getattr(self, "block_candidate_abandoned_counts", None)
+                if counts is None:
+                    counts = {}
+                    self.block_candidate_abandoned_counts = counts
+                counts[reason] = int(counts.get(reason, 0)) + 1
+        if accepted_race_won:
+            self._clear_accepted_block_payout_preview(block_hash)
+            outcome.reason = None
+            return True
+
         print(
             f"prism coordinator: block candidate abandoned reason={reason}: {message}",
             flush=True,
         )
+        return False
 
     def active_block_candidate_height(self, block_hash: str) -> int | None:
         """Return the active-chain height for a previously submitted candidate."""
@@ -16527,6 +16638,7 @@ class PrismCoordinator:
     def _defer_for_pending_parent_payout_transition(
         self,
         *,
+        block_hash: str,
         parent_hash: str,
         parent_height: int,
         worker: str | None,
@@ -16561,6 +16673,7 @@ class PrismCoordinator:
             self._abandon_block_candidate(
                 PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                 f"could not validate pending ancestor payout state: {exc}",
+                block_hash=block_hash,
                 worker=worker,
             )
             return True
@@ -16570,6 +16683,7 @@ class PrismCoordinator:
         self._abandon_block_candidate(
             PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
             "parent or ancestor payout confirmation is still pending",
+            block_hash=block_hash,
             worker=worker,
         )
         return True
@@ -16604,6 +16718,7 @@ class PrismCoordinator:
         )
         with self._payout_balance_mutation_lock:
             if self._defer_for_pending_parent_payout_transition(
+                block_hash=block_hash,
                 parent_hash=parent_hash,
                 parent_height=expected_height - 1,
                 worker=worker,
@@ -16629,6 +16744,7 @@ class PrismCoordinator:
                     self._abandon_block_candidate(
                         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                         "reorg reconciliation failed before block replay",
+                        block_hash=block_hash,
                         worker=worker,
                     )
                     return None
@@ -16636,6 +16752,7 @@ class PrismCoordinator:
                     self._abandon_block_candidate(
                         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                         "reorg reconciliation reported an untrusted chain view",
+                        block_hash=block_hash,
                         worker=worker,
                     )
                     return None
@@ -16675,6 +16792,7 @@ class PrismCoordinator:
                     self._abandon_block_candidate(
                         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                         "reorg reconciliation failed before block submit",
+                        block_hash=block_hash,
                         worker=worker,
                     )
                     return None
@@ -16682,6 +16800,7 @@ class PrismCoordinator:
                 self._abandon_block_candidate(
                     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                     "reorg reconciliation reported an untrusted chain view",
+                    block_hash=block_hash,
                     worker=worker,
                 )
                 return None
@@ -16689,6 +16808,7 @@ class PrismCoordinator:
                 already_active
                 and not already_confirmed
                 and self._defer_for_pending_parent_payout_transition(
+                    block_hash=block_hash,
                     parent_hash=parent_hash,
                     parent_height=expected_height - 1,
                     worker=worker,
@@ -16700,26 +16820,20 @@ class PrismCoordinator:
                 and not already_active
                 and not self.prior_balances_match_current(context.prior_balances)
             ):
-                self._clear_accepted_block_payout_preview(
-                    block_hash,
-                    invalidate_published=True,
-                )
                 self._abandon_block_candidate(
                     PRISM_REJECTION_STALE_JOB,
                     "prior balances changed since the job was issued",
+                    block_hash=block_hash,
                     worker=worker,
                 )
                 return None
             if not already_active:
                 before_height = int(self.rpc.call("getblockcount"))
                 if before_height + 1 != expected_height:
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
                     self._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
                         f"stale block height: template={expected_height} tip={before_height}",
+                        block_hash=block_hash,
                         worker=worker,
                     )
                     return None
@@ -16741,13 +16855,10 @@ class PrismCoordinator:
                 result = self.rpc.call("submitblock", [submission.block_hex])
                 self._record_heartbeat("block_submitter")
                 if result not in (None, "duplicate"):
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
                     self._abandon_block_candidate(
                         PRISM_REJECTION_SUBMITBLOCK_REJECTED,
                         f"submitblock rejected candidate: {result}",
+                        block_hash=block_hash,
                         worker=worker,
                     )
                     return None
@@ -16755,13 +16866,10 @@ class PrismCoordinator:
                     self.rpc.call("getblockhash", [expected_height])
                 ).lower()
                 if active_hash != block_hash:
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
                     self._abandon_block_candidate(
                         PRISM_REJECTION_SUBMITBLOCK_REJECTED,
                         f"submitted block is not active at height {expected_height}",
+                        block_hash=block_hash,
                         worker=worker,
                     )
                     return None
@@ -16787,6 +16895,7 @@ class PrismCoordinator:
                     self._abandon_block_candidate(
                         PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                         "accepted block payout base changed before preview publication",
+                        block_hash=block_hash,
                         worker=worker,
                     )
                     return None
@@ -16848,6 +16957,7 @@ class PrismCoordinator:
                 self._abandon_block_candidate(
                     PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
                     "final audit bundle coinbase does not match submitted coinbase",
+                    block_hash=block_hash,
                     worker=worker,
                 )
                 return None
@@ -16888,6 +16998,7 @@ class PrismCoordinator:
                             self._abandon_block_candidate(
                                 PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                                 "accepted block payout base changed before preview publication",
+                                block_hash=block_hash,
                                 worker=worker,
                             )
                             return None
@@ -16906,6 +17017,7 @@ class PrismCoordinator:
                             PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
                             "verified final payout preview does not match the "
                             f"issued block job: {exc}",
+                            block_hash=block_hash,
                             worker=worker,
                         )
                         return None
@@ -16933,6 +17045,7 @@ class PrismCoordinator:
                         self._abandon_block_candidate(
                             PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                             "accepted ancestor left the active chain during replay",
+                            block_hash=block_hash,
                             worker=worker,
                         )
                         return None
@@ -16941,13 +17054,10 @@ class PrismCoordinator:
                         block_hash=block_hash,
                         active_tip_height=active_tip_height,
                     )
-                    self._clear_accepted_block_payout_preview(
-                        block_hash,
-                        invalidate_published=True,
-                    )
                     self._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
                         "accepted block left the active chain before ledger confirmation",
+                        block_hash=block_hash,
                         worker=worker,
                     )
                     return None
@@ -16968,6 +17078,7 @@ class PrismCoordinator:
                     self._abandon_block_candidate(
                         PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                         f"ledger did not confirm accepted block {block_hash}",
+                        block_hash=block_hash,
                         worker=worker,
                     )
                     return None
@@ -17001,6 +17112,7 @@ class PrismCoordinator:
                             PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                             "confirmed payout balances do not match the published "
                             f"preview for accepted block {block_hash}",
+                            block_hash=block_hash,
                             worker=worker,
                         )
                         return None
@@ -17108,6 +17220,15 @@ class PrismCoordinator:
         ``submitblock`` call and is replayable after a crash. Returns True only
         after that finalization completes.
         """
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        with self._block_candidate_disposition(block_hash):
+            return self._submit_block_candidate_serialized(candidate)
+
+    def _submit_block_candidate_serialized(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> bool:
+        """Process a candidate while its same-hash disposition guard is held."""
         outcome = getattr(self, "_block_candidate_outcome", None)
         if outcome is None:
             outcome = threading.local()
@@ -17126,13 +17247,10 @@ class PrismCoordinator:
                 and block_hash not in self._accounted_accepted_block_hashes
             )
         if pool_closed:
-            self._clear_accepted_block_payout_preview(
-                block_hash,
-                invalidate_published=True,
-            )
             self._abandon_block_candidate(
                 PRISM_REJECTION_POOL_CLOSED,
                 "pool is no longer accepting blocks",
+                block_hash=block_hash,
                 worker=worker,
             )
             return False
@@ -17148,18 +17266,16 @@ class PrismCoordinator:
                 self._abandon_block_candidate(
                     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                     "could not determine whether a prior candidate is active",
+                    block_hash=block_hash,
                     worker=worker,
                 )
                 return False
         already_active = landed_height == expected_height
         if landed_height is not None and not already_active:
-            self._clear_accepted_block_payout_preview(
-                block_hash,
-                invalidate_published=True,
-            )
             self._abandon_block_candidate(
                 PRISM_REJECTION_BLOCK_STALE,
                 f"candidate active at unexpected height {landed_height}",
+                block_hash=block_hash,
                 worker=worker,
             )
             return False
@@ -17170,16 +17286,21 @@ class PrismCoordinator:
                 flush=True,
             )
         elif parent_hash != current_tip:
-            self._clear_accepted_block_payout_preview(
-                block_hash,
-                invalidate_published=True,
-            )
-            self._abandon_block_candidate(
+            if self._block_candidate_acceptance_recorded(block_hash):
+                # A duplicate wakeup can reach this check after the accepted
+                # success tail but after a newer tip hides the candidate from
+                # the active-header probe. Its durable work is already done;
+                # let the caller finalize the outbox as submitted.
+                self._clear_accepted_block_payout_preview(block_hash)
+                return True
+            accepted_race_won = self._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
                 f"tip moved before submit: {current_tip}",
+                block_hash=block_hash,
                 worker=worker,
+                preserve_if_accepted=True,
             )
-            return False
+            return accepted_race_won
         landed = self._land_and_confirm_block_candidate(
             candidate,
             current_tip=current_tip,
