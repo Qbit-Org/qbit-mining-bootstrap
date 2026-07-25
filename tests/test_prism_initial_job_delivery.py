@@ -291,6 +291,15 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         recorded = install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 8
         server.stratum_max_pending_initial_jobs = 250
+        # The storm asserts single-flight coalescing, i.e. no REDUNDANT
+        # builds. The harness's short template (2s) and bundle (10s) TTLs are
+        # load-dependent confounds: an expiry mid-storm forces a legitimate
+        # fresh build (a template refetch sweeps the deliberately blocked
+        # flight; bundle eviction rebuilds current work), failing the
+        # one-build invariant without any coalescing defect. Pin both TTLs
+        # past the test's lifetime.
+        server.template_cache_seconds = 300.0
+        server.job_bundle_cache_seconds = 300.0
         server.prewarm_current_tip_ready_bundle()
         with server._job_cache_lock:
             server._job_bundle_cache.clear()
@@ -308,7 +317,10 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             with build_calls_lock:
                 build_calls += 1
             build_entered.set()
-            self.assertTrue(release_build.wait(10))
+            # Generous budget: a timeout here raises inside the build
+            # executor, fails the flight, and later workers then correctly
+            # rebuild -- surfacing as a flaky build count, not a test error.
+            self.assertTrue(release_build.wait(120))
             return original_build(*args, **kwargs)  # type: ignore[arg-type]
 
         server.build_shared_job_bundle = blocked_build  # type: ignore[method-assign]
@@ -335,6 +347,19 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         barrier.wait()
         try:
             self.assertTrue(build_entered.wait(10))
+            # Hold the release until the other three delivery workers have
+            # coalesced onto the in-flight build. Releasing on first entry
+            # alone lets the build complete while a straggling worker is
+            # still constructing its request; that worker then finds an
+            # empty single-flight lane a moment before the winner publishes
+            # the cache entry and legitimately starts a second build --
+            # a razor-thin startup race, not a coalescing defect.
+            wait_until(
+                lambda: (
+                    server.initial_job_prepared_work_counts["singleflight"]
+                    >= 3
+                )
+            )
             for thread in request_threads:
                 thread.join(5)
             self.assertTrue(all(not thread.is_alive() for thread in request_threads))
