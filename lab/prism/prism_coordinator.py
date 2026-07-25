@@ -17369,6 +17369,21 @@ class PrismCoordinator:
                     counts = {}
                     self.block_candidate_abandoned_counts = counts
                 counts[reason] = int(counts.get(reason, 0)) + 1
+                # Seal the disposition in the same critical section that
+                # commits it: stop matching tip observations for this hash so
+                # no acceptance evidence can register between this terminal
+                # decision and the caller's follow-up durable work (rejecting
+                # prepared payout rows). Observation registration takes this
+                # same lock, so exclusion across the gap is total. A crash
+                # before the durable outbox update replays the candidate,
+                # which re-registers and re-evaluates from live chain state.
+                self._outstanding_block_candidate_hashes.discard(
+                    block_hash.lower()
+                )
+                self._tip_observed_accepted_block_hashes.pop(
+                    block_hash.lower(),
+                    None,
+                )
         if accepted_race_won:
             self._clear_accepted_block_payout_preview(block_hash)
             outcome.reason = None
@@ -17833,12 +17848,14 @@ class PrismCoordinator:
                     # later confirmation (and reactivation only covers
                     # inactive rows), so rejection must follow -- never
                     # precede -- a terminal decision. The abandon defers on
-                    # live acceptance evidence, and its terminal commit reads
-                    # that evidence atomically with the commit, so no
-                    # observation can land between the decision and this
-                    # rejection unseen. A crash in between leaves the outbox
-                    # row pending; restart replay re-runs the disposition and
-                    # rejects then.
+                    # live acceptance evidence; its terminal commit consults
+                    # that evidence atomically with the commit AND seals the
+                    # hash against further observation matching, so no
+                    # evidence can register anywhere in the gap between the
+                    # sealed decision and this rejection. A crash in between
+                    # leaves the outbox row pending; restart replay
+                    # re-registers the hash and re-evaluates from live chain
+                    # state before rejecting.
                     self._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
                         "accepted block left the active chain before ledger confirmation",

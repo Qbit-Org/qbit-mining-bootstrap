@@ -11455,6 +11455,118 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         )
         self.assertEqual(server.block_candidate_accept_pending_defer_count, 1)
 
+    def test_terminal_seal_excludes_observations_after_the_commit(self) -> None:
+        # Codex round 3: acceptance evidence arriving after the terminal
+        # commit but before the follow-up durable rejection must be excluded
+        # deterministically. The terminal commit seals the hash (drops it
+        # from outstanding) in the same critical section, so a later
+        # observation is a no-op instead of contradicting the sealed
+        # disposition mid-rejection.
+        block_hash = "b8" * 32
+        server, _state, _ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server._register_outstanding_block_candidate(block_hash)
+        server.rpc = AcceptanceProbeRpc(tip="11" * 32, header=None)
+
+        accepted_race_won = server._abandon_block_candidate(
+            PRISM_REJECTION_STALE_JOB,
+            "tip moved before submit: test",
+            block_hash=block_hash,
+            worker=None,
+            preserve_if_accepted=True,
+            expected_height=10,
+        )
+
+        self.assertFalse(accepted_race_won)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+            1,
+        )
+        self.assertNotIn(block_hash, server._outstanding_block_candidate_hashes)
+
+        # A blockwait observation lands right after the sealed commit: it
+        # must not register acceptance evidence for the sealed hash.
+        self.assertTrue(server.observe_tip_for_refresh(block_hash))
+        self.assertNotIn(block_hash, server._tip_observed_accepted_block_hashes)
+
+    def test_observation_during_prepared_row_rejection_cannot_split_state(self) -> None:
+        # The exact round-3 interleaving at the post-persist site: a
+        # blockwait observation fires inside the gap between the sealed
+        # terminal decision and reject_prepared_block (during the
+        # getblockcount call). The seal excludes it, so the rows are
+        # rejected exactly once with no contradictory evidence registered
+        # and no defer emitted after the seal.
+        parent = "00" * 32
+        block_hash = "c9" * 32
+        racing_winner = "77" * 32
+        server, state, ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 2
+        server.stop_after_block = False
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+            rpc = LostAckSubmitRpc(
+                start_tip=parent,
+                hash_by_hex={"00": block_hash},
+            )
+            rpc.lose_acks = False
+            server.rpc = rpc
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+            race_state: dict[str, bool] = {"post_persist": False}
+            real_persist = ledger.persist_accepted_block
+
+            def persist_then_lose_race(**kwargs: object) -> dict[str, object]:
+                result = real_persist(**kwargs)
+                rpc.tip = racing_winner
+                rpc.active.pop(block_hash, None)
+                rpc.getblockhash_override = racing_winner
+                race_state["post_persist"] = True
+                return result
+
+            ledger.persist_accepted_block = persist_then_lose_race  # type: ignore[method-assign]
+            real_call = rpc.call
+
+            def observing_call(
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount" and race_state["post_persist"]:
+                    # Blockwait reports the candidate as tip inside the
+                    # seal -> reject gap.
+                    server.observe_tip_for_refresh(block_hash)
+                return real_call(method, params)
+
+            rpc.call = observing_call  # type: ignore[method-assign]
+
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+
+            self.assertEqual(len(ledger.rejected), 1)
+            self.assertEqual(abandoned, [block_hash])
+            self.assertEqual(submitted, [])
+            self.assertEqual(
+                server.block_candidate_abandoned_counts["block-stale"],
+                1,
+            )
+            self.assertNotIn(
+                block_hash, server._tip_observed_accepted_block_hashes
+            )
+            self.assertNotIn(
+                block_hash, server._outstanding_block_candidate_hashes
+            )
+            self.assertEqual(
+                getattr(server, "block_candidate_accept_pending_defer_count", 0),
+                0,
+            )
+
     def test_pool_closed_gate_requires_probe_proven_acceptance(self) -> None:
         # Bugbot: observation evidence alone must not open the pool-closed
         # gate -- an off-chain candidate would fall through toward
