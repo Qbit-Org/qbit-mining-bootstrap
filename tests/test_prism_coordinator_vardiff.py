@@ -11629,6 +11629,62 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         )
         self.assertFalse(server._payout_state_publication_blocked)
 
+    def test_wrong_height_probe_verdict_overrules_late_observation(self) -> None:
+        # Bugbot round 6: the probe must win both directions in the late
+        # check too. An observation arriving during the withdrawal cannot
+        # revive a candidate the pre-check probe proved active at the wrong
+        # height -- header heights are immutable, so that verdict stands and
+        # the abandon commits terminally instead of deferring to window
+        # expiry.
+        block_hash = "bb" * 32
+        server, _state, _ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server._register_outstanding_block_candidate(block_hash)
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        server.rpc = AcceptanceProbeRpc(
+            tip="11" * 32,
+            header={"height": 9, "confirmations": 2},
+        )
+        real_clear = server._clear_accepted_block_payout_preview
+
+        def observing_clear(
+            hash_arg: str,
+            *,
+            invalidate_published: bool = False,
+        ) -> None:
+            if invalidate_published:
+                with server.lock:
+                    server._tip_observed_accepted_block_hashes[block_hash] = (
+                        time.monotonic()
+                    )
+            return real_clear(
+                hash_arg,
+                invalidate_published=invalidate_published,
+            )
+
+        server._clear_accepted_block_payout_preview = observing_clear  # type: ignore[method-assign]
+
+        accepted_race_won = server._abandon_block_candidate(
+            "block-stale",
+            "candidate active at unexpected height 9",
+            block_hash=block_hash,
+            worker=None,
+            expected_height=10,
+        )
+
+        self.assertFalse(accepted_race_won)
+        outcome = getattr(server, "_block_candidate_outcome", None)
+        self.assertEqual(getattr(outcome, "reason", None), "block-stale")
+        self.assertEqual(
+            server.block_candidate_abandoned_counts["block-stale"],
+            1,
+        )
+        self.assertEqual(
+            getattr(server, "block_candidate_accept_pending_defer_count", 0),
+            0,
+        )
+
     def test_terminal_seal_excludes_observations_after_the_commit(self) -> None:
         # Codex round 3: acceptance evidence arriving after the terminal
         # commit but before the follow-up durable rejection must be excluded

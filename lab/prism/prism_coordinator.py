@@ -17368,9 +17368,13 @@ class PrismCoordinator:
             self._clear_accepted_block_payout_preview(block_hash)
             outcome.reason = None
             return True
-        if self._block_candidate_acceptance_pending(
+        chain_probe = self._block_candidate_chain_probe(
             block_hash,
             expected_height=expected_height,
+        )
+        if chain_probe is True or (
+            chain_probe is None
+            and self._block_candidate_acceptance_observed(block_hash)
         ):
             self._count_accept_pending_defer()
             self._defer_block_candidate(
@@ -17404,9 +17408,13 @@ class PrismCoordinator:
             # observation (or a recovered probe) to register acceptance
             # evidence that the pre-invalidation check missed. Terminal
             # commitment must consult it, atomically with the counts, or the
-            # same blind spot reopens inside this window.
+            # same blind spot reopens inside this window. The probe still
+            # wins both directions: a provably wrong-height verdict is
+            # immutable (headers cannot change height), so observation
+            # evidence never revives a candidate the probe overruled.
             late_acceptance_observed = bool(
                 not accepted_race_won
+                and chain_probe is not False
                 and self._block_candidate_acceptance_observed(block_hash)
             )
             if not accepted_race_won and not late_acceptance_observed:
