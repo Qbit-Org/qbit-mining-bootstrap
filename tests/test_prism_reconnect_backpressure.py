@@ -791,7 +791,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         self.assertTrue(server.schedule_initial_job(newcomer))
         server.shutdown_tip_refresh_executor()
 
-    def test_delivery_executor_prioritizes_new_tip_then_initial_then_same_tip(self) -> None:
+    def test_delivery_executor_prioritizes_initial_then_new_tip_then_same_tip(self) -> None:
         executor = _BoundedPriorityExecutor(max_workers=1, max_queue_size=4)
         blocker_started = threading.Event()
         release = threading.Event()
@@ -821,7 +821,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         routine.result(5)
         executor.shutdown(wait=True, cancel_futures=True)
 
-        self.assertEqual(order, ["new-tip", "initial", "routine"])
+        self.assertEqual(order, ["initial", "new-tip", "routine"])
 
     def test_blocked_initial_workers_do_not_starve_new_tip_delivery(self) -> None:
         server = coordinator(connection_limit=8, pending_limit=8)
@@ -921,7 +921,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
                 workers_contending += 1
                 if workers_contending == server.initial_job_max_workers:
                     all_workers_contending.set()
-            preparation_token, _preparation_cancellation = (
+            preparation_token, _preparation_cancellation, _subscribed = (
                 server._begin_routine_job_build_preparation(
                     request_source="initial",
                     cancelled=_request.cancelled.is_set,

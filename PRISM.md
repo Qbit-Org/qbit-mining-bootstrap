@@ -143,6 +143,14 @@ pending bound stays active. Initial delivery outranks new-tip replacement,
 same-tip/Vardiff refresh, and routine maintenance; duplicate authorization work
 is coalesced by connection and authorization generation.
 
+A first-job request that already has a usable cached bundle is served
+immediately, even while a publication-critical build is running. On a cache
+miss behind such a build, the request subscribes to that build's result and
+consumes it at completion instead of polling out the priority window and
+rebuilding. Transient payout-gate non-admission (a publication in flight, or a
+bundle generation going stale at the gate) retries within the request's own
+deadline rather than disconnecting the client.
+
 `/healthz` reports connection and pending capacity, current-tip job coverage,
 delivery progress, and overload state. It uses
 `PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS` (default 30) before persistent
@@ -214,6 +222,8 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS` | `60` | fail-closed timeout for one signed shared-bundle subprocess |
 | `PRISM_COORDINATION_BLOCKED_EXIT_SECONDS` | `900` | maximum continuous age of coordination-only template-refresh deferrals before the publication watchdog restarts the coordinator |
 | `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` | `15` | maximum monotonic age of a known tip/template/payout refresh before `/healthz` returns HTTP 503 |
+| `PRISM_INITIAL_JOB_MAX_WORKERS` | `4` | dedicated first-job delivery workers; raise under sustained reconnect churn so first notifies do not queue behind each other |
+| `PRISM_JOB_BUILD_EXECUTOR_WORKERS` | `2` | bounded shared job-build executor threads; raise only with spare cores because builds compete for the coordinator's GIL |
 | `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | `15` | maximum monotonic age of the last coherent qbit tip/template poll before `/healthz` returns HTTP 503 |
 | `PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS` | `1` | minimum spacing (plus up to 25% jitter) between failed tip-refresh attempts while the observed tip is unchanged; success or a new tip re-arms immediately; set `0` for unspaced retries |
 | `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | after a tip flip, credits same-connection prior-tip shares until this long after that connection receives new-tip work (shares stay creditable while delivery is still pending); set `0` to reject all prior-tip shares |
