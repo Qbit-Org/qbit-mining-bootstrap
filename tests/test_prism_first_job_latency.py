@@ -363,6 +363,46 @@ class ShareWindowSerializationCacheTests(unittest.TestCase):
             rebuilt,
         )
 
+    def test_concurrent_builders_share_one_digest_computation(self) -> None:
+        server, _rpc = coordinator()
+        shares = window_shares()
+        artifact = payout_ledger_artifact(shares)
+        digest_calls = 0
+        original_sha = prism_coordinator.canonical_json_sha256
+
+        def counting_sha(value: object) -> str:
+            nonlocal digest_calls
+            digest_calls += 1
+            return original_sha(value)
+
+        barrier = threading.Barrier(2)
+        results: list[object] = []
+        results_lock = threading.Lock()
+
+        def compute() -> None:
+            barrier.wait()
+            serialization = server._share_window_serialization_for_artifact(
+                artifact,
+                shares,
+            )
+            with results_lock:
+                results.append(serialization)
+
+        with patch.object(
+            prism_coordinator,
+            "canonical_json_sha256",
+            counting_sha,
+        ):
+            threads = [threading.Thread(target=compute) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+
+        self.assertEqual(len(results), 2)
+        self.assertIs(results[0], results[1])
+        self.assertEqual(digest_calls, 1)
+
     def test_precomposed_builder_payload_matches_inline_encoding(self) -> None:
         """The composed pipe write must be byte-for-byte JSON-equivalent to
         the historical single json.dump of the same payload."""
@@ -487,8 +527,8 @@ class WorkerKnobTests(unittest.TestCase):
             source = module_source.read()
         self.assertRegex(
             source,
-            r'env_positive_int\(\s*"PRISM_INITIAL_JOB_MAX_WORKERS",\s*'
-            r"DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,",
+            r"resolve_initial_job_max_workers\(\s*"
+            r'env_optional_positive_int\("PRISM_INITIAL_JOB_MAX_WORKERS"\)',
         )
         self.assertRegex(
             source,
@@ -529,6 +569,18 @@ class WorkerKnobTests(unittest.TestCase):
             validate(129, 128)
         with self.assertRaisesRegex(SystemExit, "positive"):
             validate(0, 128)
+
+    def test_implicit_initial_worker_default_caps_to_pending_bound(self) -> None:
+        resolve = prism_coordinator.resolve_initial_job_max_workers
+        # Pre-knob deployments with tiny pending bounds stay bootable.
+        self.assertEqual(resolve(None, 2), 2)
+        self.assertEqual(
+            resolve(None, 128),
+            DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
+        )
+        self.assertEqual(resolve(2, 2), 2)
+        with self.assertRaisesRegex(SystemExit, "cannot exceed"):
+            resolve(4, 2)
 
     def test_job_build_executor_workers_rejects_unusable_widths(self) -> None:
         validate = prism_coordinator.validate_job_build_executor_workers

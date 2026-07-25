@@ -906,6 +906,22 @@ def validate_initial_job_max_workers(workers: int, max_pending: int) -> int:
     return workers
 
 
+def resolve_initial_job_max_workers(
+    explicit: int | None,
+    max_pending: int,
+) -> int:
+    """Resolve the first-job worker count against the pending-client bound.
+
+    Deployments that bound pending clients below the default worker count
+    were valid before the worker knob existed; the implicit default must cap
+    itself to the pending bound rather than fail their startup. An explicit
+    setting keeps strict validation.
+    """
+    if explicit is None:
+        return min(DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS, int(max_pending))
+    return validate_initial_job_max_workers(explicit, max_pending)
+
+
 def validate_job_build_executor_workers(workers: int) -> int:
     """Reject executor widths the build scheduler can never use.
 
@@ -2498,11 +2514,8 @@ class PrismCoordinator:
             "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
             DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
         )
-        self.initial_job_max_workers = validate_initial_job_max_workers(
-            env_positive_int(
-                "PRISM_INITIAL_JOB_MAX_WORKERS",
-                DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
-            ),
+        self.initial_job_max_workers = resolve_initial_job_max_workers(
+            env_optional_positive_int("PRISM_INITIAL_JOB_MAX_WORKERS"),
             self.stratum_max_pending_initial_jobs,
         )
         self.job_build_executor_workers = validate_job_build_executor_workers(
@@ -6997,22 +7010,27 @@ class PrismCoordinator:
             int(payout_artifact.generation),
             window_weight,
         )
+        # The digest is computed under the slot lock on purpose: the two
+        # bounded build flights can request the same window concurrently, and
+        # letting both walk the share tree would duplicate exactly the
+        # GIL-heavy pass this cache removes. The loser waits briefly and
+        # reuses the winner's entry; a different-key waiter is serialized
+        # behind at most one O(window) pass.
         with self._share_window_serialization_lock:
             cached = self._share_window_serialization
-        if (
-            cached is not None
-            and cached.key == key
-            and cached.share_count == len(shares)
-        ):
-            return cached
-        serialization = _ShareWindowSerialization(
-            key=key,
-            share_count=len(shares),
-            share_snapshot_sha256=canonical_json_sha256(shares),
-        )
-        with self._share_window_serialization_lock:
+            if (
+                cached is not None
+                and cached.key == key
+                and cached.share_count == len(shares)
+            ):
+                return cached
+            serialization = _ShareWindowSerialization(
+                key=key,
+                share_count=len(shares),
+                share_snapshot_sha256=canonical_json_sha256(shares),
+            )
             self._share_window_serialization = serialization
-        return serialization
+            return serialization
 
     def build_shared_job_bundle(
         self,
