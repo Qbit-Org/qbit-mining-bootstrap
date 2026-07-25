@@ -17206,22 +17206,19 @@ class PrismCoordinator:
             return True
         return (time.monotonic() - observed) <= window
 
-    def _block_candidate_acceptance_pending(
+    def _block_candidate_chain_probe(
         self,
         block_hash: str,
         *,
         expected_height: int | None = None,
-    ) -> bool:
-        """Return whether abandoning this candidate would discard an accepted block.
+    ) -> bool | None:
+        """Fresh chain verdict for a candidate: proven active, proven wrong, or unknown.
 
-        A fresh probe wins in both directions: a candidate proven active is
-        accepted even if its tip observation was missed, and a candidate
-        proven active at the wrong height stays abandonable. When the probe
-        cannot prove either way (the hash absent from one instantaneous
-        chain view during a tip race, or the probe itself failing), a recent
-        own-hash tip observation keeps the candidate deferring instead of
-        terminal: qbitd accepted it once, so only a durably settled chain
-        view may discard it.
+        Returns True when the candidate's own hash is the fresh best tip or
+        an active chain header at its expected height, False when it is
+        provably active at the wrong height (a corrupt intent, never a tip
+        race), and None when this instantaneous view proves nothing (the
+        hash absent during a tip race, or the probe itself failing).
         """
         key = block_hash.lower()
         height: int | None = None
@@ -17237,12 +17234,41 @@ class PrismCoordinator:
                 flush=True,
             )
             traceback.print_exc()
-        if height is not None:
-            if expected_height is None or int(height) == int(expected_height):
-                self._note_tip_observation_for_candidates(key)
-                return True
-            return False
-        return self._block_candidate_acceptance_observed(key)
+        if height is None:
+            return None
+        if expected_height is None or int(height) == int(expected_height):
+            self._note_tip_observation_for_candidates(key)
+            return True
+        return False
+
+    def _block_candidate_acceptance_pending(
+        self,
+        block_hash: str,
+        *,
+        expected_height: int | None = None,
+    ) -> bool:
+        """Return whether abandoning this candidate would discard an accepted block.
+
+        A fresh probe wins in both directions: a candidate proven active is
+        accepted even if its tip observation was missed, and a candidate
+        proven active at the wrong height stays abandonable. When the probe
+        cannot prove either way, a recent own-hash tip observation keeps the
+        candidate deferring instead of terminal: qbitd accepted it once, so
+        only a durably settled chain view may discard it.
+        """
+        probe = self._block_candidate_chain_probe(
+            block_hash,
+            expected_height=expected_height,
+        )
+        if probe is not None:
+            return probe
+        return self._block_candidate_acceptance_observed(block_hash)
+
+    def _count_accept_pending_defer(self) -> None:
+        with self.lock:
+            self.block_candidate_accept_pending_defer_count = int(
+                getattr(self, "block_candidate_accept_pending_defer_count", 0)
+            ) + 1
 
     def _abandon_block_candidate(
         self,
@@ -17253,6 +17279,7 @@ class PrismCoordinator:
         worker: str | None,
         preserve_if_accepted: bool = False,
         expected_height: int | None = None,
+        recheck_acceptance: bool = True,
     ) -> bool:
         """Record a lost/failed block candidate as a BLOCK-path event.
 
@@ -17279,7 +17306,11 @@ class PrismCoordinator:
         accounting and withdraw its landed preview -- fencing payout
         publication for work qbitd already accepted -- so such candidates
         defer for retry instead; only hashes provably absent from the active
-        chain (past the observation window) abandon terminally.
+        chain (past the observation window) abandon terminally. Callers that
+        have already performed that acceptance check themselves -- and hold
+        durable state that a late defer could no longer honor, such as
+        already-rejected prepared payout rows -- pass
+        ``recheck_acceptance=False`` to commit the terminal outcome.
         """
         if reason in PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS:
             self._defer_block_candidate(reason, message, worker=worker)
@@ -17298,14 +17329,11 @@ class PrismCoordinator:
             self._clear_accepted_block_payout_preview(block_hash)
             outcome.reason = None
             return True
-        if self._block_candidate_acceptance_pending(
+        if recheck_acceptance and self._block_candidate_acceptance_pending(
             block_hash,
             expected_height=expected_height,
         ):
-            with self.lock:
-                self.block_candidate_accept_pending_defer_count = int(
-                    getattr(self, "block_candidate_accept_pending_defer_count", 0)
-                ) + 1
+            self._count_accept_pending_defer()
             self._defer_block_candidate(
                 PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
                 "candidate is on (or was recently observed as) the active "
@@ -17327,7 +17355,17 @@ class PrismCoordinator:
                 preserve_if_accepted
                 and block_hash.lower() in self._accounted_accepted_block_hashes
             )
-            if not accepted_race_won:
+            # The invalidation above can block long enough for a blockwait
+            # observation (or a recovered probe) to register acceptance
+            # evidence that the pre-invalidation check missed. Terminal
+            # commitment must consult it, atomically with the counts, or the
+            # same blind spot reopens inside this window.
+            late_acceptance_observed = bool(
+                recheck_acceptance
+                and not accepted_race_won
+                and self._block_candidate_acceptance_observed(block_hash)
+            )
+            if not accepted_race_won and not late_acceptance_observed:
                 outcome.reason = reason
                 counts = getattr(self, "block_candidate_abandoned_counts", None)
                 if counts is None:
@@ -17338,6 +17376,18 @@ class PrismCoordinator:
             self._clear_accepted_block_payout_preview(block_hash)
             outcome.reason = None
             return True
+        if late_acceptance_observed:
+            # The withdrawal already published; the deferred retry's accepted
+            # tail re-registers and republishes the preview, healing it.
+            self._count_accept_pending_defer()
+            self._defer_block_candidate(
+                PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
+                "acceptance evidence arrived during payout-preview "
+                f"withdrawal; refusing terminal abandonment (was {reason}: "
+                f"{message})",
+                worker=worker,
+            )
+            return False
 
         print(
             f"prism coordinator: block candidate abandoned reason={reason}: {message}",
@@ -17781,17 +17831,40 @@ class PrismCoordinator:
                             worker=worker,
                         )
                         return None
+                    if self._block_candidate_acceptance_pending(
+                        block_hash,
+                        expected_height=expected_height,
+                    ):
+                        # Defer BEFORE rejecting the prepared payout rows: a
+                        # rejected/reversed row cannot be confirmed by a later
+                        # settled chain view (confirmation only promotes
+                        # prepared rows), so rejecting first would let a
+                        # deferred retry account the block as accepted while
+                        # its payout transition stays reversed.
+                        self._count_accept_pending_defer()
+                        self._defer_block_candidate(
+                            PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
+                            "candidate left this chain view after persistence "
+                            "while acceptance evidence stands; deferring "
+                            "before rejecting prepared payout state",
+                            worker=worker,
+                        )
+                        return None
                     active_tip_height = int(self.rpc.call("getblockcount"))
                     self.reject_prepared_block(
                         block_hash=block_hash,
                         active_tip_height=active_tip_height,
                     )
+                    # The acceptance check above just failed and the prepared
+                    # rows are now rejected; a late defer could no longer be
+                    # honored, so this terminal outcome must commit.
                     self._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
                         "accepted block left the active chain before ledger confirmation",
                         block_hash=block_hash,
                         worker=worker,
                         expected_height=expected_height,
+                        recheck_acceptance=False,
                     )
                     return None
                 confirmation = self.ledger.confirm_accepted_block(
@@ -17983,14 +18056,17 @@ class PrismCoordinator:
                 self.accepted_block_count >= self.max_blocks
                 and block_hash not in self._accounted_accepted_block_hashes
             )
-        if pool_closed and self._block_candidate_acceptance_pending(
+        if pool_closed and self._block_candidate_chain_probe(
             block_hash,
             expected_height=expected_height,
-        ):
-            # The chain already contains this block; its payout accounting
+        ) is True:
+            # The chain provably contains this block; its payout accounting
             # must complete regardless of when the pool stopped accepting
             # new work. Fall through to the normal disposition below, which
-            # resumes the accepted success tail.
+            # resumes the accepted success tail. Observation evidence alone
+            # deliberately does not open this gate -- an unprovable view
+            # defers via the abandon path instead, so a closed pool can
+            # never fall through to submitblock on stale evidence.
             pool_closed = False
         if pool_closed:
             self._abandon_block_candidate(
