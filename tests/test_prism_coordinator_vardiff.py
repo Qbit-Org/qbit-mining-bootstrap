@@ -10865,15 +10865,19 @@ class AcceptanceProbeRpc(FakeRpc):
         tip: str,
         header: dict[str, object] | None = None,
         fail: bool = False,
+        fail_tip: bool = False,
     ) -> None:
         self.tip = tip
         self.header = header
         self.fail = fail
+        self.fail_tip = fail_tip
 
     def call(self, method: str, params: list[object] | None = None) -> object:
         if self.fail:
             raise RuntimeError("qbit RPC unavailable")
         if method == "getbestblockhash":
+            if self.fail_tip:
+                raise RuntimeError("qbit RPC getbestblockhash unavailable")
             return self.tip
         if method == "getblockheader":
             if self.header is None:
@@ -11289,6 +11293,34 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             )
         )
 
+        # A best-tip lookup failure must not suppress the active-header
+        # probe: the header alone proves acceptance, with no observation.
+        observed(None)
+        server.rpc = AcceptanceProbeRpc(
+            tip="11" * 32,
+            header={"height": 10, "confirmations": 2},
+            fail_tip=True,
+        )
+        self.assertTrue(
+            server._block_candidate_acceptance_pending(
+                block_hash, expected_height=10
+            )
+        )
+
+        # ... and the header's wrong-height verdict also stands alone,
+        # overriding even a fresh observation.
+        observed(1.0)
+        server.rpc = AcceptanceProbeRpc(
+            tip="11" * 32,
+            header={"height": 9, "confirmations": 2},
+            fail_tip=True,
+        )
+        self.assertFalse(
+            server._block_candidate_acceptance_pending(
+                block_hash, expected_height=10
+            )
+        )
+
     def test_post_persist_stale_view_defers_before_rejecting_prepared_rows(self) -> None:
         # Codex P1 / Bugbot: the post-persistence active-hash check could
         # reject the prepared payout rows and only then reach the abandon,
@@ -11454,6 +11486,17 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             getattr(server, "block_candidate_abandoned_counts", {}),
         )
         self.assertEqual(server.block_candidate_accept_pending_defer_count, 1)
+        # The landed barrier is restored (and its fail-closed tombstone
+        # popped) so descendant builders wait on the preview instead of
+        # failing closed while the deferred retry heals it.
+        self.assertIn(block_hash, server._accepted_block_payout_previews)
+        self.assertTrue(
+            server._accepted_block_payout_previews[block_hash].landed
+        )
+        self.assertNotIn(
+            block_hash,
+            server._invalidated_accepted_block_payout_previews,
+        )
 
     def test_terminal_seal_excludes_observations_after_the_commit(self) -> None:
         # Codex round 3: acceptance evidence arriving after the terminal

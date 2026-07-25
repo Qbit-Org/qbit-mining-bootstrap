@@ -17221,15 +17221,26 @@ class PrismCoordinator:
         hash absent during a tip race, or the probe itself failing).
         """
         key = block_hash.lower()
-        height: int | None = None
+        # The two probes are independent: a best-tip lookup failure must not
+        # suppress the active-header check, which subsumes it (the tip block
+        # itself reports one confirmation) and can prove acceptance alone.
         try:
             if str(self.rpc.call("getbestblockhash")).lower() == key:
                 self._note_tip_observation_for_candidates(key)
                 return True
+        except Exception:
+            print(
+                "prism coordinator: acceptance re-check best-tip probe "
+                f"failed hash={key}; trying the active-header probe",
+                flush=True,
+            )
+            traceback.print_exc()
+        height: int | None = None
+        try:
             height = self.active_block_candidate_height(key)
         except Exception:
             print(
-                "prism coordinator: acceptance re-check probe failed "
+                "prism coordinator: acceptance re-check header probe failed "
                 f"hash={key}; falling back to tip-observation evidence",
                 flush=True,
             )
@@ -17389,8 +17400,23 @@ class PrismCoordinator:
             outcome.reason = None
             return True
         if late_acceptance_observed:
-            # The withdrawal already published; the deferred retry's accepted
-            # tail re-registers and republishes the preview, healing it.
+            # Restore the landed barrier the withdrawal just removed (and pop
+            # its fail-closed tombstone): the candidate is still an accepted
+            # block pending finalization, so descendant builders must keep
+            # waiting on its preview -- not fail closed -- until the deferred
+            # retry's accepted tail republishes it. Without this, retries
+            # that keep deferring on observation evidence alone would leave
+            # the tombstone fencing template refreshes, recreating the
+            # coordination-blocked stall this path exists to prevent.
+            self._begin_accepted_block_payout_preview(
+                block_hash,
+                block_height=expected_height,
+            )
+            if expected_height is not None:
+                self._mark_accepted_block_payout_landed(
+                    block_hash,
+                    block_height=expected_height,
+                )
             self._count_accept_pending_defer()
             self._defer_block_candidate(
                 PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
