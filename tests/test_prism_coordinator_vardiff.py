@@ -31,6 +31,7 @@ from lab.prism.prism_coordinator import (
     MAX_PENDING_SHARE_APPENDS,
     PRISM_CREDIT_POLICY_STALE_GRACE,
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+    PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
     PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
     PRISM_REJECTION_DUPLICATE_SHARE,
     PRISM_REJECTION_INVALID_NTIME_OR_NONCE,
@@ -10801,6 +10802,534 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         self.assertTrue(server.pool_readiness_latched())
         context.collection_only = False
         self.assertFalse(server.client_needs_tip_template_refresh(state, snapshot))
+
+
+class LostAckSubmitRpc(FakeRpc):
+    """qbitd accepts submitted blocks while every submitblock ack is lost.
+
+    Models the mainnet 2026-07-25 interleaving: the block connects (the tip
+    flips to the candidate hash, so blockwait reports it) but the RPC
+    response never reaches the coordinator, and the retry disposition can
+    then read a transient racing snapshot in which the tip has moved on and
+    the header probe cannot prove the candidate active.
+    """
+
+    def __init__(self, *, start_tip: str, hash_by_hex: dict[str, str]) -> None:
+        self.tip = start_tip
+        self.height = 9
+        self.hash_by_hex = dict(hash_by_hex)
+        self.active: dict[str, int] = {}
+        self.racing_tip: str | None = None
+        self.submitblock_calls = 0
+
+    def call(self, method: str, params: list[object] | None = None) -> object:
+        if method == "getbestblockhash":
+            return self.racing_tip or self.tip
+        if method == "getblockcount":
+            return self.height
+        if method == "submitblock":
+            self.submitblock_calls += 1
+            block_hash = self.hash_by_hex[str((params or [""])[0])]
+            self.height += 1
+            self.active[block_hash] = self.height
+            self.tip = block_hash
+            raise OSError("connection reset by peer before submitblock ack")
+        if method == "getblockheader":
+            requested = str((params or [""])[0]).lower()
+            if self.racing_tip is None and requested in self.active:
+                block_height = self.active[requested]
+                return {
+                    "height": block_height,
+                    "confirmations": self.height - block_height + 1,
+                }
+            raise RuntimeError("qbit RPC getblockheader failed: -5 Block not found")
+        if method == "getblockhash":
+            requested_height = int((params or [0])[0])
+            for block_hash, block_height in self.active.items():
+                if block_height == requested_height:
+                    return block_hash
+            raise RuntimeError(f"unknown height {requested_height}")
+        return super().call(method, params)
+
+
+class AcceptanceProbeRpc(FakeRpc):
+    def __init__(
+        self,
+        *,
+        tip: str,
+        header: dict[str, object] | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.tip = tip
+        self.header = header
+        self.fail = fail
+
+    def call(self, method: str, params: list[object] | None = None) -> object:
+        if self.fail:
+            raise RuntimeError("qbit RPC unavailable")
+        if method == "getbestblockhash":
+            return self.tip
+        if method == "getblockheader":
+            if self.header is None:
+                raise RuntimeError("qbit RPC getblockheader failed: -5 Block not found")
+            return self.header
+        return super().call(method, params)
+
+
+class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
+    """Blockwait-first acceptance must survive every abandon-capable path.
+
+    Regression coverage for the accepted-block blind spot left open by #89:
+    the accepted registry was only written in the direct-accept submit tail,
+    so a candidate whose submitblock ack was lost -- acceptance arriving via
+    a blockwait tip observation instead -- could be terminally abandoned as
+    stale-job by a retry that read one racing chain snapshot. The abandon
+    withdrew the landed payout preview, fenced payout publication, and left
+    template refreshes coordination-blocked until the watchdog restart.
+    """
+
+    def _accepted_tail_scaffolding(self, server: PrismCoordinator, tempdir: str) -> tuple[list[str], list[str]]:
+        server._ensure_job_cache_state()
+        server.reorg_reconciler_enabled = False
+        server.block_candidate_retry_initial_seconds = 0.0
+        server.audit_dir = Path(tempdir)
+        server.evidence_path = Path(tempdir) / "evidence.json"
+        server.ledger_writer_public_key_hex = "aa" * 32
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+        submitted: list[str] = []
+        abandoned: list[str] = []
+        server.ledger.mark_block_candidate_submitted = (  # type: ignore[attr-defined]
+            lambda **kwargs: submitted.append(str(kwargs["block_hash"])) or True
+        )
+        server.ledger.mark_block_candidate_abandoned = (  # type: ignore[attr-defined]
+            lambda **kwargs: abandoned.append(str(kwargs["block_hash"])) or True
+        )
+        return submitted, abandoned
+
+    def _retained_candidate(self, server: PrismCoordinator) -> PrismBlockCandidate:
+        with server.lock:
+            candidate = server._retry_block_candidate
+            server._retry_block_candidate = None
+        self.assertIsNotNone(candidate)
+        return candidate
+
+    def _chained_context(
+        self,
+        server: PrismCoordinator,
+        *,
+        job_id: str,
+        parent_hash: str,
+        height: int,
+    ) -> None:
+        base = server.jobs["job-1"]
+        server.jobs[job_id] = SimpleNamespace(
+            job=SimpleNamespace(
+                job_id=job_id,
+                share_target=base.job.share_target,
+                share_difficulty=base.job.share_difficulty,
+                transaction_hexes=(),
+            ),
+            template={
+                "previousblockhash": parent_hash,
+                "height": height,
+                "coinbasevalue": 50_00000000,
+            },
+            found_block={"network_difficulty": 1},
+            issued_at_ms=12345,
+            collection_only=False,
+            worker=base.worker,
+            shares_json=[],
+            prior_balances=[],
+        )
+
+    def test_blockwait_observed_acceptance_survives_stale_chain_probe(self) -> None:
+        # The 2026-07-25 mainnet interleaving, end to end: lost submitblock
+        # ack, blockwait reports the pool's own hash as the new tip, and the
+        # retry disposition reads a racing snapshot in which the tip moved on
+        # and the header probe cannot prove the candidate active. The
+        # candidate must defer (never terminally abandon), keep its landed
+        # payout preview, and finalize as submitted once the view settles --
+        # with no "qbit accepted direct" tail having run before the defer.
+        parent = "00" * 32
+        block_hash = "b1" * 32
+        racing_tip = "77" * 32
+        server, state, ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 2
+        server.stop_after_block = False
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+            rpc = LostAckSubmitRpc(
+                start_tip=parent,
+                hash_by_hex={"00": block_hash},
+            )
+            server.rpc = rpc
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+
+            # Attempt 1: submitblock lands the block but the ack is lost.
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+            self.assertEqual(rpc.submitblock_calls, 1)
+            self.assertIn(block_hash, server._accepted_block_payout_previews)
+            self.assertTrue(
+                server._accepted_block_payout_previews[block_hash].landed
+            )
+            candidate = self._retained_candidate(server)
+
+            # Blockwait sees the pool's own hash as the new tip. This is the
+            # only acceptance signal: no direct-submit ack ever arrived and
+            # the accepted success tail has not run.
+            self.assertTrue(server.observe_tip_for_refresh(block_hash))
+            self.assertIn(block_hash, server._tip_observed_accepted_block_hashes)
+            self.assertNotIn(block_hash, server._accounted_accepted_block_hashes)
+
+            # Attempt 2: the disposition reads a racing snapshot -- tip moved
+            # past the candidate and the header probe reports not-found. #89
+            # abandoned here; the observation evidence must defer instead.
+            rpc.racing_tip = racing_tip
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+            self.assertNotIn(
+                PRISM_REJECTION_STALE_JOB,
+                getattr(server, "block_candidate_abandoned_counts", {}),
+            )
+            self.assertEqual(abandoned, [])
+            self.assertEqual(server.block_candidate_accept_pending_defer_count, 1)
+            # The landed preview is preserved -- not withdrawn, not
+            # tombstoned -- so payout publication stays unfenced and the
+            # reconcile/template path stays unblocked.
+            self.assertIn(block_hash, server._accepted_block_payout_previews)
+            self.assertTrue(
+                server._accepted_block_payout_previews[block_hash].landed
+            )
+            self.assertNotIn(
+                block_hash,
+                server._invalidated_accepted_block_payout_previews,
+            )
+            self.assertFalse(server._payout_state_publication_blocked)
+            candidate = self._retained_candidate(server)
+
+            # Attempt 3: the chain view settles with the pool's own block as
+            # the tip; the resume path runs the full accepted success tail
+            # and finalizes the durable outbox as submitted.
+            rpc.racing_tip = None
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+
+            self.assertEqual(submitted, [block_hash])
+            self.assertEqual(abandoned, [])
+            self.assertEqual(rpc.submitblock_calls, 1)
+            self.assertIn(block_hash, server._accounted_accepted_block_hashes)
+            self.assertEqual(server.accepted_block_count, 1)
+            self.assertEqual(len(ledger.persisted), 1)
+            self.assertEqual(len(ledger.confirmed), 1)
+            self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+            self.assertNotIn(
+                block_hash,
+                server._invalidated_accepted_block_payout_previews,
+            )
+            self.assertFalse(server._payout_state_publication_blocked)
+            self.assertIsNone(
+                server._accepted_block_payout_transition_for_parent(
+                    block_hash,
+                    parent_height=10,
+                )
+            )
+            self.assertNotIn(
+                block_hash, server._outstanding_block_candidate_hashes
+            )
+            self.assertNotIn(
+                block_hash, server._tip_observed_accepted_block_hashes
+            )
+            self.assertIn(
+                "qbit_prism_block_candidate_accept_pending_defers_total 1",
+                server.metrics_payload(),
+            )
+
+    def test_three_blocks_quick_succession_lost_acks_finalize_all(self) -> None:
+        # Three pool blocks land back to back (the 20:58 / 21:06:58 /
+        # 21:07:20 pattern), every submitblock ack is lost, and one retry
+        # even reads a transient foreign-tip snapshot. All three candidates
+        # must finalize as submitted with payout publication unfenced.
+        parent = "00" * 32
+        hashes = ["b1" * 32, "b2" * 32, "b3" * 32]
+        block_hexes = ["0a", "0b", "0c"]
+        server, state, ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 5
+        server.stop_after_block = False
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+            rpc = LostAckSubmitRpc(
+                start_tip=parent,
+                hash_by_hex=dict(zip(block_hexes, hashes)),
+            )
+            server.rpc = rpc
+            parents = [parent, hashes[0], hashes[1]]
+            for index, (block_hash, block_hex) in enumerate(
+                zip(hashes, block_hexes)
+            ):
+                job_id = f"job-chain-{index}"
+                self._chained_context(
+                    server,
+                    job_id=job_id,
+                    parent_hash=parents[index],
+                    height=10 + index,
+                )
+                candidate = block_candidate(
+                    server,
+                    state,
+                    SimpleNamespace(
+                        coinbase_tx_hex="c0ffee",
+                        block_hash_hex=block_hash,
+                        block_hex=block_hex,
+                        share_pass=True,
+                        block_pass=True,
+                    ),
+                    job_id=job_id,
+                )
+
+                # Lost-ack landing.
+                self.assertTrue(
+                    server._submit_next_block_candidate_writer(candidate)
+                )
+                candidate = self._retained_candidate(server)
+                # Blockwait-first acceptance.
+                self.assertTrue(server.observe_tip_for_refresh(block_hash))
+
+                if index == 1:
+                    # One retry reads a transient foreign-tip snapshot in
+                    # which nothing can be proven active; it must defer.
+                    rpc.racing_tip = "77" * 32
+                    self.assertTrue(
+                        server._submit_next_block_candidate_writer(candidate)
+                    )
+                    self.assertEqual(abandoned, [])
+                    rpc.racing_tip = None
+                    candidate = self._retained_candidate(server)
+
+                # Settled view: the resume path finalizes as submitted.
+                self.assertTrue(
+                    server._submit_next_block_candidate_writer(candidate)
+                )
+                self.assertIn(
+                    block_hash, server._accounted_accepted_block_hashes
+                )
+
+            self.assertEqual(submitted, hashes)
+            self.assertEqual(abandoned, [])
+            self.assertEqual(server.accepted_block_count, 3)
+            self.assertEqual(
+                getattr(server, "block_candidate_abandoned_counts", {}),
+                {},
+            )
+            self.assertEqual(len(ledger.persisted), 3)
+            self.assertEqual(len(ledger.confirmed), 3)
+            self.assertFalse(server._payout_state_publication_blocked)
+            self.assertEqual(server._accepted_block_payout_previews, {})
+            self.assertEqual(
+                server._invalidated_accepted_block_payout_previews, {}
+            )
+            self.assertEqual(server._outstanding_block_candidate_hashes, set())
+            self.assertEqual(server._tip_observed_accepted_block_hashes, {})
+
+    def test_observed_window_expiry_keeps_genuinely_stale_abandon_terminal(self) -> None:
+        # A candidate that was once observed as the tip but has stayed off
+        # the active chain past the observation window is genuinely stale
+        # (permanently reorged out): the terminal abandon and its payout
+        # preview withdrawal must still happen.
+        parent = "00" * 32
+        block_hash = "d4" * 32
+        server, state, _ledger = submit_coordinator(tip=parent)
+        server.observed_tip_accept_window_seconds = 60.0
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+            rpc = LostAckSubmitRpc(
+                start_tip=parent,
+                hash_by_hex={"00": block_hash},
+            )
+            server.rpc = rpc
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+            candidate = self._retained_candidate(server)
+            self.assertTrue(server.observe_tip_for_refresh(block_hash))
+
+            # The chain moved on without the candidate and the observation
+            # aged out: the block was reorged away for good.
+            rpc.racing_tip = "77" * 32
+            rpc.active.pop(block_hash, None)
+            with server.lock:
+                server._tip_observed_accepted_block_hashes[block_hash] = (
+                    time.monotonic() - 61.0
+                )
+
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+
+            self.assertEqual(abandoned, [block_hash])
+            self.assertEqual(submitted, [])
+            self.assertEqual(
+                server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+                1,
+            )
+            self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+            self.assertNotIn(block_hash, server._accounted_accepted_block_hashes)
+
+    def test_block_candidate_acceptance_pending_probe_semantics(self) -> None:
+        block_hash = "e5" * 32
+        server, _state, _ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.observed_tip_accept_window_seconds = 60.0
+        server._register_outstanding_block_candidate(block_hash)
+
+        def observed(age_seconds: float | None) -> None:
+            with server.lock:
+                server._tip_observed_accepted_block_hashes.pop(block_hash, None)
+                if age_seconds is not None:
+                    server._tip_observed_accepted_block_hashes[block_hash] = (
+                        time.monotonic() - age_seconds
+                    )
+
+        # Own hash is the fresh best tip: accepted, and the probe itself
+        # registers the observation for later checks.
+        observed(None)
+        server.rpc = AcceptanceProbeRpc(tip=block_hash)
+        self.assertTrue(server._block_candidate_acceptance_pending(block_hash))
+        self.assertIn(block_hash, server._tip_observed_accepted_block_hashes)
+
+        # Active header at the expected height: accepted.
+        observed(None)
+        server.rpc = AcceptanceProbeRpc(
+            tip="11" * 32,
+            header={"height": 10, "confirmations": 2},
+        )
+        self.assertTrue(
+            server._block_candidate_acceptance_pending(
+                block_hash, expected_height=10
+            )
+        )
+
+        # Provably active at the wrong height: abandonable even when the
+        # hash was recently observed.
+        observed(1.0)
+        server.rpc = AcceptanceProbeRpc(
+            tip="11" * 32,
+            header={"height": 9, "confirmations": 2},
+        )
+        self.assertFalse(
+            server._block_candidate_acceptance_pending(
+                block_hash, expected_height=10
+            )
+        )
+
+        # Unprovable probe + fresh observation: accepted (defer).
+        observed(1.0)
+        server.rpc = AcceptanceProbeRpc(tip="11" * 32, header=None)
+        self.assertTrue(
+            server._block_candidate_acceptance_pending(
+                block_hash, expected_height=10
+            )
+        )
+
+        # Unprovable probe + expired observation: genuinely stale.
+        observed(61.0)
+        self.assertFalse(
+            server._block_candidate_acceptance_pending(
+                block_hash, expected_height=10
+            )
+        )
+
+        # Unprovable probe + no observation: genuinely stale.
+        observed(None)
+        self.assertFalse(
+            server._block_candidate_acceptance_pending(
+                block_hash, expected_height=10
+            )
+        )
+
+        # Probe failure + fresh observation: acceptance evidence wins.
+        observed(1.0)
+        server.rpc = AcceptanceProbeRpc(tip="11" * 32, fail=True)
+        self.assertTrue(
+            server._block_candidate_acceptance_pending(
+                block_hash, expected_height=10
+            )
+        )
+
+        # Probe failure + no observation: unchanged legacy behavior.
+        observed(None)
+        self.assertFalse(
+            server._block_candidate_acceptance_pending(
+                block_hash, expected_height=10
+            )
+        )
+
+    def test_pool_closed_gate_yields_to_on_chain_candidate(self) -> None:
+        # A candidate already on the active chain must complete its payout
+        # accounting even after the pool stops accepting new blocks; the
+        # pool-closed gate previously abandoned it terminally.
+        parent = "00" * 32
+        block_hash = "f6" * 32
+        server, state, ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 1
+        server.stop_after_block = False
+        server.accepted_block_count = 1
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+            rpc = LostAckSubmitRpc(
+                start_tip=parent,
+                hash_by_hex={"00": block_hash},
+            )
+            # The block is already active with the pool's own hash as tip
+            # (for example after a watchdog restart replayed the outbox).
+            rpc.tip = block_hash
+            rpc.height = 10
+            rpc.active[block_hash] = 10
+            server.rpc = rpc
+            server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+                lambda _tip: True
+            )
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+
+            self.assertEqual(submitted, [block_hash])
+            self.assertEqual(abandoned, [])
+            self.assertNotIn(
+                PRISM_REJECTION_POOL_CLOSED,
+                getattr(server, "block_candidate_abandoned_counts", {}),
+            )
+            self.assertIn(block_hash, server._accounted_accepted_block_hashes)
+            self.assertEqual(server.accepted_block_count, 2)
 
 
 if __name__ == "__main__":
