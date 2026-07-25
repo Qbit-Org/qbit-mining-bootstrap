@@ -223,7 +223,7 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_COORDINATION_BLOCKED_EXIT_SECONDS` | `900` | maximum continuous age of coordination-only template-refresh deferrals before the publication watchdog restarts the coordinator |
 | `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` | `15` | maximum monotonic age of a known tip/template/payout refresh before `/healthz` returns HTTP 503 |
 | `PRISM_INITIAL_JOB_MAX_WORKERS` | `4` | dedicated first-job delivery workers; raise under sustained reconnect churn so first notifies do not queue behind each other |
-| `PRISM_JOB_BUILD_EXECUTOR_WORKERS` | `2` | bounded shared job-build executor threads; raise only with spare cores because builds compete for the coordinator's GIL |
+| `PRISM_JOB_BUILD_EXECUTOR_WORKERS` | `2` | shared job-build executor threads; the scheduler admits at most two concurrent flights, so values above `2` are rejected — lower to `1` to serialize builds on constrained hosts |
 | `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | `15` | maximum monotonic age of the last coherent qbit tip/template poll before `/healthz` returns HTTP 503 |
 | `PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS` | `1` | minimum spacing (plus up to 25% jitter) between failed tip-refresh attempts while the observed tip is unchanged; success or a new tip re-arms immediately; set `0` for unspaced retries |
 | `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | after a tip flip, credits same-connection prior-tip shares until this long after that connection receives new-tip work (shares stay creditable while delivery is still pending); set `0` to reject all prior-tip shares |

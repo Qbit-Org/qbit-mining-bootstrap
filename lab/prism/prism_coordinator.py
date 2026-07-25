@@ -888,6 +888,23 @@ def canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_text(value).encode()).hexdigest()
 
 
+def validate_job_build_executor_workers(workers: int) -> int:
+    """Reject executor widths the build scheduler can never use.
+
+    The scheduler admits at most two concurrent build flights (one active,
+    one retiring); extra executor threads would never receive work, so a
+    higher setting would be a silent no-op rather than a tuning gain.
+    """
+    if workers <= 0:
+        raise SystemExit("PRISM_JOB_BUILD_EXECUTOR_WORKERS must be positive")
+    if workers > DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS:
+        raise SystemExit(
+            "PRISM_JOB_BUILD_EXECUTOR_WORKERS cannot exceed "
+            f"{DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS}"
+        )
+    return workers
+
+
 def _compact_share_payload(
     shares: list[dict[str, object]],
 ) -> tuple[list[tuple[str, str, str]], list[tuple[object, ...]]]:
@@ -2467,9 +2484,11 @@ class PrismCoordinator:
             "PRISM_INITIAL_JOB_MAX_WORKERS",
             DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
         )
-        self.job_build_executor_workers = env_positive_int(
-            "PRISM_JOB_BUILD_EXECUTOR_WORKERS",
-            DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
+        self.job_build_executor_workers = validate_job_build_executor_workers(
+            env_positive_int(
+                "PRISM_JOB_BUILD_EXECUTOR_WORKERS",
+                DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
+            )
         )
         if (
             self.stratum_max_connections > 0

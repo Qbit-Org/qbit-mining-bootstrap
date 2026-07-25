@@ -499,7 +499,7 @@ class WorkerKnobTests(unittest.TestCase):
     def test_metrics_render_configured_worker_knobs(self) -> None:
         server, _rpc = coordinator()
         server.initial_job_max_workers = 7
-        server.job_build_executor_workers = 5
+        server.job_build_executor_workers = 1
         initial_metrics = "\n".join(server.initial_delivery_metrics_lines())
         build_metrics = "\n".join(server.job_build_metrics_lines())
         self.assertIn(
@@ -507,19 +507,31 @@ class WorkerKnobTests(unittest.TestCase):
             initial_metrics,
         )
         self.assertIn(
-            "qbit_prism_job_build_configured_workers 5",
+            "qbit_prism_job_build_configured_workers 1",
             build_metrics,
         )
 
     def test_job_build_executor_honors_configured_workers(self) -> None:
         server, _rpc = coordinator()
-        server.job_build_executor_workers = 5
+        server.job_build_executor_workers = 1
         try:
             with server._job_build_scheduler_lock:
                 executor = server._job_build_executor_locked()
-            self.assertEqual(executor._max_workers, 5)
+            self.assertEqual(executor._max_workers, 1)
         finally:
             server.shutdown_job_build_executor()
+
+    def test_job_build_executor_workers_rejects_unusable_widths(self) -> None:
+        validate = prism_coordinator.validate_job_build_executor_workers
+        self.assertEqual(validate(1), 1)
+        self.assertEqual(
+            validate(DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS),
+            DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
+        )
+        with self.assertRaisesRegex(SystemExit, "cannot exceed"):
+            validate(DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS + 1)
+        with self.assertRaisesRegex(SystemExit, "positive"):
+            validate(0)
 
     def test_initial_job_executor_honors_configured_workers(self) -> None:
         server, _rpc = coordinator()
