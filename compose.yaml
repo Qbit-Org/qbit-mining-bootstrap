@@ -440,6 +440,17 @@ services:
       nofile:
         soft: ${PRISM_COORDINATOR_NOFILE_SOFT:-65536}
         hard: ${PRISM_COORDINATOR_NOFILE_HARD:-524288}
+      # Unlimited core dumps for native-crash forensics. Where the dump lands
+      # is decided by the *host's* /proc/sys/kernel/core_pattern (it is not
+      # namespaced): a relative pattern such as "core" writes into the crashed
+      # process's cwd inside the container — /app for this image — and, with
+      # restart: on-failure reusing the same container, survives the restart;
+      # retrieve it with `docker cp <container>:/app/core`. A pipe pattern
+      # (e.g. |systemd-coredump or apport) delivers the dump to that handler
+      # on the host instead — look it up there with `coredumpctl`.
+      core:
+        soft: -1
+        hard: -1
     build:
       context: .
       dockerfile: lab/prism/Dockerfile

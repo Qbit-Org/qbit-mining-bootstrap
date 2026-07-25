@@ -10,6 +10,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 import dataclasses
 import errno
+import faulthandler
 from functools import wraps
 import hashlib
 import heapq
@@ -20081,6 +20082,13 @@ def scaled_target_difficulty(target: int) -> int:
 
 
 def main() -> int:
+    # A native fault (SIGSEGV/SIGABRT/SIGBUS/SIGFPE) otherwise kills the
+    # process with zero Python-side output; enable unconditionally so the
+    # tracebacks of every thread reach stderr even when PYTHONFAULTHANDLER
+    # is unset in the deployment environment. SIGUSR2 gives an on-demand
+    # all-thread dump for live triage without disturbing the process.
+    faulthandler.enable(all_threads=True)
+    faulthandler.register(signal.SIGUSR2, all_threads=True)
     coordinator = PrismCoordinator()
 
     def _request_shutdown(signum: int, _frame: Any) -> None:
