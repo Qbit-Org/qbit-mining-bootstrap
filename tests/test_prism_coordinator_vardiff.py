@@ -11498,6 +11498,137 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             server._invalidated_accepted_block_payout_previews,
         )
 
+    def test_replay_restores_acceptance_evidence_from_durable_block_state(self) -> None:
+        # Codex round 5: the observation registry dies with the process. A
+        # durable prepared/confirmed pool-block row proves a prior process's
+        # submitblock succeeded, so startup replay must restore acceptance
+        # evidence before a replay disposition can race a transient fork
+        # view and terminally abandon the accepted block.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        accepted_hash = "e7" * 32
+        unproven_hash = "e8" * 32
+        for index, block_hash in enumerate((accepted_hash, unproven_hash), start=1):
+            pending = PendingShare(
+                share_id=f"miner-a:{block_hash}",
+                miner_id="miner-a",
+                order_key="miner-a",
+                p2mr_program_hex="11" * 32,
+                share_difficulty=1,
+                network_difficulty=1,
+                template_height=9,
+                job_id="job-1",
+                job_issued_at_ms=1,
+                accepted_at_ms=index,
+                ntime=1,
+            )
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="00",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+                pending_share=pending,
+            )
+            ledger.append_batch(
+                [(pending, server.block_candidate_intent(candidate))]
+            )
+        ledger.pool_block_state = (  # type: ignore[attr-defined]
+            lambda *, block_hash: (
+                {"chain_state": "prepared", "maturity_state": "immature"}
+                if block_hash == accepted_hash
+                else None
+            )
+        )
+
+        self.assertEqual(server.replay_pending_block_candidates(), 2)
+
+        self.assertIn(accepted_hash, server._tip_observed_accepted_block_hashes)
+        self.assertIn(accepted_hash, server._outstanding_block_candidate_hashes)
+        # No durable acceptance proof: replays without synthetic evidence.
+        self.assertNotIn(
+            unproven_hash, server._tip_observed_accepted_block_hashes
+        )
+
+    def test_late_defer_republishes_withdrawn_preview_and_unfences(self) -> None:
+        # Bugbot round 5: when the withdrawal's own publication loses its
+        # race, delivery is fenced before the late-acceptance defer runs.
+        # The defer must republish the withdrawn preview so admission
+        # reopens immediately instead of staying coordination-blocked
+        # across the deferral cycles.
+        block_hash = "ba" * 32
+        server, _state, _ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server._register_outstanding_block_candidate(block_hash)
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        server._publish_accepted_block_payout_preview(block_hash, [])
+        self.assertFalse(server._payout_state_publication_blocked)
+        server.rpc = AcceptanceProbeRpc(tip="11" * 32, header=None)
+
+        real_publish = server._publish_payout_state_candidate
+
+        def withdrawal_publication_lost(candidate: object) -> object:
+            if getattr(candidate, "accepted_block_withdrawal", False):
+                return None
+            return real_publish(candidate)
+
+        server._publish_payout_state_candidate = withdrawal_publication_lost  # type: ignore[method-assign]
+        real_clear = server._clear_accepted_block_payout_preview
+
+        def observing_clear(
+            hash_arg: str,
+            *,
+            invalidate_published: bool = False,
+        ) -> None:
+            if invalidate_published:
+                with server.lock:
+                    server._tip_observed_accepted_block_hashes[block_hash] = (
+                        time.monotonic()
+                    )
+            return real_clear(
+                hash_arg,
+                invalidate_published=invalidate_published,
+            )
+
+        server._clear_accepted_block_payout_preview = observing_clear  # type: ignore[method-assign]
+
+        accepted_race_won = server._abandon_block_candidate(
+            PRISM_REJECTION_STALE_JOB,
+            "tip moved before submit: test",
+            block_hash=block_hash,
+            worker=None,
+            preserve_if_accepted=True,
+            expected_height=10,
+        )
+
+        self.assertFalse(accepted_race_won)
+        outcome = getattr(server, "_block_candidate_outcome", None)
+        self.assertEqual(
+            getattr(outcome, "reason", None),
+            PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
+        )
+        # The barrier is restored AND publication admission reopened: the
+        # withdrawn preview was republished despite the withdrawal's own
+        # publication loss having fenced delivery.
+        self.assertIn(block_hash, server._accepted_block_payout_previews)
+        self.assertTrue(
+            server._accepted_block_payout_previews[block_hash].landed
+        )
+        self.assertIsNotNone(
+            server._accepted_block_payout_previews[block_hash].preview
+        )
+        self.assertNotIn(
+            block_hash,
+            server._invalidated_accepted_block_payout_previews,
+        )
+        self.assertFalse(server._payout_state_publication_blocked)
+
     def test_terminal_seal_excludes_observations_after_the_commit(self) -> None:
         # Codex round 3: acceptance evidence arriving after the terminal
         # commit but before the follow-up durable rejection must be excluded

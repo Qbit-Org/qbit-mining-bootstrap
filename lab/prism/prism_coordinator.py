@@ -16648,6 +16648,36 @@ class PrismCoordinator:
                     durable_block_hash,
                     block_height=int(intent["expected_height"]),
                 )
+                # A durable prepared/confirmed pool-block row proves a prior
+                # process's submitblock succeeded. Restore the acceptance
+                # evidence that died with that process's memory (the
+                # observation window restarts at replay time), so a replay
+                # probe racing a transient fork view cannot terminally
+                # abandon the accepted block before blockwait re-observes it.
+                block_state = None
+                try:
+                    state_reader = getattr(self.ledger, "pool_block_state", None)
+                    if callable(state_reader):
+                        block_state = state_reader(block_hash=durable_block_hash)
+                except Exception:
+                    traceback.print_exc()
+                    block_state = None
+                if block_state is not None and str(
+                    block_state.get("chain_state", "")
+                ) in {"prepared", "confirmed"}:
+                    self._register_outstanding_block_candidate(
+                        durable_block_hash
+                    )
+                    with self.lock:
+                        self._tip_observed_accepted_block_hashes[
+                            durable_block_hash
+                        ] = time.monotonic()
+                    print(
+                        "prism coordinator: restored acceptance evidence for "
+                        f"replayed block candidate hash={durable_block_hash} "
+                        f"chain_state={block_state.get('chain_state')}",
+                        flush=True,
+                    )
                 if self.enqueue_block_candidate(candidate):
                     queued += 1
             except Exception:
@@ -17355,6 +17385,12 @@ class PrismCoordinator:
         # Own the cleanup invariant here rather than relying on every caller to
         # remember it. Invalidation can block behind another candidate pass;
         # recheck the accepted record afterward before committing abandonment.
+        # Capture the transition first: if late acceptance evidence forces a
+        # defer below, its published preview must be restorable.
+        with self._accepted_block_payout_preview_condition:
+            withdrawn_transition = self._accepted_block_payout_previews.get(
+                block_hash.lower()
+            )
         self._clear_accepted_block_payout_preview(
             block_hash,
             invalidate_published=True,
@@ -17417,6 +17453,30 @@ class PrismCoordinator:
                     block_hash,
                     block_height=expected_height,
                 )
+            if (
+                withdrawn_transition is not None
+                and withdrawn_transition.preview is not None
+            ):
+                # The withdrawal superseded payout publication and, on a
+                # lost publication race, left delivery fenced. Republish the
+                # withdrawn preview now so admission reopens with the defer
+                # rather than staying coordination-blocked across the
+                # deferral cycles until the accepted tail republishes it.
+                try:
+                    self._publish_accepted_block_payout_preview(
+                        block_hash,
+                        self._materialize_prior_balance_preview(
+                            withdrawn_transition.preview
+                        ),
+                    )
+                except Exception:
+                    print(
+                        "prism coordinator: could not republish withdrawn "
+                        f"payout preview hash={block_hash}; the scheduled "
+                        "refresh will retry publication",
+                        flush=True,
+                    )
+                    traceback.print_exc()
             self._count_accept_pending_defer()
             self._defer_block_candidate(
                 PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
