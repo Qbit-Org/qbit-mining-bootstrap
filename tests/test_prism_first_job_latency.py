@@ -521,6 +521,15 @@ class WorkerKnobTests(unittest.TestCase):
         finally:
             server.shutdown_job_build_executor()
 
+    def test_initial_job_workers_reject_widths_past_pending_bound(self) -> None:
+        validate = prism_coordinator.validate_initial_job_max_workers
+        self.assertEqual(validate(4, 128), 4)
+        self.assertEqual(validate(128, 128), 128)
+        with self.assertRaisesRegex(SystemExit, "cannot exceed"):
+            validate(129, 128)
+        with self.assertRaisesRegex(SystemExit, "positive"):
+            validate(0, 128)
+
     def test_job_build_executor_workers_rejects_unusable_widths(self) -> None:
         validate = prism_coordinator.validate_job_build_executor_workers
         self.assertEqual(validate(1), 1)

@@ -888,6 +888,24 @@ def canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_text(value).encode()).hexdigest()
 
 
+def validate_initial_job_max_workers(workers: int, max_pending: int) -> int:
+    """Reject first-job worker counts the pending-client bound cannot feed.
+
+    The dedicated executor's queue is bounded by
+    PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS, so workers beyond that count can
+    never receive a task; unbounded values would also risk partially failed
+    thread creation on constrained hosts.
+    """
+    if workers <= 0:
+        raise SystemExit("PRISM_INITIAL_JOB_MAX_WORKERS must be positive")
+    if workers > max_pending:
+        raise SystemExit(
+            "PRISM_INITIAL_JOB_MAX_WORKERS cannot exceed "
+            "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS"
+        )
+    return workers
+
+
 def validate_job_build_executor_workers(workers: int) -> int:
     """Reject executor widths the build scheduler can never use.
 
@@ -2480,9 +2498,12 @@ class PrismCoordinator:
             "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
             DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
         )
-        self.initial_job_max_workers = env_positive_int(
-            "PRISM_INITIAL_JOB_MAX_WORKERS",
-            DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
+        self.initial_job_max_workers = validate_initial_job_max_workers(
+            env_positive_int(
+                "PRISM_INITIAL_JOB_MAX_WORKERS",
+                DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
+            ),
+            self.stratum_max_pending_initial_jobs,
         )
         self.job_build_executor_workers = validate_job_build_executor_workers(
             env_positive_int(
