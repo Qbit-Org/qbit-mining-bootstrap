@@ -122,9 +122,13 @@ DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
 DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
 DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS = 4
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
+# Cancellation-check slice while an initial request rides a subscribed
+# publication-priority build promise. Promise completion wakes the waiter
+# immediately; this only bounds how stale a cancellation can go unnoticed.
+PRISM_INITIAL_JOB_SUBSCRIBE_POLL_SECONDS = 0.25
 DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS = 60.0
 DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS = 0.25
-PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
+DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 PRISM_VARDIFF_IDLE_RETARGET_MAX_WORKERS = 2
 MAX_PENDING_VARDIFF_IDLE_RETARGETS = 8
@@ -240,8 +244,11 @@ PRISM_TIP_REFRESH_CANCELLATION_STAGES = (
     "client_lock",
     "payout_gate",
 )
-PRISM_DELIVERY_PRIORITY_NEW_TIP = 0
-PRISM_DELIVERY_PRIORITY_INITIAL = 1
+# Never-served clients outrank the fleet's tip-refresh wave: a client with no
+# active job is producing nothing until its first notify, while a client with
+# stale-tip work keeps mining (stale-grace credits it) for the wave's duration.
+PRISM_DELIVERY_PRIORITY_INITIAL = 0
+PRISM_DELIVERY_PRIORITY_NEW_TIP = 1
 PRISM_DELIVERY_PRIORITY_SAME_TIP = 2
 PRISM_PROGRESS_HEALTH_REASONS = (
     "tip_poll_stale",
@@ -882,6 +889,90 @@ def canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_text(value).encode()).hexdigest()
 
 
+def validate_initial_job_max_workers(workers: int, max_pending: int) -> int:
+    """Reject first-job worker counts the pending-client bound cannot feed.
+
+    The dedicated executor's queue is bounded by
+    PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS, so workers beyond that count can
+    never receive a task; unbounded values would also risk partially failed
+    thread creation on constrained hosts.
+    """
+    if workers <= 0:
+        raise SystemExit("PRISM_INITIAL_JOB_MAX_WORKERS must be positive")
+    if workers > max_pending:
+        raise SystemExit(
+            "PRISM_INITIAL_JOB_MAX_WORKERS cannot exceed "
+            "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS"
+        )
+    return workers
+
+
+def resolve_initial_job_max_workers(
+    explicit: int | None,
+    max_pending: int,
+) -> int:
+    """Resolve the first-job worker count against the pending-client bound.
+
+    Deployments that bound pending clients below the default worker count
+    were valid before the worker knob existed; the implicit default must cap
+    itself to the pending bound rather than fail their startup. An explicit
+    setting keeps strict validation.
+    """
+    if explicit is None:
+        return min(DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS, int(max_pending))
+    return validate_initial_job_max_workers(explicit, max_pending)
+
+
+def validate_job_build_executor_workers(workers: int) -> int:
+    """Reject executor widths the build scheduler can never use.
+
+    The scheduler admits at most two concurrent build flights (one active,
+    one retiring); extra executor threads would never receive work, so a
+    higher setting would be a silent no-op rather than a tuning gain.
+    """
+    if workers <= 0:
+        raise SystemExit("PRISM_JOB_BUILD_EXECUTOR_WORKERS must be positive")
+    if workers > DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS:
+        raise SystemExit(
+            "PRISM_JOB_BUILD_EXECUTOR_WORKERS cannot exceed "
+            f"{DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS}"
+        )
+    return workers
+
+
+def _compact_share_payload(
+    shares: list[dict[str, object]],
+) -> tuple[list[tuple[str, str, str]], list[tuple[object, ...]]]:
+    """Deduplicate share identities into the audit-builder compact form."""
+
+    identity_indexes: dict[tuple[str, str, str], int] = {}
+    identities: list[tuple[str, str, str]] = []
+    compact_shares: list[tuple[object, ...]] = []
+    for share in shares:
+        identity = (
+            str(share["miner_id"]),
+            str(share["order_key"]),
+            str(share["p2mr_program_hex"]),
+        )
+        identity_index = identity_indexes.get(identity)
+        if identity_index is None:
+            identity_index = len(identities)
+            identity_indexes[identity] = identity_index
+            identities.append(identity)
+        compact_shares.append(
+            (
+                share["share_seq"],
+                share["share_id"],
+                identity_index,
+                share["share_difficulty"],
+                share["job_issued_at_ms"],
+                share["accepted_at_ms"],
+                share.get("credit_policy"),
+            )
+        )
+    return identities, compact_shares
+
+
 class JsonRpc:
     def __init__(self, *, host: str, port: int, user: str, password: str):
         self.host = host
@@ -1299,6 +1390,61 @@ class PayoutLedgerArtifact:
     # replaying qbit_audit_share_window at the declared anchor must reproduce
     # exactly these shares, which only holds at the snapshot's own anchor.
     snapshot_anchor_ms: int | None = None
+
+
+@dataclass
+class _ShareWindowSerialization:
+    """Derived share-window forms cached per payout generation.
+
+    For a fixed (payout state generation, ledger artifact generation, window)
+    the serialized share window is immutable: its canonical digest and the
+    audit-builder compact payload fragments are pure functions of the
+    artifact's share snapshot. Recomputing them inside every template-bump
+    build serialized the whole window under the GIL each time. The compact
+    fragments are derived lazily by the first audit-builder invocation --
+    embedders that replace the builder never require the compact schema.
+    """
+
+    key: tuple[int, int, int]
+    share_count: int
+    share_snapshot_sha256: str
+    _compact_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+    )
+    _compact_share_identities_json: str | None = field(
+        default=None,
+        repr=False,
+    )
+    _compact_shares_json: str | None = field(default=None, repr=False)
+
+    def compact_fragments(
+        self,
+        shares: list[dict[str, object]],
+    ) -> tuple[str, str]:
+        """Encoded compact fragments, computed once per generation.
+
+        Concurrent builders block here instead of duplicating the encode; the
+        window is immutable for this key, so first-writer-wins is exact.
+        """
+        with self._compact_lock:
+            if (
+                self._compact_share_identities_json is None
+                or self._compact_shares_json is None
+            ):
+                identities, compact_shares = _compact_share_payload(shares)
+                self._compact_share_identities_json = json.dumps(
+                    identities,
+                    separators=(",", ":"),
+                )
+                self._compact_shares_json = json.dumps(
+                    compact_shares,
+                    separators=(",", ":"),
+                )
+            return (
+                self._compact_share_identities_json,
+                self._compact_shares_json,
+            )
 
 
 @dataclass
@@ -2369,7 +2515,16 @@ class PrismCoordinator:
             "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS",
             DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
         )
-        self.initial_job_max_workers = DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS
+        self.initial_job_max_workers = resolve_initial_job_max_workers(
+            env_optional_positive_int("PRISM_INITIAL_JOB_MAX_WORKERS"),
+            self.stratum_max_pending_initial_jobs,
+        )
+        self.job_build_executor_workers = validate_job_build_executor_workers(
+            env_positive_int(
+                "PRISM_JOB_BUILD_EXECUTOR_WORKERS",
+                DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
+            )
+        )
         if (
             self.stratum_max_connections > 0
             and self.stratum_max_pending_initial_jobs > self.stratum_max_connections
@@ -3330,7 +3485,12 @@ class PrismCoordinator:
         if not hasattr(self, "initial_job_prepared_work_counts"):
             self.initial_job_prepared_work_counts = {
                 result: 0
-                for result in ("cache_hit", "singleflight", "deferred")
+                for result in (
+                    "cache_hit",
+                    "singleflight",
+                    "deferred",
+                    "subscribed",
+                )
             }
         if not hasattr(self, "job_build_cancellation_seconds"):
             self.job_build_cancellation_seconds = {
@@ -3359,6 +3519,12 @@ class PrismCoordinator:
             self._health_refresh_loop_running = False
         if not hasattr(self, "health_snapshot_refresh_failure_count"):
             self.health_snapshot_refresh_failure_count = 0
+        if not hasattr(self, "_share_window_serialization_lock"):
+            self._share_window_serialization_lock = threading.Lock()
+        if not hasattr(self, "_share_window_serialization"):
+            self._share_window_serialization: (
+                _ShareWindowSerialization | None
+            ) = None
         if not hasattr(self, "_bundle_preparation_lock"):
             self._bundle_preparation_lock = threading.Lock()
         if not hasattr(self, "_bundle_preparation_flights"):
@@ -3795,7 +3961,13 @@ class PrismCoordinator:
         executor = self._job_build_executor
         if executor is None:
             executor = ThreadPoolExecutor(
-                max_workers=PRISM_JOB_BUILD_EXECUTOR_WORKERS,
+                max_workers=int(
+                    getattr(
+                        self,
+                        "job_build_executor_workers",
+                        DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
+                    )
+                ),
                 thread_name_prefix="prism-job-build",
             )
             self._job_build_executor = executor
@@ -4004,12 +4176,22 @@ class PrismCoordinator:
         *,
         request_source: str,
         cancelled: Callable[[], bool] | None,
-    ) -> tuple[int, _JobBuildCancellation]:
-        """Atomically admit cancellable routine request construction."""
+    ) -> tuple[int, _JobBuildCancellation, CachedJobBundle | None]:
+        """Atomically admit cancellable routine request construction.
+
+        Initial requests do not poll out the publication-priority window:
+        they subscribe to the in-flight priority build's promise, wake when
+        it completes, and hand its bundle back to the caller. Riding the
+        result that displaced them replaces the old defer-then-rebuild cycle
+        (and its wakeup storm) with one shared build.
+        """
 
         deferred_recorded = False
+        subscription_recorded = False
+        subscribed_bundle: CachedJobBundle | None = None
         while True:
             self._job_build_priority_changed.clear()
+            priority_promises: tuple[Future[CachedJobBundle], ...] = ()
             with self._job_build_scheduler_lock:
                 if not self._publication_priority_scheduled_locked():
                     self._job_build_routine_preparation_sequence += 1
@@ -4045,12 +4227,19 @@ class PrismCoordinator:
                         preparation_cancellation,
                         remove_dead_preparation,
                     )
-                    return token, preparation_cancellation
+                    return token, preparation_cancellation, subscribed_bundle
                 if not deferred_recorded:
                     self.job_build_priority_counts["routine_deferred"] += 1
                     if request_source == "initial":
                         self._record_initial_prepared_work_locked("deferred")
                     deferred_recorded = True
+                if request_source == "initial":
+                    priority_promises = (
+                        self._publication_priority_promises_locked()
+                    )
+                    if priority_promises and not subscription_recorded:
+                        self._record_initial_prepared_work_locked("subscribed")
+                        subscription_recorded = True
             if cancelled is not None and cancelled():
                 raise _JobBuildCancelled(
                     "job bundle request was cancelled behind publication priority"
@@ -4060,7 +4249,64 @@ class PrismCoordinator:
                 raise _JobBuildCancelled(
                     "coordinator stopped behind publication priority"
                 )
-            self._job_build_priority_changed.wait(0.05)
+            if priority_promises:
+                for promise in priority_promises:
+                    if (
+                        promise.done()
+                        and not promise.cancelled()
+                        and promise.exception() is None
+                    ):
+                        subscribed_bundle = promise.result()
+                pending_promises = tuple(
+                    promise
+                    for promise in priority_promises
+                    if not promise.done()
+                )
+                if pending_promises:
+                    done, _pending = wait(
+                        pending_promises,
+                        timeout=PRISM_INITIAL_JOB_SUBSCRIBE_POLL_SECONDS,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for completed in done:
+                        if (
+                            completed.cancelled()
+                            or completed.exception() is not None
+                        ):
+                            continue
+                        subscribed_bundle = completed.result()
+                else:
+                    # Every live priority promise has resolved; the scheduler
+                    # is about to sweep the finished flights. Waiting on the
+                    # event instead of the done promises avoids a hot loop.
+                    self._job_build_priority_changed.wait(0.05)
+            else:
+                # Reservation-only window: the priority request object (and
+                # its promise) does not exist yet. This window only spans
+                # immutable request construction, never the build itself.
+                self._job_build_priority_changed.wait(0.05)
+
+    def _publication_priority_promises_locked(
+        self,
+    ) -> tuple[Future[CachedJobBundle], ...]:
+        """Promises of live publication-critical build requests."""
+
+        promises: list[Future[CachedJobBundle]] = []
+        pending = self._job_build_pending
+        if (
+            pending is not None
+            and not pending.cancellation.is_set()
+            and self._job_build_is_publication_critical(pending)
+        ):
+            promises.append(pending.promise)
+        for flight in (self._job_build_active, self._job_build_retiring):
+            if (
+                flight is not None
+                and not flight.request.cancellation.is_set()
+                and self._job_build_is_publication_critical(flight.request)
+            ):
+                promises.append(flight.request.promise)
+        return tuple(promises)
 
     def _finish_routine_job_build_preparation(self, token: int) -> None:
         with self._job_build_scheduler_lock:
@@ -6407,6 +6653,53 @@ class PrismCoordinator:
                 self._job_bundle_cache.pop(oldest_key, None)
             return True
 
+    def _probe_initial_job_bundle(
+        self,
+        artifacts: CachedTemplateArtifacts,
+        worker: WorkerIdentity | None,
+        mode: str | None,
+    ) -> CachedJobBundle | None:
+        """Serve an initial request straight from the bundle cache.
+
+        Routine admission exists to keep CPU-heavy request construction from
+        competing with a publication-critical build; a cache probe does none
+        of that work. Probing before admission lets a first job ship the
+        already-published bundle immediately instead of waiting out an entire
+        priority build it would never have contended with.
+        """
+        resolved_mode = self._job_bundle_mode(mode)
+        if resolved_mode == "collection" and worker is None:
+            raise CollectionIdentityUnavailable(
+                "collection-mode worker identity is temporarily unavailable"
+            )
+        with self._job_cache_lock:
+            payout_state_generation = self._payout_state_generation
+        payout_artifact = (
+            self._usable_payout_ledger_artifact(
+                payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            if resolved_mode == "ready"
+            else None
+        )
+        key = self._job_bundle_key(
+            artifacts,
+            mode=resolved_mode,
+            payout_state_generation=payout_state_generation,
+            payout_artifact_generation=(
+                payout_artifact.generation if payout_artifact is not None else 0
+            ),
+            worker=worker,
+        )
+        cached = self._lookup_job_bundle(key)
+        if not self._job_bundle_entry_usable(cached, artifacts):
+            return None
+        self._record_job_cache_event("bundle", hit=True)
+        with self._job_build_scheduler_lock:
+            self.initial_job_prepared_work_counts["cache_hit"] += 1
+        assert cached is not None
+        return self._bind_cached_bundle_to_artifacts(cached, artifacts)
+
     def shared_job_bundle(
         self,
         artifacts: CachedTemplateArtifacts,
@@ -6470,10 +6763,20 @@ class PrismCoordinator:
         while True:
             routine_preparation_token: int | None = None
             preparation_cancellation: _JobBuildCancellation | None = None
+            subscribed_bundle: CachedJobBundle | None = None
             if not publication_critical:
+                if request_source == "initial":
+                    probed = self._probe_initial_job_bundle(
+                        artifacts,
+                        worker,
+                        mode,
+                    )
+                    if probed is not None:
+                        return probed
                 (
                     routine_preparation_token,
                     preparation_cancellation,
+                    subscribed_bundle,
                 ) = self._begin_routine_job_build_preparation(
                     request_source=request_source,
                     cancelled=cancelled,
@@ -6512,6 +6815,15 @@ class PrismCoordinator:
                 worker=worker,
             )
             cached = self._lookup_job_bundle(key)
+            if (
+                cached is None
+                and subscribed_bundle is not None
+                and subscribed_bundle.key == key
+            ):
+                # The subscribed priority result may not have won the global
+                # cache-publication race yet; consume it directly. Usability
+                # below applies exactly the checks a cache entry would face.
+                cached = subscribed_bundle
             if self._job_bundle_entry_usable(cached, artifacts):
                 if preparation_cancellation is not None:
                     preparation_cancellation.raise_if_cancelled(
@@ -6674,6 +6986,53 @@ class PrismCoordinator:
                 )
             return built
 
+    def _share_window_serialization_for_artifact(
+        self,
+        payout_artifact: PayoutLedgerArtifact,
+        shares: list[dict[str, object]],
+    ) -> _ShareWindowSerialization:
+        """Cached digest and builder fragments for the artifact's share window.
+
+        Single-slot cache keyed by (payout state generation, artifact
+        generation, window weight): the window only changes when a payout
+        generation or its prepared artifact does, while builds recur on every
+        template bump. The compute deliberately takes no cancellation
+        checkpoints -- the result outlives any one requester and is served to
+        whichever build wins next.
+        """
+        self._ensure_job_cache_state()
+        window_weight = (
+            PRISM_REWARD_WINDOW_MULTIPLIER
+            * PRISM_SNAPSHOT_WINDOW_MARGIN
+            * int(payout_artifact.network_difficulty)
+        )
+        key = (
+            int(payout_artifact.payout_state_generation),
+            int(payout_artifact.generation),
+            window_weight,
+        )
+        # The digest is computed under the slot lock on purpose: the two
+        # bounded build flights can request the same window concurrently, and
+        # letting both walk the share tree would duplicate exactly the
+        # GIL-heavy pass this cache removes. The loser waits briefly and
+        # reuses the winner's entry; a different-key waiter is serialized
+        # behind at most one O(window) pass.
+        with self._share_window_serialization_lock:
+            cached = self._share_window_serialization
+            if (
+                cached is not None
+                and cached.key == key
+                and cached.share_count == len(shares)
+            ):
+                return cached
+            serialization = _ShareWindowSerialization(
+                key=key,
+                share_count=len(shares),
+                share_snapshot_sha256=canonical_json_sha256(shares),
+            )
+            self._share_window_serialization = serialization
+            return serialization
+
     def build_shared_job_bundle(
         self,
         artifacts: CachedTemplateArtifacts,
@@ -6823,7 +7182,15 @@ class PrismCoordinator:
                 "ledger_snapshot",
                 ledger_elapsed,
             )
-        share_snapshot_sha256 = canonical_json_sha256(shares)
+        share_serialization: _ShareWindowSerialization | None = None
+        if resolved_mode == "ready" and payout_artifact is not None:
+            share_serialization = self._share_window_serialization_for_artifact(
+                payout_artifact,
+                shares,
+            )
+            share_snapshot_sha256 = share_serialization.share_snapshot_sha256
+        else:
+            share_snapshot_sha256 = canonical_json_sha256(shares)
         final_build_key = dataclass_replace(
             build_request.key,
             share_snapshot_sha256=share_snapshot_sha256,
@@ -6866,6 +7233,7 @@ class PrismCoordinator:
                         else None
                     ),
                     cancellation=cancellation,
+                    share_serialization=share_serialization,
                 )
                 collection_only = False
             else:
@@ -8266,8 +8634,16 @@ class PrismCoordinator:
                     generation=bundle.payout_state_generation,
                     fallback_wait_seconds=time.monotonic() - gate_started,
                 )
-                if not admitted or cancelled():
+                if cancelled():
                     return False
+                if not admitted:
+                    # Non-admission with a bundle in hand is transient gate
+                    # state: a payout invalidation pending publication, or
+                    # this bundle's generation going stale while waiting.
+                    # Rebuild and retry within the request deadline; treating
+                    # it as terminal turned every unlucky join during a payout
+                    # publication into a disconnect-reconnect-rebuild loop.
+                    return None
                 with self._job_cache_lock:
                     payout_current = (
                         bundle.payout_state_generation == self._payout_state_generation
@@ -10354,6 +10730,13 @@ class PrismCoordinator:
                     client: client.active_job
                     for client in clients
                 }
+        # Bounded submission admits at most max_inflight tasks at a time, so
+        # queue priority alone cannot lift a never-served client over a fleet
+        # wave that has not been submitted yet. Order admission itself.
+        clients = sorted(
+            clients,
+            key=lambda ordered: expected_active_jobs.get(ordered) is not None,
+        )
         clients_iter = iter(clients)
         max_inflight = max(1, int(self.tip_refresh_max_workers))
 
@@ -13955,6 +14338,7 @@ class PrismCoordinator:
         payout_policy: dict[str, object] | None = None,
         ctv_settlement: dict[str, object] | None = None,
         cancellation: _JobBuildCancellation | None = None,
+        share_serialization: _ShareWindowSerialization | None = None,
     ) -> dict[str, Any]:
         self._ensure_job_cache_state()
         self._ensure_tip_refresh_state()
@@ -13975,35 +14359,21 @@ class PrismCoordinator:
         record_phase_metrics = bool(
             getattr(job_build_phase_local, "tip_refresh_metrics", False)
         )
+        precomposed: tuple[str, str] | None = None
         if summary_only:
             artifact_started = time.monotonic()
-            identity_indexes: dict[tuple[str, str, str], int] = {}
-            identities: list[tuple[str, str, str]] = []
-            compact_shares: list[tuple[object, ...]] = []
-            for share in shares:
-                identity = (
-                    str(share["miner_id"]),
-                    str(share["order_key"]),
-                    str(share["p2mr_program_hex"]),
-                )
-                identity_index = identity_indexes.get(identity)
-                if identity_index is None:
-                    identity_index = len(identities)
-                    identity_indexes[identity] = identity_index
-                    identities.append(identity)
-                compact_shares.append(
-                    (
-                        share["share_seq"],
-                        share["share_id"],
-                        identity_index,
-                        share["share_difficulty"],
-                        share["job_issued_at_ms"],
-                        share["accepted_at_ms"],
-                        share.get("credit_policy"),
-                    )
-                )
-            payload["compact_share_identities"] = identities
-            payload["compact_shares"] = compact_shares
+            if (
+                share_serialization is not None
+                and share_serialization.share_count == len(shares)
+            ):
+                # The compact conversion and its encoded fragments are pure
+                # per-generation functions of the share window; reuse the
+                # cached strings instead of re-walking the window.
+                precomposed = share_serialization.compact_fragments(shares)
+            else:
+                identities, compact_shares = _compact_share_payload(shares)
+                payload["compact_share_identities"] = identities
+                payload["compact_shares"] = compact_shares
             if record_phase_metrics:
                 self._observe_tip_refresh_build_phase(
                     "serialization_copy",
@@ -14148,13 +14518,28 @@ class PrismCoordinator:
 
                 serialization_started = time.monotonic()
                 try:
-                    # iterencode writes bounded fragments to the child instead
-                    # of allocating a second full JSON representation in Python.
-                    json.dump(
-                        payload,
-                        _CancelableInput(process.stdin),
-                        separators=(",", ":"),
-                    )
+                    sink = _CancelableInput(process.stdin)
+                    if precomposed is not None:
+                        # Per-build fields are encoded fresh; the dominant
+                        # share-window fragments are the cached per-generation
+                        # strings, piped without re-encoding the share tree.
+                        identities_json, compact_shares_json = precomposed
+                        prefix = json.dumps(payload, separators=(",", ":"))
+                        sink.write(prefix[:-1])
+                        sink.write(',"compact_share_identities":')
+                        sink.write(identities_json)
+                        sink.write(',"compact_shares":')
+                        sink.write(compact_shares_json)
+                        sink.write("}")
+                    else:
+                        # iterencode writes bounded fragments to the child
+                        # instead of allocating a second full JSON
+                        # representation in Python.
+                        json.dump(
+                            payload,
+                            sink,
+                            separators=(",", ":"),
+                        )
                 except BrokenPipeError:
                     # Prefer the builder's diagnostic below.
                     pass
@@ -19699,7 +20084,12 @@ class PrismCoordinator:
                 "# TYPE qbit_prism_initial_job_prepared_work_total counter",
                 *[
                     f'qbit_prism_initial_job_prepared_work_total{{result="{result}"}} {int(initial_prepared_counts.get(result, 0))}'
-                    for result in ("cache_hit", "singleflight", "deferred")
+                    for result in (
+                        "cache_hit",
+                        "singleflight",
+                        "deferred",
+                        "subscribed",
+                    )
                 ],
                 "# HELP qbit_prism_job_build_worker_events_total Pure builder subprocess lifecycle events.",
                 "# TYPE qbit_prism_job_build_worker_events_total counter",
@@ -19707,6 +20097,12 @@ class PrismCoordinator:
                     f'qbit_prism_job_build_worker_events_total{{event="{event}"}} {int(worker_counts.get(event, 0))}'
                     for event in ("starts", "terminations", "crashes", "restarts")
                 ],
+                "# HELP qbit_prism_job_build_configured_workers Configured bounded job-build executor worker count.",
+                "# TYPE qbit_prism_job_build_configured_workers gauge",
+                (
+                    "qbit_prism_job_build_configured_workers "
+                    f"{int(getattr(self, 'job_build_executor_workers', DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS))}"
+                ),
             ]
         )
         return lines

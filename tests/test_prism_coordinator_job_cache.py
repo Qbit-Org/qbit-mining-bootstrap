@@ -2816,9 +2816,15 @@ class JobBundleCacheTests(unittest.TestCase):
 
         def blocked_usable_artifact(*args: object, **kwargs: object) -> object:
             if threading.current_thread() is routine_thread:
-                routine_in_payout_lookup.set()
-                if not release_routine_lookup.wait(5):
-                    raise AssertionError("test did not release payout lookup")
+                # The pre-admission cache probe also consults the payout
+                # artifact; only the lookup made under an admitted routine
+                # preparation exercises the cancellation contract here.
+                with server._job_build_scheduler_lock:
+                    admitted = bool(server._job_build_routine_preparations)
+                if admitted:
+                    routine_in_payout_lookup.set()
+                    if not release_routine_lookup.wait(5):
+                        raise AssertionError("test did not release payout lookup")
             return original_usable_artifact(*args, **kwargs)  # type: ignore[arg-type]
 
         def observed_new_request(*args: object, **kwargs: object) -> object:
