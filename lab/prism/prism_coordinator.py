@@ -17279,7 +17279,6 @@ class PrismCoordinator:
         worker: str | None,
         preserve_if_accepted: bool = False,
         expected_height: int | None = None,
-        recheck_acceptance: bool = True,
     ) -> bool:
         """Record a lost/failed block candidate as a BLOCK-path event.
 
@@ -17306,11 +17305,10 @@ class PrismCoordinator:
         accounting and withdraw its landed preview -- fencing payout
         publication for work qbitd already accepted -- so such candidates
         defer for retry instead; only hashes provably absent from the active
-        chain (past the observation window) abandon terminally. Callers that
-        have already performed that acceptance check themselves -- and hold
-        durable state that a late defer could no longer honor, such as
-        already-rejected prepared payout rows -- pass
-        ``recheck_acceptance=False`` to commit the terminal outcome.
+        chain (past the observation window) abandon terminally. The terminal
+        commit re-reads the observation evidence atomically with the counts,
+        so callers holding follow-up durable work (rejecting prepared payout
+        rows) can order it strictly after a sealed terminal outcome.
         """
         if reason in PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS:
             self._defer_block_candidate(reason, message, worker=worker)
@@ -17329,7 +17327,7 @@ class PrismCoordinator:
             self._clear_accepted_block_payout_preview(block_hash)
             outcome.reason = None
             return True
-        if recheck_acceptance and self._block_candidate_acceptance_pending(
+        if self._block_candidate_acceptance_pending(
             block_hash,
             expected_height=expected_height,
         ):
@@ -17361,8 +17359,7 @@ class PrismCoordinator:
             # commitment must consult it, atomically with the counts, or the
             # same blind spot reopens inside this window.
             late_acceptance_observed = bool(
-                recheck_acceptance
-                and not accepted_race_won
+                not accepted_race_won
                 and self._block_candidate_acceptance_observed(block_hash)
             )
             if not accepted_race_won and not late_acceptance_observed:
@@ -17831,41 +17828,36 @@ class PrismCoordinator:
                             worker=worker,
                         )
                         return None
-                    if self._block_candidate_acceptance_pending(
-                        block_hash,
-                        expected_height=expected_height,
-                    ):
-                        # Defer BEFORE rejecting the prepared payout rows: a
-                        # rejected/reversed row cannot be confirmed by a later
-                        # settled chain view (confirmation only promotes
-                        # prepared rows), so rejecting first would let a
-                        # deferred retry account the block as accepted while
-                        # its payout transition stays reversed.
-                        self._count_accept_pending_defer()
-                        self._defer_block_candidate(
-                            PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
-                            "candidate left this chain view after persistence "
-                            "while acceptance evidence stands; deferring "
-                            "before rejecting prepared payout state",
-                            worker=worker,
-                        )
-                        return None
-                    active_tip_height = int(self.rpc.call("getblockcount"))
-                    self.reject_prepared_block(
-                        block_hash=block_hash,
-                        active_tip_height=active_tip_height,
-                    )
-                    # The acceptance check above just failed and the prepared
-                    # rows are now rejected; a late defer could no longer be
-                    # honored, so this terminal outcome must commit.
+                    # Seal the disposition BEFORE touching the prepared
+                    # payout rows: a rejected row can never be promoted by a
+                    # later confirmation (and reactivation only covers
+                    # inactive rows), so rejection must follow -- never
+                    # precede -- a terminal decision. The abandon defers on
+                    # live acceptance evidence, and its terminal commit reads
+                    # that evidence atomically with the commit, so no
+                    # observation can land between the decision and this
+                    # rejection unseen. A crash in between leaves the outbox
+                    # row pending; restart replay re-runs the disposition and
+                    # rejects then.
                     self._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
                         "accepted block left the active chain before ledger confirmation",
                         block_hash=block_hash,
                         worker=worker,
                         expected_height=expected_height,
-                        recheck_acceptance=False,
                     )
+                    outcome = getattr(self, "_block_candidate_outcome", None)
+                    sealed_reason = (
+                        getattr(outcome, "reason", None)
+                        if outcome is not None
+                        else None
+                    )
+                    if sealed_reason == PRISM_REJECTION_BLOCK_STALE:
+                        active_tip_height = int(self.rpc.call("getblockcount"))
+                        self.reject_prepared_block(
+                            block_hash=block_hash,
+                            active_tip_height=active_tip_height,
+                        )
                     return None
                 confirmation = self.ledger.confirm_accepted_block(
                     block_hash=block_hash,

@@ -11350,8 +11350,8 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         # The terminal half of the same site: submitblock succeeds but a
         # sibling steals the height right after persistence and the pool's
         # block was never observed as the tip. With no acceptance evidence,
-        # the prepared rows are rejected exactly once and the abandon
-        # commits terminally (the recheck is disabled after rejection).
+        # the terminal decision seals first and only then are the prepared
+        # rows rejected, exactly once.
         parent = "00" * 32
         block_hash = "c8" * 32
         racing_winner = "77" * 32
