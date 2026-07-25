@@ -275,16 +275,32 @@ PRISM_REJECTION_INTERNAL_ERROR = "internal-error"
 PRISM_REJECTION_POOL_CLOSED = "pool-closed"
 PRISM_REJECTION_BLOCK_STALE = "block-stale"
 PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED = "ledger-confirmation-failed"
+# A would-be terminal abandonment refused because the candidate's own block
+# hash is (or was recently observed as) part of the active chain: qbitd
+# accepted the block even though this process has not completed the accepted
+# success tail (for example when the direct submitblock ack was lost in
+# transport and acceptance was learned from a blockwait tip observation).
+# The candidate defers and retries until the tail finalizes it as submitted.
+PRISM_REJECTION_BLOCK_ACCEPT_PENDING = "accepted-pending-finalization"
 PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
     {
         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
         PRISM_REJECTION_INTERNAL_ERROR,
         PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
         PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
+        PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
     }
 )
 DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS = 0.25
 DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
+# How long an own-hash tip observation keeps protecting a block candidate
+# from terminal abandonment while instantaneous chain probes disagree
+# (transient sibling/fork views during quick-succession blocks, RPC blips).
+# Within the window the candidate defers and retries until a fresh probe
+# proves it active again (the accepted tail then finalizes it as submitted);
+# once the window expires with the hash still absent from the active chain,
+# the candidate is genuinely stale and abandons terminally.
+DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS = 300.0
 BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS = 0.25
 # Used only by lightweight embedders that bypass dataclass/coordinator
 # construction. Production instances install these locks eagerly in __init__.
@@ -2387,6 +2403,14 @@ class PrismCoordinator:
             "PRISM_BLOCKWAIT_TIMEOUT_SECONDS",
             DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS,
         )
+        # An own-hash tip observation is acceptance evidence even when the
+        # direct submitblock ack was lost; this window bounds how long that
+        # evidence blocks a terminal abandonment while fresh chain probes
+        # cannot prove the candidate active.
+        self.observed_tip_accept_window_seconds = env_positive_float(
+            "PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS",
+            DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,
+        )
         # After a FAILED refresh pass, the fallback poller re-attempts no
         # sooner than this many seconds (plus jitter) while the tip the failed
         # pass worked against is still current, so a persistent blockage or
@@ -2787,6 +2811,19 @@ class PrismCoordinator:
         self.block_candidate_wakeups_coalesced = 0
         self.block_candidate_retry_count = 0
         self.block_candidate_poisoned_count = 0
+        self.block_candidate_accept_pending_defer_count = 0
+        # Hashes of block candidates this process may still land (durable
+        # outbox pending, queued, retained for retry, or mid-disposition).
+        # Membership lets every tip-observation channel recognize the pool's
+        # own block the moment it becomes the chain tip.
+        self._outstanding_block_candidate_hashes: set[str] = set()
+        # Outstanding candidate hashes observed as the chain tip
+        # (hash -> monotonic stamp). qbitd only reports a candidate hash as
+        # its tip after accepting that block, so an entry here is acceptance
+        # evidence that outlives transient fork views and lost submitblock
+        # acks; disposition/abandon paths consult it before treating any
+        # instantaneous chain probe as terminal truth.
+        self._tip_observed_accepted_block_hashes: dict[str, float] = {}
         self.block_candidate_retry_initial_seconds = (
             DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS
         )
@@ -3412,6 +3449,10 @@ class PrismCoordinator:
             ] = {}
         if not hasattr(self, "_accounted_accepted_block_hashes"):
             self._accounted_accepted_block_hashes: set[str] = set()
+        if not hasattr(self, "_outstanding_block_candidate_hashes"):
+            self._outstanding_block_candidate_hashes: set[str] = set()
+        if not hasattr(self, "_tip_observed_accepted_block_hashes"):
+            self._tip_observed_accepted_block_hashes: dict[str, float] = {}
         if not hasattr(self, "_payout_state_metrics_lock"):
             self._payout_state_metrics_lock = threading.Lock()
         if not hasattr(self, "payout_state_histograms"):
@@ -11703,6 +11744,11 @@ class PrismCoordinator:
         if observation_sequence is None:
             observation_sequence = self._reserve_tip_observation_sequence()
         self._ensure_job_cache_state()
+        # Before any sequencing decision: an own-candidate hash arriving as
+        # the tip is acceptance evidence (blockwait can see it before -- or
+        # instead of -- the direct submitblock ack) and must be registered
+        # even when this observation loses the sequence race below.
+        self._note_tip_observation_for_candidates(tip_hash)
         now = time.monotonic()
         active_to_cancel: _FanoutCancellation | None = None
         should_mark_pending = False
@@ -15002,6 +15048,9 @@ class PrismCoordinator:
                     self._clear_accepted_block_payout_preview(
                         submission.block_hash_hex
                     )
+                    self._discard_outstanding_block_candidate(
+                        str(submission.block_hash_hex)
+                    )
                 self._forget_recent_share_key(share_key)
                 self.reject_stratum(
                     23,
@@ -15013,6 +15062,9 @@ class PrismCoordinator:
                 finish = getattr(self.ledger, "mark_block_candidate_submitted", None)
                 if callable(finish):
                     finish(block_hash=submission.block_hash_hex)
+                self._discard_outstanding_block_candidate(
+                    str(submission.block_hash_hex)
+                )
                 if evicted_entry is not None:
                     self.note_evicted_job_submit(credit_policy)
             return False
@@ -16520,6 +16572,12 @@ class PrismCoordinator:
             ) = idle_window_state
 
     def enqueue_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
+        # Outstanding from admission (even when the wakeup coalesces below:
+        # the durable outbox row keeps the candidate replayable), so a tip
+        # observation can register acceptance before the submitter drains it.
+        self._register_outstanding_block_candidate(
+            str(candidate.submission.block_hash_hex)
+        )
         queue_obj = getattr(self, "block_candidate_queue", None)
         if queue_obj is None:
             queue_obj = queue.Queue(maxsize=MAX_PENDING_BLOCK_CANDIDATES)
@@ -16590,6 +16648,36 @@ class PrismCoordinator:
                     durable_block_hash,
                     block_height=int(intent["expected_height"]),
                 )
+                # A durable prepared/confirmed pool-block row proves a prior
+                # process's submitblock succeeded. Restore the acceptance
+                # evidence that died with that process's memory (the
+                # observation window restarts at replay time), so a replay
+                # probe racing a transient fork view cannot terminally
+                # abandon the accepted block before blockwait re-observes it.
+                block_state = None
+                try:
+                    state_reader = getattr(self.ledger, "pool_block_state", None)
+                    if callable(state_reader):
+                        block_state = state_reader(block_hash=durable_block_hash)
+                except Exception:
+                    traceback.print_exc()
+                    block_state = None
+                if block_state is not None and str(
+                    block_state.get("chain_state", "")
+                ) in {"prepared", "confirmed"}:
+                    self._register_outstanding_block_candidate(
+                        durable_block_hash
+                    )
+                    with self.lock:
+                        self._tip_observed_accepted_block_hashes[
+                            durable_block_hash
+                        ] = time.monotonic()
+                    print(
+                        "prism coordinator: restored acceptance evidence for "
+                        f"replayed block candidate hash={durable_block_hash} "
+                        f"chain_state={block_state.get('chain_state')}",
+                        flush=True,
+                    )
                 if self.enqueue_block_candidate(candidate):
                     queued += 1
             except Exception:
@@ -16612,6 +16700,9 @@ class PrismCoordinator:
                         )
                         if quarantined:
                             self._clear_block_candidate_retry_state(durable_block_hash)
+                            self._discard_outstanding_block_candidate(
+                                durable_block_hash
+                            )
                             with self.lock:
                                 self.block_candidate_poisoned_count = int(
                                     getattr(self, "block_candidate_poisoned_count", 0)
@@ -16974,6 +17065,7 @@ class PrismCoordinator:
             if registry is not None:
                 registry.pop(block_hash, None)
         self._clear_block_candidate_retry_state(block_hash)
+        self._discard_outstanding_block_candidate(block_hash)
         # Terminal for this process either way: an accepted candidate credited
         # its share during the success tail (a no-op release here), and an
         # abandoned one can only be credited by restart replay, which stamps a
@@ -17082,6 +17174,143 @@ class PrismCoordinator:
         with self.lock:
             return block_hash.lower() in self._accounted_accepted_block_hashes
 
+    def _register_outstanding_block_candidate(self, block_hash: str) -> None:
+        """Track a candidate this process may still land, for tip matching."""
+        self._ensure_job_cache_state()
+        with self.lock:
+            self._outstanding_block_candidate_hashes.add(block_hash.lower())
+
+    def _discard_outstanding_block_candidate(self, block_hash: str) -> None:
+        """Stop matching tip observations once a candidate is terminal."""
+        self._ensure_job_cache_state()
+        key = block_hash.lower()
+        with self.lock:
+            self._outstanding_block_candidate_hashes.discard(key)
+            self._tip_observed_accepted_block_hashes.pop(key, None)
+
+    def _note_tip_observation_for_candidates(self, tip_hash: str) -> None:
+        """Register a tip observation that matches an outstanding candidate.
+
+        qbitd only ever reports the pool's own candidate hash as its chain
+        tip after accepting that block, so the observation itself is
+        acceptance evidence -- even when the direct submitblock ack was lost
+        in transport and the accepted success tail has not run (blockwait
+        typically learns of the tip before, or instead of, the ack). Every
+        tip-observation channel funnels through here so later disposition
+        and abandon checks can outlive transient fork views.
+        """
+        key = tip_hash.lower()
+        self._ensure_job_cache_state()
+        newly_observed = False
+        with self.lock:
+            if key in self._outstanding_block_candidate_hashes:
+                newly_observed = (
+                    key not in self._tip_observed_accepted_block_hashes
+                )
+                self._tip_observed_accepted_block_hashes[key] = time.monotonic()
+        if newly_observed:
+            print(
+                "prism coordinator: chain tip observation matches pool block "
+                f"candidate hash={key}; acceptance registered pending "
+                "finalization",
+                flush=True,
+            )
+
+    def _block_candidate_acceptance_observed(self, block_hash: str) -> bool:
+        """Whether a recent tip observation already proved this candidate landed."""
+        self._ensure_job_cache_state()
+        with self.lock:
+            observed = self._tip_observed_accepted_block_hashes.get(
+                block_hash.lower()
+            )
+        if observed is None:
+            return False
+        window = float(
+            getattr(
+                self,
+                "observed_tip_accept_window_seconds",
+                DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,
+            )
+        )
+        if window <= 0:
+            return True
+        return (time.monotonic() - observed) <= window
+
+    def _block_candidate_chain_probe(
+        self,
+        block_hash: str,
+        *,
+        expected_height: int | None = None,
+    ) -> bool | None:
+        """Fresh chain verdict for a candidate: proven active, proven wrong, or unknown.
+
+        Returns True when the candidate's own hash is the fresh best tip or
+        an active chain header at its expected height, False when it is
+        provably active at the wrong height (a corrupt intent, never a tip
+        race), and None when this instantaneous view proves nothing (the
+        hash absent during a tip race, or the probe itself failing).
+        """
+        key = block_hash.lower()
+        # The two probes are independent: a best-tip lookup failure must not
+        # suppress the active-header check, which subsumes it (the tip block
+        # itself reports one confirmation) and can prove acceptance alone.
+        try:
+            if str(self.rpc.call("getbestblockhash")).lower() == key:
+                self._note_tip_observation_for_candidates(key)
+                return True
+        except Exception:
+            print(
+                "prism coordinator: acceptance re-check best-tip probe "
+                f"failed hash={key}; trying the active-header probe",
+                flush=True,
+            )
+            traceback.print_exc()
+        height: int | None = None
+        try:
+            height = self.active_block_candidate_height(key)
+        except Exception:
+            print(
+                "prism coordinator: acceptance re-check header probe failed "
+                f"hash={key}; falling back to tip-observation evidence",
+                flush=True,
+            )
+            traceback.print_exc()
+        if height is None:
+            return None
+        if expected_height is None or int(height) == int(expected_height):
+            self._note_tip_observation_for_candidates(key)
+            return True
+        return False
+
+    def _block_candidate_acceptance_pending(
+        self,
+        block_hash: str,
+        *,
+        expected_height: int | None = None,
+    ) -> bool:
+        """Return whether abandoning this candidate would discard an accepted block.
+
+        A fresh probe wins in both directions: a candidate proven active is
+        accepted even if its tip observation was missed, and a candidate
+        proven active at the wrong height stays abandonable. When the probe
+        cannot prove either way, a recent own-hash tip observation keeps the
+        candidate deferring instead of terminal: qbitd accepted it once, so
+        only a durably settled chain view may discard it.
+        """
+        probe = self._block_candidate_chain_probe(
+            block_hash,
+            expected_height=expected_height,
+        )
+        if probe is not None:
+            return probe
+        return self._block_candidate_acceptance_observed(block_hash)
+
+    def _count_accept_pending_defer(self) -> None:
+        with self.lock:
+            self.block_candidate_accept_pending_defer_count = int(
+                getattr(self, "block_candidate_accept_pending_defer_count", 0)
+            ) + 1
+
     def _abandon_block_candidate(
         self,
         reason: str,
@@ -17090,6 +17319,7 @@ class PrismCoordinator:
         block_hash: str,
         worker: str | None,
         preserve_if_accepted: bool = False,
+        expected_height: int | None = None,
     ) -> bool:
         """Record a lost/failed block candidate as a BLOCK-path event.
 
@@ -17107,6 +17337,19 @@ class PrismCoordinator:
         success tail while withdrawal was in flight, the accepted disposition
         wins and the caller must finalize the outbox as submitted. Returns
         whether that accepted disposition won.
+
+        Independent of that completed-tail record, a candidate whose own
+        block hash is the fresh best tip, an active chain header at its
+        expected height, or a recent own-hash tip observation is an ACCEPTED
+        block whose finalization is still pending (for example after a lost
+        submitblock ack). Terminal abandonment would discard its payout
+        accounting and withdraw its landed preview -- fencing payout
+        publication for work qbitd already accepted -- so such candidates
+        defer for retry instead; only hashes provably absent from the active
+        chain (past the observation window) abandon terminally. The terminal
+        commit re-reads the observation evidence atomically with the counts,
+        so callers holding follow-up durable work (rejecting prepared payout
+        rows) can order it strictly after a sealed terminal outcome.
         """
         if reason in PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS:
             self._defer_block_candidate(reason, message, worker=worker)
@@ -17125,10 +17368,33 @@ class PrismCoordinator:
             self._clear_accepted_block_payout_preview(block_hash)
             outcome.reason = None
             return True
+        chain_probe = self._block_candidate_chain_probe(
+            block_hash,
+            expected_height=expected_height,
+        )
+        if chain_probe is True or (
+            chain_probe is None
+            and self._block_candidate_acceptance_observed(block_hash)
+        ):
+            self._count_accept_pending_defer()
+            self._defer_block_candidate(
+                PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
+                "candidate is on (or was recently observed as) the active "
+                f"chain; refusing terminal abandonment (was {reason}: "
+                f"{message})",
+                worker=worker,
+            )
+            return False
 
         # Own the cleanup invariant here rather than relying on every caller to
         # remember it. Invalidation can block behind another candidate pass;
         # recheck the accepted record afterward before committing abandonment.
+        # Capture the transition first: if late acceptance evidence forces a
+        # defer below, its published preview must be restorable.
+        with self._accepted_block_payout_preview_condition:
+            withdrawn_transition = self._accepted_block_payout_previews.get(
+                block_hash.lower()
+            )
         self._clear_accepted_block_payout_preview(
             block_hash,
             invalidate_published=True,
@@ -17138,17 +17404,96 @@ class PrismCoordinator:
                 preserve_if_accepted
                 and block_hash.lower() in self._accounted_accepted_block_hashes
             )
-            if not accepted_race_won:
+            # The invalidation above can block long enough for a blockwait
+            # observation (or a recovered probe) to register acceptance
+            # evidence that the pre-invalidation check missed. Terminal
+            # commitment must consult it, atomically with the counts, or the
+            # same blind spot reopens inside this window. The probe still
+            # wins both directions: a provably wrong-height verdict is
+            # immutable (headers cannot change height), so observation
+            # evidence never revives a candidate the probe overruled.
+            late_acceptance_observed = bool(
+                not accepted_race_won
+                and chain_probe is not False
+                and self._block_candidate_acceptance_observed(block_hash)
+            )
+            if not accepted_race_won and not late_acceptance_observed:
                 outcome.reason = reason
                 counts = getattr(self, "block_candidate_abandoned_counts", None)
                 if counts is None:
                     counts = {}
                     self.block_candidate_abandoned_counts = counts
                 counts[reason] = int(counts.get(reason, 0)) + 1
+                # Seal the disposition in the same critical section that
+                # commits it: stop matching tip observations for this hash so
+                # no acceptance evidence can register between this terminal
+                # decision and the caller's follow-up durable work (rejecting
+                # prepared payout rows). Observation registration takes this
+                # same lock, so exclusion across the gap is total. A crash
+                # before the durable outbox update replays the candidate,
+                # which re-registers and re-evaluates from live chain state.
+                self._outstanding_block_candidate_hashes.discard(
+                    block_hash.lower()
+                )
+                self._tip_observed_accepted_block_hashes.pop(
+                    block_hash.lower(),
+                    None,
+                )
         if accepted_race_won:
             self._clear_accepted_block_payout_preview(block_hash)
             outcome.reason = None
             return True
+        if late_acceptance_observed:
+            # Restore the landed barrier the withdrawal just removed (and pop
+            # its fail-closed tombstone): the candidate is still an accepted
+            # block pending finalization, so descendant builders must keep
+            # waiting on its preview -- not fail closed -- until the deferred
+            # retry's accepted tail republishes it. Without this, retries
+            # that keep deferring on observation evidence alone would leave
+            # the tombstone fencing template refreshes, recreating the
+            # coordination-blocked stall this path exists to prevent.
+            self._begin_accepted_block_payout_preview(
+                block_hash,
+                block_height=expected_height,
+            )
+            if expected_height is not None:
+                self._mark_accepted_block_payout_landed(
+                    block_hash,
+                    block_height=expected_height,
+                )
+            if (
+                withdrawn_transition is not None
+                and withdrawn_transition.preview is not None
+            ):
+                # The withdrawal superseded payout publication and, on a
+                # lost publication race, left delivery fenced. Republish the
+                # withdrawn preview now so admission reopens with the defer
+                # rather than staying coordination-blocked across the
+                # deferral cycles until the accepted tail republishes it.
+                try:
+                    self._publish_accepted_block_payout_preview(
+                        block_hash,
+                        self._materialize_prior_balance_preview(
+                            withdrawn_transition.preview
+                        ),
+                    )
+                except Exception:
+                    print(
+                        "prism coordinator: could not republish withdrawn "
+                        f"payout preview hash={block_hash}; the scheduled "
+                        "refresh will retry publication",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+            self._count_accept_pending_defer()
+            self._defer_block_candidate(
+                PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
+                "acceptance evidence arrived during payout-preview "
+                f"withdrawal; refusing terminal abandonment (was {reason}: "
+                f"{message})",
+                worker=worker,
+            )
+            return False
 
         print(
             f"prism coordinator: block candidate abandoned reason={reason}: {message}",
@@ -17364,6 +17709,7 @@ class PrismCoordinator:
                     "prior balances changed since the job was issued",
                     block_hash=block_hash,
                     worker=worker,
+                    expected_height=expected_height,
                 )
                 return None
             if not already_active:
@@ -17374,6 +17720,7 @@ class PrismCoordinator:
                         f"stale block height: template={expected_height} tip={before_height}",
                         block_hash=block_hash,
                         worker=worker,
+                        expected_height=expected_height,
                     )
                     return None
                 # Register before submitblock can expose this hash as the new
@@ -17399,6 +17746,7 @@ class PrismCoordinator:
                         f"submitblock rejected candidate: {result}",
                         block_hash=block_hash,
                         worker=worker,
+                        expected_height=expected_height,
                     )
                     return None
                 active_hash = str(
@@ -17410,6 +17758,7 @@ class PrismCoordinator:
                         f"submitted block is not active at height {expected_height}",
                         block_hash=block_hash,
                         worker=worker,
+                        expected_height=expected_height,
                     )
                     return None
                 self._cancel_obsolete_job_builds("direct PRISM block accepted")
@@ -17588,17 +17937,38 @@ class PrismCoordinator:
                             worker=worker,
                         )
                         return None
-                    active_tip_height = int(self.rpc.call("getblockcount"))
-                    self.reject_prepared_block(
-                        block_hash=block_hash,
-                        active_tip_height=active_tip_height,
-                    )
+                    # Seal the disposition BEFORE touching the prepared
+                    # payout rows: a rejected row can never be promoted by a
+                    # later confirmation (and reactivation only covers
+                    # inactive rows), so rejection must follow -- never
+                    # precede -- a terminal decision. The abandon defers on
+                    # live acceptance evidence; its terminal commit consults
+                    # that evidence atomically with the commit AND seals the
+                    # hash against further observation matching, so no
+                    # evidence can register anywhere in the gap between the
+                    # sealed decision and this rejection. A crash in between
+                    # leaves the outbox row pending; restart replay
+                    # re-registers the hash and re-evaluates from live chain
+                    # state before rejecting.
                     self._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
                         "accepted block left the active chain before ledger confirmation",
                         block_hash=block_hash,
                         worker=worker,
+                        expected_height=expected_height,
                     )
+                    outcome = getattr(self, "_block_candidate_outcome", None)
+                    sealed_reason = (
+                        getattr(outcome, "reason", None)
+                        if outcome is not None
+                        else None
+                    )
+                    if sealed_reason == PRISM_REJECTION_BLOCK_STALE:
+                        active_tip_height = int(self.rpc.call("getblockcount"))
+                        self.reject_prepared_block(
+                            block_hash=block_hash,
+                            active_tip_height=active_tip_height,
+                        )
                     return None
                 confirmation = self.ledger.confirm_accepted_block(
                     block_hash=block_hash,
@@ -17780,17 +18150,34 @@ class PrismCoordinator:
         block_hash = str(submission.block_hash_hex).lower()
         parent_hash = str(context.template["previousblockhash"])
         self._ensure_job_cache_state()
+        # Every disposition (queue drain, synchronous below-target submit,
+        # outbox replay, retained retry) marks its hash outstanding so tip
+        # observations arriving on other threads can register acceptance.
+        self._register_outstanding_block_candidate(block_hash)
         with self.lock:
             pool_closed = (
                 self.accepted_block_count >= self.max_blocks
                 and block_hash not in self._accounted_accepted_block_hashes
             )
+        if pool_closed and self._block_candidate_chain_probe(
+            block_hash,
+            expected_height=expected_height,
+        ) is True:
+            # The chain provably contains this block; its payout accounting
+            # must complete regardless of when the pool stopped accepting
+            # new work. Fall through to the normal disposition below, which
+            # resumes the accepted success tail. Observation evidence alone
+            # deliberately does not open this gate -- an unprovable view
+            # defers via the abandon path instead, so a closed pool can
+            # never fall through to submitblock on stale evidence.
+            pool_closed = False
         if pool_closed:
             self._abandon_block_candidate(
                 PRISM_REJECTION_POOL_CLOSED,
                 "pool is no longer accepting blocks",
                 block_hash=block_hash,
                 worker=worker,
+                expected_height=expected_height,
             )
             return False
         current_tip = str(self.rpc.call("getbestblockhash"))
@@ -17816,9 +18203,14 @@ class PrismCoordinator:
                 f"candidate active at unexpected height {landed_height}",
                 block_hash=block_hash,
                 worker=worker,
+                expected_height=expected_height,
             )
             return False
         if already_active:
+            # A disposition probe is a tip observation too: remember it so a
+            # later attempt cannot terminally abandon this hash on a racing
+            # chain snapshot after this attempt fails mid-tail.
+            self._note_tip_observation_for_candidates(block_hash)
             print(
                 "prism coordinator: resuming finalization for active block candidate "
                 f"height={landed_height} hash={submission.block_hash_hex}",
@@ -17838,6 +18230,7 @@ class PrismCoordinator:
                 block_hash=block_hash,
                 worker=worker,
                 preserve_if_accepted=True,
+                expected_height=expected_height,
             )
             return accepted_race_won
         landed = self._land_and_confirm_block_candidate(
@@ -19329,6 +19722,9 @@ class PrismCoordinator:
             "# HELP qbit_prism_block_candidate_retries_total Transient candidate outcomes retained for durable retry.",
             "# TYPE qbit_prism_block_candidate_retries_total counter",
             f"qbit_prism_block_candidate_retries_total {int(getattr(self, 'block_candidate_retry_count', 0))}",
+            "# HELP qbit_prism_block_candidate_accept_pending_defers_total Terminal abandonments refused because the candidate is (or was recently observed as) an active chain block; the candidate retries until its accepted success tail finalizes it as submitted.",
+            "# TYPE qbit_prism_block_candidate_accept_pending_defers_total counter",
+            f"qbit_prism_block_candidate_accept_pending_defers_total {int(getattr(self, 'block_candidate_accept_pending_defer_count', 0))}",
             "# HELP qbit_prism_block_candidate_poisoned_total Invalid durable candidate intents quarantined from replay.",
             "# TYPE qbit_prism_block_candidate_poisoned_total counter",
             f"qbit_prism_block_candidate_poisoned_total {int(getattr(self, 'block_candidate_poisoned_count', 0))}",
