@@ -4104,6 +4104,7 @@ class PrismCoordinator:
             if artifact.payout_state_generation != self._payout_state_generation:
                 return
             current = self._payout_ledger_artifact
+            already_current = False
             if (
                 current is not None
                 and current.payout_state_generation
@@ -4125,33 +4126,40 @@ class PrismCoordinator:
                         and current.share_snapshot_sha256
                         == artifact.share_snapshot_sha256
                     ):
-                        return
-                    template_artifacts = getattr(
-                        self,
-                        "_template_artifacts",
-                        None,
-                    )
-                    if (
-                        current.network_difficulty
-                        != artifact.network_difficulty
-                        and template_artifacts is not None
-                        and current.network_difficulty
-                        == int(template_artifacts.network_difficulty)
-                        and artifact.network_difficulty
-                        != int(template_artifacts.network_difficulty)
-                    ):
-                        # Equal counts cannot order snapshots across a
-                        # retarget; keep the artifact the live template
-                        # difficulty can actually reuse rather than letting
-                        # a delayed pre-retarget build regress it.
-                        return
-            self._payout_ledger_artifact_generation += 1
-            self._payout_ledger_artifact = dataclass_replace(
-                artifact,
-                generation=self._payout_ledger_artifact_generation,
-            )
-        # An armed artifact proves preparation can succeed again; let the
-        # next fence-failure re-arm run at the configured floor.
+                        # The armed artifact already carries exactly this
+                        # window; keep its generation (no lookup re-key) but
+                        # still treat the preparation as a success below.
+                        already_current = True
+                    else:
+                        template_artifacts = getattr(
+                            self,
+                            "_template_artifacts",
+                            None,
+                        )
+                        if (
+                            current.network_difficulty
+                            != artifact.network_difficulty
+                            and template_artifacts is not None
+                            and current.network_difficulty
+                            == int(template_artifacts.network_difficulty)
+                            and artifact.network_difficulty
+                            != int(template_artifacts.network_difficulty)
+                        ):
+                            # Equal counts cannot order snapshots across a
+                            # retarget; keep the artifact the live template
+                            # difficulty can actually reuse rather than
+                            # letting a delayed pre-retarget build regress
+                            # it.
+                            return
+            if not already_current:
+                self._payout_ledger_artifact_generation += 1
+                self._payout_ledger_artifact = dataclass_replace(
+                    artifact,
+                    generation=self._payout_ledger_artifact_generation,
+                )
+        # An armed artifact -- installed fresh or confirmed already current
+        # -- proves preparation can succeed again; let the next fence-failure
+        # re-arm run at the configured floor.
         with self._payout_artifact_executor_lock:
             self._payout_artifact_rearm_backoff = 1
 
@@ -15361,8 +15369,19 @@ class PrismCoordinator:
         except BaseException:
             client.close()
             raise
+        restarted = False
         with self._job_build_scheduler_lock:
+            if self._job_build_worker_restart_pending:
+                # This daemon replaces a worker that crashed or was
+                # terminated; attribute the restart here instead of leaking
+                # the pending flag to an unrelated later one-shot build.
+                self.job_build_worker_counts["restarts"] += 1
+                self._job_build_worker_restart_pending = False
+                restarted = True
             self.job_build_worker_counts["starts"] += 1
+        if restarted:
+            with self._tip_refresh_metrics_lock:
+                self.tip_refresh_worker_restarts += 1
         return client
 
     def _serve_builder_read_line(
@@ -21893,7 +21912,7 @@ class PrismCoordinator:
                 "# HELP qbit_prism_tip_refresh_builder_worker_failures_total Audit-builder subprocess failures.",
                 "# TYPE qbit_prism_tip_refresh_builder_worker_failures_total counter",
                 f"qbit_prism_tip_refresh_builder_worker_failures_total {worker_failures}",
-                "# HELP qbit_prism_tip_refresh_builder_worker_restarts_total Long-lived builder worker restarts; zero for the inline subprocess design.",
+                "# HELP qbit_prism_tip_refresh_builder_worker_restarts_total Long-lived builder worker restarts (persistent --serve daemon respawns after a crash or supersession).",
                 "# TYPE qbit_prism_tip_refresh_builder_worker_restarts_total counter",
                 f"qbit_prism_tip_refresh_builder_worker_restarts_total {worker_restarts}",
                 "# HELP qbit_prism_tip_refresh_builder_ipc_bytes_total Bytes copied across audit-builder subprocess IPC.",

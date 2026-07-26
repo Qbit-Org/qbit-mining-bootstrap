@@ -2281,13 +2281,18 @@ class JobBundleCacheTests(unittest.TestCase):
 
         # No share committed since: the speculative rebuild reads the same
         # window under a fresh anchor and must not spin the generation,
-        # which would re-key bundle lookups for nothing.
+        # which would re-key bundle lookups for nothing -- but it is still a
+        # successful preparation, so an accumulated re-arm backoff releases.
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_rearm_backoff = 4
         server._prepare_payout_ledger_artifact(
             server._payout_state_generation,
             artifacts.network_difficulty,
         )
         with server._job_cache_lock:
             self.assertIs(server._payout_ledger_artifact, installed)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 1)
 
         # A new durable share makes the rebuild a genuine replacement.
         server.ledger.miners = [*server.ledger.miners, "late-share"]
@@ -6021,6 +6026,31 @@ class ServeBuilderTests(unittest.TestCase):
         self.assertEqual(counts["fallbacks"], 1)
         self.assertEqual(counts["spawns"], 0)
         self.assertEqual(server.tip_refresh_worker_failures, 1)
+
+    def test_daemon_respawn_counts_as_worker_restart(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            # A prior worker ended abnormally (crash or supersession kill)
+            # with no immediate fallback consuming the flag; the replacement
+            # daemon spawn must claim the restart instead of leaking it to
+            # an unrelated later one-shot build.
+            server._ensure_tip_refresh_state()
+            with server._job_build_scheduler_lock:
+                server._job_build_worker_restart_pending = True
+
+            result = self._build(server, shares, serialization, height=10)
+
+            self.assertEqual(result["transport"], "serve")
+            with server._job_build_scheduler_lock:
+                counts = dict(server.job_build_worker_counts)
+                self.assertFalse(server._job_build_worker_restart_pending)
+            self.assertEqual(counts["restarts"], 1)
+            self.assertGreaterEqual(counts["starts"], 1)
+            self.assertEqual(server.tip_refresh_worker_restarts, 1)
+        finally:
+            server.shutdown_serve_builder()
 
     def test_daemon_detaches_from_build_control_after_request(self) -> None:
         server = self._coordinator()
