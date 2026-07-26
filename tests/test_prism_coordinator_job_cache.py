@@ -2301,6 +2301,57 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertGreater(replaced.generation, installed.generation)
         self.assertEqual(replaced.accepted_share_count, 4)
 
+    def test_delayed_older_snapshot_does_not_regress_artifact(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.shared_job_bundle(artifacts, mode="ready")
+        with server._job_cache_lock:
+            current = server._payout_ledger_artifact
+        assert current is not None
+        self.assertEqual(current.accepted_share_count, 3)
+
+        # A snapshot read at an earlier count finishes its window conversion
+        # late, so its preparation timestamp is newer than the installed
+        # artifact's; the count still proves it is the older window.
+        older_window = [
+            {"share_seq": seq, "miner_id": "miner-a"} for seq in (1, 2)
+        ]
+        delayed = PayoutLedgerArtifact(
+            generation=0,
+            payout_state_generation=server._payout_state_generation,
+            network_difficulty=int(current.network_difficulty),
+            accepted_share_count=2,
+            shares_json=tuple(older_window),
+            prior_balances=(),
+            prepared_monotonic=time.monotonic(),
+            snapshot_anchor_ms=current.snapshot_anchor_ms,
+            share_snapshot_sha256=canonical_json_sha256(older_window),
+        )
+        server._install_payout_ledger_artifact(delayed)
+        with server._job_cache_lock:
+            self.assertIs(server._payout_ledger_artifact, current)
+
+        # A genuinely newer window replaces regardless of its preparation
+        # timestamp ordering.
+        newer_window = [
+            {"share_seq": seq, "miner_id": "miner-a"} for seq in (1, 2, 3, 4)
+        ]
+        fresher = dataclass_replace(
+            delayed,
+            accepted_share_count=4,
+            shares_json=tuple(newer_window),
+            prepared_monotonic=current.prepared_monotonic - 1.0,
+            share_snapshot_sha256=canonical_json_sha256(newer_window),
+        )
+        server._install_payout_ledger_artifact(fresher)
+        with server._job_cache_lock:
+            replaced = server._payout_ledger_artifact
+        assert replaced is not None
+        self.assertGreater(replaced.generation, current.generation)
+        self.assertEqual(replaced.accepted_share_count, 4)
+
     def test_difficulty_change_replaces_same_window_artifact(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)

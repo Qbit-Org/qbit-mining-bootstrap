@@ -4055,13 +4055,15 @@ class PrismCoordinator:
     ) -> None:
         """Atomically publish a prepared artifact for its own generation.
 
-        Freshness-ordered and idempotent: every waiter on a shared build
-        flight re-runs cache publication with the same prepared artifact, and
-        a background rebuild can finish in between. Re-installing an equal or
-        older snapshot -- or a byte-identical window under a fresh anchor,
-        which a speculative rebuild produces whenever no share committed
-        since the installed artifact -- would spin the artifact generation
-        (re-keying bundle lookups) without changing reuse fidelity.
+        Snapshot-freshness-ordered and idempotent: accepted-share counts are
+        append-only within a payout generation, so the count orders snapshots
+        even when a build delayed in window conversion finishes after a
+        later snapshot installed (completion time cannot order snapshots).
+        Equal-count installs with an identical window -- every flight waiter
+        re-runs cache publication with the same prepared artifact, and a
+        same-window speculative rebuild re-reads unchanged state under a
+        fresh anchor -- keep the installed generation instead of re-keying
+        bundle lookups for nothing.
         """
         with self._job_cache_lock:
             if artifact.payout_state_generation != self._payout_state_generation:
@@ -4071,20 +4073,22 @@ class PrismCoordinator:
                 current is not None
                 and current.payout_state_generation
                 == artifact.payout_state_generation
-                and (
-                    current.prepared_monotonic >= artifact.prepared_monotonic
-                    or (
-                        current.accepted_share_count
-                        == artifact.accepted_share_count
-                        and current.network_difficulty
-                        == artifact.network_difficulty
-                        and current.share_snapshot_sha256 is not None
-                        and current.share_snapshot_sha256
-                        == artifact.share_snapshot_sha256
-                    )
-                )
             ):
-                return
+                if (
+                    current.accepted_share_count
+                    > artifact.accepted_share_count
+                ):
+                    return
+                if (
+                    current.accepted_share_count
+                    == artifact.accepted_share_count
+                    and current.network_difficulty
+                    == artifact.network_difficulty
+                    and current.share_snapshot_sha256 is not None
+                    and current.share_snapshot_sha256
+                    == artifact.share_snapshot_sha256
+                ):
+                    return
             self._payout_ledger_artifact_generation += 1
             self._payout_ledger_artifact = dataclass_replace(
                 artifact,
