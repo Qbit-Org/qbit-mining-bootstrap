@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import socket
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 import unittest
+from pathlib import Path
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
@@ -5086,6 +5088,7 @@ class ShareWindowSpoolTests(unittest.TestCase):
         server, _rpc = coordinator()
         server.signing_seed_hex = "42" * 32
         server.ledger_attestation_signing_seed_hex = "43" * 32
+        self.addCleanup(server.retire_share_window_spool)
         return server
 
     def _ledger_artifact(
@@ -5113,7 +5116,9 @@ class ShareWindowSpoolTests(unittest.TestCase):
         *,
         height: int,
     ) -> dict[str, object]:
-        with patch(
+        # These tests cover the one-shot spool handoff; pin the persistent
+        # builder off so the echo helper is never spawned as a daemon.
+        with patch.dict(os.environ, {"PRISM_BUILDER_SERVE": "0"}), patch(
             "lab.prism.prism_coordinator.prism_tool_command",
             return_value=list(ECHO_BUILDER_COMMAND),
         ):
@@ -5313,6 +5318,269 @@ class ShareWindowSpoolTests(unittest.TestCase):
 
         self.assertTrue(lease[0].closed)
         self.assertIsNone(serialization.acquire_spooled_tail(shares))
+
+
+FAKE_SERVE_BUILDER_COMMAND = [
+    sys.executable,
+    str(Path(__file__).resolve().parent / "fixtures" / "fake_serve_builder.py"),
+]
+
+
+class ServeBuilderTests(unittest.TestCase):
+    """Persistent --serve builder client, its fallback, and supersession."""
+
+    def _coordinator(self) -> PrismCoordinator:
+        server, _rpc = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        self.addCleanup(server.shutdown_serve_builder)
+        self.addCleanup(server.retire_share_window_spool)
+        return server
+
+    def _serialization(
+        self,
+        server: PrismCoordinator,
+        shares: list[dict[str, object]],
+        *,
+        generation: int = 1,
+    ) -> object:
+        return server._share_window_serialization_for_artifact(
+            PayoutLedgerArtifact(
+                generation=generation,
+                payout_state_generation=0,
+                network_difficulty=1,
+                accepted_share_count=len(shares),
+                shares_json=tuple(shares),
+                prior_balances=(),
+                prepared_monotonic=time.monotonic(),
+                snapshot_anchor_ms=None,
+            ),
+            shares,
+        )
+
+    def _build(
+        self,
+        server: PrismCoordinator,
+        shares: list[dict[str, object]],
+        serialization: object,
+        *,
+        height: int,
+        mode: str = "ok",
+        cancellation: object = None,
+    ) -> dict[str, object]:
+        with patch.dict(
+            os.environ,
+            {"FAKE_SERVE_BUILDER_MODE": mode},
+        ), patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=list(FAKE_SERVE_BUILDER_COMMAND),
+        ):
+            return server.build_audit_bundle(
+                shares=shares,
+                found_block={
+                    "block_height": height,
+                    "coinbase_value_sats": 50_00000000,
+                    "network_difficulty": 1,
+                    "anchor_job_issued_at_ms": 1_700_000_000_000,
+                },
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                summary_only=True,
+                payout_policy={"policy": "day-one"},
+                share_serialization=serialization,  # type: ignore[arg-type]
+                cancellation=cancellation,  # type: ignore[arg-type]
+            )
+
+    def test_cache_miss_uploads_window_then_hits_on_next_request(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        identities, compact_shares = _compact_share_payload(shares)
+        expected_window = {
+            "compact_share_identities": [
+                list(identity) for identity in identities
+            ],
+            "compact_shares": [list(share) for share in compact_shares],
+        }
+        try:
+            first = self._build(server, shares, serialization, height=10)
+            second = self._build(server, shares, serialization, height=11)
+
+            self.assertEqual(first["transport"], "serve")
+            self.assertTrue(first["request_had_window"])
+            self.assertEqual(first["window"], expected_window)
+            self.assertEqual(first["found_block"]["block_height"], 10)
+
+            self.assertEqual(second["transport"], "serve")
+            self.assertFalse(second["request_had_window"])
+            self.assertEqual(second["window"], expected_window)
+            self.assertEqual(second["found_block"]["block_height"], 11)
+
+            with server._serve_builder_lock:
+                counts = dict(server.serve_builder_counts)
+                window_counts = dict(server.serve_builder_window_cache_counts)
+            self.assertEqual(counts["requests"], 2)
+            self.assertEqual(counts["spawns"], 1)
+            self.assertEqual(counts["fallbacks"], 0)
+            self.assertEqual(counts["window_uploads"], 1)
+            self.assertEqual(window_counts, {"hits": 1, "misses": 1})
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_needs_window_bounce_reuploads_and_succeeds(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            first = self._build(server, shares, serialization, height=10)
+            self.assertTrue(first["request_had_window"])
+            client = server._serve_builder
+            assert client is not None
+            second_shares = [spool_share(seq) for seq in range(1, 5)]
+            second_serialization = self._serialization(
+                server,
+                second_shares,
+                generation=2,
+            )
+            # Pretend this window was already uploaded: the daemon's
+            # needs_window bounce must repair the divergence transparently.
+            client.note_uploaded_window(
+                second_serialization.share_snapshot_sha256  # type: ignore[attr-defined]
+            )
+
+            second = self._build(
+                server,
+                second_shares,
+                second_serialization,
+                height=11,
+            )
+
+            self.assertEqual(second["transport"], "serve")
+            self.assertTrue(second["request_had_window"])
+            self.assertEqual(second["found_block"]["block_height"], 11)
+            with server._serve_builder_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["requests"], 2)
+            self.assertEqual(counts["fallbacks"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_daemon_crash_falls_back_to_one_shot(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            result = self._build(
+                server,
+                shares,
+                serialization,
+                height=10,
+                mode="crash-before-response",
+            )
+
+            self.assertEqual(result["transport"], "one-shot")
+            self.assertEqual(
+                result["received"]["found_block"]["block_height"],
+                10,
+            )
+            self.assertIn("compact_shares", result["received"])
+            with server._serve_builder_lock:
+                counts = dict(server.serve_builder_counts)
+                self.assertIsNone(server._serve_builder)
+            self.assertEqual(counts["fallbacks"], 1)
+            self.assertEqual(counts["requests"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_protocol_mismatch_falls_back_to_one_shot(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            result = self._build(
+                server,
+                shares,
+                serialization,
+                height=10,
+                mode="protocol-mismatch",
+            )
+
+            self.assertEqual(result["transport"], "one-shot")
+            with server._serve_builder_lock:
+                counts = dict(server.serve_builder_counts)
+                self.assertIsNone(server._serve_builder)
+            self.assertEqual(counts["fallbacks"], 1)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_disabled_serve_builder_uses_one_shot_directly(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        with patch.dict(os.environ, {"PRISM_BUILDER_SERVE": "0"}):
+            result = self._build(server, shares, serialization, height=10)
+
+        self.assertEqual(result["transport"], "one-shot")
+        with server._serve_builder_lock:
+            counts = dict(server.serve_builder_counts)
+        self.assertEqual(counts["spawns"], 0)
+
+    def test_supersession_cancels_in_flight_daemon_request(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        control = prism_coordinator_module._JobBundleBuildControl(
+            key=("serve-test",),
+            previousblockhash="11" * 32,
+            payout_state_generation=0,
+            payout_artifact_generation=1,
+        )
+        with server._job_cache_lock:
+            server._active_job_bundle_builds[control.key] = control
+        errors: list[BaseException] = []
+        results: list[object] = []
+
+        def build() -> None:
+            # The bundle-build control travels on the builder thread's local
+            # state, exactly as _execute_job_build installs it.
+            server._job_build_phase_local.bundle_build_control = control
+            try:
+                results.append(
+                    self._build(
+                        server,
+                        shares,
+                        serialization,
+                        height=10,
+                        mode="hang-after-request",
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+            finally:
+                server._job_build_phase_local.bundle_build_control = None
+
+        thread = threading.Thread(target=build)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if control.process is not None:
+                    break
+                time.sleep(0.005)
+            self.assertIsNotNone(control.process)
+
+            control.cancel_event.set()
+            thread.join(5.0)
+        finally:
+            control.cancel_event.set()
+            thread.join(1.0)
+            server.shutdown_serve_builder()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], JobBuildSuperseded)
+        self.assertIsNone(server._serve_builder)
 
 
 if __name__ == "__main__":

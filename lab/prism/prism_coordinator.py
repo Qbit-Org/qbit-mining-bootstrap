@@ -1591,6 +1591,74 @@ class _ShareWindowSerialization:
             pass
 
 
+# JSONL protocol version this coordinator speaks with the --serve audit
+# builder. The daemon announces its version in a startup handshake; any
+# mismatch retires the daemon and every build falls back to one-shot mode.
+PRISM_SERVE_BUILDER_PROTOCOL_VERSION = 1
+# Parsed share windows the --serve daemon retains; the coordinator mirrors
+# the bound to predict which uploads the daemon still holds.
+PRISM_SERVE_BUILDER_WINDOW_CACHE_ENTRIES = 2
+
+
+class _ServeBuilderUnavailable(RuntimeError):
+    """Daemon anomaly; the build must transparently use one-shot mode."""
+
+
+@dataclass
+class _ServeBuilderClient:
+    """Line-oriented I/O state for one long-lived --serve audit builder."""
+
+    process: subprocess.Popen[bytes]
+    stdout_buffer: bytearray = field(default_factory=bytearray, repr=False)
+    # Mirrors the daemon's bounded LRU so requests can predict whether the
+    # window must ride along. Divergence is repaired by the daemon's
+    # needs_window response, never trusted blindly.
+    uploaded_windows: OrderedDict[str, None] = field(
+        default_factory=OrderedDict,
+        repr=False,
+    )
+
+    def note_uploaded_window(self, share_snapshot_sha256: str) -> None:
+        self.uploaded_windows.pop(share_snapshot_sha256, None)
+        self.uploaded_windows[share_snapshot_sha256] = None
+        while len(self.uploaded_windows) > PRISM_SERVE_BUILDER_WINDOW_CACHE_ENTRIES:
+            self.uploaded_windows.popitem(last=False)
+
+    def close(self) -> None:
+        # Tolerates lightweight process fakes used by embedders and tests,
+        # which do not necessarily expose the full Popen surface.
+        process = self.process
+        poll = getattr(process, "poll", None)
+        wait = getattr(process, "wait", None)
+        if callable(poll):
+            if poll() is None:
+                try:
+                    process.kill()
+                except (ProcessLookupError, OSError, AttributeError):
+                    pass
+            if callable(wait):
+                try:
+                    wait(timeout=5.0)
+                except (
+                    subprocess.TimeoutExpired,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    AttributeError,
+                ):
+                    pass
+        for stream in (
+            getattr(process, "stdin", None),
+            getattr(process, "stdout", None),
+        ):
+            if stream is None or not hasattr(stream, "close"):
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 @dataclass
 class _PayoutDeliveryAdmission:
     admitted: bool
@@ -3569,6 +3637,25 @@ class PrismCoordinator:
             # their debounce from the newest scheduled rebuild, whichever
             # path requested it.
             self._payout_artifact_last_schedule_monotonic: float | None = None
+        if not hasattr(self, "_serve_builder_lock"):
+            # Serializes daemon ownership per request. Contended builds do
+            # not queue behind the daemon; they take the one-shot path.
+            self._serve_builder_lock = threading.Lock()
+        if not hasattr(self, "_serve_builder"):
+            self._serve_builder: _ServeBuilderClient | None = None
+        if not hasattr(self, "_serve_builder_shutdown"):
+            self._serve_builder_shutdown = False
+        if not hasattr(self, "serve_builder_counts"):
+            # Guarded by _serve_builder_lock.
+            self.serve_builder_counts = {
+                "requests": 0,
+                "fallbacks": 0,
+                "spawns": 0,
+                "window_uploads": 0,
+            }
+        if not hasattr(self, "serve_builder_window_cache_counts"):
+            # Guarded by _serve_builder_lock.
+            self.serve_builder_window_cache_counts = {"hits": 0, "misses": 0}
         if not hasattr(self, "_payout_state_delivery_gate"):
             # Orders reconciliation mutations against final job-delivery
             # admission while preserving parallel sends to different miners.
@@ -8485,6 +8572,7 @@ class PrismCoordinator:
         self.shutdown_job_build_executor()
         self.shutdown_payout_artifact_executor()
         self.retire_share_window_spool()
+        self.shutdown_serve_builder()
 
     def retire_share_window_spool(self) -> None:
         """Release the cached share-window spool during shutdown.
@@ -14931,6 +15019,555 @@ class PrismCoordinator:
             cancellation=cancellation,
         )
 
+    def shutdown_serve_builder(self) -> None:
+        """Retire the persistent audit builder; builds revert to one-shot."""
+        self._ensure_job_cache_state()
+        with self._serve_builder_lock:
+            self._serve_builder_shutdown = True
+            client, self._serve_builder = self._serve_builder, None
+        if client is not None:
+            client.close()
+
+    def _retire_serve_builder_locked(self) -> None:
+        client, self._serve_builder = self._serve_builder, None
+        if client is not None:
+            client.close()
+
+    def _observe_builder_phase_metrics(self, metrics: dict[str, Any]) -> None:
+        """Apply one build's builder-side phase timings to refresh metrics.
+
+        Shared by the one-shot stderr metrics line and the --serve response
+        payload so serialization_copy and the builder phase histograms stay
+        comparable regardless of the transport that ran the build.
+        """
+        phase_seconds = metrics.get("phases_seconds", {})
+        if isinstance(phase_seconds, dict):
+            for phase in (
+                "payout_state_derivation",
+                "ctv_manifest_construction",
+                "coinbase_bundle_construction",
+                "signing_verification",
+            ):
+                elapsed = phase_seconds.get(phase)
+                if isinstance(elapsed, (int, float)):
+                    self._observe_tip_refresh_build_phase(
+                        phase,
+                        float(elapsed),
+                    )
+        rust_serialization = sum(
+            float(metrics.get(name, 0.0))
+            for name in (
+                "input_deserialization_seconds",
+                "output_serialization_seconds",
+            )
+        )
+        self._observe_tip_refresh_build_phase(
+            "serialization_copy",
+            rust_serialization,
+        )
+
+    def _spawn_serve_builder_locked(
+        self,
+        deadline: float,
+        cancellation: _JobBuildCancellation | None,
+    ) -> _ServeBuilderClient:
+        command = prism_tool_command("qbit-prism-build-audit-bundle") + [
+            "--serve",
+            "--signing-key-seed-hex",
+            self.signing_seed_hex,
+            "--ledger-signing-key-seed-hex",
+            self.ledger_attestation_signing_seed_hex,
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                # The daemon inherits the coordinator's stderr so a crash's
+                # diagnostics land in the journal instead of a per-request
+                # capture file that dies with the request.
+                stderr=None,
+                close_fds=True,
+            )
+        except OSError as exc:
+            raise _ServeBuilderUnavailable(
+                f"audit-builder daemon spawn failed: {exc}"
+            ) from exc
+        client = _ServeBuilderClient(process=process)
+        try:
+            assert process.stdin is not None and process.stdout is not None
+            os.set_blocking(process.stdin.fileno(), False)
+            os.set_blocking(process.stdout.fileno(), False)
+            handshake_line = self._serve_builder_read_line(
+                client,
+                deadline,
+                cancellation,
+                None,
+            )
+            handshake = json.loads(handshake_line)
+            if (
+                not isinstance(handshake, dict)
+                or handshake.get("event") != "handshake"
+                or handshake.get("protocol")
+                != PRISM_SERVE_BUILDER_PROTOCOL_VERSION
+            ):
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon announced an unsupported protocol"
+                )
+        except _ServeBuilderUnavailable:
+            client.close()
+            raise
+        except (OSError, ValueError, AttributeError) as exc:
+            client.close()
+            raise _ServeBuilderUnavailable(
+                f"audit-builder daemon handshake failed: {exc}"
+            ) from exc
+        except BaseException:
+            client.close()
+            raise
+        with self._job_build_scheduler_lock:
+            self.job_build_worker_counts["starts"] += 1
+        return client
+
+    def _serve_builder_read_line(
+        self,
+        client: _ServeBuilderClient,
+        deadline: float,
+        cancellation: _JobBuildCancellation | None,
+        build_control: _JobBundleBuildControl | None,
+    ) -> bytes:
+        stdout = client.process.stdout
+        assert stdout is not None
+        file_descriptor = stdout.fileno()
+        while True:
+            newline_index = client.stdout_buffer.find(b"\n")
+            if newline_index >= 0:
+                line = bytes(client.stdout_buffer[:newline_index])
+                del client.stdout_buffer[: newline_index + 1]
+                return line
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("serve builder response")
+            if (
+                build_control is not None
+                and build_control.cancel_event.is_set()
+            ):
+                raise _JobBundleBuildSuperseded(
+                    "audit-builder daemon request was canceled after supersession"
+                )
+            if time.monotonic() >= deadline:
+                with self._tip_refresh_metrics_lock:
+                    self.tip_refresh_worker_failures += 1
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon timed out"
+                )
+            try:
+                chunk = os.read(file_descriptor, 1 << 16)
+            except (BlockingIOError, InterruptedError):
+                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
+                continue
+            except OSError as exc:
+                raise _ServeBuilderUnavailable(
+                    f"audit-builder daemon read failed: {exc}"
+                ) from exc
+            if not chunk:
+                if (
+                    build_control is not None
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder daemon was terminated after supersession"
+                    )
+                with self._job_build_scheduler_lock:
+                    self.job_build_worker_counts["crashes"] += 1
+                    self._job_build_worker_restart_pending = True
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon exited mid-request"
+                )
+            client.stdout_buffer += chunk
+
+    def _serve_builder_write(
+        self,
+        client: _ServeBuilderClient,
+        data: bytes,
+        deadline: float,
+        cancellation: _JobBuildCancellation | None,
+        build_control: _JobBundleBuildControl | None,
+    ) -> int:
+        stdin = client.process.stdin
+        assert stdin is not None
+        file_descriptor = stdin.fileno()
+        remaining = memoryview(data)
+        written_total = 0
+        while remaining:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("serve builder request")
+            if (
+                build_control is not None
+                and build_control.cancel_event.is_set()
+            ):
+                raise _JobBundleBuildSuperseded(
+                    "audit-builder daemon request was canceled after supersession"
+                )
+            if time.monotonic() >= deadline:
+                with self._tip_refresh_metrics_lock:
+                    self.tip_refresh_worker_failures += 1
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon timed out"
+                )
+            try:
+                written = os.write(file_descriptor, remaining)
+            except (BlockingIOError, InterruptedError):
+                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
+                continue
+            except BrokenPipeError as exc:
+                if (
+                    build_control is not None
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder daemon was terminated after supersession"
+                    ) from exc
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon input pipe closed"
+                ) from exc
+            except OSError as exc:
+                raise _ServeBuilderUnavailable(
+                    f"audit-builder daemon write failed: {exc}"
+                ) from exc
+            if written <= 0:
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon input pipe closed"
+                )
+            written_total += written
+            remaining = remaining[written:]
+        return written_total
+
+    def _serve_builder_splice_spool(
+        self,
+        client: _ServeBuilderClient,
+        spool_file: Any,
+        spool_size: int,
+        deadline: float,
+        cancellation: _JobBuildCancellation | None,
+        build_control: _JobBundleBuildControl | None,
+    ) -> int:
+        stdin = client.process.stdin
+        assert stdin is not None
+        stdin_fd = stdin.fileno()
+        spool_fd = spool_file.fileno()
+        offset = 0
+        while offset < spool_size:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("serve builder request")
+            if (
+                build_control is not None
+                and build_control.cancel_event.is_set()
+            ):
+                raise _JobBundleBuildSuperseded(
+                    "audit-builder daemon request was canceled after supersession"
+                )
+            if time.monotonic() >= deadline:
+                with self._tip_refresh_metrics_lock:
+                    self.tip_refresh_worker_failures += 1
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon timed out"
+                )
+            try:
+                moved = os.splice(
+                    spool_fd,
+                    stdin_fd,
+                    min(PRISM_SPOOL_SPLICE_CHUNK_BYTES, spool_size - offset),
+                    offset_src=offset,
+                )
+            except (BlockingIOError, InterruptedError):
+                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
+                continue
+            except OSError as exc:
+                if (
+                    build_control is not None
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder daemon was terminated after supersession"
+                    ) from exc
+                raise _ServeBuilderUnavailable(
+                    f"audit-builder daemon spool transfer failed: {exc}"
+                ) from exc
+            if moved <= 0:
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon input pipe closed"
+                )
+            offset += moved
+        return offset
+
+    def _serve_builder_request_locked(
+        self,
+        client: _ServeBuilderClient,
+        *,
+        deadline: float,
+        payload: dict[str, object],
+        shares: list[dict[str, object]],
+        precomposed: tuple[str, str],
+        share_serialization: _ShareWindowSerialization,
+        cancellation: _JobBuildCancellation | None,
+        build_control: _JobBundleBuildControl | None,
+        record_phase_metrics: bool,
+    ) -> dict[str, Any]:
+        """One JSONL round trip; raises _ServeBuilderUnavailable on anomaly."""
+        share_snapshot_sha256 = share_serialization.share_snapshot_sha256
+        request_fields = dict(payload)
+        request_fields["window_key"] = {
+            "share_snapshot_sha256": share_snapshot_sha256,
+        }
+        prefix = json.dumps(request_fields, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        phases = self._job_build_phases()
+        input_bytes = 0
+
+        def send_request(upload_window: bool) -> None:
+            nonlocal input_bytes
+            serialization_started = time.monotonic()
+            try:
+                if not upload_window:
+                    input_bytes += self._serve_builder_write(
+                        client,
+                        prefix + b"\n",
+                        deadline,
+                        cancellation,
+                        build_control,
+                    )
+                    return
+                input_bytes += self._serve_builder_write(
+                    client,
+                    prefix[:-1],
+                    deadline,
+                    cancellation,
+                    build_control,
+                )
+                lease = (
+                    share_serialization.acquire_spooled_tail(shares)
+                    if hasattr(os, "splice")
+                    else None
+                )
+                if lease is not None:
+                    try:
+                        spool_file, spool_size = lease
+                        input_bytes += self._serve_builder_splice_spool(
+                            client,
+                            spool_file,
+                            spool_size,
+                            deadline,
+                            cancellation,
+                            build_control,
+                        )
+                    finally:
+                        share_serialization.release_spooled_tail()
+                else:
+                    identities_json, compact_shares_json = precomposed
+                    for fragment in (
+                        b',"compact_share_identities":',
+                        identities_json.encode("utf-8"),
+                        b',"compact_shares":',
+                        compact_shares_json.encode("utf-8"),
+                        b"}",
+                    ):
+                        input_bytes += self._serve_builder_write(
+                            client,
+                            fragment,
+                            deadline,
+                            cancellation,
+                            build_control,
+                        )
+                input_bytes += self._serve_builder_write(
+                    client,
+                    b"\n",
+                    deadline,
+                    cancellation,
+                    build_control,
+                )
+            finally:
+                elapsed = time.monotonic() - serialization_started
+                phases["input_serialization"] = (
+                    phases.get("input_serialization", 0.0) + elapsed
+                )
+                if record_phase_metrics:
+                    self._observe_tip_refresh_build_phase(
+                        "serialization_copy",
+                        elapsed,
+                    )
+
+        def read_response() -> tuple[dict[str, Any], bytes]:
+            worker_started = time.monotonic()
+            line = self._serve_builder_read_line(
+                client,
+                deadline,
+                cancellation,
+                build_control,
+            )
+            phases["worker"] = phases.get("worker", 0.0) + (
+                time.monotonic() - worker_started
+            )
+            output_started = time.monotonic()
+            try:
+                value = json.loads(line)
+            except ValueError as exc:
+                raise _ServeBuilderUnavailable(
+                    f"audit-builder daemon response was malformed: {exc}"
+                ) from exc
+            finally:
+                phases["output_serialization"] = phases.get(
+                    "output_serialization",
+                    0.0,
+                ) + (time.monotonic() - output_started)
+            if not isinstance(value, dict):
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon response was not an object"
+                )
+            return value, line
+
+        upload_window = share_snapshot_sha256 not in client.uploaded_windows
+        send_request(upload_window)
+        response, response_line = read_response()
+        if (
+            response.get("ok") is not True
+            and bool(response.get("needs_window"))
+            and not upload_window
+        ):
+            # The daemon evicted this window (respawn or generation churn the
+            # coordinator's mirror missed); repeat the request with the
+            # window riding along.
+            upload_window = True
+            send_request(True)
+            response, response_line = read_response()
+        if response.get("ok") is not True:
+            raise _ServeBuilderUnavailable(
+                "audit-builder daemon error: "
+                f"{response.get('error', 'unknown')}"
+            )
+        summary = response.get("summary")
+        if not isinstance(summary, dict):
+            raise _ServeBuilderUnavailable(
+                "audit-builder daemon returned a malformed summary"
+            )
+        if upload_window:
+            client.note_uploaded_window(share_snapshot_sha256)
+            self.serve_builder_counts["window_uploads"] += 1
+        window_cache = response.get("window_cache")
+        if isinstance(window_cache, dict):
+            outcome = "hits" if bool(window_cache.get("hit")) else "misses"
+            self.serve_builder_window_cache_counts[outcome] += 1
+        if record_phase_metrics:
+            metrics_value = response.get("metrics")
+            if isinstance(metrics_value, dict):
+                try:
+                    self._observe_builder_phase_metrics(metrics_value)
+                except (TypeError, ValueError):
+                    # Metrics are diagnostic only. A malformed timing payload
+                    # must never invalidate an otherwise valid summary.
+                    pass
+            self._record_tip_refresh_ipc_bytes("input", input_bytes)
+            self._record_tip_refresh_ipc_bytes("output", len(response_line))
+        return summary
+
+    def _build_audit_bundle_via_serve_builder(
+        self,
+        *,
+        payload: dict[str, object],
+        shares: list[dict[str, object]],
+        precomposed: tuple[str, str],
+        share_serialization: _ShareWindowSerialization,
+        cancellation: _JobBuildCancellation | None,
+        record_phase_metrics: bool,
+    ) -> dict[str, Any] | None:
+        """Build through the persistent daemon; None means use one-shot.
+
+        Any daemon anomaly -- spawn failure, handshake or protocol mismatch,
+        crash, timeout, malformed response -- retires the daemon and returns
+        None so the caller's one-shot path runs unchanged. Cancellation and
+        supersession raise exactly like the one-shot path instead of falling
+        back.
+        """
+        if not env_bool("PRISM_BUILDER_SERVE", "1"):
+            return None
+        self._ensure_job_cache_state()
+        if not getattr(self, "signing_seed_hex", None) or not getattr(
+            self,
+            "ledger_attestation_signing_seed_hex",
+            None,
+        ):
+            return None
+        if not self._serve_builder_lock.acquire(blocking=False):
+            # A concurrent build owns the daemon. One-shot is cheaper than
+            # queueing behind a multi-second build.
+            return None
+        try:
+            if self._serve_builder_shutdown:
+                return None
+            build_control = getattr(
+                self._job_build_phase_local,
+                "bundle_build_control",
+                None,
+            )
+            if not isinstance(build_control, _JobBundleBuildControl):
+                build_control = None
+            deadline = time.monotonic() + float(
+                getattr(
+                    self,
+                    "bundle_build_timeout_seconds",
+                    DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
+                )
+            )
+            try:
+                client = self._serve_builder
+                if client is not None and client.process.poll() is not None:
+                    self._retire_serve_builder_locked()
+                    client = None
+                if client is None:
+                    client = self._spawn_serve_builder_locked(
+                        deadline,
+                        cancellation,
+                    )
+                    self._serve_builder = client
+                    self.serve_builder_counts["spawns"] += 1
+                if build_control is not None:
+                    self._register_job_bundle_process(
+                        build_control,
+                        client.process,  # type: ignore[arg-type]
+                    )
+                summary = self._serve_builder_request_locked(
+                    client,
+                    deadline=deadline,
+                    payload=payload,
+                    shares=shares,
+                    precomposed=precomposed,
+                    share_serialization=share_serialization,
+                    cancellation=cancellation,
+                    build_control=build_control,
+                    record_phase_metrics=record_phase_metrics,
+                )
+            except (JobBuildCancelled, _JobBundleBuildSuperseded):
+                # The daemon stream is indeterminate mid-request; retire it
+                # so the replacement build starts clean.
+                self._retire_serve_builder_locked()
+                with self._job_build_scheduler_lock:
+                    self.job_build_worker_counts["terminations"] += 1
+                    self._job_build_worker_restart_pending = True
+                raise
+            except _ServeBuilderUnavailable:
+                self._retire_serve_builder_locked()
+                self.serve_builder_counts["fallbacks"] += 1
+                return None
+            except (OSError, ValueError):
+                self._retire_serve_builder_locked()
+                self.serve_builder_counts["fallbacks"] += 1
+                return None
+            else:
+                self.serve_builder_counts["requests"] += 1
+                return summary
+        finally:
+            self._serve_builder_lock.release()
+
     def build_audit_bundle(
         self,
         *,
@@ -14997,6 +15634,25 @@ class PrismCoordinator:
             payload["ctv_settlement"] = ctv_settlement
         if canonical_output_path is not None and summary_only:
             raise ValueError("canonical output and job summary output are mutually exclusive")
+        if (
+            summary_only
+            and canonical_output_path is None
+            and precomposed is not None
+            and share_serialization is not None
+        ):
+            # The persistent builder serves the artifact-backed summary path,
+            # whose window identity and cached fragments it can key on. Every
+            # anomaly falls back to the one-shot subprocess below.
+            served = self._build_audit_bundle_via_serve_builder(
+                payload=payload,
+                shares=shares,
+                precomposed=precomposed,
+                share_serialization=share_serialization,
+                cancellation=cancellation,
+                record_phase_metrics=record_phase_metrics,
+            )
+            if served is not None:
+                return served
         command = prism_tool_command("qbit-prism-build-audit-bundle") + [
             "--input",
             "-",
@@ -15341,31 +15997,8 @@ class PrismCoordinator:
                         )
                         try:
                             metrics = json.loads(raw_metrics)
-                            phase_seconds = metrics.get("phases_seconds", {})
-                            if isinstance(phase_seconds, dict):
-                                for phase in (
-                                    "payout_state_derivation",
-                                    "ctv_manifest_construction",
-                                    "coinbase_bundle_construction",
-                                    "signing_verification",
-                                ):
-                                    elapsed = phase_seconds.get(phase)
-                                    if isinstance(elapsed, (int, float)):
-                                        self._observe_tip_refresh_build_phase(
-                                            phase,
-                                            float(elapsed),
-                                        )
-                            rust_serialization = sum(
-                                float(metrics.get(name, 0.0))
-                                for name in (
-                                    "input_deserialization_seconds",
-                                    "output_serialization_seconds",
-                                )
-                            )
-                            self._observe_tip_refresh_build_phase(
-                                "serialization_copy",
-                                rust_serialization,
-                            )
+                            if isinstance(metrics, dict):
+                                self._observe_builder_phase_metrics(metrics)
                         except (TypeError, ValueError, json.JSONDecodeError):
                             # Metrics are diagnostic only. A malformed timing
                             # line must never invalidate an otherwise valid
@@ -20985,6 +21618,34 @@ class PrismCoordinator:
                 *[
                     f'qbit_prism_tip_refresh_builder_ipc_bytes_total{{direction="{direction}"}} {int(ipc_bytes.get(direction, 0))}'
                     for direction in ("input", "output")
+                ],
+            ]
+        )
+        self._ensure_job_cache_state()
+        with self._serve_builder_lock:
+            serve_counts = dict(self.serve_builder_counts)
+            serve_window_counts = dict(self.serve_builder_window_cache_counts)
+        lines.extend(
+            [
+                "# HELP qbit_prism_serve_builder_events_total Persistent audit-builder daemon lifecycle and request outcomes.",
+                "# TYPE qbit_prism_serve_builder_events_total counter",
+                *[
+                    f'qbit_prism_serve_builder_events_total{{event="{event}"}} {int(serve_counts.get(event, 0))}'
+                    for event in (
+                        "requests",
+                        "fallbacks",
+                        "spawns",
+                        "window_uploads",
+                    )
+                ],
+                "# HELP qbit_prism_serve_builder_window_cache_total Daemon parsed share-window cache outcomes.",
+                "# TYPE qbit_prism_serve_builder_window_cache_total counter",
+                *[
+                    f'qbit_prism_serve_builder_window_cache_total{{result="{result}"}} {int(serve_window_counts.get(counter_key, 0))}'
+                    for result, counter_key in (
+                        ("hit", "hits"),
+                        ("miss", "misses"),
+                    )
                 ],
             ]
         )
