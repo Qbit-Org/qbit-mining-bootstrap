@@ -387,28 +387,27 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
         )
 
     def test_payout_artifact_declares_its_own_snapshot_anchor(self) -> None:
-        # An artifact snapshot is taken at its own (possibly clamped) anchor.
-        # A bundle reusing the artifact must declare that anchor rather than
-        # the fresher job-issue time: a share that was already durable at
-        # artifact build time but stamped above the artifact's clamped anchor
-        # is excluded from the artifact by construction, yet a re-derivation
-        # at the job-issue anchor would include it.
+        # An artifact snapshot is taken at its own earlier anchor. A bundle
+        # reusing the artifact must declare that anchor rather than the
+        # fresher job-issue time: a share stamped between the two anchors is
+        # excluded from the artifact by construction, yet a re-derivation at
+        # the job-issue anchor would include it.
         ledger = AnchorRecordingLedger()
         server, _rpc = coordinator(ledger=ledger)
         install_fake_bundle_builder(server)
         artifacts = server.current_template_artifacts()
-        stamped_ms = now_ms() - 5
-        share = stamped_pending_share(stamped_ms)
-        self._hold_floor(server, share)
-
-        artifact = server._build_payout_ledger_artifact(
-            0, 0, artifacts.network_difficulty
-        )
+        artifact_anchor_ms = now_ms() - 6
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            return_value=artifact_anchor_ms,
+        ):
+            artifact = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
         assert artifact is not None
-        self.assertEqual(artifact.snapshot_anchor_ms, stamped_ms - 1)
-        self.assertEqual(ledger.anchors[-1], stamped_ms - 1)
+        self.assertEqual(artifact.snapshot_anchor_ms, artifact_anchor_ms)
+        self.assertEqual(ledger.anchors[-1], artifact_anchor_ms)
 
-        server._finish_pending_share_commit(share)
         # Construction re-validates that the passed artifact is the installed
         # current one.
         with server._job_cache_lock:
@@ -423,6 +422,41 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
             artifact.snapshot_anchor_ms,
         )
         self.assertGreater(bundle.issued_at_ms, int(artifact.snapshot_anchor_ms))
+
+    def test_artifact_paths_refuse_while_a_pending_commit_holds_the_floor(
+        self,
+    ) -> None:
+        # Stamping and writer enqueue are not atomic, so while a pending
+        # commit clamps the anchor a later-stamped share may already be
+        # durable; the global accepted count cannot be scoped to a clamped
+        # anchor, and neither artifact producer may bind them.
+        ledger = AnchorRecordingLedger()
+        server, _rpc = coordinator(ledger=ledger)
+        install_fake_bundle_builder(server)
+        artifacts = server.current_template_artifacts()
+        stamped_ms = now_ms() - 5
+        share = stamped_pending_share(stamped_ms)
+        self._hold_floor(server, share)
+        try:
+            self.assertIsNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            # Refused before paying the window walk.
+            self.assertEqual(ledger.snapshot_calls, 0)
+
+            # The synchronous build itself proceeds at the clamped anchor,
+            # but publishing its window for reuse is refused.
+            bundle = server.build_shared_job_bundle(artifacts, worker())
+            self.assertEqual(bundle.issued_at_ms, stamped_ms - 1)
+            with server._job_cache_lock:
+                self.assertIsNone(server._payout_ledger_artifact)
+                self.assertIsNone(
+                    server._job_build_anchor_counts.get(artifacts.generation)
+                )
+        finally:
+            server._finish_pending_share_commit(share)
 
 def mark_progress_healthy(server: PrismCoordinator) -> None:
     snapshot = server.fetch_qbit_tip_template_snapshot()
@@ -2281,13 +2315,18 @@ class JobBundleCacheTests(unittest.TestCase):
 
         # No share committed since: the speculative rebuild reads the same
         # window under a fresh anchor and must not spin the generation,
-        # which would re-key bundle lookups for nothing.
+        # which would re-key bundle lookups for nothing -- but it is still a
+        # successful preparation, so an accumulated re-arm backoff releases.
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_rearm_backoff = 4
         server._prepare_payout_ledger_artifact(
             server._payout_state_generation,
             artifacts.network_difficulty,
         )
         with server._job_cache_lock:
             self.assertIs(server._payout_ledger_artifact, installed)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 1)
 
         # A new durable share makes the rebuild a genuine replacement.
         server.ledger.miners = [*server.ledger.miners, "late-share"]
@@ -6036,6 +6075,11 @@ class ServeBuilderTests(unittest.TestCase):
                 counts = dict(server.serve_builder_counts)
                 self.assertIsNone(server._serve_builder)
             self.assertEqual(counts["fallbacks"], 1)
+            # The mismatched daemon was a real worker launch and must appear
+            # in the lifecycle totals alongside the one-shot fallback.
+            with server._job_build_scheduler_lock:
+                worker_counts = dict(server.job_build_worker_counts)
+            self.assertEqual(worker_counts["starts"], 2)
         finally:
             server.shutdown_serve_builder()
 
@@ -6077,6 +6121,68 @@ class ServeBuilderTests(unittest.TestCase):
         self.assertEqual(counts["fallbacks"], 1)
         self.assertEqual(counts["spawns"], 0)
         self.assertEqual(server.tip_refresh_worker_failures, 1)
+        # The live daemon killed at the handshake deadline is a recorded
+        # termination, and the one-shot replacement consumes the pending
+        # restart: two launches, one termination, one restart.
+        with server._job_build_scheduler_lock:
+            worker_counts = dict(server.job_build_worker_counts)
+            self.assertFalse(server._job_build_worker_restart_pending)
+        self.assertEqual(worker_counts["starts"], 2)
+        self.assertEqual(worker_counts["terminations"], 1)
+        self.assertEqual(worker_counts["restarts"], 1)
+
+    def test_idle_daemon_death_counts_crash_and_restart(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            first = self._build(server, shares, serialization, height=10)
+            self.assertEqual(first["transport"], "serve")
+            client = server._serve_builder
+            assert client is not None
+            client.process.kill()
+            client.process.wait(timeout=5)
+
+            second = self._build(server, shares, serialization, height=11)
+
+            self.assertEqual(second["transport"], "serve")
+            with server._job_build_scheduler_lock:
+                counts = dict(server.job_build_worker_counts)
+                self.assertFalse(server._job_build_worker_restart_pending)
+            self.assertEqual(counts["crashes"], 1)
+            self.assertEqual(counts["restarts"], 1)
+            self.assertEqual(server.tip_refresh_worker_restarts, 1)
+            with server._serve_builder_metrics_lock:
+                serve_counts = dict(server.serve_builder_counts)
+            self.assertEqual(serve_counts["spawns"], 2)
+            self.assertEqual(serve_counts["fallbacks"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_daemon_respawn_counts_as_worker_restart(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            # A prior worker ended abnormally (crash or supersession kill)
+            # with no immediate fallback consuming the flag; the replacement
+            # daemon spawn must claim the restart instead of leaking it to
+            # an unrelated later one-shot build.
+            server._ensure_tip_refresh_state()
+            with server._job_build_scheduler_lock:
+                server._job_build_worker_restart_pending = True
+
+            result = self._build(server, shares, serialization, height=10)
+
+            self.assertEqual(result["transport"], "serve")
+            with server._job_build_scheduler_lock:
+                counts = dict(server.job_build_worker_counts)
+                self.assertFalse(server._job_build_worker_restart_pending)
+            self.assertEqual(counts["restarts"], 1)
+            self.assertGreaterEqual(counts["starts"], 1)
+            self.assertEqual(server.tip_refresh_worker_restarts, 1)
+        finally:
+            server.shutdown_serve_builder()
 
     def test_daemon_detaches_from_build_control_after_request(self) -> None:
         server = self._coordinator()
