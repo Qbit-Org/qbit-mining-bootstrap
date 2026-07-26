@@ -3975,6 +3975,22 @@ class PrismCoordinator:
             except ProcessLookupError:
                 pass
 
+    def _unregister_job_bundle_process(
+        self,
+        control: _JobBundleBuildControl,
+        process: Any,
+    ) -> None:
+        """Detach a shared daemon from a build control after its request.
+
+        Registration makes supersession terminate the in-flight process.
+        Once this build's daemon request has completed, a later supersession
+        of the build must not kill the shared daemon out from under
+        whichever request owns it next.
+        """
+        with self._job_cache_lock:
+            if control.process is process:
+                control.process = None
+
     def _build_payout_ledger_artifact(
         self,
         expected_payout_state_generation: int,
@@ -15754,17 +15770,24 @@ class PrismCoordinator:
                         build_control,
                         client.process,  # type: ignore[arg-type]
                     )
-                summary = self._serve_builder_request_locked(
-                    client,
-                    deadline=deadline,
-                    payload=payload,
-                    shares=shares,
-                    precomposed=precomposed,
-                    share_serialization=share_serialization,
-                    cancellation=cancellation,
-                    build_control=build_control,
-                    record_phase_metrics=record_phase_metrics,
-                )
+                try:
+                    summary = self._serve_builder_request_locked(
+                        client,
+                        deadline=deadline,
+                        payload=payload,
+                        shares=shares,
+                        precomposed=precomposed,
+                        share_serialization=share_serialization,
+                        cancellation=cancellation,
+                        build_control=build_control,
+                        record_phase_metrics=record_phase_metrics,
+                    )
+                finally:
+                    if build_control is not None:
+                        self._unregister_job_bundle_process(
+                            build_control,
+                            client.process,
+                        )
             except (JobBuildCancelled, _JobBundleBuildSuperseded):
                 # The daemon stream is indeterminate mid-request; retire it
                 # so the replacement build starts clean.

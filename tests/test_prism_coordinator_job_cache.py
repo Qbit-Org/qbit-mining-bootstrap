@@ -5969,6 +5969,37 @@ class ServeBuilderTests(unittest.TestCase):
         self.assertEqual(counts["spawns"], 0)
         self.assertEqual(server.tip_refresh_worker_failures, 1)
 
+    def test_daemon_detaches_from_build_control_after_request(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        control = prism_coordinator_module._JobBundleBuildControl(
+            key=("serve-detach",),
+            previousblockhash="11" * 32,
+            payout_state_generation=0,
+            payout_artifact_generation=1,
+        )
+        with server._job_cache_lock:
+            server._active_job_bundle_builds[control.key] = control
+        server._job_build_phase_local.bundle_build_control = control
+        try:
+            result = self._build(server, shares, serialization, height=10)
+
+            self.assertEqual(result["transport"], "serve")
+            # The completed request detached the daemon: a late supersession
+            # of this build has no process reference left to terminate.
+            self.assertIsNone(control.process)
+            control.cancel_event.set()
+            client = server._serve_builder
+            assert client is not None
+            self.assertIsNone(client.process.poll())
+        finally:
+            server._job_build_phase_local.bundle_build_control = None
+            control.cancel_event.set()
+            with server._job_cache_lock:
+                server._active_job_bundle_builds.pop(control.key, None)
+            server.shutdown_serve_builder()
+
     def test_supersession_cancels_in_flight_daemon_request(self) -> None:
         server = self._coordinator()
         shares = [spool_share(seq) for seq in range(1, 4)]
