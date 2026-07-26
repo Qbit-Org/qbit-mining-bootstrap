@@ -192,6 +192,19 @@ class CkpoolRejectsPatchWiringTests(unittest.TestCase):
         self.assertIn("scripts/build-patched-ckpool.sh", makefile)
         self.assertIn("QBIT_CKPOOL_REJECTS_BIN", makefile)
 
+    def test_compose_forwards_bounded_worker_limit(self) -> None:
+        compose = (ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
+        ckpool_service = compose.split("\n  ckpool:\n", 1)[1].split(
+            "\n  permissionless-miner:\n", 1
+        )[0]
+        self.assertIn(
+            "QBIT_REJECTS_WORKER_LIMIT: ${QBIT_REJECTS_WORKER_LIMIT:-4096}",
+            ckpool_service,
+        )
+
+        env_example = (ROOT_DIR / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("QBIT_REJECTS_WORKER_LIMIT=4096", env_example.splitlines())
+
     def test_readme_documents_exporter_contract(self) -> None:
         readme = (ROOT_DIR / "ckpool" / "README.md").read_text(encoding="utf-8")
         self.assertIn("rejects.status", readme)
