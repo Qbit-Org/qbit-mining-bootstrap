@@ -12145,15 +12145,21 @@ class PrismCoordinator:
             reconcile_source = "serial"
             reconcile_join_started = time.monotonic()
             try:
-                if reconcile_memo_enabled and self._reorg_reconcile_memo_fresh(
-                    snapshot.bestblockhash
+                if (
+                    reconcile_memo_enabled
+                    and int(getattr(self, "tip_detection_epoch", 0))
+                    == reconcile_detection_epoch
+                    and self._reorg_reconcile_memo_fresh(
+                        snapshot.bestblockhash
+                    )
                 ):
-                    # Fresh at join time: armed before this poll, or by a
-                    # pass (prefetched or another caller's) that completed
-                    # while the template was fetched. Pre-fetch memo state is
-                    # never trusted here -- a detected flip-away-and-back
-                    # during the fetch evicts the entry and lands in the
-                    # serial branch below.
+                    # Fresh at join time AND no detection interleaved the
+                    # fetch. Both are required: a flip away and back evicts
+                    # the entry, but a pass whose execution straddled the
+                    # flip can re-arm it afterwards (the latest detected
+                    # hash matches again), and its proof belongs to the
+                    # closed epoch. Any epoch movement lands in the serial
+                    # re-prove branches below.
                     reconcile_source = (
                         "overlap" if reconcile_prefetch is not None else "memo_hit"
                     )
