@@ -6558,6 +6558,47 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
             metrics,
         )
 
+    def test_overlap_join_blocks_when_trust_flips_after_prefetch(self) -> None:
+        # The prefetched pass proves trust when it runs, up to a fetch
+        # window earlier. Headers running ahead without a best-hash change
+        # (an arriving reorg, no detection) must still block the refresh at
+        # the join, matching the memo branch's live trust check.
+        template = base_template()
+        server, _ = coordinator(template=template)
+        server.reorg_reconciler_enabled = True
+        tip = str(template["previousblockhash"])
+
+        class TrustFlipRpc(FakeRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblocktemplate":
+                    # Headers run ahead after the fetch: untrusted view with
+                    # no tip detection (epoch unchanged).
+                    self.blockchain_info["headers"] = 101
+                return super().call(method, params)
+
+        rpc = TrustFlipRpc(template, tip=tip)
+        server.rpc = rpc
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            lambda _tip: True
+        )
+
+        try:
+            with self.assertRaises(TemplateRefreshBlocked) as raised:
+                server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertIn("untrusted", str(raised.exception))
+        self.assertIsNone(state.active_job)
+
     def test_reconcile_prefetch_slot_is_reused_across_failed_attempts(self) -> None:
         # A refresh attempt that dies before its join (template-RPC outage)
         # must not queue another serialized pass per retry: the slot holds

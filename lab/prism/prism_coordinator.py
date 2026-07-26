@@ -12189,6 +12189,14 @@ class PrismCoordinator:
                                 snapshot.bestblockhash
                             )
                         )
+                    # A trust flip after the pass completed (headers running
+                    # ahead with no detection) is deliberately NOT re-checked
+                    # here: prepared fanout re-proves the live chain view in
+                    # _validate_prepared_tip_refresh, and sequential issuance
+                    # re-proves it per client in
+                    # ensure_reorg_reconciled_for_current_tip, whose trust
+                    # check is never cached. A second live check here would
+                    # break the one-trust-validation-per-refresh economy.
                 else:
                     if reconcile_prefetch is not None:
                         # The tip moved between the probe and the template
@@ -13753,6 +13761,7 @@ class PrismCoordinator:
         trusted: bool,
         clear_memo: bool = False,
         evict_others: bool = False,
+        proof_epoch: int | None = None,
     ) -> None:
         """Record a reconcile outcome in the per-tip trusted memo.
 
@@ -13765,7 +13774,11 @@ class PrismCoordinator:
         were taken against pre-mutation rows and no longer hold, even if the
         chain later flips back before any tip observation lands. A reconcile
         error passes clear_memo=True; a partially applied ledger mutation
-        invalidates every cached outcome.
+        invalidates every cached outcome. ``proof_epoch`` carries the
+        tip-detection epoch the pass started its reads in: arming is refused
+        when the epoch moved during the pass, so a flip away and back can
+        never re-arm an entry with a proof from the closed epoch (the
+        latest-detected-hash guard alone cannot see the round trip).
         """
 
         self._ensure_job_cache_state()
@@ -13791,6 +13804,13 @@ class PrismCoordinator:
                     # newest detected one; its epoch is over. Arming would
                     # re-add an entry the newer observation already evicted
                     # and let a flip-back reuse a pre-flip outcome.
+                    return
+                if proof_epoch is not None and proof_epoch != int(
+                    getattr(self, "tip_detection_epoch", 0)
+                ):
+                    # The pass spanned a detection cycle; every memo
+                    # consumer (refresh joins, initial-job and vardiff-idle
+                    # builds) must see a full re-proof instead.
                     return
                 memo[tip_hash] = now
                 memo.move_to_end(tip_hash)
@@ -14296,6 +14316,8 @@ class PrismCoordinator:
             ),
         )
 
+        proof_epoch = int(getattr(self, "tip_detection_epoch", 0))
+
         def finish(*, trusted: bool) -> dict[str, object]:
             with self.lock:
                 self.reorg_inactive_block_count += inactive_blocks_total
@@ -14312,6 +14334,7 @@ class PrismCoordinator:
                     or reactivated_blocks_total
                     or matured_payouts_total
                 ),
+                proof_epoch=proof_epoch,
             )
             summary["inactive_blocks"] = inactive_blocks_total
             summary["reactivated_blocks"] = reactivated_blocks_total
@@ -14334,6 +14357,11 @@ class PrismCoordinator:
             candidate_to_publish: PayoutStateCandidate | None = None
             error_candidate: PayoutStateCandidate | None = None
             attempt_trusted = True
+            # The memo entry this attempt may arm must prove state for the
+            # epoch its reads happen in; a detection cycle during the pass
+            # (away, or away and back) refuses the arm in
+            # _note_reorg_reconcile_outcome.
+            proof_epoch = int(getattr(self, "tip_detection_epoch", 0))
             try:
                 with self._payout_state_prepare_lock:
                     prepared_started = time.monotonic()

@@ -4553,6 +4553,37 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with server._reconcile_flight_lock:
             server._reconcile_flights.pop(tip, None)
 
+    def test_pass_spanning_detection_cycle_does_not_arm_memo(self) -> None:
+        # A pass whose reads straddle a flip away and back finishes with the
+        # latest detected hash matching its tip again, but its proof belongs
+        # to the closed epoch: arming must be refused so every memo consumer
+        # (refresh joins, initial-job and vardiff-idle builds) re-proves.
+        tip = "5c" * 32
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        ledger = ReorgLedger([])
+
+        def epoch_bumping_watch(*, active_tip_height: int) -> list[dict[str, object]]:
+            with server.lock:
+                server.tip_detection_epoch = (
+                    int(getattr(server, "tip_detection_epoch", 0)) + 2
+                )
+            return []
+
+        ledger.reorg_watch_blocks = epoch_bumping_watch  # type: ignore[method-assign]
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+
+        self.assertTrue(server.ensure_reorg_reconciled_for_tip(tip))
+
+        with server.lock:
+            self.assertNotIn(tip, server._reorg_reconcile_trusted_memo)
+
     def test_row_mutating_pass_evicts_other_tip_memo_entries(self) -> None:
         tip_a = "a1" * 32
         tip_b = "b2" * 32
