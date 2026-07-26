@@ -469,6 +469,35 @@ def worker_entry(status: dict[str, object], workername: str) -> dict[str, object
     raise AssertionError(f"worker {workername} missing from status: {workers}")
 
 
+def assert_snapshot_consistent(
+    test: unittest.TestCase, status: dict[str, object], *, expect_equal: bool = False
+) -> None:
+    """Pool and worker tallies are copied under one lock hold, so within any
+    single document per-bucket worker sums can never exceed the pool totals;
+    once all submitting workers are listed and traffic has settled, they are
+    equal. Checked on every observed document, including mid-load reads."""
+    pool = status["pool"]
+    workers = status["workers"]
+    assert isinstance(pool, dict) and isinstance(workers, list)
+    for name in ALL_BUCKETS:
+        pool_count, pool_diff = bucket(pool, name)
+        worker_counts = sum(bucket(entry, name)[0] for entry in workers)
+        worker_diffs = sum(bucket(entry, name)[1] for entry in workers)
+        if expect_equal:
+            test.assertEqual(worker_counts, pool_count, f"{name} counts diverge: {status}")
+            test.assertTrue(
+                math.isclose(worker_diffs, pool_diff, rel_tol=1e-9, abs_tol=1e-15),
+                f"{name} diffs diverge: {worker_diffs} != {pool_diff}",
+            )
+        else:
+            test.assertLessEqual(worker_counts, pool_count, f"{name} counts exceed pool: {status}")
+            test.assertLessEqual(
+                worker_diffs,
+                pool_diff * (1 + 1e-9) + 1e-15,
+                f"{name} diffs exceed pool: {worker_diffs} > {pool_diff}",
+            )
+
+
 def assert_share_response(
     test: unittest.TestCase, response: dict[str, object], *, accepted: bool, error: str | None
 ) -> None:
@@ -658,6 +687,7 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
 
                 worker = worker_entry(status, f"{USER_ADDRESS}.rig0")
                 self.expect_counts(worker, expected)
+                assert_snapshot_consistent(self, status, expect_equal=True)
 
                 # 60s cadence: the matching write is a later write of the
                 # same file, landing near a 60-second boundary.
@@ -810,12 +840,15 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                 submit_begin = time.monotonic()
 
                 # Poll the status file while the storm runs: every read must
-                # parse as complete JSON thanks to the tmp+rename contract.
+                # parse as complete JSON thanks to the tmp+rename contract,
+                # and every document must be an internally consistent
+                # snapshot even with submissions in flight.
                 polls = 0
                 while any(thread.is_alive() for thread in threads):
                     status = harness.read_status()
                     if status is not None:
                         self.assertIn("pool", status)
+                        assert_snapshot_consistent(self, status)
                         polls += 1
                     time.sleep(0.05)
                 for thread in threads:
@@ -841,11 +874,13 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                 pool = status["pool"]
 
                 # Exact conservation across four concurrent submitters:
-                # nothing lost, nothing double counted, no stray buckets.
+                # nothing lost, nothing double counted, no stray buckets,
+                # and worker rows summing exactly to the pool totals.
                 pool_expected = {reason: clients * count for reason, count in plan.items()}
                 self.expect_counts(pool, pool_expected)
                 total = sum(bucket(pool, reason)[0] for reason in REASONS)
                 self.assertEqual(total, clients * per_client_total)
+                assert_snapshot_consistent(self, status, expect_equal=True)
 
                 workers = status["workers"]
                 self.assertIsInstance(workers, list)

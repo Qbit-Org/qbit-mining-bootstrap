@@ -139,6 +139,12 @@ difficulty. Counters are cumulative since ckpool startup and reset on restart;
 exporters should treat them as monotonic counters and derive rates from
 deltas.
 
+The pool totals and all worker rows in one document are copied under a single
+lock hold, so each document is one consistent snapshot: per-bucket worker sums
+never exceed the pool totals. A worker authorized while a snapshot is being
+assembled appears from the next write, so worker sums can transiently trail
+pool totals by that worker's first submissions until the next cycle.
+
 Block-candidate outcomes are tracked in two additional buckets,
 `block_accepted` and `block_rejected`, counting local `submitblock` results
 for shares that met network difficulty. A candidate is also classified as a
