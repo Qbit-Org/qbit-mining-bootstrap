@@ -387,28 +387,27 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
         )
 
     def test_payout_artifact_declares_its_own_snapshot_anchor(self) -> None:
-        # An artifact snapshot is taken at its own (possibly clamped) anchor.
-        # A bundle reusing the artifact must declare that anchor rather than
-        # the fresher job-issue time: a share that was already durable at
-        # artifact build time but stamped above the artifact's clamped anchor
-        # is excluded from the artifact by construction, yet a re-derivation
-        # at the job-issue anchor would include it.
+        # An artifact snapshot is taken at its own earlier anchor. A bundle
+        # reusing the artifact must declare that anchor rather than the
+        # fresher job-issue time: a share stamped between the two anchors is
+        # excluded from the artifact by construction, yet a re-derivation at
+        # the job-issue anchor would include it.
         ledger = AnchorRecordingLedger()
         server, _rpc = coordinator(ledger=ledger)
         install_fake_bundle_builder(server)
         artifacts = server.current_template_artifacts()
-        stamped_ms = now_ms() - 5
-        share = stamped_pending_share(stamped_ms)
-        self._hold_floor(server, share)
-
-        artifact = server._build_payout_ledger_artifact(
-            0, 0, artifacts.network_difficulty
-        )
+        artifact_anchor_ms = now_ms() - 6
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            return_value=artifact_anchor_ms,
+        ):
+            artifact = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
         assert artifact is not None
-        self.assertEqual(artifact.snapshot_anchor_ms, stamped_ms - 1)
-        self.assertEqual(ledger.anchors[-1], stamped_ms - 1)
+        self.assertEqual(artifact.snapshot_anchor_ms, artifact_anchor_ms)
+        self.assertEqual(ledger.anchors[-1], artifact_anchor_ms)
 
-        server._finish_pending_share_commit(share)
         # Construction re-validates that the passed artifact is the installed
         # current one.
         with server._job_cache_lock:
@@ -423,6 +422,41 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
             artifact.snapshot_anchor_ms,
         )
         self.assertGreater(bundle.issued_at_ms, int(artifact.snapshot_anchor_ms))
+
+    def test_artifact_paths_refuse_while_a_pending_commit_holds_the_floor(
+        self,
+    ) -> None:
+        # Stamping and writer enqueue are not atomic, so while a pending
+        # commit clamps the anchor a later-stamped share may already be
+        # durable; the global accepted count cannot be scoped to a clamped
+        # anchor, and neither artifact producer may bind them.
+        ledger = AnchorRecordingLedger()
+        server, _rpc = coordinator(ledger=ledger)
+        install_fake_bundle_builder(server)
+        artifacts = server.current_template_artifacts()
+        stamped_ms = now_ms() - 5
+        share = stamped_pending_share(stamped_ms)
+        self._hold_floor(server, share)
+        try:
+            self.assertIsNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            # Refused before paying the window walk.
+            self.assertEqual(ledger.snapshot_calls, 0)
+
+            # The synchronous build itself proceeds at the clamped anchor,
+            # but publishing its window for reuse is refused.
+            bundle = server.build_shared_job_bundle(artifacts, worker())
+            self.assertEqual(bundle.issued_at_ms, stamped_ms - 1)
+            with server._job_cache_lock:
+                self.assertIsNone(server._payout_ledger_artifact)
+                self.assertIsNone(
+                    server._job_build_anchor_counts.get(artifacts.generation)
+                )
+        finally:
+            server._finish_pending_share_commit(share)
 
 def mark_progress_healthy(server: PrismCoordinator) -> None:
     snapshot = server.fetch_qbit_tip_template_snapshot()

@@ -4020,7 +4020,19 @@ class PrismCoordinator:
                     * PRISM_SNAPSHOT_WINDOW_MARGIN
                     * int(network_difficulty)
                 )
-                snapshot_anchor_ms = self._job_snapshot_anchor_ms(now_ms())
+                clamp_now_ms = now_ms()
+                snapshot_anchor_ms = self._job_snapshot_anchor_ms(clamp_now_ms)
+                if snapshot_anchor_ms != clamp_now_ms:
+                    # A pending commit holds the anchor floor. Stamping and
+                    # writer enqueue are not atomic, so a share stamped after
+                    # the floor holder may already be durable; the global
+                    # accepted count then cannot be scoped to the clamped
+                    # anchor, and publishing that pairing could let reuse
+                    # serve a window that omits a durable share. Abort before
+                    # paying the window walk; the re-arm backoff paces
+                    # retries and the floor drains within group-commit
+                    # latency.
+                    return None
                 records = list(
                     self.ledger.snapshot_at_job_issue(
                         snapshot_anchor_ms,
@@ -7064,9 +7076,20 @@ class PrismCoordinator:
                     count_before, _ = self.accepted_share_stats()
                 except Exception:
                     count_before = None
-                candidate_anchor_ms = self._job_snapshot_anchor_ms(now_ms())
+                clamp_now_ms = now_ms()
+                candidate_anchor_ms = self._job_snapshot_anchor_ms(
+                    clamp_now_ms
+                )
                 if count_before is None:
                     break
+                if candidate_anchor_ms != clamp_now_ms:
+                    # A pending commit clamps the anchor below now. Stamping
+                    # and writer enqueue are not atomic, so a share stamped
+                    # after the floor holder may already be durable and the
+                    # global count cannot be scoped to this anchor; retry
+                    # for a drained floor instead of storing an unbindable
+                    # count.
+                    continue
                 try:
                     count_after, _ = self.accepted_share_stats()
                 except Exception:
