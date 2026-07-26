@@ -2540,6 +2540,41 @@ class JobBundleCacheTests(unittest.TestCase):
         with server._payout_artifact_executor_lock:
             self.assertEqual(server._payout_artifact_rearm_backoff, 1)
 
+    def test_payout_publication_resets_rearm_backoff(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_rearm_backoff = 8
+
+        # The accepted-block preview publishes a new payout generation whose
+        # candidate artifact installs through the atomic publication pointer
+        # swap; the accumulated backoff must release with it.
+        parent_hash = str(rpc.template["previousblockhash"])
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        server._publish_accepted_block_payout_preview(
+            parent_hash,
+            [
+                {
+                    "recipient_id": "miner-a",
+                    "order_key": "miner-a",
+                    "p2mr_program_hex": "11" * 32,
+                    "balance_sats": 25,
+                }
+            ],
+        )
+
+        self.assertGreater(server._payout_state_generation, 0)
+        with server._job_cache_lock:
+            self.assertIsNotNone(server._payout_ledger_artifact)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 1)
+
     def test_landed_preview_suppresses_fence_failure_rearm(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
@@ -5350,6 +5385,27 @@ class JobBuildMetricsTests(unittest.TestCase):
         self.assertIn("qbit_prism_tip_refresh_bundle_queue_depth 0", metrics)
         self.assertIn("qbit_prism_tip_refresh_bundle_inflight 0", metrics)
         self.assertIn("qbit_prism_connected_clients 0", metrics)
+
+    def test_poll_observes_reorg_reconcile_phase(self) -> None:
+        # The reconcile stage runs serially before every refresh build; one
+        # poll must record exactly one reorg_reconcile phase observation.
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 1)
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_tip_refresh_bundle_phase_seconds_count{phase="reorg_reconcile"} 1',
+            metrics,
+        )
 
     def test_metrics_split_payout_preparation_publication_and_delivery(self) -> None:
         server, _ = coordinator()
