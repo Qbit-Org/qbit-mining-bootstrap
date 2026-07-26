@@ -19,17 +19,20 @@ from unittest.mock import patch
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
+from lab.prism import prism_coordinator as prism_coordinator_module
 from lab.prism.prism_coordinator import (
     ClientState,
     JobBuildSuperseded,
     MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     PRISM_REJECTION_REASON_IDS,
+    PayoutLedgerArtifact,
     PrismCoordinator,
     ShutdownInProgress,
     TemplateRefreshBlocked,
     WorkerIdentity,
     _PayoutStatePublicationBlocked,
+    _compact_share_payload,
     canonical_json_sha256,
     canonical_json_text,
     default_prism_coinbase_tag_hex,
@@ -5053,6 +5056,263 @@ class JobBuildMetricsTests(unittest.TestCase):
             metrics,
         )
         self.assertIn("qbit_prism_payout_candidates_discarded_total 0", metrics)
+
+
+def spool_share(seq: int) -> dict[str, object]:
+    return {
+        "share_seq": seq,
+        "share_id": f"share-{seq}",
+        "miner_id": "miner-a",
+        "order_key": "miner-a",
+        "p2mr_program_hex": "22" * 32,
+        "share_difficulty": 1,
+        "job_issued_at_ms": 1_700_000_000_000 + seq,
+        "accepted_at_ms": 1_700_000_000_100 + seq,
+        "credit_policy": None,
+    }
+
+
+ECHO_BUILDER_COMMAND = [
+    sys.executable,
+    "-c",
+    "import json,sys; json.dump({'received': json.load(sys.stdin)}, sys.stdout)",
+]
+
+
+class ShareWindowSpoolTests(unittest.TestCase):
+    """Spool-file handoff of the serialized share window to the builder."""
+
+    def _coordinator(self) -> PrismCoordinator:
+        server, _rpc = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        return server
+
+    def _ledger_artifact(
+        self,
+        shares: list[dict[str, object]],
+        *,
+        generation: int,
+    ) -> PayoutLedgerArtifact:
+        return PayoutLedgerArtifact(
+            generation=generation,
+            payout_state_generation=0,
+            network_difficulty=1,
+            accepted_share_count=len(shares),
+            shares_json=tuple(shares),
+            prior_balances=(),
+            prepared_monotonic=time.monotonic(),
+            snapshot_anchor_ms=None,
+        )
+
+    def _build_with_echo_builder(
+        self,
+        server: PrismCoordinator,
+        shares: list[dict[str, object]],
+        serialization: object,
+        *,
+        height: int,
+    ) -> dict[str, object]:
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=list(ECHO_BUILDER_COMMAND),
+        ):
+            return server.build_audit_bundle(
+                shares=shares,
+                found_block={
+                    "block_height": height,
+                    "coinbase_value_sats": 50_00000000,
+                    "network_difficulty": 1,
+                    "anchor_job_issued_at_ms": 1_700_000_000_000,
+                },
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                summary_only=True,
+                payout_policy={"policy": "day-one"},
+                share_serialization=serialization,  # type: ignore[arg-type]
+            )
+
+    def _expected_payload(
+        self,
+        shares: list[dict[str, object]],
+        *,
+        height: int,
+    ) -> dict[str, object]:
+        identities, compact_shares = _compact_share_payload(shares)
+        return {
+            "found_block": {
+                "block_height": height,
+                "coinbase_value_sats": 50_00000000,
+                "network_difficulty": 1,
+                "anchor_job_issued_at_ms": 1_700_000_000_000,
+            },
+            "prior_balances": [],
+            "payout_policy": {"policy": "day-one"},
+            "coinbase_script_sig_suffix_hex": "00",
+            "witness_merkle_leaves_hex": [],
+            "compact_share_identities": [
+                list(identity) for identity in identities
+            ],
+            "compact_shares": [list(share) for share in compact_shares],
+        }
+
+    def test_spool_feeds_builder_and_is_written_once_per_generation(
+        self,
+    ) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+        spool_creations: list[int] = []
+        real_spool_file = prism_coordinator_module._share_window_spool_file
+
+        def counting_spool_file() -> object:
+            spool_creations.append(1)
+            return real_spool_file()
+
+        with patch(
+            "lab.prism.prism_coordinator._share_window_spool_file",
+            side_effect=counting_spool_file,
+        ):
+            first = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=10,
+            )
+            second = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=11,
+            )
+
+        self.assertEqual(
+            first["received"],
+            self._expected_payload(shares, height=10),
+        )
+        self.assertEqual(
+            second["received"],
+            self._expected_payload(shares, height=11),
+        )
+        self.assertEqual(len(spool_creations), 1)
+
+    def test_spool_creation_failure_falls_back_to_pipe_writes(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator._share_window_spool_file",
+            side_effect=OSError("temp filesystem unavailable"),
+        ) as spool_factory:
+            first = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=10,
+            )
+            second = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=11,
+            )
+
+        self.assertEqual(
+            first["received"],
+            self._expected_payload(shares, height=10),
+        )
+        self.assertEqual(
+            second["received"],
+            self._expected_payload(shares, height=11),
+        )
+        # The failure is sticky: a broken temp filesystem is not retried on
+        # every subsequent build of the same generation.
+        self.assertEqual(spool_factory.call_count, 1)
+
+    def test_splice_failure_poisons_spool_and_falls_back_to_pipe(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.os.splice",
+            side_effect=OSError("splice unsupported"),
+        ):
+            first = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=10,
+            )
+        second = self._build_with_echo_builder(
+            server,
+            shares,
+            serialization,
+            height=11,
+        )
+
+        self.assertEqual(
+            first["received"],
+            self._expected_payload(shares, height=10),
+        )
+        self.assertEqual(
+            second["received"],
+            self._expected_payload(shares, height=11),
+        )
+        self.assertTrue(serialization._spool_failed)
+        self.assertIsNone(serialization._spool_file)
+
+    def test_generation_rotation_retires_spool_after_last_lease(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        first = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+        lease = first.acquire_spooled_tail(shares)
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        spool_file, spool_size = lease
+        self.assertGreater(spool_size, 0)
+
+        second = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=2),
+            shares,
+        )
+        self.assertIsNot(second, first)
+        # Retired: no new leases, but the in-flight transfer keeps the
+        # descriptor alive until it releases.
+        self.assertIsNone(first.acquire_spooled_tail(shares))
+        self.assertFalse(spool_file.closed)
+        first.release_spooled_tail()
+        self.assertTrue(spool_file.closed)
+
+    def test_shutdown_retires_current_spool(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+        lease = serialization.acquire_spooled_tail(shares)
+        assert lease is not None
+        serialization.release_spooled_tail()
+        self.assertFalse(lease[0].closed)
+
+        server.retire_share_window_spool()
+
+        self.assertTrue(lease[0].closed)
+        self.assertIsNone(serialization.acquire_spooled_tail(shares))
 
 
 if __name__ == "__main__":

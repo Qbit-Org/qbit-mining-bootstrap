@@ -92,6 +92,10 @@ DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS = 60.0
 # rebuild walks the full reward window; the floor keeps that CTE from running
 # continuously when shares land faster than a rebuild can complete.
 DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS = 5.0
+# Upper bound for one kernel transfer from the share-window spool file into
+# the audit builder's stdin pipe. The kernel clamps each call to the free
+# pipe capacity anyway; the bound only paces cancellation checkpoints.
+PRISM_SPOOL_SPLICE_CHUNK_BYTES = 1 << 20
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
 DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
@@ -1431,6 +1435,17 @@ class PayoutLedgerArtifact:
     snapshot_anchor_ms: int | None = None
 
 
+def _share_window_spool_file() -> Any:
+    """Anonymous spool file for the serialized share-window payload tail.
+
+    Created in the same temporary filesystem the builder's captured output
+    and stderr already use, and unlinked from birth: a crashed coordinator
+    can never strand a multi-megabyte window on disk, and closing the last
+    descriptor is the entire cleanup story.
+    """
+    return tempfile.TemporaryFile()
+
+
 @dataclass
 class _ShareWindowSerialization:
     """Derived share-window forms cached per payout generation.
@@ -1442,6 +1457,13 @@ class _ShareWindowSerialization:
     build serialized the whole window under the GIL each time. The compact
     fragments are derived lazily by the first audit-builder invocation --
     embedders that replace the builder never require the compact schema.
+
+    The fragments' invariant byte encoding is additionally spooled to an
+    anonymous temp file once per key, so every build after the first can feed
+    the audit builder's stdin through kernel transfers instead of re-writing
+    megabytes of unchanged JSON through Python. Spool access is leased:
+    rotation to a new generation retires the spool, and the descriptor closes
+    when the last in-flight transfer releases it, never underneath one.
     """
 
     key: tuple[int, int, int]
@@ -1456,6 +1478,15 @@ class _ShareWindowSerialization:
         repr=False,
     )
     _compact_shares_json: str | None = field(default=None, repr=False)
+    _spool_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+    )
+    _spool_file: Any = field(default=None, repr=False)
+    _spool_size: int = field(default=0, repr=False)
+    _spool_failed: bool = field(default=False, repr=False)
+    _spool_retired: bool = field(default=False, repr=False)
+    _spool_leases: int = field(default=0, repr=False)
 
     def compact_fragments(
         self,
@@ -1484,6 +1515,80 @@ class _ShareWindowSerialization:
                 self._compact_share_identities_json,
                 self._compact_shares_json,
             )
+
+    def acquire_spooled_tail(
+        self,
+        shares: list[dict[str, object]],
+    ) -> tuple[Any, int] | None:
+        """Lease the spooled payload tail, writing it on first use.
+
+        Returns the open spool file and its byte size, or None when spooling
+        is unavailable (creation failed earlier, a transfer poisoned it, or
+        the generation was retired). The caller must pair a successful lease
+        with release_spooled_tail once its transfer is finished.
+        """
+        with self._spool_lock:
+            if self._spool_failed or self._spool_retired:
+                return None
+            if self._spool_file is None:
+                identities_json, compact_shares_json = self.compact_fragments(
+                    shares
+                )
+                spool = None
+                try:
+                    spool = _share_window_spool_file()
+                    spool.write(b',"compact_share_identities":')
+                    spool.write(identities_json.encode("utf-8"))
+                    spool.write(b',"compact_shares":')
+                    spool.write(compact_shares_json.encode("utf-8"))
+                    spool.write(b"}")
+                    spool.flush()
+                    size = spool.seek(0, os.SEEK_END)
+                except (OSError, ValueError):
+                    # Spooling is an optimization; the in-memory pipe path
+                    # remains authoritative. Failure is sticky so a broken
+                    # temp filesystem is not retried on every build.
+                    self._spool_failed = True
+                    if spool is not None:
+                        try:
+                            spool.close()
+                        except OSError:
+                            pass
+                    return None
+                self._spool_file = spool
+                self._spool_size = int(size)
+            self._spool_leases += 1
+            return self._spool_file, self._spool_size
+
+    def release_spooled_tail(self) -> None:
+        with self._spool_lock:
+            self._spool_leases -= 1
+            self._close_spool_if_unused_locked()
+
+    def mark_spool_failed(self) -> None:
+        """Poison the spool after a transfer-side failure (still leased)."""
+        with self._spool_lock:
+            self._spool_failed = True
+
+    def retire_spool(self) -> None:
+        """Stop new leases and close the file once in-flight ones finish."""
+        with self._spool_lock:
+            self._spool_retired = True
+            self._close_spool_if_unused_locked()
+
+    def _close_spool_if_unused_locked(self) -> None:
+        if (
+            self._spool_leases > 0
+            or self._spool_file is None
+            or not (self._spool_retired or self._spool_failed)
+        ):
+            return
+        spool, self._spool_file = self._spool_file, None
+        self._spool_size = 0
+        try:
+            spool.close()
+        except OSError:
+            pass
 
 
 @dataclass
@@ -7287,7 +7392,11 @@ class PrismCoordinator:
                 share_snapshot_sha256=canonical_json_sha256(shares),
             )
             self._share_window_serialization = serialization
-            return serialization
+        if cached is not None:
+            # Generation rotation retires the replaced spool; a build still
+            # holding a lease keeps the descriptor alive until it releases.
+            cached.retire_spool()
+        return serialization
 
     def build_shared_job_bundle(
         self,
@@ -8375,6 +8484,19 @@ class PrismCoordinator:
             executor.shutdown(wait=True)
         self.shutdown_job_build_executor()
         self.shutdown_payout_artifact_executor()
+        self.retire_share_window_spool()
+
+    def retire_share_window_spool(self) -> None:
+        """Release the cached share-window spool during shutdown.
+
+        Runs after the build executors quiesce, so any lease still held by a
+        draining transfer defers the close to its own release.
+        """
+        self._ensure_job_cache_state()
+        with self._share_window_serialization_lock:
+            serialization = self._share_window_serialization
+        if serialization is not None:
+            serialization.retire_spool()
 
     def _cancel_initial_job_future(self, future: Future[bool]) -> bool:
         """Cancel one initial-job future and account physical queue removal."""
@@ -15002,20 +15124,85 @@ class PrismCoordinator:
                         return len(value)
 
                 serialization_started = time.monotonic()
+                spool_lease: tuple[Any, int] | None = None
                 try:
                     sink = _CancelableInput(process.stdin)
-                    if precomposed is not None:
-                        # Per-build fields are encoded fresh; the dominant
-                        # share-window fragments are the cached per-generation
-                        # strings, piped without re-encoding the share tree.
+
+                    def write_precomposed_tail() -> None:
+                        assert precomposed is not None
                         identities_json, compact_shares_json = precomposed
-                        prefix = json.dumps(payload, separators=(",", ":"))
-                        sink.write(prefix[:-1])
                         sink.write(',"compact_share_identities":')
                         sink.write(identities_json)
                         sink.write(',"compact_shares":')
                         sink.write(compact_shares_json)
                         sink.write("}")
+
+                    if (
+                        precomposed is not None
+                        and share_serialization is not None
+                        and sink.file_descriptor is not None
+                        and hasattr(os, "splice")
+                    ):
+                        spool_lease = share_serialization.acquire_spooled_tail(
+                            shares
+                        )
+                    if precomposed is not None:
+                        # Per-build fields are encoded fresh; the dominant
+                        # share-window fragments stream from the spool file
+                        # written once per generation (kernel moves the bytes
+                        # into the pipe), falling back to the cached strings
+                        # whenever no spool is available.
+                        prefix = json.dumps(payload, separators=(",", ":"))
+                        sink.write(prefix[:-1])
+                        spool_transferred = False
+                        if spool_lease is not None:
+                            spool_file, spool_size = spool_lease
+                            spool_fd = spool_file.fileno()
+                            offset = 0
+                            while offset < spool_size:
+                                sink.check_cancelled()
+                                try:
+                                    moved = os.splice(
+                                        spool_fd,
+                                        sink.file_descriptor,
+                                        min(
+                                            PRISM_SPOOL_SPLICE_CHUNK_BYTES,
+                                            spool_size - offset,
+                                        ),
+                                        offset_src=offset,
+                                    )
+                                except (BlockingIOError, InterruptedError):
+                                    time.sleep(
+                                        min(
+                                            0.02,
+                                            PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
+                                        )
+                                    )
+                                    continue
+                                except OSError:
+                                    if offset:
+                                        # Part of the tail already reached the
+                                        # pipe; the stream cannot be repaired
+                                        # by re-writing it from memory.
+                                        raise
+                                    # Kernel transfer unsupported for this
+                                    # spool (filesystem without splice
+                                    # support, for example). Poison the spool
+                                    # and stream the cached strings; nothing
+                                    # of the tail reached the pipe yet.
+                                    share_serialization.mark_spool_failed()
+                                    break
+                                if moved <= 0:
+                                    raise BrokenPipeError(
+                                        "audit-builder input pipe closed"
+                                    )
+                                offset += moved
+                                input_byte_count += moved
+                            spool_transferred = (
+                                spool_size > 0 and offset >= spool_size
+                            )
+                        if not spool_transferred:
+                            write_precomposed_tail()
                     else:
                         # iterencode writes bounded fragments to the child
                         # instead of allocating a second full JSON
@@ -15043,6 +15230,8 @@ class PrismCoordinator:
                             self._job_build_worker_restart_pending = True
                     raise
                 finally:
+                    if spool_lease is not None and share_serialization is not None:
+                        share_serialization.release_spooled_tail()
                     phases = self._job_build_phases()
                     phases["input_serialization"] = phases.get(
                         "input_serialization",
