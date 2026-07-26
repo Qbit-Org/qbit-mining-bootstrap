@@ -205,6 +205,7 @@ PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS = (1, 2, 5, 10, 25, 50, 100)
 PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_TIP_REFRESH_BUILD_PHASES = (
+    "reorg_reconcile",
     "ledger_snapshot",
     "payout_state_derivation",
     "ctv_manifest_construction",
@@ -11228,6 +11229,7 @@ class PrismCoordinator:
                 snapshot,
                 observation_sequence,
             )
+            reconcile_started = time.monotonic()
             try:
                 reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
                     snapshot.bestblockhash
@@ -11244,6 +11246,14 @@ class PrismCoordinator:
                 raise TemplateRefreshBlocked(
                     "qbit reorg reconciliation failed before refresh preparation"
                 ) from exc
+            finally:
+                # The only serial pre-build stage without a phase metric;
+                # observe failures too so a slow reconcile that blocks the
+                # refresh still shows up in the histogram.
+                self._observe_tip_refresh_build_phase(
+                    "reorg_reconcile",
+                    time.monotonic() - reconcile_started,
+                )
             if not reorg_reconciled:
                 raise TemplateRefreshBlocked(
                     "qbit chain view remained untrusted after reorg reconciliation"
