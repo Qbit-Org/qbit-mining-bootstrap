@@ -6389,6 +6389,14 @@ class PrismCoordinator:
         if published_generation is None:
             self._record_discarded_payout_candidate()
             return None
+        # A publication is a fresh start for speculative preparation: the
+        # candidate artifact installs through the atomic pointer swap above
+        # (not _install_payout_ledger_artifact), so whatever re-arm backoff
+        # pre-publication share traffic accumulated must be released here or
+        # a share landing right after publication would stay suppressed for
+        # the whole scaled interval.
+        with self._payout_artifact_executor_lock:
+            self._payout_artifact_rearm_backoff = 1
         self._cancel_obsolete_job_bundle_builds(
             payout_state_generation=published_generation
         )

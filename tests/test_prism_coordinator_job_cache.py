@@ -2540,6 +2540,41 @@ class JobBundleCacheTests(unittest.TestCase):
         with server._payout_artifact_executor_lock:
             self.assertEqual(server._payout_artifact_rearm_backoff, 1)
 
+    def test_payout_publication_resets_rearm_backoff(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_rearm_backoff = 8
+
+        # The accepted-block preview publishes a new payout generation whose
+        # candidate artifact installs through the atomic publication pointer
+        # swap; the accumulated backoff must release with it.
+        parent_hash = str(rpc.template["previousblockhash"])
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        server._publish_accepted_block_payout_preview(
+            parent_hash,
+            [
+                {
+                    "recipient_id": "miner-a",
+                    "order_key": "miner-a",
+                    "p2mr_program_hex": "11" * 32,
+                    "balance_sats": 25,
+                }
+            ],
+        )
+
+        self.assertGreater(server._payout_state_generation, 0)
+        with server._job_cache_lock:
+            self.assertIsNotNone(server._payout_ledger_artifact)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 1)
+
     def test_landed_preview_suppresses_fence_failure_rearm(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
