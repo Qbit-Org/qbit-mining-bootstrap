@@ -2226,6 +2226,41 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(len(rebuilt.shares_json), 4)
         self.assertEqual(recorded["calls"], 2)
 
+    def test_same_window_background_rebuild_keeps_artifact_generation(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        server.shared_job_bundle(artifacts, mode="ready")
+        with server._job_cache_lock:
+            installed = server._payout_ledger_artifact
+        assert installed is not None
+
+        # No share committed since: the speculative rebuild reads the same
+        # window under a fresh anchor and must not spin the generation,
+        # which would re-key bundle lookups for nothing.
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            self.assertIs(server._payout_ledger_artifact, installed)
+
+        # A new durable share makes the rebuild a genuine replacement.
+        server.ledger.miners = [*server.ledger.miners, "late-share"]
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            replaced = server._payout_ledger_artifact
+        assert replaced is not None
+        self.assertGreater(replaced.generation, installed.generation)
+        self.assertEqual(replaced.accepted_share_count, 4)
+
     def test_fence_failure_rearms_artifact_preparation_with_debounce(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
@@ -5593,6 +5628,33 @@ class ServeBuilderTests(unittest.TestCase):
         with server._serve_builder_lock:
             counts = dict(server.serve_builder_counts)
         self.assertEqual(counts["spawns"], 0)
+
+    def test_daemon_timeout_fallback_shares_the_build_deadline(self) -> None:
+        server = self._coordinator()
+        # An already-exhausted budget: the daemon attempt must not grant the
+        # one-shot fallback a fresh full deadline, and the timeout is counted
+        # as one worker failure, not two.
+        server.bundle_build_timeout_seconds = 0.0
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "qbit-prism-build-audit-bundle timed out",
+        ):
+            self._build(
+                server,
+                shares,
+                serialization,
+                height=10,
+                mode="hang-after-request",
+            )
+
+        with server._serve_builder_lock:
+            counts = dict(server.serve_builder_counts)
+        self.assertEqual(counts["fallbacks"], 1)
+        self.assertEqual(counts["spawns"], 0)
+        self.assertEqual(server.tip_refresh_worker_failures, 1)
 
     def test_supersession_cancels_in_flight_daemon_request(self) -> None:
         server = self._coordinator()

@@ -4053,8 +4053,10 @@ class PrismCoordinator:
         Freshness-ordered and idempotent: every waiter on a shared build
         flight re-runs cache publication with the same prepared artifact, and
         a background rebuild can finish in between. Re-installing an equal or
-        older snapshot would spin the artifact generation (re-keying bundle
-        lookups) without changing reuse fidelity.
+        older snapshot -- or a byte-identical window under a fresh anchor,
+        which a speculative rebuild produces whenever no share committed
+        since the installed artifact -- would spin the artifact generation
+        (re-keying bundle lookups) without changing reuse fidelity.
         """
         with self._job_cache_lock:
             if artifact.payout_state_generation != self._payout_state_generation:
@@ -4064,7 +4066,16 @@ class PrismCoordinator:
                 current is not None
                 and current.payout_state_generation
                 == artifact.payout_state_generation
-                and current.prepared_monotonic >= artifact.prepared_monotonic
+                and (
+                    current.prepared_monotonic >= artifact.prepared_monotonic
+                    or (
+                        current.accepted_share_count
+                        == artifact.accepted_share_count
+                        and current.share_snapshot_sha256 is not None
+                        and current.share_snapshot_sha256
+                        == artifact.share_snapshot_sha256
+                    )
+                )
             ):
                 return
             self._payout_ledger_artifact_generation += 1
@@ -15268,8 +15279,9 @@ class PrismCoordinator:
                     "audit-builder daemon request was canceled after supersession"
                 )
             if time.monotonic() >= deadline:
-                with self._tip_refresh_metrics_lock:
-                    self.tip_refresh_worker_failures += 1
+                # Not counted as a worker failure here: the fallback one-shot
+                # runs against this same exhausted deadline and its own
+                # timeout path records the failure exactly once.
                 raise _ServeBuilderUnavailable(
                     "audit-builder daemon timed out"
                 )
@@ -15322,8 +15334,9 @@ class PrismCoordinator:
                     "audit-builder daemon request was canceled after supersession"
                 )
             if time.monotonic() >= deadline:
-                with self._tip_refresh_metrics_lock:
-                    self.tip_refresh_worker_failures += 1
+                # Not counted as a worker failure here: the fallback one-shot
+                # runs against this same exhausted deadline and its own
+                # timeout path records the failure exactly once.
                 raise _ServeBuilderUnavailable(
                     "audit-builder daemon timed out"
                 )
@@ -15380,8 +15393,9 @@ class PrismCoordinator:
                     "audit-builder daemon request was canceled after supersession"
                 )
             if time.monotonic() >= deadline:
-                with self._tip_refresh_metrics_lock:
-                    self.tip_refresh_worker_failures += 1
+                # Not counted as a worker failure here: the fallback one-shot
+                # runs against this same exhausted deadline and its own
+                # timeout path records the failure exactly once.
                 raise _ServeBuilderUnavailable(
                     "audit-builder daemon timed out"
                 )
@@ -15592,14 +15606,16 @@ class PrismCoordinator:
         share_serialization: _ShareWindowSerialization,
         cancellation: _JobBuildCancellation | None,
         record_phase_metrics: bool,
+        deadline: float,
     ) -> dict[str, Any] | None:
         """Build through the persistent daemon; None means use one-shot.
 
         Any daemon anomaly -- spawn failure, handshake or protocol mismatch,
         crash, timeout, malformed response -- retires the daemon and returns
-        None so the caller's one-shot path runs unchanged. Cancellation and
-        supersession raise exactly like the one-shot path instead of falling
-        back.
+        None so the caller's one-shot path runs unchanged against the same
+        deadline (whatever budget the daemon consumed stays consumed).
+        Cancellation and supersession raise exactly like the one-shot path
+        instead of falling back.
         """
         if not env_bool("PRISM_BUILDER_SERVE", "1"):
             return None
@@ -15624,13 +15640,6 @@ class PrismCoordinator:
             )
             if not isinstance(build_control, _JobBundleBuildControl):
                 build_control = None
-            deadline = time.monotonic() + float(
-                getattr(
-                    self,
-                    "bundle_build_timeout_seconds",
-                    DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
-                )
-            )
             try:
                 client = self._serve_builder
                 if client is not None and client.process.poll() is not None:
@@ -15747,6 +15756,17 @@ class PrismCoordinator:
             payload["ctv_settlement"] = ctv_settlement
         if canonical_output_path is not None and summary_only:
             raise ValueError("canonical output and job summary output are mutually exclusive")
+        # One deadline covers the whole build regardless of transport: a
+        # daemon anomaly falls back to the one-shot subprocess with only the
+        # remaining budget, so a hung daemon cannot double the configured
+        # limit while progress health already treats one limit as stuck.
+        build_deadline = time.monotonic() + float(
+            getattr(
+                self,
+                "bundle_build_timeout_seconds",
+                DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
+            )
+        )
         if (
             summary_only
             and canonical_output_path is None
@@ -15763,6 +15783,7 @@ class PrismCoordinator:
                 share_serialization=share_serialization,
                 cancellation=cancellation,
                 record_phase_metrics=record_phase_metrics,
+                deadline=build_deadline,
             )
             if served is not None:
                 return served
@@ -15818,14 +15839,7 @@ class PrismCoordinator:
                     self.job_build_worker_counts["starts"] += 1
                 assert process.stdin is not None
                 input_byte_count = 0
-                builder_started = time.monotonic()
-                worker_deadline = builder_started + float(
-                    getattr(
-                        self,
-                        "bundle_build_timeout_seconds",
-                        DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
-                    )
-                )
+                worker_deadline = build_deadline
                 coordinator = self
 
                 class _CancelableInput:

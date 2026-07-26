@@ -104,6 +104,16 @@ struct ServeWindowCacheStats {
     entries: usize,
 }
 
+#[derive(Serialize)]
+struct ServeResponse<'a> {
+    ok: bool,
+    // Pre-encoded during the measured output window and embedded verbatim,
+    // so the envelope write never re-serializes the summary.
+    summary: &'a serde_json::value::RawValue,
+    metrics: BuildPhaseMetrics,
+    window_cache: ServeWindowCacheStats,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("qbit-prism-build-audit-bundle: {error}");
@@ -416,28 +426,33 @@ fn serve_requests(
                 continue;
             }
         };
+        // The summary is fully encoded inside the measured window, exactly
+        // the serialization work the one-shot mode times for its stdout
+        // body; the envelope only appends small fixed-size fields around the
+        // pre-encoded bytes.
         let output_started = Instant::now();
-        let summary = serde_json::to_value(&JobBuildSummary {
+        let summary_json = serde_json::to_string(&JobBuildSummary {
             found_block: &bundle.found_block,
             signed_coinbase_manifest: &bundle.signed_coinbase_manifest,
             payout_policy_manifest: &bundle.payout_policy_manifest,
         })?;
         let output_serialization_seconds = output_started.elapsed().as_secs_f64();
-        let response = serde_json::json!({
-            "ok": true,
-            "summary": summary,
-            "metrics": BuildPhaseMetrics {
+        let summary_raw = serde_json::value::RawValue::from_string(summary_json)?;
+        let response = ServeResponse {
+            ok: true,
+            summary: &summary_raw,
+            metrics: BuildPhaseMetrics {
                 input_deserialization_seconds,
                 phases_seconds,
                 output_serialization_seconds,
             },
-            "window_cache": ServeWindowCacheStats {
+            window_cache: ServeWindowCacheStats {
                 hit: cache_hit,
                 hits: cache_hits,
                 misses: cache_misses,
                 entries: window_cache.len(),
             },
-        });
+        };
         let mut out = stdout.lock();
         serde_json::to_writer(&mut out, &response)?;
         writeln!(out)?;
