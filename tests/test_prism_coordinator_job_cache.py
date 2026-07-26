@@ -2461,6 +2461,67 @@ class JobBundleCacheTests(unittest.TestCase):
                 ),
             )
 
+    def test_aborted_speculative_rebuilds_back_off_and_reset(self) -> None:
+        class MidReadLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.commit_mid_read = True
+
+            def snapshot_at_job_issue(
+                self,
+                anchor_job_issued_at_ms: int,
+                *,
+                window_weight: int | None = None,
+            ) -> list[FakeShare]:
+                result = super().snapshot_at_job_issue(
+                    anchor_job_issued_at_ms,
+                    window_weight=window_weight,
+                )
+                if self.commit_mid_read:
+                    self.miners = [
+                        *self.miners,
+                        f"mid-read-{self.snapshot_calls}",
+                    ]
+                return result
+
+        ledger = MidReadLedger()
+        server, rpc = coordinator(ledger=ledger)
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.payout_artifact_rearm_min_seconds = 5.0
+
+        # Continuous writes abort the fenced rebuild; each abort doubles the
+        # re-arm interval instead of retrying the reward-window walk at the
+        # floor forever.
+        server._prepare_payout_ledger_artifact(0, artifacts.network_difficulty)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 2)
+        server._prepare_payout_ledger_artifact(0, artifacts.network_difficulty)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 4)
+
+        # Elapsed time beyond the floor but inside the scaled interval must
+        # not re-arm.
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_last_schedule_monotonic = (
+                time.monotonic() - 10.0
+            )
+        server._rearm_payout_ledger_artifact_after_fence_failure(
+            0,
+            artifacts.network_difficulty,
+        )
+        with server._payout_artifact_executor_lock:
+            self.assertIsNone(server._payout_artifact_requested)
+
+        # A rebuild that finally arms resets the backoff to the floor.
+        ledger.commit_mid_read = False
+        server._prepare_payout_ledger_artifact(0, artifacts.network_difficulty)
+        with server._job_cache_lock:
+            self.assertIsNotNone(server._payout_ledger_artifact)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 1)
+
     def test_landed_preview_suppresses_fence_failure_rearm(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)

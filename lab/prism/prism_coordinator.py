@@ -92,6 +92,13 @@ DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS = 60.0
 # rebuild walks the full reward window; the floor keeps that CTE from running
 # continuously when shares land faster than a rebuild can complete.
 DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS = 5.0
+# Consecutive aborted speculative rebuilds double the re-arm interval up to
+# this multiplier (80s at the default floor). Under sustained share traffic
+# the exact-count publication fence keeps aborting rebuilds; backing off
+# stops the reward-window CTE from cycling -- and from holding the payout
+# preparation lock tip builds also need -- while writes stay continuous. Any
+# successful install or event-driven preparation resets the backoff.
+PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP = 16
 # Upper bound for one kernel transfer from the share-window spool file into
 # the audit builder's stdin pipe. The kernel clamps each call to the free
 # pipe capacity anyway; the bound only paces cancellation checkpoints.
@@ -3649,6 +3656,9 @@ class PrismCoordinator:
             # their debounce from the newest scheduled rebuild, whichever
             # path requested it.
             self._payout_artifact_last_schedule_monotonic: float | None = None
+        if not hasattr(self, "_payout_artifact_rearm_backoff"):
+            # Guarded by _payout_artifact_executor_lock.
+            self._payout_artifact_rearm_backoff = 1
         if not hasattr(self, "_serve_builder_lock"):
             # Serializes daemon ownership per request. Contended builds do
             # not queue behind the daemon; they take the one-shot path.
@@ -4046,6 +4056,15 @@ class PrismCoordinator:
             network_difficulty,
         )
         if artifact is None:
+            # The publication fence (or a superseding generation) discarded
+            # this attempt; continuous share traffic can keep doing so, and
+            # each attempt walks the reward window under the preparation
+            # lock. Back the fence-failure re-arm off until something arms.
+            with self._payout_artifact_executor_lock:
+                self._payout_artifact_rearm_backoff = min(
+                    self._payout_artifact_rearm_backoff * 2,
+                    PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP,
+                )
             return
         self._install_payout_ledger_artifact(artifact)
 
@@ -4094,6 +4113,10 @@ class PrismCoordinator:
                 artifact,
                 generation=self._payout_ledger_artifact_generation,
             )
+        # An armed artifact proves preparation can succeed again; let the
+        # next fence-failure re-arm run at the configured floor.
+        with self._payout_artifact_executor_lock:
+            self._payout_artifact_rearm_backoff = 1
 
     def _payout_artifact_preparation_loop(self) -> None:
         while True:
@@ -4123,14 +4146,22 @@ class PrismCoordinator:
         with self._payout_artifact_executor_lock:
             if self._payout_artifact_executor_shutdown:
                 return
-            if (
-                min_interval_seconds is not None
-                and self._payout_artifact_last_schedule_monotonic is not None
-                and time.monotonic()
-                - self._payout_artifact_last_schedule_monotonic
-                < min_interval_seconds
-            ):
-                return
+            if min_interval_seconds is not None:
+                # Consecutive aborted rebuilds stretch the re-arm interval;
+                # event-driven preparations below reset the backoff because
+                # they mark a real state change worth retrying promptly for.
+                effective_interval = (
+                    min_interval_seconds * self._payout_artifact_rearm_backoff
+                )
+                if (
+                    self._payout_artifact_last_schedule_monotonic is not None
+                    and time.monotonic()
+                    - self._payout_artifact_last_schedule_monotonic
+                    < effective_interval
+                ):
+                    return
+            else:
+                self._payout_artifact_rearm_backoff = 1
             self._payout_artifact_requested = (
                 int(payout_state_generation),
                 int(network_difficulty),
