@@ -114,11 +114,15 @@ class CkpoolRejectsPatchWiringTests(unittest.TestCase):
 
     def test_patch_defines_every_exporter_bucket(self) -> None:
         patch_text = PATCH.read_text(encoding="utf-8")
+        writer = patch_text.split(
+            "+static void qbit_write_rejects_status", maxsplit=1
+        )[1].split("\n static void *statsupdate", maxsplit=1)[0]
         for bucket in REASON_BUCKETS + BLOCK_BUCKETS:
             self.assertIn(f'"{bucket}"', patch_text)
         self.assertIn("pool/rejects.status", patch_text)
         self.assertIn('"%s.tmp"', patch_text)
-        self.assertIn("rename(tmpname, fname)", patch_text)
+        self.assertIn("if (unlikely(rename(tmpname, fname))) {", writer)
+        self.assertEqual(writer.count("unlink(tmpname);"), 2)
 
     def test_worker_export_uses_bounded_lazy_active_registry(self) -> None:
         patch_text = PATCH.read_text(encoding="utf-8")
