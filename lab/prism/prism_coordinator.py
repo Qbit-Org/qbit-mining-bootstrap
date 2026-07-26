@@ -3657,8 +3657,13 @@ class PrismCoordinator:
             self._serve_builder: _ServeBuilderClient | None = None
         if not hasattr(self, "_serve_builder_shutdown"):
             self._serve_builder_shutdown = False
+        if not hasattr(self, "_serve_builder_metrics_lock"):
+            # Counters get their own short-lived lock so a metrics scrape
+            # never waits behind _serve_builder_lock, which one request can
+            # hold for a whole daemon round trip.
+            self._serve_builder_metrics_lock = threading.Lock()
         if not hasattr(self, "serve_builder_counts"):
-            # Guarded by _serve_builder_lock.
+            # Guarded by _serve_builder_metrics_lock.
             self.serve_builder_counts = {
                 "requests": 0,
                 "fallbacks": 0,
@@ -3666,7 +3671,7 @@ class PrismCoordinator:
                 "window_uploads": 0,
             }
         if not hasattr(self, "serve_builder_window_cache_counts"):
-            # Guarded by _serve_builder_lock.
+            # Guarded by _serve_builder_metrics_lock.
             self.serve_builder_window_cache_counts = {"hits": 0, "misses": 0}
         if not hasattr(self, "_payout_state_delivery_gate"):
             # Orders reconciliation mutations against final job-delivery
@@ -4071,6 +4076,8 @@ class PrismCoordinator:
                     or (
                         current.accepted_share_count
                         == artifact.accepted_share_count
+                        and current.network_difficulty
+                        == artifact.network_difficulty
                         and current.share_snapshot_sha256 is not None
                         and current.share_snapshot_sha256
                         == artifact.share_snapshot_sha256
@@ -15579,11 +15586,13 @@ class PrismCoordinator:
             )
         if upload_window:
             client.note_uploaded_window(share_snapshot_sha256)
-            self.serve_builder_counts["window_uploads"] += 1
+            with self._serve_builder_metrics_lock:
+                self.serve_builder_counts["window_uploads"] += 1
         window_cache = response.get("window_cache")
         if isinstance(window_cache, dict):
             outcome = "hits" if bool(window_cache.get("hit")) else "misses"
-            self.serve_builder_window_cache_counts[outcome] += 1
+            with self._serve_builder_metrics_lock:
+                self.serve_builder_window_cache_counts[outcome] += 1
         if record_phase_metrics:
             metrics_value = response.get("metrics")
             if isinstance(metrics_value, dict):
@@ -15651,7 +15660,8 @@ class PrismCoordinator:
                         cancellation,
                     )
                     self._serve_builder = client
-                    self.serve_builder_counts["spawns"] += 1
+                    with self._serve_builder_metrics_lock:
+                        self.serve_builder_counts["spawns"] += 1
                 if build_control is not None:
                     self._register_job_bundle_process(
                         build_control,
@@ -15678,14 +15688,17 @@ class PrismCoordinator:
                 raise
             except _ServeBuilderUnavailable:
                 self._retire_serve_builder_locked()
-                self.serve_builder_counts["fallbacks"] += 1
+                with self._serve_builder_metrics_lock:
+                    self.serve_builder_counts["fallbacks"] += 1
                 return None
             except (OSError, ValueError):
                 self._retire_serve_builder_locked()
-                self.serve_builder_counts["fallbacks"] += 1
+                with self._serve_builder_metrics_lock:
+                    self.serve_builder_counts["fallbacks"] += 1
                 return None
             else:
-                self.serve_builder_counts["requests"] += 1
+                with self._serve_builder_metrics_lock:
+                    self.serve_builder_counts["requests"] += 1
                 return summary
         finally:
             self._serve_builder_lock.release()
@@ -21749,7 +21762,7 @@ class PrismCoordinator:
             ]
         )
         self._ensure_job_cache_state()
-        with self._serve_builder_lock:
+        with self._serve_builder_metrics_lock:
             serve_counts = dict(self.serve_builder_counts)
             serve_window_counts = dict(self.serve_builder_window_cache_counts)
         lines.extend(

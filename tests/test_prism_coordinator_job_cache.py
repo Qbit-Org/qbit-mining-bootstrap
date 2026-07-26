@@ -2261,6 +2261,33 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertGreater(replaced.generation, installed.generation)
         self.assertEqual(replaced.accepted_share_count, 4)
 
+    def test_difficulty_change_replaces_same_window_artifact(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.shared_job_bundle(artifacts, mode="ready")
+        with server._job_cache_lock:
+            installed = server._payout_ledger_artifact
+        assert installed is not None
+
+        # A retarget changes network difficulty while the share window stays
+        # identical. The rebuild must still replace the artifact: keeping the
+        # old-difficulty artifact would fail the reuse fence on every build
+        # while the same-window skip kept discarding its replacement.
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            int(installed.network_difficulty) + 1,
+        )
+        with server._job_cache_lock:
+            replaced = server._payout_ledger_artifact
+        assert replaced is not None
+        self.assertGreater(replaced.generation, installed.generation)
+        self.assertEqual(
+            replaced.network_difficulty,
+            int(installed.network_difficulty) + 1,
+        )
+
     def test_fence_failure_rearms_artifact_preparation_with_debounce(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
@@ -5520,7 +5547,7 @@ class ServeBuilderTests(unittest.TestCase):
             self.assertEqual(second["window"], expected_window)
             self.assertEqual(second["found_block"]["block_height"], 11)
 
-            with server._serve_builder_lock:
+            with server._serve_builder_metrics_lock:
                 counts = dict(server.serve_builder_counts)
                 window_counts = dict(server.serve_builder_window_cache_counts)
             self.assertEqual(counts["requests"], 2)
@@ -5562,7 +5589,7 @@ class ServeBuilderTests(unittest.TestCase):
             self.assertEqual(second["transport"], "serve")
             self.assertTrue(second["request_had_window"])
             self.assertEqual(second["found_block"]["block_height"], 11)
-            with server._serve_builder_lock:
+            with server._serve_builder_metrics_lock:
                 counts = dict(server.serve_builder_counts)
             self.assertEqual(counts["requests"], 2)
             self.assertEqual(counts["fallbacks"], 0)
@@ -5588,7 +5615,7 @@ class ServeBuilderTests(unittest.TestCase):
                 10,
             )
             self.assertIn("compact_shares", result["received"])
-            with server._serve_builder_lock:
+            with server._serve_builder_metrics_lock:
                 counts = dict(server.serve_builder_counts)
                 self.assertIsNone(server._serve_builder)
             self.assertEqual(counts["fallbacks"], 1)
@@ -5610,7 +5637,7 @@ class ServeBuilderTests(unittest.TestCase):
             )
 
             self.assertEqual(result["transport"], "one-shot")
-            with server._serve_builder_lock:
+            with server._serve_builder_metrics_lock:
                 counts = dict(server.serve_builder_counts)
                 self.assertIsNone(server._serve_builder)
             self.assertEqual(counts["fallbacks"], 1)
@@ -5625,7 +5652,7 @@ class ServeBuilderTests(unittest.TestCase):
             result = self._build(server, shares, serialization, height=10)
 
         self.assertEqual(result["transport"], "one-shot")
-        with server._serve_builder_lock:
+        with server._serve_builder_metrics_lock:
             counts = dict(server.serve_builder_counts)
         self.assertEqual(counts["spawns"], 0)
 
@@ -5650,7 +5677,7 @@ class ServeBuilderTests(unittest.TestCase):
                 mode="hang-after-request",
             )
 
-        with server._serve_builder_lock:
+        with server._serve_builder_metrics_lock:
             counts = dict(server.serve_builder_counts)
         self.assertEqual(counts["fallbacks"], 1)
         self.assertEqual(counts["spawns"], 0)
