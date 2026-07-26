@@ -12772,10 +12772,27 @@ class PrismCoordinator:
                 return True
         return self.ensure_reorg_reconciled_for_tip(current_tip)
 
-    def ensure_reorg_reconciled_for_tip(self, tip_hash: str) -> bool:
+    def ensure_reorg_reconciled_for_tip(
+        self,
+        tip_hash: str,
+        *,
+        _coalesce_same_tip: bool = True,
+    ) -> bool:
+        """Reconcile one tip, optionally bypassing same-tip flight reuse.
+
+        Lock-owning accepted-block callers disable waiting for an existing
+        leader because it may itself be waiting for the payout-balance
+        mutation lock. Their own pass remains visible to ordinary followers.
+        """
         if not getattr(self, "reorg_reconciler_enabled", True):
             return True
-        summary = self.reconcile_prism_pool_blocks_once(tip_hash=tip_hash)
+        if _coalesce_same_tip:
+            summary = self.reconcile_prism_pool_blocks_once(tip_hash=tip_hash)
+        else:
+            summary = self.reconcile_prism_pool_blocks_once(
+                tip_hash=tip_hash,
+                _wait_for_same_tip_flight=False,
+            )
         return not bool(summary.get("untrusted") or summary.get("superseded"))
 
     def qbit_chain_view_untrusted(self) -> bool:
@@ -12929,6 +12946,7 @@ class PrismCoordinator:
         tip_hash: str | None = None,
         _force_publish: bool = False,
         _source_reserved: bool = False,
+        _wait_for_same_tip_flight: bool = True,
     ) -> dict[str, object]:
         """Reconcile pool blocks, coalescing same-tip concurrent callers.
 
@@ -12936,7 +12954,9 @@ class PrismCoordinator:
         await that pass and share its summary instead of queueing another
         full serialized pass. Callers carrying side-effect obligations (a
         forced publication or an already-reserved source) and callers without
-        a tip always run their own pass.
+        a tip always run their own pass. Lock-owning callers may disable
+        waiting for an existing flight while still registering as the visible
+        leader when no same-tip flight exists.
         """
         self._ensure_job_cache_state()
         if tip_hash is None or _force_publish or _source_reserved:
@@ -12952,6 +12972,10 @@ class PrismCoordinator:
                 flight = _ReconcileFlight()
                 self._reconcile_flights[tip_hash] = flight
         if not leading:
+            if not _wait_for_same_tip_flight:
+                return self._reconcile_prism_pool_blocks_serialized(
+                    tip_hash=tip_hash
+                )
             wait_seconds = float(
                 getattr(
                     self,
@@ -17868,7 +17892,10 @@ class PrismCoordinator:
                 # transition becomes a landed barrier and before validating its
                 # payout base.
                 try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                        current_tip,
+                        _coalesce_same_tip=False,
+                    )
                 except Exception:
                     traceback.print_exc()
                     self._abandon_block_candidate(
@@ -17916,7 +17943,10 @@ class PrismCoordinator:
                 reorg_reconciled = True
             else:
                 try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                        current_tip,
+                        _coalesce_same_tip=False,
+                    )
                 except Exception:
                     traceback.print_exc()
                     self._abandon_block_candidate(
