@@ -1,5 +1,5 @@
 diff --git a/src/stratifier.c b/src/stratifier.c
-index f49fede..6e43b20 100644
+index f49fede..1b01cb6 100644
 --- a/src/stratifier.c
 +++ b/src/stratifier.c
 @@ -87,6 +87,58 @@ struct pool_stats {
@@ -247,10 +247,29 @@ index f49fede..6e43b20 100644
  	if (!sdata->wbincomplete && ((!result && !submit) || !share)) {
  		/* Is this the first in a run of invalids? */
  		if (client->first_invalid < client->last_share.tv_sec || !client->first_invalid)
-@@ -8005,6 +8151,126 @@ static void lazy_drop_client(ckpool_t *ckp, stratum_instance_t *client)
+@@ -8005,6 +8151,152 @@ static void lazy_drop_client(ckpool_t *ckp, stratum_instance_t *client)
  	connector_drop_client(ckp, client->id);
  }
  
++/* qbit rejects observability: true once any submission or block outcome has
++ * been recorded. Counters only ever grow, so a relaxed read without the
++ * rejects lock is safe for filtering: a worker racing its first submission
++ * is picked up by the next cycle. */
++static bool qbit_tally_active(const qbit_reject_tally_t *tally)
++{
++	int i;
++
++	for (i = 0; i < QR_REASONS; i++) {
++		if (tally->count[i])
++			return true;
++	}
++	for (i = 0; i < QB_OUTCOMES; i++) {
++		if (tally->block_count[i])
++			return true;
++	}
++	return false;
++}
++
 +/* qbit rejects observability: render one tally as json entries of the form
 + * "reason": {"count": N, "diff": D} appended to val. */
 +static void qbit_tally_to_json(json_t *val, const qbit_reject_tally_t *tally)
@@ -292,11 +311,16 @@ index f49fede..6e43b20 100644
 +	/* Worker instances are only ever appended, never freed, so pointers
 +	 * collected here stay valid without holding the instance lock. A
 +	 * worker authorised after this walk joins the next cycle, keeping
-+	 * worker rows a subset of what the pool tally has seen. */
++	 * worker rows a subset of what the pool tally has seen. Workers
++	 * without a single recorded submission are excluded so the export,
++	 * its allocations and the locked copy below scale with submitting
++	 * workers only; authorisation spam alone cannot grow them. */
 +	while ((user = next_user(sdata, user)) != NULL) {
 +		worker = NULL;
-+		while ((worker = next_worker(sdata, user, worker)) != NULL)
-+			worker_count++;
++		while ((worker = next_worker(sdata, user, worker)) != NULL) {
++			if (qbit_tally_active(&worker->rejects))
++				worker_count++;
++		}
 +	}
 +
 +	/* One extra slot so a zero worker count needs no special casing */
@@ -307,8 +331,10 @@ index f49fede..6e43b20 100644
 +	while (workers_snapped < worker_count && (user = next_user(sdata, user)) != NULL) {
 +		worker = NULL;
 +		while (workers_snapped < worker_count &&
-+		       (worker = next_worker(sdata, user, worker)) != NULL)
-+			workers[workers_snapped++] = worker;
++		       (worker = next_worker(sdata, user, worker)) != NULL) {
++			if (qbit_tally_active(&worker->rejects))
++				workers[workers_snapped++] = worker;
++		}
 +	}
 +
 +	/* Single lock hold: pool and worker tallies form one consistent
@@ -374,7 +400,7 @@ index f49fede..6e43b20 100644
  static void *statsupdate(void *arg)
  {
  	ckpool_t *ckp = (ckpool_t *)arg;
-@@ -8301,6 +8567,8 @@ static void *statsupdate(void *arg)
+@@ -8301,6 +8593,8 @@ static void *statsupdate(void *arg)
  		fclose(fp);
  
  out_status:
@@ -383,7 +409,7 @@ index f49fede..6e43b20 100644
  		if (ckp->proxy && sdata->proxy) {
  			proxy_t *proxy, *proxytmp, *subproxy, *subtmp;
  
-@@ -8691,6 +8959,10 @@ void *stratifier(void *arg)
+@@ -8691,6 +8985,10 @@ void *stratifier(void *arg)
  	cksem_init(&sdata->update_sem);
  	cksem_post(&sdata->update_sem);
  

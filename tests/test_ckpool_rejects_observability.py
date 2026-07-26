@@ -539,6 +539,12 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                 self.assertEqual(first_status["interval"], 60)
                 first_update = int(first_status["lastupdate"])
 
+                # A worker that authorises but never submits must not grow
+                # the export: rejects.status lists submitting workers only.
+                idle = MinerClient(harness.stratum_port, f"{USER_ADDRESS}.idle0")
+                idle.handshake()
+                idle.close()
+
                 miner = MinerClient(harness.stratum_port, f"{USER_ADDRESS}.rig0")
                 try:
                     miner.handshake()
@@ -688,6 +694,10 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                 worker = worker_entry(status, f"{USER_ADDRESS}.rig0")
                 self.expect_counts(worker, expected)
                 assert_snapshot_consistent(self, status, expect_equal=True)
+
+                # The authorised-but-idle worker is excluded from the export.
+                listed = [entry["workername"] for entry in status["workers"]]
+                self.assertEqual(listed, [f"{USER_ADDRESS}.rig0"])
 
                 # 60s cadence: the matching write is a later write of the
                 # same file, landing near a 60-second boundary.

@@ -141,9 +141,15 @@ deltas.
 
 The pool totals and all worker rows in one document are copied under a single
 lock hold, so each document is one consistent snapshot: per-bucket worker sums
-never exceed the pool totals. A worker authorized while a snapshot is being
-assembled appears from the next write, so worker sums can transiently trail
+never exceed the pool totals. A worker whose first counted submission races a
+snapshot appears from the next write, so worker sums can transiently trail
 pool totals by that worker's first submissions until the next cycle.
+
+Only workers with at least one counted submission are listed. Workers that
+merely authorize never appear, so the file size, the snapshot allocations, and
+the lock-held copy all scale with submitting workers only — authorization spam
+on the public Stratum port cannot grow the export. Per-worker tallies
+otherwise live exactly as long as ckpool's own per-worker share stats.
 
 Block-candidate outcomes are tracked in two additional buckets,
 `block_accepted` and `block_rejected`, counting local `submitblock` results
