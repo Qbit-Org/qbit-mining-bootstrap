@@ -1208,6 +1208,11 @@ class PrismBlockCandidate:
     pending_share: PendingShare
     client: ClientState
     credit_share_on_accept: bool = False
+    # When this in-process attempt became runnable: live candidates stamp
+    # share-accept time, durable outbox replays stamp row-restore time. The
+    # block-submit histogram measures from here to submitblock's return --
+    # the race-critical interval a lost block round is decided in.
+    landed_monotonic: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -3739,6 +3744,20 @@ class PrismCoordinator:
                 (path, source): 0
                 for path in PRISM_REORG_RECONCILE_LOOKUP_PATHS
                 for source in PRISM_REORG_RECONCILE_LOOKUP_SOURCES
+            }
+        if not hasattr(self, "_block_submit_metrics_lock"):
+            self._block_submit_metrics_lock = threading.Lock()
+        if not hasattr(self, "block_submit_seconds_histogram"):
+            # Landed candidate -> submitblock-return interval. Post-submit
+            # bookkeeping (audit build, persistence, outbox finalize) is
+            # deliberately excluded; the outbox created_at/completed_at span
+            # already covers it.
+            self.block_submit_seconds_histogram = {
+                "buckets": {
+                    bucket: 0 for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
+                },
+                "sum": 0.0,
+                "count": 0,
             }
         if not hasattr(self, "_accepted_block_payout_preview_condition"):
             self._accepted_block_payout_preview_condition = threading.Condition()
@@ -19523,6 +19542,14 @@ class PrismCoordinator:
                 self._record_heartbeat("block_submitter")
                 result = self.rpc.call("submitblock", [submission.block_hex])
                 self._record_heartbeat("block_submitter")
+                landed_monotonic = getattr(candidate, "landed_monotonic", None)
+                if landed_monotonic is not None:
+                    # Observed for every attempt whose RPC returned, accepted
+                    # or rejected: a rejected race is exactly the tail this
+                    # histogram exists to expose.
+                    self._observe_block_submit_seconds(
+                        time.monotonic() - float(landed_monotonic)
+                    )
                 if result not in (None, "duplicate"):
                     self._abandon_block_candidate(
                         PRISM_REJECTION_SUBMITBLOCK_REJECTED,
@@ -21224,6 +21251,20 @@ class PrismCoordinator:
             f"qbit_prism_coordinator_lock_wait_seconds_max {float(wait_max):.6f}",
         ]
 
+    def _observe_block_submit_seconds(self, elapsed_seconds: float) -> None:
+        self._ensure_job_cache_state()
+        with self._block_submit_metrics_lock:
+            histogram = self.block_submit_seconds_histogram
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + max(
+                0.0, elapsed_seconds
+            )
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
     def block_submitter_metrics_lines(self) -> list[str]:
         pending_metrics = {
             "pending_count": -1,
@@ -21239,6 +21280,7 @@ class PrismCoordinator:
                 # its watchdog remain authoritative when this read is down.
                 pass
         self._ensure_block_submitter_retry_state()
+        self._ensure_job_cache_state()
         now = time.monotonic()
         with self._block_submitter_retry_state_lock:
             deadline = self._block_submitter_backoff_deadline_monotonic
@@ -21247,7 +21289,20 @@ class PrismCoordinator:
                 max(0.0, float(deadline) - now) if deadline is not None else 0.0
             )
             backoff_delay = float(self._block_submitter_backoff_delay_seconds)
+        with self._block_submit_metrics_lock:
+            submit_buckets = dict(self.block_submit_seconds_histogram["buckets"])
+            submit_sum = float(self.block_submit_seconds_histogram["sum"])
+            submit_count = int(self.block_submit_seconds_histogram["count"])
         return [
+            "# HELP qbit_prism_block_submit_seconds Seconds from a block candidate landing in this process to its submitblock RPC returning.",
+            "# TYPE qbit_prism_block_submit_seconds histogram",
+            *[
+                f'qbit_prism_block_submit_seconds_bucket{{le="{bucket:g}"}} {int(submit_buckets.get(bucket, 0))}'
+                for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
+            ],
+            f'qbit_prism_block_submit_seconds_bucket{{le="+Inf"}} {submit_count}',
+            f"qbit_prism_block_submit_seconds_sum {submit_sum:.6f}",
+            f"qbit_prism_block_submit_seconds_count {submit_count}",
             "# HELP qbit_prism_block_candidates_pending Durable block candidates awaiting a terminal outcome, or -1 if unavailable.",
             "# TYPE qbit_prism_block_candidates_pending gauge",
             f"qbit_prism_block_candidates_pending {int(pending_metrics['pending_count'])}",

@@ -7058,6 +7058,75 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertTrue(all(entry.error is not None for entry in entries))
             self.assertFalse(server.share_recovery_path.exists())
 
+    def test_block_submit_histogram_measures_landed_to_rpc_interval(self) -> None:
+        # The race-critical span (candidate landed -> submitblock returned)
+        # must be observed exactly once per attempted submit, independent of
+        # the post-submit audit/persistence bookkeeping the outbox
+        # created_at/completed_at interval also includes.
+        old_tip = "00" * 32
+        block_hash = "ab" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        server.stop_after_block = False
+        server.max_blocks = 10
+        server.clients = {state}
+        sent: list[dict[str, object]] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+
+        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
+            return prism_context(
+                "fresh-job",
+                block_hash,
+                worker=state.worker,
+                difficulty=Decimal("1"),
+                clean_jobs=clean_jobs,
+            )
+
+        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            share_pass=True,
+            block_pass=True,
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitAcceptingTemplateRpc(
+                old_tip=old_tip,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = lambda **_kwargs: verified_block_bundle()  # type: ignore[method-assign]
+            server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
+
+            with patch(
+                "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+                return_value=submission,
+            ):
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+            self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(server.accepted_block_count, 1)
+        metrics = "\n".join(server.block_submitter_metrics_lines())
+        self.assertIn("qbit_prism_block_submit_seconds_count 1", metrics)
+        self.assertIn(
+            'qbit_prism_block_submit_seconds_bucket{le="+Inf"} 1',
+            metrics,
+        )
+        # The candidate landed moments ago in this process, so the interval
+        # must fall inside the finite buckets, not only the +Inf overflow.
+        self.assertIn(
+            'qbit_prism_block_submit_seconds_bucket{le="30"} 1',
+            metrics,
+        )
+
     def test_orphaned_block_candidate_keeps_share_credit(self) -> None:
         # Option-A semantics: a share that met its target stays credited even
         # when its block candidate loses the tip race in the submitter.
