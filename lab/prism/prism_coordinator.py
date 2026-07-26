@@ -128,6 +128,11 @@ DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS = 30.0
 # memo hit or their own serial pass.
 PRISM_REORG_RECONCILE_LOOKUP_PATHS = ("tip_refresh", "job_build")
 PRISM_REORG_RECONCILE_LOOKUP_SOURCES = ("memo_hit", "overlap", "serial")
+# Read-to-ack latency labels for mining.submit. Accepted shares wait for the
+# group commit before their ack; rejected shares (measured when the reject
+# decision is made) skip it, so the pair separates commit pressure from
+# thread-scheduling/GIL pressure as connection count grows.
+PRISM_SHARE_ACK_RESULTS = ("accepted", "rejected")
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS = 15.0
 DEFAULT_PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS = 15.0
@@ -2198,6 +2203,10 @@ class ClientState:
     # Protected by the coordinator lock. Disconnect retirement sets this before
     # waiting for any per-client job update so queued work can reject the client.
     closing: bool = False
+    # Stamped by the handler thread when a request line arrives, before JSON
+    # parsing. Only that thread reads it; mining.submit uses it to observe
+    # read-to-ack latency (the share-ingest saturation instrument).
+    request_received_monotonic: float | None = None
     # Serializes every job build/register/send transition for this connection.
     # The coordinator lock may be acquired while this lock is held, never in
     # the reverse order. RLock permits authorize/retarget helpers to call the
@@ -3222,6 +3231,7 @@ class PrismCoordinator:
             hasattr(self, "_recent_share_lock")
             and hasattr(self, "_share_accounting_lock")
             and hasattr(self, "recent_share_keys")
+            and hasattr(self, "share_ack_histograms")
         ):
             return
         with _HOT_PATH_LOCK_INITIALIZATION_LOCK:
@@ -3231,6 +3241,71 @@ class PrismCoordinator:
                 self._share_accounting_lock = threading.Lock()
             if not hasattr(self, "recent_share_keys"):
                 self.recent_share_keys = set()
+            if not hasattr(self, "share_ack_histograms"):
+                self.share_ack_histograms = {
+                    result: {
+                        "buckets": {
+                            bucket: 0
+                            for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
+                        },
+                        "sum": 0.0,
+                        "count": 0,
+                    }
+                    for result in PRISM_SHARE_ACK_RESULTS
+                }
+
+    def _observe_share_ack_seconds(
+        self,
+        result: str,
+        elapsed_seconds: float,
+    ) -> None:
+        if result not in PRISM_SHARE_ACK_RESULTS:
+            raise ValueError(f"unknown share ack result: {result}")
+        self._ensure_share_hot_path_state()
+        with self._share_accounting_lock:
+            histogram = self.share_ack_histograms[result]
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + max(
+                0.0, elapsed_seconds
+            )
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
+    def share_ack_metrics_lines(self) -> list[str]:
+        self._ensure_share_hot_path_state()
+        with self._share_accounting_lock:
+            histograms = {
+                result: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
+                }
+                for result, histogram in self.share_ack_histograms.items()
+            }
+        lines = [
+            "# HELP qbit_prism_share_ack_seconds mining.submit line arrival to Stratum response, by outcome.",
+            "# TYPE qbit_prism_share_ack_seconds histogram",
+        ]
+        for result in PRISM_SHARE_ACK_RESULTS:
+            histogram = histograms[result]
+            buckets = histogram["buckets"]
+            lines.extend(
+                f'qbit_prism_share_ack_seconds_bucket{{result="{result}",le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+                for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
+            )
+            lines.append(
+                f'qbit_prism_share_ack_seconds_bucket{{result="{result}",le="+Inf"}} {histogram["count"]}'
+            )
+            lines.append(
+                f'qbit_prism_share_ack_seconds_sum{{result="{result}"}} {histogram["sum"]:.6f}'
+            )
+            lines.append(
+                f'qbit_prism_share_ack_seconds_count{{result="{result}"}} {histogram["count"]}'
+            )
+        return lines
 
     @staticmethod
     def _client_vardiff_lock(client: ClientState) -> threading.RLock:
@@ -14473,6 +14548,7 @@ class PrismCoordinator:
                 line = line.strip()
                 if not line:
                     continue
+                client.request_received_monotonic = time.monotonic()
                 request_id: object = None
                 try:
                     request = json.loads(line)
@@ -14714,9 +14790,29 @@ class PrismCoordinator:
             self.handle_suggest_difficulty(client, request_id, params)
             return
         if method == "mining.submit":
-            accepted_and_closed = self.handle_submit(client, params)
+            received_monotonic = getattr(
+                client,
+                "request_received_monotonic",
+                None,
+            )
+            try:
+                accepted_and_closed = self.handle_submit(client, params)
+            except StratumError:
+                if received_monotonic is not None:
+                    # Rejects skip the group-commit wait; measured at the
+                    # decision (the error response write follows upstream).
+                    self._observe_share_ack_seconds(
+                        "rejected",
+                        time.monotonic() - received_monotonic,
+                    )
+                raise
             try:
                 self.send_result(client, request_id, True)
+                if received_monotonic is not None:
+                    self._observe_share_ack_seconds(
+                        "accepted",
+                        time.monotonic() - received_monotonic,
+                    )
             finally:
                 self.refresh_jobs_after_pending_accepted_block(client)
             if accepted_and_closed:
@@ -22100,6 +22196,7 @@ class PrismCoordinator:
         lines.extend(self.shutdown_metrics_lines())
         lines.extend(self.coordinator_lock_metrics_lines())
         lines.extend(self.block_submitter_metrics_lines())
+        lines.extend(self.share_ack_metrics_lines())
         lines.extend(self.ctv_fanout_broadcaster_metrics_lines())
         lines.extend(self.vardiff_idle_metrics_lines())
         lines.extend(self.job_build_metrics_lines())

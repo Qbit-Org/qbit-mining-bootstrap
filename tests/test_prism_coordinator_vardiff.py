@@ -5643,6 +5643,62 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertIsNone(ledger.pending[0].credit_policy)
 
+    def test_share_ack_latency_histogram_observes_accept_and_reject(self) -> None:
+        # The read-to-ack instrument for share-ingest saturation: accepted
+        # submits include the commit wait, rejects measure the fast path.
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        sent: list[dict[str, object]] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        state.request_received_monotonic = time.monotonic()
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            server.handle_request(
+                state,
+                {
+                    "id": 7,
+                    "method": "mining.submit",
+                    "params": ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                },
+            )
+        self.assertEqual(sent, [{"id": 7, "result": True, "error": None}])
+
+        state.request_received_monotonic = time.monotonic()
+        with self.assertRaises(StratumError):
+            server.handle_request(
+                state,
+                {
+                    "id": 8,
+                    "method": "mining.submit",
+                    "params": [
+                        "miner-a",
+                        "missing-job",
+                        "00" * 8,
+                        "00000001",
+                        "00000002",
+                    ],
+                },
+            )
+
+        metrics = "\n".join(server.share_ack_metrics_lines())
+        self.assertIn(
+            'qbit_prism_share_ack_seconds_count{result="accepted"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_share_ack_seconds_count{result="rejected"} 1',
+            metrics,
+        )
+
     def test_reconnected_same_username_submits_against_disconnected_job(self) -> None:
         # A proxy flap leaves devices mining the dead connection's jobs;
         # their shares arrive on the replacement connection and must credit
