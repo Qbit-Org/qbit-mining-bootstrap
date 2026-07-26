@@ -6,7 +6,13 @@ from __future__ import annotations
 import base64
 import copy
 from collections import OrderedDict
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    CancelledError as FuturesCancelledError,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from contextlib import ExitStack, contextmanager
 import dataclasses
 import errno
@@ -115,6 +121,13 @@ PRISM_REORG_RECONCILE_MEMO_MAX_TIPS = 8
 # a liveness backstop, not a pacing knob: a follower that outwaits it simply
 # runs its own serialized pass, exactly as every caller did before flights.
 DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS = 30.0
+# Reconcile demand observability: which caller lane asked, and what satisfied
+# it. The tip-refresh lane can be satisfied by the per-tip trusted memo, by a
+# pass overlapped with the template fetch on the prefetch worker, or by a
+# serial pass on the refresh thread; per-client job builds only ever see a
+# memo hit or their own serial pass.
+PRISM_REORG_RECONCILE_LOOKUP_PATHS = ("tip_refresh", "job_build")
+PRISM_REORG_RECONCILE_LOOKUP_SOURCES = ("memo_hit", "overlap", "serial")
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS = 15.0
 DEFAULT_PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS = 15.0
@@ -3709,6 +3722,24 @@ class PrismCoordinator:
             self._reorg_reconcile_trusted_memo: OrderedDict[str, float] = (
                 OrderedDict()
             )
+        if not hasattr(self, "_reconcile_prefetch_executor_lock"):
+            self._reconcile_prefetch_executor_lock = threading.Lock()
+        if not hasattr(self, "_reconcile_prefetch_executor"):
+            # Single-worker lane that overlaps the tip-refresh reconcile pass
+            # with the template fetch. Only the refresh singleflight owner
+            # submits, so at most one prefetched pass is in flight; same-tip
+            # followers still coalesce through _reconcile_flights.
+            self._reconcile_prefetch_executor: ThreadPoolExecutor | None = None
+        if not hasattr(self, "_reconcile_prefetch_executor_shutdown"):
+            self._reconcile_prefetch_executor_shutdown = False
+        if not hasattr(self, "reorg_reconcile_lookup_counts"):
+            # Reconcile demand by (caller path, satisfying source), guarded
+            # by self.lock.
+            self.reorg_reconcile_lookup_counts = {
+                (path, source): 0
+                for path in PRISM_REORG_RECONCILE_LOOKUP_PATHS
+                for source in PRISM_REORG_RECONCILE_LOOKUP_SOURCES
+            }
         if not hasattr(self, "_accepted_block_payout_preview_condition"):
             self._accepted_block_payout_preview_condition = threading.Condition()
         if not hasattr(self, "_accepted_block_payout_previews"):
@@ -8808,6 +8839,7 @@ class PrismCoordinator:
             executor.shutdown(wait=True)
         self.shutdown_job_build_executor()
         self.shutdown_payout_artifact_executor()
+        self.shutdown_reconcile_prefetch_executor()
         self.retire_share_window_spool()
         self.shutdown_serve_builder()
 
@@ -11806,6 +11838,33 @@ class PrismCoordinator:
                     pending_signal_token,
                     observation_sequence,
                 )
+            # Captured before reconciliation can begin: the pass may run on
+            # the prefetch worker while this thread fetches the template, so
+            # the mutation bracket must open before either starts.
+            payout_generation_before_reconciliation = int(
+                getattr(self, "_payout_state_generation", 0)
+            )
+            # Reconciliation is keyed by tip hash and the probe above already
+            # observed the best hash, so a memo miss can run its full pass on
+            # the prefetch worker while this thread fetches and derives the
+            # template. A memo hit skips only the redundant serialized pass;
+            # publication still re-proves chain trust in
+            # _validate_prepared_tip_refresh before any fanout.
+            reconciler_enabled = bool(
+                getattr(self, "reorg_reconciler_enabled", True)
+            )
+            reconcile_prefetch: Future[bool] | None = None
+            reconcile_memo_hit = False
+            reconcile_probe_started = time.monotonic()
+            if reconciler_enabled:
+                reconcile_memo_hit = self._reorg_reconcile_memo_fresh(
+                    observed_best_tip
+                )
+                if not reconcile_memo_hit:
+                    reconcile_prefetch = self._submit_reconcile_prefetch(
+                        observed_best_tip
+                    )
+            reconcile_probe_seconds = time.monotonic() - reconcile_probe_started
             snapshot = self._reuse_current_tip_template_snapshot(observed_best_tip)
             if snapshot is None:
                 self._record_job_cache_event("template", hit=False)
@@ -11837,9 +11896,6 @@ class PrismCoordinator:
             self._progress_refresh_started()
             progress_refresh_active = True
             self.pool_readiness_latched()
-            payout_generation_before_reconciliation = int(
-                getattr(self, "_payout_state_generation", 0)
-            )
             with self.lock:
                 previous_snapshot = self.tip_template_snapshot
                 # Generation orders concurrent observations but is not itself
@@ -11889,16 +11945,39 @@ class PrismCoordinator:
                 snapshot,
                 observation_sequence,
             )
-            reconcile_started = time.monotonic()
+            reconcile_source = "serial"
+            reconcile_join_started = time.monotonic()
             try:
-                reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
-                    snapshot.bestblockhash
-                )
-            except ShutdownInProgress:
-                # Shutdown may close writer admission after this refresh has
-                # fetched a snapshot. Leave the refresh incomplete and let
-                # the controlled shutdown proceed without consuming the
-                # template failure budget or taking the hard-exit path.
+                if (
+                    reconcile_memo_hit
+                    and snapshot.bestblockhash == observed_best_tip
+                ):
+                    reconcile_source = "memo_hit"
+                    reorg_reconciled = True
+                elif (
+                    reconcile_prefetch is not None
+                    and snapshot.bestblockhash == observed_best_tip
+                ):
+                    reconcile_source = "overlap"
+                    reorg_reconciled = reconcile_prefetch.result()
+                else:
+                    if reconcile_prefetch is not None:
+                        # The tip moved between the probe and the template
+                        # fetch; the prefetched pass proved a superseded
+                        # hash. Reconcile the snapshot tip on this thread.
+                        self._discard_stale_reconcile_prefetch(
+                            reconcile_prefetch
+                        )
+                        reconcile_prefetch = None
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                        snapshot.bestblockhash
+                    )
+            except (ShutdownInProgress, FuturesCancelledError):
+                # Shutdown may close writer admission (or cancel the queued
+                # prefetch) after this refresh has fetched a snapshot. Leave
+                # the refresh incomplete and let the controlled shutdown
+                # proceed without consuming the template failure budget or
+                # taking the hard-exit path.
                 return 0
             except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked):
                 raise
@@ -11907,13 +11986,20 @@ class PrismCoordinator:
                     "qbit reorg reconciliation failed before refresh preparation"
                 ) from exc
             finally:
-                # The only serial pre-build stage without a phase metric;
-                # observe failures too so a slow reconcile that blocks the
-                # refresh still shows up in the histogram.
+                # The effective serial reconcile cost of this refresh: the
+                # memo probe plus whatever wait the template fetch did not
+                # absorb. Observe failures too so a slow reconcile that
+                # blocks the refresh still shows up in the histogram.
                 self._observe_tip_refresh_build_phase(
                     "reorg_reconcile",
-                    time.monotonic() - reconcile_started,
+                    reconcile_probe_seconds
+                    + (time.monotonic() - reconcile_join_started),
                 )
+                if reconciler_enabled:
+                    self._record_reorg_reconcile_lookup(
+                        "tip_refresh",
+                        reconcile_source,
+                    )
             if not reorg_reconciled:
                 raise TemplateRefreshBlocked(
                     "qbit chain view remained untrusted after reorg reconciliation"
@@ -13428,32 +13514,105 @@ class PrismCoordinator:
             )
         if not reconciler_enabled:
             return True
-        # A trusted reconciliation for this same tip within the cache window is
-        # reused: the blockpoll loop re-reconciles every poll anyway, so
-        # per-client job builds do not each need a full ledger reconcile pass.
-        # The memo is per tip: an untrusted outcome recorded for another tip
-        # never unarms this one. The chain-view trust check is NOT cached:
-        # headers can run ahead of the validated tip without the best block
-        # hash changing (an arriving reorg), and job issuance must pause
-        # immediately, not a TTL later.
+        if self._reorg_reconcile_memo_fresh(current_tip):
+            self._record_reorg_reconcile_lookup("job_build", "memo_hit")
+            return True
+        self._record_reorg_reconcile_lookup("job_build", "serial")
+        return self.ensure_reorg_reconciled_for_tip(current_tip)
+
+    def _reorg_reconcile_memo_fresh(self, tip_hash: str) -> bool:
+        """True when a trusted pass for ``tip_hash`` is inside the cache TTL
+        and the live chain view is still trusted.
+
+        A fresh memo entry lets a caller reuse the completed pass instead of
+        queueing a redundant serialized one. The memo is per tip: an
+        untrusted outcome recorded for another tip never unarms this one.
+        The chain-view trust check is NOT cached: headers can run ahead of
+        the validated tip without the best block hash changing (an arriving
+        reorg), and job issuance must pause immediately, not a TTL later.
+        """
         ttl = getattr(
             self,
             "reorg_reconcile_cache_seconds",
             DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
         )
-        if ttl > 0:
-            self._ensure_job_cache_state()
-            with self.lock:
-                reconciled_monotonic = self._reorg_reconcile_trusted_memo.get(
-                    current_tip
+        if ttl <= 0:
+            return False
+        self._ensure_job_cache_state()
+        with self.lock:
+            reconciled_monotonic = self._reorg_reconcile_trusted_memo.get(
+                tip_hash
+            )
+        return bool(
+            reconciled_monotonic is not None
+            and time.monotonic() - reconciled_monotonic <= ttl
+            and not self.qbit_chain_view_untrusted()
+        )
+
+    def _record_reorg_reconcile_lookup(self, path: str, source: str) -> None:
+        if path not in PRISM_REORG_RECONCILE_LOOKUP_PATHS:
+            raise ValueError(f"unknown reorg reconcile lookup path: {path}")
+        if source not in PRISM_REORG_RECONCILE_LOOKUP_SOURCES:
+            raise ValueError(f"unknown reorg reconcile lookup source: {source}")
+        self._ensure_job_cache_state()
+        with self.lock:
+            self.reorg_reconcile_lookup_counts[(path, source)] += 1
+
+    def _submit_reconcile_prefetch(self, tip_hash: str) -> Future[bool] | None:
+        """Run one reconcile pass on the prefetch worker so it overlaps the
+        caller's template fetch.
+
+        Returns ``None`` once shutdown has retired the executor; the caller
+        falls back to its serial pass. Only the tip-refresh singleflight
+        owner submits here, so the single worker never queues more than the
+        occasional pass abandoned by a superseded refresh.
+        """
+        self._ensure_job_cache_state()
+        with self._reconcile_prefetch_executor_lock:
+            if self._reconcile_prefetch_executor_shutdown:
+                return None
+            executor = self._reconcile_prefetch_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="prism-reconcile-prefetch",
                 )
-            if (
-                reconciled_monotonic is not None
-                and time.monotonic() - reconciled_monotonic <= ttl
-                and not self.qbit_chain_view_untrusted()
-            ):
-                return True
-        return self.ensure_reorg_reconciled_for_tip(current_tip)
+                self._reconcile_prefetch_executor = executor
+        try:
+            return executor.submit(self.ensure_reorg_reconciled_for_tip, tip_hash)
+        except RuntimeError:
+            # Executor shutdown raced this submit; the serial path covers it.
+            return None
+
+    @staticmethod
+    def _discard_stale_reconcile_prefetch(future: Future[bool]) -> None:
+        """Detach a prefetched pass whose tip was superseded during the
+        template fetch.
+
+        The pass cannot be cancelled mid-ledger-mutation and already records
+        its own outcome/error accounting; the serial pass for the current
+        tip re-surfaces any condition that still applies. Consuming the
+        result here only prevents an unretrieved-exception warning.
+        """
+
+        def _consume(done: Future[bool]) -> None:
+            try:
+                done.result()
+            except BaseException:
+                pass
+
+        future.add_done_callback(_consume)
+
+    def shutdown_reconcile_prefetch_executor(self) -> None:
+        self._ensure_job_cache_state()
+        with self._reconcile_prefetch_executor_lock:
+            executor = self._reconcile_prefetch_executor
+            self._reconcile_prefetch_executor = None
+            self._reconcile_prefetch_executor_shutdown = True
+        if executor is not None:
+            # A pass blocked on writer admission aborts via
+            # ShutdownInProgress on its own; never hold shutdown for it.
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def ensure_reorg_reconciled_for_tip(
         self,
@@ -21415,6 +21574,14 @@ class PrismCoordinator:
             "# HELP qbit_prism_reorg_reconcile_errors_total Reorg reconciliation errors that prevented ordered job issuance.",
             "# TYPE qbit_prism_reorg_reconcile_errors_total counter",
             f"qbit_prism_reorg_reconcile_errors_total {self.reorg_reconcile_error_count}",
+            "# HELP qbit_prism_reorg_reconcile_lookups_total Reconcile demand by caller path and the source that satisfied it.",
+            "# TYPE qbit_prism_reorg_reconcile_lookups_total counter",
+            *[
+                f'qbit_prism_reorg_reconcile_lookups_total{{path="{path}",source="{source}"}} '
+                f"{int(getattr(self, 'reorg_reconcile_lookup_counts', {}).get((path, source), 0))}"
+                for path in PRISM_REORG_RECONCILE_LOOKUP_PATHS
+                for source in PRISM_REORG_RECONCILE_LOOKUP_SOURCES
+            ],
             "# HELP qbit_prism_matured_payouts_total Payout entries marked mature by the coordinator tip reconciliation path.",
             "# TYPE qbit_prism_matured_payouts_total counter",
             f"qbit_prism_matured_payouts_total {self.matured_payout_count}",
