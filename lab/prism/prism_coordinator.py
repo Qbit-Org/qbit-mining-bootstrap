@@ -1179,6 +1179,10 @@ class PrismJobContext:
     connection_id: int = 0
     authorization_generation: int = 0
     difficulty_generation: int = 0
+    # Version-rolling mask negotiated on the connection this job was
+    # delivered to. Cross-connection resumes validate in-flight version bits
+    # against this mask, not the replacement connection's (often still 0).
+    version_mask: int = 0
 
 
 @dataclass
@@ -8294,6 +8298,7 @@ class PrismCoordinator:
             difficulty_generation=int(
                 getattr(client, "difficulty_generation", 0)
             ),
+            version_mask=int(getattr(client, "version_mask", 0)),
         )
 
     def accepted_share_stats(self) -> tuple[int, int]:
@@ -14564,6 +14569,7 @@ class PrismCoordinator:
                     continue
                 client.request_received_monotonic = time.monotonic()
                 request_id: object = None
+                request: object = None
                 try:
                     request = json.loads(line)
                     if not isinstance(request, dict):
@@ -14574,6 +14580,20 @@ class PrismCoordinator:
                     self.send_error(client, request_id, 20, f"invalid JSON: {exc.msg}")
                 except StratumError as exc:
                     self.send_error(client, request_id, exc.code, exc.message, reason=exc.reason)
+                    received_monotonic = client.request_received_monotonic
+                    if (
+                        received_monotonic is not None
+                        and isinstance(request, dict)
+                        and request.get("method") == "mining.submit"
+                    ):
+                        # Symmetric with the accepted-path observation after
+                        # send_result: both sides include the response write,
+                        # so the accepted-vs-rejected comparison separates
+                        # commit pressure from transport/thread saturation.
+                        self._observe_share_ack_seconds(
+                            "rejected",
+                            time.monotonic() - received_monotonic,
+                        )
                     if exc.disconnect:
                         break
                 except Exception:
@@ -14809,20 +14829,12 @@ class PrismCoordinator:
                 "request_received_monotonic",
                 None,
             )
-            try:
-                accepted_and_closed = self.handle_submit(client, params)
-            except StratumError:
-                if received_monotonic is not None:
-                    # Rejects skip the group-commit wait; measured at the
-                    # decision (the error response write follows upstream).
-                    self._observe_share_ack_seconds(
-                        "rejected",
-                        time.monotonic() - received_monotonic,
-                    )
-                raise
+            accepted_and_closed = self.handle_submit(client, params)
             try:
                 self.send_result(client, request_id, True)
                 if received_monotonic is not None:
+                    # Rejects are observed symmetrically in handle_client
+                    # after their error response write.
                     self._observe_share_ack_seconds(
                         "accepted",
                         time.monotonic() - received_monotonic,
@@ -16998,6 +17010,15 @@ class PrismCoordinator:
                     worker=worker_name,
                 )
 
+        submit_version_mask = client.version_mask
+        if (
+            evicted_entry is not None
+            and evicted_entry.connection_id != client.connection_id
+        ):
+            # In-flight work from the dead connection was rolled under the
+            # mask negotiated there; the replacement's own mask (often still
+            # 0 before mining.configure) must not judge those version bits.
+            submit_version_mask = int(getattr(context, "version_mask", 0))
         try:
             submission = direct_stratum.assemble_submission(
                 context.job,
@@ -17005,7 +17026,7 @@ class PrismCoordinator:
                 ntime_hex=ntime_hex,
                 nonce_hex=nonce_hex,
                 version_bits_hex=version_bits_hex,
-                version_mask=client.version_mask,
+                version_mask=submit_version_mask,
             )
         except ValueError as exc:
             self.reject_stratum(

@@ -6508,5 +6508,20 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
         )
 
 
+class JobContextStampTests(unittest.TestCase):
+    def test_job_context_stamps_client_version_mask(self) -> None:
+        # Cross-connection resumes validate version bits against the mask
+        # negotiated on the delivering connection, so the context must
+        # record it at stamp time.
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.version_mask = 0x1FFFE000
+
+        context = server.build_job_for_client(state, clean_jobs=True)
+
+        self.assertEqual(context.version_mask, 0x1FFFE000)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5644,8 +5644,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIsNone(ledger.pending[0].credit_policy)
 
     def test_share_ack_latency_histogram_observes_accept_and_reject(self) -> None:
-        # The read-to-ack instrument for share-ingest saturation: accepted
-        # submits include the commit wait, rejects measure the fast path.
+        # The read-to-ack instrument for share-ingest saturation, driven
+        # through the real handler loop: both outcomes are observed after
+        # their response write, so accepted-vs-rejected separates commit
+        # pressure from transport/thread saturation.
         tip = "00" * 32
         server, state, _ledger = submit_coordinator(tip=tip)
         sent: list[dict[str, object]] = []
@@ -5656,39 +5658,43 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             share_pass=True,
             block_pass=False,
         )
+        coordinator_sock, peer = socket.socketpair()
+        state.sock = coordinator_sock
+        accepted_line = json.dumps(
+            {
+                "id": 7,
+                "method": "mining.submit",
+                "params": ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            }
+        )
+        rejected_line = json.dumps(
+            {
+                "id": 8,
+                "method": "mining.submit",
+                "params": [
+                    "miner-a",
+                    "missing-job",
+                    "00" * 8,
+                    "00000001",
+                    "00000002",
+                ],
+            }
+        )
 
-        state.request_received_monotonic = time.monotonic()
         with patch(
             "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
             return_value=submission,
         ):
-            server.handle_request(
-                state,
-                {
-                    "id": 7,
-                    "method": "mining.submit",
-                    "params": ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
-                },
-            )
-        self.assertEqual(sent, [{"id": 7, "result": True, "error": None}])
+            handler = threading.Thread(target=server.handle_client, args=(state,))
+            handler.start()
+            peer.sendall((accepted_line + "\n" + rejected_line + "\n").encode())
+            peer.close()
+            handler.join(5)
 
-        state.request_received_monotonic = time.monotonic()
-        with self.assertRaises(StratumError):
-            server.handle_request(
-                state,
-                {
-                    "id": 8,
-                    "method": "mining.submit",
-                    "params": [
-                        "miner-a",
-                        "missing-job",
-                        "00" * 8,
-                        "00000001",
-                        "00000002",
-                    ],
-                },
-            )
-
+        self.assertFalse(handler.is_alive())
+        self.assertEqual(sent[0], {"id": 7, "result": True, "error": None})
+        self.assertEqual(sent[1]["id"], 8)
+        self.assertIsNotNone(sent[1]["error"])
         metrics = "\n".join(server.share_ack_metrics_lines())
         self.assertIn(
             'qbit_prism_share_ack_seconds_count{result="accepted"} 1',
@@ -5787,6 +5793,58 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.reason, PRISM_REJECTION_UNKNOWN_JOB)
+
+    def test_cross_connection_submit_uses_retained_version_mask(self) -> None:
+        # In-flight work from the dead connection was version-rolled under
+        # the mask negotiated there; the replacement's own mask (0 before
+        # mining.configure) must not judge those version bits.
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.jobs["job-1"].version_mask = 0x1FFFE000
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+
+        reconnected = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=2,
+            extranonce1_hex="00000002",
+        )
+        reconnected.subscribed = True
+        reconnected.authorized = True
+        reconnected.username = "miner-a"
+        reconnected.worker = worker_identity("miner-a")
+        self.assertEqual(reconnected.version_mask, 0)
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ) as assemble:
+            self.assertFalse(
+                server.handle_submit(
+                    reconnected,
+                    [
+                        "miner-a",
+                        "job-1",
+                        "00" * 8,
+                        "00000001",
+                        "00000002",
+                        "1fffe000",
+                    ],
+                )
+            )
+
+        self.assertEqual(
+            assemble.call_args.kwargs["version_mask"],
+            0x1FFFE000,
+        )
 
     def test_cross_connection_block_candidate_keeps_original_extranonce(self) -> None:
         # The mined coinbase embeds the extranonce1 the retained job was
