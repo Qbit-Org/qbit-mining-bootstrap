@@ -864,7 +864,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(config.max_step_factor, Decimal("4"))
         self.assertEqual(config.max_step_down_factor, Decimal("4"))
 
-    def test_vardiff_retarget_sends_new_difficulty_and_clean_job(self) -> None:
+    def test_vardiff_step_up_retarget_sends_new_difficulty_without_flush(self) -> None:
         server = coordinator()
         state = client()
         state.share_difficulty = Decimal("1")
@@ -880,12 +880,120 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.note_vardiff_submitted_share(state)
         server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
 
-        # Difficulty is now advertised by maybe_send_job alongside the job (gated on
-        # a successful build), so the retarget commits the pending difficulty and
-        # requests a single clean job.
+        # Difficulty is advertised by maybe_send_job alongside the job (gated on
+        # a successful build). A step-up must not flush the miner's in-flight
+        # work: old jobs validate at their own stamped share_target, so the
+        # retarget requests a single non-clean job.
+        self.assertEqual(state.pending_share_difficulty, Decimal("4"))
+        self.assertEqual(sent["jobs"], 1)
+        self.assertFalse(sent["clean"])
+
+    def test_vardiff_step_down_retarget_flushes_with_clean_job(self) -> None:
+        # Firmware that applies mining.set_difficulty retroactively would
+        # submit sub-target shares against the old job after a step-down, so
+        # the step-down keeps flushing in-flight work.
+        server = coordinator()
+        state = client()
+        state.share_difficulty = Decimal("16")
+        state.vardiff_window_started_monotonic = time.monotonic() - 65
+        sent: dict[str, object] = {"jobs": 0}
+
+        def fake_send_job(client: object, clean_jobs: bool) -> bool:
+            sent.update({"jobs": sent["jobs"] + 1, "clean": clean_jobs})
+            return True
+
+        server.maybe_send_job = fake_send_job  # type: ignore[method-assign]
+
+        server.note_vardiff_submitted_share(state)
+        server.note_vardiff_accepted_share(state, FakeJob(Decimal("16")))  # type: ignore[arg-type]
+
         self.assertEqual(state.pending_share_difficulty, Decimal("4"))
         self.assertEqual(sent["jobs"], 1)
         self.assertTrue(sent["clean"])
+
+    def test_step_up_retarget_keeps_old_job_submittable_at_old_difficulty(self) -> None:
+        tip = "00" * 32
+        server = coordinator()
+        server.accepted_block_count = 0
+        server.max_blocks = 1
+        server.stop_after_block = True
+        server.jobs = {}
+        server.recent_share_keys = set()
+        server.share_weights_by_username = {}
+        ledger = RecordingLedger()
+        server.ledger = ledger
+        worker = worker_identity()
+        state = client()
+        state.username = worker.username
+        state.worker = worker
+        state.share_difficulty = Decimal("1")
+        state.vardiff_window_started_monotonic = time.monotonic() - 2
+        sent: list[dict[str, object]] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+        server.clients = {state}
+        server.rpc = TipTemplateRpc(tip=tip, template=gbt_template(tip))
+
+        old_context = prism_context("old-job", tip, worker=worker, difficulty=Decimal("1"))
+        state.active_job = old_context
+        state.active_job_ids = {"old-job"}
+        server.jobs["old-job"] = old_context
+
+        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
+            return prism_context(
+                "fresh-job",
+                tip,
+                worker=worker,
+                difficulty=client.pending_share_difficulty or client.share_difficulty,
+                clean_jobs=clean_jobs,
+            )
+
+        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
+
+        server.note_vardiff_submitted_share(state)
+        server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
+
+        # The 1 -> 4 step-up pairs the new difficulty with a non-clean job and
+        # keeps the old job registered and submittable.
+        self.assertEqual(state.share_difficulty, Decimal("4"))
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertEqual(sent[0]["params"], [4.0])
+        self.assertEqual(sent[1]["params"][0], "fresh-job")
+        self.assertFalse(sent[1]["params"][8])
+        self.assertIn("old-job", server.jobs)
+        self.assertIn("fresh-job", server.jobs)
+        self.assertEqual(state.active_job_ids, {"old-job", "fresh-job"})
+
+        # In-flight work against the old job still lands, validated at the old
+        # job's own stamped difficulty: this share passes the diff-1 target it
+        # was mined against, not the diff-4 target advertised afterward.
+        def assemble_at_stamped_difficulty(job: object, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                header_hex="aa" * 80,
+                block_hash_hex="bb" * 32,
+                share_pass=job.share_difficulty <= Decimal("1"),
+                block_pass=False,
+            )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            side_effect=assemble_at_stamped_difficulty,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "old-job", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.pending[0].job_id, "old-job")
+        self.assertEqual(server.low_difficulty_share_count, 0)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 0)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_UNKNOWN_JOB], 0)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_STALE_JOB], 0)
 
     def test_vardiff_retarget_build_failure_keeps_consistent_difficulty_and_job(self) -> None:
         # If the job build is skipped during a retarget, the client must stay on its

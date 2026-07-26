@@ -16754,11 +16754,17 @@ class PrismCoordinator:
                     idle_window_reset_at,
                 )
 
+        # A same-tip retarget only needs to flush in-flight work on a
+        # step-down: firmware that applies mining.set_difficulty retroactively
+        # would otherwise submit sub-target shares against the old job. On a
+        # step-up the old job stays valid at its own stamped share_target, so
+        # keeping it avoids discarding the miner's in-flight work.
+        clean_jobs = next_difficulty < current_difficulty
         try:
             if require_idle:
                 sent = self._maybe_send_job_locked(
                     client,
-                    clean_jobs=True,
+                    clean_jobs=clean_jobs,
                     raise_on_build_failure=True,
                     prepared_bundle=prepared_bundle,
                     commit_guard=idle_commit_guard,
@@ -16772,7 +16778,7 @@ class PrismCoordinator:
                     client.authorized
                     and client.subscribed
                     and not self.stop_event.is_set()
-                    and self.maybe_send_job(client, clean_jobs=True)
+                    and self.maybe_send_job(client, clean_jobs=clean_jobs)
                 )
             # A completed paired send is the commit point. Shutdown may race
             # immediately afterward, but it cannot make already-delivered work
