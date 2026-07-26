@@ -5985,6 +5985,11 @@ class ServeBuilderTests(unittest.TestCase):
                 counts = dict(server.serve_builder_counts)
                 self.assertIsNone(server._serve_builder)
             self.assertEqual(counts["fallbacks"], 1)
+            # The mismatched daemon was a real worker launch and must appear
+            # in the lifecycle totals alongside the one-shot fallback.
+            with server._job_build_scheduler_lock:
+                worker_counts = dict(server.job_build_worker_counts)
+            self.assertEqual(worker_counts["starts"], 2)
         finally:
             server.shutdown_serve_builder()
 

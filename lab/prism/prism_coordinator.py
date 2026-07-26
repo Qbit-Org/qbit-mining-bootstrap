@@ -15337,6 +15337,20 @@ class PrismCoordinator:
             raise _ServeBuilderUnavailable(
                 f"audit-builder daemon spawn failed: {exc}"
             ) from exc
+        # The start (and any pending restart it satisfies) is recorded as
+        # soon as the worker exists, exactly like the one-shot path: a
+        # handshake-phase death or protocol mismatch must not leave the
+        # lifecycle totals describing fewer workers than were launched.
+        restarted = False
+        with self._job_build_scheduler_lock:
+            if self._job_build_worker_restart_pending:
+                self.job_build_worker_counts["restarts"] += 1
+                self._job_build_worker_restart_pending = False
+                restarted = True
+            self.job_build_worker_counts["starts"] += 1
+        if restarted:
+            with self._tip_refresh_metrics_lock:
+                self.tip_refresh_worker_restarts += 1
         client = _ServeBuilderClient(process=process)
         try:
             assert process.stdin is not None and process.stdout is not None
@@ -15369,19 +15383,6 @@ class PrismCoordinator:
         except BaseException:
             client.close()
             raise
-        restarted = False
-        with self._job_build_scheduler_lock:
-            if self._job_build_worker_restart_pending:
-                # This daemon replaces a worker that crashed or was
-                # terminated; attribute the restart here instead of leaking
-                # the pending flag to an unrelated later one-shot build.
-                self.job_build_worker_counts["restarts"] += 1
-                self._job_build_worker_restart_pending = False
-                restarted = True
-            self.job_build_worker_counts["starts"] += 1
-        if restarted:
-            with self._tip_refresh_metrics_lock:
-                self.tip_refresh_worker_restarts += 1
         return client
 
     def _serve_builder_read_line(
