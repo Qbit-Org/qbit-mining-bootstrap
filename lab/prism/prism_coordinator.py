@@ -17096,6 +17096,12 @@ class PrismCoordinator:
         """Keep the oldest unresolved candidate ahead of queued descendants."""
         candidate_height = int(candidate.context.template["height"])
         candidate_hash = str(candidate.submission.block_hash_hex).lower()
+        # A retained candidate will be re-disposed, so the disposition seal
+        # (which stopped tip-observation matching at a terminal commit) no
+        # longer applies: the terminal work did not complete. Re-register
+        # immediately -- not at the next disposition -- so acceptance
+        # evidence arriving during the retry backoff is not lost.
+        self._register_outstanding_block_candidate(candidate_hash)
         with self.lock:
             self.block_candidate_retry_count = int(
                 getattr(self, "block_candidate_retry_count", 0)
