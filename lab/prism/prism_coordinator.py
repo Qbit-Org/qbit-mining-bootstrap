@@ -87,6 +87,11 @@ DEFAULT_PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS = 1.0
 PRISM_TIP_REFRESH_FAILURE_HOLDOFF_JITTER_FRACTION = 0.25
 DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS = 10.0
 DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS = 60.0
+# Minimum spacing between speculative payout-ledger-artifact rebuilds armed by
+# a failed reuse fence. Every fence failure wants a fresh artifact, but each
+# rebuild walks the full reward window; the floor keeps that CTE from running
+# continuously when shares land faster than a rebuild can complete.
+DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS = 5.0
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
 DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
@@ -1314,6 +1319,15 @@ class CachedJobBundle:
     # full audit bundle (and its duplicate shares tree) in every cached job.
     prospective_prior_balances: tuple[tuple[str, str, str, int], ...] | None = None
     build_key: JobBuildKey | None = None
+    # A synchronous ready build publishes its fenced ledger window for reuse
+    # only once this bundle wins cache publication (or is served as pinned
+    # snapshot work). Installing mid-build would re-key concurrent lookups
+    # away from the in-flight single flight and fork redundant builds.
+    prepared_ledger_artifact: PayoutLedgerArtifact | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -2502,6 +2516,10 @@ class PrismCoordinator:
             "PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS",
             DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
         )
+        self.payout_artifact_rearm_min_seconds = env_positive_float(
+            "PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS",
+            DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,
+        )
         self.template_cache_seconds = env_nonnegative_float(
             "PRISM_TEMPLATE_CACHE_SECONDS",
             self.blockpoll_seconds,
@@ -3440,6 +3458,12 @@ class PrismCoordinator:
             self._payout_artifact_requested: tuple[int, int] | None = None
         if not hasattr(self, "_payout_artifact_executor_shutdown"):
             self._payout_artifact_executor_shutdown = False
+        if not hasattr(self, "_payout_artifact_last_schedule_monotonic"):
+            # Guarded by _payout_artifact_executor_lock. Stamped by every
+            # accepted preparation request so fence-failure re-arms measure
+            # their debounce from the newest scheduled rebuild, whichever
+            # path requested it.
+            self._payout_artifact_last_schedule_monotonic: float | None = None
         if not hasattr(self, "_payout_state_delivery_gate"):
             # Orders reconciliation mutations against final job-delivery
             # admission while preserving parallel sends to different miners.
@@ -3812,8 +3836,30 @@ class PrismCoordinator:
         )
         if artifact is None:
             return
+        self._install_payout_ledger_artifact(artifact)
+
+    def _install_payout_ledger_artifact(
+        self,
+        artifact: PayoutLedgerArtifact,
+    ) -> None:
+        """Atomically publish a prepared artifact for its own generation.
+
+        Freshness-ordered and idempotent: every waiter on a shared build
+        flight re-runs cache publication with the same prepared artifact, and
+        a background rebuild can finish in between. Re-installing an equal or
+        older snapshot would spin the artifact generation (re-keying bundle
+        lookups) without changing reuse fidelity.
+        """
         with self._job_cache_lock:
-            if payout_state_generation != self._payout_state_generation:
+            if artifact.payout_state_generation != self._payout_state_generation:
+                return
+            current = self._payout_ledger_artifact
+            if (
+                current is not None
+                and current.payout_state_generation
+                == artifact.payout_state_generation
+                and current.prepared_monotonic >= artifact.prepared_monotonic
+            ):
                 return
             self._payout_ledger_artifact_generation += 1
             self._payout_ledger_artifact = dataclass_replace(
@@ -3845,6 +3891,7 @@ class PrismCoordinator:
                 int(payout_state_generation),
                 int(network_difficulty),
             )
+            self._payout_artifact_last_schedule_monotonic = time.monotonic()
             if self._payout_artifact_future is not None:
                 return
             executor = self._payout_artifact_executor
@@ -3883,6 +3930,14 @@ class PrismCoordinator:
         except Exception:
             return None
         if accepted_share_count != artifact.accepted_share_count:
+            # The armed artifact went stale the moment a newer share became
+            # durable. No payout event may arrive for a long time, so queue a
+            # bounded speculative rebuild; exact-count reuse semantics are
+            # unchanged because the stale artifact stays rejected here.
+            self._rearm_payout_ledger_artifact_after_fence_failure(
+                payout_state_generation,
+                network_difficulty,
+            )
             return None
         balances_sha256 = canonical_json_sha256(artifact.prior_balances)
         with self._job_cache_lock:
@@ -3899,6 +3954,52 @@ class PrismCoordinator:
                 self._payout_ledger_artifact = None
                 return None
             return artifact
+
+    def _rearm_payout_ledger_artifact_after_fence_failure(
+        self,
+        payout_state_generation: int,
+        network_difficulty: int,
+    ) -> None:
+        """Debounced rebuild scheduling for a share-staled artifact.
+
+        The interval floor keeps the reward-window CTE from running
+        continuously when shares land faster than rebuilds complete. Landed
+        accepted-block previews suppress the re-arm entirely: a speculative
+        rebuild in that window would read database balances the published
+        prospective state has already superseded, and the durable-confirmation
+        path resumes preparation itself once the gap closes.
+        """
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            if (
+                self._payout_state_publication_blocked
+                or payout_state_generation != self._payout_state_generation
+            ):
+                return
+        with self._accepted_block_payout_preview_condition:
+            if any(
+                transition.landed
+                for transition in self._accepted_block_payout_previews.values()
+            ):
+                return
+        rearm_min_seconds = float(
+            getattr(
+                self,
+                "payout_artifact_rearm_min_seconds",
+                DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,
+            )
+        )
+        with self._payout_artifact_executor_lock:
+            last_scheduled = self._payout_artifact_last_schedule_monotonic
+            if (
+                last_scheduled is not None
+                and time.monotonic() - last_scheduled < rearm_min_seconds
+            ):
+                return
+        self._schedule_payout_ledger_artifact_preparation(
+            payout_state_generation,
+            network_difficulty,
+        )
 
     def _schedule_current_payout_ledger_artifact_if_missing(self) -> None:
         """Resume speculative preparation after a durable preview catches up."""
@@ -6381,6 +6482,32 @@ class PrismCoordinator:
             return self._job_bundle_cache.get(key)
         return None
 
+    def _no_artifact_job_bundle_key(
+        self,
+        artifacts: CachedTemplateArtifacts,
+        *,
+        mode: str,
+        payout_state_generation: int,
+        worker: WorkerIdentity | None,
+    ) -> tuple[object, ...]:
+        """Fallback cache identity for work built before an artifact re-key.
+
+        A synchronous build caches its bundle under the no-artifact key and
+        then publishes its fenced window as the payout ledger artifact. The
+        next lookup is keyed to that artifact and would miss the still-fresh
+        bundle and rebuild identical work: within one payout generation and
+        template identity the no-artifact bundle binds the same balances,
+        window anchor, and policy inputs, so it remains a correct cache
+        identity to serve until ordinary TTL or template rotation retires it.
+        """
+        return self._job_bundle_key(
+            artifacts,
+            mode=mode,
+            payout_state_generation=payout_state_generation,
+            payout_artifact_generation=0,
+            worker=worker,
+        )
+
     def _job_bundle_entry_usable(
         self,
         cached: CachedJobBundle | None,
@@ -6743,7 +6870,13 @@ class PrismCoordinator:
             while len(self._job_bundle_cache) > MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES:
                 oldest_key = next(iter(self._job_bundle_cache))
                 self._job_bundle_cache.pop(oldest_key, None)
-            return True
+        # Arm the build's fenced ledger window only after the bundle itself
+        # won cache publication: lookups re-keyed by the fresh artifact fall
+        # back to exactly this cached no-artifact entry instead of forking a
+        # redundant build.
+        if built.prepared_ledger_artifact is not None:
+            self._install_payout_ledger_artifact(built.prepared_ledger_artifact)
+        return True
 
     def _probe_initial_job_bundle(
         self,
@@ -6784,6 +6917,15 @@ class PrismCoordinator:
             worker=worker,
         )
         cached = self._lookup_job_bundle(key)
+        if cached is None and payout_artifact is not None:
+            cached = self._lookup_job_bundle(
+                self._no_artifact_job_bundle_key(
+                    artifacts,
+                    mode=resolved_mode,
+                    payout_state_generation=payout_state_generation,
+                    worker=worker,
+                )
+            )
         if not self._job_bundle_entry_usable(cached, artifacts):
             return None
         self._record_job_cache_event("bundle", hit=True)
@@ -6906,16 +7048,34 @@ class PrismCoordinator:
                 payout_artifact_generation=payout_artifact_generation,
                 worker=worker,
             )
+            no_artifact_key = (
+                self._no_artifact_job_bundle_key(
+                    artifacts,
+                    mode=resolved_mode,
+                    payout_state_generation=payout_state_generation,
+                    worker=worker,
+                )
+                if payout_artifact_generation != 0
+                else None
+            )
             cached = self._lookup_job_bundle(key)
             if (
                 cached is None
                 and subscribed_bundle is not None
-                and subscribed_bundle.key == key
+                and (
+                    subscribed_bundle.key == key
+                    or (
+                        no_artifact_key is not None
+                        and subscribed_bundle.key == no_artifact_key
+                    )
+                )
             ):
                 # The subscribed priority result may not have won the global
                 # cache-publication race yet; consume it directly. Usability
                 # below applies exactly the checks a cache entry would face.
                 cached = subscribed_bundle
+            if cached is None and no_artifact_key is not None:
+                cached = self._lookup_job_bundle(no_artifact_key)
             if self._job_bundle_entry_usable(cached, artifacts):
                 if preparation_cancellation is not None:
                     preparation_cancellation.raise_if_cancelled(
@@ -7067,6 +7227,10 @@ class PrismCoordinator:
                     # Snapshot-owned work may outlive an unrelated global
                     # cache fill. Return it only to its refresh validator or
                     # retained collection delivery; never retain it globally.
+                    if built.prepared_ledger_artifact is not None:
+                        self._install_payout_ledger_artifact(
+                            built.prepared_ledger_artifact
+                        )
                     return built
                 if retry_superseded:
                     with self._job_cache_lock:
@@ -7186,6 +7350,7 @@ class PrismCoordinator:
             * PRISM_SNAPSHOT_WINDOW_MARGIN
             * int(build_request.key.network_difficulty)
         )
+        prepared_ledger_artifact: PayoutLedgerArtifact | None = None
         if payout_artifact is not None:
             if (
                 self._usable_payout_ledger_artifact(
@@ -7214,6 +7379,7 @@ class PrismCoordinator:
                 fallback_balances=prior_balances,
             )
         else:
+            snapshot_accepted_count: int | None = None
             with self._payout_state_prepare_lock:
                 with self._job_cache_lock:
                     published_artifact = self._published_payout_state.artifact
@@ -7230,6 +7396,14 @@ class PrismCoordinator:
                         raise JobBuildSuperseded(
                             "payout generation changed before ledger snapshot"
                         )
+                accepted_before: int | None = None
+                if resolved_mode == "ready":
+                    try:
+                        accepted_before, _ = self.accepted_share_stats()
+                    except Exception:
+                        # Artifact seeding is speculative; snapshot errors
+                        # stay owned by the bundle build itself.
+                        accepted_before = None
                 records = (
                     self.ledger.snapshot_at_job_issue(
                         issued_at_ms,
@@ -7238,6 +7412,18 @@ class PrismCoordinator:
                     if resolved_mode == "ready"
                     else []
                 )
+                if accepted_before is not None:
+                    try:
+                        accepted_after, _ = self.accepted_share_stats()
+                    except Exception:
+                        pass
+                    else:
+                        # Same fence as the background preparation path: a
+                        # share committing during the read leaves the window
+                        # ambiguously bound to either count, so the window
+                        # must not be republished for reuse.
+                        if int(accepted_after) == int(accepted_before):
+                            snapshot_accepted_count = int(accepted_after)
                 # An accepted parent's prospective carry state supersedes the
                 # published artifact for children built on that parent; the
                 # published balances remain the fallback for ordinary tips.
@@ -7255,6 +7441,28 @@ class PrismCoordinator:
                         cancellation,
                     )
                 shares.append(record.to_prism_json())
+            if snapshot_accepted_count is not None and shares:
+                # This build already paid the full ledger read; carry the
+                # window it produced so cache publication can arm it for
+                # builds arriving before the next share commit. The artifact
+                # carries the published payout-state balances, not this
+                # bundle's possibly parent-adjusted view: reuse re-applies
+                # the parent override itself and the reuse fence hashes the
+                # artifact balances against the published payout artifact.
+                prepared_ledger_artifact = PayoutLedgerArtifact(
+                    generation=0,
+                    payout_state_generation=payout_state_generation,
+                    network_difficulty=int(
+                        build_request.key.network_difficulty
+                    ),
+                    accepted_share_count=snapshot_accepted_count,
+                    shares_json=tuple(shares),
+                    prior_balances=tuple(
+                        build_request.payout_artifact.prior_balances()
+                    ),
+                    prepared_monotonic=time.monotonic(),
+                    snapshot_anchor_ms=issued_at_ms,
+                )
         # A reused artifact carries shares snapshotted at its own earlier
         # anchor. The bundle must declare that anchor: replaying the audit
         # window at this job's fresher anchor could include a share that was
@@ -7412,6 +7620,7 @@ class PrismCoordinator:
             collection_identity=collection_identity,
             prospective_prior_balances=prospective_prior_balances,
             build_key=final_build_key,
+            prepared_ledger_artifact=prepared_ledger_artifact,
         )
 
     def stamp_job_for_client(

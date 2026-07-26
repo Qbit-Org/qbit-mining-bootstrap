@@ -2073,6 +2073,191 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(bundle.payout_artifact_generation, 0)
         self.assertEqual(server.ledger.snapshot_calls, 1)
 
+    def test_sync_ledger_snapshot_publishes_reusable_artifact(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        first = server.store_template_artifacts(dict(rpc.template))
+        assert first is not None
+        with server._job_cache_lock:
+            server._job_build_issued_at_ms[first.generation] = 1_700_000_000_000
+
+        inline = server.shared_job_bundle(first, mode="ready")
+
+        self.assertEqual(inline.payout_artifact_generation, 0)
+        self.assertEqual(server.ledger.snapshot_calls, 1)
+        with server._job_cache_lock:
+            artifact = server._payout_ledger_artifact
+        self.assertIsNotNone(artifact)
+        assert artifact is not None
+        self.assertGreater(artifact.generation, 0)
+        self.assertEqual(
+            artifact.payout_state_generation,
+            server._payout_state_generation,
+        )
+        self.assertEqual(
+            artifact.accepted_share_count,
+            len(server.ledger.miners),
+        )
+        self.assertEqual(list(artifact.shares_json), inline.shares_json)
+        self.assertEqual(artifact.snapshot_anchor_ms, inline.issued_at_ms)
+
+        second = server.store_template_artifacts(
+            base_template(height=11, prevhash="22" * 32)
+        )
+        assert second is not None
+        with server._job_cache_lock:
+            server._job_build_issued_at_ms[second.generation] = (
+                1_700_000_001_000
+            )
+
+        reused = server.shared_job_bundle(second, mode="ready")
+
+        self.assertEqual(reused.payout_artifact_generation, artifact.generation)
+        self.assertEqual(server.ledger.snapshot_calls, 1)
+        self.assertEqual(reused.shares_json, inline.shares_json)
+        self.assertNotEqual(reused.issued_at_ms, inline.issued_at_ms)
+        self.assertEqual(
+            reused.found_block["anchor_job_issued_at_ms"],
+            artifact.snapshot_anchor_ms,
+        )
+
+    def test_sync_artifact_publication_refused_when_share_commits_mid_read(
+        self,
+    ) -> None:
+        class MidReadCommitLedger(FakeLedger):
+            def snapshot_at_job_issue(
+                self,
+                anchor_job_issued_at_ms: int,
+                *,
+                window_weight: int | None = None,
+            ) -> list[FakeShare]:
+                result = super().snapshot_at_job_issue(
+                    anchor_job_issued_at_ms,
+                    window_weight=window_weight,
+                )
+                # A share becomes durable while the window read is in flight,
+                # so the read is ambiguously bound to either accepted count.
+                self.miners = [*self.miners, f"mid-read-{self.snapshot_calls}"]
+                return result
+
+        server, rpc = coordinator(ledger=MidReadCommitLedger())
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        bundle = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertFalse(bundle.collection_only)
+        self.assertEqual(bundle.payout_artifact_generation, 0)
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+
+    def test_fence_failure_rearms_artifact_preparation_with_debounce(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.payout_artifact_rearm_min_seconds = 5.0
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        scheduled: list[tuple[int, int]] = []
+
+        def record_schedule(
+            payout_state_generation: int,
+            network_difficulty: int,
+        ) -> None:
+            scheduled.append((payout_state_generation, network_difficulty))
+            with server._payout_artifact_executor_lock:
+                server._payout_artifact_last_schedule_monotonic = (
+                    time.monotonic()
+                )
+
+        server._schedule_payout_ledger_artifact_preparation = (  # type: ignore[method-assign]
+            record_schedule
+        )
+
+        usable = server._usable_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        self.assertIsNotNone(usable)
+        self.assertEqual(scheduled, [])
+
+        server.ledger.miners = [*server.ledger.miners, "late-share"]
+
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+        self.assertEqual(
+            scheduled,
+            [(server._payout_state_generation, artifacts.network_difficulty)],
+        )
+
+        # A second failed probe inside the interval must not re-schedule.
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+        self.assertEqual(len(scheduled), 1)
+
+        # Once the interval has elapsed the next failed probe re-arms.
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_last_schedule_monotonic = (
+                time.monotonic() - 6.0
+            )
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+        self.assertEqual(len(scheduled), 2)
+
+    def test_landed_preview_suppresses_fence_failure_rearm(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        scheduled: list[tuple[int, int]] = []
+        server._schedule_payout_ledger_artifact_preparation = (  # type: ignore[method-assign]
+            lambda generation, difficulty: scheduled.append(
+                (generation, difficulty)
+            )
+        )
+        accepted_hash = "d0" * 32
+        server._begin_accepted_block_payout_preview(
+            accepted_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        server._mark_accepted_block_payout_landed(
+            accepted_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+
+        server.ledger.miners = [*server.ledger.miners, "late-share"]
+
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+        # A speculative rebuild would read database balances the landed
+        # prospective state supersedes; preparation resumes only through the
+        # durable-confirmation call site.
+        self.assertEqual(scheduled, [])
+
     def test_new_tip_cancels_blocked_old_bundle_without_publication(self) -> None:
         old_tip = "11" * 32
         new_tip = "22" * 32
