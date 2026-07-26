@@ -1706,6 +1706,55 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertTrue(server.ensure_reorg_reconciled_for_current_tip())
         self.assertEqual(reconcile_calls, [rpc.tip])
 
+    def test_tip_flip_back_within_ttl_requires_fresh_reconcile(self) -> None:
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        tip_a = rpc.tip
+        self.addCleanup(server.shutdown_tip_refresh_executor)
+        server.observe_tip_for_refresh(tip_a)
+        server._note_reorg_reconcile_outcome(tip_a, trusted=True)
+        reconcile_calls: list[str | None] = []
+
+        def fake_reconcile(*, tip_hash: str | None = None) -> dict[str, object]:
+            reconcile_calls.append(tip_hash)
+            return {"untrusted": False}
+
+        server.reconcile_prism_pool_blocks_once = fake_reconcile  # type: ignore[method-assign]
+
+        self.assertTrue(server.ensure_reorg_reconciled_for_current_tip())
+        self.assertEqual(reconcile_calls, [])
+
+        # Detecting an intervening tip ends tip A's memo epoch: when the
+        # chain flips back to A within the cache TTL, pool-block chain state
+        # must be re-proven by a fresh pass, not assumed from the pre-flip
+        # outcome.
+        server.observe_tip_for_refresh("bb" * 32)
+
+        self.assertTrue(server.ensure_reorg_reconciled_for_current_tip())
+        self.assertEqual(reconcile_calls, [tip_a])
+
+    def test_stale_pass_cannot_rearm_memo_after_newer_tip_detected(self) -> None:
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        tip_a = rpc.tip
+        self.addCleanup(server.shutdown_tip_refresh_executor)
+        server.observe_tip_for_refresh(tip_a)
+        server.observe_tip_for_refresh("bb" * 32)
+
+        # A pass for tip A finishing after tip B was detected must not arm
+        # the memo for A: its epoch already ended at the newer observation.
+        server._note_reorg_reconcile_outcome(tip_a, trusted=True)
+        reconcile_calls: list[str | None] = []
+
+        def fake_reconcile(*, tip_hash: str | None = None) -> dict[str, object]:
+            reconcile_calls.append(tip_hash)
+            return {"untrusted": False}
+
+        server.reconcile_prism_pool_blocks_once = fake_reconcile  # type: ignore[method-assign]
+
+        self.assertTrue(server.ensure_reorg_reconciled_for_current_tip())
+        self.assertEqual(reconcile_calls, [tip_a])
+
     def test_reorg_cache_rechecks_chain_view_before_reuse(self) -> None:
         server, rpc = coordinator()
         server.reorg_reconciler_enabled = True

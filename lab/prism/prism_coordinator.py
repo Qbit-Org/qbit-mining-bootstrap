@@ -11819,6 +11819,8 @@ class PrismCoordinator:
                 prior_detected_hash is not None
                 and prior_detected_hash != tip_hash
             )
+            if detection_changed:
+                self._evict_reorg_reconcile_memo_for_new_tip_locked(tip_hash)
             if (
                 detection_changed
                 and self._payout_state_source[1] != tip_hash
@@ -12684,12 +12686,39 @@ class PrismCoordinator:
             if tip_hash is None:
                 return
             if trusted:
+                latest = getattr(self, "latest_detected_tip", None)
+                if latest is not None and latest[0] != tip_hash:
+                    # This pass finished for a tip that is no longer the
+                    # newest detected one; its epoch is over. Arming would
+                    # re-add an entry the newer observation already evicted
+                    # and let a flip-back reuse a pre-flip outcome.
+                    return
                 memo[tip_hash] = now
                 memo.move_to_end(tip_hash)
                 while len(memo) > PRISM_REORG_RECONCILE_MEMO_MAX_TIPS:
                     memo.popitem(last=False)
             else:
                 memo.pop(tip_hash, None)
+
+    def _evict_reorg_reconcile_memo_for_new_tip_locked(
+        self,
+        tip_hash: str,
+    ) -> None:
+        """Drop trusted-reconcile entries for every tip except ``tip_hash``.
+
+        Called under self.lock when a newer tip is detected. A detected flip
+        ends the epoch of every previously cached outcome: if the chain later
+        flips back to an earlier hash within the cache TTL, pool-block chain
+        state must be re-proven by a fresh pass, not assumed from a pre-flip
+        reconciliation. Detection is observation-sequenced, so only genuinely
+        newer observations evict.
+        """
+
+        self._ensure_job_cache_state()
+        memo = self._reorg_reconcile_trusted_memo
+        for cached_tip in list(memo):
+            if cached_tip != tip_hash:
+                del memo[cached_tip]
 
     def ensure_reorg_reconciled_for_current_tip(
         self,
