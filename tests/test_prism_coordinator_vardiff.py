@@ -4238,6 +4238,48 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with server._reconcile_flight_lock:
             server._reconcile_flights.pop(tip, None)
 
+    def test_row_mutating_pass_evicts_other_tip_memo_entries(self) -> None:
+        tip_a = "a1" * 32
+        tip_b = "b2" * 32
+        pool_block_hash = "cd" * 32
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        ledger = ReorgLedger([])
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip_b,
+            template=gbt_template(tip_b, height=11),
+            height=10,
+            block_hashes={10: tip_b},
+        )
+        server._ensure_job_cache_state()
+        server._note_reorg_reconcile_outcome(tip_a, trusted=True)
+
+        # A pass for another tip that mutates no rows leaves tip A's cached
+        # proof valid: rows and tip-A chain state are both unchanged.
+        first = server.reconcile_prism_pool_blocks_once(tip_hash=tip_b)
+        self.assertEqual(first["published_generation"], 1)
+        with server.lock:
+            self.assertIn(tip_a, server._reorg_reconcile_trusted_memo)
+            self.assertIn(tip_b, server._reorg_reconcile_trusted_memo)
+
+        # A pass that applies orphan/maturity row mutations ends every other
+        # tip's memo epoch, even though tip B was never observed by
+        # observe_tip_for_refresh.
+        ledger.rows.append(
+            {
+                "block_hash": pool_block_hash,
+                "block_height": 12,
+                "chain_state": "confirmed",
+                "maturity_state": "immature",
+            }
+        )
+        second = server.reconcile_prism_pool_blocks_once(tip_hash=tip_b)
+        self.assertEqual(second["inactive_blocks"], 1)
+        with server.lock:
+            self.assertNotIn(tip_a, server._reorg_reconcile_trusted_memo)
+            self.assertIn(tip_b, server._reorg_reconcile_trusted_memo)
+
     def test_reconciliation_reactivates_inactive_block_that_returns_to_active_chain(self) -> None:
         pool_block_hash = "cc" * 32
         server = coordinator()

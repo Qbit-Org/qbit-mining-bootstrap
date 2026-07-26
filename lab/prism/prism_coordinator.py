@@ -12662,6 +12662,7 @@ class PrismCoordinator:
         *,
         trusted: bool,
         clear_memo: bool = False,
+        evict_others: bool = False,
     ) -> None:
         """Record a reconcile outcome in the per-tip trusted memo.
 
@@ -12669,8 +12670,12 @@ class PrismCoordinator:
         (superseded publication, untrusted chain view) unarms only its own
         tip: it proves nothing about reconciliations already completed for
         other tips, and unarming them globally forces every job build into a
-        redundant full pass. A reconcile error passes clear_memo=True; a
-        partially applied ledger mutation invalidates every cached outcome.
+        redundant full pass. A pass that applied orphan/maturity row
+        mutations passes evict_others=True: cached proofs for other tips
+        were taken against pre-mutation rows and no longer hold, even if the
+        chain later flips back before any tip observation lands. A reconcile
+        error passes clear_memo=True; a partially applied ledger mutation
+        invalidates every cached outcome.
         """
 
         self._ensure_job_cache_state()
@@ -12683,6 +12688,10 @@ class PrismCoordinator:
             if clear_memo:
                 memo.clear()
                 return
+            if evict_others:
+                for cached_tip in list(memo):
+                    if cached_tip != tip_hash:
+                        del memo[cached_tip]
             if tip_hash is None:
                 return
             if trusted:
@@ -13057,7 +13066,18 @@ class PrismCoordinator:
                 self.reorg_inactive_block_count += inactive_blocks_total
                 self.reorg_reactivated_block_count += reactivated_blocks_total
                 self.matured_payout_count += matured_payouts_total
-            self._note_reorg_reconcile_outcome(tip_hash, trusted=trusted)
+            self._note_reorg_reconcile_outcome(
+                tip_hash,
+                trusted=trusted,
+                # Row mutations invalidate proofs cached for other tips even
+                # when the mutating pass's tip was never observed (per-client
+                # callers reconcile straight off getbestblockhash).
+                evict_others=bool(
+                    inactive_blocks_total
+                    or reactivated_blocks_total
+                    or matured_payouts_total
+                ),
+            )
             summary["inactive_blocks"] = inactive_blocks_total
             summary["reactivated_blocks"] = reactivated_blocks_total
             summary["matured_payouts"] = matured_payouts_total
