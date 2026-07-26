@@ -36,6 +36,7 @@ class FakeQbitState:
         weightlimit: int = 2_000_000,
         versionrollingmask: str | None = DEFAULT_VERSION_ROLLING_MASK,
         reject_gbt_during_ibd: bool = False,
+        submitblock_results: list[str] | None = None,
     ) -> None:
         self.bits = bits
         self.target = target
@@ -49,11 +50,26 @@ class FakeQbitState:
         self.height = 1
         self.requests = 0
         self.submits = 0
+        # Scripted submitblock results, consumed in order with the last value
+        # sticky. "null" means accepted; any other string is returned verbatim
+        # the way qbitd reports a rejection reason. Unset preserves the
+        # original always-accept behavior.
+        self.submitblock_results = submitblock_results
+        self.submitblock_params: list[str] = []
 
     def log(self, method: str) -> None:
         self.requests += 1
         if self.requests <= self.log_requests or method == "submitblock":
             print(f"fake qbit rpc {self.requests}: {method}", flush=True)
+
+    def next_submitblock_result(self) -> Any:
+        if not self.submitblock_results:
+            return None
+        if len(self.submitblock_results) > 1:
+            result = self.submitblock_results.pop(0)
+        else:
+            result = self.submitblock_results[0]
+        return None if result == "null" else result
 
     def result_for(self, method: str, params: list[Any]) -> tuple[Any, dict[str, Any] | None]:
         if method == "validateaddress":
@@ -118,8 +134,18 @@ class FakeQbitState:
 
         if method == "submitblock":
             self.submits += 1
-            self.height += 1
-            return None, None
+            self.submitblock_params.append(str(params[0]) if params else "")
+            del self.submitblock_params[:-8]
+            result = self.next_submitblock_result()
+            # A rejected block does not advance the chain; "duplicate" is
+            # treated as accepted by ckpool and keeps today's height bump.
+            if result is None or result == "duplicate":
+                self.height += 1
+            return result, None
+
+        if method == "decoderawtransaction":
+            # Just enough decode surface for ckpool's btcsolo coinbase check.
+            return {"txid": "00" * 32, "version": 1, "vin": [], "vout": []}, None
 
         if method == "getblockcount":
             return self.height - 1, None
@@ -141,12 +167,36 @@ def build_handler(state: FakeQbitState) -> type[BaseHTTPRequestHandler]:
         def log_message(self, _format: str, *_args: object) -> None:
             return
 
+        def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+            body = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
         def do_POST(self) -> None:
             length = int(self.headers.get("content-length", "0"))
             try:
                 request = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
             except json.JSONDecodeError:
                 request = {}
+
+            # Out-of-band test controls, disjoint from the RPC surface.
+            if self.path == "/control":
+                advance = request.get("advance_height")
+                if isinstance(advance, int) and advance > 0:
+                    state.height += advance
+                self._send_json(
+                    {
+                        "height": state.height,
+                        "submits": state.submits,
+                        "submitblock_params": list(state.submitblock_params),
+                    }
+                )
+                return
 
             method = str(request.get("method") or "")
             params = request.get("params")
@@ -187,6 +237,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_VERSION_ROLLING_MASK,
         help="versionrollingmask advertised in getblocktemplate; set to empty to omit",
     )
+    parser.add_argument(
+        "--submitblock-results",
+        default="",
+        help=(
+            "comma-separated submitblock results consumed in order with the "
+            "last value sticky; 'null' accepts, anything else is returned as "
+            "the rejection reason string. Empty preserves always-accept."
+        ),
+    )
     return parser
 
 
@@ -202,6 +261,11 @@ def main() -> int:
         weightlimit=args.weightlimit,
         versionrollingmask=args.versionrollingmask or None,
         reject_gbt_during_ibd=args.reject_gbt_during_ibd,
+        submitblock_results=(
+            [value.strip() for value in args.submitblock_results.split(",") if value.strip()]
+            if args.submitblock_results
+            else None
+        ),
     )
     server = ThreadingHTTPServer((args.host, args.port), build_handler(state))
     print(f"fake qbit RPC listening on {args.host}:{args.port}", flush=True)

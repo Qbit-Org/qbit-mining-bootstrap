@@ -117,6 +117,12 @@ test-compose-prism-config:
 	PRISM_STRATUM_PORT=43340 \
 	$(COMPOSE) --profile prism config >/dev/null
 
+test-ckpool-rejects-observability:
+	@set -euo pipefail; \
+	bin="$$(bash scripts/build-patched-ckpool.sh)"; \
+	QBIT_CKPOOL_REJECTS_BIN="$$bin" \
+	python3 -m unittest -v tests.test_ckpool_rejects_observability
+
 up: up-dual-pools
 
 up-permissionless:

@@ -67,6 +67,30 @@ jobs:
               config --quiet
           done
 
+  ckpool-rejects-observability:
+    name: ckpool rejects observability live suite
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ckpool build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake build-essential libtool pkgconf yasm \
+            libcurl4-openssl-dev libjansson-dev libzmq3-dev
+
+      - name: Build patched ckpool and run live regression and load tests
+        run: make test-ckpool-rejects-observability
+
   postgres-native-client:
     name: PostgreSQL ledger API with production psycopg
     runs-on: blacksmith-2vcpu-ubuntu-2404

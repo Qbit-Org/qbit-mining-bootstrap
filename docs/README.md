@@ -21,7 +21,9 @@ references. For public-facing navigation, prefer the short path below.
 - [mainnet-deployment.md](mainnet-deployment.md): fail-closed production
   deployment sequence and go-live checks.
 - [prism-rejections.md](prism-rejections.md): stable PRISM rejection reason IDs
-  for Stratum errors, metrics, and dashboards.
+  for Stratum errors, metrics, and dashboards. The ckpool comparison lane has
+  its own per-worker rejects observability contract in
+  [../ckpool/README.md](../ckpool/README.md#rejects-observability).
 - [router-integration-notes.md](router-integration-notes.md): router/hash
   aggregator guidance for the qbit ckpool comparison path.
 

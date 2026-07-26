@@ -95,6 +95,67 @@ Public qbit networks currently run with `fP2MROnly=true` for non-coinbase output
 - If your signet needs a lower starting share difficulty, set `CKPOOL_MINDIFF` and `CKPOOL_STARTDIFF` explicitly instead of reusing the regtest floor.
 - Set `CKPOOL_MAXDIFF` when operators need an upper bound on ckpool's vardiff-selected share difficulty.
 
+## Rejects observability
+
+The patched ckpool aggregates every Stratum `mining.submit` by worker and
+reason and writes the tallies to `<logdir>/pool/rejects.status` (in the
+container: `/var/log/ckpool/pool/rejects.status`) once per 60-second stats
+cycle. The write is staged to `rejects.status.tmp` and atomically renamed, so
+exporters never observe a partial document. Share validation, share responses,
+and block submission behavior are unchanged; the file is purely additive
+observability from `docker/ckpool/qbit-rejects-observability.patch`.
+
+Document shape (version 1):
+
+```json
+{
+ "version": 1,
+ "poolinstance": "qbitlab",
+ "runtime": 120,
+ "lastupdate": 1712345678,
+ "interval": 60,
+ "pool":    { "accepted": {"count": 10, "diff": 9.5e-06}, "...": {} },
+ "workers": [ { "workername": "qb1....rig0", "accepted": {"count": 10, "diff": 9.5e-06}, "...": {} } ]
+}
+```
+
+Every submission lands in exactly one reason bucket, so bucket counts sum to
+total submissions per worker:
+
+- `accepted`: share met its assigned difficulty and was accounted.
+- `above_target`: share hash above the target for the assigned difficulty
+  (upstream's "Above target" reject).
+- `stale`: share against a job retired by a block change.
+- `duplicate`: byte-identical resubmission of an already-accepted share.
+- `invalid_job`: unknown job id.
+- `invalid_ntime`: ntime outside the allowed rolling window.
+- `invalid_version`: version bits outside the negotiated BIP310 mask.
+- `malformed`: every other unprocessable submission (bad parameter shape,
+  worker mismatch, or no current workbase).
+
+`count` is the number of submissions; `diff` sums the difficulty *assigned* to
+the worker at each submission (the accounting diff), not the achieved share
+difficulty. Counters are cumulative since ckpool startup and reset on restart;
+exporters should treat them as monotonic counters and derive rates from
+deltas.
+
+Block-candidate outcomes are tracked in two additional buckets,
+`block_accepted` and `block_rejected`, counting local `submitblock` results
+for shares that met network difficulty. A candidate is also classified as a
+share in the reason buckets above, so block buckets are intentionally not part
+of the per-worker submission sum. Their `diff` sums the achieved share
+difficulty of each candidate. Candidates arriving without a worker attribution
+(node-relayed blocks) count toward the pool totals only.
+
+These buckets are the ckpool-lane counterpart of the PRISM coordinator's
+rejection reason IDs documented in
+[`docs/prism-rejections.md`](../docs/prism-rejections.md); the two lanes keep
+their own taxonomies because they classify at different layers.
+
+Regression and load coverage lives in
+`tests/test_ckpool_rejects_observability.py`; run it against a locally built
+patched binary with `make test-ckpool-rejects-observability`.
+
 ## Vardiff note
 
 ckpool caps vardiff at current network difficulty. Under qbit regtest, the patched ckpool path floors network difficulty at `1/256`, so Stratum difficulty is expected to stay at `0.00390625` even when a high-rate CPU miner solves hundreds of blocks. This is a regtest artifact, not evidence that vardiff is broken on signet/mainnet-like targets.
