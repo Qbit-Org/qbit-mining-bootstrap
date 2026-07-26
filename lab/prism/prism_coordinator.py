@@ -90,6 +90,15 @@ DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS = 60.0
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
 DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
+# Trusted reconcile outcomes are memoized per tip so an untrusted outcome for
+# one tip cannot unarm the cache for every other tip. The map only ever
+# answers for the current best hash; a small bound merely caps growth while
+# stale entries age out of the TTL.
+PRISM_REORG_RECONCILE_MEMO_MAX_TIPS = 8
+# Same-tip reconcile callers coalesce behind one in-flight pass. The wait is
+# a liveness backstop, not a pacing knob: a follower that outwaits it simply
+# runs its own serialized pass, exactly as every caller did before flights.
+DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS = 30.0
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS = 15.0
 DEFAULT_PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS = 15.0
@@ -2346,6 +2355,17 @@ class _PayoutStatePublicationBlocked(TemplateRefreshBlocked):
     """Job construction is waiting for a prepared payout publication."""
 
 
+class _ReconcileFlight:
+    """One in-flight reconcile pass shared by concurrent same-tip callers."""
+
+    __slots__ = ("event", "summary", "exception")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.summary: dict[str, object] | None = None
+        self.exception: BaseException | None = None
+
+
 class _JobBundleBuildSuperseded(JobBuildSuperseded):
     """A newer tip or payout generation canceled this deterministic build."""
 
@@ -3430,6 +3450,21 @@ class PrismCoordinator:
             # accepted-block path can hold this lock across expensive writes
             # without preventing replacement jobs from reaching miners.
             self._payout_balance_mutation_lock = threading.RLock()
+        if not hasattr(self, "_reconcile_flight_lock"):
+            self._reconcile_flight_lock = threading.Lock()
+        if not hasattr(self, "_reconcile_flights"):
+            # In-flight reconcile passes keyed by tip hash. Unflagged callers
+            # for a tip already being reconciled await that pass's summary
+            # instead of queueing a redundant serialized pass of their own.
+            self._reconcile_flights: dict[str, _ReconcileFlight] = {}
+        if not hasattr(self, "_reorg_reconcile_trusted_memo"):
+            # Monotonic completion time of the last trusted reconcile pass,
+            # per tip hash, guarded by self.lock. Entries are unarmed only by
+            # an untrusted outcome for their own tip (or a reconcile error,
+            # which clears the whole map); see _note_reorg_reconcile_outcome.
+            self._reorg_reconcile_trusted_memo: OrderedDict[str, float] = (
+                OrderedDict()
+            )
         if not hasattr(self, "_accepted_block_payout_preview_condition"):
             self._accepted_block_payout_preview_condition = threading.Condition()
         if not hasattr(self, "_accepted_block_payout_previews"):
@@ -5759,6 +5794,22 @@ class PrismCoordinator:
                 return candidate.source_generation != published_source
             with self.lock:
                 return self._payout_state_source[0] != published_source
+
+    def _captured_payout_source_requires_publication(
+        self,
+        captured: tuple[int, int, str | None, str, float],
+    ) -> bool:
+        """Publication check for a captured source, without a candidate.
+
+        Answers exactly what _payout_source_requires_publication would answer
+        for a candidate prepared from ``captured``. Candidate preparation can
+        include a multi-second ledger snapshot, so decision sites must be able
+        to ask this first and prepare only when publication will follow.
+        """
+
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            return captured[1] != self._published_payout_state.source_generation
 
     def _publish_payout_state_candidate(
         self,
@@ -12603,6 +12654,43 @@ class PrismCoordinator:
             "unable to derive exact artifacts for observed qbit template"
         )
 
+    def _note_reorg_reconcile_outcome(
+        self,
+        tip_hash: str | None,
+        *,
+        trusted: bool,
+        clear_memo: bool = False,
+    ) -> None:
+        """Record a reconcile outcome in the per-tip trusted memo.
+
+        A trusted pass arms the memo for its own tip. An untrusted outcome
+        (superseded publication, untrusted chain view) unarms only its own
+        tip: it proves nothing about reconciliations already completed for
+        other tips, and unarming them globally forces every job build into a
+        redundant full pass. A reconcile error passes clear_memo=True; a
+        partially applied ledger mutation invalidates every cached outcome.
+        """
+
+        self._ensure_job_cache_state()
+        now = time.monotonic()
+        with self.lock:
+            self.last_reorg_reconciled_tip_hash = tip_hash
+            self.last_reorg_reconciled_trusted = trusted
+            self.last_reorg_reconciled_monotonic = now
+            memo = self._reorg_reconcile_trusted_memo
+            if clear_memo:
+                memo.clear()
+                return
+            if tip_hash is None:
+                return
+            if trusted:
+                memo[tip_hash] = now
+                memo.move_to_end(tip_hash)
+                while len(memo) > PRISM_REORG_RECONCILE_MEMO_MAX_TIPS:
+                    memo.popitem(last=False)
+            else:
+                memo.pop(tip_hash, None)
+
     def ensure_reorg_reconciled_for_current_tip(
         self,
         *,
@@ -12622,24 +12710,25 @@ class PrismCoordinator:
         # A trusted reconciliation for this same tip within the cache window is
         # reused: the blockpoll loop re-reconciles every poll anyway, so
         # per-client job builds do not each need a full ledger reconcile pass.
-        # The chain-view trust check is NOT cached: headers can run ahead of
-        # the validated tip without the best block hash changing (an arriving
-        # reorg), and job issuance must pause immediately, not a TTL later.
+        # The memo is per tip: an untrusted outcome recorded for another tip
+        # never unarms this one. The chain-view trust check is NOT cached:
+        # headers can run ahead of the validated tip without the best block
+        # hash changing (an arriving reorg), and job issuance must pause
+        # immediately, not a TTL later.
         ttl = getattr(
             self,
             "reorg_reconcile_cache_seconds",
             DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
         )
         if ttl > 0:
+            self._ensure_job_cache_state()
             with self.lock:
-                last_hash = self.last_reorg_reconciled_tip_hash
-                trusted = self.last_reorg_reconciled_trusted
-                last_monotonic = getattr(self, "last_reorg_reconciled_monotonic", None)
+                reconciled_monotonic = self._reorg_reconcile_trusted_memo.get(
+                    current_tip
+                )
             if (
-                trusted
-                and last_hash == current_tip
-                and last_monotonic is not None
-                and time.monotonic() - last_monotonic <= ttl
+                reconciled_monotonic is not None
+                and time.monotonic() - reconciled_monotonic <= ttl
                 and not self.qbit_chain_view_untrusted()
             ):
                 return True
@@ -12796,8 +12885,72 @@ class PrismCoordinator:
                 f"configured={configured_rate} required={required_rate} bits/1000 weight"
             )
 
-    @ledger_writer_operation("payout_reconciliation")
     def reconcile_prism_pool_blocks_once(
+        self,
+        *,
+        tip_hash: str | None = None,
+        _force_publish: bool = False,
+        _source_reserved: bool = False,
+    ) -> dict[str, object]:
+        """Reconcile pool blocks, coalescing same-tip concurrent callers.
+
+        Unflagged callers asking about a tip whose pass is already in flight
+        await that pass and share its summary instead of queueing another
+        full serialized pass. Callers carrying side-effect obligations (a
+        forced publication or an already-reserved source) and callers without
+        a tip always run their own pass.
+        """
+        self._ensure_job_cache_state()
+        if tip_hash is None or _force_publish or _source_reserved:
+            return self._reconcile_prism_pool_blocks_serialized(
+                tip_hash=tip_hash,
+                _force_publish=_force_publish,
+                _source_reserved=_source_reserved,
+            )
+        with self._reconcile_flight_lock:
+            flight = self._reconcile_flights.get(tip_hash)
+            leading = flight is None
+            if leading:
+                flight = _ReconcileFlight()
+                self._reconcile_flights[tip_hash] = flight
+        if not leading:
+            wait_seconds = float(
+                getattr(
+                    self,
+                    "reconcile_flight_wait_seconds",
+                    DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS,
+                )
+            )
+            if flight.event.wait(timeout=wait_seconds):
+                exception = flight.exception
+                if exception is not None:
+                    raise exception
+                summary = flight.summary
+                assert summary is not None
+                # Followers get a copy: summaries are mutable dicts and the
+                # leader's caller already holds the original.
+                return dict(summary)
+            # Liveness backstop: the leader outlived the wait. Run our own
+            # pass; the writer lock still serializes the actual work.
+            return self._reconcile_prism_pool_blocks_serialized(
+                tip_hash=tip_hash
+            )
+        try:
+            summary = self._reconcile_prism_pool_blocks_serialized(
+                tip_hash=tip_hash
+            )
+            flight.summary = summary
+            return summary
+        except BaseException as exc:
+            flight.exception = exc
+            raise
+        finally:
+            with self._reconcile_flight_lock:
+                self._reconcile_flights.pop(tip_hash, None)
+            flight.event.set()
+
+    @ledger_writer_operation("payout_reconciliation")
+    def _reconcile_prism_pool_blocks_serialized(
         self,
         *,
         tip_hash: str | None = None,
@@ -12875,9 +13028,7 @@ class PrismCoordinator:
                 self.reorg_inactive_block_count += inactive_blocks_total
                 self.reorg_reactivated_block_count += reactivated_blocks_total
                 self.matured_payout_count += matured_payouts_total
-                self.last_reorg_reconciled_tip_hash = tip_hash
-                self.last_reorg_reconciled_trusted = trusted
-                self.last_reorg_reconciled_monotonic = time.monotonic()
+            self._note_reorg_reconcile_outcome(tip_hash, trusted=trusted)
             summary["inactive_blocks"] = inactive_blocks_total
             summary["reactivated_blocks"] = reactivated_blocks_total
             summary["matured_payouts"] = matured_payouts_total
@@ -12931,16 +13082,17 @@ class PrismCoordinator:
                                 None,
                             )
                             if not callable(watch_blocks):
-                                candidate = self._prepared_payout_state_candidate(
-                                    captured_source
-                                )
                                 if (
                                     _force_publish
-                                    or self._payout_source_requires_publication(
-                                        candidate
+                                    or self._captured_payout_source_requires_publication(
+                                        captured_source
                                     )
                                 ):
-                                    candidate_to_publish = candidate
+                                    candidate_to_publish = (
+                                        self._prepared_payout_state_candidate(
+                                            captured_source
+                                        )
+                                    )
                             else:
                                 rows = watch_blocks(
                                     active_tip_height=active_tip_height
@@ -13035,19 +13187,22 @@ class PrismCoordinator:
                                 inactive_blocks_total += inactive_blocks
                                 reactivated_blocks_total += reactivated_blocks
                                 matured_payouts_total += matured_payouts
-                                candidate = (
-                                    self._prepared_payout_state_candidate(
-                                        captured_source
-                                    )
-                                )
                                 if (
                                     payout_changed
                                     or _force_publish
-                                    or self._payout_source_requires_publication(
-                                        candidate
+                                    or self._captured_payout_source_requires_publication(
+                                        captured_source
                                     )
                                 ):
-                                    candidate_to_publish = candidate
+                                    # Candidate preparation embeds the ledger
+                                    # snapshot artifact; a pass that will not
+                                    # publish must not pay for one only to
+                                    # discard it.
+                                    candidate_to_publish = (
+                                        self._prepared_payout_state_candidate(
+                                            captured_source
+                                        )
+                                    )
                     except Exception:
                         inactive_blocks_total += inactive_blocks
                         reactivated_blocks_total += reactivated_blocks
@@ -13072,11 +13227,13 @@ class PrismCoordinator:
                             )
                             self.matured_payout_count += matured_payouts_total
                             self.reorg_reconcile_error_count += 1
-                            self.last_reorg_reconciled_tip_hash = tip_hash
-                            self.last_reorg_reconciled_trusted = False
-                            self.last_reorg_reconciled_monotonic = (
-                                time.monotonic()
-                            )
+                        # A pass that errored mid-mutation invalidates every
+                        # cached outcome, not just its own tip's.
+                        self._note_reorg_reconcile_outcome(
+                            tip_hash,
+                            trusted=False,
+                            clear_memo=True,
+                        )
                         raise
                     finally:
                         self._observe_payout_state_seconds(

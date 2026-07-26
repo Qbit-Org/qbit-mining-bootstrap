@@ -60,6 +60,7 @@ from lab.prism.prism_coordinator import (
     _ObservedRLock,
     _PayoutStatePublicationBlocked,
     _JobBuildCancellation,
+    _ReconcileFlight,
     default_prism_coinbase_tag_hex,
     default_prism_username_fallback_address,
     load_prism_highdiff_listener,
@@ -4013,6 +4014,229 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.events, [("watch", 10), ("mature", 10), ("watch", 10), ("mature", 10)])
         self.assertEqual(server._payout_state_generation, 1)
         self.assertEqual(server._payout_state_source[0], 1)
+
+    @staticmethod
+    def _reconcile_coordinator_with_artifact_counter(
+        ledger: ReorgLedger,
+        rpc: ReorgRpc,
+    ) -> tuple[PrismCoordinator, list[tuple[int, int]]]:
+        """Coordinator armed so candidate preparation would build an artifact."""
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = rpc
+        server._ensure_job_cache_state()
+        # Keep the speculative background preparer out of the way so the
+        # counter observes only builds requested by reconcile passes.
+        server._payout_artifact_executor_shutdown = True
+        server._pool_ready_latched = True
+        server._template_artifacts = SimpleNamespace(network_difficulty=1)
+        build_calls: list[tuple[int, int]] = []
+
+        def fake_build(
+            expected_payout_state_generation: int,
+            artifact_payout_state_generation: int,
+            network_difficulty: int,
+        ) -> None:
+            build_calls.append(
+                (
+                    expected_payout_state_generation,
+                    artifact_payout_state_generation,
+                )
+            )
+            return None
+
+        server._build_payout_ledger_artifact = fake_build  # type: ignore[method-assign]
+        return server, build_calls
+
+    def test_ledger_artifact_not_built_when_publication_not_required(self) -> None:
+        tip = "5b" * 32
+        ledger = ReorgLedger([])
+        server, build_calls = self._reconcile_coordinator_with_artifact_counter(
+            ledger,
+            ReorgRpc(
+                tip=tip,
+                template=gbt_template(tip, height=11),
+                height=10,
+                block_hashes={10: tip},
+            ),
+        )
+
+        first = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+        self.assertEqual(first["published_generation"], 1)
+        self.assertEqual(len(build_calls), 1)
+
+        second = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+
+        self.assertIsNone(second["published_generation"])
+        self.assertEqual(
+            len(build_calls),
+            1,
+            "a pass without publication need must not build the ledger artifact",
+        )
+        self.assertEqual(
+            ledger.events,
+            [("watch", 10), ("mature", 10), ("watch", 10), ("mature", 10)],
+        )
+
+    def test_payout_change_forces_publication_and_builds_artifact(self) -> None:
+        tip = "5d" * 32
+        pool_block_hash = "ae" * 32
+        ledger = ReorgLedger([])
+        server, build_calls = self._reconcile_coordinator_with_artifact_counter(
+            ledger,
+            ReorgRpc(
+                tip=tip,
+                template=gbt_template(tip, height=11),
+                height=10,
+                block_hashes={10: tip},
+            ),
+        )
+
+        first = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+        self.assertEqual(first["published_generation"], 1)
+        self.assertEqual(len(build_calls), 1)
+
+        # An orphaned confirmed block appears without any new payout source:
+        # payout_changed alone must still force a publication.
+        ledger.rows.append(
+            {
+                "block_hash": pool_block_hash,
+                "block_height": 12,
+                "chain_state": "confirmed",
+                "maturity_state": "immature",
+            }
+        )
+
+        second = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+
+        self.assertEqual(second["inactive_blocks"], 1)
+        self.assertEqual(second["published_generation"], 2)
+        self.assertEqual(len(build_calls), 2)
+        self.assertEqual(ledger.rows[0]["chain_state"], "inactive")
+        self.assertIn(("inactive", pool_block_hash, 10), ledger.events)
+
+    def test_concurrent_same_tip_reconciles_share_one_pass(self) -> None:
+        tip = "5c" * 32
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingReorgLedger(ReorgLedger):
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                entered.set()
+                if not release.wait(timeout=5.0):
+                    raise AssertionError("reconcile release was never signaled")
+                return super().reorg_watch_blocks(
+                    active_tip_height=active_tip_height
+                )
+
+        ledger = BlockingReorgLedger([])
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        server._ensure_job_cache_state()
+
+        results: list[dict[str, object] | None] = [None, None]
+
+        def reconcile(slot: int) -> None:
+            results[slot] = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+
+        leader = threading.Thread(target=reconcile, args=(0,))
+        leader.start()
+        self.assertTrue(entered.wait(timeout=5.0))
+        with server._reconcile_flight_lock:
+            flight = server._reconcile_flights[tip]
+
+        follower_waiting = threading.Event()
+
+        class SignalingEvent:
+            def __init__(self, inner: threading.Event) -> None:
+                self._inner = inner
+
+            def wait(self, timeout: float | None = None) -> bool:
+                follower_waiting.set()
+                return self._inner.wait(timeout)
+
+            def set(self) -> None:
+                self._inner.set()
+
+        flight.event = SignalingEvent(flight.event)  # type: ignore[assignment]
+        follower = threading.Thread(target=reconcile, args=(1,))
+        follower.start()
+        self.assertTrue(follower_waiting.wait(timeout=5.0))
+
+        release.set()
+        leader.join(timeout=5.0)
+        follower.join(timeout=5.0)
+        self.assertFalse(leader.is_alive())
+        self.assertFalse(follower.is_alive())
+
+        self.assertEqual(
+            ledger.events,
+            [("watch", 10), ("mature", 10)],
+            "the follower must reuse the leader's pass, not run its own",
+        )
+        self.assertEqual(results[0], results[1])
+        self.assertIsNotNone(results[0])
+        self.assertIsNot(results[0], results[1])
+        with server._reconcile_flight_lock:
+            self.assertEqual(server._reconcile_flights, {})
+
+    def test_forced_and_reserved_reconciles_bypass_flight_reuse(self) -> None:
+        tip = "5e" * 32
+        ledger = ReorgLedger([])
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        server._ensure_job_cache_state()
+
+        sentinel_summary: dict[str, object] = {"sentinel": True}
+        flight = _ReconcileFlight()
+        flight.summary = sentinel_summary
+        flight.event.set()
+        with server._reconcile_flight_lock:
+            server._reconcile_flights[tip] = flight
+
+        joined = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+        self.assertEqual(joined, sentinel_summary)
+        self.assertIsNot(joined, sentinel_summary)
+        self.assertEqual(ledger.events, [])
+
+        forced = server.reconcile_prism_pool_blocks_once(
+            tip_hash=tip,
+            _force_publish=True,
+        )
+        self.assertEqual(forced["published_generation"], 1)
+        self.assertEqual(ledger.events, [("watch", 10), ("mature", 10)])
+
+        reserved = server.reconcile_prism_pool_blocks_once(
+            tip_hash=tip,
+            _source_reserved=True,
+        )
+        self.assertIsNone(reserved["published_generation"])
+        self.assertEqual(
+            ledger.events,
+            [("watch", 10), ("mature", 10), ("watch", 10), ("mature", 10)],
+        )
+
+        with server._reconcile_flight_lock:
+            server._reconcile_flights.pop(tip, None)
 
     def test_reconciliation_reactivates_inactive_block_that_returns_to_active_chain(self) -> None:
         pool_block_hash = "cc" * 32
