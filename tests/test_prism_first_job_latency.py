@@ -654,12 +654,14 @@ class FanoutOrderingTests(unittest.TestCase):
 
             # A job-less newcomer burns zero hashrate while stale clients burn
             # their full rate on old-tip work, so the next wave must serve the
-            # fastest stale client first and the newcomer last -- the newcomer
-            # keeps only its initial-delivery queue priority. The fast client
-            # ranks by its vardiff estimate; the slow one exercises the
+            # fastest stale client first and the newcomer last -- even when
+            # the newcomer's configured difficulty is the highest in the wave,
+            # it keeps only its initial-delivery queue priority. The fast
+            # client ranks by its vardiff estimate; the slow one exercises the
             # share_difficulty fallback used before an estimate exists.
             newcomer.active_job = None
             newcomer.active_job_ids = set()
+            newcomer.share_difficulty = Decimal("64")
             slow_stale.share_difficulty = Decimal("8")
             fast_stale.vardiff_difficulty_estimate = Decimal("32")
             notified.clear()

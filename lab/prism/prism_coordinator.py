@@ -10834,13 +10834,18 @@ class PrismCoordinator:
             }
         # Bounded submission admits at most max_inflight tasks at a time, so
         # queue priority alone cannot lift one client over a fleet wave that
-        # has not been submitted yet. Order admission itself by descending
-        # hashrate: a stale fast client burns more work per second of refresh
-        # lag than a slow one, so serving it first minimizes hashrate-weighted
-        # staleness across the wave.
+        # has not been submitted yet. Order admission itself: stale-job
+        # clients by descending hashrate, job-less clients last. A stale fast
+        # client burns its full rate on old-tip work every second of refresh
+        # lag, while a job-less client burns nothing while it waits regardless
+        # of its configured difficulty (it also keeps its initial-delivery
+        # queue priority once admitted).
         clients = sorted(
             clients,
-            key=lambda ordered: hashrate_proxies.get(ordered, Decimal(0)),
+            key=lambda ordered: (
+                expected_active_jobs.get(ordered) is not None,
+                hashrate_proxies.get(ordered, Decimal(0)),
+            ),
             reverse=True,
         )
         clients_iter = iter(clients)
