@@ -3844,6 +3844,14 @@ class PrismCoordinator:
             self._reconcile_prefetch_executor: ThreadPoolExecutor | None = None
         if not hasattr(self, "_reconcile_prefetch_executor_shutdown"):
             self._reconcile_prefetch_executor_shutdown = False
+        if not hasattr(self, "_reconcile_prefetch_pending"):
+            # At most one outstanding prefetch, keyed by tip, guarded by
+            # _reconcile_prefetch_executor_lock. Failed refresh attempts
+            # (for example a template-RPC outage) reuse it instead of
+            # queueing another serialized pass per retry.
+            self._reconcile_prefetch_pending: (
+                tuple[str, Future[bool]] | None
+            ) = None
         if not hasattr(self, "reorg_reconcile_lookup_counts"):
             # Reconcile demand by (caller path, satisfying source), guarded
             # by self.lock.
@@ -12021,23 +12029,38 @@ class PrismCoordinator:
             # Reconciliation is keyed by tip hash and the probe above already
             # observed the best hash, so a memo miss can run its full pass on
             # the prefetch worker while this thread fetches and derives the
-            # template. A memo hit skips only the redundant serialized pass;
-            # publication still re-proves chain trust in
-            # _validate_prepared_tip_refresh before any fanout.
+            # template. Whether the pass can be skipped is decided at the
+            # join below against the memo's state AT THAT TIME -- a tip that
+            # flips away and back during the fetch evicts the entry so
+            # post-flip pool-block state is re-proven -- and publication
+            # still re-proves chain trust in _validate_prepared_tip_refresh
+            # before any fanout. With the memo disabled (TTL 0) there is no
+            # way to validate an overlapped pass across the fetch window, so
+            # the poll keeps its historical serial pass.
             reconciler_enabled = bool(
                 getattr(self, "reorg_reconciler_enabled", True)
             )
+            reconcile_memo_enabled = reconciler_enabled and (
+                float(
+                    getattr(
+                        self,
+                        "reorg_reconcile_cache_seconds",
+                        DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
+                    )
+                )
+                > 0
+            )
             reconcile_prefetch: Future[bool] | None = None
-            reconcile_memo_hit = False
             reconcile_probe_started = time.monotonic()
-            if reconciler_enabled:
-                reconcile_memo_hit = self._reorg_reconcile_memo_fresh(
+            reconcile_detection_epoch = int(
+                getattr(self, "tip_detection_epoch", 0)
+            )
+            if reconcile_memo_enabled and not self._reorg_reconcile_memo_fresh(
+                observed_best_tip
+            ):
+                reconcile_prefetch = self._submit_reconcile_prefetch(
                     observed_best_tip
                 )
-                if not reconcile_memo_hit:
-                    reconcile_prefetch = self._submit_reconcile_prefetch(
-                        observed_best_tip
-                    )
             reconcile_probe_seconds = time.monotonic() - reconcile_probe_started
             snapshot = self._reuse_current_tip_template_snapshot(observed_best_tip)
             if snapshot is None:
@@ -12122,11 +12145,23 @@ class PrismCoordinator:
             reconcile_source = "serial"
             reconcile_join_started = time.monotonic()
             try:
-                if (
-                    reconcile_memo_hit
-                    and snapshot.bestblockhash == observed_best_tip
+                if reconcile_memo_enabled and self._reorg_reconcile_memo_fresh(
+                    snapshot.bestblockhash
                 ):
-                    reconcile_source = "memo_hit"
+                    # Fresh at join time: armed before this poll, or by a
+                    # pass (prefetched or another caller's) that completed
+                    # while the template was fetched. Pre-fetch memo state is
+                    # never trusted here -- a detected flip-away-and-back
+                    # during the fetch evicts the entry and lands in the
+                    # serial branch below.
+                    reconcile_source = (
+                        "overlap" if reconcile_prefetch is not None else "memo_hit"
+                    )
+                    if reconcile_prefetch is not None:
+                        self._discard_stale_reconcile_prefetch(
+                            reconcile_prefetch
+                        )
+                        reconcile_prefetch = None
                     reorg_reconciled = True
                 elif (
                     reconcile_prefetch is not None
@@ -12134,6 +12169,20 @@ class PrismCoordinator:
                 ):
                     reconcile_source = "overlap"
                     reorg_reconciled = reconcile_prefetch.result()
+                    if reorg_reconciled and (
+                        int(getattr(self, "tip_detection_epoch", 0))
+                        != reconcile_detection_epoch
+                    ):
+                        # A detection interleaved the fetch (a flip away, or
+                        # away and back to this same hash): cached proofs
+                        # were evicted and the overlapped pass may have run
+                        # in the closed epoch. Re-prove on this thread.
+                        reconcile_source = "serial"
+                        reorg_reconciled = (
+                            self.ensure_reorg_reconciled_for_tip(
+                                snapshot.bestblockhash
+                            )
+                        )
                 else:
                     if reconcile_prefetch is not None:
                         # The tip moved between the probe and the template
@@ -12764,6 +12813,13 @@ class PrismCoordinator:
             )
             if detection_changed:
                 self._evict_reorg_reconcile_memo_for_new_tip_locked(tip_hash)
+                # Bumped exactly when cached reconcile proofs are dropped:
+                # a refresh's join compares this epoch to tell whether any
+                # flip (away, or away and back) interleaved its template
+                # fetch and invalidated a pass that ran concurrently.
+                self.tip_detection_epoch = (
+                    int(getattr(self, "tip_detection_epoch", 0)) + 1
+                )
             if (
                 detection_changed
                 and self._payout_state_source[1] != tip_hash
@@ -13510,6 +13566,13 @@ class PrismCoordinator:
         context = entry.context
         if str(context.template["previousblockhash"]) == current_tip:
             return context, None
+        if entry.connection_id != client.connection_id:
+            # Cross-connection resumes are same-tip only. A tip that moves
+            # between the graveyard lookup and this classification must not
+            # fall through to stale grace: that window anchors on the
+            # submitting connection's delivery state, which says nothing
+            # about work another (dead) connection delivered.
+            return None
         if not self.context_eligible_for_stale_grace(client, context, current_tip):
             return None
         return context, PRISM_CREDIT_POLICY_STALE_GRACE
@@ -13810,19 +13873,46 @@ class PrismCoordinator:
         with self.lock:
             self.reorg_reconcile_lookup_counts[(path, source)] += 1
 
+    def _reconcile_prefetch_pass(self, tip_hash: str) -> bool:
+        """One prefetched reconcile, honoring the memo like the join does.
+
+        A prefetch that queued behind a completed same-tip pass (abandoned
+        refresh attempts reuse the slot, but a replaced tip can leave one
+        queued) would otherwise re-run the full serialized pass for nothing.
+        """
+        if self._reorg_reconcile_memo_fresh(tip_hash):
+            return True
+        return self.ensure_reorg_reconciled_for_tip(tip_hash)
+
     def _submit_reconcile_prefetch(self, tip_hash: str) -> Future[bool] | None:
         """Run one reconcile pass on the prefetch worker so it overlaps the
         caller's template fetch.
 
         Returns ``None`` once shutdown has retired the executor; the caller
-        falls back to its serial pass. Only the tip-refresh singleflight
-        owner submits here, so the single worker never queues more than the
-        occasional pass abandoned by a superseded refresh.
+        falls back to its serial pass. At most one prefetch is outstanding:
+        a refresh attempt that failed before its join (for example a
+        template-RPC outage) leaves its future in the slot, and the retry
+        reuses it for the same tip instead of queueing another serialized
+        pass behind the first.
         """
         self._ensure_job_cache_state()
+        stale_future: Future[bool] | None = None
+        future: Future[bool] | None = None
         with self._reconcile_prefetch_executor_lock:
             if self._reconcile_prefetch_executor_shutdown:
                 return None
+            pending = self._reconcile_prefetch_pending
+            if pending is not None:
+                pending_tip, pending_future = pending
+                if not pending_future.done() and pending_tip == tip_hash:
+                    return pending_future
+                # Replaced tip or completed future: hand the old future off
+                # for disposal outside this lock -- cancellation runs done
+                # callbacks inline on this thread, and _clear_slot below
+                # re-takes the lock.
+                self._reconcile_prefetch_pending = None
+                if not pending_future.done():
+                    stale_future = pending_future
             executor = self._reconcile_prefetch_executor
             if executor is None:
                 executor = ThreadPoolExecutor(
@@ -13830,11 +13920,31 @@ class PrismCoordinator:
                     thread_name_prefix="prism-reconcile-prefetch",
                 )
                 self._reconcile_prefetch_executor = executor
-        try:
-            return executor.submit(self.ensure_reorg_reconciled_for_tip, tip_hash)
-        except RuntimeError:
-            # Executor shutdown raced this submit; the serial path covers it.
+            try:
+                future = executor.submit(self._reconcile_prefetch_pass, tip_hash)
+                self._reconcile_prefetch_pending = (tip_hash, future)
+            except RuntimeError:
+                # Executor shutdown raced this submit; the serial path
+                # covers it (after the stale future is disposed below).
+                future = None
+        if stale_future is not None and not stale_future.cancel():
+            # Already running for a replaced tip; let it finish detached.
+            # The slot holds the new tip, so at most one task ever waits
+            # behind the running one.
+            self._discard_stale_reconcile_prefetch(stale_future)
+        if future is None:
             return None
+
+        def _clear_slot(done: Future[bool]) -> None:
+            with self._reconcile_prefetch_executor_lock:
+                pending_now = self._reconcile_prefetch_pending
+                if pending_now is not None and pending_now[1] is done:
+                    self._reconcile_prefetch_pending = None
+
+        # Registered outside the slot lock: a completed future runs the
+        # callback inline on this thread.
+        future.add_done_callback(_clear_slot)
+        return future
 
     @staticmethod
     def _discard_stale_reconcile_prefetch(future: Future[bool]) -> None:
@@ -13861,6 +13971,7 @@ class PrismCoordinator:
             executor = self._reconcile_prefetch_executor
             self._reconcile_prefetch_executor = None
             self._reconcile_prefetch_executor_shutdown = True
+            self._reconcile_prefetch_pending = None
         if executor is not None:
             # A pass blocked on writer admission aborts via
             # ShutdownInProgress on its own; never hold shutdown for it.

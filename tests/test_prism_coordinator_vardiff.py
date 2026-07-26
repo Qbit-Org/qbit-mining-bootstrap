@@ -5894,6 +5894,66 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(candidate.extranonce1_hex, "00000001")
         self.assertIs(candidate.client, reconnected)
 
+    def test_detached_entry_never_falls_back_to_stale_grace(self) -> None:
+        # A tip moving between the graveyard lookup and submit
+        # classification must not let a detached cross-connection entry
+        # borrow the reconnect's stale-grace window: cross-connection
+        # resumes are same-tip only.
+        tip_old = "00" * 32
+        tip_new = "11" * 32
+        server, state, _ledger = submit_coordinator(tip=tip_old)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+        detached = server.evicted_job_graveyard.get("job-1")
+        self.assertIsNotNone(detached)
+        assert detached is not None
+        self.assertIsNone(detached.client)
+
+        reconnected = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=2,
+            extranonce1_hex="00000002",
+        )
+        reconnected.subscribed = True
+        reconnected.authorized = True
+        reconnected.username = "miner-a"
+        reconnected.worker = worker_identity("miner-a")
+        eligibility_calls: list[str] = []
+
+        def recording_eligibility(
+            _client: ClientState,
+            _context: object,
+            current_tip: str,
+        ) -> bool:
+            eligibility_calls.append(current_tip)
+            return True
+
+        server.context_eligible_for_stale_grace = (  # type: ignore[method-assign]
+            recording_eligibility
+        )
+
+        self.assertIsNone(
+            server.evicted_submit_context(reconnected, detached, tip_new)
+        )
+        self.assertEqual(eligibility_calls, [])
+
+        # Same-connection entries keep today's stale-grace classification.
+        live_state = client()
+        server.jobs["job-2"] = prism_context(
+            "job-2",
+            tip_old,
+            worker=live_state.worker,
+        )
+        server.bury_evicted_job(live_state, "job-2")
+        live_entry = server.evicted_job_graveyard["job-2"]
+        result = server.evicted_submit_context(live_state, live_entry, tip_new)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result[1], PRISM_CREDIT_POLICY_STALE_GRACE)
+        self.assertEqual(eligibility_calls, [tip_new])
+
     def test_disconnected_retention_capacity_is_bounded(self) -> None:
         tip = "00" * 32
         server, state, _ledger = submit_coordinator(tip=tip)
