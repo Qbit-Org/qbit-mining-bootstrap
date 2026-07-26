@@ -5788,6 +5788,54 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.reason, PRISM_REJECTION_UNKNOWN_JOB)
 
+    def test_cross_connection_block_candidate_keeps_original_extranonce(self) -> None:
+        # The mined coinbase embeds the extranonce1 the retained job was
+        # stamped with; a candidate recording the replacement connection's
+        # extranonce would fail the audit fence after submitblock.
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.stop_after_block = False
+        server.max_blocks = 10
+        server.jobs["job-1"].job.extranonce1_hex = state.extranonce1_hex
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+
+        reconnected = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=2,
+            extranonce1_hex="00000002",
+        )
+        reconnected.subscribed = True
+        reconnected.authorized = True
+        reconnected.username = "miner-a"
+        reconnected.worker = worker_identity("miner-a")
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=True,
+            coinbase_tx_hex="c0ffee",
+            block_hex="00",
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            self.assertFalse(
+                server.handle_submit(
+                    reconnected,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+            )
+
+        self.assertEqual(server.block_candidate_queue.qsize(), 1)
+        candidate = server.block_candidate_queue.get_nowait()
+        self.assertEqual(candidate.extranonce1_hex, "00000001")
+        self.assertIs(candidate.client, reconnected)
+
     def test_disconnected_retention_capacity_is_bounded(self) -> None:
         tip = "00" * 32
         server, state, _ledger = submit_coordinator(tip=tip)
@@ -7297,32 +7345,40 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.persisted), 1)
         self.assertEqual(len(ledger.confirmed), 1)
 
-    def test_speculative_bundle_failure_falls_back_to_locked_build(self) -> None:
-        # Speculation is purely an optimization: a failed pre-lock build
-        # must neither abandon the candidate nor leak a shutdown; the
-        # landing rebuilds under the lock exactly as before.
+    def test_block_submitted_before_audit_bundle_build(self) -> None:
+        # The audit build runs with the balance serializer released, but
+        # never before submitblock: announcement of a freshly solved block
+        # must not wait on audit construction (a lost race is a lost round).
         server, state, ledger = submit_coordinator()
         server.stop_after_block = False
         server.max_blocks = 10
-        build_calls: list[int] = []
+        order: list[str] = []
+        block_hash = "cc" * 32
 
-        def flaky_build_audit_bundle(**_kwargs: object) -> dict[str, object]:
-            build_calls.append(1)
-            if len(build_calls) == 1:
-                raise RuntimeError("transient builder failure")
+        class OrderRecordingRpc(SubmitRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    order.append("submitblock")
+                return super().call(method, params)
+
+        def ordered_build(**_kwargs: object) -> dict[str, object]:
+            order.append("build_audit_bundle")
             return verified_block_bundle()
 
         with tempfile.TemporaryDirectory() as tempdir:
             server.audit_dir = Path(tempdir)
             server.evidence_path = Path(tempdir) / "evidence.json"
             server.ledger_writer_public_key_hex = "aa" * 32
-            block_hash = "cc" * 32
-            server.rpc = SubmitRpc(
+            server.rpc = OrderRecordingRpc(
                 tip="00" * 32,
                 block_hash=block_hash,
                 ledger=ledger,
             )
-            server.build_audit_bundle = flaky_build_audit_bundle  # type: ignore[method-assign]
+            server.build_audit_bundle = ordered_build  # type: ignore[method-assign]
             server.verify_bundle = (  # type: ignore[method-assign]
                 lambda *_args, **_kwargs: verified_audit_report()
             )
@@ -7335,16 +7391,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             accepted = server.submit_block_candidate(
                 block_candidate(server, state, submission, pending_share=pending)
             )
-            leftover_candidates = list(
-                Path(tempdir).glob("*candidate*")
-            )
 
         self.assertTrue(accepted)
-        self.assertEqual(build_calls, [1, 1])
-        self.assertFalse(server.stop_event.is_set())
+        self.assertEqual(order, ["submitblock", "build_audit_bundle"])
         self.assertEqual(len(ledger.persisted), 1)
         self.assertEqual(len(ledger.confirmed), 1)
-        self.assertEqual(leftover_candidates, [])
 
     def test_block_submit_histogram_measures_landed_to_rpc_interval(self) -> None:
         # The race-critical span (candidate landed -> submitblock returned)
@@ -8517,6 +8568,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             def __exit__(self, *_args: object) -> None:
                 mutation_lock.release()
 
+            # The landing's audit-build release window drives the serializer
+            # through the plain lock interface as well.
+            def acquire(self, *args: object, **kwargs: object) -> bool:
+                return mutation_lock.acquire(*args, **kwargs)  # type: ignore[arg-type]
+
+            def release(self) -> None:
+                mutation_lock.release()
+
         server._payout_balance_mutation_lock = ObservedBalanceLock()  # type: ignore[assignment]
 
         with tempfile.TemporaryDirectory() as tempdir:
@@ -8773,15 +8832,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             parent_thread = threading.Thread(target=submit_parent)
             parent_thread.start()
             try:
-                # The audit bundle now builds speculatively before the
-                # balance serializer is taken, so the build gate proves only
-                # that nothing has landed yet. The preview-visible mid-flight
-                # window this test pins starts at persistence.
                 self.assertTrue(build_started.wait(5))
                 self.assertEqual(ledger.current_prior_balances(), [])
-                release_build.set()
-                self.assertTrue(persist_started.wait(5))
-                self.assertTrue(parent_thread.is_alive())
                 self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
                 child_context = state.active_job
                 self.assertIsNotNone(child_context)
@@ -8815,6 +8867,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                         )
                     )
                 self.assertEqual(server.block_candidate_queue.qsize(), 1)
+                release_build.set()
+                self.assertTrue(persist_started.wait(5))
                 self.assertTrue(parent_thread.is_alive())
             finally:
                 release_build.set()
