@@ -6964,19 +6964,28 @@ class PrismCoordinator:
             # anchor is durable, and binding the inclusive count to the
             # anchor-exclusive window would wedge the reuse fence open.
             anchor_scoped_count: int | None = None
-            try:
-                count_before, _ = self.accepted_share_stats()
-            except Exception:
-                count_before = None
-            candidate_anchor_ms = self._job_snapshot_anchor_ms(now_ms())
-            if count_before is not None:
+            candidate_anchor_ms: int | None = None
+            # A commit racing the clamp voids one bracket. The capture is a
+            # pair of cheap aggregate reads, so retry a bounded number of
+            # times instead of leaving synchronous seeding disabled for this
+            # whole generation; a late re-bind after freezing is impossible
+            # because a failed bracket cannot tell which side of the clamp
+            # each racing commit landed on.
+            for _capture_attempt in range(3):
+                try:
+                    count_before, _ = self.accepted_share_stats()
+                except Exception:
+                    count_before = None
+                candidate_anchor_ms = self._job_snapshot_anchor_ms(now_ms())
+                if count_before is None:
+                    break
                 try:
                     count_after, _ = self.accepted_share_stats()
                 except Exception:
-                    pass
-                else:
-                    if int(count_after) == int(count_before):
-                        anchor_scoped_count = int(count_after)
+                    break
+                if int(count_after) == int(count_before):
+                    anchor_scoped_count = int(count_after)
+                    break
             with self._job_cache_lock:
                 issued_at_ms = self._job_build_issued_at_ms.get(
                     artifacts.generation
@@ -15474,9 +15483,10 @@ class PrismCoordinator:
         )
         phases = self._job_build_phases()
         input_bytes = 0
+        input_serialization_elapsed = 0.0
 
         def send_request(upload_window: bool) -> None:
-            nonlocal input_bytes
+            nonlocal input_bytes, input_serialization_elapsed
             serialization_started = time.monotonic()
             try:
                 if not upload_window:
@@ -15541,11 +15551,10 @@ class PrismCoordinator:
                 phases["input_serialization"] = (
                     phases.get("input_serialization", 0.0) + elapsed
                 )
-                if record_phase_metrics:
-                    self._observe_tip_refresh_build_phase(
-                        "serialization_copy",
-                        elapsed,
-                    )
+                # Accumulated across a possible needs_window re-send and
+                # observed once per build so serialization_copy stays
+                # comparable with the one-shot transport.
+                input_serialization_elapsed += elapsed
 
         def read_response() -> tuple[dict[str, Any], bytes]:
             worker_started = time.monotonic()
@@ -15610,6 +15619,10 @@ class PrismCoordinator:
             with self._serve_builder_metrics_lock:
                 self.serve_builder_window_cache_counts[outcome] += 1
         if record_phase_metrics:
+            self._observe_tip_refresh_build_phase(
+                "serialization_copy",
+                input_serialization_elapsed,
+            )
             metrics_value = response.get("metrics")
             if isinstance(metrics_value, dict):
                 try:

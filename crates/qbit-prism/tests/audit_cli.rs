@@ -1099,6 +1099,25 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
     assert_eq!(missing["ok"], false);
     assert_eq!(missing["needs_window"], true);
 
+    // Identities without shares are rejected like one-shot mode, and never
+    // classified as a cache hit or a window that needs uploading.
+    let mut request_identities_only = build_fields.clone();
+    request_identities_only["window_key"] =
+        serde_json::json!({"share_snapshot_sha256": "window-a"});
+    request_identities_only["compact_share_identities"] =
+        serde_json::Value::Array(compact_identities.clone());
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&request_identities_only).unwrap()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let identities_only: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(identities_only["ok"], false);
+    assert_eq!(identities_only["needs_window"], false);
+
     // Two fresh uploads bound the cache to the most recent generations and
     // evict window-a.
     for name in ["window-b", "window-c"] {

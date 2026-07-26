@@ -371,12 +371,21 @@ fn serve_requests(
             }
         };
         let window_sha = request.window_key.share_snapshot_sha256.clone();
+        let uploaded_window = !request.compact_shares.is_empty();
+        if !uploaded_window && !request.compact_share_identities.is_empty() {
+            respond_error(
+                &stdout,
+                "compact share identities were supplied without compact shares",
+                false,
+            )?;
+            continue;
+        }
         // The window vector is loaned to the build rather than cloned: both
         // audit build entry points only borrow the shares for derivation and
         // move the vector unmodified into AuditBundle.shares, so it is
         // reclaimed from the finished bundle below. A failed build drops the
         // loaned window; the coordinator's needs_window bounce re-uploads it.
-        let shares: Vec<AcceptedShare> = if !request.compact_shares.is_empty() {
+        let shares: Vec<AcceptedShare> = if uploaded_window {
             match expand_compact_shares(&request.compact_share_identities, request.compact_shares) {
                 Ok(expanded) => {
                     cache_misses += 1;
@@ -404,7 +413,9 @@ fn serve_requests(
             )?;
             continue;
         };
-        let cache_hit = request.compact_share_identities.is_empty();
+        // Derived from the same predicate that selected the cache branch, so
+        // the per-response flag always agrees with the hit/miss counters.
+        let cache_hit = !uploaded_window;
         let payout_policy = request
             .payout_policy
             .unwrap_or_else(PayoutPolicy::day_one_default);

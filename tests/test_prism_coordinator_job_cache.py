@@ -2226,6 +2226,46 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(len(rebuilt.shares_json), 4)
         self.assertEqual(recorded["calls"], 2)
 
+    def test_anchor_count_capture_retries_a_racing_commit(self) -> None:
+        class BracketRaceLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__(
+                    miners=["miner-a", "miner-b", "miner-c", "miner-d"]
+                )
+                self._pending_counts = iter([3, 4])
+
+            def accepted_share_stats(self) -> dict[str, int]:
+                self.stats_calls += 1
+                try:
+                    count = next(self._pending_counts)
+                except StopIteration:
+                    count = 4
+                return {
+                    "accepted_share_count": count,
+                    "distinct_miner_count": 4,
+                }
+
+        server, rpc = coordinator(ledger=BracketRaceLedger())
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        # The first bracket races a commit (3 then 4); the bounded retry
+        # captures a stable bracket instead of disabling synchronous
+        # artifact seeding for the whole generation.
+        bundle = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertFalse(bundle.collection_only)
+        with server._job_cache_lock:
+            self.assertEqual(
+                server._job_build_anchor_counts.get(artifacts.generation),
+                4,
+            )
+            artifact = server._payout_ledger_artifact
+        self.assertIsNotNone(artifact)
+        assert artifact is not None
+        self.assertEqual(artifact.accepted_share_count, 4)
+
     def test_same_window_background_rebuild_keeps_artifact_generation(
         self,
     ) -> None:
@@ -5593,12 +5633,17 @@ class ServeBuilderTests(unittest.TestCase):
                 second_serialization.share_snapshot_sha256  # type: ignore[attr-defined]
             )
 
-            second = self._build(
-                server,
-                second_shares,
-                second_serialization,
-                height=11,
-            )
+            server._ensure_tip_refresh_state()
+            server._job_build_phase_local.tip_refresh_metrics = True
+            try:
+                second = self._build(
+                    server,
+                    second_shares,
+                    second_serialization,
+                    height=11,
+                )
+            finally:
+                server._job_build_phase_local.tip_refresh_metrics = False
 
             self.assertEqual(second["transport"], "serve")
             self.assertTrue(second["request_had_window"])
@@ -5607,6 +5652,14 @@ class ServeBuilderTests(unittest.TestCase):
                 counts = dict(server.serve_builder_counts)
             self.assertEqual(counts["requests"], 2)
             self.assertEqual(counts["fallbacks"], 0)
+            # One build observes serialization_copy exactly three times --
+            # fragment precompose, the accumulated transport writes, and the
+            # daemon's reported timings -- matching the one-shot transport
+            # even when a needs_window bounce re-sent the request.
+            histogram = server.tip_refresh_build_phase_histograms[
+                "serialization_copy"
+            ]
+            self.assertEqual(histogram["count"], 3)
         finally:
             server.shutdown_serve_builder()
 
