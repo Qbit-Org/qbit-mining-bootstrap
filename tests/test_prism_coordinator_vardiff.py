@@ -4192,6 +4192,113 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with server._reconcile_flight_lock:
             self.assertEqual(server._reconcile_flights, {})
 
+    def test_lock_owner_reconcile_bypasses_same_tip_flight(self) -> None:
+        tip = "5f" * 32
+        ledger = ReorgLedger([])
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        server._ensure_job_cache_state()
+
+        leader_lock_attempted = threading.Event()
+        flight_waited = threading.Event()
+        flight_completed = threading.Event()
+        underlying_lock = threading.RLock()
+        leader: threading.Thread | None = None
+
+        class ObservedBalanceLock:
+            def __enter__(self) -> ObservedBalanceLock:
+                if threading.current_thread() is leader:
+                    if underlying_lock.acquire(blocking=False):
+                        underlying_lock.release()
+                        raise AssertionError(
+                            "reconcile leader unexpectedly acquired the owned lock"
+                        )
+                    leader_lock_attempted.set()
+                    underlying_lock.acquire()
+                else:
+                    underlying_lock.acquire()
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                underlying_lock.release()
+
+        class WaitForbiddenEvent:
+            def __init__(self, inner: threading.Event) -> None:
+                self._inner = inner
+
+            def wait(self, timeout: float | None = None) -> bool:
+                flight_waited.set()
+                raise AssertionError(
+                    "lock-owning reconciliation joined the same-tip flight"
+                )
+
+            def set(self) -> None:
+                flight_completed.set()
+                self._inner.set()
+
+        server._payout_balance_mutation_lock = ObservedBalanceLock()  # type: ignore[assignment]
+        leader_results: list[dict[str, object]] = []
+        leader_errors: list[BaseException] = []
+
+        def lead_reconcile() -> None:
+            try:
+                leader_results.append(
+                    server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                leader_errors.append(exc)
+
+        leader = threading.Thread(target=lead_reconcile)
+        try:
+            with server._payout_balance_mutation_lock:
+                leader.start()
+                self.assertTrue(leader_lock_attempted.wait(timeout=5.0))
+                with server._reconcile_flight_lock:
+                    flight = server._reconcile_flights[tip]
+                    flight.event = WaitForbiddenEvent(  # type: ignore[assignment]
+                        flight.event
+                    )
+
+                bypassed = server.ensure_reorg_reconciled_for_tip(
+                    tip,
+                    _coalesce_same_tip=False,
+                )
+
+                self.assertTrue(bypassed)
+                self.assertFalse(flight_waited.is_set())
+                self.assertTrue(leader.is_alive())
+                self.assertEqual(
+                    ledger.events,
+                    [("watch", 10), ("mature", 10)],
+                )
+        finally:
+            leader.join(timeout=5.0)
+
+        self.assertFalse(leader.is_alive())
+        if leader_errors:
+            raise leader_errors[0]
+        self.assertEqual(len(leader_results), 1)
+        self.assertTrue(flight_completed.is_set())
+        self.assertFalse(flight_waited.is_set())
+        self.assertEqual(
+            ledger.events,
+            [
+                ("watch", 10),
+                ("mature", 10),
+                ("watch", 10),
+                ("mature", 10),
+            ],
+        )
+        with server._reconcile_flight_lock:
+            self.assertEqual(server._reconcile_flights, {})
+
     def test_forced_and_reserved_reconciles_bypass_flight_reuse(self) -> None:
         tip = "5e" * 32
         ledger = ReorgLedger([])
@@ -8731,7 +8838,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server, state, ledger = submit_coordinator()
         server._ensure_job_cache_state()
         server.reorg_reconciler_enabled = True
-        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            lambda _tip, *, _coalesce_same_tip: not _coalesce_same_tip
+        )
         server.qbit_chain_view_untrusted = lambda: True  # type: ignore[method-assign]
         block_hash = "d1" * 32
         newer_tip = "d2" * 32
@@ -8838,7 +8947,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
             active_rpc = ActiveAncestorRpc()
             server.rpc = active_rpc
-            server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+            server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+                lambda _tip, *, _coalesce_same_tip: not _coalesce_same_tip
+            )
             server.build_audit_bundle = lambda **_kwargs: {  # type: ignore[method-assign]
                 "found_block": {"coinbase_value_sats": 50_00000000},
                 "ledger_window_attestation": {"signature": {"public_key_hex": "aa" * 32}},
@@ -12287,7 +12398,7 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             rpc.active[block_hash] = 10
             server.rpc = rpc
             server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
-                lambda _tip: True
+                lambda _tip, *, _coalesce_same_tip: not _coalesce_same_tip
             )
             candidate = block_candidate(
                 server,

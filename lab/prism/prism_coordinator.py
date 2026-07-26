@@ -12772,10 +12772,25 @@ class PrismCoordinator:
                 return True
         return self.ensure_reorg_reconciled_for_tip(current_tip)
 
-    def ensure_reorg_reconciled_for_tip(self, tip_hash: str) -> bool:
+    def ensure_reorg_reconciled_for_tip(
+        self,
+        tip_hash: str,
+        *,
+        _coalesce_same_tip: bool = True,
+    ) -> bool:
+        """Reconcile one tip, optionally bypassing same-tip flight reuse.
+
+        Lock-owning accepted-block callers disable coalescing because a flight
+        leader may itself be waiting for the payout-balance mutation lock.
+        """
         if not getattr(self, "reorg_reconciler_enabled", True):
             return True
-        summary = self.reconcile_prism_pool_blocks_once(tip_hash=tip_hash)
+        if _coalesce_same_tip:
+            summary = self.reconcile_prism_pool_blocks_once(tip_hash=tip_hash)
+        else:
+            summary = self._reconcile_prism_pool_blocks_serialized(
+                tip_hash=tip_hash
+            )
         return not bool(summary.get("untrusted") or summary.get("superseded"))
 
     def qbit_chain_view_untrusted(self) -> bool:
@@ -17868,7 +17883,10 @@ class PrismCoordinator:
                 # transition becomes a landed barrier and before validating its
                 # payout base.
                 try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                        current_tip,
+                        _coalesce_same_tip=False,
+                    )
                 except Exception:
                     traceback.print_exc()
                     self._abandon_block_candidate(
@@ -17916,7 +17934,10 @@ class PrismCoordinator:
                 reorg_reconciled = True
             else:
                 try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                        current_tip,
+                        _coalesce_same_tip=False,
+                    )
                 except Exception:
                     traceback.print_exc()
                     self._abandon_block_candidate(
