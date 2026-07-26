@@ -370,6 +370,10 @@ fn serve_requests(
                 continue;
             }
         };
+        // Sampled immediately after the JSON parse and before compact-window
+        // expansion, exactly where one-shot mode samples the same metric, so
+        // transport comparisons measure identical work.
+        let input_deserialization_seconds = input_started.elapsed().as_secs_f64();
         let window_sha = request.window_key.share_snapshot_sha256.clone();
         let uploaded_window = !request.compact_shares.is_empty();
         if !uploaded_window && !request.compact_share_identities.is_empty() {
@@ -419,7 +423,6 @@ fn serve_requests(
         let payout_policy = request
             .payout_policy
             .unwrap_or_else(PayoutPolicy::day_one_default);
-        let input_deserialization_seconds = input_started.elapsed().as_secs_f64();
         let (bundle_result, phases_seconds) = run_profiled_build(
             shares,
             request.found_block,
