@@ -141,23 +141,29 @@ deltas.
 
 The pool totals and all worker rows in one document are copied under a single
 lock hold, so each document is one consistent snapshot: per-bucket worker sums
-never exceed the pool totals. A worker whose first counted submission races a
-snapshot appears from the next write, so worker sums can transiently trail
-pool totals by that worker's first submissions until the next cycle.
+never exceed the pool totals. A worker whose first counted submission or
+attributed block outcome races snapshot sizing appears from the next write, so
+worker sums can transiently trail pool totals until the next cycle.
 
-Only workers with at least one counted submission are listed. Workers that
-merely authorize never appear, so the file size, the snapshot allocations, and
-the lock-held copy all scale with submitting workers only — authorization spam
-on the public Stratum port cannot grow the export. Per-worker tallies
-otherwise live exactly as long as ckpool's own per-worker share stats.
+Only workers with at least one counted submission or attributed block outcome
+are listed. They are registered once on an append-only active list when that
+first event is counted; status writes never scan the full authorized-worker
+set. The per-worker tally is also allocated lazily at that point, so workers
+that merely authorize add neither tally storage nor periodic export work.
+The file, snapshot allocations, and lock-held copy therefore scale with active
+exported workers only. Per-worker tallies otherwise live exactly as long as
+ckpool's own per-worker share stats.
 
 Block-candidate outcomes are tracked in two additional buckets,
 `block_accepted` and `block_rejected`, counting local `submitblock` results
 for shares that met network difficulty. A candidate is also classified as a
-share in the reason buckets above, so block buckets are intentionally not part
-of the per-worker submission sum. Their `diff` sums the achieved share
-difficulty of each candidate. Candidates arriving without a worker attribution
-(node-relayed blocks) count toward the pool totals only.
+share in the reason buckets above when its `mining.submit` was processed by
+this instance, so block buckets are intentionally not part of the per-worker
+submission sum. Remote/distributed candidates submitted locally may contribute
+only a block outcome here because their share classification happened on
+another instance. Block-bucket `diff` sums the achieved share difficulty of
+each candidate. Candidates arriving without a worker attribution count toward
+the pool totals only.
 
 These buckets are the ckpool-lane counterpart of the PRISM coordinator's
 rejection reason IDs documented in

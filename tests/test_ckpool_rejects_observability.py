@@ -734,10 +734,14 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             with CkpoolHarness(Path(tmp)) as harness:
-                harness.wait_for_status(lambda status: True, timeout=30.0)
+                initial_status = harness.wait_for_status(lambda status: True, timeout=30.0)
+                initial_update = int(initial_status["lastupdate"])
 
                 errors: list[str] = []
                 started = threading.Barrier(clients + 1)
+                probe_started = threading.Event()
+                stop_probe = threading.Event()
+                probe_result = {"accepted": 0}
                 elapsed: dict[str, float] = {}
 
                 def run_client(index: int) -> None:
@@ -840,42 +844,104 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                     finally:
                         miner.close()
 
+                def run_snapshot_probe() -> None:
+                    workername = f"{USER_ADDRESS}.snapshot"
+                    miner = MinerClient(harness.stratum_port, workername)
+                    accepted = 0
+                    try:
+                        miner.handshake()
+                        job = miner.job
+                        probe_started.set()
+                        nonce2_index = 0
+
+                        # Keep real accepted submissions in flight until a
+                        # fresh status document is observed. Small paced
+                        # batches prevent this probe from dominating the
+                        # fixed mixed-reason workload above.
+                        while not stop_probe.is_set():
+                            pending: list[int] = []
+                            for _ in range(8):
+                                nonce2 = miner.nonce2(nonce2_index)
+                                nonce2_index += 1
+                                base = flipped_header_base(
+                                    job, miner.enonce1, nonce2, job.ntime
+                                )
+                                nonce = find_nonce(
+                                    base, SHARE_HASH_CEILING, floor=NOT_BLOCK_FLOOR
+                                )
+                                pending.append(miner.submit_share(job, nonce2, nonce))
+                            for request_id in pending:
+                                response = miner.wait_response(request_id)
+                                if response.get("result") is not True:
+                                    errors.append(f"{workername}: {response}")
+                                else:
+                                    accepted += 1
+                            time.sleep(0.02)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{workername}: {exc!r}")
+                    finally:
+                        probe_result["accepted"] = accepted
+                        probe_started.set()
+                        miner.close()
+
                 threads = [
                     threading.Thread(target=run_client, args=(index,), daemon=True)
                     for index in range(clients)
                 ]
+                probe_thread = threading.Thread(target=run_snapshot_probe, daemon=True)
                 for thread in threads:
                     thread.start()
+                probe_thread.start()
                 started.wait(timeout=60)
-                submit_begin = time.monotonic()
+                self.assertTrue(probe_started.wait(timeout=30), "snapshot probe did not start")
 
-                # Poll the status file while the storm runs: every read must
-                # parse as complete JSON thanks to the tmp+rename contract,
-                # and every document must be an internally consistent
-                # snapshot even with submissions in flight.
+                # Poll through a real replacement while the probe keeps
+                # submissions flowing. Every read must parse as complete JSON
+                # and every observed document must remain internally
+                # consistent, including the newly written mid-load snapshot.
                 polls = 0
-                while any(thread.is_alive() for thread in threads):
-                    status = harness.read_status()
-                    if status is not None:
-                        self.assertIn("pool", status)
-                        assert_snapshot_consistent(self, status)
-                        polls += 1
-                    time.sleep(0.05)
+                mid_load_status: dict[str, object] | None = None
+                deadline = time.monotonic() + 90
+                try:
+                    while time.monotonic() < deadline:
+                        status = harness.read_status()
+                        if status is not None:
+                            self.assertIn("pool", status)
+                            assert_snapshot_consistent(self, status)
+                            polls += 1
+                            if int(status["lastupdate"]) > initial_update:
+                                self.assertTrue(
+                                    probe_thread.is_alive(),
+                                    "fresh status appeared only after the probe stopped",
+                                )
+                                mid_load_status = status
+                                break
+                        time.sleep(0.05)
+                finally:
+                    stop_probe.set()
+                    probe_thread.join(timeout=30)
+                self.assertFalse(probe_thread.is_alive(), "snapshot probe did not stop")
+                self.assertIsNotNone(mid_load_status, "no status replacement during live traffic")
+                assert mid_load_status is not None
+                probe_mid = worker_entry(mid_load_status, f"{USER_ADDRESS}.snapshot")
+                self.assertGreater(bucket(probe_mid, "accepted")[0], 0)
+
                 for thread in threads:
                     thread.join(timeout=120)
                 self.assertEqual(errors, [])
                 self.assertGreater(polls, 0)
-                submit_elapsed = time.monotonic() - submit_begin
 
                 # Low-overhead sanity: the full mixed workload including all
                 # acks stays far below the reject-flood thresholds. Generous
                 # bound for slow shared CI runners.
-                self.assertLess(submit_elapsed, 55.0, f"per-client elapsed: {elapsed}")
+                self.assertEqual(len(elapsed), clients)
+                self.assertLess(max(elapsed.values()), 55.0, f"per-client elapsed: {elapsed}")
 
                 def totals_match(status: dict[str, object]) -> bool:
                     pool = status["pool"]
                     return (
-                        bucket(pool, "accepted")[0] == clients * plan["accepted"]
+                        bucket(pool, "accepted")[0]
+                        == clients * plan["accepted"] + probe_result["accepted"]
                         and bucket(pool, "above_target")[0] == clients * plan["above_target"]
                         and bucket(pool, "malformed")[0] == clients * plan["malformed"]
                     )
@@ -887,17 +953,20 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                 # nothing lost, nothing double counted, no stray buckets,
                 # and worker rows summing exactly to the pool totals.
                 pool_expected = {reason: clients * count for reason, count in plan.items()}
+                pool_expected["accepted"] += probe_result["accepted"]
                 self.expect_counts(pool, pool_expected)
                 total = sum(bucket(pool, reason)[0] for reason in REASONS)
-                self.assertEqual(total, clients * per_client_total)
+                self.assertEqual(total, clients * per_client_total + probe_result["accepted"])
                 assert_snapshot_consistent(self, status, expect_equal=True)
 
                 workers = status["workers"]
                 self.assertIsInstance(workers, list)
-                self.assertEqual(len(workers), clients)
+                self.assertEqual(len(workers), clients + 1)
                 for index in range(clients):
                     entry = worker_entry(status, f"{USER_ADDRESS}.load{index}")
                     self.expect_counts(entry, plan)
+                probe = worker_entry(status, f"{USER_ADDRESS}.snapshot")
+                self.expect_counts(probe, {"accepted": probe_result["accepted"]})
 
                 # Bounded output: per-worker aggregation only, no per-share
                 # or per-client growth.

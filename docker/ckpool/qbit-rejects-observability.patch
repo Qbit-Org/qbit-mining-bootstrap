@@ -1,5 +1,5 @@
 diff --git a/src/stratifier.c b/src/stratifier.c
-index f49fede..1b01cb6 100644
+index f49fede..93439b6 100644
 --- a/src/stratifier.c
 +++ b/src/stratifier.c
 @@ -87,6 +87,58 @@ struct pool_stats {
@@ -32,7 +32,7 @@ index f49fede..1b01cb6 100644
 +};
 +
 +/* All tallies are guarded by sdata->rejects_lock on the pool sdata,
-+ * including the per-worker copies embedded in worker_instance. */
++ * including the lazily allocated per-worker records. */
 +struct qbit_reject_tally {
 +	int64_t count[QR_REASONS];
 +	double diff[QR_REASONS];	/* Sum of assigned difficulty */
@@ -61,28 +61,45 @@ index f49fede..1b01cb6 100644
  typedef struct genwork workbase_t;
  
  struct json_params {
-@@ -194,6 +246,8 @@ struct worker_instance {
+@@ -194,10 +246,22 @@ struct worker_instance {
  	int64_t best_ever; /* Best share ever found by this worker */
  	double mindiff; /* User chosen mindiff */
  
-+	qbit_reject_tally_t rejects; /* qbit rejects observability tallies */
++	/* Lazily allocated on the first counted submission or block outcome,
++	 * so authorisation-only workers have pointer-sized overhead. */
++	struct qbit_worker_rejects *rejects;
 +
  	bool idle;
  	bool notified_idle;
  };
-@@ -402,6 +456,11 @@ struct stratifier_data {
+ 
++/* Active worker records form an append-only list guarded by rejects_lock.
++ * Keeping the tally here avoids embedding its counters in idle workers. */
++struct qbit_worker_rejects {
++	worker_instance_t *worker;
++	struct qbit_worker_rejects *next;
++	qbit_reject_tally_t tally;
++};
++
+ typedef struct stratifier_data sdata_t;
+ 
+ typedef struct proxy_base proxy_t;
+@@ -402,6 +466,14 @@ struct stratifier_data {
  	/* Protects changes to unaccounted pool stats */
  	mutex_t uastats_lock;
  
-+	/* qbit rejects observability tallies for the whole pool. The lock
-+	 * also guards every worker_instance rejects tally. */
++	/* qbit rejects observability tallies for the whole pool. The lock guards
++	 * the pool tally, lazy worker records and append-only active-worker list. */
 +	qbit_reject_tally_t rejects;
++	struct qbit_worker_rejects *rejects_workers;
++	struct qbit_worker_rejects *rejects_workers_tail;
++	size_t rejects_worker_count;
 +	mutex_t rejects_lock;
 +
  	bool verbose;
  
  	uint64_t enonce1_64;
-@@ -2159,7 +2218,7 @@ static void put_workbase(sdata_t *sdata, workbase_t *wb)
+@@ -2159,7 +2231,7 @@ static void put_workbase(sdata_t *sdata, workbase_t *wb)
  #define put_remote_workbase(sdata, wb) put_workbase(sdata, wb)
  
  static void block_solve(ckpool_t *ckp, json_t *val);
@@ -91,7 +108,7 @@ index f49fede..1b01cb6 100644
  
  static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
  {
-@@ -2264,7 +2323,7 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
+@@ -2264,7 +2336,7 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
  	if (ret)
  		block_solve(ckp, bval);
  	else
@@ -100,10 +117,33 @@ index f49fede..1b01cb6 100644
  
  	json_decref(bval);
  out:
-@@ -3773,6 +3832,36 @@ static void block_share_summary(sdata_t *sdata)
+@@ -3773,6 +3845,61 @@ static void block_share_summary(sdata_t *sdata)
  		   sdiff, bdiff);
  }
  
++/* Entered with rejects_lock held. Register a worker on its first counted
++ * event and append it at the tail so a writer that sized an earlier prefix
++ * cannot have an existing worker displaced by a concurrent first submit. */
++static struct qbit_worker_rejects *
++qbit_get_worker_rejects(sdata_t *sdata, worker_instance_t *worker)
++{
++	struct qbit_worker_rejects *rejects = worker->rejects;
++
++	if (unlikely(!rejects)) {
++		rejects = ckzalloc(sizeof(*rejects));
++		rejects->worker = worker;
++		worker->rejects = rejects;
++		if (sdata->rejects_workers_tail)
++			sdata->rejects_workers_tail->next = rejects;
++		else
++			sdata->rejects_workers = rejects;
++		sdata->rejects_workers_tail = rejects;
++		sdata->rejects_worker_count++;
++	}
++
++	return rejects;
++}
++
 +/* qbit rejects observability: account a local submitblock outcome for a
 + * block-candidate share to the pool tally and, when the candidate carries a
 + * workername, to that worker's tally. Purely observational; never alters
@@ -111,10 +151,11 @@ index f49fede..1b01cb6 100644
 +static void qbit_record_block_outcome(ckpool_t *ckp, const char *workername,
 +				      const enum qbit_block_outcome outcome, const double diff)
 +{
++	struct qbit_worker_rejects *rejects;
 +	sdata_t *sdata = ckp->sdata;
 +	worker_instance_t *worker = NULL;
 +
-+	if (workername) {
++	if (workername && *workername) {
 +		user_instance_t *user = user_by_workername(sdata, workername);
 +
 +		/* get_user creates missing users so this cannot fail today;
@@ -128,8 +169,9 @@ index f49fede..1b01cb6 100644
 +	sdata->rejects.block_count[outcome]++;
 +	sdata->rejects.block_diff[outcome] += diff;
 +	if (worker) {
-+		worker->rejects.block_count[outcome]++;
-+		worker->rejects.block_diff[outcome] += diff;
++		rejects = qbit_get_worker_rejects(sdata, worker);
++		rejects->tally.block_count[outcome]++;
++		rejects->tally.block_diff[outcome] += diff;
 +	}
 +	mutex_unlock(&sdata->rejects_lock);
 +}
@@ -137,7 +179,7 @@ index f49fede..1b01cb6 100644
  static void block_solve(ckpool_t *ckp, json_t *val)
  {
  	char *msg, *workername = NULL;
-@@ -3792,6 +3881,8 @@ static void block_solve(ckpool_t *ckp, json_t *val)
+@@ -3792,6 +3919,8 @@ static void block_solve(ckpool_t *ckp, json_t *val)
  	json_get_double(&diff, val, "diff");
  	json_get_string(&workername, val, "workername");
  
@@ -146,7 +188,7 @@ index f49fede..1b01cb6 100644
  	if (!workername) {
  		ASPRINTF(&msg, "Block solved by %s!", ckp->name);
  		LOGWARNING("Solved and confirmed block!");
-@@ -3829,11 +3920,18 @@ static void block_solve(ckpool_t *ckp, json_t *val)
+@@ -3829,11 +3958,18 @@ static void block_solve(ckpool_t *ckp, json_t *val)
  	reset_bestshares(sdata);
  }
  
@@ -166,7 +208,7 @@ index f49fede..1b01cb6 100644
  
  	LOGWARNING("Submitted, but had block %d rejected", height);
  }
-@@ -5605,6 +5703,50 @@ static double time_bias(const double tdiff, const double period)
+@@ -5605,6 +5741,52 @@ static double time_bias(const double tdiff, const double period)
  	return 1.0 - 1.0 / exp(dexp);
  }
  
@@ -202,14 +244,16 @@ index f49fede..1b01cb6 100644
 +static void qbit_record_submit(ckpool_t *ckp, worker_instance_t *worker,
 +			       const enum qbit_submit_reason reason, const double diff)
 +{
++	struct qbit_worker_rejects *rejects;
 +	sdata_t *sdata = ckp->sdata;
 +
 +	mutex_lock(&sdata->rejects_lock);
 +	sdata->rejects.count[reason]++;
 +	sdata->rejects.diff[reason] += diff;
 +	if (likely(worker)) {
-+		worker->rejects.count[reason]++;
-+		worker->rejects.diff[reason] += diff;
++		rejects = qbit_get_worker_rejects(sdata, worker);
++		rejects->tally.count[reason]++;
++		rejects->tally.diff[reason] += diff;
 +	}
 +	mutex_unlock(&sdata->rejects_lock);
 +}
@@ -217,7 +261,7 @@ index f49fede..1b01cb6 100644
  /* Needs to be entered with client holding a ref count. */
  static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double diff, const bool valid,
  		       const bool submit)
-@@ -5830,7 +5972,7 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
+@@ -5830,7 +6012,7 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
  	if (ret)
  		block_solve(ckp, val);
  	else
@@ -226,7 +270,7 @@ index f49fede..1b01cb6 100644
  
  	json_decref(val);
  }
-@@ -6106,8 +6248,10 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
+@@ -6106,8 +6288,10 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
  
  	share = true;
  
@@ -238,7 +282,7 @@ index f49fede..1b01cb6 100644
  
  	wb = get_workbase(sdata, id);
  	if (unlikely(!wb)) {
-@@ -6282,6 +6426,8 @@ out_nowb:
+@@ -6282,6 +6466,8 @@ out_nowb:
  		upstream_json_msgtype(ckp, val, SM_SHARE);
  	json_decref(val);
  out:
@@ -247,29 +291,24 @@ index f49fede..1b01cb6 100644
  	if (!sdata->wbincomplete && ((!result && !submit) || !share)) {
  		/* Is this the first in a run of invalids? */
  		if (client->first_invalid < client->last_share.tv_sec || !client->first_invalid)
-@@ -8005,6 +8151,152 @@ static void lazy_drop_client(ckpool_t *ckp, stratum_instance_t *client)
+@@ -7240,8 +7426,13 @@ static void parse_remote_block(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
+ 		 * responses, so only use this response to determine if we
+ 		 * should reset the best shares. */
+ 		if (local_block_submit(ckp, gbt_block, flip32, wb->height)) {
++			qbit_record_block_outcome(ckp, json_string_value(workername_val),
++						  QB_ACCEPTED, diff);
+ 			block_share_summary(sdata);
+ 			reset_bestshares(sdata);
++		} else {
++			qbit_record_block_outcome(ckp, json_string_value(workername_val),
++						  QB_REJECTED, diff);
+ 		}
+ 		put_remote_workbase(sdata, wb);
+ 	}
+@@ -8005,6 +8196,122 @@ static void lazy_drop_client(ckpool_t *ckp, stratum_instance_t *client)
  	connector_drop_client(ckp, client->id);
  }
  
-+/* qbit rejects observability: true once any submission or block outcome has
-+ * been recorded. Counters only ever grow, so a relaxed read without the
-+ * rejects lock is safe for filtering: a worker racing its first submission
-+ * is picked up by the next cycle. */
-+static bool qbit_tally_active(const qbit_reject_tally_t *tally)
-+{
-+	int i;
-+
-+	for (i = 0; i < QR_REASONS; i++) {
-+		if (tally->count[i])
-+			return true;
-+	}
-+	for (i = 0; i < QB_OUTCOMES; i++) {
-+		if (tally->block_count[i])
-+			return true;
-+	}
-+	return false;
-+}
-+
 +/* qbit rejects observability: render one tally as json entries of the form
 + * "reason": {"count": N, "diff": D} appended to val. */
 +static void qbit_tally_to_json(json_t *val, const qbit_reject_tally_t *tally)
@@ -298,51 +337,40 @@ index f49fede..1b01cb6 100644
 + * observe a partial document. */
 +static void qbit_write_rejects_status(ckpool_t *ckp, sdata_t *sdata, const time_t runtime)
 +{
-+	int worker_count = 0, workers_snapped = 0, i;
++	size_t worker_count, workers_snapped = 0, i;
 +	char *fname = NULL, *tmpname = NULL, *s;
 +	json_t *val, *pool_val, *workers_val;
-+	worker_instance_t **workers, *worker;
++	struct qbit_worker_rejects *rejects;
++	worker_instance_t **workers;
 +	qbit_reject_tally_t pool_tally;
-+	user_instance_t *user = NULL;
 +	qbit_reject_tally_t *tallies;
 +	int ret;
 +	FILE *fp;
 +
-+	/* Worker instances are only ever appended, never freed, so pointers
-+	 * collected here stay valid without holding the instance lock. A
-+	 * worker authorised after this walk joins the next cycle, keeping
-+	 * worker rows a subset of what the pool tally has seen. Workers
-+	 * without a single recorded submission are excluded so the export,
-+	 * its allocations and the locked copy below scale with submitting
-+	 * workers only; authorisation spam alone cannot grow them. */
-+	while ((user = next_user(sdata, user)) != NULL) {
-+		worker = NULL;
-+		while ((worker = next_worker(sdata, user, worker)) != NULL) {
-+			if (qbit_tally_active(&worker->rejects))
-+				worker_count++;
-+		}
-+	}
++	/* Size from the lock-protected active list, then allocate without
++	 * blocking submissions. New records append at the tail, so copying
++	 * this prefix later cannot displace a worker counted here. */
++	mutex_lock(&sdata->rejects_lock);
++	worker_count = sdata->rejects_worker_count;
++	mutex_unlock(&sdata->rejects_lock);
 +
 +	/* One extra slot so a zero worker count needs no special casing */
 +	workers = ckalloc(sizeof(worker_instance_t *) * (worker_count + 1));
 +	tallies = ckalloc(sizeof(qbit_reject_tally_t) * (worker_count + 1));
 +
-+	user = NULL;
-+	while (workers_snapped < worker_count && (user = next_user(sdata, user)) != NULL) {
-+		worker = NULL;
-+		while (workers_snapped < worker_count &&
-+		       (worker = next_worker(sdata, user, worker)) != NULL) {
-+			if (qbit_tally_active(&worker->rejects))
-+				workers[workers_snapped++] = worker;
-+		}
-+	}
-+
-+	/* Single lock hold: pool and worker tallies form one consistent
-+	 * snapshot with respect to concurrent submissions. */
++	/* Single lock hold: the pool and the captured active-list prefix form
++	 * one consistent snapshot. Workers whose first event arrived after
++	 * sizing append after this prefix and join the next cycle. */
 +	mutex_lock(&sdata->rejects_lock);
 +	memcpy(&pool_tally, &sdata->rejects, sizeof(pool_tally));
-+	for (i = 0; i < workers_snapped; i++)
-+		memcpy(&tallies[i], &workers[i]->rejects, sizeof(qbit_reject_tally_t));
++	rejects = sdata->rejects_workers;
++	while (workers_snapped < worker_count && rejects) {
++		workers[workers_snapped] = rejects->worker;
++		memcpy(&tallies[workers_snapped], &rejects->tally,
++		       sizeof(qbit_reject_tally_t));
++		workers_snapped++;
++		rejects = rejects->next;
++	}
 +	mutex_unlock(&sdata->rejects_lock);
 +
 +	val = json_object();
@@ -400,7 +428,7 @@ index f49fede..1b01cb6 100644
  static void *statsupdate(void *arg)
  {
  	ckpool_t *ckp = (ckpool_t *)arg;
-@@ -8301,6 +8593,8 @@ static void *statsupdate(void *arg)
+@@ -8301,6 +8608,8 @@ static void *statsupdate(void *arg)
  		fclose(fp);
  
  out_status:
@@ -409,7 +437,7 @@ index f49fede..1b01cb6 100644
  		if (ckp->proxy && sdata->proxy) {
  			proxy_t *proxy, *proxytmp, *subproxy, *subtmp;
  
-@@ -8691,6 +8985,10 @@ void *stratifier(void *arg)
+@@ -8691,6 +9000,10 @@ void *stratifier(void *arg)
  	cksem_init(&sdata->update_sem);
  	cksem_post(&sdata->update_sem);
  

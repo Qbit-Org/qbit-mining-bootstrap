@@ -120,6 +120,51 @@ class CkpoolRejectsPatchWiringTests(unittest.TestCase):
         self.assertIn('"%s.tmp"', patch_text)
         self.assertIn("rename(tmpname, fname)", patch_text)
 
+    def test_worker_export_uses_lazy_active_registry(self) -> None:
+        patch_text = PATCH.read_text(encoding="utf-8")
+        writer = patch_text.split(
+            "+static void qbit_write_rejects_status", maxsplit=1
+        )[1].split("\n static void *statsupdate", maxsplit=1)[0]
+
+        self.assertIn("struct qbit_worker_rejects *rejects;", patch_text)
+        self.assertIn("rejects = ckzalloc(sizeof(*rejects));", patch_text)
+        self.assertIn("sdata->rejects_workers_tail->next = rejects;", patch_text)
+        self.assertIn("worker_count = sdata->rejects_worker_count;", writer)
+        self.assertIn("rejects = sdata->rejects_workers;", writer)
+        self.assertNotIn("next_user(", writer)
+        self.assertNotIn("next_worker(", writer)
+        self.assertNotIn("qbit_tally_active", patch_text)
+
+    def test_every_local_submitblock_path_records_an_outcome(self) -> None:
+        patch_text = PATCH.read_text(encoding="utf-8")
+        remote_hunks = [
+            hunk
+            for hunk in patch_text.split("\n@@ ")
+            if "parse_remote_block" in hunk and "local_block_submit" in hunk
+        ]
+
+        # Direct and node-forwarded candidates flow through block_solve /
+        # block_reject. Remote/distributed candidates submit locally in
+        # parse_remote_block and need explicit outcome hooks there.
+        self.assertIn(
+            "qbit_record_block_outcome(ckp, workername, QB_ACCEPTED, diff)",
+            patch_text,
+        )
+        self.assertIn(
+            "qbit_record_block_outcome(ckp, workername, QB_REJECTED, diff)",
+            patch_text,
+        )
+        self.assertEqual(len(remote_hunks), 1)
+        remote_hunk = remote_hunks[0]
+        self.assertEqual(
+            remote_hunk.count(
+                "qbit_record_block_outcome(ckp, json_string_value(workername_val),"
+            ),
+            2,
+        )
+        self.assertIn("QB_ACCEPTED", remote_hunk)
+        self.assertIn("QB_REJECTED", remote_hunk)
+
     def test_reason_buckets_match_live_suite_contract(self) -> None:
         from test_ckpool_rejects_observability import BLOCK_OUTCOMES, REASONS
 
