@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, getcontext
@@ -46,6 +47,13 @@ class DirectQbitStratumJob:
     extranonce1_hex: str
     extranonce2_size: int
     clean_jobs: bool = True
+    # The seven mining.notify params every client of one job build shares
+    # (prevhash through ntime), serialized once at build time. Per-client
+    # stamping copies the reference, so a fleet-wide notify wave splices job
+    # id and clean_jobs around this fragment instead of re-serializing the
+    # coinbase parts once per connection. None on hand-built jobs; senders
+    # fall back to full serialization.
+    notify_shared_params_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -401,15 +409,17 @@ def make_job_from_builder_manifest(
         field_name="template previousblockhash",
     )
 
+    prevhash = stratum_codec.stratum_prevhash_from_display_hash(previousblockhash)
+    merkle_branch = merkle_branch_for_coinbase(transaction_hexes)
     return DirectQbitStratumJob(
         job_id=str(job_id),
         previousblockhash_display=previousblockhash,
-        prevhash=stratum_codec.stratum_prevhash_from_display_hash(previousblockhash),
+        prevhash=prevhash,
         coinb1=coinb1,
         coinb2=coinb2,
         full_coinbase_prefix=full_prefix,
         full_coinbase_suffix=full_suffix,
-        merkle_branch=merkle_branch_for_coinbase(transaction_hexes),
+        merkle_branch=merkle_branch,
         transaction_hexes=transaction_hexes,
         version=version,
         nbits=nbits,
@@ -420,7 +430,38 @@ def make_job_from_builder_manifest(
         extranonce1_hex=extranonce1_hex,
         extranonce2_size=extranonce2_size,
         clean_jobs=clean_jobs,
+        notify_shared_params_json=notify_shared_params_json(
+            prevhash=prevhash,
+            coinb1=coinb1,
+            coinb2=coinb2,
+            merkle_branch=merkle_branch,
+            version=version,
+            nbits=nbits,
+            ntime=ntime,
+        ),
     )
+
+
+def notify_shared_params_json(
+    *,
+    prevhash: str,
+    coinb1: str,
+    coinb2: str,
+    merkle_branch: tuple[str, ...],
+    version: str,
+    nbits: str,
+    ntime: str,
+) -> str:
+    """Serialize the seven client-invariant mining.notify params once.
+
+    The returned fragment is the JSON of the seven-element list with its
+    outer brackets stripped, so a sender can splice the per-client job id
+    before it and the per-client clean_jobs flag after it and produce bytes
+    identical to serializing the full params list.
+    """
+    return json.dumps(
+        [prevhash, coinb1, coinb2, list(merkle_branch), version, nbits, ntime]
+    )[1:-1]
 
 
 def assemble_submission(

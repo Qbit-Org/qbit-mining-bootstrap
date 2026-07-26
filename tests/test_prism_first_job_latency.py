@@ -607,6 +607,84 @@ class WorkerKnobTests(unittest.TestCase):
 
 
 class FanoutOrderingTests(unittest.TestCase):
+    def test_fanout_wave_duration_histogram_is_observed(self) -> None:
+        # One completed prepared wave records exactly one wall-clock span
+        # (first task submission to last successful delivery).
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        states = [client(1), client(2)]
+        for state in states:
+            state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = set(states)
+
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        server.observe_tip_first_seen(snapshot.bestblockhash)
+        server.pool_readiness_latched()
+        server.tip_template_snapshot = snapshot
+        bundle = server.prepare_tip_refresh_bundle(snapshot)
+        try:
+            sent, first_delivery, last_delivery, failed = (
+                server._fanout_prepared_tip_refresh(
+                    states,
+                    bundle,
+                    snapshot,
+                    heartbeat_name="qbit_blockpoll",
+                )
+            )
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(sent, 2)
+        self.assertEqual(failed, 0)
+        self.assertIsNotNone(first_delivery)
+        self.assertIsNotNone(last_delivery)
+        metrics = server.metrics_payload()
+        self.assertIn(
+            "qbit_prism_tip_refresh_fanout_wave_seconds_count 1",
+            metrics,
+        )
+
+    def test_send_job_update_precomposed_bytes_match_full_serialization(
+        self,
+    ) -> None:
+        # The precomposed notify line must be byte-identical to serializing
+        # the payload dicts, or protocol bytes would silently diverge from
+        # what monkeypatched-send tests observe.
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+
+        class RecorderSock:
+            def __init__(self) -> None:
+                self.chunks: list[bytes] = []
+
+            def sendall(self, data: bytes) -> None:
+                self.chunks.append(data)
+
+        sock = RecorderSock()
+        state.sock = sock  # type: ignore[assignment]
+
+        snapshot = server.fetch_qbit_tip_template_snapshot()
+        server.observe_tip_first_seen(snapshot.bestblockhash)
+        server.pool_readiness_latched()
+        server.tip_template_snapshot = snapshot
+        try:
+            bundle = server.prepare_tip_refresh_bundle(snapshot)
+        finally:
+            server.shutdown_tip_refresh_executor()
+        job = bundle.base_job
+        self.assertIsNotNone(job.notify_shared_params_json)
+
+        server.send_job_update(state, job)
+
+        expected = (
+            json.dumps(server.difficulty_payload(job.share_difficulty)).encode()
+            + b"\n"
+            + json.dumps(PrismCoordinator.job_payload(job)).encode()
+            + b"\n"
+        )
+        self.assertEqual(b"".join(sock.chunks), expected)
+
     def test_priority_constants_put_first_jobs_ahead_of_the_wave(self) -> None:
         self.assertLess(
             PRISM_DELIVERY_PRIORITY_INITIAL,

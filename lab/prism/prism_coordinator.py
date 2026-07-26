@@ -2201,15 +2201,29 @@ class ClientState:
         with self.send_lock:
             self.sock.sendall(data)
 
-    def send_batch(self, payloads: list[dict[str, object]]) -> None:
+    def send_batch(
+        self,
+        payloads: list[dict[str, object]],
+        *,
+        preserialized: bytes | None = None,
+    ) -> None:
         # Tests and embedders may replace ``send`` with an in-memory recorder;
         # retain that seam while production sockets write the whole difficulty
         # + notify pair under one send lock with no response interleaving.
+        # ``preserialized`` must be the exact serialization of ``payloads``;
+        # callers with a shared precomposed fragment pass it so a fleet-wide
+        # wave does not re-serialize identical coinbase parts per client.
         if "send" in self.__dict__:
             for payload in payloads:
                 self.send(payload)
             return
-        data = b"".join(json.dumps(payload).encode() + b"\n" for payload in payloads)
+        data = (
+            preserialized
+            if preserialized is not None
+            else b"".join(
+                json.dumps(payload).encode() + b"\n" for payload in payloads
+            )
+        )
         with self.send_lock:
             self.sock.sendall(data)
 
@@ -8373,7 +8387,13 @@ class PrismCoordinator:
                     "sum": 0.0,
                     "count": 0,
                 }
-                for name in ("refresh", "bundle_build", "first_delivery", "last_delivery")
+                for name in (
+                    "refresh",
+                    "bundle_build",
+                    "first_delivery",
+                    "last_delivery",
+                    "fanout_wave",
+                )
             }
         if not hasattr(self, "tip_refresh_build_phase_histograms"):
             self.tip_refresh_build_phase_histograms = {
@@ -11815,6 +11835,16 @@ class PrismCoordinator:
                 raise TemplateRefreshSuperseded(
                     "prepared refresh payout state changed during post-fanout "
                     "validation; immediate retry scheduled"
+                )
+            if last_delivery is not None and submitted_at:
+                # Wall-clock span of the wave itself (first task submission
+                # to last successful delivery), independent of the reconcile
+                # and bundle-build stages the first/last_delivery histograms
+                # include. At fleet scale this is the dominant staleness term
+                # bounded by the delivery worker pool.
+                self._observe_tip_refresh_seconds(
+                    "fanout_wave",
+                    max(0.0, last_delivery - min(submitted_at.values())),
                 )
             return sent, first_delivery, last_delivery, failed
         finally:
@@ -15373,11 +15403,34 @@ class PrismCoordinator:
             self.send_difficulty(client, job)
             self.send_job(client, job)
             return
+        payloads = [
+            self.difficulty_payload(job.share_difficulty),
+            self.job_payload(job),
+        ]
+        shared_params = getattr(job, "notify_shared_params_json", None)
+        if shared_params is None:
+            client.send_batch(payloads)
+            return
+        # Splice the per-client fields around the fragment serialized once
+        # per bundle build; at fleet scale the coinb1/coinb2/merkle parts
+        # dominate the notify and are byte-identical for every client.
+        notify_line = (
+            '{"id": null, "method": "mining.notify", "params": ['
+            + json.dumps(job.job_id)
+            + ", "
+            + shared_params
+            + ", "
+            + ("true" if job.clean_jobs else "false")
+            + "]}"
+        )
         client.send_batch(
-            [
-                self.difficulty_payload(job.share_difficulty),
-                self.job_payload(job),
-            ]
+            payloads,
+            preserialized=(
+                json.dumps(payloads[0]).encode()
+                + b"\n"
+                + notify_line.encode()
+                + b"\n"
+            ),
         )
 
     def build_job_for_client(self, client: ClientState, *, clean_jobs: bool) -> PrismJobContext:
@@ -22262,12 +22315,14 @@ class PrismCoordinator:
             "bundle_build": "qbit_prism_tip_refresh_bundle_build_seconds",
             "first_delivery": "qbit_prism_tip_refresh_first_delivery_seconds",
             "last_delivery": "qbit_prism_tip_refresh_last_delivery_seconds",
+            "fanout_wave": "qbit_prism_tip_refresh_fanout_wave_seconds",
         }
         descriptions = {
             "refresh": "Full qbit tip/template refresh pass wall time.",
             "bundle_build": "Shared ready-pool refresh bundle preparation wall time.",
             "first_delivery": "Tip observation to first successful client delivery.",
             "last_delivery": "Tip observation to last successful client delivery.",
+            "fanout_wave": "First task submission to last successful delivery of one completed prepared fanout wave.",
         }
         lines: list[str] = []
         for name, metric_name in metric_names.items():
