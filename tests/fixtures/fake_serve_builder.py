@@ -64,6 +64,9 @@ def serve() -> None:
             misses += 1
         elif key in cache:
             hits += 1
+            # Promote like the real daemon: a hit entry moves to
+            # most-recent position before any later eviction.
+            cache[key] = cache.pop(key)
         else:
             sys.stdout.write(
                 json.dumps(

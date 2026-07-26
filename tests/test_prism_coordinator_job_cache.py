@@ -5663,6 +5663,50 @@ class ServeBuilderTests(unittest.TestCase):
         finally:
             server.shutdown_serve_builder()
 
+    def test_hit_promotion_keeps_mirror_and_daemon_lru_aligned(self) -> None:
+        server = self._coordinator()
+        shares_a = [spool_share(seq) for seq in range(1, 4)]
+        shares_b = [spool_share(seq) for seq in range(1, 5)]
+        shares_c = [spool_share(seq) for seq in range(1, 6)]
+        ser_a = self._serialization(server, shares_a, generation=1)
+        ser_b = self._serialization(server, shares_b, generation=2)
+        ser_c = self._serialization(server, shares_c, generation=3)
+        try:
+            self.assertTrue(
+                self._build(server, shares_a, ser_a, height=10)[
+                    "request_had_window"
+                ]
+            )
+            self.assertTrue(
+                self._build(server, shares_b, ser_b, height=11)[
+                    "request_had_window"
+                ]
+            )
+            # The hit promotes window A on both sides; uploading a third
+            # window must therefore evict B everywhere.
+            self.assertFalse(
+                self._build(server, shares_a, ser_a, height=12)[
+                    "request_had_window"
+                ]
+            )
+            self.assertTrue(
+                self._build(server, shares_c, ser_c, height=13)[
+                    "request_had_window"
+                ]
+            )
+
+            aligned = self._build(server, shares_a, ser_a, height=14)
+
+            self.assertEqual(aligned["transport"], "serve")
+            self.assertFalse(aligned["request_had_window"])
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["requests"], 5)
+            self.assertEqual(counts["window_uploads"], 3)
+            self.assertEqual(counts["fallbacks"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
     def test_daemon_crash_falls_back_to_one_shot(self) -> None:
         server = self._coordinator()
         shares = [spool_share(seq) for seq in range(1, 4)]

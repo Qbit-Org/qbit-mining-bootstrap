@@ -15609,8 +15609,12 @@ class PrismCoordinator:
             raise _ServeBuilderUnavailable(
                 "audit-builder daemon returned a malformed summary"
             )
+        # Every successful response promotes the window in the mirror, hits
+        # included: the daemon moves a hit entry to most-recent position, and
+        # a mirror that only tracked uploads would evict a different key and
+        # either re-upload a still-cached window or bounce on needs_window.
+        client.note_uploaded_window(share_snapshot_sha256)
         if upload_window:
-            client.note_uploaded_window(share_snapshot_sha256)
             with self._serve_builder_metrics_lock:
                 self.serve_builder_counts["window_uploads"] += 1
         window_cache = response.get("window_cache")
