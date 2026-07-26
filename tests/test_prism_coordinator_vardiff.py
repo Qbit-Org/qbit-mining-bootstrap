@@ -7058,6 +7058,119 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertTrue(all(entry.error is not None for entry in entries))
             self.assertFalse(server.share_recovery_path.exists())
 
+    def test_landing_builds_audit_bundle_outside_balance_serializer(self) -> None:
+        # The builder/verifier subprocess time must stay off the
+        # payout-balance mutation lock: job delivery and reconciliation
+        # queue behind that lock, and holding it across the bundle build was
+        # the dominant term of the finalization delivery stall.
+        server, state, ledger = submit_coordinator()
+        server.stop_after_block = False
+        server.max_blocks = 10
+        lock_held_during_build: list[bool] = []
+        build_calls: list[int] = []
+
+        def probe_lock_from_other_thread() -> bool:
+            # An RLock re-acquires freely on the owning thread, so the probe
+            # must come from a thread that cannot be the owner.
+            acquired: list[bool] = []
+
+            def attempt() -> None:
+                got = server._payout_balance_mutation_lock.acquire(
+                    blocking=False
+                )
+                if got:
+                    server._payout_balance_mutation_lock.release()
+                acquired.append(not got)
+
+            prober = threading.Thread(target=attempt)
+            prober.start()
+            prober.join(5)
+            return bool(acquired and acquired[0])
+
+        def fake_build_audit_bundle(**_kwargs: object) -> dict[str, object]:
+            build_calls.append(1)
+            lock_held_during_build.append(probe_lock_from_other_thread())
+            return verified_block_bundle()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            block_hash = "cc" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+            pending = SimpleNamespace(share_id="miner-a:" + block_hash)
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission, pending_share=pending)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(build_calls, [1])
+        self.assertEqual(lock_held_during_build, [False])
+        self.assertEqual(len(ledger.persisted), 1)
+        self.assertEqual(len(ledger.confirmed), 1)
+
+    def test_speculative_bundle_failure_falls_back_to_locked_build(self) -> None:
+        # Speculation is purely an optimization: a failed pre-lock build
+        # must neither abandon the candidate nor leak a shutdown; the
+        # landing rebuilds under the lock exactly as before.
+        server, state, ledger = submit_coordinator()
+        server.stop_after_block = False
+        server.max_blocks = 10
+        build_calls: list[int] = []
+
+        def flaky_build_audit_bundle(**_kwargs: object) -> dict[str, object]:
+            build_calls.append(1)
+            if len(build_calls) == 1:
+                raise RuntimeError("transient builder failure")
+            return verified_block_bundle()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            block_hash = "cc" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = flaky_build_audit_bundle  # type: ignore[method-assign]
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+            pending = SimpleNamespace(share_id="miner-a:" + block_hash)
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission, pending_share=pending)
+            )
+            leftover_candidates = list(
+                Path(tempdir).glob("*candidate*")
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(build_calls, [1, 1])
+        self.assertFalse(server.stop_event.is_set())
+        self.assertEqual(len(ledger.persisted), 1)
+        self.assertEqual(len(ledger.confirmed), 1)
+        self.assertEqual(leftover_candidates, [])
+
     def test_block_submit_histogram_measures_landed_to_rpc_interval(self) -> None:
         # The race-critical span (candidate landed -> submitblock returned)
         # must be observed exactly once per attempted submit, independent of
@@ -8485,8 +8598,15 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             parent_thread = threading.Thread(target=submit_parent)
             parent_thread.start()
             try:
+                # The audit bundle now builds speculatively before the
+                # balance serializer is taken, so the build gate proves only
+                # that nothing has landed yet. The preview-visible mid-flight
+                # window this test pins starts at persistence.
                 self.assertTrue(build_started.wait(5))
                 self.assertEqual(ledger.current_prior_balances(), [])
+                release_build.set()
+                self.assertTrue(persist_started.wait(5))
+                self.assertTrue(parent_thread.is_alive())
                 self.assertTrue(server.maybe_send_job(state, clean_jobs=True))
                 child_context = state.active_job
                 self.assertIsNotNone(child_context)
@@ -8520,8 +8640,6 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                         )
                     )
                 self.assertEqual(server.block_candidate_queue.qsize(), 1)
-                release_build.set()
-                self.assertTrue(persist_started.wait(5))
                 self.assertTrue(parent_thread.is_alive())
             finally:
                 release_build.set()

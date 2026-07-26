@@ -1216,6 +1216,23 @@ class PrismBlockCandidate:
 
 
 @dataclass
+class _SpeculativeAuditBundle:
+    """A candidate's audit bundle built and verified off the payout-balance
+    serializer, before the landing acquires it.
+
+    All inputs are frozen on the candidate, so the landing can adopt these
+    results under the lock without rebuilding; see
+    _build_speculative_audit_bundle for the fallback contract.
+    """
+
+    bundle_path: Path
+    final_bundle: dict[str, Any]
+    report: dict[str, Any]
+    canonical_bundle_path: Path | None
+    verified_preview: list[dict[str, object]]
+
+
+@dataclass
 class _BlockCandidateDispositionFlight:
     """One same-hash submission guard shared by its holder and waiters."""
 
@@ -19368,6 +19385,110 @@ class PrismCoordinator:
         )
         return True
 
+    def _build_speculative_audit_bundle(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        already_active: bool,
+    ) -> _SpeculativeAuditBundle | None:
+        """Build and verify the candidate's audit bundle off the balance
+        serializer, before the landing acquires it.
+
+        Every input is frozen on the candidate (share window, prior
+        balances, extranonces, template fields), so the result is
+        byte-identical to the in-lock build it replaces; producing it here
+        removes the builder/verifier subprocess time from both the
+        payout-balance lock hold and the landed-transition fence window that
+        starve job delivery during finalization.
+
+        Purely an optimization: any anomaly (build failure, coinbase
+        mismatch, verification failure) returns ``None`` and the landing
+        rebuilds under the lock with today's exact fence and shutdown
+        semantics. In particular a mismatch here must NOT abandon the
+        candidate -- submitblock always comes first; the in-lock rebuild
+        re-derives the mismatch deterministically after the submit.
+        """
+        context = candidate.context
+        submission = candidate.submission
+        bundle_path: Path | None = None
+        try:
+            if not already_active:
+                # A candidate that already lost its height race abandons in
+                # the locked triage without needing a bundle; skip the
+                # speculative subprocess work for it.
+                before_height = int(self.rpc.call("getblockcount"))
+                if before_height + 1 != int(context.template["height"]):
+                    return None
+            bundle_path = self.temporary_audit_bundle_path(
+                block_hash=submission.block_hash_hex
+            )
+            final_bundle = self.build_audit_bundle(
+                shares=context.shares_json,
+                found_block=context.found_block,
+                prior_balances=context.prior_balances,
+                coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
+                    candidate.extranonce1_hex,
+                    candidate.extranonce2_hex,
+                ),
+                witness_merkle_leaves_hex=list(
+                    getattr(context.job, "witness_merkle_leaves_hex", ())
+                )
+                or direct_stratum.witness_merkle_leaves_hex(
+                    getattr(context.job, "transaction_hexes", ())
+                ),
+                ctv_fee_parent_hash=str(context.template["previousblockhash"]),
+                canonical_output_path=bundle_path,
+            )
+            if not bundle_path.exists():
+                bundle_path = self.write_temporary_audit_bundle(
+                    final_bundle,
+                    block_hash=submission.block_hash_hex,
+                )
+            final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
+            final_coinbase_tx_hex_raw = final_manifest["coinbase_tx_hex"]
+            if not isinstance(final_coinbase_tx_hex_raw, str):
+                raise ValueError(
+                    "final audit bundle coinbase_tx_hex is not a string"
+                )
+            if (
+                final_coinbase_tx_hex_raw.lower()
+                != submission.coinbase_tx_hex.lower()
+            ):
+                raise ValueError(
+                    "speculative audit bundle coinbase does not match the "
+                    "submitted coinbase"
+                )
+            report = self.verify_bundle(
+                bundle_path,
+                submission.coinbase_tx_hex,
+                self.trusted_ledger_writer_public_key_hex(final_bundle),
+                expected_coinbase_value_sats=int(
+                    context.template["coinbasevalue"]
+                ),
+            )
+            canonical_bundle_path = self.verified_canonical_bundle_path(
+                bundle_path,
+                report,
+            )
+            verified_preview = self._accepted_block_payout_preview_from_bundle(
+                final_bundle,
+                prior_balances=context.prior_balances,
+            )
+        except Exception:
+            if bundle_path is not None:
+                try:
+                    bundle_path.unlink()
+                except FileNotFoundError:
+                    pass
+            return None
+        return _SpeculativeAuditBundle(
+            bundle_path=bundle_path,
+            final_bundle=final_bundle,
+            report=report,
+            canonical_bundle_path=canonical_bundle_path,
+            verified_preview=verified_preview,
+        )
+
     def _land_and_confirm_block_candidate(
         self,
         candidate: PrismBlockCandidate,
@@ -19386,6 +19507,10 @@ class PrismCoordinator:
         The balance serializer spans the last prior-state check through durable
         confirmation. Reconciliation therefore cannot change the base beneath
         the accepted coinbase, while ordinary job delivery remains unblocked.
+        The audit bundle is built and verified before the serializer is taken
+        (see _build_speculative_audit_bundle), so the serializer and the
+        landed-transition fence cover only the submit RPC, the preview
+        publications, and the durable persist/confirm writes.
         """
         context = candidate.context
         submission = candidate.submission
@@ -19396,6 +19521,54 @@ class PrismCoordinator:
         durable_payout_state = bool(
             getattr(self.ledger, "durable_payout_state", False)
         )
+        speculative = self._build_speculative_audit_bundle(
+            candidate,
+            already_active=already_active,
+        )
+        try:
+            return self._land_and_confirm_block_candidate_locked(
+                candidate,
+                current_tip=current_tip,
+                already_active=already_active,
+                worker=worker,
+                speculative=speculative,
+                context=context,
+                submission=submission,
+                expected_height=expected_height,
+                block_hash=block_hash,
+                parent_hash=parent_hash,
+                durable_payout_state=durable_payout_state,
+            )
+        finally:
+            # Triage may return before the locked path ever adopts the
+            # speculative file; the locked path's own cleanup only covers
+            # the bundle path it reached.
+            if speculative is not None:
+                try:
+                    speculative.bundle_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _land_and_confirm_block_candidate_locked(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        current_tip: str,
+        already_active: bool,
+        worker: str | None,
+        speculative: _SpeculativeAuditBundle | None,
+        context: PrismJobContext,
+        submission: direct_stratum.DirectQbitSubmission,
+        expected_height: int,
+        block_hash: str,
+        parent_hash: str,
+        durable_payout_state: bool,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+    ] | None:
         with self._payout_balance_mutation_lock:
             if self._defer_for_pending_parent_payout_transition(
                 block_hash=block_hash,
@@ -19600,34 +19773,46 @@ class PrismCoordinator:
                 self._publish_accepted_block_payout_preview(block_hash, preview)
 
             self._record_heartbeat("block_submitter")
-            candidate_bundle_path = self.temporary_audit_bundle_path(
-                block_hash=submission.block_hash_hex
-            )
-            final_bundle = self.build_audit_bundle(
-                shares=context.shares_json,
-                found_block=context.found_block,
-                prior_balances=context.prior_balances,
-                coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
-                    candidate.extranonce1_hex,
-                    candidate.extranonce2_hex,
-                ),
-                witness_merkle_leaves_hex=list(
-                    getattr(context.job, "witness_merkle_leaves_hex", ())
+            if speculative is not None:
+                # Built and verified before the serializer was taken, from
+                # inputs frozen on the candidate. Adopting it here removes
+                # the builder/verifier subprocess time from the lock hold
+                # and from the landed-transition fence window.
+                candidate_bundle_path = speculative.bundle_path
+                final_bundle = speculative.final_bundle
+            else:
+                candidate_bundle_path = self.temporary_audit_bundle_path(
+                    block_hash=submission.block_hash_hex
                 )
-                or direct_stratum.witness_merkle_leaves_hex(
-                    getattr(context.job, "transaction_hexes", ())
-                ),
-                ctv_fee_parent_hash=parent_hash,
-                canonical_output_path=candidate_bundle_path,
-            )
-            # Compatibility builders used by tests and older integrations may
-            # ignore canonical_output_path. Persist their logical bundle via
-            # the normal canonicalization fallback without mislabeling bytes.
-            if not candidate_bundle_path.exists():
-                candidate_bundle_path = self.write_temporary_audit_bundle(
-                    final_bundle,
-                    block_hash=submission.block_hash_hex,
+                final_bundle = self.build_audit_bundle(
+                    shares=context.shares_json,
+                    found_block=context.found_block,
+                    prior_balances=context.prior_balances,
+                    coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
+                        candidate.extranonce1_hex,
+                        candidate.extranonce2_hex,
+                    ),
+                    witness_merkle_leaves_hex=list(
+                        getattr(context.job, "witness_merkle_leaves_hex", ())
+                    )
+                    or direct_stratum.witness_merkle_leaves_hex(
+                        getattr(context.job, "transaction_hexes", ())
+                    ),
+                    ctv_fee_parent_hash=parent_hash,
+                    canonical_output_path=candidate_bundle_path,
                 )
+                # Compatibility builders used by tests and older integrations
+                # may ignore canonical_output_path. Persist their logical
+                # bundle via the normal canonicalization fallback without
+                # mislabeling bytes.
+                if not candidate_bundle_path.exists():
+                    candidate_bundle_path = self.write_temporary_audit_bundle(
+                        final_bundle,
+                        block_hash=submission.block_hash_hex,
+                    )
+            # The coinbase equality fence stays under the lock even for a
+            # speculative bundle: the compare is cheap and the shutdown
+            # semantics of a mismatch belong to the authoritative section.
             try:
                 final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
                 final_coinbase_tx_hex_raw = final_manifest["coinbase_tx_hex"]
@@ -19662,22 +19847,32 @@ class PrismCoordinator:
             payout_commit_started: float | None = None
             payout_commit_source: int | None = None
             try:
-                report = self.verify_bundle(
-                    candidate_bundle_path,
-                    submission.coinbase_tx_hex,
-                    self.trusted_ledger_writer_public_key_hex(final_bundle),
-                    expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
-                )
-                persistence_canonical_bundle_path = (
-                    self.verified_canonical_bundle_path(
-                        candidate_bundle_path,
-                        report,
+                if speculative is not None:
+                    report = speculative.report
+                    persistence_canonical_bundle_path = (
+                        speculative.canonical_bundle_path
                     )
-                )
+                else:
+                    report = self.verify_bundle(
+                        candidate_bundle_path,
+                        submission.coinbase_tx_hex,
+                        self.trusted_ledger_writer_public_key_hex(final_bundle),
+                        expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
+                    )
+                    persistence_canonical_bundle_path = (
+                        self.verified_canonical_bundle_path(
+                            candidate_bundle_path,
+                            report,
+                        )
+                    )
                 self._record_heartbeat("block_submitter")
-                verified_preview = self._accepted_block_payout_preview_from_bundle(
-                    final_bundle,
-                    prior_balances=context.prior_balances,
+                verified_preview = (
+                    speculative.verified_preview
+                    if speculative is not None
+                    else self._accepted_block_payout_preview_from_bundle(
+                        final_bundle,
+                        prior_balances=context.prior_balances,
+                    )
                 )
                 if not already_confirmed:
                     if preview is None and durable_payout_state:
