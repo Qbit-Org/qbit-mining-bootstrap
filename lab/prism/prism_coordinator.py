@@ -205,6 +205,7 @@ PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS = (1, 2, 5, 10, 25, 50, 100)
 PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_TIP_REFRESH_BUILD_PHASES = (
+    "reorg_reconcile",
     "ledger_snapshot",
     "payout_state_derivation",
     "ctv_manifest_construction",
@@ -10816,18 +10817,36 @@ class PrismCoordinator:
         futures: dict[Future[RefreshResult], ClientState] = {}
         submitted_at: dict[Future[RefreshResult], float] = {}
         queued_cancellations: set[Future[RefreshResult]] = set()
-        if expected_active_jobs is None:
-            with self.lock:
+        with self.lock:
+            if expected_active_jobs is None:
                 expected_active_jobs = {
                     client: client.active_job
                     for client in clients
                 }
+            # Vardiff drives every client toward the same share interval, so
+            # the difficulty a client sustains is proportional to its hashrate.
+            # Snapshot the proxies in the same locked pass as the job snapshot.
+            hashrate_proxies = {
+                client: (
+                    client.vardiff_difficulty_estimate or client.share_difficulty
+                )
+                for client in clients
+            }
         # Bounded submission admits at most max_inflight tasks at a time, so
-        # queue priority alone cannot lift a never-served client over a fleet
-        # wave that has not been submitted yet. Order admission itself.
+        # queue priority alone cannot lift one client over a fleet wave that
+        # has not been submitted yet. Order admission itself: stale-job
+        # clients by descending hashrate, job-less clients last. A stale fast
+        # client burns its full rate on old-tip work every second of refresh
+        # lag, while a job-less client burns nothing while it waits regardless
+        # of its configured difficulty (it also keeps its initial-delivery
+        # queue priority once admitted).
         clients = sorted(
             clients,
-            key=lambda ordered: expected_active_jobs.get(ordered) is not None,
+            key=lambda ordered: (
+                expected_active_jobs.get(ordered) is not None,
+                hashrate_proxies.get(ordered, Decimal(0)),
+            ),
+            reverse=True,
         )
         clients_iter = iter(clients)
         max_inflight = max(1, int(self.tip_refresh_max_workers))
@@ -11215,6 +11234,7 @@ class PrismCoordinator:
                 snapshot,
                 observation_sequence,
             )
+            reconcile_started = time.monotonic()
             try:
                 reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
                     snapshot.bestblockhash
@@ -11231,6 +11251,14 @@ class PrismCoordinator:
                 raise TemplateRefreshBlocked(
                     "qbit reorg reconciliation failed before refresh preparation"
                 ) from exc
+            finally:
+                # The only serial pre-build stage without a phase metric;
+                # observe failures too so a slow reconcile that blocks the
+                # refresh still shows up in the histogram.
+                self._observe_tip_refresh_build_phase(
+                    "reorg_reconcile",
+                    time.monotonic() - reconcile_started,
+                )
             if not reorg_reconciled:
                 raise TemplateRefreshBlocked(
                     "qbit chain view remained untrusted after reorg reconciliation"
@@ -12772,10 +12800,27 @@ class PrismCoordinator:
                 return True
         return self.ensure_reorg_reconciled_for_tip(current_tip)
 
-    def ensure_reorg_reconciled_for_tip(self, tip_hash: str) -> bool:
+    def ensure_reorg_reconciled_for_tip(
+        self,
+        tip_hash: str,
+        *,
+        _coalesce_same_tip: bool = True,
+    ) -> bool:
+        """Reconcile one tip, optionally bypassing same-tip flight reuse.
+
+        Lock-owning accepted-block callers disable waiting for an existing
+        leader because it may itself be waiting for the payout-balance
+        mutation lock. Their own pass remains visible to ordinary followers.
+        """
         if not getattr(self, "reorg_reconciler_enabled", True):
             return True
-        summary = self.reconcile_prism_pool_blocks_once(tip_hash=tip_hash)
+        if _coalesce_same_tip:
+            summary = self.reconcile_prism_pool_blocks_once(tip_hash=tip_hash)
+        else:
+            summary = self.reconcile_prism_pool_blocks_once(
+                tip_hash=tip_hash,
+                _wait_for_same_tip_flight=False,
+            )
         return not bool(summary.get("untrusted") or summary.get("superseded"))
 
     def qbit_chain_view_untrusted(self) -> bool:
@@ -12929,6 +12974,7 @@ class PrismCoordinator:
         tip_hash: str | None = None,
         _force_publish: bool = False,
         _source_reserved: bool = False,
+        _wait_for_same_tip_flight: bool = True,
     ) -> dict[str, object]:
         """Reconcile pool blocks, coalescing same-tip concurrent callers.
 
@@ -12936,7 +12982,9 @@ class PrismCoordinator:
         await that pass and share its summary instead of queueing another
         full serialized pass. Callers carrying side-effect obligations (a
         forced publication or an already-reserved source) and callers without
-        a tip always run their own pass.
+        a tip always run their own pass. Lock-owning callers may disable
+        waiting for an existing flight while still registering as the visible
+        leader when no same-tip flight exists.
         """
         self._ensure_job_cache_state()
         if tip_hash is None or _force_publish or _source_reserved:
@@ -12952,6 +13000,10 @@ class PrismCoordinator:
                 flight = _ReconcileFlight()
                 self._reconcile_flights[tip_hash] = flight
         if not leading:
+            if not _wait_for_same_tip_flight:
+                return self._reconcile_prism_pool_blocks_serialized(
+                    tip_hash=tip_hash
+                )
             wait_seconds = float(
                 getattr(
                     self,
@@ -16717,11 +16769,17 @@ class PrismCoordinator:
                     idle_window_reset_at,
                 )
 
+        # A same-tip retarget only needs to flush in-flight work on a
+        # step-down: firmware that applies mining.set_difficulty retroactively
+        # would otherwise submit sub-target shares against the old job. On a
+        # step-up the old job stays valid at its own stamped share_target, so
+        # keeping it avoids discarding the miner's in-flight work.
+        clean_jobs = next_difficulty < current_difficulty
         try:
             if require_idle:
                 sent = self._maybe_send_job_locked(
                     client,
-                    clean_jobs=True,
+                    clean_jobs=clean_jobs,
                     raise_on_build_failure=True,
                     prepared_bundle=prepared_bundle,
                     commit_guard=idle_commit_guard,
@@ -16735,7 +16793,7 @@ class PrismCoordinator:
                     client.authorized
                     and client.subscribed
                     and not self.stop_event.is_set()
-                    and self.maybe_send_job(client, clean_jobs=True)
+                    and self.maybe_send_job(client, clean_jobs=clean_jobs)
                 )
             # A completed paired send is the commit point. Shutdown may race
             # immediately afterward, but it cannot make already-delivered work
@@ -16861,6 +16919,7 @@ class PrismCoordinator:
                 # probe racing a transient fork view cannot terminally
                 # abandon the accepted block before blockwait re-observes it.
                 block_state = None
+                state_read_failed = False
                 try:
                     state_reader = getattr(self.ledger, "pool_block_state", None)
                     if callable(state_reader):
@@ -16868,9 +16927,21 @@ class PrismCoordinator:
                 except Exception:
                     traceback.print_exc()
                     block_state = None
-                if block_state is not None and str(
-                    block_state.get("chain_state", "")
-                ) in {"prepared", "confirmed"}:
+                    # Fail safe: an unreadable durable state must protect the
+                    # candidate like proven acceptance, not strip it. A
+                    # genuinely stale replay then defers only until the
+                    # bounded observation window expires, while an accepted
+                    # block survives a flaky read racing a transient fork.
+                    state_read_failed = True
+                durable_chain_state = (
+                    str(block_state.get("chain_state", ""))
+                    if block_state is not None
+                    else ""
+                )
+                if state_read_failed or durable_chain_state in {
+                    "prepared",
+                    "confirmed",
+                }:
                     self._register_outstanding_block_candidate(
                         durable_block_hash
                     )
@@ -16881,7 +16952,11 @@ class PrismCoordinator:
                     print(
                         "prism coordinator: restored acceptance evidence for "
                         f"replayed block candidate hash={durable_block_hash} "
-                        f"chain_state={block_state.get('chain_state')}",
+                        + (
+                            "after a failed durable-state read"
+                            if state_read_failed
+                            else f"chain_state={durable_chain_state}"
+                        ),
                         flush=True,
                     )
                 if self.enqueue_block_candidate(candidate):
@@ -17285,6 +17360,12 @@ class PrismCoordinator:
         """Keep the oldest unresolved candidate ahead of queued descendants."""
         candidate_height = int(candidate.context.template["height"])
         candidate_hash = str(candidate.submission.block_hash_hex).lower()
+        # A retained candidate will be re-disposed, so the disposition seal
+        # (which stopped tip-observation matching at a terminal commit) no
+        # longer applies: the terminal work did not complete. Re-register
+        # immediately -- not at the next disposition -- so acceptance
+        # evidence arriving during the retry backoff is not lost.
+        self._register_outstanding_block_candidate(candidate_hash)
         with self.lock:
             self.block_candidate_retry_count = int(
                 getattr(self, "block_candidate_retry_count", 0)
@@ -17605,23 +17686,40 @@ class PrismCoordinator:
             block_hash,
             invalidate_published=True,
         )
+        # The invalidation above can block long enough for the chain view to
+        # heal (a buried accepted block is not always re-observed as the tip
+        # while blockwait only reports the newest of rapid connects), so an
+        # unknown pre-withdrawal verdict must re-probe before the terminal
+        # commit. A provably wrong-height verdict is immutable (headers
+        # cannot change height) and is never re-probed.
+        late_probe = (
+            chain_probe
+            if chain_probe is False
+            else self._block_candidate_chain_probe(
+                block_hash,
+                expected_height=expected_height,
+            )
+        )
         with self.lock:
             accepted_race_won = bool(
                 preserve_if_accepted
                 and block_hash.lower() in self._accounted_accepted_block_hashes
             )
-            # The invalidation above can block long enough for a blockwait
-            # observation (or a recovered probe) to register acceptance
-            # evidence that the pre-invalidation check missed. Terminal
-            # commitment must consult it, atomically with the counts, or the
-            # same blind spot reopens inside this window. The probe still
-            # wins both directions: a provably wrong-height verdict is
-            # immutable (headers cannot change height), so observation
-            # evidence never revives a candidate the probe overruled.
+            # A blockwait observation can also register during the blocking
+            # invalidation. Terminal commitment must consult the evidence
+            # atomically with the counts, or the same blind spot reopens
+            # inside this window; the probe still wins both directions.
             late_acceptance_observed = bool(
                 not accepted_race_won
-                and chain_probe is not False
-                and self._block_candidate_acceptance_observed(block_hash)
+                and (
+                    late_probe is True
+                    or (
+                        late_probe is not False
+                        and self._block_candidate_acceptance_observed(
+                            block_hash
+                        )
+                    )
+                )
             )
             if not accepted_race_won and not late_acceptance_observed:
                 outcome.reason = reason
@@ -17828,7 +17926,10 @@ class PrismCoordinator:
                 # transition becomes a landed barrier and before validating its
                 # payout base.
                 try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                        current_tip,
+                        _coalesce_same_tip=False,
+                    )
                 except Exception:
                     traceback.print_exc()
                     self._abandon_block_candidate(
@@ -17876,7 +17977,10 @@ class PrismCoordinator:
                 reorg_reconciled = True
             else:
                 try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(current_tip)
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                        current_tip,
+                        _coalesce_same_tip=False,
+                    )
                 except Exception:
                     traceback.print_exc()
                     self._abandon_block_candidate(

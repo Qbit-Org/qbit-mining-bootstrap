@@ -864,7 +864,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(config.max_step_factor, Decimal("4"))
         self.assertEqual(config.max_step_down_factor, Decimal("4"))
 
-    def test_vardiff_retarget_sends_new_difficulty_and_clean_job(self) -> None:
+    def test_vardiff_step_up_retarget_sends_new_difficulty_without_flush(self) -> None:
         server = coordinator()
         state = client()
         state.share_difficulty = Decimal("1")
@@ -880,12 +880,120 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.note_vardiff_submitted_share(state)
         server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
 
-        # Difficulty is now advertised by maybe_send_job alongside the job (gated on
-        # a successful build), so the retarget commits the pending difficulty and
-        # requests a single clean job.
+        # Difficulty is advertised by maybe_send_job alongside the job (gated on
+        # a successful build). A step-up must not flush the miner's in-flight
+        # work: old jobs validate at their own stamped share_target, so the
+        # retarget requests a single non-clean job.
+        self.assertEqual(state.pending_share_difficulty, Decimal("4"))
+        self.assertEqual(sent["jobs"], 1)
+        self.assertFalse(sent["clean"])
+
+    def test_vardiff_step_down_retarget_flushes_with_clean_job(self) -> None:
+        # Firmware that applies mining.set_difficulty retroactively would
+        # submit sub-target shares against the old job after a step-down, so
+        # the step-down keeps flushing in-flight work.
+        server = coordinator()
+        state = client()
+        state.share_difficulty = Decimal("16")
+        state.vardiff_window_started_monotonic = time.monotonic() - 65
+        sent: dict[str, object] = {"jobs": 0}
+
+        def fake_send_job(client: object, clean_jobs: bool) -> bool:
+            sent.update({"jobs": sent["jobs"] + 1, "clean": clean_jobs})
+            return True
+
+        server.maybe_send_job = fake_send_job  # type: ignore[method-assign]
+
+        server.note_vardiff_submitted_share(state)
+        server.note_vardiff_accepted_share(state, FakeJob(Decimal("16")))  # type: ignore[arg-type]
+
         self.assertEqual(state.pending_share_difficulty, Decimal("4"))
         self.assertEqual(sent["jobs"], 1)
         self.assertTrue(sent["clean"])
+
+    def test_step_up_retarget_keeps_old_job_submittable_at_old_difficulty(self) -> None:
+        tip = "00" * 32
+        server = coordinator()
+        server.accepted_block_count = 0
+        server.max_blocks = 1
+        server.stop_after_block = True
+        server.jobs = {}
+        server.recent_share_keys = set()
+        server.share_weights_by_username = {}
+        ledger = RecordingLedger()
+        server.ledger = ledger
+        worker = worker_identity()
+        state = client()
+        state.username = worker.username
+        state.worker = worker
+        state.share_difficulty = Decimal("1")
+        state.vardiff_window_started_monotonic = time.monotonic() - 2
+        sent: list[dict[str, object]] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+        server.clients = {state}
+        server.rpc = TipTemplateRpc(tip=tip, template=gbt_template(tip))
+
+        old_context = prism_context("old-job", tip, worker=worker, difficulty=Decimal("1"))
+        state.active_job = old_context
+        state.active_job_ids = {"old-job"}
+        server.jobs["old-job"] = old_context
+
+        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
+            return prism_context(
+                "fresh-job",
+                tip,
+                worker=worker,
+                difficulty=client.pending_share_difficulty or client.share_difficulty,
+                clean_jobs=clean_jobs,
+            )
+
+        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
+
+        server.note_vardiff_submitted_share(state)
+        server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
+
+        # The 1 -> 4 step-up pairs the new difficulty with a non-clean job and
+        # keeps the old job registered and submittable.
+        self.assertEqual(state.share_difficulty, Decimal("4"))
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(
+            [payload["method"] for payload in sent],
+            ["mining.set_difficulty", "mining.notify"],
+        )
+        self.assertEqual(sent[0]["params"], [4.0])
+        self.assertEqual(sent[1]["params"][0], "fresh-job")
+        self.assertFalse(sent[1]["params"][8])
+        self.assertIn("old-job", server.jobs)
+        self.assertIn("fresh-job", server.jobs)
+        self.assertEqual(state.active_job_ids, {"old-job", "fresh-job"})
+
+        # In-flight work against the old job still lands, validated at the old
+        # job's own stamped difficulty: this share passes the diff-1 target it
+        # was mined against, not the diff-4 target advertised afterward.
+        def assemble_at_stamped_difficulty(job: object, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                header_hex="aa" * 80,
+                block_hash_hex="bb" * 32,
+                share_pass=job.share_difficulty <= Decimal("1"),
+                block_pass=False,
+            )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            side_effect=assemble_at_stamped_difficulty,
+        ):
+            should_close = server.handle_submit(
+                state,
+                ["miner-a", "old-job", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(ledger.pending[0].job_id, "old-job")
+        self.assertEqual(server.low_difficulty_share_count, 0)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_LOW_DIFFICULTY], 0)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_UNKNOWN_JOB], 0)
+        self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_STALE_JOB], 0)
 
     def test_vardiff_retarget_build_failure_keeps_consistent_difficulty_and_job(self) -> None:
         # If the job build is skipped during a retarget, the client must stay on its
@@ -4189,6 +4297,213 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(results[0], results[1])
         self.assertIsNotNone(results[0])
         self.assertIsNot(results[0], results[1])
+        with server._reconcile_flight_lock:
+            self.assertEqual(server._reconcile_flights, {})
+
+    def test_lock_owner_reconcile_bypasses_same_tip_flight(self) -> None:
+        tip = "5f" * 32
+        ledger = ReorgLedger([])
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        server._ensure_job_cache_state()
+
+        leader_lock_attempted = threading.Event()
+        flight_waited = threading.Event()
+        flight_completed = threading.Event()
+        underlying_lock = threading.RLock()
+        leader: threading.Thread | None = None
+
+        class ObservedBalanceLock:
+            def __enter__(self) -> ObservedBalanceLock:
+                if threading.current_thread() is leader:
+                    if underlying_lock.acquire(blocking=False):
+                        underlying_lock.release()
+                        raise AssertionError(
+                            "reconcile leader unexpectedly acquired the owned lock"
+                        )
+                    leader_lock_attempted.set()
+                    underlying_lock.acquire()
+                else:
+                    underlying_lock.acquire()
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                underlying_lock.release()
+
+        class WaitForbiddenEvent:
+            def __init__(self, inner: threading.Event) -> None:
+                self._inner = inner
+
+            def wait(self, timeout: float | None = None) -> bool:
+                flight_waited.set()
+                raise AssertionError(
+                    "lock-owning reconciliation joined the same-tip flight"
+                )
+
+            def set(self) -> None:
+                flight_completed.set()
+                self._inner.set()
+
+        server._payout_balance_mutation_lock = ObservedBalanceLock()  # type: ignore[assignment]
+        leader_results: list[dict[str, object]] = []
+        leader_errors: list[BaseException] = []
+
+        def lead_reconcile() -> None:
+            try:
+                leader_results.append(
+                    server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                leader_errors.append(exc)
+
+        leader = threading.Thread(target=lead_reconcile)
+        try:
+            with server._payout_balance_mutation_lock:
+                leader.start()
+                self.assertTrue(leader_lock_attempted.wait(timeout=5.0))
+                with server._reconcile_flight_lock:
+                    flight = server._reconcile_flights[tip]
+                    flight.event = WaitForbiddenEvent(  # type: ignore[assignment]
+                        flight.event
+                    )
+
+                bypassed = server.ensure_reorg_reconciled_for_tip(
+                    tip,
+                    _coalesce_same_tip=False,
+                )
+
+                self.assertTrue(bypassed)
+                self.assertFalse(flight_waited.is_set())
+                self.assertTrue(leader.is_alive())
+                self.assertEqual(
+                    ledger.events,
+                    [("watch", 10), ("mature", 10)],
+                )
+        finally:
+            leader.join(timeout=5.0)
+
+        self.assertFalse(leader.is_alive())
+        if leader_errors:
+            raise leader_errors[0]
+        self.assertEqual(len(leader_results), 1)
+        self.assertTrue(flight_completed.is_set())
+        self.assertFalse(flight_waited.is_set())
+        self.assertEqual(
+            ledger.events,
+            [
+                ("watch", 10),
+                ("mature", 10),
+                ("watch", 10),
+                ("mature", 10),
+            ],
+        )
+        with server._reconcile_flight_lock:
+            self.assertEqual(server._reconcile_flights, {})
+
+    def test_lock_owner_reconcile_leads_visible_flight_when_absent(self) -> None:
+        tip = "60" * 32
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingReorgLedger(ReorgLedger):
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                entered.set()
+                if not release.wait(timeout=5.0):
+                    raise AssertionError("reconcile release was never signaled")
+                return super().reorg_watch_blocks(
+                    active_tip_height=active_tip_height
+                )
+
+        ledger = BlockingReorgLedger([])
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        server._ensure_job_cache_state()
+
+        lock_owner_result: list[bool] = []
+        follower_result: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+        follower_waiting = threading.Event()
+
+        class SignalingEvent:
+            def __init__(self, inner: threading.Event) -> None:
+                self._inner = inner
+
+            def wait(self, timeout: float | None = None) -> bool:
+                follower_waiting.set()
+                return self._inner.wait(timeout)
+
+            def set(self) -> None:
+                self._inner.set()
+
+        def reconcile_while_owning_lock() -> None:
+            try:
+                with server._payout_balance_mutation_lock:
+                    lock_owner_result.append(
+                        server.ensure_reorg_reconciled_for_tip(
+                            tip,
+                            _coalesce_same_tip=False,
+                        )
+                    )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        def follow_reconcile() -> None:
+            try:
+                follower_result.append(
+                    server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        lock_owner = threading.Thread(target=reconcile_while_owning_lock)
+        follower = threading.Thread(target=follow_reconcile)
+        lock_owner.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5.0))
+            with server._reconcile_flight_lock:
+                flight = server._reconcile_flights[tip]
+                flight.event = SignalingEvent(flight.event)  # type: ignore[assignment]
+
+            follower.start()
+            self.assertTrue(follower_waiting.wait(timeout=5.0))
+            self.assertTrue(lock_owner.is_alive())
+            self.assertTrue(follower.is_alive())
+            self.assertEqual(ledger.events, [])
+        finally:
+            release.set()
+            lock_owner.join(timeout=5.0)
+            if follower.ident is not None:
+                follower.join(timeout=5.0)
+
+        self.assertFalse(lock_owner.is_alive())
+        self.assertFalse(follower.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(lock_owner_result, [True])
+        self.assertEqual(len(follower_result), 1)
+        self.assertEqual(
+            ledger.events,
+            [("watch", 10), ("mature", 10)],
+            "the ordinary caller must reuse the lock owner's visible pass",
+        )
         with server._reconcile_flight_lock:
             self.assertEqual(server._reconcile_flights, {})
 
@@ -8731,7 +9046,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server, state, ledger = submit_coordinator()
         server._ensure_job_cache_state()
         server.reorg_reconciler_enabled = True
-        server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            lambda _tip, *, _coalesce_same_tip: not _coalesce_same_tip
+        )
         server.qbit_chain_view_untrusted = lambda: True  # type: ignore[method-assign]
         block_hash = "d1" * 32
         newer_tip = "d2" * 32
@@ -8838,7 +9155,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
             active_rpc = ActiveAncestorRpc()
             server.rpc = active_rpc
-            server.ensure_reorg_reconciled_for_tip = lambda _tip: True  # type: ignore[method-assign]
+            server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+                lambda _tip, *, _coalesce_same_tip: not _coalesce_same_tip
+            )
             server.build_audit_bundle = lambda **_kwargs: {  # type: ignore[method-assign]
                 "found_block": {"coinbase_value_sats": 50_00000000},
                 "ledger_window_attestation": {"signature": {"public_key_hex": "aa" * 32}},
@@ -11775,7 +12094,10 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         server.ledger = ledger
         accepted_hash = "e7" * 32
         unproven_hash = "e8" * 32
-        for index, block_hash in enumerate((accepted_hash, unproven_hash), start=1):
+        unreadable_hash = "e9" * 32
+        for index, block_hash in enumerate(
+            (accepted_hash, unproven_hash, unreadable_hash), start=1
+        ):
             pending = PendingShare(
                 share_id=f"miner-a:{block_hash}",
                 miner_id="miner-a",
@@ -11804,21 +12126,28 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             ledger.append_batch(
                 [(pending, server.block_candidate_intent(candidate))]
             )
-        ledger.pool_block_state = (  # type: ignore[attr-defined]
-            lambda *, block_hash: (
-                {"chain_state": "prepared", "maturity_state": "immature"}
-                if block_hash == accepted_hash
-                else None
-            )
-        )
+        def durable_block_state(*, block_hash: str) -> dict[str, object] | None:
+            if block_hash == accepted_hash:
+                return {"chain_state": "prepared", "maturity_state": "immature"}
+            if block_hash == unreadable_hash:
+                raise RuntimeError("postgres unavailable")
+            return None
 
-        self.assertEqual(server.replay_pending_block_candidates(), 2)
+        ledger.pool_block_state = durable_block_state  # type: ignore[attr-defined]
+
+        self.assertEqual(server.replay_pending_block_candidates(), 3)
 
         self.assertIn(accepted_hash, server._tip_observed_accepted_block_hashes)
         self.assertIn(accepted_hash, server._outstanding_block_candidate_hashes)
         # No durable acceptance proof: replays without synthetic evidence.
         self.assertNotIn(
             unproven_hash, server._tip_observed_accepted_block_hashes
+        )
+        # An unreadable durable state fails safe: the candidate replays
+        # protected, bounded by the observation window, instead of exposed
+        # to a transient fork view racing its first disposition.
+        self.assertIn(
+            unreadable_hash, server._tip_observed_accepted_block_hashes
         )
 
     def test_late_defer_republishes_withdrawn_preview_and_unfences(self) -> None:
@@ -11894,6 +12223,66 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             server._invalidated_accepted_block_payout_previews,
         )
         self.assertFalse(server._payout_state_publication_blocked)
+
+    def test_late_gate_reprobes_after_withdrawal_heals_buried_block(self) -> None:
+        # Bugbot round 7: an unknown pre-withdrawal probe verdict must
+        # re-probe after the (blocking) withdrawal. A buried accepted block
+        # is not always re-observed as the tip -- blockwait reports only the
+        # newest of rapid connects -- so the recovered probe alone, with no
+        # observation evidence at all, must defer the terminal abandon.
+        block_hash = "bc" * 32
+        server, _state, _ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server._register_outstanding_block_candidate(block_hash)
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        rpc = AcceptanceProbeRpc(tip="11" * 32, header=None)
+        server.rpc = rpc
+        real_clear = server._clear_accepted_block_payout_preview
+
+        def healing_clear(
+            hash_arg: str,
+            *,
+            invalidate_published: bool = False,
+        ) -> None:
+            if invalidate_published:
+                # The chain view heals while the withdrawal blocks: the
+                # candidate is provably active again, two blocks deep.
+                rpc.header = {"height": 10, "confirmations": 2}
+            return real_clear(
+                hash_arg,
+                invalidate_published=invalidate_published,
+            )
+
+        server._clear_accepted_block_payout_preview = healing_clear  # type: ignore[method-assign]
+
+        accepted_race_won = server._abandon_block_candidate(
+            PRISM_REJECTION_STALE_JOB,
+            "tip moved before submit: test",
+            block_hash=block_hash,
+            worker=None,
+            preserve_if_accepted=True,
+            expected_height=10,
+        )
+
+        self.assertFalse(accepted_race_won)
+        outcome = getattr(server, "_block_candidate_outcome", None)
+        self.assertEqual(
+            getattr(outcome, "reason", None),
+            PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
+        )
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            getattr(server, "block_candidate_abandoned_counts", {}),
+        )
+        self.assertIn(block_hash, server._accepted_block_payout_previews)
+        self.assertTrue(
+            server._accepted_block_payout_previews[block_hash].landed
+        )
+        self.assertNotIn(
+            block_hash,
+            server._invalidated_accepted_block_payout_previews,
+        )
 
     def test_wrong_height_probe_verdict_overrules_late_observation(self) -> None:
         # Bugbot round 6: the probe must win both directions in the late
@@ -12063,6 +12452,78 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
                 0,
             )
 
+    def test_retained_candidate_reregisters_for_tip_observations(self) -> None:
+        # Codex round 8: the terminal seal stops observation matching, but
+        # when the terminal cleanup itself fails (reject_prepared_block
+        # raising) the candidate is retained for retry -- and evidence
+        # arriving during that backoff gap must register again, not vanish.
+        parent = "00" * 32
+        block_hash = "cd" * 32
+        racing_winner = "77" * 32
+        server, state, ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 2
+        server.stop_after_block = False
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+            rpc = LostAckSubmitRpc(
+                start_tip=parent,
+                hash_by_hex={"00": block_hash},
+            )
+            rpc.lose_acks = False
+            server.rpc = rpc
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+            real_persist = ledger.persist_accepted_block
+
+            def persist_then_lose_race(**kwargs: object) -> dict[str, object]:
+                result = real_persist(**kwargs)
+                rpc.tip = racing_winner
+                rpc.active.pop(block_hash, None)
+                rpc.getblockhash_override = racing_winner
+                return result
+
+            ledger.persist_accepted_block = persist_then_lose_race  # type: ignore[method-assign]
+            reject_attempts: list[dict[str, object]] = []
+
+            def failing_reject(**kwargs: object) -> dict[str, object]:
+                reject_attempts.append(kwargs)
+                raise RuntimeError("psql briefly unavailable")
+
+            ledger.reject_prepared_block = failing_reject  # type: ignore[method-assign]
+            ledger.pool_block_state = (  # type: ignore[attr-defined]
+                lambda *, block_hash: {
+                    "chain_state": "prepared",
+                    "maturity_state": "immature",
+                }
+            )
+
+            # The sealed terminal pass aborts inside the rejection (site
+            # attempt, then the writer's terminal-cleanup attempt): the
+            # candidate is retained and must match observations again.
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+            self.assertEqual(len(reject_attempts), 2)
+            self.assertIsNotNone(getattr(server, "_retry_block_candidate", None))
+            self.assertIn(
+                block_hash, server._outstanding_block_candidate_hashes
+            )
+
+            # Blockwait reports the pool's own hash during the backoff gap:
+            # the evidence registers instead of vanishing behind the seal.
+            self.assertTrue(server.observe_tip_for_refresh(block_hash))
+            self.assertIn(
+                block_hash, server._tip_observed_accepted_block_hashes
+            )
+            self.assertEqual(abandoned, [])
+
     def test_pool_closed_gate_requires_probe_proven_acceptance(self) -> None:
         # Bugbot: observation evidence alone must not open the pool-closed
         # gate -- an off-chain candidate would fall through toward
@@ -12145,7 +12606,7 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             rpc.active[block_hash] = 10
             server.rpc = rpc
             server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
-                lambda _tip: True
+                lambda _tip, *, _coalesce_same_tip: not _coalesce_same_tip
             )
             candidate = block_candidate(
                 server,
