@@ -205,6 +205,7 @@ PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS = (1, 2, 5, 10, 25, 50, 100)
 PRISM_TIP_REFRESH_SECONDS_BUCKETS = PRISM_JOB_BUILD_SECONDS_BUCKETS
 PRISM_TIP_REFRESH_BUILD_PHASES = (
+    "reorg_reconcile",
     "ledger_snapshot",
     "payout_state_derivation",
     "ctv_manifest_construction",
@@ -10816,18 +10817,36 @@ class PrismCoordinator:
         futures: dict[Future[RefreshResult], ClientState] = {}
         submitted_at: dict[Future[RefreshResult], float] = {}
         queued_cancellations: set[Future[RefreshResult]] = set()
-        if expected_active_jobs is None:
-            with self.lock:
+        with self.lock:
+            if expected_active_jobs is None:
                 expected_active_jobs = {
                     client: client.active_job
                     for client in clients
                 }
+            # Vardiff drives every client toward the same share interval, so
+            # the difficulty a client sustains is proportional to its hashrate.
+            # Snapshot the proxies in the same locked pass as the job snapshot.
+            hashrate_proxies = {
+                client: (
+                    client.vardiff_difficulty_estimate or client.share_difficulty
+                )
+                for client in clients
+            }
         # Bounded submission admits at most max_inflight tasks at a time, so
-        # queue priority alone cannot lift a never-served client over a fleet
-        # wave that has not been submitted yet. Order admission itself.
+        # queue priority alone cannot lift one client over a fleet wave that
+        # has not been submitted yet. Order admission itself: stale-job
+        # clients by descending hashrate, job-less clients last. A stale fast
+        # client burns its full rate on old-tip work every second of refresh
+        # lag, while a job-less client burns nothing while it waits regardless
+        # of its configured difficulty (it also keeps its initial-delivery
+        # queue priority once admitted).
         clients = sorted(
             clients,
-            key=lambda ordered: expected_active_jobs.get(ordered) is not None,
+            key=lambda ordered: (
+                expected_active_jobs.get(ordered) is not None,
+                hashrate_proxies.get(ordered, Decimal(0)),
+            ),
+            reverse=True,
         )
         clients_iter = iter(clients)
         max_inflight = max(1, int(self.tip_refresh_max_workers))
@@ -11215,6 +11234,7 @@ class PrismCoordinator:
                 snapshot,
                 observation_sequence,
             )
+            reconcile_started = time.monotonic()
             try:
                 reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
                     snapshot.bestblockhash
@@ -11231,6 +11251,14 @@ class PrismCoordinator:
                 raise TemplateRefreshBlocked(
                     "qbit reorg reconciliation failed before refresh preparation"
                 ) from exc
+            finally:
+                # The only serial pre-build stage without a phase metric;
+                # observe failures too so a slow reconcile that blocks the
+                # refresh still shows up in the histogram.
+                self._observe_tip_refresh_build_phase(
+                    "reorg_reconcile",
+                    time.monotonic() - reconcile_started,
+                )
             if not reorg_reconciled:
                 raise TemplateRefreshBlocked(
                     "qbit chain view remained untrusted after reorg reconciliation"
@@ -16741,11 +16769,17 @@ class PrismCoordinator:
                     idle_window_reset_at,
                 )
 
+        # A same-tip retarget only needs to flush in-flight work on a
+        # step-down: firmware that applies mining.set_difficulty retroactively
+        # would otherwise submit sub-target shares against the old job. On a
+        # step-up the old job stays valid at its own stamped share_target, so
+        # keeping it avoids discarding the miner's in-flight work.
+        clean_jobs = next_difficulty < current_difficulty
         try:
             if require_idle:
                 sent = self._maybe_send_job_locked(
                     client,
-                    clean_jobs=True,
+                    clean_jobs=clean_jobs,
                     raise_on_build_failure=True,
                     prepared_bundle=prepared_bundle,
                     commit_guard=idle_commit_guard,
@@ -16759,7 +16793,7 @@ class PrismCoordinator:
                     client.authorized
                     and client.subscribed
                     and not self.stop_event.is_set()
-                    and self.maybe_send_job(client, clean_jobs=True)
+                    and self.maybe_send_job(client, clean_jobs=clean_jobs)
                 )
             # A completed paired send is the commit point. Shutdown may race
             # immediately afterward, but it cannot make already-delivered work

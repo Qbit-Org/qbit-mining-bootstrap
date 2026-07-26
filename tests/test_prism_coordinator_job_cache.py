@@ -4846,6 +4846,27 @@ class JobBuildMetricsTests(unittest.TestCase):
         self.assertIn("qbit_prism_tip_refresh_bundle_inflight 0", metrics)
         self.assertIn("qbit_prism_connected_clients 0", metrics)
 
+    def test_poll_observes_reorg_reconcile_phase(self) -> None:
+        # The reconcile stage runs serially before every refresh build; one
+        # poll must record exactly one reorg_reconcile phase observation.
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 1)
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_tip_refresh_bundle_phase_seconds_count{phase="reorg_reconcile"} 1',
+            metrics,
+        )
+
     def test_metrics_split_payout_preparation_publication_and_delivery(self) -> None:
         server, _ = coordinator()
         install_fake_bundle_builder(server)
