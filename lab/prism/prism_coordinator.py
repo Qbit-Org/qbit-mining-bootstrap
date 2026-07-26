@@ -15803,6 +15803,13 @@ class PrismCoordinator:
             try:
                 client = self._serve_builder
                 if client is not None and client.process.poll() is not None:
+                    # The daemon died between requests (its own crash or an
+                    # external kill). Record the lifecycle transition before
+                    # retiring it so the immediate respawn below reads as a
+                    # crash-and-restart rather than an ordinary start.
+                    with self._job_build_scheduler_lock:
+                        self.job_build_worker_counts["crashes"] += 1
+                        self._job_build_worker_restart_pending = True
                     self._retire_serve_builder_locked()
                     client = None
                 if client is None:

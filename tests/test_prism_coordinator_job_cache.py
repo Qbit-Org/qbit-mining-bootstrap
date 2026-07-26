@@ -6027,6 +6027,34 @@ class ServeBuilderTests(unittest.TestCase):
         self.assertEqual(counts["spawns"], 0)
         self.assertEqual(server.tip_refresh_worker_failures, 1)
 
+    def test_idle_daemon_death_counts_crash_and_restart(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            first = self._build(server, shares, serialization, height=10)
+            self.assertEqual(first["transport"], "serve")
+            client = server._serve_builder
+            assert client is not None
+            client.process.kill()
+            client.process.wait(timeout=5)
+
+            second = self._build(server, shares, serialization, height=11)
+
+            self.assertEqual(second["transport"], "serve")
+            with server._job_build_scheduler_lock:
+                counts = dict(server.job_build_worker_counts)
+                self.assertFalse(server._job_build_worker_restart_pending)
+            self.assertEqual(counts["crashes"], 1)
+            self.assertEqual(counts["restarts"], 1)
+            self.assertEqual(server.tip_refresh_worker_restarts, 1)
+            with server._serve_builder_metrics_lock:
+                serve_counts = dict(server.serve_builder_counts)
+            self.assertEqual(serve_counts["spawns"], 2)
+            self.assertEqual(serve_counts["fallbacks"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
     def test_daemon_respawn_counts_as_worker_restart(self) -> None:
         server = self._coordinator()
         shares = [spool_share(seq) for seq in range(1, 4)]
