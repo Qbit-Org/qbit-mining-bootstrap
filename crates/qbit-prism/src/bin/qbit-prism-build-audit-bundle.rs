@@ -371,14 +371,17 @@ fn serve_requests(
             }
         };
         let window_sha = request.window_key.share_snapshot_sha256.clone();
+        // The window vector is loaned to the build rather than cloned: both
+        // audit build entry points only borrow the shares for derivation and
+        // move the vector unmodified into AuditBundle.shares, so it is
+        // reclaimed from the finished bundle below. A failed build drops the
+        // loaned window; the coordinator's needs_window bounce re-uploads it.
         let shares: Vec<AcceptedShare> = if !request.compact_shares.is_empty() {
             match expand_compact_shares(&request.compact_share_identities, request.compact_shares) {
                 Ok(expanded) => {
                     cache_misses += 1;
                     window_cache.retain(|(key, _)| key != &window_sha);
-                    window_cache.insert(0, (window_sha.clone(), expanded));
-                    window_cache.truncate(SERVE_WINDOW_CACHE_MAX_ENTRIES);
-                    window_cache[0].1.clone()
+                    expanded
                 }
                 Err(error) => {
                     respond_error(&stdout, &format!("invalid window upload: {error}"), false)?;
@@ -390,9 +393,7 @@ fn serve_requests(
             .position(|(key, _)| key == &window_sha)
         {
             cache_hits += 1;
-            let entry = window_cache.remove(position);
-            window_cache.insert(0, entry);
-            window_cache[0].1.clone()
+            window_cache.remove(position).1
         } else {
             // Not counted as a miss: the coordinator's follow-up upload of
             // this same window is the miss that gets counted.
@@ -438,6 +439,11 @@ fn serve_requests(
         })?;
         let output_serialization_seconds = output_started.elapsed().as_secs_f64();
         let summary_raw = serde_json::value::RawValue::from_string(summary_json)?;
+        // Reclaim the loaned window from the finished bundle before
+        // reporting cache occupancy: no bytes were copied on the way in or
+        // out, and the entry keeps most-recent position.
+        window_cache.insert(0, (window_sha, bundle.shares));
+        window_cache.truncate(SERVE_WINDOW_CACHE_MAX_ENTRIES);
         let response = ServeResponse {
             ok: true,
             summary: &summary_raw,

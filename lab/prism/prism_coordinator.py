@@ -4105,11 +4105,27 @@ class PrismCoordinator:
         self,
         payout_state_generation: int,
         network_difficulty: int,
+        *,
+        min_interval_seconds: float | None = None,
     ) -> None:
-        """Latest-generation-wins scheduling with one worker and one slot."""
+        """Latest-generation-wins scheduling with one worker and one slot.
+
+        With min_interval_seconds, the debounce check, timestamp update, and
+        request enqueue are one atomic step under the executor lock: a
+        concurrent dequeue or a racing probe cannot slip a duplicate request
+        into the emptied slot and run the reward-window snapshot twice.
+        """
         self._ensure_job_cache_state()
         with self._payout_artifact_executor_lock:
             if self._payout_artifact_executor_shutdown:
+                return
+            if (
+                min_interval_seconds is not None
+                and self._payout_artifact_last_schedule_monotonic is not None
+                and time.monotonic()
+                - self._payout_artifact_last_schedule_monotonic
+                < min_interval_seconds
+            ):
                 return
             self._payout_artifact_requested = (
                 int(payout_state_generation),
@@ -4133,6 +4149,8 @@ class PrismCoordinator:
         self,
         payout_state_generation: int,
         network_difficulty: int,
+        *,
+        rearm_on_fence_failure: bool = True,
     ) -> PayoutLedgerArtifact | None:
         self._ensure_job_cache_state()
         with self._job_cache_lock:
@@ -4158,10 +4176,11 @@ class PrismCoordinator:
             # durable. No payout event may arrive for a long time, so queue a
             # bounded speculative rebuild; exact-count reuse semantics are
             # unchanged because the stale artifact stays rejected here.
-            self._rearm_payout_ledger_artifact_after_fence_failure(
-                payout_state_generation,
-                network_difficulty,
-            )
+            if rearm_on_fence_failure:
+                self._rearm_payout_ledger_artifact_after_fence_failure(
+                    payout_state_generation,
+                    network_difficulty,
+                )
             return None
         balances_sha256 = canonical_json_sha256(artifact.prior_balances)
         with self._job_cache_lock:
@@ -4206,23 +4225,16 @@ class PrismCoordinator:
                 for transition in self._accepted_block_payout_previews.values()
             ):
                 return
-        rearm_min_seconds = float(
-            getattr(
-                self,
-                "payout_artifact_rearm_min_seconds",
-                DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,
-            )
-        )
-        with self._payout_artifact_executor_lock:
-            last_scheduled = self._payout_artifact_last_schedule_monotonic
-            if (
-                last_scheduled is not None
-                and time.monotonic() - last_scheduled < rearm_min_seconds
-            ):
-                return
         self._schedule_payout_ledger_artifact_preparation(
             payout_state_generation,
             network_difficulty,
+            min_interval_seconds=float(
+                getattr(
+                    self,
+                    "payout_artifact_rearm_min_seconds",
+                    DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,
+                )
+            ),
         )
 
     def _schedule_current_payout_ledger_artifact_if_missing(self) -> None:
@@ -4236,6 +4248,10 @@ class PrismCoordinator:
         if self._usable_payout_ledger_artifact(
             payout_state_generation,
             template_artifacts.network_difficulty,
+            # This call site enqueues unconditionally below; letting the
+            # probe also re-arm would race the one-slot worker's dequeue and
+            # run the reward-window snapshot twice for one resumption.
+            rearm_on_fence_failure=False,
         ) is not None:
             return
         self._schedule_payout_ledger_artifact_preparation(

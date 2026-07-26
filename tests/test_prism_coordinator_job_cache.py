@@ -2298,28 +2298,27 @@ class JobBundleCacheTests(unittest.TestCase):
             server._payout_state_generation,
             artifacts.network_difficulty,
         )
-        scheduled: list[tuple[int, int]] = []
 
-        def record_schedule(
-            payout_state_generation: int,
-            network_difficulty: int,
-        ) -> None:
-            scheduled.append((payout_state_generation, network_difficulty))
-            with server._payout_artifact_executor_lock:
-                server._payout_artifact_last_schedule_monotonic = (
-                    time.monotonic()
-                )
+        class RecordingExecutor:
+            def __init__(self) -> None:
+                self.submissions = 0
 
-        server._schedule_payout_ledger_artifact_preparation = (  # type: ignore[method-assign]
-            record_schedule
-        )
+            def submit(self, _fn: object) -> Future[None]:
+                # Recorded but never run: the request slot stays observable.
+                self.submissions += 1
+                return Future()
+
+        executor = RecordingExecutor()
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_executor = executor  # type: ignore[assignment]
 
         usable = server._usable_payout_ledger_artifact(
             server._payout_state_generation,
             artifacts.network_difficulty,
         )
         self.assertIsNotNone(usable)
-        self.assertEqual(scheduled, [])
+        with server._payout_artifact_executor_lock:
+            self.assertIsNone(server._payout_artifact_requested)
 
         server.ledger.miners = [*server.ledger.miners, "late-share"]
 
@@ -2329,19 +2328,27 @@ class JobBundleCacheTests(unittest.TestCase):
                 artifacts.network_difficulty,
             )
         )
-        self.assertEqual(
-            scheduled,
-            [(server._payout_state_generation, artifacts.network_difficulty)],
-        )
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(
+                server._payout_artifact_requested,
+                (
+                    server._payout_state_generation,
+                    int(artifacts.network_difficulty),
+                ),
+            )
+            self.assertEqual(executor.submissions, 1)
+            # The one-slot worker dequeues the request; a failed probe inside
+            # the interval must not slip a duplicate into the emptied slot.
+            server._payout_artifact_requested = None
 
-        # A second failed probe inside the interval must not re-schedule.
         self.assertIsNone(
             server._usable_payout_ledger_artifact(
                 server._payout_state_generation,
                 artifacts.network_difficulty,
             )
         )
-        self.assertEqual(len(scheduled), 1)
+        with server._payout_artifact_executor_lock:
+            self.assertIsNone(server._payout_artifact_requested)
 
         # Once the interval has elapsed the next failed probe re-arms.
         with server._payout_artifact_executor_lock:
@@ -2354,7 +2361,14 @@ class JobBundleCacheTests(unittest.TestCase):
                 artifacts.network_difficulty,
             )
         )
-        self.assertEqual(len(scheduled), 2)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(
+                server._payout_artifact_requested,
+                (
+                    server._payout_state_generation,
+                    int(artifacts.network_difficulty),
+                ),
+            )
 
     def test_landed_preview_suppresses_fence_failure_rearm(self) -> None:
         server, rpc = coordinator()
@@ -2367,7 +2381,7 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         scheduled: list[tuple[int, int]] = []
         server._schedule_payout_ledger_artifact_preparation = (  # type: ignore[method-assign]
-            lambda generation, difficulty: scheduled.append(
+            lambda generation, difficulty, **_kwargs: scheduled.append(
                 (generation, difficulty)
             )
         )
