@@ -16861,6 +16861,7 @@ class PrismCoordinator:
                 # probe racing a transient fork view cannot terminally
                 # abandon the accepted block before blockwait re-observes it.
                 block_state = None
+                state_read_failed = False
                 try:
                     state_reader = getattr(self.ledger, "pool_block_state", None)
                     if callable(state_reader):
@@ -16868,9 +16869,21 @@ class PrismCoordinator:
                 except Exception:
                     traceback.print_exc()
                     block_state = None
-                if block_state is not None and str(
-                    block_state.get("chain_state", "")
-                ) in {"prepared", "confirmed"}:
+                    # Fail safe: an unreadable durable state must protect the
+                    # candidate like proven acceptance, not strip it. A
+                    # genuinely stale replay then defers only until the
+                    # bounded observation window expires, while an accepted
+                    # block survives a flaky read racing a transient fork.
+                    state_read_failed = True
+                durable_chain_state = (
+                    str(block_state.get("chain_state", ""))
+                    if block_state is not None
+                    else ""
+                )
+                if state_read_failed or durable_chain_state in {
+                    "prepared",
+                    "confirmed",
+                }:
                     self._register_outstanding_block_candidate(
                         durable_block_hash
                     )
@@ -16881,7 +16894,11 @@ class PrismCoordinator:
                     print(
                         "prism coordinator: restored acceptance evidence for "
                         f"replayed block candidate hash={durable_block_hash} "
-                        f"chain_state={block_state.get('chain_state')}",
+                        + (
+                            "after a failed durable-state read"
+                            if state_read_failed
+                            else f"chain_state={durable_chain_state}"
+                        ),
                         flush=True,
                     )
                 if self.enqueue_block_candidate(candidate):
@@ -17285,6 +17302,12 @@ class PrismCoordinator:
         """Keep the oldest unresolved candidate ahead of queued descendants."""
         candidate_height = int(candidate.context.template["height"])
         candidate_hash = str(candidate.submission.block_hash_hex).lower()
+        # A retained candidate will be re-disposed, so the disposition seal
+        # (which stopped tip-observation matching at a terminal commit) no
+        # longer applies: the terminal work did not complete. Re-register
+        # immediately -- not at the next disposition -- so acceptance
+        # evidence arriving during the retry backoff is not lost.
+        self._register_outstanding_block_candidate(candidate_hash)
         with self.lock:
             self.block_candidate_retry_count = int(
                 getattr(self, "block_candidate_retry_count", 0)
@@ -17605,23 +17628,40 @@ class PrismCoordinator:
             block_hash,
             invalidate_published=True,
         )
+        # The invalidation above can block long enough for the chain view to
+        # heal (a buried accepted block is not always re-observed as the tip
+        # while blockwait only reports the newest of rapid connects), so an
+        # unknown pre-withdrawal verdict must re-probe before the terminal
+        # commit. A provably wrong-height verdict is immutable (headers
+        # cannot change height) and is never re-probed.
+        late_probe = (
+            chain_probe
+            if chain_probe is False
+            else self._block_candidate_chain_probe(
+                block_hash,
+                expected_height=expected_height,
+            )
+        )
         with self.lock:
             accepted_race_won = bool(
                 preserve_if_accepted
                 and block_hash.lower() in self._accounted_accepted_block_hashes
             )
-            # The invalidation above can block long enough for a blockwait
-            # observation (or a recovered probe) to register acceptance
-            # evidence that the pre-invalidation check missed. Terminal
-            # commitment must consult it, atomically with the counts, or the
-            # same blind spot reopens inside this window. The probe still
-            # wins both directions: a provably wrong-height verdict is
-            # immutable (headers cannot change height), so observation
-            # evidence never revives a candidate the probe overruled.
+            # A blockwait observation can also register during the blocking
+            # invalidation. Terminal commitment must consult the evidence
+            # atomically with the counts, or the same blind spot reopens
+            # inside this window; the probe still wins both directions.
             late_acceptance_observed = bool(
                 not accepted_race_won
-                and chain_probe is not False
-                and self._block_candidate_acceptance_observed(block_hash)
+                and (
+                    late_probe is True
+                    or (
+                        late_probe is not False
+                        and self._block_candidate_acceptance_observed(
+                            block_hash
+                        )
+                    )
+                )
             )
             if not accepted_race_won and not late_acceptance_observed:
                 outcome.reason = reason

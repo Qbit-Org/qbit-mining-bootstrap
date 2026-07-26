@@ -11775,7 +11775,10 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         server.ledger = ledger
         accepted_hash = "e7" * 32
         unproven_hash = "e8" * 32
-        for index, block_hash in enumerate((accepted_hash, unproven_hash), start=1):
+        unreadable_hash = "e9" * 32
+        for index, block_hash in enumerate(
+            (accepted_hash, unproven_hash, unreadable_hash), start=1
+        ):
             pending = PendingShare(
                 share_id=f"miner-a:{block_hash}",
                 miner_id="miner-a",
@@ -11804,21 +11807,28 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             ledger.append_batch(
                 [(pending, server.block_candidate_intent(candidate))]
             )
-        ledger.pool_block_state = (  # type: ignore[attr-defined]
-            lambda *, block_hash: (
-                {"chain_state": "prepared", "maturity_state": "immature"}
-                if block_hash == accepted_hash
-                else None
-            )
-        )
+        def durable_block_state(*, block_hash: str) -> dict[str, object] | None:
+            if block_hash == accepted_hash:
+                return {"chain_state": "prepared", "maturity_state": "immature"}
+            if block_hash == unreadable_hash:
+                raise RuntimeError("postgres unavailable")
+            return None
 
-        self.assertEqual(server.replay_pending_block_candidates(), 2)
+        ledger.pool_block_state = durable_block_state  # type: ignore[attr-defined]
+
+        self.assertEqual(server.replay_pending_block_candidates(), 3)
 
         self.assertIn(accepted_hash, server._tip_observed_accepted_block_hashes)
         self.assertIn(accepted_hash, server._outstanding_block_candidate_hashes)
         # No durable acceptance proof: replays without synthetic evidence.
         self.assertNotIn(
             unproven_hash, server._tip_observed_accepted_block_hashes
+        )
+        # An unreadable durable state fails safe: the candidate replays
+        # protected, bounded by the observation window, instead of exposed
+        # to a transient fork view racing its first disposition.
+        self.assertIn(
+            unreadable_hash, server._tip_observed_accepted_block_hashes
         )
 
     def test_late_defer_republishes_withdrawn_preview_and_unfences(self) -> None:
@@ -11894,6 +11904,66 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             server._invalidated_accepted_block_payout_previews,
         )
         self.assertFalse(server._payout_state_publication_blocked)
+
+    def test_late_gate_reprobes_after_withdrawal_heals_buried_block(self) -> None:
+        # Bugbot round 7: an unknown pre-withdrawal probe verdict must
+        # re-probe after the (blocking) withdrawal. A buried accepted block
+        # is not always re-observed as the tip -- blockwait reports only the
+        # newest of rapid connects -- so the recovered probe alone, with no
+        # observation evidence at all, must defer the terminal abandon.
+        block_hash = "bc" * 32
+        server, _state, _ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server._register_outstanding_block_candidate(block_hash)
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        rpc = AcceptanceProbeRpc(tip="11" * 32, header=None)
+        server.rpc = rpc
+        real_clear = server._clear_accepted_block_payout_preview
+
+        def healing_clear(
+            hash_arg: str,
+            *,
+            invalidate_published: bool = False,
+        ) -> None:
+            if invalidate_published:
+                # The chain view heals while the withdrawal blocks: the
+                # candidate is provably active again, two blocks deep.
+                rpc.header = {"height": 10, "confirmations": 2}
+            return real_clear(
+                hash_arg,
+                invalidate_published=invalidate_published,
+            )
+
+        server._clear_accepted_block_payout_preview = healing_clear  # type: ignore[method-assign]
+
+        accepted_race_won = server._abandon_block_candidate(
+            PRISM_REJECTION_STALE_JOB,
+            "tip moved before submit: test",
+            block_hash=block_hash,
+            worker=None,
+            preserve_if_accepted=True,
+            expected_height=10,
+        )
+
+        self.assertFalse(accepted_race_won)
+        outcome = getattr(server, "_block_candidate_outcome", None)
+        self.assertEqual(
+            getattr(outcome, "reason", None),
+            PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
+        )
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            getattr(server, "block_candidate_abandoned_counts", {}),
+        )
+        self.assertIn(block_hash, server._accepted_block_payout_previews)
+        self.assertTrue(
+            server._accepted_block_payout_previews[block_hash].landed
+        )
+        self.assertNotIn(
+            block_hash,
+            server._invalidated_accepted_block_payout_previews,
+        )
 
     def test_wrong_height_probe_verdict_overrules_late_observation(self) -> None:
         # Bugbot round 6: the probe must win both directions in the late
@@ -12062,6 +12132,78 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
                 getattr(server, "block_candidate_accept_pending_defer_count", 0),
                 0,
             )
+
+    def test_retained_candidate_reregisters_for_tip_observations(self) -> None:
+        # Codex round 8: the terminal seal stops observation matching, but
+        # when the terminal cleanup itself fails (reject_prepared_block
+        # raising) the candidate is retained for retry -- and evidence
+        # arriving during that backoff gap must register again, not vanish.
+        parent = "00" * 32
+        block_hash = "cd" * 32
+        racing_winner = "77" * 32
+        server, state, ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 2
+        server.stop_after_block = False
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+            rpc = LostAckSubmitRpc(
+                start_tip=parent,
+                hash_by_hex={"00": block_hash},
+            )
+            rpc.lose_acks = False
+            server.rpc = rpc
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+            real_persist = ledger.persist_accepted_block
+
+            def persist_then_lose_race(**kwargs: object) -> dict[str, object]:
+                result = real_persist(**kwargs)
+                rpc.tip = racing_winner
+                rpc.active.pop(block_hash, None)
+                rpc.getblockhash_override = racing_winner
+                return result
+
+            ledger.persist_accepted_block = persist_then_lose_race  # type: ignore[method-assign]
+            reject_attempts: list[dict[str, object]] = []
+
+            def failing_reject(**kwargs: object) -> dict[str, object]:
+                reject_attempts.append(kwargs)
+                raise RuntimeError("psql briefly unavailable")
+
+            ledger.reject_prepared_block = failing_reject  # type: ignore[method-assign]
+            ledger.pool_block_state = (  # type: ignore[attr-defined]
+                lambda *, block_hash: {
+                    "chain_state": "prepared",
+                    "maturity_state": "immature",
+                }
+            )
+
+            # The sealed terminal pass aborts inside the rejection (site
+            # attempt, then the writer's terminal-cleanup attempt): the
+            # candidate is retained and must match observations again.
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+            self.assertEqual(len(reject_attempts), 2)
+            self.assertIsNotNone(getattr(server, "_retry_block_candidate", None))
+            self.assertIn(
+                block_hash, server._outstanding_block_candidate_hashes
+            )
+
+            # Blockwait reports the pool's own hash during the backoff gap:
+            # the evidence registers instead of vanishing behind the seal.
+            self.assertTrue(server.observe_tip_for_refresh(block_hash))
+            self.assertIn(
+                block_hash, server._tip_observed_accepted_block_hashes
+            )
+            self.assertEqual(abandoned, [])
 
     def test_pool_closed_gate_requires_probe_proven_acceptance(self) -> None:
         # Bugbot: observation evidence alone must not open the pool-closed
