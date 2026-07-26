@@ -157,6 +157,12 @@ DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS = 10.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS = 30.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
 DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
+# How many same-tip retained contexts may outlive their connection so a
+# reconnecting client (same authorized username) can submit work computed
+# against the prior connection's jobs instead of eating unknown-job rejects
+# across a proxy flap. Entries keep the normal same-tip TTL; 0 restores the
+# historical purge-on-disconnect behavior.
+DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION = 16_384
 DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
 DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS = 4
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
@@ -297,8 +303,12 @@ PRISM_PROGRESS_HEALTH_REASONS = (
     "bundle_build_stuck",
 )
 PRISM_EVICTED_JOB_CLASSES = ("same_tip", "stale_grace")
-PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = ("accepted_same_tip", "credited_stale_grace")
-PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection",)
+PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = (
+    "accepted_same_tip",
+    "credited_stale_grace",
+    "accepted_same_tip_cross_connection",
+)
+PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection", "disconnected")
 PRISM_REJECTION_STALE_JOB = "stale-job"
 PRISM_REJECTION_DUPLICATE_SHARE = "duplicate-share"
 PRISM_REJECTION_LOW_DIFFICULTY = "low-difficulty"
@@ -2712,6 +2722,10 @@ class PrismCoordinator:
         self.same_tip_job_retention_per_connection = env_nonnegative_int(
             "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION",
             DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION,
+        )
+        self.disconnected_job_retention = env_nonnegative_int(
+            "PRISM_STRATUM_DISCONNECTED_JOB_RETENTION",
+            DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,
         )
         self.tip_refresh_max_workers = env_positive_int(
             "PRISM_TIP_REFRESH_MAX_WORKERS",
@@ -13107,6 +13121,17 @@ class PrismCoordinator:
             self.same_tip_job_retention_per_connection = (
                 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION
             )
+        if not hasattr(self, "disconnected_job_retention"):
+            self.disconnected_job_retention = (
+                DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION
+            )
+        if not hasattr(self, "_disconnected_evicted_job_ids"):
+            # Insertion-ordered ids of graveyard entries whose connection is
+            # gone (entry.client is None); bounds cross-connection retention
+            # independently of live connections' per-connection caps.
+            self._disconnected_evicted_job_ids: OrderedDict[str, None] = (
+                OrderedDict()
+            )
         current_tip = self._current_published_tip_hash_locked()
         if self.evicted_job_index_tip_hash != current_tip:
             rebuild_indexes = True
@@ -13143,6 +13168,7 @@ class PrismCoordinator:
             if not connection_jobs:
                 self.evicted_same_tip_by_connection.pop(entry.connection_id, None)
         self.evicted_same_tip_job_ids.pop(job_id, None)
+        self._disconnected_evicted_job_ids.pop(job_id, None)
         return entry
 
     def _index_evicted_job_locked(self, job_id: str, entry: EvictedJobEntry) -> None:
@@ -13184,6 +13210,19 @@ class PrismCoordinator:
                 self._remove_evicted_job_locked(oldest_job_id)
                 self.evicted_job_capacity_eviction_counts["connection"] += 1
                 job_ids = self.evicted_same_tip_by_connection.get(candidate_connection_id)
+
+    def _enforce_disconnected_evicted_capacity_locked(self) -> None:
+        cap = int(
+            getattr(
+                self,
+                "disconnected_job_retention",
+                DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,
+            )
+        )
+        while len(self._disconnected_evicted_job_ids) > max(0, cap):
+            oldest_job_id = next(iter(self._disconnected_evicted_job_ids))
+            self._remove_evicted_job_locked(oldest_job_id)
+            self.evicted_job_capacity_eviction_counts["disconnected"] += 1
 
     def _stale_grace_entry_expired_locked(
         self,
@@ -13309,7 +13348,15 @@ class PrismCoordinator:
         with self.lock:
             self._ensure_evicted_job_state()
             entry = getattr(self, "evicted_job_graveyard", {}).get(job_id)
-            if entry is None or entry.connection_id != client.connection_id:
+            if entry is None:
+                return None
+            if (
+                entry.connection_id != client.connection_id
+                and not self._cross_connection_evicted_entry_allowed_locked(
+                    entry,
+                    client,
+                )
+            ):
                 return None
             job_class, expired = self._evicted_job_expired_locked(
                 entry,
@@ -13320,6 +13367,45 @@ class PrismCoordinator:
                 self.evicted_job_expiration_counts[job_class] += 1
                 return None
             return entry
+
+    def _cross_connection_evicted_entry_allowed_locked(
+        self,
+        entry: EvictedJobEntry,
+        client: ClientState,
+    ) -> bool:
+        """Whether a retained context of a dead connection may serve this
+        submitter.
+
+        Only same-tip contexts qualify (they are fully valid current work;
+        stale-grace expiry anchors on the original connection's delivery
+        state, which a dead connection can never advance), and only for an
+        authorized reconnect of the same username -- the credit goes to the
+        context's original worker identity either way, so a foreign
+        submitter could at most donate work, but refusing keeps job ids
+        unguessable-by-effect and the accounting per miner honest. Replays
+        stay rejected by the (username, header) dedup key.
+        """
+        if entry.client is not None:
+            # The owning connection is still alive; job ids stay scoped to it.
+            return False
+        if (
+            int(
+                getattr(
+                    self,
+                    "disconnected_job_retention",
+                    DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,
+                )
+            )
+            <= 0
+        ):
+            return False
+        if not client.authorized or not client.username:
+            return False
+        worker = getattr(entry.context, "worker", None)
+        username = getattr(worker, "username", None)
+        if not username or username != client.username:
+            return False
+        return self._evicted_job_class_locked(entry) == "same_tip"
 
     def evicted_submit_context(
         self,
@@ -13334,12 +13420,18 @@ class PrismCoordinator:
             return None
         return context, PRISM_CREDIT_POLICY_STALE_GRACE
 
-    def note_evicted_job_submit(self, credit_policy: str | None) -> None:
-        outcome = (
-            "credited_stale_grace"
-            if credit_policy == PRISM_CREDIT_POLICY_STALE_GRACE
-            else "accepted_same_tip"
-        )
+    def note_evicted_job_submit(
+        self,
+        credit_policy: str | None,
+        *,
+        cross_connection: bool = False,
+    ) -> None:
+        if credit_policy == PRISM_CREDIT_POLICY_STALE_GRACE:
+            outcome = "credited_stale_grace"
+        elif cross_connection:
+            outcome = "accepted_same_tip_cross_connection"
+        else:
+            outcome = "accepted_same_tip"
         with self.lock:
             self._ensure_evicted_job_state()
             self.evicted_job_submit_counts[outcome] += 1
@@ -14452,15 +14544,51 @@ class PrismCoordinator:
             # Retirement above holds neither while this potentially waits.
             with client.job_update_lock:
                 with self.lock:
+                    self._ensure_evicted_job_state()
+                    retention_cap = int(
+                        getattr(
+                            self,
+                            "disconnected_job_retention",
+                            DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,
+                        )
+                    )
+                    if retention_cap > 0:
+                        # Devices behind a flapping proxy keep mining the
+                        # jobs this connection delivered; bury the active
+                        # ones so their in-flight shares can resume against
+                        # the retained context after the reconnect.
+                        for job_id in tuple(client.active_job_ids):
+                            self.bury_evicted_job(client, job_id, prune=False)
                     for job_id in tuple(client.active_job_ids):
                         self.jobs.pop(job_id, None)
                     client.active_job_ids.clear()
                     client.active_job = None
-                    self._ensure_evicted_job_state()
                     for job_id in tuple(
                         self.evicted_jobs_by_connection.get(client.connection_id, ())
                     ):
-                        self._remove_evicted_job_locked(job_id)
+                        entry = self.evicted_job_graveyard.get(job_id)
+                        if entry is None:
+                            continue
+                        if (
+                            retention_cap <= 0
+                            or self._evicted_job_class_locked(entry) != "same_tip"
+                        ):
+                            # Stale-grace work stays tied to the connection
+                            # that received it (its expiry anchors on that
+                            # connection's delivered work); only fully valid
+                            # same-tip contexts survive the disconnect.
+                            self._remove_evicted_job_locked(job_id)
+                            continue
+                        # Detach from the dead connection object: expiry then
+                        # anchors on the entry's own eviction time (same-tip
+                        # TTL) or the published tip flip, never on delivery
+                        # state this connection can no longer advance.
+                        self.evicted_job_graveyard[job_id] = dataclasses.replace(
+                            entry,
+                            client=None,
+                        )
+                        self._disconnected_evicted_job_ids[job_id] = None
+                    self._enforce_disconnected_evicted_capacity_locked()
                     client.authorized = False
                     client.worker = None
                     client.username = ""
@@ -16789,7 +16917,13 @@ class PrismCoordinator:
                     credit_policy=credit_policy,
                 )
                 if evicted_entry is not None:
-                    self.note_evicted_job_submit(credit_policy)
+                    self.note_evicted_job_submit(
+                        credit_policy,
+                        cross_connection=(
+                            evicted_entry.connection_id
+                            != client.connection_id
+                        ),
+                    )
             except BaseException:
                 self._forget_recent_share_key(share_key)
                 raise
@@ -16886,7 +17020,13 @@ class PrismCoordinator:
                     str(submission.block_hash_hex)
                 )
                 if evicted_entry is not None:
-                    self.note_evicted_job_submit(credit_policy)
+                    self.note_evicted_job_submit(
+                        credit_policy,
+                        cross_connection=(
+                            evicted_entry.connection_id
+                            != client.connection_id
+                        ),
+                    )
             return False
         # A block-worthy submission that met the share target is a valid share
         # regardless of the block's fate: credit it now, acknowledge the miner
@@ -16904,7 +17044,12 @@ class PrismCoordinator:
                 candidate_intent=candidate_intent,
             )
             if evicted_entry is not None:
-                self.note_evicted_job_submit(credit_policy)
+                self.note_evicted_job_submit(
+                    credit_policy,
+                    cross_connection=(
+                        evicted_entry.connection_id != client.connection_id
+                    ),
+                )
         except BaseException:
             # Idempotent with append_accepted_share's own release; also covers
             # an intent serialization failure before the append started.

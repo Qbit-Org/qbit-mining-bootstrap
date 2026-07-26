@@ -5643,6 +5643,113 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertIsNone(ledger.pending[0].credit_policy)
 
+    def test_reconnected_same_username_submits_against_disconnected_job(self) -> None:
+        # A proxy flap leaves devices mining the dead connection's jobs;
+        # their shares arrive on the replacement connection and must credit
+        # against the retained context instead of rejecting unknown-job.
+        tip = "00" * 32
+        server, state, ledger = submit_coordinator(tip=tip)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+        retained = server.evicted_job_graveyard.get("job-1")
+        self.assertIsNotNone(retained)
+        assert retained is not None
+        self.assertIsNone(retained.client)
+
+        reconnected = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=2,
+            extranonce1_hex="00000002",
+        )
+        reconnected.subscribed = True
+        reconnected.authorized = True
+        reconnected.username = "miner-a"
+        reconnected.worker = worker_identity("miner-a")
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                reconnected,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertIsNone(ledger.pending[0].credit_policy)
+        # Credit follows the retained context's original worker identity.
+        self.assertEqual(ledger.pending[0].share_id, "miner-a:" + "cf" * 32)
+        self.assertEqual(
+            server.evicted_job_submit_counts[
+                "accepted_same_tip_cross_connection"
+            ],
+            1,
+        )
+
+    def test_cross_connection_submit_requires_same_username(self) -> None:
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+        self.assertIn("job-1", server.evicted_job_graveyard)
+
+        intruder = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 3),
+            connection_id=3,
+            extranonce1_hex="00000003",
+        )
+        intruder.subscribed = True
+        intruder.authorized = True
+        intruder.username = "miner-b"
+        intruder.worker = worker_identity("miner-b")
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    intruder,
+                    ["miner-b", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_UNKNOWN_JOB)
+
+    def test_disconnected_retention_capacity_is_bounded(self) -> None:
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.disconnected_job_retention = 1
+        server.jobs["job-2"] = prism_context("job-2", tip, worker=state.worker)
+        state.active_job_ids = {"job-1", "job-2"}
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+
+        server.disconnect_client(state)
+
+        self.assertEqual(len(server._disconnected_evicted_job_ids), 1)
+        self.assertEqual(len(server.evicted_job_graveyard), 1)
+        self.assertEqual(
+            server.evicted_job_capacity_eviction_counts["disconnected"],
+            1,
+        )
+
     def test_retained_share_dedup_uses_original_worker_after_reauthorization(self) -> None:
         tip = "00" * 32
         server, state, ledger = submit_coordinator(tip=tip)
@@ -5842,7 +5949,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(server.evicted_job_graveyard), 4_097)
         self.assertEqual(server.evicted_job_capacity_eviction_counts["connection"], 1)
 
-    def test_tip_change_and_disconnect_remove_retained_contexts(self) -> None:
+    def test_tip_change_prunes_and_disconnect_detaches_retained_contexts(self) -> None:
         old_tip = "00" * 32
         new_tip = "11" * 32
         server, state, _ledger = submit_coordinator(tip=old_tip)
@@ -5860,6 +5967,18 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.clients = {state}
         state.close = lambda: None  # type: ignore[method-assign]
         server.disconnect_client(state)
+        # Same-tip work survives the disconnect for a same-username
+        # reconnect; the dead connection's entry is detached and ages out on
+        # the normal same-tip TTL instead of vanishing with the socket.
+        retained = server.evicted_job_graveyard.get("job-2")
+        self.assertIsNotNone(retained)
+        assert retained is not None
+        self.assertIsNone(retained.client)
+        server.prune_evicted_job_graveyard(
+            now=time.monotonic()
+            + float(server.same_tip_job_retention_seconds)
+            + 1.0
+        )
         self.assertEqual(server.evicted_job_graveyard, {})
 
     def test_tip_flip_reanchors_retained_job_grace_to_client_delivery(self) -> None:

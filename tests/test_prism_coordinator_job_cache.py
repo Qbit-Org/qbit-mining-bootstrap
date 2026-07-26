@@ -5267,6 +5267,41 @@ class ClientCleanupTests(unittest.TestCase):
         self.assertIsNone(state.active_job)
         self.assertEqual(state.active_job_ids, set())
         self.assertNotIn(active_id, server.jobs)
+        # Same-tip contexts survive the disconnect (detached from the dead
+        # connection object) so a same-username reconnect can still submit
+        # in-flight work; they age out on the same-tip retention TTL.
+        for job_id in (active_id, evicted_id):
+            entry = server.evicted_job_graveyard.get(job_id)
+            self.assertIsNotNone(entry)
+            assert entry is not None
+            self.assertIsNone(entry.client)
+            self.assertIn(job_id, server._disconnected_evicted_job_ids)
+
+    def test_disconnect_purges_evicted_contexts_when_retention_disabled(
+        self,
+    ) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        server.disconnected_job_retention = 0
+        state = client(1)
+        active = server.build_job_for_client(state, clean_jobs=True)
+        evicted = server.build_job_for_client(state, clean_jobs=False)
+        active_id = active.job.job_id
+        evicted_id = evicted.job.job_id
+        state.active_job = active
+        state.active_job_ids = {active_id}
+        server.jobs = {active_id: active, evicted_id: evicted}
+        server.bury_evicted_job(state, evicted_id)
+        server.jobs.pop(evicted_id)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+
+        server.disconnect_client(state)
+
+        self.assertIsNone(state.active_job)
+        self.assertEqual(state.active_job_ids, set())
+        self.assertNotIn(active_id, server.jobs)
+        self.assertNotIn(active_id, server.evicted_job_graveyard)
         self.assertNotIn(evicted_id, server.evicted_job_graveyard)
         self.assertNotIn(state.connection_id, server.evicted_jobs_by_connection)
 
