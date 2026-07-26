@@ -10816,18 +10816,31 @@ class PrismCoordinator:
         futures: dict[Future[RefreshResult], ClientState] = {}
         submitted_at: dict[Future[RefreshResult], float] = {}
         queued_cancellations: set[Future[RefreshResult]] = set()
-        if expected_active_jobs is None:
-            with self.lock:
+        with self.lock:
+            if expected_active_jobs is None:
                 expected_active_jobs = {
                     client: client.active_job
                     for client in clients
                 }
+            # Vardiff drives every client toward the same share interval, so
+            # the difficulty a client sustains is proportional to its hashrate.
+            # Snapshot the proxies in the same locked pass as the job snapshot.
+            hashrate_proxies = {
+                client: (
+                    client.vardiff_difficulty_estimate or client.share_difficulty
+                )
+                for client in clients
+            }
         # Bounded submission admits at most max_inflight tasks at a time, so
-        # queue priority alone cannot lift a never-served client over a fleet
-        # wave that has not been submitted yet. Order admission itself.
+        # queue priority alone cannot lift one client over a fleet wave that
+        # has not been submitted yet. Order admission itself by descending
+        # hashrate: a stale fast client burns more work per second of refresh
+        # lag than a slow one, so serving it first minimizes hashrate-weighted
+        # staleness across the wave.
         clients = sorted(
             clients,
-            key=lambda ordered: expected_active_jobs.get(ordered) is not None,
+            key=lambda ordered: hashrate_proxies.get(ordered, Decimal(0)),
+            reverse=True,
         )
         clients_iter = iter(clients)
         max_inflight = max(1, int(self.tip_refresh_max_workers))

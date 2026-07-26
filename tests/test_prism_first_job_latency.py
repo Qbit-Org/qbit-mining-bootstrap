@@ -4,7 +4,7 @@
 Covers the coordinator changes that flatten the first-notify tail: initial
 requests subscribing to in-flight publication-priority builds, retryable
 payout-gate non-admission, per-generation share-window serialization caching,
-worker-count env knobs, and never-served-first tip-refresh fanout ordering.
+worker-count env knobs, and hashrate-ordered tip-refresh fanout admission.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import Future
+from decimal import Decimal
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Iterator
@@ -616,14 +617,14 @@ class FanoutOrderingTests(unittest.TestCase):
             PRISM_DELIVERY_PRIORITY_SAME_TIP,
         )
 
-    def test_never_served_client_leads_the_fanout_wave(self) -> None:
+    def test_fanout_wave_serves_descending_hashrate_first(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         server.tip_refresh_max_workers = 1
-        served_first = client(1)
+        slow_stale = client(1)
         newcomer = client(2)
-        served_second = client(3)
-        states = [served_first, newcomer, served_second]
+        fast_stale = client(3)
+        states = [slow_stale, newcomer, fast_stale]
         notified: list[int] = []
 
         def sender(state: ClientState) -> object:
@@ -651,10 +652,16 @@ class FanoutOrderingTests(unittest.TestCase):
             )
             self.assertEqual(sorted(notified), [1, 2, 3])
 
-            # A newcomer arrives with no job while the fleet holds old-tip
-            # work; the next wave must serve it first, not last.
+            # A job-less newcomer burns zero hashrate while stale clients burn
+            # their full rate on old-tip work, so the next wave must serve the
+            # fastest stale client first and the newcomer last -- the newcomer
+            # keeps only its initial-delivery queue priority. The fast client
+            # ranks by its vardiff estimate; the slow one exercises the
+            # share_difficulty fallback used before an estimate exists.
             newcomer.active_job = None
             newcomer.active_job_ids = set()
+            slow_stale.share_difficulty = Decimal("8")
+            fast_stale.vardiff_difficulty_estimate = Decimal("32")
             notified.clear()
             rpc.tip = "22" * 32
             rpc.template = base_template(height=11, prevhash="22" * 32)
@@ -683,7 +690,7 @@ class FanoutOrderingTests(unittest.TestCase):
 
             server._submit_delivery_task = recording_submit  # type: ignore[method-assign]
             server._fanout_prepared_tip_refresh(
-                [served_first, newcomer, served_second],
+                [slow_stale, newcomer, fast_stale],
                 replacement_bundle,
                 replacement,
                 heartbeat_name="qbit_blockpoll",
@@ -691,10 +698,13 @@ class FanoutOrderingTests(unittest.TestCase):
         finally:
             server.shutdown_tip_refresh_executor()
 
-        self.assertEqual(sorted(notified), [1, 2, 3])
-        self.assertEqual(notified[0], 2)
+        self.assertEqual(notified, [3, 1, 2])
         self.assertEqual(
-            submissions[0],
+            [connection_id for connection_id, _priority in submissions],
+            [3, 1, 2],
+        )
+        self.assertEqual(
+            submissions[2],
             (2, PRISM_DELIVERY_PRIORITY_INITIAL),
         )
         self.assertEqual(
