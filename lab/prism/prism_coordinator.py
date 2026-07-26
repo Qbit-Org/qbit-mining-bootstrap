@@ -15438,6 +15438,7 @@ class PrismCoordinator:
     def _serve_builder_splice_spool(
         self,
         client: _ServeBuilderClient,
+        share_serialization: _ShareWindowSerialization,
         spool_file: Any,
         spool_size: int,
         deadline: float,
@@ -15476,6 +15477,18 @@ class PrismCoordinator:
             except (BlockingIOError, InterruptedError):
                 time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
                 continue
+            except BrokenPipeError as exc:
+                # The daemon's stdin closed; the spool itself is fine.
+                if (
+                    build_control is not None
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder daemon was terminated after supersession"
+                    ) from exc
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon input pipe closed"
+                ) from exc
             except OSError as exc:
                 if (
                     build_control is not None
@@ -15484,6 +15497,11 @@ class PrismCoordinator:
                     raise _JobBundleBuildSuperseded(
                         "audit-builder daemon was terminated after supersession"
                     ) from exc
+                # The spool itself cannot stream. Poison it so the one-shot
+                # fallback -- and every later build -- writes the cached
+                # in-memory fragments instead of retrying the same transfer
+                # and failing mid-stream.
+                share_serialization.mark_spool_failed()
                 raise _ServeBuilderUnavailable(
                     f"audit-builder daemon spool transfer failed: {exc}"
                 ) from exc
@@ -15550,6 +15568,7 @@ class PrismCoordinator:
                         spool_file, spool_size = lease
                         input_bytes += self._serve_builder_splice_spool(
                             client,
+                            share_serialization,
                             spool_file,
                             spool_size,
                             deadline,
@@ -16043,18 +16062,22 @@ class PrismCoordinator:
                                         )
                                     )
                                     continue
+                                except BrokenPipeError:
+                                    # The child's stdin closed; the spool
+                                    # itself is fine and the surrounding
+                                    # pipe-error handling owns this.
+                                    raise
                                 except OSError:
+                                    # The spool cannot stream (unsupported
+                                    # filesystem or an I/O error); the cached
+                                    # in-memory fragments stay authoritative
+                                    # for this and every later build.
+                                    share_serialization.mark_spool_failed()
                                     if offset:
                                         # Part of the tail already reached the
-                                        # pipe; the stream cannot be repaired
+                                        # pipe; this build cannot be repaired
                                         # by re-writing it from memory.
                                         raise
-                                    # Kernel transfer unsupported for this
-                                    # spool (filesystem without splice
-                                    # support, for example). Poison the spool
-                                    # and stream the cached strings; nothing
-                                    # of the tail reached the pipe yet.
-                                    share_serialization.mark_spool_failed()
                                     break
                                 if moved <= 0:
                                     raise BrokenPipeError(

@@ -5574,6 +5574,44 @@ class ShareWindowSpoolTests(unittest.TestCase):
         self.assertTrue(serialization._spool_failed)
         self.assertIsNone(serialization._spool_file)
 
+    def test_mid_stream_splice_failure_poisons_spool_for_later_builds(
+        self,
+    ) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+
+        # The first chunk moves and the second fails: this build is
+        # unrepairable (partial tail already in the pipe), but the spool must
+        # be poisoned so later builds stream the cached fragments instead of
+        # repeating the failure.
+        with patch(
+            "lab.prism.prism_coordinator.os.splice",
+            side_effect=[16, OSError("splice io error")],
+        ):
+            with self.assertRaises(OSError):
+                self._build_with_echo_builder(
+                    server,
+                    shares,
+                    serialization,
+                    height=10,
+                )
+        self.assertTrue(serialization._spool_failed)
+
+        recovered = self._build_with_echo_builder(
+            server,
+            shares,
+            serialization,
+            height=11,
+        )
+        self.assertEqual(
+            recovered["received"],
+            self._expected_payload(shares, height=11),
+        )
+
     def test_generation_rotation_retires_spool_after_last_lease(self) -> None:
         server = self._coordinator()
         shares = [spool_share(seq) for seq in range(1, 4)]
@@ -5843,6 +5881,31 @@ class ServeBuilderTests(unittest.TestCase):
                 self.assertIsNone(server._serve_builder)
             self.assertEqual(counts["fallbacks"], 1)
             self.assertEqual(counts["requests"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_daemon_splice_failure_poisons_spool_and_one_shot_recovers(
+        self,
+    ) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            # The daemon upload dies mid-splice; the spool is poisoned before
+            # falling back, so the fresh one-shot subprocess streams the
+            # cached fragments instead of retrying the same failing transfer.
+            with patch(
+                "lab.prism.prism_coordinator.os.splice",
+                side_effect=[16, OSError("splice io error")],
+            ):
+                result = self._build(server, shares, serialization, height=10)
+
+            self.assertEqual(result["transport"], "one-shot")
+            self.assertIn("compact_shares", result["received"])
+            self.assertTrue(serialization._spool_failed)  # type: ignore[attr-defined]
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["fallbacks"], 1)
         finally:
             server.shutdown_serve_builder()
 
