@@ -4117,13 +4117,34 @@ class PrismCoordinator:
                 if (
                     current.accepted_share_count
                     == artifact.accepted_share_count
-                    and current.network_difficulty
-                    == artifact.network_difficulty
-                    and current.share_snapshot_sha256 is not None
-                    and current.share_snapshot_sha256
-                    == artifact.share_snapshot_sha256
                 ):
-                    return
+                    if (
+                        current.network_difficulty
+                        == artifact.network_difficulty
+                        and current.share_snapshot_sha256 is not None
+                        and current.share_snapshot_sha256
+                        == artifact.share_snapshot_sha256
+                    ):
+                        return
+                    template_artifacts = getattr(
+                        self,
+                        "_template_artifacts",
+                        None,
+                    )
+                    if (
+                        current.network_difficulty
+                        != artifact.network_difficulty
+                        and template_artifacts is not None
+                        and current.network_difficulty
+                        == int(template_artifacts.network_difficulty)
+                        and artifact.network_difficulty
+                        != int(template_artifacts.network_difficulty)
+                    ):
+                        # Equal counts cannot order snapshots across a
+                        # retarget; keep the artifact the live template
+                        # difficulty can actually reuse rather than letting
+                        # a delayed pre-retarget build regress it.
+                        return
             self._payout_ledger_artifact_generation += 1
             self._payout_ledger_artifact = dataclass_replace(
                 artifact,

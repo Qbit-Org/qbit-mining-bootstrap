@@ -2362,22 +2362,40 @@ class JobBundleCacheTests(unittest.TestCase):
             installed = server._payout_ledger_artifact
         assert installed is not None
 
-        # A retarget changes network difficulty while the share window stays
-        # identical. The rebuild must still replace the artifact: keeping the
-        # old-difficulty artifact would fail the reuse fence on every build
-        # while the same-window skip kept discarding its replacement.
+        # A retarget moves the live template to a new difficulty while the
+        # share window stays identical. The rebuild at the live difficulty
+        # must replace the artifact: keeping the old-difficulty artifact
+        # would fail the reuse fence on every build while the same-window
+        # skip kept discarding its replacement.
+        retarget_difficulty = int(installed.network_difficulty) + 1
+        with server._job_cache_lock:
+            live = server._template_artifacts
+            assert live is not None
+            server._template_artifacts = dataclass_replace(
+                live,
+                network_difficulty=retarget_difficulty,
+            )
         server._prepare_payout_ledger_artifact(
             server._payout_state_generation,
-            int(installed.network_difficulty) + 1,
+            retarget_difficulty,
         )
         with server._job_cache_lock:
             replaced = server._payout_ledger_artifact
         assert replaced is not None
         self.assertGreater(replaced.generation, installed.generation)
-        self.assertEqual(
-            replaced.network_difficulty,
-            int(installed.network_difficulty) + 1,
+        self.assertEqual(replaced.network_difficulty, retarget_difficulty)
+
+        # A pre-retarget build delayed after its snapshot carries the same
+        # count at the old difficulty; equal counts cannot order snapshots
+        # across a retarget, so the live-difficulty artifact must stay.
+        delayed = dataclass_replace(
+            installed,
+            generation=0,
+            prepared_monotonic=time.monotonic(),
         )
+        server._install_payout_ledger_artifact(delayed)
+        with server._job_cache_lock:
+            self.assertIs(server._payout_ledger_artifact, replaced)
 
     def test_fence_failure_rearms_artifact_preparation_with_debounce(self) -> None:
         server, rpc = coordinator()
