@@ -15277,6 +15277,26 @@ class PrismCoordinator:
         if client is not None:
             client.close()
 
+    def _record_live_serve_builder_termination(
+        self,
+        client: _ServeBuilderClient | None,
+    ) -> None:
+        """Account for deliberately killing a still-running daemon.
+
+        Crash paths count themselves when the EOF surfaces; a live worker
+        retired for a timeout, malformed response, protocol mismatch, or
+        spool failure must land in the termination counters so its
+        replacement reads as a restart, mirroring the cancellation path.
+        """
+        if client is None:
+            return
+        poll = getattr(client.process, "poll", None)
+        if not callable(poll) or poll() is not None:
+            return
+        with self._job_build_scheduler_lock:
+            self.job_build_worker_counts["terminations"] += 1
+            self._job_build_worker_restart_pending = True
+
     def _observe_builder_phase_metrics(self, metrics: dict[str, Any]) -> None:
         """Apply one build's builder-side phase timings to refresh metrics.
 
@@ -15373,14 +15393,17 @@ class PrismCoordinator:
                     "audit-builder daemon announced an unsupported protocol"
                 )
         except _ServeBuilderUnavailable:
+            self._record_live_serve_builder_termination(client)
             client.close()
             raise
         except (OSError, ValueError, AttributeError) as exc:
+            self._record_live_serve_builder_termination(client)
             client.close()
             raise _ServeBuilderUnavailable(
                 f"audit-builder daemon handshake failed: {exc}"
             ) from exc
         except BaseException:
+            self._record_live_serve_builder_termination(client)
             client.close()
             raise
         return client
@@ -15853,11 +15876,17 @@ class PrismCoordinator:
                     self._job_build_worker_restart_pending = True
                 raise
             except _ServeBuilderUnavailable:
+                self._record_live_serve_builder_termination(
+                    self._serve_builder
+                )
                 self._retire_serve_builder_locked()
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["fallbacks"] += 1
                 return None
             except (OSError, ValueError):
+                self._record_live_serve_builder_termination(
+                    self._serve_builder
+                )
                 self._retire_serve_builder_locked()
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["fallbacks"] += 1

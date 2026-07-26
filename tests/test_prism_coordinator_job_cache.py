@@ -6031,6 +6031,15 @@ class ServeBuilderTests(unittest.TestCase):
         self.assertEqual(counts["fallbacks"], 1)
         self.assertEqual(counts["spawns"], 0)
         self.assertEqual(server.tip_refresh_worker_failures, 1)
+        # The live daemon killed at the handshake deadline is a recorded
+        # termination, and the one-shot replacement consumes the pending
+        # restart: two launches, one termination, one restart.
+        with server._job_build_scheduler_lock:
+            worker_counts = dict(server.job_build_worker_counts)
+            self.assertFalse(server._job_build_worker_restart_pending)
+        self.assertEqual(worker_counts["starts"], 2)
+        self.assertEqual(worker_counts["terminations"], 1)
+        self.assertEqual(worker_counts["restarts"], 1)
 
     def test_idle_daemon_death_counts_crash_and_restart(self) -> None:
         server = self._coordinator()
