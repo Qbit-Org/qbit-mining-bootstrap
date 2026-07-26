@@ -308,11 +308,18 @@ class MinerClient:
 class CkpoolHarness:
     """fake qbit RPC + patched ckpool in btcsolo mode, as deployed."""
 
-    def __init__(self, tmpdir: Path, *, submitblock_results: str = "") -> None:
+    def __init__(
+        self,
+        tmpdir: Path,
+        *,
+        submitblock_results: str = "",
+        worker_limit: int | None = None,
+    ) -> None:
         self.tmpdir = tmpdir
         self.rpc_port = free_port()
         self.stratum_port = free_low_port()
         self.submitblock_results = submitblock_results
+        self.worker_limit = worker_limit
         self.rpc_process: subprocess.Popen[str] | None = None
         self.ckpool_process: subprocess.Popen[str] | None = None
         self.logdir = tmpdir / "logs"
@@ -367,6 +374,10 @@ class CkpoolHarness:
         config_path.write_text(json.dumps(config, indent=1), encoding="utf-8")
         sockdir = self.tmpdir / "sock"
         sockdir.mkdir()
+        ckpool_env = os.environ.copy()
+        ckpool_env.pop("QBIT_REJECTS_WORKER_LIMIT", None)
+        if self.worker_limit is not None:
+            ckpool_env["QBIT_REJECTS_WORKER_LIMIT"] = str(self.worker_limit)
         self.ckpool_process = subprocess.Popen(
             [
                 CKPOOL_BIN,
@@ -384,6 +395,7 @@ class CkpoolHarness:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            env=ckpool_env,
         )
         self._wait_for_stratum()
         return self
@@ -472,17 +484,23 @@ def worker_entry(status: dict[str, object], workername: str) -> dict[str, object
 def assert_snapshot_consistent(
     test: unittest.TestCase, status: dict[str, object], *, expect_equal: bool = False
 ) -> None:
-    """Pool and worker tallies are copied under one lock hold, so within any
-    single document per-bucket worker sums can never exceed the pool totals;
-    once all submitting workers are listed and traffic has settled, they are
-    equal. Checked on every observed document, including mid-load reads."""
+    """Pool, worker, and capped-registry overflow tallies are copied under one
+    lock hold, so within any document their per-bucket sums can never exceed
+    the pool totals. Once attributed traffic has settled they are equal.
+    Checked on every observed document, including mid-load reads."""
     pool = status["pool"]
+    overflow = status["worker_overflow"]
     workers = status["workers"]
-    assert isinstance(pool, dict) and isinstance(workers, list)
+    assert (
+        isinstance(pool, dict)
+        and isinstance(overflow, dict)
+        and isinstance(workers, list)
+    )
     for name in ALL_BUCKETS:
         pool_count, pool_diff = bucket(pool, name)
-        worker_counts = sum(bucket(entry, name)[0] for entry in workers)
-        worker_diffs = sum(bucket(entry, name)[1] for entry in workers)
+        overflow_count, overflow_diff = bucket(overflow, name)
+        worker_counts = overflow_count + sum(bucket(entry, name)[0] for entry in workers)
+        worker_diffs = overflow_diff + sum(bucket(entry, name)[1] for entry in workers)
         if expect_equal:
             test.assertEqual(worker_counts, pool_count, f"{name} counts diverge: {status}")
             test.assertTrue(
@@ -531,12 +549,15 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
     def test_reason_taxonomy_block_outcomes_and_atomic_writer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with CkpoolHarness(
-                Path(tmp), submitblock_results="rejected,null"
+                Path(tmp), submitblock_results="rejected,null", worker_limit=1
             ) as harness:
                 first_status = harness.wait_for_status(lambda status: True, timeout=30.0)
                 self.assertEqual(first_status["version"], 1)
                 self.assertEqual(first_status["poolinstance"], "rejectslab")
                 self.assertEqual(first_status["interval"], 60)
+                self.assertEqual(first_status["worker_limit"], 1)
+                self.assertIs(first_status["workers_truncated"], False)
+                self.expect_counts(first_status["worker_overflow"], {})
                 first_update = int(first_status["lastupdate"])
 
                 # A worker that authorises but never submits must not grow
@@ -561,6 +582,32 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                         miner.submit([miner.workername, job.job_id, miner.nonce2(0), job.ntime])
                     )
                     assert_share_response(self, response, accepted=False, error="Invalid array size")
+
+                    # The compiled registry cap is exercised with a
+                    # test-only lower limit. A fresh worker can still submit
+                    # normally, but its counters aggregate into the bounded
+                    # overflow object instead of allocating another row.
+                    overflow = MinerClient(
+                        harness.stratum_port, f"{USER_ADDRESS}.overflow0"
+                    )
+                    try:
+                        overflow.handshake()
+                        overflow_job = overflow.job
+                        response = overflow.wait_response(
+                            overflow.submit(
+                                [
+                                    overflow.workername,
+                                    overflow_job.job_id,
+                                    overflow.nonce2(0),
+                                    overflow_job.ntime,
+                                ]
+                            )
+                        )
+                        assert_share_response(
+                            self, response, accepted=False, error="Invalid array size"
+                        )
+                    finally:
+                        overflow.close()
 
                     # invalid_version: version bits outside the negotiated
                     # mask (nothing was negotiated, so any bits qualify).
@@ -652,7 +699,7 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                     )
                     assert_share_response(self, response, accepted=False, error="Stale")
 
-                    expected = {
+                    worker_expected = {
                         "accepted": 2,
                         "above_target": 3,
                         "stale": 2,
@@ -664,11 +711,15 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                         "block_accepted": 1,
                         "block_rejected": 1,
                     }
+                    pool_expected = dict(worker_expected)
+                    pool_expected["malformed"] += 1
+                    overflow_expected = {"malformed": 1}
 
                     def totals_match(status: dict[str, object]) -> bool:
                         pool = status["pool"]
                         return all(
-                            bucket(pool, reason)[0] == count for reason, count in expected.items()
+                            bucket(pool, reason)[0] == count
+                            for reason, count in pool_expected.items()
                         )
 
                     status = harness.wait_for_status(totals_match)
@@ -684,7 +735,7 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                 self.assertEqual(int(control["height"]), 2)
 
                 pool = status["pool"]
-                self.expect_counts(pool, expected)
+                self.expect_counts(pool, pool_expected)
                 for outcome in BLOCK_OUTCOMES:
                     _count, diff = bucket(pool, outcome)
                     # Block-candidate difficulty is the actual share diff,
@@ -692,10 +743,14 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                     self.assertGreaterEqual(diff, 1 / 256 * 0.99)
 
                 worker = worker_entry(status, f"{USER_ADDRESS}.rig0")
-                self.expect_counts(worker, expected)
+                self.expect_counts(worker, worker_expected)
+                self.expect_counts(status["worker_overflow"], overflow_expected)
+                self.assertEqual(status["worker_limit"], 1)
+                self.assertIs(status["workers_truncated"], True)
                 assert_snapshot_consistent(self, status, expect_equal=True)
 
-                # The authorised-but-idle worker is excluded from the export.
+                # Neither the authorised-but-idle worker nor the overflow
+                # worker gets a row; the first active worker remains stable.
                 listed = [entry["workername"] for entry in status["workers"]]
                 self.assertEqual(listed, [f"{USER_ADDRESS}.rig0"])
 
@@ -735,6 +790,9 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with CkpoolHarness(Path(tmp)) as harness:
                 initial_status = harness.wait_for_status(lambda status: True, timeout=30.0)
+                self.assertEqual(initial_status["worker_limit"], 4096)
+                self.assertIs(initial_status["workers_truncated"], False)
+                self.expect_counts(initial_status["worker_overflow"], {})
                 initial_update = int(initial_status["lastupdate"])
 
                 errors: list[str] = []
@@ -967,6 +1025,8 @@ class CkpoolRejectsObservabilityTests(unittest.TestCase):
                     self.expect_counts(entry, plan)
                 probe = worker_entry(status, f"{USER_ADDRESS}.snapshot")
                 self.expect_counts(probe, {"accepted": probe_result["accepted"]})
+                self.expect_counts(status["worker_overflow"], {})
+                self.assertIs(status["workers_truncated"], False)
 
                 # Bounded output: per-worker aggregation only, no per-share
                 # or per-client growth.

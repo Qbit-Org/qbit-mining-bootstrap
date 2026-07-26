@@ -120,7 +120,7 @@ class CkpoolRejectsPatchWiringTests(unittest.TestCase):
         self.assertIn('"%s.tmp"', patch_text)
         self.assertIn("rename(tmpname, fname)", patch_text)
 
-    def test_worker_export_uses_lazy_active_registry(self) -> None:
+    def test_worker_export_uses_bounded_lazy_active_registry(self) -> None:
         patch_text = PATCH.read_text(encoding="utf-8")
         writer = patch_text.split(
             "+static void qbit_write_rejects_status", maxsplit=1
@@ -131,6 +131,21 @@ class CkpoolRejectsPatchWiringTests(unittest.TestCase):
         self.assertIn("sdata->rejects_workers_tail->next = rejects;", patch_text)
         self.assertIn("worker_count = sdata->rejects_worker_count;", writer)
         self.assertIn("rejects = sdata->rejects_workers;", writer)
+        self.assertIn("#define QBIT_REJECTS_WORKER_LIMIT_MAX 4096", patch_text)
+        self.assertIn("configured > QBIT_REJECTS_WORKER_LIMIT_MAX", patch_text)
+        self.assertIn(
+            "sdata->rejects_worker_count >= sdata->rejects_worker_limit",
+            patch_text,
+        )
+        self.assertIn("sdata->rejects_worker_overflow.count[reason]++;", patch_text)
+        self.assertIn(
+            "sdata->rejects_worker_overflow.block_count[outcome]++;", patch_text
+        )
+        self.assertIn('json_set_int64(val, "worker_limit", worker_limit);', writer)
+        self.assertIn(
+            'json_set_bool(val, "workers_truncated", workers_truncated);', writer
+        )
+        self.assertIn('"worker_overflow", overflow_val', writer)
         self.assertNotIn("next_user(", writer)
         self.assertNotIn("next_worker(", writer)
         self.assertNotIn("qbit_tally_active", patch_text)

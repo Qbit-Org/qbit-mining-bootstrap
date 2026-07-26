@@ -114,7 +114,10 @@ Document shape (version 1):
  "runtime": 120,
  "lastupdate": 1712345678,
  "interval": 60,
+ "worker_limit": 4096,
+ "workers_truncated": false,
  "pool":    { "accepted": {"count": 10, "diff": 9.5e-06}, "...": {} },
+ "worker_overflow": { "accepted": {"count": 0, "diff": 0.0}, "...": {} },
  "workers": [ { "workername": "qb1....rig0", "accepted": {"count": 10, "diff": 9.5e-06}, "...": {} } ]
 }
 ```
@@ -139,20 +142,29 @@ difficulty. Counters are cumulative since ckpool startup and reset on restart;
 exporters should treat them as monotonic counters and derive rates from
 deltas.
 
-The pool totals and all worker rows in one document are copied under a single
-lock hold, so each document is one consistent snapshot: per-bucket worker sums
-never exceed the pool totals. A worker whose first counted submission or
-attributed block outcome races snapshot sizing appears from the next write, so
-worker sums can transiently trail pool totals until the next cycle.
+The pool totals, `worker_overflow`, and all worker rows in one document are
+copied under a single lock hold, so each document is one consistent snapshot:
+their per-bucket sums never exceed the pool totals. A worker whose first
+counted submission or attributed block outcome races snapshot sizing appears
+from the next write, so worker sums can transiently trail pool totals until
+the next cycle.
 
 Only workers with at least one counted submission or attributed block outcome
-are listed. They are registered once on an append-only active list when that
-first event is counted; status writes never scan the full authorized-worker
-set. The per-worker tally is also allocated lazily at that point, so workers
-that merely authorize add neither tally storage nor periodic export work.
-The file, snapshot allocations, and lock-held copy therefore scale with active
-exported workers only. Per-worker tallies otherwise live exactly as long as
-ckpool's own per-worker share stats.
+are listed. They are registered once on a bounded append-only active list when
+that first event is counted; status writes never scan the full
+authorized-worker set. The per-worker tally is also allocated lazily at that
+point, so workers that merely authorize add neither tally storage nor periodic
+export work.
+
+At most 4,096 worker rows are retained. Once that bound is reached, new
+workers still contribute to the complete pool tally, while their events are
+combined in `worker_overflow` and `workers_truncated` remains `true`. This
+bounds tally memory, snapshot allocation, lock-held copying, JSON
+serialization, and status-file size even when clients submit once under many
+unique worker names. `worker_limit` reports the active bound; operators may
+lower it with `QBIT_REJECTS_WORKER_LIMIT` (valid range `1..4096`) but cannot
+raise it above the compiled maximum. Registered per-worker tallies otherwise
+live exactly as long as ckpool's own per-worker share stats.
 
 Block-candidate outcomes are tracked in two additional buckets,
 `block_accepted` and `block_rejected`, counting local `submitblock` results
