@@ -4299,6 +4299,106 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with server._reconcile_flight_lock:
             self.assertEqual(server._reconcile_flights, {})
 
+    def test_lock_owner_reconcile_leads_visible_flight_when_absent(self) -> None:
+        tip = "60" * 32
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingReorgLedger(ReorgLedger):
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                entered.set()
+                if not release.wait(timeout=5.0):
+                    raise AssertionError("reconcile release was never signaled")
+                return super().reorg_watch_blocks(
+                    active_tip_height=active_tip_height
+                )
+
+        ledger = BlockingReorgLedger([])
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        server._ensure_job_cache_state()
+
+        lock_owner_result: list[bool] = []
+        follower_result: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+        follower_waiting = threading.Event()
+
+        class SignalingEvent:
+            def __init__(self, inner: threading.Event) -> None:
+                self._inner = inner
+
+            def wait(self, timeout: float | None = None) -> bool:
+                follower_waiting.set()
+                return self._inner.wait(timeout)
+
+            def set(self) -> None:
+                self._inner.set()
+
+        def reconcile_while_owning_lock() -> None:
+            try:
+                with server._payout_balance_mutation_lock:
+                    lock_owner_result.append(
+                        server.ensure_reorg_reconciled_for_tip(
+                            tip,
+                            _coalesce_same_tip=False,
+                        )
+                    )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        def follow_reconcile() -> None:
+            try:
+                follower_result.append(
+                    server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+
+        lock_owner = threading.Thread(target=reconcile_while_owning_lock)
+        follower = threading.Thread(target=follow_reconcile)
+        lock_owner.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5.0))
+            with server._reconcile_flight_lock:
+                flight = server._reconcile_flights[tip]
+                flight.event = SignalingEvent(flight.event)  # type: ignore[assignment]
+
+            follower.start()
+            self.assertTrue(follower_waiting.wait(timeout=5.0))
+            self.assertTrue(lock_owner.is_alive())
+            self.assertTrue(follower.is_alive())
+            self.assertEqual(ledger.events, [])
+        finally:
+            release.set()
+            lock_owner.join(timeout=5.0)
+            if follower.ident is not None:
+                follower.join(timeout=5.0)
+
+        self.assertFalse(lock_owner.is_alive())
+        self.assertFalse(follower.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(lock_owner_result, [True])
+        self.assertEqual(len(follower_result), 1)
+        self.assertEqual(
+            ledger.events,
+            [("watch", 10), ("mature", 10)],
+            "the ordinary caller must reuse the lock owner's visible pass",
+        )
+        with server._reconcile_flight_lock:
+            self.assertEqual(server._reconcile_flights, {})
+
     def test_forced_and_reserved_reconciles_bypass_flight_reuse(self) -> None:
         tip = "5e" * 32
         ledger = ReorgLedger([])
