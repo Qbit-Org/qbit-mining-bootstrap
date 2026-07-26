@@ -2085,6 +2085,9 @@ class JobBundleCacheTests(unittest.TestCase):
         assert first is not None
         with server._job_cache_lock:
             server._job_build_issued_at_ms[first.generation] = 1_700_000_000_000
+            server._job_build_anchor_counts[first.generation] = len(
+                server.ledger.miners
+            )
 
         inline = server.shared_job_bundle(first, mode="ready")
 
@@ -2113,6 +2116,9 @@ class JobBundleCacheTests(unittest.TestCase):
         with server._job_cache_lock:
             server._job_build_issued_at_ms[second.generation] = (
                 1_700_000_001_000
+            )
+            server._job_build_anchor_counts[second.generation] = len(
+                server.ledger.miners
             )
 
         reused = server.shared_job_bundle(second, mode="ready")
@@ -2156,6 +2162,69 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(bundle.payout_artifact_generation, 0)
         with server._job_cache_lock:
             self.assertIsNone(server._payout_ledger_artifact)
+
+    def test_sync_artifact_publication_refused_when_anchor_predates_share(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        first = server.shared_job_bundle(artifacts, mode="ready")
+        self.assertFalse(first.collection_only)
+        with server._job_cache_lock:
+            self.assertIsNotNone(server._payout_ledger_artifact)
+            # A share becomes durable after this generation's anchor was
+            # frozen. Force the synchronous path to run again for the same
+            # frozen anchor.
+            server._payout_ledger_artifact = None
+            server._job_bundle_cache.clear()
+        server.ledger.miners = [*server.ledger.miners, "post-anchor-share"]
+
+        second = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertEqual(second.payout_artifact_generation, 0)
+        # The before/after counts agree (4 == 4) but exceed the count that
+        # was scoped to the frozen anchor, so the window read at that anchor
+        # excludes a durable share and must not be published for reuse.
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+
+    def test_rearmed_artifact_is_not_shadowed_by_stale_cached_bundle(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        stale = server.shared_job_bundle(artifacts, mode="ready")
+        self.assertEqual(recorded["calls"], 1)
+        self.assertEqual(len(stale.shares_json), 3)
+
+        # A share lands and the debounced re-arm rebuilds a fresher window.
+        server.ledger.miners = [*server.ledger.miners, "late-share"]
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            fresh_artifact = server._payout_ledger_artifact
+        assert fresh_artifact is not None
+        self.assertEqual(fresh_artifact.accepted_share_count, 4)
+
+        rebuilt = server.shared_job_bundle(artifacts, mode="ready")
+
+        # The pre-re-arm bundle is still inside its cache TTL under the
+        # no-artifact key; its older window must not shadow the fresher
+        # artifact.
+        self.assertEqual(
+            rebuilt.payout_artifact_generation,
+            fresh_artifact.generation,
+        )
+        self.assertEqual(len(rebuilt.shares_json), 4)
+        self.assertEqual(recorded["calls"], 2)
 
     def test_fence_failure_rearms_artifact_preparation_with_debounce(self) -> None:
         server, rpc = coordinator()

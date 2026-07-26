@@ -1433,6 +1433,11 @@ class PayoutLedgerArtifact:
     # replaying qbit_audit_share_window at the declared anchor must reproduce
     # exactly these shares, which only holds at the snapshot's own anchor.
     snapshot_anchor_ms: int | None = None
+    # Canonical digest of shares_json. Cached bundles built before this
+    # artifact was armed may only keep serving re-keyed lookups when their
+    # own window digest matches; anything else must rebuild from the
+    # artifact so a fresher window is never shadowed by older cached work.
+    share_snapshot_sha256: str | None = None
 
 
 def _share_window_spool_file() -> Any:
@@ -3571,6 +3576,13 @@ class PrismCoordinator:
             self._job_build_pending: _JobBuildRequest | None = None
         if not hasattr(self, "_job_build_issued_at_ms"):
             self._job_build_issued_at_ms: OrderedDict[int, int] = OrderedDict()
+        if not hasattr(self, "_job_build_anchor_counts"):
+            # Accepted-share count captured (bracketed) when the matching
+            # generation's snapshot anchor was clamped; None when the count
+            # read failed or moved mid-clamp. Guarded by _job_cache_lock.
+            self._job_build_anchor_counts: OrderedDict[int, int | None] = (
+                OrderedDict()
+            )
         if not hasattr(self, "job_build_timeout_seconds"):
             self.job_build_timeout_seconds = DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS
         if not hasattr(self, "job_build_cancel_grace_seconds"):
@@ -4000,6 +4012,7 @@ class PrismCoordinator:
         copy_started = time.monotonic()
         shares_json = tuple(record.to_prism_json() for record in records)
         frozen_balances = tuple(prior_balances)
+        share_snapshot_sha256 = canonical_json_sha256(shares_json)
         self._observe_tip_refresh_build_phase(
             "serialization_copy",
             time.monotonic() - copy_started,
@@ -4013,6 +4026,7 @@ class PrismCoordinator:
             prior_balances=frozen_balances,
             prepared_monotonic=time.monotonic(),
             snapshot_anchor_ms=snapshot_anchor_ms,
+            share_snapshot_sha256=share_snapshot_sha256,
         )
 
     def _prepare_payout_ledger_artifact(
@@ -6690,7 +6704,9 @@ class PrismCoordinator:
         bundle and rebuild identical work: within one payout generation and
         template identity the no-artifact bundle binds the same balances,
         window anchor, and policy inputs, so it remains a correct cache
-        identity to serve until ordinary TTL or template rotation retires it.
+        identity to serve -- but only while its window digest matches the
+        armed artifact (see _no_artifact_bundle_matches_artifact); a fence
+        re-arm can install a fresher window that cached work must not shadow.
         """
         return self._job_bundle_key(
             artifacts,
@@ -6698,6 +6714,28 @@ class PrismCoordinator:
             payout_state_generation=payout_state_generation,
             payout_artifact_generation=0,
             worker=worker,
+        )
+
+    @staticmethod
+    def _no_artifact_bundle_matches_artifact(
+        cached: CachedJobBundle,
+        payout_artifact: PayoutLedgerArtifact | None,
+    ) -> bool:
+        """Whether pre-re-key cached work carries exactly the artifact's window.
+
+        A speculative rebuild can arm a fresher artifact while an older
+        no-artifact bundle is still inside its cache TTL. Serving that bundle
+        would shadow the fresher window behind cached work, so the fallback
+        identity is honored only when the window digests are byte-identical
+        -- which the bundle that published the artifact satisfies by
+        construction.
+        """
+        return (
+            payout_artifact is not None
+            and payout_artifact.share_snapshot_sha256 is not None
+            and cached.build_key is not None
+            and cached.build_key.share_snapshot_sha256
+            == payout_artifact.share_snapshot_sha256
         )
 
     def _job_bundle_entry_usable(
@@ -6877,15 +6915,50 @@ class PrismCoordinator:
         )
         with self._job_cache_lock:
             issued_at_ms = self._job_build_issued_at_ms.get(artifacts.generation)
-            if issued_at_ms is None:
-                # The issued time doubles as the audit window anchor, so it
-                # must not cover a stamped share whose commit is still in
-                # flight: the frozen anchor stays reproducible from the
-                # durable ledger for every rebuild of this generation.
-                issued_at_ms = self._job_snapshot_anchor_ms(now_ms())
-                self._job_build_issued_at_ms[artifacts.generation] = issued_at_ms
-                while len(self._job_build_issued_at_ms) > 128:
-                    self._job_build_issued_at_ms.popitem(last=False)
+        if issued_at_ms is None:
+            # The issued time doubles as the audit window anchor, so it
+            # must not cover a stamped share whose commit is still in
+            # flight: the frozen anchor stays reproducible from the
+            # durable ledger for every rebuild of this generation.
+            #
+            # The accepted count bracketing the clamp is captured with it:
+            # commits are single-writer FIFO in accepted_at_ms order, so at
+            # clamp time the total durable count equals the count of shares
+            # at or below the anchor. A later synchronous snapshot may only
+            # seed the payout ledger artifact while the live count still
+            # equals this value; otherwise a share newer than the frozen
+            # anchor is durable, and binding the inclusive count to the
+            # anchor-exclusive window would wedge the reuse fence open.
+            anchor_scoped_count: int | None = None
+            try:
+                count_before, _ = self.accepted_share_stats()
+            except Exception:
+                count_before = None
+            candidate_anchor_ms = self._job_snapshot_anchor_ms(now_ms())
+            if count_before is not None:
+                try:
+                    count_after, _ = self.accepted_share_stats()
+                except Exception:
+                    pass
+                else:
+                    if int(count_after) == int(count_before):
+                        anchor_scoped_count = int(count_after)
+            with self._job_cache_lock:
+                issued_at_ms = self._job_build_issued_at_ms.get(
+                    artifacts.generation
+                )
+                if issued_at_ms is None:
+                    issued_at_ms = candidate_anchor_ms
+                    self._job_build_issued_at_ms[artifacts.generation] = (
+                        issued_at_ms
+                    )
+                    self._job_build_anchor_counts[artifacts.generation] = (
+                        anchor_scoped_count
+                    )
+                    while len(self._job_build_issued_at_ms) > 128:
+                        self._job_build_issued_at_ms.popitem(last=False)
+                    while len(self._job_build_anchor_counts) > 128:
+                        self._job_build_anchor_counts.popitem(last=False)
         build_key = JobBuildKey(
             best_tip_hash=artifacts.previousblockhash,
             previous_block_hash=artifacts.previousblockhash,
@@ -7110,7 +7183,7 @@ class PrismCoordinator:
         )
         cached = self._lookup_job_bundle(key)
         if cached is None and payout_artifact is not None:
-            cached = self._lookup_job_bundle(
+            fallback = self._lookup_job_bundle(
                 self._no_artifact_job_bundle_key(
                     artifacts,
                     mode=resolved_mode,
@@ -7118,6 +7191,11 @@ class PrismCoordinator:
                     worker=worker,
                 )
             )
+            if fallback is not None and self._no_artifact_bundle_matches_artifact(
+                fallback,
+                payout_artifact,
+            ):
+                cached = fallback
         if not self._job_bundle_entry_usable(cached, artifacts):
             return None
         self._record_job_cache_event("bundle", hit=True)
@@ -7259,6 +7337,10 @@ class PrismCoordinator:
                     or (
                         no_artifact_key is not None
                         and subscribed_bundle.key == no_artifact_key
+                        and self._no_artifact_bundle_matches_artifact(
+                            subscribed_bundle,
+                            payout_artifact,
+                        )
                     )
                 )
             ):
@@ -7267,7 +7349,15 @@ class PrismCoordinator:
                 # below applies exactly the checks a cache entry would face.
                 cached = subscribed_bundle
             if cached is None and no_artifact_key is not None:
-                cached = self._lookup_job_bundle(no_artifact_key)
+                fallback = self._lookup_job_bundle(no_artifact_key)
+                if (
+                    fallback is not None
+                    and self._no_artifact_bundle_matches_artifact(
+                        fallback,
+                        payout_artifact,
+                    )
+                ):
+                    cached = fallback
             if self._job_bundle_entry_usable(cached, artifacts):
                 if preparation_cancellation is not None:
                     preparation_cancellation.raise_if_cancelled(
@@ -7476,7 +7566,12 @@ class PrismCoordinator:
             serialization = _ShareWindowSerialization(
                 key=key,
                 share_count=len(shares),
-                share_snapshot_sha256=canonical_json_sha256(shares),
+                # The artifact's digest covers exactly these share objects;
+                # recompute only for artifacts predating the digest field.
+                share_snapshot_sha256=(
+                    payout_artifact.share_snapshot_sha256
+                    or canonical_json_sha256(shares)
+                ),
             )
             self._share_window_serialization = serialization
         if cached is not None:
@@ -7547,6 +7642,7 @@ class PrismCoordinator:
             * int(build_request.key.network_difficulty)
         )
         prepared_ledger_artifact: PayoutLedgerArtifact | None = None
+        snapshot_accepted_count: int | None = None
         if payout_artifact is not None:
             if (
                 self._usable_payout_ledger_artifact(
@@ -7575,7 +7671,6 @@ class PrismCoordinator:
                 fallback_balances=prior_balances,
             )
         else:
-            snapshot_accepted_count: int | None = None
             with self._payout_state_prepare_lock:
                 with self._job_cache_lock:
                     published_artifact = self._published_payout_state.artifact
@@ -7614,11 +7709,26 @@ class PrismCoordinator:
                     except Exception:
                         pass
                     else:
-                        # Same fence as the background preparation path: a
+                        with self._job_cache_lock:
+                            anchor_scoped_count = (
+                                self._job_build_anchor_counts.get(
+                                    build_request.key.template_generation
+                                )
+                            )
+                        # Same fence as the background preparation path -- a
                         # share committing during the read leaves the window
-                        # ambiguously bound to either count, so the window
-                        # must not be republished for reuse.
-                        if int(accepted_after) == int(accepted_before):
+                        # ambiguously bound to either count -- plus an anchor
+                        # scope check: this generation's anchor was frozen
+                        # earlier, so a share that became durable since then
+                        # is counted by accepted_share_stats but excluded
+                        # from the window read at the anchor. Publishing that
+                        # pairing would wedge the exact-count reuse fence
+                        # open around a window missing a durable share.
+                        if (
+                            anchor_scoped_count is not None
+                            and int(accepted_after) == int(accepted_before)
+                            and int(accepted_after) == int(anchor_scoped_count)
+                        ):
                             snapshot_accepted_count = int(accepted_after)
                 # An accepted parent's prospective carry state supersedes the
                 # published artifact for children built on that parent; the
@@ -7637,28 +7747,6 @@ class PrismCoordinator:
                         cancellation,
                     )
                 shares.append(record.to_prism_json())
-            if snapshot_accepted_count is not None and shares:
-                # This build already paid the full ledger read; carry the
-                # window it produced so cache publication can arm it for
-                # builds arriving before the next share commit. The artifact
-                # carries the published payout-state balances, not this
-                # bundle's possibly parent-adjusted view: reuse re-applies
-                # the parent override itself and the reuse fence hashes the
-                # artifact balances against the published payout artifact.
-                prepared_ledger_artifact = PayoutLedgerArtifact(
-                    generation=0,
-                    payout_state_generation=payout_state_generation,
-                    network_difficulty=int(
-                        build_request.key.network_difficulty
-                    ),
-                    accepted_share_count=snapshot_accepted_count,
-                    shares_json=tuple(shares),
-                    prior_balances=tuple(
-                        build_request.payout_artifact.prior_balances()
-                    ),
-                    prepared_monotonic=time.monotonic(),
-                    snapshot_anchor_ms=issued_at_ms,
-                )
         # A reused artifact carries shares snapshotted at its own earlier
         # anchor. The bundle must declare that anchor: replaying the audit
         # window at this job's fresher anchor could include a share that was
@@ -7687,6 +7775,31 @@ class PrismCoordinator:
             share_snapshot_sha256 = share_serialization.share_snapshot_sha256
         else:
             share_snapshot_sha256 = canonical_json_sha256(shares)
+        if (
+            payout_artifact is None
+            and snapshot_accepted_count is not None
+            and shares
+        ):
+            # This build already paid the full ledger read; carry the window
+            # it produced so cache publication can arm it for builds arriving
+            # before the next share commit. The artifact carries the
+            # published payout-state balances, not this bundle's possibly
+            # parent-adjusted view: reuse re-applies the parent override
+            # itself and the reuse fence hashes the artifact balances against
+            # the published payout artifact.
+            prepared_ledger_artifact = PayoutLedgerArtifact(
+                generation=0,
+                payout_state_generation=payout_state_generation,
+                network_difficulty=int(build_request.key.network_difficulty),
+                accepted_share_count=snapshot_accepted_count,
+                shares_json=tuple(shares),
+                prior_balances=tuple(
+                    build_request.payout_artifact.prior_balances()
+                ),
+                prepared_monotonic=time.monotonic(),
+                snapshot_anchor_ms=issued_at_ms,
+                share_snapshot_sha256=share_snapshot_sha256,
+            )
         final_build_key = dataclass_replace(
             build_request.key,
             share_snapshot_sha256=share_snapshot_sha256,
