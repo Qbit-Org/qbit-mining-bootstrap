@@ -802,6 +802,52 @@ class TipRefreshEpochTests(unittest.TestCase):
         self.assertFalse(server._tip_refresh_retry.is_set())
         self.assertFalse(server._consume_tip_refresh_retry())
 
+    def test_payout_epoch_tip_prefers_observed_refresh_target(self) -> None:
+        server, _rpc = coordinator()
+        server.tip_refresh_epoch_fanout = True
+        server._ensure_tip_refresh_state()
+
+        self.assertIsNone(server._payout_epoch_tip_hash_locked())
+        server.current_tip_first_seen = (TIP_C, 1.0)
+        self.assertEqual(server._payout_epoch_tip_hash_locked(), TIP_C)
+        server.latest_detected_tip = (TIP_B, 2.0)
+        self.assertEqual(server._payout_epoch_tip_hash_locked(), TIP_B)
+        server._tip_refresh_epoch_tip_hash = TIP_A
+        self.assertEqual(server._payout_epoch_tip_hash_locked(), TIP_A)
+
+    def test_accepted_block_preview_keeps_epoch_on_observed_tip(self) -> None:
+        server, _rpc = coordinator()
+        server.tip_refresh_epoch_fanout = True
+        server._ensure_tip_refresh_state()
+        self.assertTrue(
+            server.observe_tip_for_refresh(
+                TIP_A,
+                observation_sequence=1,
+                mark_pending=False,
+            )
+        )
+        minted = server._tip_refresh_epoch_sequence
+        block_hash = "bb" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._publish_accepted_block_payout_preview(block_hash, preview)
+
+        # The accepted block hash is not a template parent; the payout
+        # mint must keep the epoch on the observed refresh target.
+        self.assertEqual(server._tip_refresh_epoch_tip_hash, TIP_A)
+        self.assertGreater(server._tip_refresh_epoch_sequence, minted)
+        self.assertEqual(
+            server._tip_refresh_epoch_payout_generation,
+            server._payout_state_generation,
+        )
+
     def test_initial_fence_miss_completes_request_with_newer_work(self) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)

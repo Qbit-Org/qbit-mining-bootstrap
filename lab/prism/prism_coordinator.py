@@ -6597,18 +6597,7 @@ class PrismCoordinator:
                             published_monotonic=publish_started,
                             artifact=artifact,
                         )
-                        latest_detected = getattr(self, "latest_detected_tip", None)
-                        published_tip = getattr(self, "current_tip_first_seen", None)
-                        epoch_tip_hash = (
-                            candidate.source_tip_hash
-                            or (
-                                latest_detected[0]
-                                if latest_detected is not None
-                                else published_tip[0]
-                                if published_tip is not None
-                                else None
-                            )
-                        )
+                        epoch_tip_hash = self._payout_epoch_tip_hash_locked()
                         if epoch_tip_hash is not None:
                             self._mint_tip_refresh_epoch_locked(
                                 tip_hash=epoch_tip_hash,
@@ -8697,6 +8686,29 @@ class PrismCoordinator:
         except (InvalidOperation, TypeError, ValueError):
             return Decimal(0)
         return resolved if resolved.is_finite() and resolved > 0 else Decimal(0)
+
+    def _payout_epoch_tip_hash_locked(self) -> str | None:
+        """Label a payout-minted epoch with the current refresh target tip.
+
+        A payout publication advances the payout generation of the target
+        the fleet is already converging on; it must not move or invent the
+        tip. Candidate source hashes are unusable here: an accepted-block
+        preview stores the accepted block's own hash, which is not a
+        template parent and can trail an already-observed newer tip, so
+        labeling the epoch with it strands token currency, identity
+        publication, and the fixpoint until a later tip observation
+        remints.
+        """
+        current_epoch_tip = getattr(self, "_tip_refresh_epoch_tip_hash", None)
+        if current_epoch_tip is not None:
+            return str(current_epoch_tip)
+        latest_detected = getattr(self, "latest_detected_tip", None)
+        if latest_detected is not None:
+            return str(latest_detected[0])
+        published_tip = getattr(self, "current_tip_first_seen", None)
+        if published_tip is not None:
+            return str(published_tip[0])
+        return None
 
     def _mint_tip_refresh_epoch_locked(
         self,
