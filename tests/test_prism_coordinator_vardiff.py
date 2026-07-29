@@ -4553,6 +4553,37 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with server._reconcile_flight_lock:
             server._reconcile_flights.pop(tip, None)
 
+    def test_pass_spanning_detection_cycle_does_not_arm_memo(self) -> None:
+        # A pass whose reads straddle a flip away and back finishes with the
+        # latest detected hash matching its tip again, but its proof belongs
+        # to the closed epoch: arming must be refused so every memo consumer
+        # (refresh joins, initial-job and vardiff-idle builds) re-proves.
+        tip = "5c" * 32
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        ledger = ReorgLedger([])
+
+        def epoch_bumping_watch(*, active_tip_height: int) -> list[dict[str, object]]:
+            with server.lock:
+                server.tip_detection_epoch = (
+                    int(getattr(server, "tip_detection_epoch", 0)) + 2
+                )
+            return []
+
+        ledger.reorg_watch_blocks = epoch_bumping_watch  # type: ignore[method-assign]
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+
+        self.assertTrue(server.ensure_reorg_reconciled_for_tip(tip))
+
+        with server.lock:
+            self.assertNotIn(tip, server._reorg_reconcile_trusted_memo)
+
     def test_row_mutating_pass_evicts_other_tip_memo_entries(self) -> None:
         tip_a = "a1" * 32
         tip_b = "b2" * 32
@@ -5643,6 +5674,335 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 1)
         self.assertIsNone(ledger.pending[0].credit_policy)
 
+    def test_share_ack_latency_histogram_observes_accept_and_reject(self) -> None:
+        # The read-to-ack instrument for share-ingest saturation, driven
+        # through the real handler loop: both outcomes are observed after
+        # their response write, so accepted-vs-rejected separates commit
+        # pressure from transport/thread saturation.
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        sent: list[dict[str, object]] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+        coordinator_sock, peer = socket.socketpair()
+        state.sock = coordinator_sock
+        accepted_line = json.dumps(
+            {
+                "id": 7,
+                "method": "mining.submit",
+                "params": ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            }
+        )
+        rejected_line = json.dumps(
+            {
+                "id": 8,
+                "method": "mining.submit",
+                "params": [
+                    "miner-a",
+                    "missing-job",
+                    "00" * 8,
+                    "00000001",
+                    "00000002",
+                ],
+            }
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            handler = threading.Thread(target=server.handle_client, args=(state,))
+            handler.start()
+            peer.sendall((accepted_line + "\n" + rejected_line + "\n").encode())
+            peer.close()
+            handler.join(5)
+
+        self.assertFalse(handler.is_alive())
+        self.assertEqual(sent[0], {"id": 7, "result": True, "error": None})
+        self.assertEqual(sent[1]["id"], 8)
+        self.assertIsNotNone(sent[1]["error"])
+        metrics = "\n".join(server.share_ack_metrics_lines())
+        self.assertIn(
+            'qbit_prism_share_ack_seconds_count{result="accepted"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_share_ack_seconds_count{result="rejected"} 1',
+            metrics,
+        )
+
+    def test_reconnected_same_username_submits_against_disconnected_job(self) -> None:
+        # A proxy flap leaves devices mining the dead connection's jobs;
+        # their shares arrive on the replacement connection and must credit
+        # against the retained context instead of rejecting unknown-job.
+        tip = "00" * 32
+        server, state, ledger = submit_coordinator(tip=tip)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+        retained = server.evicted_job_graveyard.get("job-1")
+        self.assertIsNotNone(retained)
+        assert retained is not None
+        self.assertIsNone(retained.client)
+
+        reconnected = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=2,
+            extranonce1_hex="00000002",
+        )
+        reconnected.subscribed = True
+        reconnected.authorized = True
+        reconnected.username = "miner-a"
+        reconnected.worker = worker_identity("miner-a")
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            should_close = server.handle_submit(
+                reconnected,
+                ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+            )
+
+        self.assertFalse(should_close)
+        self.assertEqual(len(ledger.pending), 1)
+        self.assertIsNone(ledger.pending[0].credit_policy)
+        # Credit follows the retained context's original worker identity.
+        self.assertEqual(ledger.pending[0].share_id, "miner-a:" + "cf" * 32)
+        self.assertEqual(
+            server.evicted_job_submit_counts[
+                "accepted_same_tip_cross_connection"
+            ],
+            1,
+        )
+
+    def test_cross_connection_submit_requires_same_username(self) -> None:
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+        self.assertIn("job-1", server.evicted_job_graveyard)
+
+        intruder = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 3),
+            connection_id=3,
+            extranonce1_hex="00000003",
+        )
+        intruder.subscribed = True
+        intruder.authorized = True
+        intruder.username = "miner-b"
+        intruder.worker = worker_identity("miner-b")
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    intruder,
+                    ["miner-b", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.reason, PRISM_REJECTION_UNKNOWN_JOB)
+
+    def test_cross_connection_submit_uses_retained_version_mask(self) -> None:
+        # In-flight work from the dead connection was version-rolled under
+        # the mask negotiated there; the replacement's own mask (0 before
+        # mining.configure) must not judge those version bits.
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.jobs["job-1"].version_mask = 0x1FFFE000
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+
+        reconnected = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=2,
+            extranonce1_hex="00000002",
+        )
+        reconnected.subscribed = True
+        reconnected.authorized = True
+        reconnected.username = "miner-a"
+        reconnected.worker = worker_identity("miner-a")
+        self.assertEqual(reconnected.version_mask, 0)
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=False,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ) as assemble:
+            self.assertFalse(
+                server.handle_submit(
+                    reconnected,
+                    [
+                        "miner-a",
+                        "job-1",
+                        "00" * 8,
+                        "00000001",
+                        "00000002",
+                        "1fffe000",
+                    ],
+                )
+            )
+
+        self.assertEqual(
+            assemble.call_args.kwargs["version_mask"],
+            0x1FFFE000,
+        )
+
+    def test_cross_connection_block_candidate_keeps_original_extranonce(self) -> None:
+        # The mined coinbase embeds the extranonce1 the retained job was
+        # stamped with; a candidate recording the replacement connection's
+        # extranonce would fail the audit fence after submitblock.
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.stop_after_block = False
+        server.max_blocks = 10
+        server.jobs["job-1"].job.extranonce1_hex = state.extranonce1_hex
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+
+        reconnected = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=2,
+            extranonce1_hex="00000002",
+        )
+        reconnected.subscribed = True
+        reconnected.authorized = True
+        reconnected.username = "miner-a"
+        reconnected.worker = worker_identity("miner-a")
+        submission = SimpleNamespace(
+            header_hex="af" * 80,
+            block_hash_hex="cf" * 32,
+            share_pass=True,
+            block_pass=True,
+            coinbase_tx_hex="c0ffee",
+            block_hex="00",
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            self.assertFalse(
+                server.handle_submit(
+                    reconnected,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+            )
+
+        self.assertEqual(server.block_candidate_queue.qsize(), 1)
+        candidate = server.block_candidate_queue.get_nowait()
+        self.assertEqual(candidate.extranonce1_hex, "00000001")
+        self.assertIs(candidate.client, reconnected)
+
+    def test_detached_entry_never_falls_back_to_stale_grace(self) -> None:
+        # A tip moving between the graveyard lookup and submit
+        # classification must not let a detached cross-connection entry
+        # borrow the reconnect's stale-grace window: cross-connection
+        # resumes are same-tip only.
+        tip_old = "00" * 32
+        tip_new = "11" * 32
+        server, state, _ledger = submit_coordinator(tip=tip_old)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+        server.disconnect_client(state)
+        detached = server.evicted_job_graveyard.get("job-1")
+        self.assertIsNotNone(detached)
+        assert detached is not None
+        self.assertIsNone(detached.client)
+
+        reconnected = ClientState(
+            sock=object(),
+            address=("127.0.0.1", 2),
+            connection_id=2,
+            extranonce1_hex="00000002",
+        )
+        reconnected.subscribed = True
+        reconnected.authorized = True
+        reconnected.username = "miner-a"
+        reconnected.worker = worker_identity("miner-a")
+        eligibility_calls: list[str] = []
+
+        def recording_eligibility(
+            _client: ClientState,
+            _context: object,
+            current_tip: str,
+        ) -> bool:
+            eligibility_calls.append(current_tip)
+            return True
+
+        server.context_eligible_for_stale_grace = (  # type: ignore[method-assign]
+            recording_eligibility
+        )
+
+        self.assertIsNone(
+            server.evicted_submit_context(reconnected, detached, tip_new)
+        )
+        self.assertEqual(eligibility_calls, [])
+
+        # Same-connection entries keep today's stale-grace classification.
+        live_state = client()
+        server.jobs["job-2"] = prism_context(
+            "job-2",
+            tip_old,
+            worker=live_state.worker,
+        )
+        server.bury_evicted_job(live_state, "job-2")
+        live_entry = server.evicted_job_graveyard["job-2"]
+        result = server.evicted_submit_context(live_state, live_entry, tip_new)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result[1], PRISM_CREDIT_POLICY_STALE_GRACE)
+        self.assertEqual(eligibility_calls, [tip_new])
+
+    def test_disconnected_retention_capacity_is_bounded(self) -> None:
+        tip = "00" * 32
+        server, state, _ledger = submit_coordinator(tip=tip)
+        server.disconnected_job_retention = 1
+        server.jobs["job-2"] = prism_context("job-2", tip, worker=state.worker)
+        state.active_job_ids = {"job-1", "job-2"}
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+
+        server.disconnect_client(state)
+
+        self.assertEqual(len(server._disconnected_evicted_job_ids), 1)
+        self.assertEqual(len(server.evicted_job_graveyard), 1)
+        self.assertEqual(
+            server.evicted_job_capacity_eviction_counts["disconnected"],
+            1,
+        )
+
     def test_retained_share_dedup_uses_original_worker_after_reauthorization(self) -> None:
         tip = "00" * 32
         server, state, ledger = submit_coordinator(tip=tip)
@@ -5842,7 +6202,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(server.evicted_job_graveyard), 4_097)
         self.assertEqual(server.evicted_job_capacity_eviction_counts["connection"], 1)
 
-    def test_tip_change_and_disconnect_remove_retained_contexts(self) -> None:
+    def test_tip_change_prunes_and_disconnect_detaches_retained_contexts(self) -> None:
         old_tip = "00" * 32
         new_tip = "11" * 32
         server, state, _ledger = submit_coordinator(tip=old_tip)
@@ -5860,6 +6220,18 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.clients = {state}
         state.close = lambda: None  # type: ignore[method-assign]
         server.disconnect_client(state)
+        # Same-tip work survives the disconnect for a same-username
+        # reconnect; the dead connection's entry is detached and ages out on
+        # the normal same-tip TTL instead of vanishing with the socket.
+        retained = server.evicted_job_graveyard.get("job-2")
+        self.assertIsNotNone(retained)
+        assert retained is not None
+        self.assertIsNone(retained.client)
+        server.prune_evicted_job_graveyard(
+            now=time.monotonic()
+            + float(server.same_tip_job_retention_seconds)
+            + 1.0
+        )
         self.assertEqual(server.evicted_job_graveyard, {})
 
     def test_tip_flip_reanchors_retained_job_grace_to_client_delivery(self) -> None:
@@ -7058,6 +7430,191 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertTrue(all(entry.error is not None for entry in entries))
             self.assertFalse(server.share_recovery_path.exists())
 
+    def test_landing_builds_audit_bundle_outside_balance_serializer(self) -> None:
+        # The builder/verifier subprocess time must stay off the
+        # payout-balance mutation lock: job delivery and reconciliation
+        # queue behind that lock, and holding it across the bundle build was
+        # the dominant term of the finalization delivery stall.
+        server, state, ledger = submit_coordinator()
+        server.stop_after_block = False
+        server.max_blocks = 10
+        lock_held_during_build: list[bool] = []
+        build_calls: list[int] = []
+
+        def probe_lock_from_other_thread() -> bool:
+            # An RLock re-acquires freely on the owning thread, so the probe
+            # must come from a thread that cannot be the owner.
+            acquired: list[bool] = []
+
+            def attempt() -> None:
+                got = server._payout_balance_mutation_lock.acquire(
+                    blocking=False
+                )
+                if got:
+                    server._payout_balance_mutation_lock.release()
+                acquired.append(not got)
+
+            prober = threading.Thread(target=attempt)
+            prober.start()
+            prober.join(5)
+            return bool(acquired and acquired[0])
+
+        def fake_build_audit_bundle(**_kwargs: object) -> dict[str, object]:
+            build_calls.append(1)
+            lock_held_during_build.append(probe_lock_from_other_thread())
+            return verified_block_bundle()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            block_hash = "cc" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+            pending = SimpleNamespace(share_id="miner-a:" + block_hash)
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission, pending_share=pending)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(build_calls, [1])
+        self.assertEqual(lock_held_during_build, [False])
+        self.assertEqual(len(ledger.persisted), 1)
+        self.assertEqual(len(ledger.confirmed), 1)
+
+    def test_block_submitted_before_audit_bundle_build(self) -> None:
+        # The audit build runs with the balance serializer released, but
+        # never before submitblock: announcement of a freshly solved block
+        # must not wait on audit construction (a lost race is a lost round).
+        server, state, ledger = submit_coordinator()
+        server.stop_after_block = False
+        server.max_blocks = 10
+        order: list[str] = []
+        block_hash = "cc" * 32
+
+        class OrderRecordingRpc(SubmitRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    order.append("submitblock")
+                return super().call(method, params)
+
+        def ordered_build(**_kwargs: object) -> dict[str, object]:
+            order.append("build_audit_bundle")
+            return verified_block_bundle()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = OrderRecordingRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = ordered_build  # type: ignore[method-assign]
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+            pending = SimpleNamespace(share_id="miner-a:" + block_hash)
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission, pending_share=pending)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(order, ["submitblock", "build_audit_bundle"])
+        self.assertEqual(len(ledger.persisted), 1)
+        self.assertEqual(len(ledger.confirmed), 1)
+
+    def test_block_submit_histogram_measures_landed_to_rpc_interval(self) -> None:
+        # The race-critical span (candidate landed -> submitblock returned)
+        # must be observed exactly once per attempted submit, independent of
+        # the post-submit audit/persistence bookkeeping the outbox
+        # created_at/completed_at interval also includes.
+        old_tip = "00" * 32
+        block_hash = "ab" * 32
+        server, state, ledger = submit_coordinator(tip=old_tip)
+        server.stop_after_block = False
+        server.max_blocks = 10
+        server.clients = {state}
+        sent: list[dict[str, object]] = []
+        state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+
+        def build_fresh_job(client: ClientState, *, clean_jobs: bool) -> object:
+            return prism_context(
+                "fresh-job",
+                block_hash,
+                worker=state.worker,
+                difficulty=Decimal("1"),
+                clean_jobs=clean_jobs,
+            )
+
+        server.build_job_for_client = build_fresh_job  # type: ignore[method-assign]
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            share_pass=True,
+            block_pass=True,
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitAcceptingTemplateRpc(
+                old_tip=old_tip,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = lambda **_kwargs: verified_block_bundle()  # type: ignore[method-assign]
+            server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
+
+            with patch(
+                "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+                return_value=submission,
+            ):
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+            self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(server.accepted_block_count, 1)
+        metrics = "\n".join(server.block_submitter_metrics_lines())
+        self.assertIn("qbit_prism_block_submit_seconds_count 1", metrics)
+        self.assertIn(
+            'qbit_prism_block_submit_seconds_bucket{le="+Inf"} 1',
+            metrics,
+        )
+        # The candidate landed moments ago in this process, so the interval
+        # must fall inside the finite buckets, not only the +Inf overflow.
+        self.assertIn(
+            'qbit_prism_block_submit_seconds_bucket{le="30"} 1',
+            metrics,
+        )
+
     def test_orphaned_block_candidate_keeps_share_credit(self) -> None:
         # Option-A semantics: a share that met its target stays credited even
         # when its block candidate loses the tip race in the submitter.
@@ -8158,6 +8715,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 return self
 
             def __exit__(self, *_args: object) -> None:
+                mutation_lock.release()
+
+            # The landing's audit-build release window drives the serializer
+            # through the plain lock interface as well.
+            def acquire(self, *args: object, **kwargs: object) -> bool:
+                return mutation_lock.acquire(*args, **kwargs)  # type: ignore[arg-type]
+
+            def release(self) -> None:
                 mutation_lock.release()
 
         server._payout_balance_mutation_lock = ObservedBalanceLock()  # type: ignore[assignment]
