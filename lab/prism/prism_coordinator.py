@@ -147,6 +147,8 @@ DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
 DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
 DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS = 4
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
+PRISM_TIP_REFRESH_REENTRY_BACKOFF_SECONDS = 0.05
+PRISM_TIP_REFRESH_WAVE_PASS_BUDGET = 64
 # Cancellation-check slice while an initial request rides a subscribed
 # publication-priority build promise. Promise completion wakes the waiter
 # immediately; this only bounds how stale a cancellation can go unnoticed.
@@ -276,6 +278,7 @@ PRISM_TIP_REFRESH_WAVE_OUTCOMES = (
     "build_superseded",
     "payout_blocked",
     "trust_blocked",
+    "shutdown",
     "error",
 )
 PRISM_TIP_REFRESH_COVERAGE_TARGETS = (
@@ -12257,6 +12260,26 @@ class PrismCoordinator:
         finally:
             self._clear_active_tip_refresh(validation_token, cancel_event)
 
+    def _tip_refresh_wave_reenters(self, completed_passes: int) -> bool:
+        """Gate owner-wave re-entry so tip churn cannot spin at RPC speed.
+
+        Every re-entry pass costs template and reconcile RPC work against
+        qbitd exactly when block cadence is fastest. The inter-pass backoff
+        bounds that poll rate, and a wave that cannot converge within its
+        pass budget hands the remainder to the scheduled retry, whose fresh
+        wave restarts from the newest observed state.
+        """
+        if not getattr(self, "tip_refresh_epoch_fanout", False):
+            return False
+        if self.stop_event.is_set():
+            return False
+        if completed_passes >= PRISM_TIP_REFRESH_WAVE_PASS_BUDGET:
+            self._schedule_tip_refresh_retry()
+            return False
+        return not self.stop_event.wait(
+            PRISM_TIP_REFRESH_REENTRY_BACKOFF_SECONDS
+        )
+
     def poll_qbit_tip_template_once(
         self,
         *,
@@ -12306,6 +12329,7 @@ class PrismCoordinator:
         saw_fanout_supersession = False
         outcome = "error"
         first_pass = True
+        completed_passes = 0
         try:
             while True:
                 try:
@@ -12320,6 +12344,7 @@ class PrismCoordinator:
                         ),
                     )
                     first_pass = False
+                    completed_passes += 1
                 except _PayoutStatePublicationBlocked:
                     outcome = "payout_blocked"
                     raise
@@ -12329,20 +12354,16 @@ class PrismCoordinator:
                 except JobBuildSuperseded:
                     saw_build_supersession = True
                     first_pass = False
-                    if (
-                        getattr(self, "tip_refresh_epoch_fanout", False)
-                        and not self.stop_event.is_set()
-                    ):
+                    completed_passes += 1
+                    if self._tip_refresh_wave_reenters(completed_passes):
                         continue
                     outcome = "build_superseded"
                     raise
                 except TemplateRefreshSuperseded:
                     saw_fanout_supersession = True
                     first_pass = False
-                    if (
-                        getattr(self, "tip_refresh_epoch_fanout", False)
-                        and not self.stop_event.is_set()
-                    ):
+                    completed_passes += 1
+                    if self._tip_refresh_wave_reenters(completed_passes):
                         continue
                     outcome = "fanout_superseded"
                     raise
@@ -12352,11 +12373,19 @@ class PrismCoordinator:
 
                 if (
                     getattr(self, "tip_refresh_epoch_fanout", False)
-                    and not self.stop_event.is_set()
                     and not self._tip_refresh_epoch_fixpoint_reached()
                 ):
+                    if self.stop_event.is_set():
+                        # Shutdown interrupted convergence. Reporting the
+                        # wave as completed would hide that eligible
+                        # clients never received the newest delivered work.
+                        outcome = "shutdown"
+                        return total_refreshed
                     saw_fanout_supersession = True
-                    continue
+                    if self._tip_refresh_wave_reenters(completed_passes):
+                        continue
+                    outcome = "fanout_superseded"
+                    return total_refreshed
                 outcome = (
                     "build_superseded"
                     if saw_build_supersession
@@ -14765,6 +14794,19 @@ class PrismCoordinator:
             delivered_fingerprint = qbit_template_fingerprint(
                 delivered.template
             )
+        # Reselection must cover every condition the epoch fixpoint counts
+        # as undelivered, or the owning wave re-enters forever with no
+        # candidate to serve. A delivered collection job after the pool
+        # latches ready is one such condition even when its epoch, tip,
+        # payout generation, and fingerprint all remain current, because
+        # registration can advance past a delivery whose send failed.
+        # A client whose current-epoch delivery is registered but unproven
+        # is deliberately reselected here (the fence admits equal epochs,
+        # so the re-serve is idempotent on the wire). Deduplicating on the
+        # admitted epoch instead would be wrong: admission is monotonic
+        # and survives a failed send, so an admitted-equal skip would
+        # deselect the client while the fixpoint still counts it
+        # undelivered.
         return (
             int(getattr(delivered, "connection_id", 0))
             != int(client.connection_id)
@@ -14775,6 +14817,10 @@ class PrismCoordinator:
             or int(getattr(delivered, "payout_state_generation", 0))
             != int(getattr(self, "_tip_refresh_epoch_payout_generation", 0))
             or delivered_fingerprint != snapshot.template_fingerprint
+            or (
+                bool(getattr(delivered, "collection_only", False))
+                and bool(getattr(self, "_pool_ready_latched", False))
+            )
         )
 
     def intervening_job_supersedes_snapshot(
