@@ -8961,6 +8961,14 @@ class PrismCoordinator:
                     )
                 ):
                     return False
+            # Every eligible connection holds newest delivered work, so any
+            # refresh retry armed before this verification is satisfied.
+            # Consume it inside the same lock hold that proved convergence:
+            # signals armed afterwards stay armed, and blockpoll no longer
+            # re-runs a full wave against work a recovered supersession
+            # already finished.
+            self._tip_refresh_retry_consumed = self._tip_refresh_retry_counter
+            self._tip_refresh_retry.clear()
         return True
 
     def _retain_collection_refresh(
@@ -10008,6 +10016,19 @@ class PrismCoordinator:
                             client,
                             context.tip_refresh_epoch_sequence,
                         ):
+                            # The fence blocks only strictly older epochs, so
+                            # this connection already registered newer refresh
+                            # work whose delivery the epoch machinery owns.
+                            # Retrying here can spin until the initial-job
+                            # deadline disconnects an already-served client;
+                            # complete a request that newer current-tip work
+                            # satisfies instead.
+                            self.note_initial_job_delivered(client)
+                            if (
+                                self.pending_initial_jobs.get(client)
+                                is not request
+                            ):
+                                return False
                             return None
                         client.active_job = context
                         for job_id in tuple(client.active_job_ids):
@@ -12443,6 +12464,22 @@ class PrismCoordinator:
         finally:
             self._clear_active_tip_refresh(validation_token, cancel_event)
 
+    def _interrupted_wave_outcome(self, superseded_outcome: str) -> str:
+        """Classify a wave that declined re-entry.
+
+        With epoch fanout active, a wave that would have re-entered but for
+        shutdown was terminated by shutdown, not by the supersession it
+        recovered; reporting it superseded would pollute the terminal
+        supersession counts that rollout evaluation watches. Legacy waves
+        never re-enter, so their supersession outcome stands.
+        """
+        if (
+            getattr(self, "tip_refresh_epoch_fanout", False)
+            and self.stop_event.is_set()
+        ):
+            return "shutdown"
+        return superseded_outcome
+
     def _tip_refresh_wave_reenters(self, completed_passes: int) -> bool:
         """Gate owner-wave re-entry so tip churn cannot spin at RPC speed.
 
@@ -12540,7 +12577,9 @@ class PrismCoordinator:
                     completed_passes += 1
                     if self._tip_refresh_wave_reenters(completed_passes):
                         continue
-                    outcome = "build_superseded"
+                    outcome = self._interrupted_wave_outcome(
+                        "build_superseded"
+                    )
                     raise
                 except TemplateRefreshSuperseded:
                     saw_fanout_supersession = True
@@ -12548,7 +12587,9 @@ class PrismCoordinator:
                     completed_passes += 1
                     if self._tip_refresh_wave_reenters(completed_passes):
                         continue
-                    outcome = "fanout_superseded"
+                    outcome = self._interrupted_wave_outcome(
+                        "fanout_superseded"
+                    )
                     raise
                 except Exception:
                     outcome = "error"
@@ -12558,16 +12599,12 @@ class PrismCoordinator:
                     getattr(self, "tip_refresh_epoch_fanout", False)
                     and not self._tip_refresh_epoch_fixpoint_reached()
                 ):
-                    if self.stop_event.is_set():
-                        # Shutdown interrupted convergence. Reporting the
-                        # wave as completed would hide that eligible
-                        # clients never received the newest delivered work.
-                        outcome = "shutdown"
-                        return total_refreshed
                     saw_fanout_supersession = True
                     if self._tip_refresh_wave_reenters(completed_passes):
                         continue
-                    outcome = "fanout_superseded"
+                    outcome = self._interrupted_wave_outcome(
+                        "fanout_superseded"
+                    )
                     return total_refreshed
                 outcome = (
                     "build_superseded"
