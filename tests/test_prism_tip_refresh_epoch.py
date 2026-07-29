@@ -848,6 +848,47 @@ class TipRefreshEpochTests(unittest.TestCase):
             server._payout_state_generation,
         )
 
+    def test_payout_mint_republishes_stamping_identity(self) -> None:
+        server, _rpc = coordinator()
+        server.tip_refresh_epoch_fanout = True
+        server._ensure_tip_refresh_state()
+        snapshot, bundle, token = validated_refresh(server)
+        with server.lock:
+            server._publish_tip_refresh_epoch_identity_locked(snapshot)
+        self.assertEqual(
+            server._tip_refresh_epoch_for_bundle_locked(bundle),
+            token.epoch_sequence,
+        )
+
+        block_hash = "bb" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._publish_accepted_block_payout_preview(block_hash, preview)
+
+        identity = server._published_tip_refresh_epoch_identity
+        assert identity is not None
+        self.assertEqual(identity[0], server._tip_refresh_epoch_sequence)
+        self.assertGreater(identity[0], token.epoch_sequence)
+        self.assertEqual(identity[2], server._payout_state_generation)
+        # Rebuilt bundles carry the published payout generation and must
+        # stamp the minted epoch, not fall to 0 behind a stale identity.
+        rebuilt = server.prepare_tip_refresh_bundle(snapshot)
+        self.assertEqual(
+            int(rebuilt.payout_state_generation),
+            int(server._payout_state_generation),
+        )
+        self.assertEqual(
+            server._tip_refresh_epoch_for_bundle_locked(rebuilt),
+            server._tip_refresh_epoch_sequence,
+        )
+
     def test_initial_fence_miss_completes_request_with_newer_work(self) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)

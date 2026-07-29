@@ -6604,6 +6604,23 @@ class PrismCoordinator:
                                 payout_state_generation=published_generation,
                                 started_monotonic=candidate.invalidated_monotonic,
                             )
+                            # Re-anchor the stamping identity to the minted
+                            # epoch in the same lock hold. A stale identity
+                            # stamps rebuilt bundles at epoch 0, which the
+                            # fence blocks for every previously admitted
+                            # connection until the next wave republishes.
+                            # The publish helper no-ops when the epoch tip
+                            # is not the published snapshot tip; the owning
+                            # wave handles that transition.
+                            published_snapshot = getattr(
+                                self,
+                                "tip_template_snapshot",
+                                None,
+                            )
+                            if published_snapshot is not None:
+                                self._publish_tip_refresh_epoch_identity_locked(
+                                    published_snapshot
+                                )
                         self._payout_state_publication_blocked = False
                         self._job_bundle_cache.clear()
                         self._retained_collection_refresh = None
