@@ -5571,9 +5571,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             block_pass=True,
         )
 
-        with patch(
-            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
-            return_value=submission,
+        with (
+            patch("builtins.print") as emitted,
+            patch(
+                "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+                return_value=submission,
+            ),
         ):
             should_close = server.handle_submit(
                 state,
@@ -5586,6 +5589,15 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.pending[0].credit_policy, PRISM_CREDIT_POLICY_STALE_GRACE)
         self.assertEqual(server.grace_credited_share_count, 1)
         self.assertEqual(server.worker_share_counts["miner-a"]["grace"], 1)
+        self.assertEqual(server.block_solves_dropped_counts, {"stale_grace": 1})
+        self.assertIn(
+            'qbit_prism_block_solves_dropped_total{reason="stale_grace"} 1',
+            server.metrics_payload(),
+        )
+        self.assertEqual(emitted.call_count, 1)
+        log_line = " ".join(str(value) for value in emitted.call_args.args)
+        self.assertIn(submission.block_hash_hex, log_line)
+        self.assertIn(old_tip, log_line)
 
     def test_evicted_prior_tip_share_inside_grace_is_credited(self) -> None:
         old_tip = "00" * 32
@@ -6361,9 +6373,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.pending), 0)
 
     def test_block_submit_rejects_job_when_prior_balances_changed_before_persist(self) -> None:
-        server, state, ledger = submit_coordinator()
-        ledger.durable_payout_state = True
-        ledger.prior_balances = [
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        ledger.durable_payout_state = True  # type: ignore[attr-defined]
+        server.ledger = ledger
+        server.jobs["job-1"].prior_balances = [
             {
                 "recipient_id": "miner-a",
                 "order_key": "miner-a",
@@ -6379,16 +6393,42 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             block_hash_hex="ef" * 32,
             block_hex="00",
         )
+        pending = self._pending_append("balance-stale").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
 
-        accepted = server.submit_block_candidate(block_candidate(server, state, submission))
-
-        self.assertFalse(accepted)
+        self.assertTrue(server.submit_next_block_candidate())
         # The share was already accepted at submit time, so a lost block is a
         # block-abandonment, not a stale share rejection.
         self.assertEqual(server.stale_share_count, 0)
         self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
-        self.assertEqual(ledger.persisted, [])
-        self.assertEqual(ledger.pending, [])
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "prior balances changed since the job was issued",
+        )
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="tip_moved"} 0',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="balance_stale"} 1',
+            metrics,
+        )
 
     def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
         self,
@@ -7063,7 +7103,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         # when its block candidate loses the tip race in the submitter.
         old_tip = "00" * 32
         new_tip = "11" * 32
-        server, state, ledger = submit_coordinator(tip=old_tip)
+        server, state, _recording = submit_coordinator(tip=old_tip)
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
         submission = SimpleNamespace(
             header_hex="aa" * 80,
             block_hash_hex="cc" * 32,
@@ -7080,7 +7122,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
             )
 
-        self.assertEqual(len(ledger.pending), 1)
+        self.assertEqual(len(ledger.all_shares()), 1)
         # The tip moves before the submitter drains the candidate.
         server.rpc = TipRpc(new_tip)
 
@@ -7089,10 +7131,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.accepted_block_count, 0)
         # Counted as a block abandonment, not a share rejection.
         self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 1, "balance_stale": 0},
+        )
         self.assertEqual(server.stale_share_count, 0)
         # The credited share survives the lost block race.
-        self.assertEqual(len(ledger.pending), 1)
-        self.assertEqual(ledger.persisted, [])
+        self.assertEqual(len(ledger.all_shares()), 1)
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            f"tip moved before submit: {new_tip}",
+        )
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="tip_moved"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="balance_stale"} 0',
+            metrics,
+        )
 
     def test_accepted_candidate_with_moved_tip_finalizes_as_submitted(self) -> None:
         old_tip = "00" * 32
@@ -7594,7 +7654,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             PRISM_REJECTION_STALE_JOB,
             server.block_candidate_abandoned_counts,
         )
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="tip_moved"} 0',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="balance_stale"} 0',
+            metrics,
+        )
         self.assertEqual(ledger.pending_block_candidates(), [])
+        outbox_row = ledger._block_candidate_outbox[block_hash]
+        self.assertEqual(outbox_row["state"], "submitted")
+        self.assertIsNone(outbox_row["last_error"])
         self.assertNotIn(block_hash, server._accepted_block_payout_previews)
         self.assertNotIn(
             block_hash,
@@ -7738,6 +7810,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         server.ledger = ledger
+        moved_tip = "11" * 32
+        expected_error = f"tip moved before submit: {moved_tip}"
         pending = self._pending_append("f2").pending_share
         candidate = block_candidate(
             server,
@@ -7761,9 +7835,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             submit_calls += 1
             server._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
-                "tip moved",
+                expected_error,
                 block_hash=_candidate.submission.block_hash_hex,
                 worker="miner-a",
+                stale_job_class="tip_moved",
             )
             return False
 
@@ -7797,7 +7872,16 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             server.block_candidate_abandoned_counts,
             {PRISM_REJECTION_STALE_JOB: 1},
         )
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 1, "balance_stale": 0},
+        )
         self.assertEqual(ledger.pending_block_candidates(), [])
+        outbox_row = ledger._block_candidate_outbox[
+            candidate.submission.block_hash_hex
+        ]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(outbox_row["last_error"], expected_error)
         self.assertEqual(server._block_candidate_finalize_retries, {})
 
     def test_accepted_finalize_failure_still_triggers_post_accept_refresh(self) -> None:
