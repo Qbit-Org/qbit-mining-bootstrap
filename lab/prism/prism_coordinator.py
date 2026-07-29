@@ -4341,7 +4341,7 @@ class PrismCoordinator:
                             snapshot_anchor_ms=artifact.snapshot_anchor_ms,
                         )
                     already_current = True
-                elif current_anchor_ms == artifact_anchor_ms:
+                else:
                     template_artifacts = getattr(
                         self,
                         "_template_artifacts",
@@ -4356,11 +4356,13 @@ class PrismCoordinator:
                         and artifact.network_difficulty
                         != int(template_artifacts.network_difficulty)
                     ):
-                        # Equal anchors cannot order snapshots across a
-                        # retarget; keep the artifact the live template
-                        # difficulty can actually reuse rather than
-                        # letting a delayed pre-retarget build regress
-                        # it.
+                        # Whether a delayed pre-retarget build's anchor
+                        # ties or leads, keep the artifact the live
+                        # template difficulty can actually reuse: a
+                        # wrong-difficulty install would fail every reuse
+                        # probe on the difficulty check, which never
+                        # re-arms, until the next synchronous build
+                        # re-seeded the live window.
                         return
             if not already_current:
                 self._payout_ledger_artifact_generation += 1
@@ -7984,18 +7986,26 @@ class PrismCoordinator:
         prepared_ledger_artifact: PayoutLedgerArtifact | None = None
         snapshot_accepted_count: int | None = None
         if payout_artifact is not None:
+            # The reuse decision was made at request preparation; re-validate
+            # supersession and the balances fence only. Aging past the anchor
+            # bound while queued must not scrap the build for a full snapshot
+            # it was armed to avoid, and the comparison is by artifact
+            # identity fields rather than object identity: a same-window
+            # rebuild refreshes the armed anchor by swapping the instance
+            # while the generation -- the re-key authority -- and the window
+            # and balances bytes stay identical.
+            current_artifact = self._usable_payout_ledger_artifact(
+                payout_state_generation,
+                build_request.key.network_difficulty,
+                ignore_anchor_age=True,
+            )
             if (
-                self._usable_payout_ledger_artifact(
-                    payout_state_generation,
-                    build_request.key.network_difficulty,
-                    # The reuse decision was made at request preparation;
-                    # re-validate supersession and the balances fence only.
-                    # Aging past the anchor bound while queued must not
-                    # scrap the build for a full snapshot it was armed to
-                    # avoid.
-                    ignore_anchor_age=True,
-                )
-                is not payout_artifact
+                current_artifact is None
+                or current_artifact.payout_state_generation
+                != payout_artifact.payout_state_generation
+                or current_artifact.generation != payout_artifact.generation
+                or current_artifact.share_snapshot_sha256
+                != payout_artifact.share_snapshot_sha256
             ):
                 raise JobBuildSuperseded(
                     "precomputed payout artifact changed before construction"
@@ -17525,18 +17535,24 @@ class PrismCoordinator:
             self._pending_share_commit_floor.pop(id(pending_share), None)
 
     def _job_snapshot_anchor_ms(self, issued_at_ms: int) -> int:
-        """Clamp a share-snapshot anchor below every pending share commit.
+        """Clamp a share-snapshot anchor below every coverable share stamp.
 
         The reward-window contract lets an auditor replay
         qbit_audit_share_window(anchor) against the durable ledger and expect
-        exactly the shares the published bundle counted. A share whose
-        accepted_at_ms is already assigned but whose row has not committed yet
-        (group-commit queue, in-flight batch, or a block-candidate credit
-        linked after landing) would violate that: it is invisible to the MVCC
-        snapshot now but joins later replays at any anchor at or above its
-        accepted_at_ms. Anchoring strictly below every such share keeps the
-        issued snapshot reproducible without making job builds wait behind the
-        writer connection.
+        exactly the shares the published bundle counted. Two hazards would
+        violate that. A share whose accepted_at_ms is already assigned but
+        whose row has not committed yet (group-commit queue, in-flight batch,
+        or a block-candidate credit linked after landing) is invisible to the
+        MVCC snapshot now but joins later replays at any anchor at or above
+        its accepted_at_ms. And a share stamped right after this clamp
+        returns can land in the same millisecond as the clamp instant --
+        never protected by the pending floor -- so an anchor equal to that
+        instant would cover it too (the window predicate is
+        anchor-inclusive). Anchoring strictly below every pending share and
+        strictly below the clamp-time millisecond keeps the issued snapshot
+        reproducible without making job builds wait behind the writer
+        connection: any stamp assigned after this call is at or above the
+        clamp instant, hence above the anchor.
         """
         self._ensure_pending_share_commit_state()
         stale_share_ids: list[str] = []
@@ -17565,8 +17581,8 @@ class PrismCoordinator:
                 flush=True,
             )
         if floor_ms is None:
-            return issued_at_ms
-        return min(issued_at_ms, floor_ms - 1)
+            return issued_at_ms - 1
+        return min(issued_at_ms - 1, floor_ms - 1)
 
     def pending_share_from_submission(
         self,

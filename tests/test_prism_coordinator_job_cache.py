@@ -396,10 +396,13 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
         server, _rpc = coordinator(ledger=ledger)
         install_fake_bundle_builder(server)
         artifacts = server.current_template_artifacts()
-        artifact_anchor_ms = now_ms() - 6
+        clamp_now_ms = now_ms() - 6
+        # Anchor selection sits strictly below the clamp instant so a share
+        # stamped in the same millisecond can never tie the anchor.
+        artifact_anchor_ms = clamp_now_ms - 1
         with patch(
             "lab.prism.prism_coordinator.now_ms",
-            return_value=artifact_anchor_ms,
+            return_value=clamp_now_ms,
         ):
             artifact = server._build_payout_ledger_artifact(
                 0, 0, artifacts.network_difficulty
@@ -483,6 +486,30 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
                 )
             )
             self.assertEqual(ledger.snapshot_calls, 0)
+        finally:
+            server._finish_pending_share_commit(share)
+
+    def test_anchor_selection_excludes_same_millisecond_stamps(self) -> None:
+        # Millisecond granularity can hand a share stamped right after
+        # anchor selection the same accepted_at_ms as the clamp instant,
+        # and such a share is never protected by the pending floor. The
+        # window predicate is anchor-inclusive, so the anchor must sit
+        # strictly below the clamp-time millisecond or that share would
+        # join audit replays of a window that never contained it.
+        server, _rpc = coordinator(ledger=AnchorRecordingLedger())
+        clamp_now = now_ms()
+        self.assertEqual(
+            server._job_snapshot_anchor_ms(clamp_now),
+            clamp_now - 1,
+        )
+
+        share = stamped_pending_share(clamp_now - 7)
+        self._hold_floor(server, share)
+        try:
+            self.assertEqual(
+                server._job_snapshot_anchor_ms(clamp_now),
+                clamp_now - 8,
+            )
         finally:
             server._finish_pending_share_commit(share)
 
@@ -2500,6 +2527,20 @@ class JobBundleCacheTests(unittest.TestCase):
         with server._job_cache_lock:
             self.assertIs(server._payout_ledger_artifact, replaced)
 
+        # Even a delayed pre-retarget build that clamped a fresher anchor
+        # must not displace it: a wrong-difficulty install would fail every
+        # reuse probe on the difficulty check, which never re-arms.
+        assert replaced.snapshot_anchor_ms is not None
+        leading = dataclass_replace(
+            installed,
+            generation=0,
+            prepared_monotonic=time.monotonic(),
+            snapshot_anchor_ms=int(replaced.snapshot_anchor_ms) + 5,
+        )
+        server._install_payout_ledger_artifact(leading)
+        with server._job_cache_lock:
+            self.assertIs(server._payout_ledger_artifact, replaced)
+
     def test_fence_failure_rearms_artifact_preparation_with_debounce(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
@@ -2811,6 +2852,58 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(
             bundle.found_block["anchor_job_issued_at_ms"],
             aged.snapshot_anchor_ms,
+        )
+
+    def test_in_flight_build_survives_same_window_anchor_refresh(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            armed = server._payout_ledger_artifact
+            assert armed is not None
+            assert armed.snapshot_anchor_ms is not None
+            # An in-flight build selected the armed artifact while it
+            # carried an older anchor.
+            selected = dataclass_replace(
+                armed,
+                snapshot_anchor_ms=int(armed.snapshot_anchor_ms) - 5,
+            )
+            server._payout_ledger_artifact = selected
+
+        # A same-window rebuild refreshes the anchor in place: the stored
+        # instance swaps while the generation -- the re-key authority --
+        # and the window bytes stay identical.
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            refreshed = server._payout_ledger_artifact
+        assert refreshed is not None
+        self.assertIsNot(refreshed, selected)
+        self.assertEqual(refreshed.generation, selected.generation)
+        self.assertEqual(
+            refreshed.share_snapshot_sha256,
+            selected.share_snapshot_sha256,
+        )
+
+        # The build holding the pre-refresh instance completes its reuse
+        # instead of being scrapped into a full snapshot by the swap.
+        server.ledger.snapshot_calls = 0
+        bundle = server.build_shared_job_bundle(
+            artifacts,
+            worker(),
+            payout_artifact=selected,
+        )
+        self.assertEqual(server.ledger.snapshot_calls, 0)
+        self.assertEqual(
+            bundle.found_block["anchor_job_issued_at_ms"],
+            selected.snapshot_anchor_ms,
         )
 
     def test_reused_anchor_bundle_preview_matches_fresh_build_through_guard(
