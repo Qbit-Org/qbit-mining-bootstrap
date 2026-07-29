@@ -345,6 +345,12 @@ restarts the coordinator. Alert on
 `qbit_prism_template_refresh_coordination_blocked_age_seconds` before it
 approaches the configured bound.
 
+`PRISM_TIP_REFRESH_EPOCH_FANOUT` is a staged rollout gate and defaults to `0`.
+Leave it disabled for legacy refresh behavior. Enable it deliberately to make
+each refresh wave converge on the latest observed tip epoch; payout and trust
+publication fences remain authoritative. Monitor refresh-wave outcomes and
+delivery coverage during rollout, and return the setting to `0` to roll back.
+
 ### CTV At Genesis
 
 A chain with no confirmed transaction history cannot produce a useful

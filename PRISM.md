@@ -227,6 +227,7 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS` | `300` | how long an own-hash tip observation (blockwait/blockpoll seeing a pool block candidate as the chain tip) keeps protecting that candidate from terminal abandonment while fresh chain probes cannot prove it active; expired windows restore terminal stale abandons |
 | `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | `15` | maximum monotonic age of the last coherent qbit tip/template poll before `/healthz` returns HTTP 503 |
 | `PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS` | `1` | minimum spacing (plus up to 25% jitter) between failed tip-refresh attempts while the observed tip is unchanged; success or a new tip re-arms immediately; set `0` for unspaced retries |
+| `PRISM_TIP_REFRESH_EPOCH_FANOUT` | `0` | enables latest-wins refresh epochs; leave disabled for legacy abort-and-retry behavior, enable gradually, and set back to `0` to roll back |
 | `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | after a tip flip, credits same-connection prior-tip shares until this long after that connection receives new-tip work (shares stay creditable while delivery is still pending); set `0` to reject all prior-tip shares |
 | `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` | `15` | cadence for checking zero-submitted, zero-accepted vardiff windows so over-diffed idle miners can step down; set `0` to disable |
 | `PRISM_WORKER_METRICS_LIMIT` | `100` | maximum distinct worker labels in private metrics before new workers aggregate into `_other` |

@@ -66,6 +66,7 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_STRATUM_STALE_GRACE_SECONDS": "4",
                 "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS": "31",
                 "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION": "65",
+                "PRISM_TIP_REFRESH_EPOCH_FANOUT": "1",
                 "PRISM_TIP_REFRESH_MAX_WORKERS": "7",
                 "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "19",
                 "PRISM_WORKER_METRICS_LIMIT": "8",
@@ -163,6 +164,7 @@ class PrismComposeProfileTests(unittest.TestCase):
             env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION"],
             "65",
         )
+        self.assertEqual(env["PRISM_TIP_REFRESH_EPOCH_FANOUT"], "1")
         self.assertEqual(env["PRISM_TIP_REFRESH_MAX_WORKERS"], "7")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS"], "19")
         self.assertEqual(env["PRISM_WORKER_METRICS_LIMIT"], "8")
