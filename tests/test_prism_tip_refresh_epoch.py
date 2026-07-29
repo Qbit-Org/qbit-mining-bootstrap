@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lab.prism.prism_coordinator import (
+    PRISM_TIP_REFRESH_WAVE_PASS_BUDGET,
     JobBuildSuperseded,
     PrismCoordinator,
     TipRefreshValidationToken,
@@ -230,6 +231,119 @@ class TipRefreshEpochTests(unittest.TestCase):
             server._admit_client_tip_refresh_epoch_locked(state, 2)
         )
 
+    def test_fence_blocks_stale_write_the_comparator_admits(self) -> None:
+        """Negative control: the fence is load-bearing on the wire.
+
+        A queued delivery that already passed global validation carries an
+        older epoch than the connection has since advanced to. The
+        intervening-job comparator cannot express that ordering (an
+        old-tip snapshot must normally not be blocked by a newer-tip
+        active job), so with the fence disabled the stale write reaches
+        registration and the socket. Only the per-connection epoch fence
+        prevents the regression.
+        """
+        server, rpc = coordinator()
+        server.tip_refresh_epoch_fanout = True
+        server._ensure_tip_refresh_state()
+        state = client(1)
+        server.clients = [state]  # type: ignore[assignment]
+        wire: list[tuple[int, str]] = []
+
+        def sendall(data: bytes) -> None:
+            payloads = [
+                json.loads(line)
+                for line in data.decode("utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [payload["method"] for payload in payloads],
+                ["mining.set_difficulty", "mining.notify"],
+            )
+            context = state.active_job
+            assert context is not None
+            wire.append(
+                (
+                    int(context.tip_refresh_epoch_sequence),
+                    str(context.template["previousblockhash"]),
+                )
+            )
+
+        state.sock = SimpleNamespace(
+            sendall=sendall,
+            shutdown=lambda *_args: None,
+            close=lambda: None,
+        )
+
+        snapshot_a, bundle_a, token_a = validated_refresh(server)
+        rpc.tip = TIP_B
+        rpc.template = base_template(height=11, prevhash=TIP_B)
+        snapshot_b, bundle_b, token_b = validated_refresh(server)
+        self.assertGreater(token_b.epoch_sequence, token_a.epoch_sequence)
+
+        fresh = server.send_prepared_job(
+            state,
+            bundle_b,
+            snapshot_b,
+            token_b,
+            state.connection_id,
+            None,
+        )
+        self.assertEqual(fresh.result, "sent")
+        current = state.active_job
+        assert current is not None
+        self.assertEqual(
+            int(current.tip_refresh_epoch_sequence),
+            token_b.epoch_sequence,
+        )
+
+        # Model the queued worker whose global validation already passed
+        # before the connection advanced; identical in both arms so only
+        # the fence distinguishes them.
+        server._prepared_tip_refresh_obsolete = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: False
+        )
+        server._tip_refresh_token_current_locked = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: True
+        )
+
+        blocked = server.send_prepared_job(
+            state,
+            bundle_a,
+            snapshot_a,
+            token_a,
+            state.connection_id,
+            None,
+        )
+        self.assertEqual(blocked.result, "skipped")
+        self.assertIs(state.active_job, current)
+        self.assertEqual(len(wire), 1)
+
+        server._client_tip_refresh_epoch_blocked_locked = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: False
+        )
+        server._admit_client_tip_refresh_epoch_locked = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: True
+        )
+
+        regressed = server.send_prepared_job(
+            state,
+            bundle_a,
+            snapshot_a,
+            token_a,
+            state.connection_id,
+            None,
+        )
+        self.assertEqual(regressed.result, "sent")
+        active = state.active_job
+        assert active is not None
+        self.assertEqual(
+            str(active.template["previousblockhash"]),
+            TIP_A,
+        )
+        self.assertEqual(
+            [epoch_sequence for epoch_sequence, _tip in wire],
+            [token_b.epoch_sequence, token_a.epoch_sequence],
+        )
+
     def test_hashrate_coverage_records_fixed_thresholds_after_delivery(self) -> None:
         server, _rpc = coordinator()
         server.tip_refresh_epoch_fanout = True
@@ -403,6 +517,56 @@ class TipRefreshEpochTests(unittest.TestCase):
         )
         self.assertTrue(server._tip_refresh_epoch_fixpoint_reached())
 
+    def test_ready_latch_reselects_delivered_collection_job(self) -> None:
+        """Reselection must cover every fixpoint-incomplete condition.
+
+        A windowed registration can advance past a delivered collection
+        job when its send fails. The delivered collection job then keeps
+        the fixpoint open, so the client must stay selectable or the
+        owning wave spins forever with no candidate to serve.
+        """
+        server, _rpc = coordinator()
+        server.tip_refresh_epoch_fanout = True
+        server._ensure_tip_refresh_state()
+        state = client(1)
+        server.clients = [state]  # type: ignore[assignment]
+        snapshot = SimpleNamespace(
+            bestblockhash=TIP_A,
+            previousblockhash=TIP_A,
+            template_fingerprint="fixture-fingerprint",
+        )
+        epoch = server._mint_tip_refresh_epoch_locked(
+            tip_hash=TIP_A,
+            payout_state_generation=0,
+            started_monotonic=1.0,
+        )
+        delivered = delivered_context(
+            connection_id=state.connection_id,
+            epoch_sequence=epoch,
+            tip_hash=TIP_A,
+        )
+        delivered.template_fingerprint = snapshot.template_fingerprint
+        delivered.collection_only = True
+        registered = delivered_context(
+            connection_id=state.connection_id,
+            epoch_sequence=epoch,
+            tip_hash=TIP_A,
+        )
+        registered.template_fingerprint = snapshot.template_fingerprint
+        state.active_job = registered
+        state.active_job_ids.add("registered")
+        server.jobs["registered"] = registered  # type: ignore[assignment]
+        state._progress_delivered_context = delivered
+        server._pool_ready_latched = True
+
+        self.assertFalse(server._tip_refresh_epoch_fixpoint_reached())
+        self.assertTrue(
+            server.client_needs_tip_template_refresh(
+                state,
+                snapshot,  # type: ignore[arg-type]
+            )
+        )
+
     def test_wave_outcomes_are_recorded_once_per_owner(self) -> None:
         cases = (
             ("completed", None),
@@ -499,6 +663,89 @@ class TipRefreshEpochTests(unittest.TestCase):
                     sum(server.tip_refresh_wave_outcome_counts.values()),
                     1,
                 )
+
+    def test_shutdown_before_fixpoint_records_shutdown_outcome(self) -> None:
+        server, _rpc = coordinator()
+        server.tip_refresh_epoch_fanout = True
+        server._ensure_tip_refresh_state()
+
+        def pass_once(**_kwargs: object) -> int:
+            server.stop_event.set()
+            return 0
+
+        server._poll_qbit_tip_template_pass_once = pass_once  # type: ignore[method-assign]
+        server._tip_refresh_epoch_fixpoint_reached = lambda: False  # type: ignore[method-assign]
+
+        self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+        self.assertEqual(
+            server.tip_refresh_wave_outcome_counts["shutdown"],
+            1,
+        )
+        self.assertEqual(
+            sum(server.tip_refresh_wave_outcome_counts.values()),
+            1,
+        )
+        metrics = "\n".join(server.tip_refresh_metrics_lines())
+        self.assertIn(
+            'qbit_prism_tip_refresh_wave_outcomes_total{outcome="shutdown"} 1',
+            metrics,
+        )
+
+    def test_wave_pass_budget_falls_back_to_scheduled_retry(self) -> None:
+        server, _rpc = coordinator()
+        server.tip_refresh_epoch_fanout = True
+        server._ensure_tip_refresh_state()
+        passes = 0
+
+        def pass_once(**_kwargs: object) -> int:
+            nonlocal passes
+            passes += 1
+            return 0
+
+        server._poll_qbit_tip_template_pass_once = pass_once  # type: ignore[method-assign]
+        server._tip_refresh_epoch_fixpoint_reached = lambda: False  # type: ignore[method-assign]
+
+        with patch(
+            "lab.prism.prism_coordinator."
+            "PRISM_TIP_REFRESH_REENTRY_BACKOFF_SECONDS",
+            0.0,
+        ):
+            self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+
+        self.assertEqual(passes, PRISM_TIP_REFRESH_WAVE_PASS_BUDGET)
+        self.assertEqual(
+            server.tip_refresh_wave_outcome_counts["fanout_superseded"],
+            1,
+        )
+        self.assertEqual(
+            sum(server.tip_refresh_wave_outcome_counts.values()),
+            1,
+        )
+        self.assertTrue(server._consume_tip_refresh_retry())
+
+    def test_wave_reentry_gates_on_feature_shutdown_and_budget(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+
+        self.assertFalse(server._tip_refresh_wave_reenters(1))
+
+        server.tip_refresh_epoch_fanout = True
+        with patch(
+            "lab.prism.prism_coordinator."
+            "PRISM_TIP_REFRESH_REENTRY_BACKOFF_SECONDS",
+            0.0,
+        ):
+            self.assertTrue(server._tip_refresh_wave_reenters(1))
+            self.assertFalse(server._consume_tip_refresh_retry())
+            self.assertFalse(
+                server._tip_refresh_wave_reenters(
+                    PRISM_TIP_REFRESH_WAVE_PASS_BUDGET
+                )
+            )
+            self.assertTrue(server._consume_tip_refresh_retry())
+
+        server.stop_event.set()
+        self.assertFalse(server._tip_refresh_wave_reenters(1))
 
     def test_reconciliation_failure_records_trust_blocked(self) -> None:
         server, _rpc = coordinator()
@@ -1404,6 +1651,16 @@ class TipRefreshEpochTests(unittest.TestCase):
         self.assertEqual(queued.active_job_ids, set())
         self.assertEqual(server.tip_refresh_inflight, 0)
         self.assertIsNone(server._active_tip_refresh)
+        # Shutdown interrupted convergence before the untouched client got
+        # newest delivered work; the wave must not report completed.
+        self.assertEqual(
+            server.tip_refresh_wave_outcome_counts["shutdown"],
+            1,
+        )
+        self.assertEqual(
+            sum(server.tip_refresh_wave_outcome_counts.values()),
+            1,
+        )
         with self.assertRaisesRegex(
             RuntimeError,
             "tip refresh executor is shut down",
