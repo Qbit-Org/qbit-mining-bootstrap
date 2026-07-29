@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -14,6 +15,7 @@ from unittest.mock import patch
 from lab.prism.prism_coordinator import (
     PRISM_TIP_REFRESH_WAVE_PASS_BUDGET,
     JobBuildSuperseded,
+    PendingInitialJob,
     PrismCoordinator,
     TipRefreshValidationToken,
     _PayoutStatePublicationBlocked,
@@ -722,6 +724,139 @@ class TipRefreshEpochTests(unittest.TestCase):
             1,
         )
         self.assertTrue(server._consume_tip_refresh_retry())
+
+    def test_shutdown_during_reentry_supersession_records_shutdown(self) -> None:
+        cases = (
+            ("build", JobBuildSuperseded("superseded")),
+            ("fanout", _TipRefreshFanoutSuperseded("superseded")),
+        )
+        for label, supersession in cases:
+            with self.subTest(supersession=label):
+                server, _rpc = coordinator()
+                server.tip_refresh_epoch_fanout = True
+                server._ensure_tip_refresh_state()
+
+                def pass_once(**_kwargs: object) -> int:
+                    server.stop_event.set()
+                    raise supersession
+
+                server._poll_qbit_tip_template_pass_once = pass_once  # type: ignore[method-assign]
+                with self.assertRaises(type(supersession)):
+                    server.poll_qbit_tip_template_once()
+                self.assertEqual(
+                    server.tip_refresh_wave_outcome_counts["shutdown"],
+                    1,
+                )
+                self.assertEqual(
+                    sum(server.tip_refresh_wave_outcome_counts.values()),
+                    1,
+                )
+
+    def test_legacy_supersession_outcome_survives_shutdown(self) -> None:
+        server, _rpc = coordinator()
+        server._ensure_tip_refresh_state()
+
+        def pass_once(**_kwargs: object) -> int:
+            server.stop_event.set()
+            raise _TipRefreshFanoutSuperseded("superseded")
+
+        server._poll_qbit_tip_template_pass_once = pass_once  # type: ignore[method-assign]
+        with self.assertRaises(_TipRefreshFanoutSuperseded):
+            server.poll_qbit_tip_template_once()
+        self.assertEqual(
+            server.tip_refresh_wave_outcome_counts["fanout_superseded"],
+            1,
+        )
+        self.assertEqual(
+            sum(server.tip_refresh_wave_outcome_counts.values()),
+            1,
+        )
+
+    def test_converged_reentry_consumes_prewave_retry(self) -> None:
+        server, _rpc = coordinator()
+        server.tip_refresh_epoch_fanout = True
+        server._ensure_tip_refresh_state()
+        attempts = 0
+
+        def pass_once(**_kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                server._schedule_tip_refresh_retry()
+                raise _TipRefreshFanoutSuperseded("superseded")
+            return 0
+
+        server._poll_qbit_tip_template_pass_once = pass_once  # type: ignore[method-assign]
+        with patch(
+            "lab.prism.prism_coordinator."
+            "PRISM_TIP_REFRESH_REENTRY_BACKOFF_SECONDS",
+            0.0,
+        ):
+            self.assertEqual(server.poll_qbit_tip_template_once(), 0)
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(
+            server.tip_refresh_wave_outcome_counts["fanout_superseded"],
+            1,
+        )
+        self.assertFalse(server._tip_refresh_retry.is_set())
+        self.assertFalse(server._consume_tip_refresh_retry())
+
+    def test_initial_fence_miss_completes_request_with_newer_work(self) -> None:
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.tip_refresh_epoch_fanout = True
+        server._ensure_tip_refresh_state()
+        server._ensure_initial_job_state()
+        bundle = server.prewarm_current_tip_ready_bundle()
+        assert bundle is not None
+        artifacts = server.current_template_artifacts()
+        state = client(1)
+        state.authorization_generation = 1
+        state.difficulty_generation = 0
+        state.authorized_monotonic = time.monotonic()
+        sent_payloads: list[dict[str, object]] = []
+        state.send = sent_payloads.append  # type: ignore[method-assign]
+        server.clients = {state}
+        snapshot = server.tip_template_snapshot
+        assert snapshot is not None
+        assert snapshot.template_artifacts is not None
+        newer = SimpleNamespace(
+            connection_id=state.connection_id,
+            tip_refresh_epoch_sequence=99,
+            template=snapshot.template_artifacts.template,
+            template_fingerprint=snapshot.template_fingerprint,
+            template_generation=snapshot.template_generation,
+            payout_state_generation=int(
+                getattr(server, "_payout_state_generation", 0)
+            ),
+            authorization_generation=1,
+            difficulty_generation=0,
+            collection_only=False,
+            job=SimpleNamespace(job_id="newer"),
+        )
+        state.active_job = newer
+        state._tip_refresh_admitted_epoch_sequence = 99
+        request = PendingInitialJob(
+            client=state,
+            authorization_generation=1,
+            worker=state.worker,
+            requested_monotonic=time.monotonic(),
+            deadline_monotonic=None,
+            connection_id=state.connection_id,
+            difficulty_generation=0,
+        )
+        server.pending_initial_jobs[state] = request
+
+        self.assertIs(
+            server._deliver_initial_bundle(request, artifacts, bundle),
+            False,
+        )
+        self.assertNotIn(state, server.pending_initial_jobs)
+        self.assertTrue(request.cancelled.is_set())
+        self.assertEqual(server.initial_job_sent_count, 1)
+        self.assertIs(state.active_job, newer)
+        self.assertEqual(sent_payloads, [])
 
     def test_wave_reentry_gates_on_feature_shutdown_and_budget(self) -> None:
         server, _rpc = coordinator()
