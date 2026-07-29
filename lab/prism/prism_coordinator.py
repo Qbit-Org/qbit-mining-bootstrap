@@ -7108,14 +7108,15 @@ class PrismCoordinator:
         cached: CachedJobBundle | None,
         artifacts: CachedTemplateArtifacts,
     ) -> bool:
-        """Re-validate readiness for cached collection bundles.
+        """Re-validate freshness and readiness for cached bundles.
 
         Readiness is monotonic in practice (the distinct accepted-miner count
-        only grows), so submit-capable ready bundles are served as-is. A cached
-        collection bundle is re-checked against the cheap aggregate stats:
-        once the pool is ready it must stop being served, or jobs would keep
-        collecting winning shares without submitting blocks for up to the cache
-        TTL.
+        only grows), so submit-capable ready bundles are served as-is while
+        their declared window anchor stays inside the artifact staleness
+        bound. A cached collection bundle is re-checked against the cheap
+        aggregate stats: once the pool is ready it must stop being served, or
+        jobs would keep collecting winning shares without submitting blocks
+        for up to the cache TTL.
         """
         if cached is None:
             return False
@@ -7133,6 +7134,24 @@ class PrismCoordinator:
         if not self._job_bundle_payout_state_current(cached):
             return False
         if not cached.collection_only:
+            # The bundle cache TTL and the artifact staleness bound are
+            # independent knobs. A cached ready bundle must not keep serving
+            # a window the artifact bound would already have retired -- via a
+            # TTL that outlives the bound, or via a same-window re-anchor
+            # that keeps the artifact generation while older-anchored bundles
+            # sit in the cache -- or jobs would keep declaring an anchor
+            # older than the configured limit.
+            found_block = getattr(cached, "found_block", None)
+            declared_anchor_ms = (
+                found_block.get("anchor_job_issued_at_ms")
+                if isinstance(found_block, dict)
+                else None
+            )
+            if declared_anchor_ms is not None and (
+                now_ms() - int(declared_anchor_ms)
+                > self._payout_artifact_max_anchor_age_ms()
+            ):
+                return False
             return True
         # Collection bundles sign a synthetic bootstrap share containing the
         # exact template ntime. A clock-only observation keeps the stable work

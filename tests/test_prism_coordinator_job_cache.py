@@ -2906,6 +2906,45 @@ class JobBundleCacheTests(unittest.TestCase):
             selected.snapshot_anchor_ms,
         )
 
+    def test_cached_ready_bundle_respects_anchor_age_bound(self) -> None:
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_executor_shutdown = True
+
+        first = server.shared_job_bundle(artifacts, mode="ready")
+        self.assertEqual(recorded["calls"], 1)
+        # Inside the bound the cached bundle keeps serving.
+        server.shared_job_bundle(artifacts, mode="ready")
+        self.assertEqual(recorded["calls"], 1)
+
+        # The bundle cache TTL and the artifact staleness bound are
+        # independent knobs: an entry whose declared window anchor outlives
+        # the bound must stop serving even while its TTL is still running,
+        # or jobs would keep declaring an anchor older than the configured
+        # limit.
+        aged_anchor_ms = int(first.found_block["anchor_job_issued_at_ms"]) - 11_000
+        with server._job_cache_lock:
+            for key, entry in list(server._job_bundle_cache.items()):
+                aged_found_block = dict(entry.found_block)
+                aged_found_block["anchor_job_issued_at_ms"] = aged_anchor_ms
+                server._job_bundle_cache[key] = dataclass_replace(
+                    entry,
+                    found_block=aged_found_block,
+                )
+            armed = server._payout_ledger_artifact
+            assert armed is not None
+            assert armed.snapshot_anchor_ms is not None
+            server._payout_ledger_artifact = dataclass_replace(
+                armed,
+                snapshot_anchor_ms=int(armed.snapshot_anchor_ms) - 11_000,
+            )
+
+        server.shared_job_bundle(artifacts, mode="ready")
+        self.assertEqual(recorded["calls"], 2)
+
     def test_reused_anchor_bundle_preview_matches_fresh_build_through_guard(
         self,
     ) -> None:
