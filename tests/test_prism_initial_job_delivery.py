@@ -386,7 +386,10 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
 
         self.assertEqual(build_calls, 1)
         self.assertEqual(recorded["calls"], 2)
-        self.assertEqual(server.ledger.snapshot_calls, 2)
+        # The prewarm build published its fenced ledger window as the payout
+        # ledger artifact, so the storm's single coalesced rebuild reuses it
+        # instead of taking a second snapshot.
+        self.assertEqual(server.ledger.snapshot_calls, 1)
         self.assertIsNotNone(server.last_initial_job_delivery_monotonic)
         expected_tip = server.tip_template_snapshot.bestblockhash
         self.assertTrue(

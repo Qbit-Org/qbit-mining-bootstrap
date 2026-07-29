@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import socket
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 import unittest
+from pathlib import Path
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
@@ -19,17 +21,20 @@ from unittest.mock import patch
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
+from lab.prism import prism_coordinator as prism_coordinator_module
 from lab.prism.prism_coordinator import (
     ClientState,
     JobBuildSuperseded,
     MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     PRISM_REJECTION_REASON_IDS,
+    PayoutLedgerArtifact,
     PrismCoordinator,
     ShutdownInProgress,
     TemplateRefreshBlocked,
     WorkerIdentity,
     _PayoutStatePublicationBlocked,
+    _compact_share_payload,
     canonical_json_sha256,
     canonical_json_text,
     default_prism_coinbase_tag_hex,
@@ -382,28 +387,27 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
         )
 
     def test_payout_artifact_declares_its_own_snapshot_anchor(self) -> None:
-        # An artifact snapshot is taken at its own (possibly clamped) anchor.
-        # A bundle reusing the artifact must declare that anchor rather than
-        # the fresher job-issue time: a share that was already durable at
-        # artifact build time but stamped above the artifact's clamped anchor
-        # is excluded from the artifact by construction, yet a re-derivation
-        # at the job-issue anchor would include it.
+        # An artifact snapshot is taken at its own earlier anchor. A bundle
+        # reusing the artifact must declare that anchor rather than the
+        # fresher job-issue time: a share stamped between the two anchors is
+        # excluded from the artifact by construction, yet a re-derivation at
+        # the job-issue anchor would include it.
         ledger = AnchorRecordingLedger()
         server, _rpc = coordinator(ledger=ledger)
         install_fake_bundle_builder(server)
         artifacts = server.current_template_artifacts()
-        stamped_ms = now_ms() - 5
-        share = stamped_pending_share(stamped_ms)
-        self._hold_floor(server, share)
-
-        artifact = server._build_payout_ledger_artifact(
-            0, 0, artifacts.network_difficulty
-        )
+        artifact_anchor_ms = now_ms() - 6
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            return_value=artifact_anchor_ms,
+        ):
+            artifact = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
         assert artifact is not None
-        self.assertEqual(artifact.snapshot_anchor_ms, stamped_ms - 1)
-        self.assertEqual(ledger.anchors[-1], stamped_ms - 1)
+        self.assertEqual(artifact.snapshot_anchor_ms, artifact_anchor_ms)
+        self.assertEqual(ledger.anchors[-1], artifact_anchor_ms)
 
-        server._finish_pending_share_commit(share)
         # Construction re-validates that the passed artifact is the installed
         # current one.
         with server._job_cache_lock:
@@ -418,6 +422,41 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
             artifact.snapshot_anchor_ms,
         )
         self.assertGreater(bundle.issued_at_ms, int(artifact.snapshot_anchor_ms))
+
+    def test_artifact_paths_refuse_while_a_pending_commit_holds_the_floor(
+        self,
+    ) -> None:
+        # Stamping and writer enqueue are not atomic, so while a pending
+        # commit clamps the anchor a later-stamped share may already be
+        # durable; the global accepted count cannot be scoped to a clamped
+        # anchor, and neither artifact producer may bind them.
+        ledger = AnchorRecordingLedger()
+        server, _rpc = coordinator(ledger=ledger)
+        install_fake_bundle_builder(server)
+        artifacts = server.current_template_artifacts()
+        stamped_ms = now_ms() - 5
+        share = stamped_pending_share(stamped_ms)
+        self._hold_floor(server, share)
+        try:
+            self.assertIsNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            # Refused before paying the window walk.
+            self.assertEqual(ledger.snapshot_calls, 0)
+
+            # The synchronous build itself proceeds at the clamped anchor,
+            # but publishing its window for reuse is refused.
+            bundle = server.build_shared_job_bundle(artifacts, worker())
+            self.assertEqual(bundle.issued_at_ms, stamped_ms - 1)
+            with server._job_cache_lock:
+                self.assertIsNone(server._payout_ledger_artifact)
+                self.assertIsNone(
+                    server._job_build_anchor_counts.get(artifacts.generation)
+                )
+        finally:
+            server._finish_pending_share_commit(share)
 
 def mark_progress_healthy(server: PrismCoordinator) -> None:
     snapshot = server.fetch_qbit_tip_template_snapshot()
@@ -2072,6 +2111,546 @@ class JobBundleCacheTests(unittest.TestCase):
 
         self.assertEqual(bundle.payout_artifact_generation, 0)
         self.assertEqual(server.ledger.snapshot_calls, 1)
+
+    def test_sync_ledger_snapshot_publishes_reusable_artifact(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        first = server.store_template_artifacts(dict(rpc.template))
+        assert first is not None
+        with server._job_cache_lock:
+            server._job_build_issued_at_ms[first.generation] = 1_700_000_000_000
+            server._job_build_anchor_counts[first.generation] = len(
+                server.ledger.miners
+            )
+
+        inline = server.shared_job_bundle(first, mode="ready")
+
+        self.assertEqual(inline.payout_artifact_generation, 0)
+        self.assertEqual(server.ledger.snapshot_calls, 1)
+        with server._job_cache_lock:
+            artifact = server._payout_ledger_artifact
+        self.assertIsNotNone(artifact)
+        assert artifact is not None
+        self.assertGreater(artifact.generation, 0)
+        self.assertEqual(
+            artifact.payout_state_generation,
+            server._payout_state_generation,
+        )
+        self.assertEqual(
+            artifact.accepted_share_count,
+            len(server.ledger.miners),
+        )
+        self.assertEqual(list(artifact.shares_json), inline.shares_json)
+        self.assertEqual(artifact.snapshot_anchor_ms, inline.issued_at_ms)
+
+        second = server.store_template_artifacts(
+            base_template(height=11, prevhash="22" * 32)
+        )
+        assert second is not None
+        with server._job_cache_lock:
+            server._job_build_issued_at_ms[second.generation] = (
+                1_700_000_001_000
+            )
+            server._job_build_anchor_counts[second.generation] = len(
+                server.ledger.miners
+            )
+
+        reused = server.shared_job_bundle(second, mode="ready")
+
+        self.assertEqual(reused.payout_artifact_generation, artifact.generation)
+        self.assertEqual(server.ledger.snapshot_calls, 1)
+        self.assertEqual(reused.shares_json, inline.shares_json)
+        self.assertNotEqual(reused.issued_at_ms, inline.issued_at_ms)
+        self.assertEqual(
+            reused.found_block["anchor_job_issued_at_ms"],
+            artifact.snapshot_anchor_ms,
+        )
+
+    def test_sync_artifact_publication_refused_when_share_commits_mid_read(
+        self,
+    ) -> None:
+        class MidReadCommitLedger(FakeLedger):
+            def snapshot_at_job_issue(
+                self,
+                anchor_job_issued_at_ms: int,
+                *,
+                window_weight: int | None = None,
+            ) -> list[FakeShare]:
+                result = super().snapshot_at_job_issue(
+                    anchor_job_issued_at_ms,
+                    window_weight=window_weight,
+                )
+                # A share becomes durable while the window read is in flight,
+                # so the read is ambiguously bound to either accepted count.
+                self.miners = [*self.miners, f"mid-read-{self.snapshot_calls}"]
+                return result
+
+        server, rpc = coordinator(ledger=MidReadCommitLedger())
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        bundle = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertFalse(bundle.collection_only)
+        self.assertEqual(bundle.payout_artifact_generation, 0)
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+
+    def test_sync_artifact_publication_refused_when_anchor_predates_share(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        first = server.shared_job_bundle(artifacts, mode="ready")
+        self.assertFalse(first.collection_only)
+        with server._job_cache_lock:
+            self.assertIsNotNone(server._payout_ledger_artifact)
+            # A share becomes durable after this generation's anchor was
+            # frozen. Force the synchronous path to run again for the same
+            # frozen anchor.
+            server._payout_ledger_artifact = None
+            server._job_bundle_cache.clear()
+        server.ledger.miners = [*server.ledger.miners, "post-anchor-share"]
+
+        second = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertEqual(second.payout_artifact_generation, 0)
+        # The before/after counts agree (4 == 4) but exceed the count that
+        # was scoped to the frozen anchor, so the window read at that anchor
+        # excludes a durable share and must not be published for reuse.
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+
+    def test_rearmed_artifact_is_not_shadowed_by_stale_cached_bundle(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        stale = server.shared_job_bundle(artifacts, mode="ready")
+        self.assertEqual(recorded["calls"], 1)
+        self.assertEqual(len(stale.shares_json), 3)
+
+        # A share lands and the debounced re-arm rebuilds a fresher window.
+        server.ledger.miners = [*server.ledger.miners, "late-share"]
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            fresh_artifact = server._payout_ledger_artifact
+        assert fresh_artifact is not None
+        self.assertEqual(fresh_artifact.accepted_share_count, 4)
+
+        rebuilt = server.shared_job_bundle(artifacts, mode="ready")
+
+        # The pre-re-arm bundle is still inside its cache TTL under the
+        # no-artifact key; its older window must not shadow the fresher
+        # artifact.
+        self.assertEqual(
+            rebuilt.payout_artifact_generation,
+            fresh_artifact.generation,
+        )
+        self.assertEqual(len(rebuilt.shares_json), 4)
+        self.assertEqual(recorded["calls"], 2)
+
+    def test_anchor_count_capture_retries_a_racing_commit(self) -> None:
+        class BracketRaceLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__(
+                    miners=["miner-a", "miner-b", "miner-c", "miner-d"]
+                )
+                self._pending_counts = iter([3, 4])
+
+            def accepted_share_stats(self) -> dict[str, int]:
+                self.stats_calls += 1
+                try:
+                    count = next(self._pending_counts)
+                except StopIteration:
+                    count = 4
+                return {
+                    "accepted_share_count": count,
+                    "distinct_miner_count": 4,
+                }
+
+        server, rpc = coordinator(ledger=BracketRaceLedger())
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        # The first bracket races a commit (3 then 4); the bounded retry
+        # captures a stable bracket instead of disabling synchronous
+        # artifact seeding for the whole generation.
+        bundle = server.shared_job_bundle(artifacts, mode="ready")
+
+        self.assertFalse(bundle.collection_only)
+        with server._job_cache_lock:
+            self.assertEqual(
+                server._job_build_anchor_counts.get(artifacts.generation),
+                4,
+            )
+            artifact = server._payout_ledger_artifact
+        self.assertIsNotNone(artifact)
+        assert artifact is not None
+        self.assertEqual(artifact.accepted_share_count, 4)
+
+    def test_same_window_background_rebuild_keeps_artifact_generation(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+
+        server.shared_job_bundle(artifacts, mode="ready")
+        with server._job_cache_lock:
+            installed = server._payout_ledger_artifact
+        assert installed is not None
+
+        # No share committed since: the speculative rebuild reads the same
+        # window under a fresh anchor and must not spin the generation,
+        # which would re-key bundle lookups for nothing -- but it is still a
+        # successful preparation, so an accumulated re-arm backoff releases.
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_rearm_backoff = 4
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            self.assertIs(server._payout_ledger_artifact, installed)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 1)
+
+        # A new durable share makes the rebuild a genuine replacement.
+        server.ledger.miners = [*server.ledger.miners, "late-share"]
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            replaced = server._payout_ledger_artifact
+        assert replaced is not None
+        self.assertGreater(replaced.generation, installed.generation)
+        self.assertEqual(replaced.accepted_share_count, 4)
+
+    def test_delayed_older_snapshot_does_not_regress_artifact(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.shared_job_bundle(artifacts, mode="ready")
+        with server._job_cache_lock:
+            current = server._payout_ledger_artifact
+        assert current is not None
+        self.assertEqual(current.accepted_share_count, 3)
+
+        # A snapshot read at an earlier count finishes its window conversion
+        # late, so its preparation timestamp is newer than the installed
+        # artifact's; the count still proves it is the older window.
+        older_window = [
+            {"share_seq": seq, "miner_id": "miner-a"} for seq in (1, 2)
+        ]
+        delayed = PayoutLedgerArtifact(
+            generation=0,
+            payout_state_generation=server._payout_state_generation,
+            network_difficulty=int(current.network_difficulty),
+            accepted_share_count=2,
+            shares_json=tuple(older_window),
+            prior_balances=(),
+            prepared_monotonic=time.monotonic(),
+            snapshot_anchor_ms=current.snapshot_anchor_ms,
+            share_snapshot_sha256=canonical_json_sha256(older_window),
+        )
+        server._install_payout_ledger_artifact(delayed)
+        with server._job_cache_lock:
+            self.assertIs(server._payout_ledger_artifact, current)
+
+        # A genuinely newer window replaces regardless of its preparation
+        # timestamp ordering.
+        newer_window = [
+            {"share_seq": seq, "miner_id": "miner-a"} for seq in (1, 2, 3, 4)
+        ]
+        fresher = dataclass_replace(
+            delayed,
+            accepted_share_count=4,
+            shares_json=tuple(newer_window),
+            prepared_monotonic=current.prepared_monotonic - 1.0,
+            share_snapshot_sha256=canonical_json_sha256(newer_window),
+        )
+        server._install_payout_ledger_artifact(fresher)
+        with server._job_cache_lock:
+            replaced = server._payout_ledger_artifact
+        assert replaced is not None
+        self.assertGreater(replaced.generation, current.generation)
+        self.assertEqual(replaced.accepted_share_count, 4)
+
+    def test_difficulty_change_replaces_same_window_artifact(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.shared_job_bundle(artifacts, mode="ready")
+        with server._job_cache_lock:
+            installed = server._payout_ledger_artifact
+        assert installed is not None
+
+        # A retarget moves the live template to a new difficulty while the
+        # share window stays identical. The rebuild at the live difficulty
+        # must replace the artifact: keeping the old-difficulty artifact
+        # would fail the reuse fence on every build while the same-window
+        # skip kept discarding its replacement.
+        retarget_difficulty = int(installed.network_difficulty) + 1
+        with server._job_cache_lock:
+            live = server._template_artifacts
+            assert live is not None
+            server._template_artifacts = dataclass_replace(
+                live,
+                network_difficulty=retarget_difficulty,
+            )
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            retarget_difficulty,
+        )
+        with server._job_cache_lock:
+            replaced = server._payout_ledger_artifact
+        assert replaced is not None
+        self.assertGreater(replaced.generation, installed.generation)
+        self.assertEqual(replaced.network_difficulty, retarget_difficulty)
+
+        # A pre-retarget build delayed after its snapshot carries the same
+        # count at the old difficulty; equal counts cannot order snapshots
+        # across a retarget, so the live-difficulty artifact must stay.
+        delayed = dataclass_replace(
+            installed,
+            generation=0,
+            prepared_monotonic=time.monotonic(),
+        )
+        server._install_payout_ledger_artifact(delayed)
+        with server._job_cache_lock:
+            self.assertIs(server._payout_ledger_artifact, replaced)
+
+    def test_fence_failure_rearms_artifact_preparation_with_debounce(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.payout_artifact_rearm_min_seconds = 5.0
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+
+        class RecordingExecutor:
+            def __init__(self) -> None:
+                self.submissions = 0
+
+            def submit(self, _fn: object) -> Future[None]:
+                # Recorded but never run: the request slot stays observable.
+                self.submissions += 1
+                return Future()
+
+        executor = RecordingExecutor()
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_executor = executor  # type: ignore[assignment]
+
+        usable = server._usable_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        self.assertIsNotNone(usable)
+        with server._payout_artifact_executor_lock:
+            self.assertIsNone(server._payout_artifact_requested)
+
+        server.ledger.miners = [*server.ledger.miners, "late-share"]
+
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(
+                server._payout_artifact_requested,
+                (
+                    server._payout_state_generation,
+                    int(artifacts.network_difficulty),
+                ),
+            )
+            self.assertEqual(executor.submissions, 1)
+            # The one-slot worker dequeues the request; a failed probe inside
+            # the interval must not slip a duplicate into the emptied slot.
+            server._payout_artifact_requested = None
+
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+        with server._payout_artifact_executor_lock:
+            self.assertIsNone(server._payout_artifact_requested)
+
+        # Once the interval has elapsed the next failed probe re-arms.
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_last_schedule_monotonic = (
+                time.monotonic() - 6.0
+            )
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(
+                server._payout_artifact_requested,
+                (
+                    server._payout_state_generation,
+                    int(artifacts.network_difficulty),
+                ),
+            )
+
+    def test_aborted_speculative_rebuilds_back_off_and_reset(self) -> None:
+        class MidReadLedger(FakeLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.commit_mid_read = True
+
+            def snapshot_at_job_issue(
+                self,
+                anchor_job_issued_at_ms: int,
+                *,
+                window_weight: int | None = None,
+            ) -> list[FakeShare]:
+                result = super().snapshot_at_job_issue(
+                    anchor_job_issued_at_ms,
+                    window_weight=window_weight,
+                )
+                if self.commit_mid_read:
+                    self.miners = [
+                        *self.miners,
+                        f"mid-read-{self.snapshot_calls}",
+                    ]
+                return result
+
+        ledger = MidReadLedger()
+        server, rpc = coordinator(ledger=ledger)
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server.payout_artifact_rearm_min_seconds = 5.0
+
+        # Continuous writes abort the fenced rebuild; each abort doubles the
+        # re-arm interval instead of retrying the reward-window walk at the
+        # floor forever.
+        server._prepare_payout_ledger_artifact(0, artifacts.network_difficulty)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 2)
+        server._prepare_payout_ledger_artifact(0, artifacts.network_difficulty)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 4)
+
+        # Elapsed time beyond the floor but inside the scaled interval must
+        # not re-arm.
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_last_schedule_monotonic = (
+                time.monotonic() - 10.0
+            )
+        server._rearm_payout_ledger_artifact_after_fence_failure(
+            0,
+            artifacts.network_difficulty,
+        )
+        with server._payout_artifact_executor_lock:
+            self.assertIsNone(server._payout_artifact_requested)
+
+        # A rebuild that finally arms resets the backoff to the floor.
+        ledger.commit_mid_read = False
+        server._prepare_payout_ledger_artifact(0, artifacts.network_difficulty)
+        with server._job_cache_lock:
+            self.assertIsNotNone(server._payout_ledger_artifact)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 1)
+
+    def test_payout_publication_resets_rearm_backoff(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_rearm_backoff = 8
+
+        # The accepted-block preview publishes a new payout generation whose
+        # candidate artifact installs through the atomic publication pointer
+        # swap; the accumulated backoff must release with it.
+        parent_hash = str(rpc.template["previousblockhash"])
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        server._publish_accepted_block_payout_preview(
+            parent_hash,
+            [
+                {
+                    "recipient_id": "miner-a",
+                    "order_key": "miner-a",
+                    "p2mr_program_hex": "11" * 32,
+                    "balance_sats": 25,
+                }
+            ],
+        )
+
+        self.assertGreater(server._payout_state_generation, 0)
+        with server._job_cache_lock:
+            self.assertIsNotNone(server._payout_ledger_artifact)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 1)
+
+    def test_landed_preview_suppresses_fence_failure_rearm(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        scheduled: list[tuple[int, int]] = []
+        server._schedule_payout_ledger_artifact_preparation = (  # type: ignore[method-assign]
+            lambda generation, difficulty, **_kwargs: scheduled.append(
+                (generation, difficulty)
+            )
+        )
+        accepted_hash = "d0" * 32
+        server._begin_accepted_block_payout_preview(
+            accepted_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        server._mark_accepted_block_payout_landed(
+            accepted_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+
+        server.ledger.miners = [*server.ledger.miners, "late-share"]
+
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+        # A speculative rebuild would read database balances the landed
+        # prospective state supersedes; preparation resumes only through the
+        # durable-confirmation call site.
+        self.assertEqual(scheduled, [])
 
     def test_new_tip_cancels_blocked_old_bundle_without_publication(self) -> None:
         old_tip = "11" * 32
@@ -4889,6 +5468,774 @@ class JobBuildMetricsTests(unittest.TestCase):
             metrics,
         )
         self.assertIn("qbit_prism_payout_candidates_discarded_total 0", metrics)
+
+
+def spool_share(seq: int) -> dict[str, object]:
+    return {
+        "share_seq": seq,
+        "share_id": f"share-{seq}",
+        "miner_id": "miner-a",
+        "order_key": "miner-a",
+        "p2mr_program_hex": "22" * 32,
+        "share_difficulty": 1,
+        "job_issued_at_ms": 1_700_000_000_000 + seq,
+        "accepted_at_ms": 1_700_000_000_100 + seq,
+        "credit_policy": None,
+    }
+
+
+ECHO_BUILDER_COMMAND = [
+    sys.executable,
+    "-c",
+    "import json,sys; json.dump({'received': json.load(sys.stdin)}, sys.stdout)",
+]
+
+
+class ShareWindowSpoolTests(unittest.TestCase):
+    """Spool-file handoff of the serialized share window to the builder."""
+
+    def _coordinator(self) -> PrismCoordinator:
+        server, _rpc = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        self.addCleanup(server.retire_share_window_spool)
+        return server
+
+    def _ledger_artifact(
+        self,
+        shares: list[dict[str, object]],
+        *,
+        generation: int,
+    ) -> PayoutLedgerArtifact:
+        return PayoutLedgerArtifact(
+            generation=generation,
+            payout_state_generation=0,
+            network_difficulty=1,
+            accepted_share_count=len(shares),
+            shares_json=tuple(shares),
+            prior_balances=(),
+            prepared_monotonic=time.monotonic(),
+            snapshot_anchor_ms=None,
+        )
+
+    def _build_with_echo_builder(
+        self,
+        server: PrismCoordinator,
+        shares: list[dict[str, object]],
+        serialization: object,
+        *,
+        height: int,
+    ) -> dict[str, object]:
+        # These tests cover the one-shot spool handoff; pin the persistent
+        # builder off so the echo helper is never spawned as a daemon.
+        with patch.dict(os.environ, {"PRISM_BUILDER_SERVE": "0"}), patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=list(ECHO_BUILDER_COMMAND),
+        ):
+            return server.build_audit_bundle(
+                shares=shares,
+                found_block={
+                    "block_height": height,
+                    "coinbase_value_sats": 50_00000000,
+                    "network_difficulty": 1,
+                    "anchor_job_issued_at_ms": 1_700_000_000_000,
+                },
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                summary_only=True,
+                payout_policy={"policy": "day-one"},
+                share_serialization=serialization,  # type: ignore[arg-type]
+            )
+
+    def _expected_payload(
+        self,
+        shares: list[dict[str, object]],
+        *,
+        height: int,
+    ) -> dict[str, object]:
+        identities, compact_shares = _compact_share_payload(shares)
+        return {
+            "found_block": {
+                "block_height": height,
+                "coinbase_value_sats": 50_00000000,
+                "network_difficulty": 1,
+                "anchor_job_issued_at_ms": 1_700_000_000_000,
+            },
+            "prior_balances": [],
+            "payout_policy": {"policy": "day-one"},
+            "coinbase_script_sig_suffix_hex": "00",
+            "witness_merkle_leaves_hex": [],
+            "compact_share_identities": [
+                list(identity) for identity in identities
+            ],
+            "compact_shares": [list(share) for share in compact_shares],
+        }
+
+    def test_spool_feeds_builder_and_is_written_once_per_generation(
+        self,
+    ) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+        spool_creations: list[int] = []
+        real_spool_file = prism_coordinator_module._share_window_spool_file
+
+        def counting_spool_file() -> object:
+            spool_creations.append(1)
+            return real_spool_file()
+
+        with patch(
+            "lab.prism.prism_coordinator._share_window_spool_file",
+            side_effect=counting_spool_file,
+        ):
+            first = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=10,
+            )
+            second = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=11,
+            )
+
+        self.assertEqual(
+            first["received"],
+            self._expected_payload(shares, height=10),
+        )
+        self.assertEqual(
+            second["received"],
+            self._expected_payload(shares, height=11),
+        )
+        self.assertEqual(len(spool_creations), 1)
+
+    def test_spool_creation_failure_falls_back_to_pipe_writes(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator._share_window_spool_file",
+            side_effect=OSError("temp filesystem unavailable"),
+        ) as spool_factory:
+            first = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=10,
+            )
+            second = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=11,
+            )
+
+        self.assertEqual(
+            first["received"],
+            self._expected_payload(shares, height=10),
+        )
+        self.assertEqual(
+            second["received"],
+            self._expected_payload(shares, height=11),
+        )
+        # The failure is sticky: a broken temp filesystem is not retried on
+        # every subsequent build of the same generation.
+        self.assertEqual(spool_factory.call_count, 1)
+
+    def test_splice_failure_poisons_spool_and_falls_back_to_pipe(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.os.splice",
+            side_effect=OSError("splice unsupported"),
+        ):
+            first = self._build_with_echo_builder(
+                server,
+                shares,
+                serialization,
+                height=10,
+            )
+        second = self._build_with_echo_builder(
+            server,
+            shares,
+            serialization,
+            height=11,
+        )
+
+        self.assertEqual(
+            first["received"],
+            self._expected_payload(shares, height=10),
+        )
+        self.assertEqual(
+            second["received"],
+            self._expected_payload(shares, height=11),
+        )
+        self.assertTrue(serialization._spool_failed)
+        self.assertIsNone(serialization._spool_file)
+
+    def test_mid_stream_splice_failure_poisons_spool_for_later_builds(
+        self,
+    ) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+
+        # The first chunk moves and the second fails: this build is
+        # unrepairable (partial tail already in the pipe), but the spool must
+        # be poisoned so later builds stream the cached fragments instead of
+        # repeating the failure.
+        with patch(
+            "lab.prism.prism_coordinator.os.splice",
+            side_effect=[16, OSError("splice io error")],
+        ):
+            with self.assertRaises(OSError):
+                self._build_with_echo_builder(
+                    server,
+                    shares,
+                    serialization,
+                    height=10,
+                )
+        self.assertTrue(serialization._spool_failed)
+
+        recovered = self._build_with_echo_builder(
+            server,
+            shares,
+            serialization,
+            height=11,
+        )
+        self.assertEqual(
+            recovered["received"],
+            self._expected_payload(shares, height=11),
+        )
+
+    def test_generation_rotation_retires_spool_after_last_lease(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        first = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+        lease = first.acquire_spooled_tail(shares)
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        spool_file, spool_size = lease
+        self.assertGreater(spool_size, 0)
+
+        second = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=2),
+            shares,
+        )
+        self.assertIsNot(second, first)
+        # Retired: no new leases, but the in-flight transfer keeps the
+        # descriptor alive until it releases.
+        self.assertIsNone(first.acquire_spooled_tail(shares))
+        self.assertFalse(spool_file.closed)
+        first.release_spooled_tail()
+        self.assertTrue(spool_file.closed)
+
+    def test_shutdown_retires_current_spool(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+        lease = serialization.acquire_spooled_tail(shares)
+        assert lease is not None
+        serialization.release_spooled_tail()
+        self.assertFalse(lease[0].closed)
+
+        server.retire_share_window_spool()
+
+        self.assertTrue(lease[0].closed)
+        self.assertIsNone(serialization.acquire_spooled_tail(shares))
+
+
+FAKE_SERVE_BUILDER_COMMAND = [
+    sys.executable,
+    str(Path(__file__).resolve().parent / "fixtures" / "fake_serve_builder.py"),
+]
+
+
+class ServeBuilderTests(unittest.TestCase):
+    """Persistent --serve builder client, its fallback, and supersession."""
+
+    def _coordinator(self) -> PrismCoordinator:
+        server, _rpc = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        self.addCleanup(server.shutdown_serve_builder)
+        self.addCleanup(server.retire_share_window_spool)
+        return server
+
+    def _serialization(
+        self,
+        server: PrismCoordinator,
+        shares: list[dict[str, object]],
+        *,
+        generation: int = 1,
+    ) -> object:
+        return server._share_window_serialization_for_artifact(
+            PayoutLedgerArtifact(
+                generation=generation,
+                payout_state_generation=0,
+                network_difficulty=1,
+                accepted_share_count=len(shares),
+                shares_json=tuple(shares),
+                prior_balances=(),
+                prepared_monotonic=time.monotonic(),
+                snapshot_anchor_ms=None,
+            ),
+            shares,
+        )
+
+    def _build(
+        self,
+        server: PrismCoordinator,
+        shares: list[dict[str, object]],
+        serialization: object,
+        *,
+        height: int,
+        mode: str = "ok",
+        cancellation: object = None,
+    ) -> dict[str, object]:
+        with patch.dict(
+            os.environ,
+            {"FAKE_SERVE_BUILDER_MODE": mode},
+        ), patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=list(FAKE_SERVE_BUILDER_COMMAND),
+        ):
+            return server.build_audit_bundle(
+                shares=shares,
+                found_block={
+                    "block_height": height,
+                    "coinbase_value_sats": 50_00000000,
+                    "network_difficulty": 1,
+                    "anchor_job_issued_at_ms": 1_700_000_000_000,
+                },
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                summary_only=True,
+                payout_policy={"policy": "day-one"},
+                share_serialization=serialization,  # type: ignore[arg-type]
+                cancellation=cancellation,  # type: ignore[arg-type]
+            )
+
+    def test_cache_miss_uploads_window_then_hits_on_next_request(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        identities, compact_shares = _compact_share_payload(shares)
+        expected_window = {
+            "compact_share_identities": [
+                list(identity) for identity in identities
+            ],
+            "compact_shares": [list(share) for share in compact_shares],
+        }
+        try:
+            first = self._build(server, shares, serialization, height=10)
+            second = self._build(server, shares, serialization, height=11)
+
+            self.assertEqual(first["transport"], "serve")
+            self.assertTrue(first["request_had_window"])
+            self.assertEqual(first["window"], expected_window)
+            self.assertEqual(first["found_block"]["block_height"], 10)
+
+            self.assertEqual(second["transport"], "serve")
+            self.assertFalse(second["request_had_window"])
+            self.assertEqual(second["window"], expected_window)
+            self.assertEqual(second["found_block"]["block_height"], 11)
+
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+                window_counts = dict(server.serve_builder_window_cache_counts)
+            self.assertEqual(counts["requests"], 2)
+            self.assertEqual(counts["spawns"], 1)
+            self.assertEqual(counts["fallbacks"], 0)
+            self.assertEqual(counts["window_uploads"], 1)
+            self.assertEqual(window_counts, {"hits": 1, "misses": 1})
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_needs_window_bounce_reuploads_and_succeeds(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            first = self._build(server, shares, serialization, height=10)
+            self.assertTrue(first["request_had_window"])
+            client = server._serve_builder
+            assert client is not None
+            second_shares = [spool_share(seq) for seq in range(1, 5)]
+            second_serialization = self._serialization(
+                server,
+                second_shares,
+                generation=2,
+            )
+            # Pretend this window was already uploaded: the daemon's
+            # needs_window bounce must repair the divergence transparently.
+            client.note_uploaded_window(
+                second_serialization.share_snapshot_sha256  # type: ignore[attr-defined]
+            )
+
+            server._ensure_tip_refresh_state()
+            server._job_build_phase_local.tip_refresh_metrics = True
+            try:
+                second = self._build(
+                    server,
+                    second_shares,
+                    second_serialization,
+                    height=11,
+                )
+            finally:
+                server._job_build_phase_local.tip_refresh_metrics = False
+
+            self.assertEqual(second["transport"], "serve")
+            self.assertTrue(second["request_had_window"])
+            self.assertEqual(second["found_block"]["block_height"], 11)
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["requests"], 2)
+            self.assertEqual(counts["fallbacks"], 0)
+            # One build observes serialization_copy exactly three times --
+            # fragment precompose, the accumulated transport writes, and the
+            # daemon's reported timings -- matching the one-shot transport
+            # even when a needs_window bounce re-sent the request.
+            histogram = server.tip_refresh_build_phase_histograms[
+                "serialization_copy"
+            ]
+            self.assertEqual(histogram["count"], 3)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_hit_promotion_keeps_mirror_and_daemon_lru_aligned(self) -> None:
+        server = self._coordinator()
+        shares_a = [spool_share(seq) for seq in range(1, 4)]
+        shares_b = [spool_share(seq) for seq in range(1, 5)]
+        shares_c = [spool_share(seq) for seq in range(1, 6)]
+        ser_a = self._serialization(server, shares_a, generation=1)
+        ser_b = self._serialization(server, shares_b, generation=2)
+        ser_c = self._serialization(server, shares_c, generation=3)
+        try:
+            self.assertTrue(
+                self._build(server, shares_a, ser_a, height=10)[
+                    "request_had_window"
+                ]
+            )
+            self.assertTrue(
+                self._build(server, shares_b, ser_b, height=11)[
+                    "request_had_window"
+                ]
+            )
+            # The hit promotes window A on both sides; uploading a third
+            # window must therefore evict B everywhere.
+            self.assertFalse(
+                self._build(server, shares_a, ser_a, height=12)[
+                    "request_had_window"
+                ]
+            )
+            self.assertTrue(
+                self._build(server, shares_c, ser_c, height=13)[
+                    "request_had_window"
+                ]
+            )
+
+            aligned = self._build(server, shares_a, ser_a, height=14)
+
+            self.assertEqual(aligned["transport"], "serve")
+            self.assertFalse(aligned["request_had_window"])
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["requests"], 5)
+            self.assertEqual(counts["window_uploads"], 3)
+            self.assertEqual(counts["fallbacks"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_daemon_crash_falls_back_to_one_shot(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            result = self._build(
+                server,
+                shares,
+                serialization,
+                height=10,
+                mode="crash-before-response",
+            )
+
+            self.assertEqual(result["transport"], "one-shot")
+            self.assertEqual(
+                result["received"]["found_block"]["block_height"],
+                10,
+            )
+            self.assertIn("compact_shares", result["received"])
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+                self.assertIsNone(server._serve_builder)
+            self.assertEqual(counts["fallbacks"], 1)
+            self.assertEqual(counts["requests"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_daemon_splice_failure_poisons_spool_and_one_shot_recovers(
+        self,
+    ) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            # The daemon upload dies mid-splice; the spool is poisoned before
+            # falling back, so the fresh one-shot subprocess streams the
+            # cached fragments instead of retrying the same failing transfer.
+            with patch(
+                "lab.prism.prism_coordinator.os.splice",
+                side_effect=[16, OSError("splice io error")],
+            ):
+                result = self._build(server, shares, serialization, height=10)
+
+            self.assertEqual(result["transport"], "one-shot")
+            self.assertIn("compact_shares", result["received"])
+            self.assertTrue(serialization._spool_failed)  # type: ignore[attr-defined]
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["fallbacks"], 1)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_protocol_mismatch_falls_back_to_one_shot(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            result = self._build(
+                server,
+                shares,
+                serialization,
+                height=10,
+                mode="protocol-mismatch",
+            )
+
+            self.assertEqual(result["transport"], "one-shot")
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+                self.assertIsNone(server._serve_builder)
+            self.assertEqual(counts["fallbacks"], 1)
+            # The mismatched daemon was a real worker launch and must appear
+            # in the lifecycle totals alongside the one-shot fallback.
+            with server._job_build_scheduler_lock:
+                worker_counts = dict(server.job_build_worker_counts)
+            self.assertEqual(worker_counts["starts"], 2)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_disabled_serve_builder_uses_one_shot_directly(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        with patch.dict(os.environ, {"PRISM_BUILDER_SERVE": "0"}):
+            result = self._build(server, shares, serialization, height=10)
+
+        self.assertEqual(result["transport"], "one-shot")
+        with server._serve_builder_metrics_lock:
+            counts = dict(server.serve_builder_counts)
+        self.assertEqual(counts["spawns"], 0)
+
+    def test_daemon_timeout_fallback_shares_the_build_deadline(self) -> None:
+        server = self._coordinator()
+        # An already-exhausted budget: the daemon attempt must not grant the
+        # one-shot fallback a fresh full deadline, and the timeout is counted
+        # as one worker failure, not two.
+        server.bundle_build_timeout_seconds = 0.0
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "qbit-prism-build-audit-bundle timed out",
+        ):
+            self._build(
+                server,
+                shares,
+                serialization,
+                height=10,
+                mode="hang-after-request",
+            )
+
+        with server._serve_builder_metrics_lock:
+            counts = dict(server.serve_builder_counts)
+        self.assertEqual(counts["fallbacks"], 1)
+        self.assertEqual(counts["spawns"], 0)
+        self.assertEqual(server.tip_refresh_worker_failures, 1)
+        # The live daemon killed at the handshake deadline is a recorded
+        # termination, and the one-shot replacement consumes the pending
+        # restart: two launches, one termination, one restart.
+        with server._job_build_scheduler_lock:
+            worker_counts = dict(server.job_build_worker_counts)
+            self.assertFalse(server._job_build_worker_restart_pending)
+        self.assertEqual(worker_counts["starts"], 2)
+        self.assertEqual(worker_counts["terminations"], 1)
+        self.assertEqual(worker_counts["restarts"], 1)
+
+    def test_idle_daemon_death_counts_crash_and_restart(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            first = self._build(server, shares, serialization, height=10)
+            self.assertEqual(first["transport"], "serve")
+            client = server._serve_builder
+            assert client is not None
+            client.process.kill()
+            client.process.wait(timeout=5)
+
+            second = self._build(server, shares, serialization, height=11)
+
+            self.assertEqual(second["transport"], "serve")
+            with server._job_build_scheduler_lock:
+                counts = dict(server.job_build_worker_counts)
+                self.assertFalse(server._job_build_worker_restart_pending)
+            self.assertEqual(counts["crashes"], 1)
+            self.assertEqual(counts["restarts"], 1)
+            self.assertEqual(server.tip_refresh_worker_restarts, 1)
+            with server._serve_builder_metrics_lock:
+                serve_counts = dict(server.serve_builder_counts)
+            self.assertEqual(serve_counts["spawns"], 2)
+            self.assertEqual(serve_counts["fallbacks"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_daemon_respawn_counts_as_worker_restart(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        try:
+            # A prior worker ended abnormally (crash or supersession kill)
+            # with no immediate fallback consuming the flag; the replacement
+            # daemon spawn must claim the restart instead of leaking it to
+            # an unrelated later one-shot build.
+            server._ensure_tip_refresh_state()
+            with server._job_build_scheduler_lock:
+                server._job_build_worker_restart_pending = True
+
+            result = self._build(server, shares, serialization, height=10)
+
+            self.assertEqual(result["transport"], "serve")
+            with server._job_build_scheduler_lock:
+                counts = dict(server.job_build_worker_counts)
+                self.assertFalse(server._job_build_worker_restart_pending)
+            self.assertEqual(counts["restarts"], 1)
+            self.assertGreaterEqual(counts["starts"], 1)
+            self.assertEqual(server.tip_refresh_worker_restarts, 1)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_daemon_detaches_from_build_control_after_request(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        control = prism_coordinator_module._JobBundleBuildControl(
+            key=("serve-detach",),
+            previousblockhash="11" * 32,
+            payout_state_generation=0,
+            payout_artifact_generation=1,
+        )
+        with server._job_cache_lock:
+            server._active_job_bundle_builds[control.key] = control
+        server._job_build_phase_local.bundle_build_control = control
+        try:
+            result = self._build(server, shares, serialization, height=10)
+
+            self.assertEqual(result["transport"], "serve")
+            # The completed request detached the daemon: a late supersession
+            # of this build has no process reference left to terminate.
+            self.assertIsNone(control.process)
+            control.cancel_event.set()
+            client = server._serve_builder
+            assert client is not None
+            self.assertIsNone(client.process.poll())
+        finally:
+            server._job_build_phase_local.bundle_build_control = None
+            control.cancel_event.set()
+            with server._job_cache_lock:
+                server._active_job_bundle_builds.pop(control.key, None)
+            server.shutdown_serve_builder()
+
+    def test_supersession_cancels_in_flight_daemon_request(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+        serialization = self._serialization(server, shares)
+        control = prism_coordinator_module._JobBundleBuildControl(
+            key=("serve-test",),
+            previousblockhash="11" * 32,
+            payout_state_generation=0,
+            payout_artifact_generation=1,
+        )
+        with server._job_cache_lock:
+            server._active_job_bundle_builds[control.key] = control
+        errors: list[BaseException] = []
+        results: list[object] = []
+
+        def build() -> None:
+            # The bundle-build control travels on the builder thread's local
+            # state, exactly as _execute_job_build installs it.
+            server._job_build_phase_local.bundle_build_control = control
+            try:
+                results.append(
+                    self._build(
+                        server,
+                        shares,
+                        serialization,
+                        height=10,
+                        mode="hang-after-request",
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+            finally:
+                server._job_build_phase_local.bundle_build_control = None
+
+        thread = threading.Thread(target=build)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if control.process is not None:
+                    break
+                time.sleep(0.005)
+            self.assertIsNotNone(control.process)
+
+            control.cancel_event.set()
+            thread.join(5.0)
+        finally:
+            control.cancel_event.set()
+            thread.join(1.0)
+            server.shutdown_serve_builder()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], JobBuildSuperseded)
+        self.assertIsNone(server._serve_builder)
 
 
 if __name__ == "__main__":
