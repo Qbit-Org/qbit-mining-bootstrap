@@ -87,6 +87,22 @@ DEFAULT_PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS = 1.0
 PRISM_TIP_REFRESH_FAILURE_HOLDOFF_JITTER_FRACTION = 0.25
 DEFAULT_PRISM_JOB_BUNDLE_CACHE_SECONDS = 10.0
 DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS = 60.0
+# Minimum spacing between speculative payout-ledger-artifact rebuilds armed by
+# a failed reuse fence. Every fence failure wants a fresh artifact, but each
+# rebuild walks the full reward window; the floor keeps that CTE from running
+# continuously when shares land faster than a rebuild can complete.
+DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS = 5.0
+# Consecutive aborted speculative rebuilds double the re-arm interval up to
+# this multiplier (80s at the default floor). Under sustained share traffic
+# the exact-count publication fence keeps aborting rebuilds; backing off
+# stops the reward-window CTE from cycling -- and from holding the payout
+# preparation lock tip builds also need -- while writes stay continuous. Any
+# successful install or event-driven preparation resets the backoff.
+PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP = 16
+# Upper bound for one kernel transfer from the share-window spool file into
+# the audit builder's stdin pipe. The kernel clamps each call to the free
+# pipe capacity anyway; the bound only paces cancellation checkpoints.
+PRISM_SPOOL_SPLICE_CHUNK_BYTES = 1 << 20
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
 DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
@@ -1315,6 +1331,15 @@ class CachedJobBundle:
     # full audit bundle (and its duplicate shares tree) in every cached job.
     prospective_prior_balances: tuple[tuple[str, str, str, int], ...] | None = None
     build_key: JobBuildKey | None = None
+    # A synchronous ready build publishes its fenced ledger window for reuse
+    # only once this bundle wins cache publication (or is served as pinned
+    # snapshot work). Installing mid-build would re-key concurrent lookups
+    # away from the in-flight single flight and fork redundant builds.
+    prepared_ledger_artifact: PayoutLedgerArtifact | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -1416,6 +1441,22 @@ class PayoutLedgerArtifact:
     # replaying qbit_audit_share_window at the declared anchor must reproduce
     # exactly these shares, which only holds at the snapshot's own anchor.
     snapshot_anchor_ms: int | None = None
+    # Canonical digest of shares_json. Cached bundles built before this
+    # artifact was armed may only keep serving re-keyed lookups when their
+    # own window digest matches; anything else must rebuild from the
+    # artifact so a fresher window is never shadowed by older cached work.
+    share_snapshot_sha256: str | None = None
+
+
+def _share_window_spool_file() -> Any:
+    """Anonymous spool file for the serialized share-window payload tail.
+
+    Created in the same temporary filesystem the builder's captured output
+    and stderr already use, and unlinked from birth: a crashed coordinator
+    can never strand a multi-megabyte window on disk, and closing the last
+    descriptor is the entire cleanup story.
+    """
+    return tempfile.TemporaryFile()
 
 
 @dataclass
@@ -1429,6 +1470,13 @@ class _ShareWindowSerialization:
     build serialized the whole window under the GIL each time. The compact
     fragments are derived lazily by the first audit-builder invocation --
     embedders that replace the builder never require the compact schema.
+
+    The fragments' invariant byte encoding is additionally spooled to an
+    anonymous temp file once per key, so every build after the first can feed
+    the audit builder's stdin through kernel transfers instead of re-writing
+    megabytes of unchanged JSON through Python. Spool access is leased:
+    rotation to a new generation retires the spool, and the descriptor closes
+    when the last in-flight transfer releases it, never underneath one.
     """
 
     key: tuple[int, int, int]
@@ -1443,6 +1491,15 @@ class _ShareWindowSerialization:
         repr=False,
     )
     _compact_shares_json: str | None = field(default=None, repr=False)
+    _spool_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+    )
+    _spool_file: Any = field(default=None, repr=False)
+    _spool_size: int = field(default=0, repr=False)
+    _spool_failed: bool = field(default=False, repr=False)
+    _spool_retired: bool = field(default=False, repr=False)
+    _spool_leases: int = field(default=0, repr=False)
 
     def compact_fragments(
         self,
@@ -1471,6 +1528,148 @@ class _ShareWindowSerialization:
                 self._compact_share_identities_json,
                 self._compact_shares_json,
             )
+
+    def acquire_spooled_tail(
+        self,
+        shares: list[dict[str, object]],
+    ) -> tuple[Any, int] | None:
+        """Lease the spooled payload tail, writing it on first use.
+
+        Returns the open spool file and its byte size, or None when spooling
+        is unavailable (creation failed earlier, a transfer poisoned it, or
+        the generation was retired). The caller must pair a successful lease
+        with release_spooled_tail once its transfer is finished.
+        """
+        with self._spool_lock:
+            if self._spool_failed or self._spool_retired:
+                return None
+            if self._spool_file is None:
+                identities_json, compact_shares_json = self.compact_fragments(
+                    shares
+                )
+                spool = None
+                try:
+                    spool = _share_window_spool_file()
+                    spool.write(b',"compact_share_identities":')
+                    spool.write(identities_json.encode("utf-8"))
+                    spool.write(b',"compact_shares":')
+                    spool.write(compact_shares_json.encode("utf-8"))
+                    spool.write(b"}")
+                    spool.flush()
+                    size = spool.seek(0, os.SEEK_END)
+                except (OSError, ValueError):
+                    # Spooling is an optimization; the in-memory pipe path
+                    # remains authoritative. Failure is sticky so a broken
+                    # temp filesystem is not retried on every build.
+                    self._spool_failed = True
+                    if spool is not None:
+                        try:
+                            spool.close()
+                        except OSError:
+                            pass
+                    return None
+                self._spool_file = spool
+                self._spool_size = int(size)
+            self._spool_leases += 1
+            return self._spool_file, self._spool_size
+
+    def release_spooled_tail(self) -> None:
+        with self._spool_lock:
+            self._spool_leases -= 1
+            self._close_spool_if_unused_locked()
+
+    def mark_spool_failed(self) -> None:
+        """Poison the spool after a transfer-side failure (still leased)."""
+        with self._spool_lock:
+            self._spool_failed = True
+
+    def retire_spool(self) -> None:
+        """Stop new leases and close the file once in-flight ones finish."""
+        with self._spool_lock:
+            self._spool_retired = True
+            self._close_spool_if_unused_locked()
+
+    def _close_spool_if_unused_locked(self) -> None:
+        if (
+            self._spool_leases > 0
+            or self._spool_file is None
+            or not (self._spool_retired or self._spool_failed)
+        ):
+            return
+        spool, self._spool_file = self._spool_file, None
+        self._spool_size = 0
+        try:
+            spool.close()
+        except OSError:
+            pass
+
+
+# JSONL protocol version this coordinator speaks with the --serve audit
+# builder. The daemon announces its version in a startup handshake; any
+# mismatch retires the daemon and every build falls back to one-shot mode.
+PRISM_SERVE_BUILDER_PROTOCOL_VERSION = 1
+# Parsed share windows the --serve daemon retains; the coordinator mirrors
+# the bound to predict which uploads the daemon still holds.
+PRISM_SERVE_BUILDER_WINDOW_CACHE_ENTRIES = 2
+
+
+class _ServeBuilderUnavailable(RuntimeError):
+    """Daemon anomaly; the build must transparently use one-shot mode."""
+
+
+@dataclass
+class _ServeBuilderClient:
+    """Line-oriented I/O state for one long-lived --serve audit builder."""
+
+    process: subprocess.Popen[bytes]
+    stdout_buffer: bytearray = field(default_factory=bytearray, repr=False)
+    # Mirrors the daemon's bounded LRU so requests can predict whether the
+    # window must ride along. Divergence is repaired by the daemon's
+    # needs_window response, never trusted blindly.
+    uploaded_windows: OrderedDict[str, None] = field(
+        default_factory=OrderedDict,
+        repr=False,
+    )
+
+    def note_uploaded_window(self, share_snapshot_sha256: str) -> None:
+        self.uploaded_windows.pop(share_snapshot_sha256, None)
+        self.uploaded_windows[share_snapshot_sha256] = None
+        while len(self.uploaded_windows) > PRISM_SERVE_BUILDER_WINDOW_CACHE_ENTRIES:
+            self.uploaded_windows.popitem(last=False)
+
+    def close(self) -> None:
+        # Tolerates lightweight process fakes used by embedders and tests,
+        # which do not necessarily expose the full Popen surface.
+        process = self.process
+        poll = getattr(process, "poll", None)
+        wait = getattr(process, "wait", None)
+        if callable(poll):
+            if poll() is None:
+                try:
+                    process.kill()
+                except (ProcessLookupError, OSError, AttributeError):
+                    pass
+            if callable(wait):
+                try:
+                    wait(timeout=5.0)
+                except (
+                    subprocess.TimeoutExpired,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    AttributeError,
+                ):
+                    pass
+        for stream in (
+            getattr(process, "stdin", None),
+            getattr(process, "stdout", None),
+        ):
+            if stream is None or not hasattr(stream, "close"):
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 @dataclass
@@ -2503,6 +2702,10 @@ class PrismCoordinator:
             "PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS",
             DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
         )
+        self.payout_artifact_rearm_min_seconds = env_positive_float(
+            "PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS",
+            DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,
+        )
         self.template_cache_seconds = env_nonnegative_float(
             "PRISM_TEMPLATE_CACHE_SECONDS",
             self.blockpoll_seconds,
@@ -3381,6 +3584,13 @@ class PrismCoordinator:
             self._job_build_pending: _JobBuildRequest | None = None
         if not hasattr(self, "_job_build_issued_at_ms"):
             self._job_build_issued_at_ms: OrderedDict[int, int] = OrderedDict()
+        if not hasattr(self, "_job_build_anchor_counts"):
+            # Accepted-share count captured (bracketed) when the matching
+            # generation's snapshot anchor was clamped; None when the count
+            # read failed or moved mid-clamp. Guarded by _job_cache_lock.
+            self._job_build_anchor_counts: OrderedDict[int, int | None] = (
+                OrderedDict()
+            )
         if not hasattr(self, "job_build_timeout_seconds"):
             self.job_build_timeout_seconds = DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS
         if not hasattr(self, "job_build_cancel_grace_seconds"):
@@ -3441,6 +3651,39 @@ class PrismCoordinator:
             self._payout_artifact_requested: tuple[int, int] | None = None
         if not hasattr(self, "_payout_artifact_executor_shutdown"):
             self._payout_artifact_executor_shutdown = False
+        if not hasattr(self, "_payout_artifact_last_schedule_monotonic"):
+            # Guarded by _payout_artifact_executor_lock. Stamped by every
+            # accepted preparation request so fence-failure re-arms measure
+            # their debounce from the newest scheduled rebuild, whichever
+            # path requested it.
+            self._payout_artifact_last_schedule_monotonic: float | None = None
+        if not hasattr(self, "_payout_artifact_rearm_backoff"):
+            # Guarded by _payout_artifact_executor_lock.
+            self._payout_artifact_rearm_backoff = 1
+        if not hasattr(self, "_serve_builder_lock"):
+            # Serializes daemon ownership per request. Contended builds do
+            # not queue behind the daemon; they take the one-shot path.
+            self._serve_builder_lock = threading.Lock()
+        if not hasattr(self, "_serve_builder"):
+            self._serve_builder: _ServeBuilderClient | None = None
+        if not hasattr(self, "_serve_builder_shutdown"):
+            self._serve_builder_shutdown = False
+        if not hasattr(self, "_serve_builder_metrics_lock"):
+            # Counters get their own short-lived lock so a metrics scrape
+            # never waits behind _serve_builder_lock, which one request can
+            # hold for a whole daemon round trip.
+            self._serve_builder_metrics_lock = threading.Lock()
+        if not hasattr(self, "serve_builder_counts"):
+            # Guarded by _serve_builder_metrics_lock.
+            self.serve_builder_counts = {
+                "requests": 0,
+                "fallbacks": 0,
+                "spawns": 0,
+                "window_uploads": 0,
+            }
+        if not hasattr(self, "serve_builder_window_cache_counts"):
+            # Guarded by _serve_builder_metrics_lock.
+            self.serve_builder_window_cache_counts = {"hits": 0, "misses": 0}
         if not hasattr(self, "_payout_state_delivery_gate"):
             # Orders reconciliation mutations against final job-delivery
             # admission while preserving parallel sends to different miners.
@@ -3733,6 +3976,22 @@ class PrismCoordinator:
             except ProcessLookupError:
                 pass
 
+    def _unregister_job_bundle_process(
+        self,
+        control: _JobBundleBuildControl,
+        process: Any,
+    ) -> None:
+        """Detach a shared daemon from a build control after its request.
+
+        Registration makes supersession terminate the in-flight process.
+        Once this build's daemon request has completed, a later supersession
+        of the build must not kill the shared daemon out from under
+        whichever request owns it next.
+        """
+        with self._job_cache_lock:
+            if control.process is process:
+                control.process = None
+
     def _build_payout_ledger_artifact(
         self,
         expected_payout_state_generation: int,
@@ -3762,7 +4021,19 @@ class PrismCoordinator:
                     * PRISM_SNAPSHOT_WINDOW_MARGIN
                     * int(network_difficulty)
                 )
-                snapshot_anchor_ms = self._job_snapshot_anchor_ms(now_ms())
+                clamp_now_ms = now_ms()
+                snapshot_anchor_ms = self._job_snapshot_anchor_ms(clamp_now_ms)
+                if snapshot_anchor_ms != clamp_now_ms:
+                    # A pending commit holds the anchor floor. Stamping and
+                    # writer enqueue are not atomic, so a share stamped after
+                    # the floor holder may already be durable; the global
+                    # accepted count then cannot be scoped to the clamped
+                    # anchor, and publishing that pairing could let reuse
+                    # serve a window that omits a durable share. Abort before
+                    # paying the window walk; the re-arm backoff paces
+                    # retries and the floor drains within group-commit
+                    # latency.
+                    return None
                 records = list(
                     self.ledger.snapshot_at_job_issue(
                         snapshot_anchor_ms,
@@ -3785,6 +4056,7 @@ class PrismCoordinator:
         copy_started = time.monotonic()
         shares_json = tuple(record.to_prism_json() for record in records)
         frozen_balances = tuple(prior_balances)
+        share_snapshot_sha256 = canonical_json_sha256(shares_json)
         self._observe_tip_refresh_build_phase(
             "serialization_copy",
             time.monotonic() - copy_started,
@@ -3798,6 +4070,7 @@ class PrismCoordinator:
             prior_balances=frozen_balances,
             prepared_monotonic=time.monotonic(),
             snapshot_anchor_ms=snapshot_anchor_ms,
+            share_snapshot_sha256=share_snapshot_sha256,
         )
 
     def _prepare_payout_ledger_artifact(
@@ -3812,15 +4085,96 @@ class PrismCoordinator:
             network_difficulty,
         )
         if artifact is None:
+            # The publication fence (or a superseding generation) discarded
+            # this attempt; continuous share traffic can keep doing so, and
+            # each attempt walks the reward window under the preparation
+            # lock. Back the fence-failure re-arm off until something arms.
+            with self._payout_artifact_executor_lock:
+                self._payout_artifact_rearm_backoff = min(
+                    self._payout_artifact_rearm_backoff * 2,
+                    PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP,
+                )
             return
+        self._install_payout_ledger_artifact(artifact)
+
+    def _install_payout_ledger_artifact(
+        self,
+        artifact: PayoutLedgerArtifact,
+    ) -> None:
+        """Atomically publish a prepared artifact for its own generation.
+
+        Snapshot-freshness-ordered and idempotent: accepted-share counts are
+        append-only within a payout generation, so the count orders snapshots
+        even when a build delayed in window conversion finishes after a
+        later snapshot installed (completion time cannot order snapshots).
+        Equal-count installs with an identical window -- every flight waiter
+        re-runs cache publication with the same prepared artifact, and a
+        same-window speculative rebuild re-reads unchanged state under a
+        fresh anchor -- keep the installed generation instead of re-keying
+        bundle lookups for nothing.
+        """
         with self._job_cache_lock:
-            if payout_state_generation != self._payout_state_generation:
+            if artifact.payout_state_generation != self._payout_state_generation:
                 return
-            self._payout_ledger_artifact_generation += 1
-            self._payout_ledger_artifact = dataclass_replace(
-                artifact,
-                generation=self._payout_ledger_artifact_generation,
-            )
+            current = self._payout_ledger_artifact
+            already_current = False
+            if (
+                current is not None
+                and current.payout_state_generation
+                == artifact.payout_state_generation
+            ):
+                if (
+                    current.accepted_share_count
+                    > artifact.accepted_share_count
+                ):
+                    return
+                if (
+                    current.accepted_share_count
+                    == artifact.accepted_share_count
+                ):
+                    if (
+                        current.network_difficulty
+                        == artifact.network_difficulty
+                        and current.share_snapshot_sha256 is not None
+                        and current.share_snapshot_sha256
+                        == artifact.share_snapshot_sha256
+                    ):
+                        # The armed artifact already carries exactly this
+                        # window; keep its generation (no lookup re-key) but
+                        # still treat the preparation as a success below.
+                        already_current = True
+                    else:
+                        template_artifacts = getattr(
+                            self,
+                            "_template_artifacts",
+                            None,
+                        )
+                        if (
+                            current.network_difficulty
+                            != artifact.network_difficulty
+                            and template_artifacts is not None
+                            and current.network_difficulty
+                            == int(template_artifacts.network_difficulty)
+                            and artifact.network_difficulty
+                            != int(template_artifacts.network_difficulty)
+                        ):
+                            # Equal counts cannot order snapshots across a
+                            # retarget; keep the artifact the live template
+                            # difficulty can actually reuse rather than
+                            # letting a delayed pre-retarget build regress
+                            # it.
+                            return
+            if not already_current:
+                self._payout_ledger_artifact_generation += 1
+                self._payout_ledger_artifact = dataclass_replace(
+                    artifact,
+                    generation=self._payout_ledger_artifact_generation,
+                )
+        # An armed artifact -- installed fresh or confirmed already current
+        # -- proves preparation can succeed again; let the next fence-failure
+        # re-arm run at the configured floor.
+        with self._payout_artifact_executor_lock:
+            self._payout_artifact_rearm_backoff = 1
 
     def _payout_artifact_preparation_loop(self) -> None:
         while True:
@@ -3836,16 +4190,41 @@ class PrismCoordinator:
         self,
         payout_state_generation: int,
         network_difficulty: int,
+        *,
+        min_interval_seconds: float | None = None,
     ) -> None:
-        """Latest-generation-wins scheduling with one worker and one slot."""
+        """Latest-generation-wins scheduling with one worker and one slot.
+
+        With min_interval_seconds, the debounce check, timestamp update, and
+        request enqueue are one atomic step under the executor lock: a
+        concurrent dequeue or a racing probe cannot slip a duplicate request
+        into the emptied slot and run the reward-window snapshot twice.
+        """
         self._ensure_job_cache_state()
         with self._payout_artifact_executor_lock:
             if self._payout_artifact_executor_shutdown:
                 return
+            if min_interval_seconds is not None:
+                # Consecutive aborted rebuilds stretch the re-arm interval;
+                # event-driven preparations below reset the backoff because
+                # they mark a real state change worth retrying promptly for.
+                effective_interval = (
+                    min_interval_seconds * self._payout_artifact_rearm_backoff
+                )
+                if (
+                    self._payout_artifact_last_schedule_monotonic is not None
+                    and time.monotonic()
+                    - self._payout_artifact_last_schedule_monotonic
+                    < effective_interval
+                ):
+                    return
+            else:
+                self._payout_artifact_rearm_backoff = 1
             self._payout_artifact_requested = (
                 int(payout_state_generation),
                 int(network_difficulty),
             )
+            self._payout_artifact_last_schedule_monotonic = time.monotonic()
             if self._payout_artifact_future is not None:
                 return
             executor = self._payout_artifact_executor
@@ -3863,6 +4242,8 @@ class PrismCoordinator:
         self,
         payout_state_generation: int,
         network_difficulty: int,
+        *,
+        rearm_on_fence_failure: bool = True,
     ) -> PayoutLedgerArtifact | None:
         self._ensure_job_cache_state()
         with self._job_cache_lock:
@@ -3884,6 +4265,15 @@ class PrismCoordinator:
         except Exception:
             return None
         if accepted_share_count != artifact.accepted_share_count:
+            # The armed artifact went stale the moment a newer share became
+            # durable. No payout event may arrive for a long time, so queue a
+            # bounded speculative rebuild; exact-count reuse semantics are
+            # unchanged because the stale artifact stays rejected here.
+            if rearm_on_fence_failure:
+                self._rearm_payout_ledger_artifact_after_fence_failure(
+                    payout_state_generation,
+                    network_difficulty,
+                )
             return None
         balances_sha256 = canonical_json_sha256(artifact.prior_balances)
         with self._job_cache_lock:
@@ -3901,6 +4291,45 @@ class PrismCoordinator:
                 return None
             return artifact
 
+    def _rearm_payout_ledger_artifact_after_fence_failure(
+        self,
+        payout_state_generation: int,
+        network_difficulty: int,
+    ) -> None:
+        """Debounced rebuild scheduling for a share-staled artifact.
+
+        The interval floor keeps the reward-window CTE from running
+        continuously when shares land faster than rebuilds complete. Landed
+        accepted-block previews suppress the re-arm entirely: a speculative
+        rebuild in that window would read database balances the published
+        prospective state has already superseded, and the durable-confirmation
+        path resumes preparation itself once the gap closes.
+        """
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            if (
+                self._payout_state_publication_blocked
+                or payout_state_generation != self._payout_state_generation
+            ):
+                return
+        with self._accepted_block_payout_preview_condition:
+            if any(
+                transition.landed
+                for transition in self._accepted_block_payout_previews.values()
+            ):
+                return
+        self._schedule_payout_ledger_artifact_preparation(
+            payout_state_generation,
+            network_difficulty,
+            min_interval_seconds=float(
+                getattr(
+                    self,
+                    "payout_artifact_rearm_min_seconds",
+                    DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,
+                )
+            ),
+        )
+
     def _schedule_current_payout_ledger_artifact_if_missing(self) -> None:
         """Resume speculative preparation after a durable preview catches up."""
         self._ensure_job_cache_state()
@@ -3912,6 +4341,10 @@ class PrismCoordinator:
         if self._usable_payout_ledger_artifact(
             payout_state_generation,
             template_artifacts.network_difficulty,
+            # This call site enqueues unconditionally below; letting the
+            # probe also re-arm would race the one-slot worker's dequeue and
+            # run the reward-window snapshot twice for one resumption.
+            rearm_on_fence_failure=False,
         ) is not None:
             return
         self._schedule_payout_ledger_artifact_preparation(
@@ -5977,6 +6410,14 @@ class PrismCoordinator:
         if published_generation is None:
             self._record_discarded_payout_candidate()
             return None
+        # A publication is a fresh start for speculative preparation: the
+        # candidate artifact installs through the atomic pointer swap above
+        # (not _install_payout_ledger_artifact), so whatever re-arm backoff
+        # pre-publication share traffic accumulated must be released here or
+        # a share landing right after publication would stay suppressed for
+        # the whole scaled interval.
+        with self._payout_artifact_executor_lock:
+            self._payout_artifact_rearm_backoff = 1
         self._cancel_obsolete_job_bundle_builds(
             payout_state_generation=published_generation
         )
@@ -6382,6 +6823,56 @@ class PrismCoordinator:
             return self._job_bundle_cache.get(key)
         return None
 
+    def _no_artifact_job_bundle_key(
+        self,
+        artifacts: CachedTemplateArtifacts,
+        *,
+        mode: str,
+        payout_state_generation: int,
+        worker: WorkerIdentity | None,
+    ) -> tuple[object, ...]:
+        """Fallback cache identity for work built before an artifact re-key.
+
+        A synchronous build caches its bundle under the no-artifact key and
+        then publishes its fenced window as the payout ledger artifact. The
+        next lookup is keyed to that artifact and would miss the still-fresh
+        bundle and rebuild identical work: within one payout generation and
+        template identity the no-artifact bundle binds the same balances,
+        window anchor, and policy inputs, so it remains a correct cache
+        identity to serve -- but only while its window digest matches the
+        armed artifact (see _no_artifact_bundle_matches_artifact); a fence
+        re-arm can install a fresher window that cached work must not shadow.
+        """
+        return self._job_bundle_key(
+            artifacts,
+            mode=mode,
+            payout_state_generation=payout_state_generation,
+            payout_artifact_generation=0,
+            worker=worker,
+        )
+
+    @staticmethod
+    def _no_artifact_bundle_matches_artifact(
+        cached: CachedJobBundle,
+        payout_artifact: PayoutLedgerArtifact | None,
+    ) -> bool:
+        """Whether pre-re-key cached work carries exactly the artifact's window.
+
+        A speculative rebuild can arm a fresher artifact while an older
+        no-artifact bundle is still inside its cache TTL. Serving that bundle
+        would shadow the fresher window behind cached work, so the fallback
+        identity is honored only when the window digests are byte-identical
+        -- which the bundle that published the artifact satisfies by
+        construction.
+        """
+        return (
+            payout_artifact is not None
+            and payout_artifact.share_snapshot_sha256 is not None
+            and cached.build_key is not None
+            and cached.build_key.share_snapshot_sha256
+            == payout_artifact.share_snapshot_sha256
+        )
+
     def _job_bundle_entry_usable(
         self,
         cached: CachedJobBundle | None,
@@ -6559,15 +7050,70 @@ class PrismCoordinator:
         )
         with self._job_cache_lock:
             issued_at_ms = self._job_build_issued_at_ms.get(artifacts.generation)
-            if issued_at_ms is None:
-                # The issued time doubles as the audit window anchor, so it
-                # must not cover a stamped share whose commit is still in
-                # flight: the frozen anchor stays reproducible from the
-                # durable ledger for every rebuild of this generation.
-                issued_at_ms = self._job_snapshot_anchor_ms(now_ms())
-                self._job_build_issued_at_ms[artifacts.generation] = issued_at_ms
-                while len(self._job_build_issued_at_ms) > 128:
-                    self._job_build_issued_at_ms.popitem(last=False)
+        if issued_at_ms is None:
+            # The issued time doubles as the audit window anchor, so it
+            # must not cover a stamped share whose commit is still in
+            # flight: the frozen anchor stays reproducible from the
+            # durable ledger for every rebuild of this generation.
+            #
+            # The accepted count bracketing the clamp is captured with it:
+            # commits are single-writer FIFO in accepted_at_ms order, so at
+            # clamp time the total durable count equals the count of shares
+            # at or below the anchor. A later synchronous snapshot may only
+            # seed the payout ledger artifact while the live count still
+            # equals this value; otherwise a share newer than the frozen
+            # anchor is durable, and binding the inclusive count to the
+            # anchor-exclusive window would wedge the reuse fence open.
+            anchor_scoped_count: int | None = None
+            candidate_anchor_ms: int | None = None
+            # A commit racing the clamp voids one bracket. The capture is a
+            # pair of cheap aggregate reads, so retry a bounded number of
+            # times instead of leaving synchronous seeding disabled for this
+            # whole generation; a late re-bind after freezing is impossible
+            # because a failed bracket cannot tell which side of the clamp
+            # each racing commit landed on.
+            for _capture_attempt in range(3):
+                try:
+                    count_before, _ = self.accepted_share_stats()
+                except Exception:
+                    count_before = None
+                clamp_now_ms = now_ms()
+                candidate_anchor_ms = self._job_snapshot_anchor_ms(
+                    clamp_now_ms
+                )
+                if count_before is None:
+                    break
+                if candidate_anchor_ms != clamp_now_ms:
+                    # A pending commit clamps the anchor below now. Stamping
+                    # and writer enqueue are not atomic, so a share stamped
+                    # after the floor holder may already be durable and the
+                    # global count cannot be scoped to this anchor; retry
+                    # for a drained floor instead of storing an unbindable
+                    # count.
+                    continue
+                try:
+                    count_after, _ = self.accepted_share_stats()
+                except Exception:
+                    break
+                if int(count_after) == int(count_before):
+                    anchor_scoped_count = int(count_after)
+                    break
+            with self._job_cache_lock:
+                issued_at_ms = self._job_build_issued_at_ms.get(
+                    artifacts.generation
+                )
+                if issued_at_ms is None:
+                    issued_at_ms = candidate_anchor_ms
+                    self._job_build_issued_at_ms[artifacts.generation] = (
+                        issued_at_ms
+                    )
+                    self._job_build_anchor_counts[artifacts.generation] = (
+                        anchor_scoped_count
+                    )
+                    while len(self._job_build_issued_at_ms) > 128:
+                        self._job_build_issued_at_ms.popitem(last=False)
+                    while len(self._job_build_anchor_counts) > 128:
+                        self._job_build_anchor_counts.popitem(last=False)
         build_key = JobBuildKey(
             best_tip_hash=artifacts.previousblockhash,
             previous_block_hash=artifacts.previousblockhash,
@@ -6744,7 +7290,13 @@ class PrismCoordinator:
             while len(self._job_bundle_cache) > MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES:
                 oldest_key = next(iter(self._job_bundle_cache))
                 self._job_bundle_cache.pop(oldest_key, None)
-            return True
+        # Arm the build's fenced ledger window only after the bundle itself
+        # won cache publication: lookups re-keyed by the fresh artifact fall
+        # back to exactly this cached no-artifact entry instead of forking a
+        # redundant build.
+        if built.prepared_ledger_artifact is not None:
+            self._install_payout_ledger_artifact(built.prepared_ledger_artifact)
+        return True
 
     def _probe_initial_job_bundle(
         self,
@@ -6785,6 +7337,20 @@ class PrismCoordinator:
             worker=worker,
         )
         cached = self._lookup_job_bundle(key)
+        if cached is None and payout_artifact is not None:
+            fallback = self._lookup_job_bundle(
+                self._no_artifact_job_bundle_key(
+                    artifacts,
+                    mode=resolved_mode,
+                    payout_state_generation=payout_state_generation,
+                    worker=worker,
+                )
+            )
+            if fallback is not None and self._no_artifact_bundle_matches_artifact(
+                fallback,
+                payout_artifact,
+            ):
+                cached = fallback
         if not self._job_bundle_entry_usable(cached, artifacts):
             return None
         self._record_job_cache_event("bundle", hit=True)
@@ -6907,16 +7473,46 @@ class PrismCoordinator:
                 payout_artifact_generation=payout_artifact_generation,
                 worker=worker,
             )
+            no_artifact_key = (
+                self._no_artifact_job_bundle_key(
+                    artifacts,
+                    mode=resolved_mode,
+                    payout_state_generation=payout_state_generation,
+                    worker=worker,
+                )
+                if payout_artifact_generation != 0
+                else None
+            )
             cached = self._lookup_job_bundle(key)
             if (
                 cached is None
                 and subscribed_bundle is not None
-                and subscribed_bundle.key == key
+                and (
+                    subscribed_bundle.key == key
+                    or (
+                        no_artifact_key is not None
+                        and subscribed_bundle.key == no_artifact_key
+                        and self._no_artifact_bundle_matches_artifact(
+                            subscribed_bundle,
+                            payout_artifact,
+                        )
+                    )
+                )
             ):
                 # The subscribed priority result may not have won the global
                 # cache-publication race yet; consume it directly. Usability
                 # below applies exactly the checks a cache entry would face.
                 cached = subscribed_bundle
+            if cached is None and no_artifact_key is not None:
+                fallback = self._lookup_job_bundle(no_artifact_key)
+                if (
+                    fallback is not None
+                    and self._no_artifact_bundle_matches_artifact(
+                        fallback,
+                        payout_artifact,
+                    )
+                ):
+                    cached = fallback
             if self._job_bundle_entry_usable(cached, artifacts):
                 if preparation_cancellation is not None:
                     preparation_cancellation.raise_if_cancelled(
@@ -7068,6 +7664,10 @@ class PrismCoordinator:
                     # Snapshot-owned work may outlive an unrelated global
                     # cache fill. Return it only to its refresh validator or
                     # retained collection delivery; never retain it globally.
+                    if built.prepared_ledger_artifact is not None:
+                        self._install_payout_ledger_artifact(
+                            built.prepared_ledger_artifact
+                        )
                     return built
                 if retry_superseded:
                     with self._job_cache_lock:
@@ -7121,10 +7721,19 @@ class PrismCoordinator:
             serialization = _ShareWindowSerialization(
                 key=key,
                 share_count=len(shares),
-                share_snapshot_sha256=canonical_json_sha256(shares),
+                # The artifact's digest covers exactly these share objects;
+                # recompute only for artifacts predating the digest field.
+                share_snapshot_sha256=(
+                    payout_artifact.share_snapshot_sha256
+                    or canonical_json_sha256(shares)
+                ),
             )
             self._share_window_serialization = serialization
-            return serialization
+        if cached is not None:
+            # Generation rotation retires the replaced spool; a build still
+            # holding a lease keeps the descriptor alive until it releases.
+            cached.retire_spool()
+        return serialization
 
     def build_shared_job_bundle(
         self,
@@ -7187,6 +7796,8 @@ class PrismCoordinator:
             * PRISM_SNAPSHOT_WINDOW_MARGIN
             * int(build_request.key.network_difficulty)
         )
+        prepared_ledger_artifact: PayoutLedgerArtifact | None = None
+        snapshot_accepted_count: int | None = None
         if payout_artifact is not None:
             if (
                 self._usable_payout_ledger_artifact(
@@ -7231,6 +7842,14 @@ class PrismCoordinator:
                         raise JobBuildSuperseded(
                             "payout generation changed before ledger snapshot"
                         )
+                accepted_before: int | None = None
+                if resolved_mode == "ready":
+                    try:
+                        accepted_before, _ = self.accepted_share_stats()
+                    except Exception:
+                        # Artifact seeding is speculative; snapshot errors
+                        # stay owned by the bundle build itself.
+                        accepted_before = None
                 records = (
                     self.ledger.snapshot_at_job_issue(
                         issued_at_ms,
@@ -7239,6 +7858,33 @@ class PrismCoordinator:
                     if resolved_mode == "ready"
                     else []
                 )
+                if accepted_before is not None:
+                    try:
+                        accepted_after, _ = self.accepted_share_stats()
+                    except Exception:
+                        pass
+                    else:
+                        with self._job_cache_lock:
+                            anchor_scoped_count = (
+                                self._job_build_anchor_counts.get(
+                                    build_request.key.template_generation
+                                )
+                            )
+                        # Same fence as the background preparation path -- a
+                        # share committing during the read leaves the window
+                        # ambiguously bound to either count -- plus an anchor
+                        # scope check: this generation's anchor was frozen
+                        # earlier, so a share that became durable since then
+                        # is counted by accepted_share_stats but excluded
+                        # from the window read at the anchor. Publishing that
+                        # pairing would wedge the exact-count reuse fence
+                        # open around a window missing a durable share.
+                        if (
+                            anchor_scoped_count is not None
+                            and int(accepted_after) == int(accepted_before)
+                            and int(accepted_after) == int(anchor_scoped_count)
+                        ):
+                            snapshot_accepted_count = int(accepted_after)
                 # An accepted parent's prospective carry state supersedes the
                 # published artifact for children built on that parent; the
                 # published balances remain the fallback for ordinary tips.
@@ -7284,6 +7930,31 @@ class PrismCoordinator:
             share_snapshot_sha256 = share_serialization.share_snapshot_sha256
         else:
             share_snapshot_sha256 = canonical_json_sha256(shares)
+        if (
+            payout_artifact is None
+            and snapshot_accepted_count is not None
+            and shares
+        ):
+            # This build already paid the full ledger read; carry the window
+            # it produced so cache publication can arm it for builds arriving
+            # before the next share commit. The artifact carries the
+            # published payout-state balances, not this bundle's possibly
+            # parent-adjusted view: reuse re-applies the parent override
+            # itself and the reuse fence hashes the artifact balances against
+            # the published payout artifact.
+            prepared_ledger_artifact = PayoutLedgerArtifact(
+                generation=0,
+                payout_state_generation=payout_state_generation,
+                network_difficulty=int(build_request.key.network_difficulty),
+                accepted_share_count=snapshot_accepted_count,
+                shares_json=tuple(shares),
+                prior_balances=tuple(
+                    build_request.payout_artifact.prior_balances()
+                ),
+                prepared_monotonic=time.monotonic(),
+                snapshot_anchor_ms=issued_at_ms,
+                share_snapshot_sha256=share_snapshot_sha256,
+            )
         final_build_key = dataclass_replace(
             build_request.key,
             share_snapshot_sha256=share_snapshot_sha256,
@@ -7413,6 +8084,7 @@ class PrismCoordinator:
             collection_identity=collection_identity,
             prospective_prior_balances=prospective_prior_balances,
             build_key=final_build_key,
+            prepared_ledger_artifact=prepared_ledger_artifact,
         )
 
     def stamp_job_for_client(
@@ -8167,6 +8839,20 @@ class PrismCoordinator:
             executor.shutdown(wait=True)
         self.shutdown_job_build_executor()
         self.shutdown_payout_artifact_executor()
+        self.retire_share_window_spool()
+        self.shutdown_serve_builder()
+
+    def retire_share_window_spool(self) -> None:
+        """Release the cached share-window spool during shutdown.
+
+        Runs after the build executors quiesce, so any lease still held by a
+        draining transfer defers the close to its own release.
+        """
+        self._ensure_job_cache_state()
+        with self._share_window_serialization_lock:
+            serialization = self._share_window_serialization
+        if serialization is not None:
+            serialization.retire_spool()
 
     def _cancel_initial_job_future(self, future: Future[bool]) -> bool:
         """Cancel one initial-job future and account physical queue removal."""
@@ -14628,6 +15314,641 @@ class PrismCoordinator:
             cancellation=cancellation,
         )
 
+    def shutdown_serve_builder(self) -> None:
+        """Retire the persistent audit builder; builds revert to one-shot."""
+        self._ensure_job_cache_state()
+        with self._serve_builder_lock:
+            self._serve_builder_shutdown = True
+            client, self._serve_builder = self._serve_builder, None
+        if client is not None:
+            client.close()
+
+    def _retire_serve_builder_locked(self) -> None:
+        client, self._serve_builder = self._serve_builder, None
+        if client is not None:
+            client.close()
+
+    def _record_live_serve_builder_termination(
+        self,
+        client: _ServeBuilderClient | None,
+    ) -> None:
+        """Account for deliberately killing a still-running daemon.
+
+        Crash paths count themselves when the EOF surfaces; a live worker
+        retired for a timeout, malformed response, protocol mismatch, or
+        spool failure must land in the termination counters so its
+        replacement reads as a restart, mirroring the cancellation path.
+        """
+        if client is None:
+            return
+        poll = getattr(client.process, "poll", None)
+        if not callable(poll) or poll() is not None:
+            return
+        with self._job_build_scheduler_lock:
+            self.job_build_worker_counts["terminations"] += 1
+            self._job_build_worker_restart_pending = True
+
+    def _observe_builder_phase_metrics(self, metrics: dict[str, Any]) -> None:
+        """Apply one build's builder-side phase timings to refresh metrics.
+
+        Shared by the one-shot stderr metrics line and the --serve response
+        payload so serialization_copy and the builder phase histograms stay
+        comparable regardless of the transport that ran the build.
+        """
+        phase_seconds = metrics.get("phases_seconds", {})
+        if isinstance(phase_seconds, dict):
+            for phase in (
+                "payout_state_derivation",
+                "ctv_manifest_construction",
+                "coinbase_bundle_construction",
+                "signing_verification",
+            ):
+                elapsed = phase_seconds.get(phase)
+                if isinstance(elapsed, (int, float)):
+                    self._observe_tip_refresh_build_phase(
+                        phase,
+                        float(elapsed),
+                    )
+        rust_serialization = sum(
+            float(metrics.get(name, 0.0))
+            for name in (
+                "input_deserialization_seconds",
+                "output_serialization_seconds",
+            )
+        )
+        self._observe_tip_refresh_build_phase(
+            "serialization_copy",
+            rust_serialization,
+        )
+
+    def _spawn_serve_builder_locked(
+        self,
+        deadline: float,
+        cancellation: _JobBuildCancellation | None,
+    ) -> _ServeBuilderClient:
+        command = prism_tool_command("qbit-prism-build-audit-bundle") + [
+            "--serve",
+            "--signing-key-seed-hex",
+            self.signing_seed_hex,
+            "--ledger-signing-key-seed-hex",
+            self.ledger_attestation_signing_seed_hex,
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                # The daemon inherits the coordinator's stderr so a crash's
+                # diagnostics land in the journal instead of a per-request
+                # capture file that dies with the request.
+                stderr=None,
+                close_fds=True,
+            )
+        except OSError as exc:
+            raise _ServeBuilderUnavailable(
+                f"audit-builder daemon spawn failed: {exc}"
+            ) from exc
+        # The start (and any pending restart it satisfies) is recorded as
+        # soon as the worker exists, exactly like the one-shot path: a
+        # handshake-phase death or protocol mismatch must not leave the
+        # lifecycle totals describing fewer workers than were launched.
+        restarted = False
+        with self._job_build_scheduler_lock:
+            if self._job_build_worker_restart_pending:
+                self.job_build_worker_counts["restarts"] += 1
+                self._job_build_worker_restart_pending = False
+                restarted = True
+            self.job_build_worker_counts["starts"] += 1
+        if restarted:
+            with self._tip_refresh_metrics_lock:
+                self.tip_refresh_worker_restarts += 1
+        client = _ServeBuilderClient(process=process)
+        try:
+            assert process.stdin is not None and process.stdout is not None
+            os.set_blocking(process.stdin.fileno(), False)
+            os.set_blocking(process.stdout.fileno(), False)
+            handshake_line = self._serve_builder_read_line(
+                client,
+                deadline,
+                cancellation,
+                None,
+            )
+            handshake = json.loads(handshake_line)
+            if (
+                not isinstance(handshake, dict)
+                or handshake.get("event") != "handshake"
+                or handshake.get("protocol")
+                != PRISM_SERVE_BUILDER_PROTOCOL_VERSION
+            ):
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon announced an unsupported protocol"
+                )
+        except _ServeBuilderUnavailable:
+            self._record_live_serve_builder_termination(client)
+            client.close()
+            raise
+        except (OSError, ValueError, AttributeError) as exc:
+            self._record_live_serve_builder_termination(client)
+            client.close()
+            raise _ServeBuilderUnavailable(
+                f"audit-builder daemon handshake failed: {exc}"
+            ) from exc
+        except BaseException:
+            self._record_live_serve_builder_termination(client)
+            client.close()
+            raise
+        return client
+
+    def _serve_builder_read_line(
+        self,
+        client: _ServeBuilderClient,
+        deadline: float,
+        cancellation: _JobBuildCancellation | None,
+        build_control: _JobBundleBuildControl | None,
+    ) -> bytes:
+        stdout = client.process.stdout
+        assert stdout is not None
+        file_descriptor = stdout.fileno()
+        while True:
+            newline_index = client.stdout_buffer.find(b"\n")
+            if newline_index >= 0:
+                line = bytes(client.stdout_buffer[:newline_index])
+                del client.stdout_buffer[: newline_index + 1]
+                return line
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("serve builder response")
+            if (
+                build_control is not None
+                and build_control.cancel_event.is_set()
+            ):
+                raise _JobBundleBuildSuperseded(
+                    "audit-builder daemon request was canceled after supersession"
+                )
+            if time.monotonic() >= deadline:
+                # Not counted as a worker failure here: the fallback one-shot
+                # runs against this same exhausted deadline and its own
+                # timeout path records the failure exactly once.
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon timed out"
+                )
+            try:
+                chunk = os.read(file_descriptor, 1 << 16)
+            except (BlockingIOError, InterruptedError):
+                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
+                continue
+            except OSError as exc:
+                raise _ServeBuilderUnavailable(
+                    f"audit-builder daemon read failed: {exc}"
+                ) from exc
+            if not chunk:
+                if (
+                    build_control is not None
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder daemon was terminated after supersession"
+                    )
+                with self._job_build_scheduler_lock:
+                    self.job_build_worker_counts["crashes"] += 1
+                    self._job_build_worker_restart_pending = True
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon exited mid-request"
+                )
+            client.stdout_buffer += chunk
+
+    def _serve_builder_write(
+        self,
+        client: _ServeBuilderClient,
+        data: bytes,
+        deadline: float,
+        cancellation: _JobBuildCancellation | None,
+        build_control: _JobBundleBuildControl | None,
+    ) -> int:
+        stdin = client.process.stdin
+        assert stdin is not None
+        file_descriptor = stdin.fileno()
+        remaining = memoryview(data)
+        written_total = 0
+        while remaining:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("serve builder request")
+            if (
+                build_control is not None
+                and build_control.cancel_event.is_set()
+            ):
+                raise _JobBundleBuildSuperseded(
+                    "audit-builder daemon request was canceled after supersession"
+                )
+            if time.monotonic() >= deadline:
+                # Not counted as a worker failure here: the fallback one-shot
+                # runs against this same exhausted deadline and its own
+                # timeout path records the failure exactly once.
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon timed out"
+                )
+            try:
+                written = os.write(file_descriptor, remaining)
+            except (BlockingIOError, InterruptedError):
+                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
+                continue
+            except BrokenPipeError as exc:
+                if (
+                    build_control is not None
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder daemon was terminated after supersession"
+                    ) from exc
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon input pipe closed"
+                ) from exc
+            except OSError as exc:
+                raise _ServeBuilderUnavailable(
+                    f"audit-builder daemon write failed: {exc}"
+                ) from exc
+            if written <= 0:
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon input pipe closed"
+                )
+            written_total += written
+            remaining = remaining[written:]
+        return written_total
+
+    def _serve_builder_splice_spool(
+        self,
+        client: _ServeBuilderClient,
+        share_serialization: _ShareWindowSerialization,
+        spool_file: Any,
+        spool_size: int,
+        deadline: float,
+        cancellation: _JobBuildCancellation | None,
+        build_control: _JobBundleBuildControl | None,
+    ) -> int:
+        stdin = client.process.stdin
+        assert stdin is not None
+        stdin_fd = stdin.fileno()
+        spool_fd = spool_file.fileno()
+        offset = 0
+        while offset < spool_size:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("serve builder request")
+            if (
+                build_control is not None
+                and build_control.cancel_event.is_set()
+            ):
+                raise _JobBundleBuildSuperseded(
+                    "audit-builder daemon request was canceled after supersession"
+                )
+            if time.monotonic() >= deadline:
+                # Not counted as a worker failure here: the fallback one-shot
+                # runs against this same exhausted deadline and its own
+                # timeout path records the failure exactly once.
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon timed out"
+                )
+            try:
+                moved = os.splice(
+                    spool_fd,
+                    stdin_fd,
+                    min(PRISM_SPOOL_SPLICE_CHUNK_BYTES, spool_size - offset),
+                    offset_src=offset,
+                )
+            except (BlockingIOError, InterruptedError):
+                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
+                continue
+            except BrokenPipeError as exc:
+                # The daemon's stdin closed; the spool itself is fine.
+                if (
+                    build_control is not None
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder daemon was terminated after supersession"
+                    ) from exc
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon input pipe closed"
+                ) from exc
+            except OSError as exc:
+                if (
+                    build_control is not None
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise _JobBundleBuildSuperseded(
+                        "audit-builder daemon was terminated after supersession"
+                    ) from exc
+                # The spool itself cannot stream. Poison it so the one-shot
+                # fallback -- and every later build -- writes the cached
+                # in-memory fragments instead of retrying the same transfer
+                # and failing mid-stream.
+                share_serialization.mark_spool_failed()
+                raise _ServeBuilderUnavailable(
+                    f"audit-builder daemon spool transfer failed: {exc}"
+                ) from exc
+            if moved <= 0:
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon input pipe closed"
+                )
+            offset += moved
+        return offset
+
+    def _serve_builder_request_locked(
+        self,
+        client: _ServeBuilderClient,
+        *,
+        deadline: float,
+        payload: dict[str, object],
+        shares: list[dict[str, object]],
+        precomposed: tuple[str, str],
+        share_serialization: _ShareWindowSerialization,
+        cancellation: _JobBuildCancellation | None,
+        build_control: _JobBundleBuildControl | None,
+        record_phase_metrics: bool,
+    ) -> dict[str, Any]:
+        """One JSONL round trip; raises _ServeBuilderUnavailable on anomaly."""
+        share_snapshot_sha256 = share_serialization.share_snapshot_sha256
+        request_fields = dict(payload)
+        request_fields["window_key"] = {
+            "share_snapshot_sha256": share_snapshot_sha256,
+        }
+        prefix = json.dumps(request_fields, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        phases = self._job_build_phases()
+        input_bytes = 0
+        input_serialization_elapsed = 0.0
+
+        def send_request(upload_window: bool) -> None:
+            nonlocal input_bytes, input_serialization_elapsed
+            serialization_started = time.monotonic()
+            try:
+                if not upload_window:
+                    input_bytes += self._serve_builder_write(
+                        client,
+                        prefix + b"\n",
+                        deadline,
+                        cancellation,
+                        build_control,
+                    )
+                    return
+                input_bytes += self._serve_builder_write(
+                    client,
+                    prefix[:-1],
+                    deadline,
+                    cancellation,
+                    build_control,
+                )
+                lease = (
+                    share_serialization.acquire_spooled_tail(shares)
+                    if hasattr(os, "splice")
+                    else None
+                )
+                if lease is not None:
+                    try:
+                        spool_file, spool_size = lease
+                        input_bytes += self._serve_builder_splice_spool(
+                            client,
+                            share_serialization,
+                            spool_file,
+                            spool_size,
+                            deadline,
+                            cancellation,
+                            build_control,
+                        )
+                    finally:
+                        share_serialization.release_spooled_tail()
+                else:
+                    identities_json, compact_shares_json = precomposed
+                    for fragment in (
+                        b',"compact_share_identities":',
+                        identities_json.encode("utf-8"),
+                        b',"compact_shares":',
+                        compact_shares_json.encode("utf-8"),
+                        b"}",
+                    ):
+                        input_bytes += self._serve_builder_write(
+                            client,
+                            fragment,
+                            deadline,
+                            cancellation,
+                            build_control,
+                        )
+                input_bytes += self._serve_builder_write(
+                    client,
+                    b"\n",
+                    deadline,
+                    cancellation,
+                    build_control,
+                )
+            finally:
+                elapsed = time.monotonic() - serialization_started
+                phases["input_serialization"] = (
+                    phases.get("input_serialization", 0.0) + elapsed
+                )
+                # Accumulated across a possible needs_window re-send and
+                # observed once per build so serialization_copy stays
+                # comparable with the one-shot transport.
+                input_serialization_elapsed += elapsed
+
+        def read_response() -> tuple[dict[str, Any], bytes]:
+            worker_started = time.monotonic()
+            line = self._serve_builder_read_line(
+                client,
+                deadline,
+                cancellation,
+                build_control,
+            )
+            phases["worker"] = phases.get("worker", 0.0) + (
+                time.monotonic() - worker_started
+            )
+            output_started = time.monotonic()
+            try:
+                value = json.loads(line)
+            except ValueError as exc:
+                raise _ServeBuilderUnavailable(
+                    f"audit-builder daemon response was malformed: {exc}"
+                ) from exc
+            finally:
+                phases["output_serialization"] = phases.get(
+                    "output_serialization",
+                    0.0,
+                ) + (time.monotonic() - output_started)
+            if not isinstance(value, dict):
+                raise _ServeBuilderUnavailable(
+                    "audit-builder daemon response was not an object"
+                )
+            return value, line
+
+        upload_window = share_snapshot_sha256 not in client.uploaded_windows
+        send_request(upload_window)
+        response, response_line = read_response()
+        if (
+            response.get("ok") is not True
+            and bool(response.get("needs_window"))
+            and not upload_window
+        ):
+            # The daemon evicted this window (respawn or generation churn the
+            # coordinator's mirror missed); repeat the request with the
+            # window riding along.
+            upload_window = True
+            send_request(True)
+            response, response_line = read_response()
+        if response.get("ok") is not True:
+            raise _ServeBuilderUnavailable(
+                "audit-builder daemon error: "
+                f"{response.get('error', 'unknown')}"
+            )
+        summary = response.get("summary")
+        if not isinstance(summary, dict):
+            raise _ServeBuilderUnavailable(
+                "audit-builder daemon returned a malformed summary"
+            )
+        # Every successful response promotes the window in the mirror, hits
+        # included: the daemon moves a hit entry to most-recent position, and
+        # a mirror that only tracked uploads would evict a different key and
+        # either re-upload a still-cached window or bounce on needs_window.
+        client.note_uploaded_window(share_snapshot_sha256)
+        if upload_window:
+            with self._serve_builder_metrics_lock:
+                self.serve_builder_counts["window_uploads"] += 1
+        window_cache = response.get("window_cache")
+        if isinstance(window_cache, dict):
+            outcome = "hits" if bool(window_cache.get("hit")) else "misses"
+            with self._serve_builder_metrics_lock:
+                self.serve_builder_window_cache_counts[outcome] += 1
+        if record_phase_metrics:
+            self._observe_tip_refresh_build_phase(
+                "serialization_copy",
+                input_serialization_elapsed,
+            )
+            metrics_value = response.get("metrics")
+            if isinstance(metrics_value, dict):
+                try:
+                    self._observe_builder_phase_metrics(metrics_value)
+                except (TypeError, ValueError):
+                    # Metrics are diagnostic only. A malformed timing payload
+                    # must never invalidate an otherwise valid summary.
+                    pass
+            self._record_tip_refresh_ipc_bytes("input", input_bytes)
+            self._record_tip_refresh_ipc_bytes("output", len(response_line))
+        return summary
+
+    def _build_audit_bundle_via_serve_builder(
+        self,
+        *,
+        payload: dict[str, object],
+        shares: list[dict[str, object]],
+        precomposed: tuple[str, str],
+        share_serialization: _ShareWindowSerialization,
+        cancellation: _JobBuildCancellation | None,
+        record_phase_metrics: bool,
+        deadline: float,
+    ) -> dict[str, Any] | None:
+        """Build through the persistent daemon; None means use one-shot.
+
+        Any daemon anomaly -- spawn failure, handshake or protocol mismatch,
+        crash, timeout, malformed response -- retires the daemon and returns
+        None so the caller's one-shot path runs unchanged against the same
+        deadline (whatever budget the daemon consumed stays consumed).
+        Cancellation and supersession raise exactly like the one-shot path
+        instead of falling back.
+        """
+        if not env_bool("PRISM_BUILDER_SERVE", "1"):
+            return None
+        self._ensure_job_cache_state()
+        if not getattr(self, "signing_seed_hex", None) or not getattr(
+            self,
+            "ledger_attestation_signing_seed_hex",
+            None,
+        ):
+            return None
+        if not self._serve_builder_lock.acquire(blocking=False):
+            # A concurrent build owns the daemon. One-shot is cheaper than
+            # queueing behind a multi-second build.
+            return None
+        try:
+            if self._serve_builder_shutdown:
+                return None
+            build_control = getattr(
+                self._job_build_phase_local,
+                "bundle_build_control",
+                None,
+            )
+            if not isinstance(build_control, _JobBundleBuildControl):
+                build_control = None
+            try:
+                client = self._serve_builder
+                if client is not None and client.process.poll() is not None:
+                    # The daemon died between requests (its own crash or an
+                    # external kill). Record the lifecycle transition before
+                    # retiring it so the immediate respawn below reads as a
+                    # crash-and-restart rather than an ordinary start.
+                    with self._job_build_scheduler_lock:
+                        self.job_build_worker_counts["crashes"] += 1
+                        self._job_build_worker_restart_pending = True
+                    self._retire_serve_builder_locked()
+                    client = None
+                if client is None:
+                    client = self._spawn_serve_builder_locked(
+                        deadline,
+                        cancellation,
+                    )
+                    self._serve_builder = client
+                    with self._serve_builder_metrics_lock:
+                        self.serve_builder_counts["spawns"] += 1
+                if build_control is not None:
+                    self._register_job_bundle_process(
+                        build_control,
+                        client.process,  # type: ignore[arg-type]
+                    )
+                try:
+                    summary = self._serve_builder_request_locked(
+                        client,
+                        deadline=deadline,
+                        payload=payload,
+                        shares=shares,
+                        precomposed=precomposed,
+                        share_serialization=share_serialization,
+                        cancellation=cancellation,
+                        build_control=build_control,
+                        record_phase_metrics=record_phase_metrics,
+                    )
+                finally:
+                    if build_control is not None:
+                        self._unregister_job_bundle_process(
+                            build_control,
+                            client.process,
+                        )
+            except (JobBuildCancelled, _JobBundleBuildSuperseded):
+                # The daemon stream is indeterminate mid-request; retire it
+                # so the replacement build starts clean.
+                self._retire_serve_builder_locked()
+                with self._job_build_scheduler_lock:
+                    self.job_build_worker_counts["terminations"] += 1
+                    self._job_build_worker_restart_pending = True
+                raise
+            except _ServeBuilderUnavailable:
+                self._record_live_serve_builder_termination(
+                    self._serve_builder
+                )
+                self._retire_serve_builder_locked()
+                with self._serve_builder_metrics_lock:
+                    self.serve_builder_counts["fallbacks"] += 1
+                return None
+            except (OSError, ValueError):
+                self._record_live_serve_builder_termination(
+                    self._serve_builder
+                )
+                self._retire_serve_builder_locked()
+                with self._serve_builder_metrics_lock:
+                    self.serve_builder_counts["fallbacks"] += 1
+                return None
+            else:
+                with self._serve_builder_metrics_lock:
+                    self.serve_builder_counts["requests"] += 1
+                return summary
+        finally:
+            self._serve_builder_lock.release()
+
     def build_audit_bundle(
         self,
         *,
@@ -14694,6 +16015,37 @@ class PrismCoordinator:
             payload["ctv_settlement"] = ctv_settlement
         if canonical_output_path is not None and summary_only:
             raise ValueError("canonical output and job summary output are mutually exclusive")
+        # One deadline covers the whole build regardless of transport: a
+        # daemon anomaly falls back to the one-shot subprocess with only the
+        # remaining budget, so a hung daemon cannot double the configured
+        # limit while progress health already treats one limit as stuck.
+        build_deadline = time.monotonic() + float(
+            getattr(
+                self,
+                "bundle_build_timeout_seconds",
+                DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
+            )
+        )
+        if (
+            summary_only
+            and canonical_output_path is None
+            and precomposed is not None
+            and share_serialization is not None
+        ):
+            # The persistent builder serves the artifact-backed summary path,
+            # whose window identity and cached fragments it can key on. Every
+            # anomaly falls back to the one-shot subprocess below.
+            served = self._build_audit_bundle_via_serve_builder(
+                payload=payload,
+                shares=shares,
+                precomposed=precomposed,
+                share_serialization=share_serialization,
+                cancellation=cancellation,
+                record_phase_metrics=record_phase_metrics,
+                deadline=build_deadline,
+            )
+            if served is not None:
+                return served
         command = prism_tool_command("qbit-prism-build-audit-bundle") + [
             "--input",
             "-",
@@ -14746,14 +16098,7 @@ class PrismCoordinator:
                     self.job_build_worker_counts["starts"] += 1
                 assert process.stdin is not None
                 input_byte_count = 0
-                builder_started = time.monotonic()
-                worker_deadline = builder_started + float(
-                    getattr(
-                        self,
-                        "bundle_build_timeout_seconds",
-                        DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
-                    )
-                )
+                worker_deadline = build_deadline
                 coordinator = self
 
                 class _CancelableInput:
@@ -14821,20 +16166,89 @@ class PrismCoordinator:
                         return len(value)
 
                 serialization_started = time.monotonic()
+                spool_lease: tuple[Any, int] | None = None
                 try:
                     sink = _CancelableInput(process.stdin)
-                    if precomposed is not None:
-                        # Per-build fields are encoded fresh; the dominant
-                        # share-window fragments are the cached per-generation
-                        # strings, piped without re-encoding the share tree.
+
+                    def write_precomposed_tail() -> None:
+                        assert precomposed is not None
                         identities_json, compact_shares_json = precomposed
-                        prefix = json.dumps(payload, separators=(",", ":"))
-                        sink.write(prefix[:-1])
                         sink.write(',"compact_share_identities":')
                         sink.write(identities_json)
                         sink.write(',"compact_shares":')
                         sink.write(compact_shares_json)
                         sink.write("}")
+
+                    if (
+                        precomposed is not None
+                        and share_serialization is not None
+                        and sink.file_descriptor is not None
+                        and hasattr(os, "splice")
+                    ):
+                        spool_lease = share_serialization.acquire_spooled_tail(
+                            shares
+                        )
+                    if precomposed is not None:
+                        # Per-build fields are encoded fresh; the dominant
+                        # share-window fragments stream from the spool file
+                        # written once per generation (kernel moves the bytes
+                        # into the pipe), falling back to the cached strings
+                        # whenever no spool is available.
+                        prefix = json.dumps(payload, separators=(",", ":"))
+                        sink.write(prefix[:-1])
+                        spool_transferred = False
+                        if spool_lease is not None:
+                            spool_file, spool_size = spool_lease
+                            spool_fd = spool_file.fileno()
+                            offset = 0
+                            while offset < spool_size:
+                                sink.check_cancelled()
+                                try:
+                                    moved = os.splice(
+                                        spool_fd,
+                                        sink.file_descriptor,
+                                        min(
+                                            PRISM_SPOOL_SPLICE_CHUNK_BYTES,
+                                            spool_size - offset,
+                                        ),
+                                        offset_src=offset,
+                                    )
+                                except (BlockingIOError, InterruptedError):
+                                    time.sleep(
+                                        min(
+                                            0.02,
+                                            PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
+                                        )
+                                    )
+                                    continue
+                                except BrokenPipeError:
+                                    # The child's stdin closed; the spool
+                                    # itself is fine and the surrounding
+                                    # pipe-error handling owns this.
+                                    raise
+                                except OSError:
+                                    # The spool cannot stream (unsupported
+                                    # filesystem or an I/O error); the cached
+                                    # in-memory fragments stay authoritative
+                                    # for this and every later build.
+                                    share_serialization.mark_spool_failed()
+                                    if offset:
+                                        # Part of the tail already reached the
+                                        # pipe; this build cannot be repaired
+                                        # by re-writing it from memory.
+                                        raise
+                                    break
+                                if moved <= 0:
+                                    raise BrokenPipeError(
+                                        "audit-builder input pipe closed"
+                                    )
+                                offset += moved
+                                input_byte_count += moved
+                            spool_transferred = (
+                                spool_size > 0 and offset >= spool_size
+                            )
+                        if not spool_transferred:
+                            write_precomposed_tail()
                     else:
                         # iterencode writes bounded fragments to the child
                         # instead of allocating a second full JSON
@@ -14862,6 +16276,8 @@ class PrismCoordinator:
                             self._job_build_worker_restart_pending = True
                     raise
                 finally:
+                    if spool_lease is not None and share_serialization is not None:
+                        share_serialization.release_spooled_tail()
                     phases = self._job_build_phases()
                     phases["input_serialization"] = phases.get(
                         "input_serialization",
@@ -14971,31 +16387,8 @@ class PrismCoordinator:
                         )
                         try:
                             metrics = json.loads(raw_metrics)
-                            phase_seconds = metrics.get("phases_seconds", {})
-                            if isinstance(phase_seconds, dict):
-                                for phase in (
-                                    "payout_state_derivation",
-                                    "ctv_manifest_construction",
-                                    "coinbase_bundle_construction",
-                                    "signing_verification",
-                                ):
-                                    elapsed = phase_seconds.get(phase)
-                                    if isinstance(elapsed, (int, float)):
-                                        self._observe_tip_refresh_build_phase(
-                                            phase,
-                                            float(elapsed),
-                                        )
-                            rust_serialization = sum(
-                                float(metrics.get(name, 0.0))
-                                for name in (
-                                    "input_deserialization_seconds",
-                                    "output_serialization_seconds",
-                                )
-                            )
-                            self._observe_tip_refresh_build_phase(
-                                "serialization_copy",
-                                rust_serialization,
-                            )
+                            if isinstance(metrics, dict):
+                                self._observe_builder_phase_metrics(metrics)
                         except (TypeError, ValueError, json.JSONDecodeError):
                             # Metrics are diagnostic only. A malformed timing
                             # line must never invalidate an otherwise valid
@@ -20613,7 +22006,7 @@ class PrismCoordinator:
                 "# HELP qbit_prism_tip_refresh_builder_worker_failures_total Audit-builder subprocess failures.",
                 "# TYPE qbit_prism_tip_refresh_builder_worker_failures_total counter",
                 f"qbit_prism_tip_refresh_builder_worker_failures_total {worker_failures}",
-                "# HELP qbit_prism_tip_refresh_builder_worker_restarts_total Long-lived builder worker restarts; zero for the inline subprocess design.",
+                "# HELP qbit_prism_tip_refresh_builder_worker_restarts_total Long-lived builder worker restarts (persistent --serve daemon respawns after a crash or supersession).",
                 "# TYPE qbit_prism_tip_refresh_builder_worker_restarts_total counter",
                 f"qbit_prism_tip_refresh_builder_worker_restarts_total {worker_restarts}",
                 "# HELP qbit_prism_tip_refresh_builder_ipc_bytes_total Bytes copied across audit-builder subprocess IPC.",
@@ -20621,6 +22014,34 @@ class PrismCoordinator:
                 *[
                     f'qbit_prism_tip_refresh_builder_ipc_bytes_total{{direction="{direction}"}} {int(ipc_bytes.get(direction, 0))}'
                     for direction in ("input", "output")
+                ],
+            ]
+        )
+        self._ensure_job_cache_state()
+        with self._serve_builder_metrics_lock:
+            serve_counts = dict(self.serve_builder_counts)
+            serve_window_counts = dict(self.serve_builder_window_cache_counts)
+        lines.extend(
+            [
+                "# HELP qbit_prism_serve_builder_events_total Persistent audit-builder daemon lifecycle and request outcomes.",
+                "# TYPE qbit_prism_serve_builder_events_total counter",
+                *[
+                    f'qbit_prism_serve_builder_events_total{{event="{event}"}} {int(serve_counts.get(event, 0))}'
+                    for event in (
+                        "requests",
+                        "fallbacks",
+                        "spawns",
+                        "window_uploads",
+                    )
+                ],
+                "# HELP qbit_prism_serve_builder_window_cache_total Daemon parsed share-window cache outcomes.",
+                "# TYPE qbit_prism_serve_builder_window_cache_total counter",
+                *[
+                    f'qbit_prism_serve_builder_window_cache_total{{result="{result}"}} {int(serve_window_counts.get(counter_key, 0))}'
+                    for result, counter_key in (
+                        ("hit", "hits"),
+                        ("miss", "misses"),
+                    )
                 ],
             ]
         )

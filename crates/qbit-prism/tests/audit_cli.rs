@@ -954,3 +954,190 @@ fn reorg_verify_cli_reverses_disconnected_immature_entries() {
     );
     assert!(report["replacement_entry_count"].as_u64().unwrap() > 0);
 }
+
+#[test]
+fn build_audit_bundle_serve_mode_caches_parsed_windows() {
+    use std::io::{BufRead, BufReader as StdBufReader, Write as IoWrite};
+    use std::process::Stdio;
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    let mut compact_identities = Vec::<serde_json::Value>::new();
+    let mut compact_shares = Vec::<serde_json::Value>::new();
+    for share in fixture["shares"].as_array().unwrap() {
+        let identity = serde_json::json!([
+            share["miner_id"],
+            share["order_key"],
+            share["p2mr_program_hex"],
+        ]);
+        let identity_index = compact_identities
+            .iter()
+            .position(|candidate| candidate == &identity)
+            .unwrap_or_else(|| {
+                compact_identities.push(identity);
+                compact_identities.len() - 1
+            });
+        compact_shares.push(serde_json::json!([
+            share["share_seq"],
+            share["share_id"],
+            identity_index,
+            share["share_difficulty"],
+            share["job_issued_at_ms"],
+            share["accepted_at_ms"],
+            share
+                .get("credit_policy")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ]));
+    }
+    let build_fields = serde_json::json!({
+        "found_block": fixture["found_block"],
+        "prior_balances": serde_json::to_value(power_law_prior_balances()).unwrap(),
+    });
+
+    let one_shot_input = {
+        let mut input = build_fields.clone();
+        input["shares"] = serde_json::json!([]);
+        input["compact_share_identities"] =
+            serde_json::Value::Array(compact_identities.clone());
+        input["compact_shares"] = serde_json::Value::Array(compact_shares.clone());
+        input
+    };
+    let one_shot_path = std::env::temp_dir().join(format!(
+        "qbit-prism-serve-one-shot-input-{}.json",
+        std::process::id()
+    ));
+    fs::write(&one_shot_path, serde_json::to_vec(&one_shot_input).unwrap()).unwrap();
+    let one_shot = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&one_shot_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .arg("--job-summary-output")
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&one_shot_path);
+    assert!(
+        one_shot.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&one_shot.stderr)
+    );
+    let expected_summary: serde_json::Value =
+        serde_json::from_slice(&one_shot.stdout).unwrap();
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--serve")
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = daemon.stdin.take().unwrap();
+    let mut stdout = StdBufReader::new(daemon.stdout.take().unwrap());
+
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let handshake: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(handshake["event"], "handshake");
+    assert_eq!(handshake["protocol"], 1);
+    assert_eq!(handshake["tool"], "qbit-prism-build-audit-bundle");
+
+    let mut request_with_window = build_fields.clone();
+    request_with_window["window_key"] =
+        serde_json::json!({"share_snapshot_sha256": "window-a"});
+    request_with_window["compact_share_identities"] =
+        serde_json::Value::Array(compact_identities.clone());
+    request_with_window["compact_shares"] = serde_json::Value::Array(compact_shares.clone());
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&request_with_window).unwrap()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let uploaded: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(uploaded["ok"], true, "upload response: {line}");
+    assert_eq!(uploaded["summary"], expected_summary);
+    assert_eq!(uploaded["window_cache"]["hit"], false);
+    assert_eq!(uploaded["window_cache"]["misses"], 1);
+    assert_eq!(uploaded["window_cache"]["entries"], 1);
+    assert!(uploaded["metrics"]["input_deserialization_seconds"]
+        .as_f64()
+        .is_some());
+    assert!(uploaded["metrics"]["output_serialization_seconds"]
+        .as_f64()
+        .is_some());
+    assert!(uploaded["metrics"]["phases_seconds"].is_object());
+
+    let mut request_cached = build_fields.clone();
+    request_cached["window_key"] = serde_json::json!({"share_snapshot_sha256": "window-a"});
+    writeln!(stdin, "{}", serde_json::to_string(&request_cached).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let hit: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(hit["ok"], true, "hit response: {line}");
+    assert_eq!(hit["summary"], expected_summary);
+    assert_eq!(hit["window_cache"]["hit"], true);
+    assert_eq!(hit["window_cache"]["hits"], 1);
+
+    let mut request_unknown = build_fields.clone();
+    request_unknown["window_key"] =
+        serde_json::json!({"share_snapshot_sha256": "window-unknown"});
+    writeln!(stdin, "{}", serde_json::to_string(&request_unknown).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let missing: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(missing["ok"], false);
+    assert_eq!(missing["needs_window"], true);
+
+    // Identities without shares are rejected like one-shot mode, and never
+    // classified as a cache hit or a window that needs uploading.
+    let mut request_identities_only = build_fields.clone();
+    request_identities_only["window_key"] =
+        serde_json::json!({"share_snapshot_sha256": "window-a"});
+    request_identities_only["compact_share_identities"] =
+        serde_json::Value::Array(compact_identities.clone());
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&request_identities_only).unwrap()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let identities_only: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(identities_only["ok"], false);
+    assert_eq!(identities_only["needs_window"], false);
+
+    // Two fresh uploads bound the cache to the most recent generations and
+    // evict window-a.
+    for name in ["window-b", "window-c"] {
+        let mut request = request_with_window.clone();
+        request["window_key"] = serde_json::json!({"share_snapshot_sha256": name});
+        writeln!(stdin, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["ok"], true, "upload response: {line}");
+        assert!(response["window_cache"]["entries"].as_u64().unwrap() <= 2);
+    }
+    writeln!(stdin, "{}", serde_json::to_string(&request_cached).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let evicted: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(evicted["ok"], false);
+    assert_eq!(evicted["needs_window"], true);
+
+    drop(stdin);
+    let status = daemon.wait().unwrap();
+    assert!(status.success());
+}
