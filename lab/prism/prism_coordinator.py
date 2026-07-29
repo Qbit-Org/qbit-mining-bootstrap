@@ -6,7 +6,13 @@ from __future__ import annotations
 import base64
 import copy
 from collections import OrderedDict
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    CancelledError as FuturesCancelledError,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from contextlib import ExitStack, contextmanager
 import dataclasses
 import errno
@@ -115,6 +121,18 @@ PRISM_REORG_RECONCILE_MEMO_MAX_TIPS = 8
 # a liveness backstop, not a pacing knob: a follower that outwaits it simply
 # runs its own serialized pass, exactly as every caller did before flights.
 DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS = 30.0
+# Reconcile demand observability: which caller lane asked, and what satisfied
+# it. The tip-refresh lane can be satisfied by the per-tip trusted memo, by a
+# pass overlapped with the template fetch on the prefetch worker, or by a
+# serial pass on the refresh thread; per-client job builds only ever see a
+# memo hit or their own serial pass.
+PRISM_REORG_RECONCILE_LOOKUP_PATHS = ("tip_refresh", "job_build")
+PRISM_REORG_RECONCILE_LOOKUP_SOURCES = ("memo_hit", "overlap", "serial")
+# Read-to-ack latency labels for mining.submit. Accepted shares wait for the
+# group commit before their ack; rejected shares (measured when the reject
+# decision is made) skip it, so the pair separates commit pressure from
+# thread-scheduling/GIL pressure as connection count grows.
+PRISM_SHARE_ACK_RESULTS = ("accepted", "rejected")
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS = 15.0
 DEFAULT_PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS = 15.0
@@ -144,6 +162,12 @@ DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS = 10.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS = 30.0
 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION = 64
 DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS = 1.0
+# How many same-tip retained contexts may outlive their connection so a
+# reconnecting client (same authorized username) can submit work computed
+# against the prior connection's jobs instead of eating unknown-job rejects
+# across a proxy flap. Entries keep the normal same-tip TTL; 0 restores the
+# historical purge-on-disconnect behavior.
+DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION = 16_384
 DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS = 16
 DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS = 4
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
@@ -301,8 +325,12 @@ PRISM_PROGRESS_HEALTH_REASONS = (
     "bundle_build_stuck",
 )
 PRISM_EVICTED_JOB_CLASSES = ("same_tip", "stale_grace")
-PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = ("accepted_same_tip", "credited_stale_grace")
-PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection",)
+PRISM_EVICTED_JOB_SUBMIT_OUTCOMES = (
+    "accepted_same_tip",
+    "credited_stale_grace",
+    "accepted_same_tip_cross_connection",
+)
+PRISM_EVICTED_JOB_CAPACITY_SCOPES = ("connection", "disconnected")
 PRISM_REJECTION_STALE_JOB = "stale-job"
 PRISM_REJECTION_DUPLICATE_SHARE = "duplicate-share"
 PRISM_REJECTION_LOW_DIFFICULTY = "low-difficulty"
@@ -1169,6 +1197,10 @@ class PrismJobContext:
     authorization_generation: int = 0
     difficulty_generation: int = 0
     tip_refresh_epoch_sequence: int = 0
+    # Version-rolling mask negotiated on the connection this job was
+    # delivered to. Cross-connection resumes validate in-flight version bits
+    # against this mask, not the replacement connection's (often still 0).
+    version_mask: int = 0
 
 
 @dataclass
@@ -1213,6 +1245,11 @@ class PrismBlockCandidate:
     pending_share: PendingShare
     client: ClientState
     credit_share_on_accept: bool = False
+    # When this in-process attempt became runnable: live candidates stamp
+    # share-accept time, durable outbox replays stamp row-restore time. The
+    # block-submit histogram measures from here to submitblock's return --
+    # the race-critical interval a lost block round is decided in.
+    landed_monotonic: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -2190,6 +2227,10 @@ class ClientState:
     # Protected by the coordinator lock. Disconnect retirement sets this before
     # waiting for any per-client job update so queued work can reject the client.
     closing: bool = False
+    # Stamped by the handler thread when a request line arrives, before JSON
+    # parsing. Only that thread reads it; mining.submit uses it to observe
+    # read-to-ack latency (the share-ingest saturation instrument).
+    request_received_monotonic: float | None = None
     # Serializes every job build/register/send transition for this connection.
     # The coordinator lock may be acquired while this lock is held, never in
     # the reverse order. RLock permits authorize/retarget helpers to call the
@@ -2203,15 +2244,29 @@ class ClientState:
         with self.send_lock:
             self.sock.sendall(data)
 
-    def send_batch(self, payloads: list[dict[str, object]]) -> None:
+    def send_batch(
+        self,
+        payloads: list[dict[str, object]],
+        *,
+        preserialized: bytes | None = None,
+    ) -> None:
         # Tests and embedders may replace ``send`` with an in-memory recorder;
         # retain that seam while production sockets write the whole difficulty
         # + notify pair under one send lock with no response interleaving.
+        # ``preserialized`` must be the exact serialization of ``payloads``;
+        # callers with a shared precomposed fragment pass it so a fleet-wide
+        # wave does not re-serialize identical coinbase parts per client.
         if "send" in self.__dict__:
             for payload in payloads:
                 self.send(payload)
             return
-        data = b"".join(json.dumps(payload).encode() + b"\n" for payload in payloads)
+        data = (
+            preserialized
+            if preserialized is not None
+            else b"".join(
+                json.dumps(payload).encode() + b"\n" for payload in payloads
+            )
+        )
         with self.send_lock:
             self.sock.sendall(data)
 
@@ -2708,6 +2763,10 @@ class PrismCoordinator:
         self.same_tip_job_retention_per_connection = env_nonnegative_int(
             "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION",
             DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION,
+        )
+        self.disconnected_job_retention = env_nonnegative_int(
+            "PRISM_STRATUM_DISCONNECTED_JOB_RETENTION",
+            DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,
         )
         self.tip_refresh_max_workers = env_positive_int(
             "PRISM_TIP_REFRESH_MAX_WORKERS",
@@ -3213,6 +3272,7 @@ class PrismCoordinator:
             hasattr(self, "_recent_share_lock")
             and hasattr(self, "_share_accounting_lock")
             and hasattr(self, "recent_share_keys")
+            and hasattr(self, "share_ack_histograms")
         ):
             return
         with _HOT_PATH_LOCK_INITIALIZATION_LOCK:
@@ -3222,6 +3282,71 @@ class PrismCoordinator:
                 self._share_accounting_lock = threading.Lock()
             if not hasattr(self, "recent_share_keys"):
                 self.recent_share_keys = set()
+            if not hasattr(self, "share_ack_histograms"):
+                self.share_ack_histograms = {
+                    result: {
+                        "buckets": {
+                            bucket: 0
+                            for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
+                        },
+                        "sum": 0.0,
+                        "count": 0,
+                    }
+                    for result in PRISM_SHARE_ACK_RESULTS
+                }
+
+    def _observe_share_ack_seconds(
+        self,
+        result: str,
+        elapsed_seconds: float,
+    ) -> None:
+        if result not in PRISM_SHARE_ACK_RESULTS:
+            raise ValueError(f"unknown share ack result: {result}")
+        self._ensure_share_hot_path_state()
+        with self._share_accounting_lock:
+            histogram = self.share_ack_histograms[result]
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + max(
+                0.0, elapsed_seconds
+            )
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
+    def share_ack_metrics_lines(self) -> list[str]:
+        self._ensure_share_hot_path_state()
+        with self._share_accounting_lock:
+            histograms = {
+                result: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
+                }
+                for result, histogram in self.share_ack_histograms.items()
+            }
+        lines = [
+            "# HELP qbit_prism_share_ack_seconds mining.submit line arrival to Stratum response, by outcome.",
+            "# TYPE qbit_prism_share_ack_seconds histogram",
+        ]
+        for result in PRISM_SHARE_ACK_RESULTS:
+            histogram = histograms[result]
+            buckets = histogram["buckets"]
+            lines.extend(
+                f'qbit_prism_share_ack_seconds_bucket{{result="{result}",le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+                for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
+            )
+            lines.append(
+                f'qbit_prism_share_ack_seconds_bucket{{result="{result}",le="+Inf"}} {histogram["count"]}'
+            )
+            lines.append(
+                f'qbit_prism_share_ack_seconds_sum{{result="{result}"}} {histogram["sum"]:.6f}'
+            )
+            lines.append(
+                f'qbit_prism_share_ack_seconds_count{{result="{result}"}} {histogram["count"]}'
+            )
+        return lines
 
     @staticmethod
     def _client_vardiff_lock(client: ClientState) -> threading.RLock:
@@ -3763,6 +3888,46 @@ class PrismCoordinator:
             self._reorg_reconcile_trusted_memo: OrderedDict[str, float] = (
                 OrderedDict()
             )
+        if not hasattr(self, "_reconcile_prefetch_executor_lock"):
+            self._reconcile_prefetch_executor_lock = threading.Lock()
+        if not hasattr(self, "_reconcile_prefetch_executor"):
+            # Single-worker lane that overlaps the tip-refresh reconcile pass
+            # with the template fetch. Only the refresh singleflight owner
+            # submits, so at most one prefetched pass is in flight; same-tip
+            # followers still coalesce through _reconcile_flights.
+            self._reconcile_prefetch_executor: ThreadPoolExecutor | None = None
+        if not hasattr(self, "_reconcile_prefetch_executor_shutdown"):
+            self._reconcile_prefetch_executor_shutdown = False
+        if not hasattr(self, "_reconcile_prefetch_pending"):
+            # At most one outstanding prefetch, keyed by tip, guarded by
+            # _reconcile_prefetch_executor_lock. Failed refresh attempts
+            # (for example a template-RPC outage) reuse it instead of
+            # queueing another serialized pass per retry.
+            self._reconcile_prefetch_pending: (
+                tuple[str, Future[bool]] | None
+            ) = None
+        if not hasattr(self, "reorg_reconcile_lookup_counts"):
+            # Reconcile demand by (caller path, satisfying source), guarded
+            # by self.lock.
+            self.reorg_reconcile_lookup_counts = {
+                (path, source): 0
+                for path in PRISM_REORG_RECONCILE_LOOKUP_PATHS
+                for source in PRISM_REORG_RECONCILE_LOOKUP_SOURCES
+            }
+        if not hasattr(self, "_block_submit_metrics_lock"):
+            self._block_submit_metrics_lock = threading.Lock()
+        if not hasattr(self, "block_submit_seconds_histogram"):
+            # Landed candidate -> submitblock-return interval. Post-submit
+            # bookkeeping (audit build, persistence, outbox finalize) is
+            # deliberately excluded; the outbox created_at/completed_at span
+            # already covers it.
+            self.block_submit_seconds_histogram = {
+                "buckets": {
+                    bucket: 0 for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
+                },
+                "sum": 0.0,
+                "count": 0,
+            }
         if not hasattr(self, "_accepted_block_payout_preview_condition"):
             self._accepted_block_payout_preview_condition = threading.Condition()
         if not hasattr(self, "_accepted_block_payout_previews"):
@@ -8220,6 +8385,7 @@ class PrismCoordinator:
                 getattr(client, "difficulty_generation", 0)
             ),
             tip_refresh_epoch_sequence=int(tip_refresh_epoch_sequence),
+            version_mask=int(getattr(client, "version_mask", 0)),
         )
 
     def accepted_share_stats(self) -> tuple[int, int]:
@@ -8418,7 +8584,13 @@ class PrismCoordinator:
                     "sum": 0.0,
                     "count": 0,
                 }
-                for name in ("refresh", "bundle_build", "first_delivery", "last_delivery")
+                for name in (
+                    "refresh",
+                    "bundle_build",
+                    "first_delivery",
+                    "last_delivery",
+                    "fanout_wave",
+                )
             }
         if not hasattr(self, "tip_refresh_build_phase_histograms"):
             self.tip_refresh_build_phase_histograms = {
@@ -9228,6 +9400,7 @@ class PrismCoordinator:
             executor.shutdown(wait=True)
         self.shutdown_job_build_executor()
         self.shutdown_payout_artifact_executor()
+        self.shutdown_reconcile_prefetch_executor()
         self.retire_share_window_spool()
         self.shutdown_serve_builder()
 
@@ -12256,6 +12429,16 @@ class PrismCoordinator:
                     "prepared refresh payout state changed during post-fanout "
                     "validation; immediate retry scheduled"
                 )
+            if last_delivery is not None and submitted_at:
+                # Wall-clock span of the wave itself (first task submission
+                # to last successful delivery), independent of the reconcile
+                # and bundle-build stages the first/last_delivery histograms
+                # include. At fleet scale this is the dominant staleness term
+                # bounded by the delivery worker pool.
+                self._observe_tip_refresh_seconds(
+                    "fanout_wave",
+                    max(0.0, last_delivery - min(submitted_at.values())),
+                )
             return sent, first_delivery, last_delivery, failed
         finally:
             self._clear_active_tip_refresh(validation_token, cancel_event)
@@ -12456,6 +12639,48 @@ class PrismCoordinator:
                     pending_signal_token,
                     observation_sequence,
                 )
+            # Captured before reconciliation can begin: the pass may run on
+            # the prefetch worker while this thread fetches the template, so
+            # the mutation bracket must open before either starts.
+            payout_generation_before_reconciliation = int(
+                getattr(self, "_payout_state_generation", 0)
+            )
+            # Reconciliation is keyed by tip hash and the probe above already
+            # observed the best hash, so a memo miss can run its full pass on
+            # the prefetch worker while this thread fetches and derives the
+            # template. Whether the pass can be skipped is decided at the
+            # join below against the memo's state AT THAT TIME -- a tip that
+            # flips away and back during the fetch evicts the entry so
+            # post-flip pool-block state is re-proven -- and publication
+            # still re-proves chain trust in _validate_prepared_tip_refresh
+            # before any fanout. With the memo disabled (TTL 0) there is no
+            # way to validate an overlapped pass across the fetch window, so
+            # the poll keeps its historical serial pass.
+            reconciler_enabled = bool(
+                getattr(self, "reorg_reconciler_enabled", True)
+            )
+            reconcile_memo_enabled = reconciler_enabled and (
+                float(
+                    getattr(
+                        self,
+                        "reorg_reconcile_cache_seconds",
+                        DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
+                    )
+                )
+                > 0
+            )
+            reconcile_prefetch: Future[bool] | None = None
+            reconcile_probe_started = time.monotonic()
+            reconcile_detection_epoch = int(
+                getattr(self, "tip_detection_epoch", 0)
+            )
+            if reconcile_memo_enabled and not self._reorg_reconcile_memo_fresh(
+                observed_best_tip
+            ):
+                reconcile_prefetch = self._submit_reconcile_prefetch(
+                    observed_best_tip
+                )
+            reconcile_probe_seconds = time.monotonic() - reconcile_probe_started
             snapshot = self._reuse_current_tip_template_snapshot(observed_best_tip)
             if snapshot is None:
                 self._record_job_cache_event("template", hit=False)
@@ -12487,9 +12712,6 @@ class PrismCoordinator:
             self._progress_refresh_started()
             progress_refresh_active = True
             self.pool_readiness_latched()
-            payout_generation_before_reconciliation = int(
-                getattr(self, "_payout_state_generation", 0)
-            )
             with self.lock:
                 previous_snapshot = self.tip_template_snapshot
                 # Generation orders concurrent observations but is not itself
@@ -12539,16 +12761,79 @@ class PrismCoordinator:
                 snapshot,
                 observation_sequence,
             )
-            reconcile_started = time.monotonic()
+            reconcile_source = "serial"
+            reconcile_join_started = time.monotonic()
             try:
-                reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
-                    snapshot.bestblockhash
-                )
-            except ShutdownInProgress:
-                # Shutdown may close writer admission after this refresh has
-                # fetched a snapshot. Leave the refresh incomplete and let
-                # the controlled shutdown proceed without consuming the
-                # template failure budget or taking the hard-exit path.
+                if (
+                    reconcile_memo_enabled
+                    and int(getattr(self, "tip_detection_epoch", 0))
+                    == reconcile_detection_epoch
+                    and self._reorg_reconcile_memo_fresh(
+                        snapshot.bestblockhash
+                    )
+                ):
+                    # Fresh at join time AND no detection interleaved the
+                    # fetch. Both are required: a flip away and back evicts
+                    # the entry, but a pass whose execution straddled the
+                    # flip can re-arm it afterwards (the latest detected
+                    # hash matches again), and its proof belongs to the
+                    # closed epoch. Any epoch movement lands in the serial
+                    # re-prove branches below.
+                    reconcile_source = (
+                        "overlap" if reconcile_prefetch is not None else "memo_hit"
+                    )
+                    if reconcile_prefetch is not None:
+                        self._discard_stale_reconcile_prefetch(
+                            reconcile_prefetch
+                        )
+                        reconcile_prefetch = None
+                    reorg_reconciled = True
+                elif (
+                    reconcile_prefetch is not None
+                    and snapshot.bestblockhash == observed_best_tip
+                ):
+                    reconcile_source = "overlap"
+                    reorg_reconciled = reconcile_prefetch.result()
+                    if reorg_reconciled and (
+                        int(getattr(self, "tip_detection_epoch", 0))
+                        != reconcile_detection_epoch
+                    ):
+                        # A detection interleaved the fetch (a flip away, or
+                        # away and back to this same hash): cached proofs
+                        # were evicted and the overlapped pass may have run
+                        # in the closed epoch. Re-prove on this thread.
+                        reconcile_source = "serial"
+                        reorg_reconciled = (
+                            self.ensure_reorg_reconciled_for_tip(
+                                snapshot.bestblockhash
+                            )
+                        )
+                    # A trust flip after the pass completed (headers running
+                    # ahead with no detection) is deliberately NOT re-checked
+                    # here: prepared fanout re-proves the live chain view in
+                    # _validate_prepared_tip_refresh, and sequential issuance
+                    # re-proves it per client in
+                    # ensure_reorg_reconciled_for_current_tip, whose trust
+                    # check is never cached. A second live check here would
+                    # break the one-trust-validation-per-refresh economy.
+                else:
+                    if reconcile_prefetch is not None:
+                        # The tip moved between the probe and the template
+                        # fetch; the prefetched pass proved a superseded
+                        # hash. Reconcile the snapshot tip on this thread.
+                        self._discard_stale_reconcile_prefetch(
+                            reconcile_prefetch
+                        )
+                        reconcile_prefetch = None
+                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                        snapshot.bestblockhash
+                    )
+            except (ShutdownInProgress, FuturesCancelledError):
+                # Shutdown may close writer admission (or cancel the queued
+                # prefetch) after this refresh has fetched a snapshot. Leave
+                # the refresh incomplete and let the controlled shutdown
+                # proceed without consuming the template failure budget or
+                # taking the hard-exit path.
                 return 0
             except (TemplateRefreshSuperseded, _PayoutStatePublicationBlocked):
                 raise
@@ -12557,13 +12842,20 @@ class PrismCoordinator:
                     "qbit reorg reconciliation failed before refresh preparation"
                 ) from exc
             finally:
-                # The only serial pre-build stage without a phase metric;
-                # observe failures too so a slow reconcile that blocks the
-                # refresh still shows up in the histogram.
+                # The effective serial reconcile cost of this refresh: the
+                # memo probe plus whatever wait the template fetch did not
+                # absorb. Observe failures too so a slow reconcile that
+                # blocks the refresh still shows up in the histogram.
                 self._observe_tip_refresh_build_phase(
                     "reorg_reconcile",
-                    time.monotonic() - reconcile_started,
+                    reconcile_probe_seconds
+                    + (time.monotonic() - reconcile_join_started),
                 )
+                if reconciler_enabled:
+                    self._record_reorg_reconcile_lookup(
+                        "tip_refresh",
+                        reconcile_source,
+                    )
             if not reorg_reconciled:
                 raise _TipRefreshTrustBlocked(
                     "qbit chain view remained untrusted after reorg reconciliation"
@@ -13151,6 +13443,13 @@ class PrismCoordinator:
             )
             if detection_changed:
                 self._evict_reorg_reconcile_memo_for_new_tip_locked(tip_hash)
+                # Bumped exactly when cached reconcile proofs are dropped:
+                # a refresh's join compares this epoch to tell whether any
+                # flip (away, or away and back) interleaved its template
+                # fetch and invalidated a pass that ran concurrently.
+                self.tip_detection_epoch = (
+                    int(getattr(self, "tip_detection_epoch", 0)) + 1
+                )
             if (
                 detection_changed
                 and self._payout_state_source[1] != tip_hash
@@ -13619,6 +13918,17 @@ class PrismCoordinator:
             self.same_tip_job_retention_per_connection = (
                 DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION
             )
+        if not hasattr(self, "disconnected_job_retention"):
+            self.disconnected_job_retention = (
+                DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION
+            )
+        if not hasattr(self, "_disconnected_evicted_job_ids"):
+            # Insertion-ordered ids of graveyard entries whose connection is
+            # gone (entry.client is None); bounds cross-connection retention
+            # independently of live connections' per-connection caps.
+            self._disconnected_evicted_job_ids: OrderedDict[str, None] = (
+                OrderedDict()
+            )
         current_tip = self._current_published_tip_hash_locked()
         if self.evicted_job_index_tip_hash != current_tip:
             rebuild_indexes = True
@@ -13655,6 +13965,7 @@ class PrismCoordinator:
             if not connection_jobs:
                 self.evicted_same_tip_by_connection.pop(entry.connection_id, None)
         self.evicted_same_tip_job_ids.pop(job_id, None)
+        self._disconnected_evicted_job_ids.pop(job_id, None)
         return entry
 
     def _index_evicted_job_locked(self, job_id: str, entry: EvictedJobEntry) -> None:
@@ -13696,6 +14007,19 @@ class PrismCoordinator:
                 self._remove_evicted_job_locked(oldest_job_id)
                 self.evicted_job_capacity_eviction_counts["connection"] += 1
                 job_ids = self.evicted_same_tip_by_connection.get(candidate_connection_id)
+
+    def _enforce_disconnected_evicted_capacity_locked(self) -> None:
+        cap = int(
+            getattr(
+                self,
+                "disconnected_job_retention",
+                DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,
+            )
+        )
+        while len(self._disconnected_evicted_job_ids) > max(0, cap):
+            oldest_job_id = next(iter(self._disconnected_evicted_job_ids))
+            self._remove_evicted_job_locked(oldest_job_id)
+            self.evicted_job_capacity_eviction_counts["disconnected"] += 1
 
     def _stale_grace_entry_expired_locked(
         self,
@@ -13821,7 +14145,15 @@ class PrismCoordinator:
         with self.lock:
             self._ensure_evicted_job_state()
             entry = getattr(self, "evicted_job_graveyard", {}).get(job_id)
-            if entry is None or entry.connection_id != client.connection_id:
+            if entry is None:
+                return None
+            if (
+                entry.connection_id != client.connection_id
+                and not self._cross_connection_evicted_entry_allowed_locked(
+                    entry,
+                    client,
+                )
+            ):
                 return None
             job_class, expired = self._evicted_job_expired_locked(
                 entry,
@@ -13833,6 +14165,45 @@ class PrismCoordinator:
                 return None
             return entry
 
+    def _cross_connection_evicted_entry_allowed_locked(
+        self,
+        entry: EvictedJobEntry,
+        client: ClientState,
+    ) -> bool:
+        """Whether a retained context of a dead connection may serve this
+        submitter.
+
+        Only same-tip contexts qualify (they are fully valid current work;
+        stale-grace expiry anchors on the original connection's delivery
+        state, which a dead connection can never advance), and only for an
+        authorized reconnect of the same username -- the credit goes to the
+        context's original worker identity either way, so a foreign
+        submitter could at most donate work, but refusing keeps job ids
+        unguessable-by-effect and the accounting per miner honest. Replays
+        stay rejected by the (username, header) dedup key.
+        """
+        if entry.client is not None:
+            # The owning connection is still alive; job ids stay scoped to it.
+            return False
+        if (
+            int(
+                getattr(
+                    self,
+                    "disconnected_job_retention",
+                    DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,
+                )
+            )
+            <= 0
+        ):
+            return False
+        if not client.authorized or not client.username:
+            return False
+        worker = getattr(entry.context, "worker", None)
+        username = getattr(worker, "username", None)
+        if not username or username != client.username:
+            return False
+        return self._evicted_job_class_locked(entry) == "same_tip"
+
     def evicted_submit_context(
         self,
         client: ClientState,
@@ -13842,16 +14213,29 @@ class PrismCoordinator:
         context = entry.context
         if str(context.template["previousblockhash"]) == current_tip:
             return context, None
+        if entry.connection_id != client.connection_id:
+            # Cross-connection resumes are same-tip only. A tip that moves
+            # between the graveyard lookup and this classification must not
+            # fall through to stale grace: that window anchors on the
+            # submitting connection's delivery state, which says nothing
+            # about work another (dead) connection delivered.
+            return None
         if not self.context_eligible_for_stale_grace(client, context, current_tip):
             return None
         return context, PRISM_CREDIT_POLICY_STALE_GRACE
 
-    def note_evicted_job_submit(self, credit_policy: str | None) -> None:
-        outcome = (
-            "credited_stale_grace"
-            if credit_policy == PRISM_CREDIT_POLICY_STALE_GRACE
-            else "accepted_same_tip"
-        )
+    def note_evicted_job_submit(
+        self,
+        credit_policy: str | None,
+        *,
+        cross_connection: bool = False,
+    ) -> None:
+        if credit_policy == PRISM_CREDIT_POLICY_STALE_GRACE:
+            outcome = "credited_stale_grace"
+        elif cross_connection:
+            outcome = "accepted_same_tip_cross_connection"
+        else:
+            outcome = "accepted_same_tip"
         with self.lock:
             self._ensure_evicted_job_state()
             self.evicted_job_submit_counts[outcome] += 1
@@ -14010,6 +14394,7 @@ class PrismCoordinator:
         trusted: bool,
         clear_memo: bool = False,
         evict_others: bool = False,
+        proof_epoch: int | None = None,
     ) -> None:
         """Record a reconcile outcome in the per-tip trusted memo.
 
@@ -14022,7 +14407,11 @@ class PrismCoordinator:
         were taken against pre-mutation rows and no longer hold, even if the
         chain later flips back before any tip observation lands. A reconcile
         error passes clear_memo=True; a partially applied ledger mutation
-        invalidates every cached outcome.
+        invalidates every cached outcome. ``proof_epoch`` carries the
+        tip-detection epoch the pass started its reads in: arming is refused
+        when the epoch moved during the pass, so a flip away and back can
+        never re-arm an entry with a proof from the closed epoch (the
+        latest-detected-hash guard alone cannot see the round trip).
         """
 
         self._ensure_job_cache_state()
@@ -14048,6 +14437,13 @@ class PrismCoordinator:
                     # newest detected one; its epoch is over. Arming would
                     # re-add an entry the newer observation already evicted
                     # and let a flip-back reuse a pre-flip outcome.
+                    return
+                if proof_epoch is not None and proof_epoch != int(
+                    getattr(self, "tip_detection_epoch", 0)
+                ):
+                    # The pass spanned a detection cycle; every memo
+                    # consumer (refresh joins, initial-job and vardiff-idle
+                    # builds) must see a full re-proof instead.
                     return
                 memo[tip_hash] = now
                 memo.move_to_end(tip_hash)
@@ -14092,32 +14488,153 @@ class PrismCoordinator:
             )
         if not reconciler_enabled:
             return True
-        # A trusted reconciliation for this same tip within the cache window is
-        # reused: the blockpoll loop re-reconciles every poll anyway, so
-        # per-client job builds do not each need a full ledger reconcile pass.
-        # The memo is per tip: an untrusted outcome recorded for another tip
-        # never unarms this one. The chain-view trust check is NOT cached:
-        # headers can run ahead of the validated tip without the best block
-        # hash changing (an arriving reorg), and job issuance must pause
-        # immediately, not a TTL later.
+        if self._reorg_reconcile_memo_fresh(current_tip):
+            self._record_reorg_reconcile_lookup("job_build", "memo_hit")
+            return True
+        self._record_reorg_reconcile_lookup("job_build", "serial")
+        return self.ensure_reorg_reconciled_for_tip(current_tip)
+
+    def _reorg_reconcile_memo_fresh(self, tip_hash: str) -> bool:
+        """True when a trusted pass for ``tip_hash`` is inside the cache TTL
+        and the live chain view is still trusted.
+
+        A fresh memo entry lets a caller reuse the completed pass instead of
+        queueing a redundant serialized one. The memo is per tip: an
+        untrusted outcome recorded for another tip never unarms this one.
+        The chain-view trust check is NOT cached: headers can run ahead of
+        the validated tip without the best block hash changing (an arriving
+        reorg), and job issuance must pause immediately, not a TTL later.
+        """
         ttl = getattr(
             self,
             "reorg_reconcile_cache_seconds",
             DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
         )
-        if ttl > 0:
-            self._ensure_job_cache_state()
-            with self.lock:
-                reconciled_monotonic = self._reorg_reconcile_trusted_memo.get(
-                    current_tip
+        if ttl <= 0:
+            return False
+        self._ensure_job_cache_state()
+        with self.lock:
+            reconciled_monotonic = self._reorg_reconcile_trusted_memo.get(
+                tip_hash
+            )
+        return bool(
+            reconciled_monotonic is not None
+            and time.monotonic() - reconciled_monotonic <= ttl
+            and not self.qbit_chain_view_untrusted()
+        )
+
+    def _record_reorg_reconcile_lookup(self, path: str, source: str) -> None:
+        if path not in PRISM_REORG_RECONCILE_LOOKUP_PATHS:
+            raise ValueError(f"unknown reorg reconcile lookup path: {path}")
+        if source not in PRISM_REORG_RECONCILE_LOOKUP_SOURCES:
+            raise ValueError(f"unknown reorg reconcile lookup source: {source}")
+        self._ensure_job_cache_state()
+        with self.lock:
+            self.reorg_reconcile_lookup_counts[(path, source)] += 1
+
+    def _reconcile_prefetch_pass(self, tip_hash: str) -> bool:
+        """One prefetched reconcile, honoring the memo like the join does.
+
+        A prefetch that queued behind a completed same-tip pass (abandoned
+        refresh attempts reuse the slot, but a replaced tip can leave one
+        queued) would otherwise re-run the full serialized pass for nothing.
+        """
+        if self._reorg_reconcile_memo_fresh(tip_hash):
+            return True
+        return self.ensure_reorg_reconciled_for_tip(tip_hash)
+
+    def _submit_reconcile_prefetch(self, tip_hash: str) -> Future[bool] | None:
+        """Run one reconcile pass on the prefetch worker so it overlaps the
+        caller's template fetch.
+
+        Returns ``None`` once shutdown has retired the executor; the caller
+        falls back to its serial pass. At most one prefetch is outstanding:
+        a refresh attempt that failed before its join (for example a
+        template-RPC outage) leaves its future in the slot, and the retry
+        reuses it for the same tip instead of queueing another serialized
+        pass behind the first.
+        """
+        self._ensure_job_cache_state()
+        stale_future: Future[bool] | None = None
+        future: Future[bool] | None = None
+        with self._reconcile_prefetch_executor_lock:
+            if self._reconcile_prefetch_executor_shutdown:
+                return None
+            pending = self._reconcile_prefetch_pending
+            if pending is not None:
+                pending_tip, pending_future = pending
+                if not pending_future.done() and pending_tip == tip_hash:
+                    return pending_future
+                # Replaced tip or completed future: hand the old future off
+                # for disposal outside this lock -- cancellation runs done
+                # callbacks inline on this thread, and _clear_slot below
+                # re-takes the lock.
+                self._reconcile_prefetch_pending = None
+                if not pending_future.done():
+                    stale_future = pending_future
+            executor = self._reconcile_prefetch_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="prism-reconcile-prefetch",
                 )
-            if (
-                reconciled_monotonic is not None
-                and time.monotonic() - reconciled_monotonic <= ttl
-                and not self.qbit_chain_view_untrusted()
-            ):
-                return True
-        return self.ensure_reorg_reconciled_for_tip(current_tip)
+                self._reconcile_prefetch_executor = executor
+            try:
+                future = executor.submit(self._reconcile_prefetch_pass, tip_hash)
+                self._reconcile_prefetch_pending = (tip_hash, future)
+            except RuntimeError:
+                # Executor shutdown raced this submit; the serial path
+                # covers it (after the stale future is disposed below).
+                future = None
+        if stale_future is not None and not stale_future.cancel():
+            # Already running for a replaced tip; let it finish detached.
+            # The slot holds the new tip, so at most one task ever waits
+            # behind the running one.
+            self._discard_stale_reconcile_prefetch(stale_future)
+        if future is None:
+            return None
+
+        def _clear_slot(done: Future[bool]) -> None:
+            with self._reconcile_prefetch_executor_lock:
+                pending_now = self._reconcile_prefetch_pending
+                if pending_now is not None and pending_now[1] is done:
+                    self._reconcile_prefetch_pending = None
+
+        # Registered outside the slot lock: a completed future runs the
+        # callback inline on this thread.
+        future.add_done_callback(_clear_slot)
+        return future
+
+    @staticmethod
+    def _discard_stale_reconcile_prefetch(future: Future[bool]) -> None:
+        """Detach a prefetched pass whose tip was superseded during the
+        template fetch.
+
+        The pass cannot be cancelled mid-ledger-mutation and already records
+        its own outcome/error accounting; the serial pass for the current
+        tip re-surfaces any condition that still applies. Consuming the
+        result here only prevents an unretrieved-exception warning.
+        """
+
+        def _consume(done: Future[bool]) -> None:
+            try:
+                done.result()
+            except BaseException:
+                pass
+
+        future.add_done_callback(_consume)
+
+    def shutdown_reconcile_prefetch_executor(self) -> None:
+        self._ensure_job_cache_state()
+        with self._reconcile_prefetch_executor_lock:
+            executor = self._reconcile_prefetch_executor
+            self._reconcile_prefetch_executor = None
+            self._reconcile_prefetch_executor_shutdown = True
+            self._reconcile_prefetch_pending = None
+        if executor is not None:
+            # A pass blocked on writer admission aborts via
+            # ShutdownInProgress on its own; never hold shutdown for it.
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def ensure_reorg_reconciled_for_tip(
         self,
@@ -14432,6 +14949,8 @@ class PrismCoordinator:
             ),
         )
 
+        proof_epoch = int(getattr(self, "tip_detection_epoch", 0))
+
         def finish(*, trusted: bool) -> dict[str, object]:
             with self.lock:
                 self.reorg_inactive_block_count += inactive_blocks_total
@@ -14448,6 +14967,7 @@ class PrismCoordinator:
                     or reactivated_blocks_total
                     or matured_payouts_total
                 ),
+                proof_epoch=proof_epoch,
             )
             summary["inactive_blocks"] = inactive_blocks_total
             summary["reactivated_blocks"] = reactivated_blocks_total
@@ -14470,6 +14990,11 @@ class PrismCoordinator:
             candidate_to_publish: PayoutStateCandidate | None = None
             error_candidate: PayoutStateCandidate | None = None
             attempt_trusted = True
+            # The memo entry this attempt may arm must prove state for the
+            # epoch its reads happen in; a detection cycle during the pass
+            # (away, or away and back) refuses the arm in
+            # _note_reorg_reconcile_outcome.
+            proof_epoch = int(getattr(self, "tip_detection_epoch", 0))
             try:
                 with self._payout_state_prepare_lock:
                     prepared_started = time.monotonic()
@@ -14886,7 +15411,9 @@ class PrismCoordinator:
                 line = line.strip()
                 if not line:
                     continue
+                client.request_received_monotonic = time.monotonic()
                 request_id: object = None
+                request: object = None
                 try:
                     request = json.loads(line)
                     if not isinstance(request, dict):
@@ -14897,6 +15424,20 @@ class PrismCoordinator:
                     self.send_error(client, request_id, 20, f"invalid JSON: {exc.msg}")
                 except StratumError as exc:
                     self.send_error(client, request_id, exc.code, exc.message, reason=exc.reason)
+                    received_monotonic = client.request_received_monotonic
+                    if (
+                        received_monotonic is not None
+                        and isinstance(request, dict)
+                        and request.get("method") == "mining.submit"
+                    ):
+                        # Symmetric with the accepted-path observation after
+                        # send_result: both sides include the response write,
+                        # so the accepted-vs-rejected comparison separates
+                        # commit pressure from transport/thread saturation.
+                        self._observe_share_ack_seconds(
+                            "rejected",
+                            time.monotonic() - received_monotonic,
+                        )
                     if exc.disconnect:
                         break
                 except Exception:
@@ -14957,15 +15498,51 @@ class PrismCoordinator:
             # Retirement above holds neither while this potentially waits.
             with client.job_update_lock:
                 with self.lock:
+                    self._ensure_evicted_job_state()
+                    retention_cap = int(
+                        getattr(
+                            self,
+                            "disconnected_job_retention",
+                            DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,
+                        )
+                    )
+                    if retention_cap > 0:
+                        # Devices behind a flapping proxy keep mining the
+                        # jobs this connection delivered; bury the active
+                        # ones so their in-flight shares can resume against
+                        # the retained context after the reconnect.
+                        for job_id in tuple(client.active_job_ids):
+                            self.bury_evicted_job(client, job_id, prune=False)
                     for job_id in tuple(client.active_job_ids):
                         self.jobs.pop(job_id, None)
                     client.active_job_ids.clear()
                     client.active_job = None
-                    self._ensure_evicted_job_state()
                     for job_id in tuple(
                         self.evicted_jobs_by_connection.get(client.connection_id, ())
                     ):
-                        self._remove_evicted_job_locked(job_id)
+                        entry = self.evicted_job_graveyard.get(job_id)
+                        if entry is None:
+                            continue
+                        if (
+                            retention_cap <= 0
+                            or self._evicted_job_class_locked(entry) != "same_tip"
+                        ):
+                            # Stale-grace work stays tied to the connection
+                            # that received it (its expiry anchors on that
+                            # connection's delivered work); only fully valid
+                            # same-tip contexts survive the disconnect.
+                            self._remove_evicted_job_locked(job_id)
+                            continue
+                        # Detach from the dead connection object: expiry then
+                        # anchors on the entry's own eviction time (same-tip
+                        # TTL) or the published tip flip, never on delivery
+                        # state this connection can no longer advance.
+                        self.evicted_job_graveyard[job_id] = dataclasses.replace(
+                            entry,
+                            client=None,
+                        )
+                        self._disconnected_evicted_job_ids[job_id] = None
+                    self._enforce_disconnected_evicted_capacity_locked()
                     client.authorized = False
                     client.worker = None
                     client.username = ""
@@ -15091,9 +15668,21 @@ class PrismCoordinator:
             self.handle_suggest_difficulty(client, request_id, params)
             return
         if method == "mining.submit":
+            received_monotonic = getattr(
+                client,
+                "request_received_monotonic",
+                None,
+            )
             accepted_and_closed = self.handle_submit(client, params)
             try:
                 self.send_result(client, request_id, True)
+                if received_monotonic is not None:
+                    # Rejects are observed symmetrically in handle_client
+                    # after their error response write.
+                    self._observe_share_ack_seconds(
+                        "accepted",
+                        time.monotonic() - received_monotonic,
+                    )
             finally:
                 self.refresh_jobs_after_pending_accepted_block(client)
             if accepted_and_closed:
@@ -15914,11 +16503,34 @@ class PrismCoordinator:
             self.send_difficulty(client, job)
             self.send_job(client, job)
             return
+        payloads = [
+            self.difficulty_payload(job.share_difficulty),
+            self.job_payload(job),
+        ]
+        shared_params = getattr(job, "notify_shared_params_json", None)
+        if shared_params is None:
+            client.send_batch(payloads)
+            return
+        # Splice the per-client fields around the fragment serialized once
+        # per bundle build; at fleet scale the coinb1/coinb2/merkle parts
+        # dominate the notify and are byte-identical for every client.
+        notify_line = (
+            '{"id": null, "method": "mining.notify", "params": ['
+            + json.dumps(job.job_id)
+            + ", "
+            + shared_params
+            + ", "
+            + ("true" if job.clean_jobs else "false")
+            + "]}"
+        )
         client.send_batch(
-            [
-                self.difficulty_payload(job.share_difficulty),
-                self.job_payload(job),
-            ]
+            payloads,
+            preserialized=(
+                json.dumps(payloads[0]).encode()
+                + b"\n"
+                + notify_line.encode()
+                + b"\n"
+            ),
         )
 
     def build_job_for_client(self, client: ClientState, *, clean_jobs: bool) -> PrismJobContext:
@@ -17248,6 +17860,15 @@ class PrismCoordinator:
                     worker=worker_name,
                 )
 
+        submit_version_mask = client.version_mask
+        if (
+            evicted_entry is not None
+            and evicted_entry.connection_id != client.connection_id
+        ):
+            # In-flight work from the dead connection was rolled under the
+            # mask negotiated there; the replacement's own mask (often still
+            # 0 before mining.configure) must not judge those version bits.
+            submit_version_mask = int(getattr(context, "version_mask", 0))
         try:
             submission = direct_stratum.assemble_submission(
                 context.job,
@@ -17255,7 +17876,7 @@ class PrismCoordinator:
                 ntime_hex=ntime_hex,
                 nonce_hex=nonce_hex,
                 version_bits_hex=version_bits_hex,
-                version_mask=client.version_mask,
+                version_mask=submit_version_mask,
             )
         except ValueError as exc:
             self.reject_stratum(
@@ -17348,7 +17969,13 @@ class PrismCoordinator:
                     credit_policy=credit_policy,
                 )
                 if evicted_entry is not None:
-                    self.note_evicted_job_submit(credit_policy)
+                    self.note_evicted_job_submit(
+                        credit_policy,
+                        cross_connection=(
+                            evicted_entry.connection_id
+                            != client.connection_id
+                        ),
+                    )
             except BaseException:
                 self._forget_recent_share_key(share_key)
                 raise
@@ -17356,7 +17983,15 @@ class PrismCoordinator:
         candidate = PrismBlockCandidate(
             context=context,
             submission=submission,
-            extranonce1_hex=client.extranonce1_hex,
+            # The mined coinbase embeds the extranonce1 the job was stamped
+            # with. A cross-connection resume submits through a client whose
+            # own extranonce1 differs from the retained job's, and the audit
+            # bundle suffix must match the coinbase actually in the block,
+            # so the job's value is authoritative whenever it carries one.
+            extranonce1_hex=str(
+                getattr(context.job, "extranonce1_hex", None)
+                or client.extranonce1_hex
+            ),
             extranonce2_hex=extranonce2_hex,
             pending_share=pending_share,
             client=client,
@@ -17453,7 +18088,13 @@ class PrismCoordinator:
                     str(submission.block_hash_hex)
                 )
                 if evicted_entry is not None:
-                    self.note_evicted_job_submit(credit_policy)
+                    self.note_evicted_job_submit(
+                        credit_policy,
+                        cross_connection=(
+                            evicted_entry.connection_id
+                            != client.connection_id
+                        ),
+                    )
             return False
         # A block-worthy submission that met the share target is a valid share
         # regardless of the block's fate: credit it now, acknowledge the miner
@@ -17471,7 +18112,12 @@ class PrismCoordinator:
                 candidate_intent=candidate_intent,
             )
             if evicted_entry is not None:
-                self.note_evicted_job_submit(credit_policy)
+                self.note_evicted_job_submit(
+                    credit_policy,
+                    cross_connection=(
+                        evicted_entry.connection_id != client.connection_id
+                    ),
+                )
         except BaseException:
             # Idempotent with append_accepted_share's own release; also covers
             # an intent serialization failure before the append started.
@@ -20037,6 +20683,25 @@ class PrismCoordinator:
         )
         return True
 
+    @contextmanager
+    def _payout_balance_serializer_released(self) -> Iterator[None]:
+        """Temporarily release the balance serializer around candidate audit
+        construction.
+
+        The caller is the landing, which holds the serializer exactly once
+        (its single outer acquisition; no caller of
+        _land_and_confirm_block_candidate holds it). The landed-transition
+        fence armed before the release keeps reconciliation from mutating
+        balances while the serializer is free, so job delivery proceeds
+        during the expensive builder/verifier subprocess work instead of
+        queueing for its whole duration.
+        """
+        self._payout_balance_mutation_lock.release()
+        try:
+            yield
+        finally:
+            self._payout_balance_mutation_lock.acquire()
+
     def _land_and_confirm_block_candidate(
         self,
         candidate: PrismBlockCandidate,
@@ -20055,6 +20720,10 @@ class PrismCoordinator:
         The balance serializer spans the last prior-state check through durable
         confirmation. Reconciliation therefore cannot change the base beneath
         the accepted coinbase, while ordinary job delivery remains unblocked.
+        submitblock always runs first; the audit bundle build and verification
+        then execute with the serializer temporarily released (the landed
+        fence stays armed), so neither block announcement nor job delivery
+        waits on audit construction.
         """
         context = candidate.context
         submission = candidate.submission
@@ -20212,6 +20881,14 @@ class PrismCoordinator:
                 self._record_heartbeat("block_submitter")
                 result = self.rpc.call("submitblock", [submission.block_hex])
                 self._record_heartbeat("block_submitter")
+                landed_monotonic = getattr(candidate, "landed_monotonic", None)
+                if landed_monotonic is not None:
+                    # Observed for every attempt whose RPC returned, accepted
+                    # or rejected: a rejected race is exactly the tail this
+                    # histogram exists to expose.
+                    self._observe_block_submit_seconds(
+                        time.monotonic() - float(landed_monotonic)
+                    )
                 if result not in (None, "duplicate"):
                     self._abandon_block_candidate(
                         PRISM_REJECTION_SUBMITBLOCK_REJECTED,
@@ -20262,85 +20939,100 @@ class PrismCoordinator:
                 self._publish_accepted_block_payout_preview(block_hash, preview)
 
             self._record_heartbeat("block_submitter")
-            candidate_bundle_path = self.temporary_audit_bundle_path(
-                block_hash=submission.block_hash_hex
-            )
-            final_bundle = self.build_audit_bundle(
-                shares=context.shares_json,
-                found_block=context.found_block,
-                prior_balances=context.prior_balances,
-                coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
-                    candidate.extranonce1_hex,
-                    candidate.extranonce2_hex,
-                ),
-                witness_merkle_leaves_hex=list(
-                    getattr(context.job, "witness_merkle_leaves_hex", ())
+            # The bundle derives only from inputs frozen on the candidate
+            # (share window, prior balances, extranonces, template fields),
+            # so the serializer is released around the builder/verifier
+            # subprocess work: submitblock above has already run for fresh
+            # candidates -- announcement is never delayed by audit
+            # construction -- and the landed fence keeps reconciliation out
+            # while job delivery proceeds. Child builds consume the compact
+            # preview published above until the verified preview lands.
+            with self._payout_balance_serializer_released():
+                candidate_bundle_path = self.temporary_audit_bundle_path(
+                    block_hash=submission.block_hash_hex
                 )
-                or direct_stratum.witness_merkle_leaves_hex(
-                    getattr(context.job, "transaction_hexes", ())
-                ),
-                ctv_fee_parent_hash=parent_hash,
-                canonical_output_path=candidate_bundle_path,
-            )
-            # Compatibility builders used by tests and older integrations may
-            # ignore canonical_output_path. Persist their logical bundle via
-            # the normal canonicalization fallback without mislabeling bytes.
-            if not candidate_bundle_path.exists():
-                candidate_bundle_path = self.write_temporary_audit_bundle(
-                    final_bundle,
-                    block_hash=submission.block_hash_hex,
-                )
-            try:
-                final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
-                final_coinbase_tx_hex_raw = final_manifest["coinbase_tx_hex"]
-                if not isinstance(final_coinbase_tx_hex_raw, str):
-                    raise ValueError(
-                        "final audit bundle coinbase_tx_hex is not a string"
+                final_bundle = self.build_audit_bundle(
+                    shares=context.shares_json,
+                    found_block=context.found_block,
+                    prior_balances=context.prior_balances,
+                    coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
+                        candidate.extranonce1_hex,
+                        candidate.extranonce2_hex,
+                    ),
+                    witness_merkle_leaves_hex=list(
+                        getattr(context.job, "witness_merkle_leaves_hex", ())
                     )
-                final_coinbase_tx_hex = final_coinbase_tx_hex_raw.lower()
-            except BaseException:
-                try:
-                    candidate_bundle_path.unlink()
-                except FileNotFoundError:
-                    pass
-                raise
-            if final_coinbase_tx_hex != submission.coinbase_tx_hex.lower():
-                try:
-                    candidate_bundle_path.unlink()
-                except FileNotFoundError:
-                    pass
-                self.request_shutdown()
-                self._clear_accepted_block_payout_preview(
-                    block_hash,
-                    invalidate_published=True,
+                    or direct_stratum.witness_merkle_leaves_hex(
+                        getattr(context.job, "transaction_hexes", ())
+                    ),
+                    ctv_fee_parent_hash=parent_hash,
+                    canonical_output_path=candidate_bundle_path,
                 )
-                self._abandon_block_candidate(
-                    PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
-                    "final audit bundle coinbase does not match submitted coinbase",
-                    block_hash=block_hash,
-                    worker=worker,
-                )
-                return None
+                # Compatibility builders used by tests and older integrations
+                # may ignore canonical_output_path. Persist their logical
+                # bundle via the normal canonicalization fallback without
+                # mislabeling bytes.
+                if not candidate_bundle_path.exists():
+                    candidate_bundle_path = self.write_temporary_audit_bundle(
+                        final_bundle,
+                        block_hash=submission.block_hash_hex,
+                    )
+                try:
+                    final_manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
+                    final_coinbase_tx_hex_raw = final_manifest["coinbase_tx_hex"]
+                    if not isinstance(final_coinbase_tx_hex_raw, str):
+                        raise ValueError(
+                            "final audit bundle coinbase_tx_hex is not a string"
+                        )
+                    final_coinbase_tx_hex = final_coinbase_tx_hex_raw.lower()
+                except BaseException:
+                    try:
+                        candidate_bundle_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    raise
+                if final_coinbase_tx_hex != submission.coinbase_tx_hex.lower():
+                    try:
+                        candidate_bundle_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    self.request_shutdown()
+                    self._clear_accepted_block_payout_preview(
+                        block_hash,
+                        invalidate_published=True,
+                    )
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
+                        "final audit bundle coinbase does not match submitted coinbase",
+                        block_hash=block_hash,
+                        worker=worker,
+                    )
+                    return None
             payout_commit_started: float | None = None
             payout_commit_source: int | None = None
             try:
-                report = self.verify_bundle(
-                    candidate_bundle_path,
-                    submission.coinbase_tx_hex,
-                    self.trusted_ledger_writer_public_key_hex(final_bundle),
-                    expected_coinbase_value_sats=int(context.template["coinbasevalue"]),
-                )
-                persistence_canonical_bundle_path = (
-                    self.verified_canonical_bundle_path(
+                with self._payout_balance_serializer_released():
+                    report = self.verify_bundle(
                         candidate_bundle_path,
-                        report,
+                        submission.coinbase_tx_hex,
+                        self.trusted_ledger_writer_public_key_hex(final_bundle),
+                        expected_coinbase_value_sats=int(
+                            context.template["coinbasevalue"]
+                        ),
                     )
-                )
+                    persistence_canonical_bundle_path = (
+                        self.verified_canonical_bundle_path(
+                            candidate_bundle_path,
+                            report,
+                        )
+                    )
+                    verified_preview = (
+                        self._accepted_block_payout_preview_from_bundle(
+                            final_bundle,
+                            prior_balances=context.prior_balances,
+                        )
+                    )
                 self._record_heartbeat("block_submitter")
-                verified_preview = self._accepted_block_payout_preview_from_bundle(
-                    final_bundle,
-                    prior_balances=context.prior_balances,
-                )
                 if not already_confirmed:
                     if preview is None and durable_payout_state:
                         live_prior_balances = self.settlement_balances_by_program(
@@ -21924,6 +22616,20 @@ class PrismCoordinator:
             f"qbit_prism_coordinator_lock_wait_seconds_max {float(wait_max):.6f}",
         ]
 
+    def _observe_block_submit_seconds(self, elapsed_seconds: float) -> None:
+        self._ensure_job_cache_state()
+        with self._block_submit_metrics_lock:
+            histogram = self.block_submit_seconds_histogram
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + max(
+                0.0, elapsed_seconds
+            )
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS:
+                if elapsed_seconds <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
     def block_submitter_metrics_lines(self) -> list[str]:
         pending_metrics = {
             "pending_count": -1,
@@ -21939,6 +22645,7 @@ class PrismCoordinator:
                 # its watchdog remain authoritative when this read is down.
                 pass
         self._ensure_block_submitter_retry_state()
+        self._ensure_job_cache_state()
         now = time.monotonic()
         with self._block_submitter_retry_state_lock:
             deadline = self._block_submitter_backoff_deadline_monotonic
@@ -21947,7 +22654,20 @@ class PrismCoordinator:
                 max(0.0, float(deadline) - now) if deadline is not None else 0.0
             )
             backoff_delay = float(self._block_submitter_backoff_delay_seconds)
+        with self._block_submit_metrics_lock:
+            submit_buckets = dict(self.block_submit_seconds_histogram["buckets"])
+            submit_sum = float(self.block_submit_seconds_histogram["sum"])
+            submit_count = int(self.block_submit_seconds_histogram["count"])
         return [
+            "# HELP qbit_prism_block_submit_seconds Seconds from a block candidate landing in this process to its submitblock RPC returning.",
+            "# TYPE qbit_prism_block_submit_seconds histogram",
+            *[
+                f'qbit_prism_block_submit_seconds_bucket{{le="{bucket:g}"}} {int(submit_buckets.get(bucket, 0))}'
+                for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
+            ],
+            f'qbit_prism_block_submit_seconds_bucket{{le="+Inf"}} {submit_count}',
+            f"qbit_prism_block_submit_seconds_sum {submit_sum:.6f}",
+            f"qbit_prism_block_submit_seconds_count {submit_count}",
             "# HELP qbit_prism_block_candidates_pending Durable block candidates awaiting a terminal outcome, or -1 if unavailable.",
             "# TYPE qbit_prism_block_candidates_pending gauge",
             f"qbit_prism_block_candidates_pending {int(pending_metrics['pending_count'])}",
@@ -22303,6 +23023,14 @@ class PrismCoordinator:
             "# HELP qbit_prism_reorg_reconcile_errors_total Reorg reconciliation errors that prevented ordered job issuance.",
             "# TYPE qbit_prism_reorg_reconcile_errors_total counter",
             f"qbit_prism_reorg_reconcile_errors_total {self.reorg_reconcile_error_count}",
+            "# HELP qbit_prism_reorg_reconcile_lookups_total Reconcile demand by caller path and the source that satisfied it.",
+            "# TYPE qbit_prism_reorg_reconcile_lookups_total counter",
+            *[
+                f'qbit_prism_reorg_reconcile_lookups_total{{path="{path}",source="{source}"}} '
+                f"{int(getattr(self, 'reorg_reconcile_lookup_counts', {}).get((path, source), 0))}"
+                for path in PRISM_REORG_RECONCILE_LOOKUP_PATHS
+                for source in PRISM_REORG_RECONCILE_LOOKUP_SOURCES
+            ],
             "# HELP qbit_prism_matured_payouts_total Payout entries marked mature by the coordinator tip reconciliation path.",
             "# TYPE qbit_prism_matured_payouts_total counter",
             f"qbit_prism_matured_payouts_total {self.matured_payout_count}",
@@ -22373,6 +23101,7 @@ class PrismCoordinator:
         lines.extend(self.shutdown_metrics_lines())
         lines.extend(self.coordinator_lock_metrics_lines())
         lines.extend(self.block_submitter_metrics_lines())
+        lines.extend(self.share_ack_metrics_lines())
         lines.extend(self.ctv_fanout_broadcaster_metrics_lines())
         lines.extend(self.vardiff_idle_metrics_lines())
         lines.extend(self.job_build_metrics_lines())
@@ -22744,12 +23473,14 @@ class PrismCoordinator:
             "bundle_build": "qbit_prism_tip_refresh_bundle_build_seconds",
             "first_delivery": "qbit_prism_tip_refresh_first_delivery_seconds",
             "last_delivery": "qbit_prism_tip_refresh_last_delivery_seconds",
+            "fanout_wave": "qbit_prism_tip_refresh_fanout_wave_seconds",
         }
         descriptions = {
             "refresh": "Full qbit tip/template refresh pass wall time.",
             "bundle_build": "Shared ready-pool refresh bundle preparation wall time.",
             "first_delivery": "Tip observation to first successful client delivery.",
             "last_delivery": "Tip observation to last successful client delivery.",
+            "fanout_wave": "First task submission to last successful delivery of one completed prepared fanout wave.",
         }
         lines: list[str] = []
         for name, metric_name in metric_names.items():

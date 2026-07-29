@@ -5306,6 +5306,41 @@ class ClientCleanupTests(unittest.TestCase):
         self.assertIsNone(state.active_job)
         self.assertEqual(state.active_job_ids, set())
         self.assertNotIn(active_id, server.jobs)
+        # Same-tip contexts survive the disconnect (detached from the dead
+        # connection object) so a same-username reconnect can still submit
+        # in-flight work; they age out on the same-tip retention TTL.
+        for job_id in (active_id, evicted_id):
+            entry = server.evicted_job_graveyard.get(job_id)
+            self.assertIsNotNone(entry)
+            assert entry is not None
+            self.assertIsNone(entry.client)
+            self.assertIn(job_id, server._disconnected_evicted_job_ids)
+
+    def test_disconnect_purges_evicted_contexts_when_retention_disabled(
+        self,
+    ) -> None:
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        server.disconnected_job_retention = 0
+        state = client(1)
+        active = server.build_job_for_client(state, clean_jobs=True)
+        evicted = server.build_job_for_client(state, clean_jobs=False)
+        active_id = active.job.job_id
+        evicted_id = evicted.job.job_id
+        state.active_job = active
+        state.active_job_ids = {active_id}
+        server.jobs = {active_id: active, evicted_id: evicted}
+        server.bury_evicted_job(state, evicted_id)
+        server.jobs.pop(evicted_id)
+        server.clients = {state}
+        state.close = lambda: None  # type: ignore[method-assign]
+
+        server.disconnect_client(state)
+
+        self.assertIsNone(state.active_job)
+        self.assertEqual(state.active_job_ids, set())
+        self.assertNotIn(active_id, server.jobs)
+        self.assertNotIn(active_id, server.evicted_job_graveyard)
         self.assertNotIn(evicted_id, server.evicted_job_graveyard)
         self.assertNotIn(state.connection_id, server.evicted_jobs_by_connection)
 
@@ -6236,6 +6271,455 @@ class ServeBuilderTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], JobBuildSuperseded)
         self.assertIsNone(server._serve_builder)
+
+
+class ReorgReconcileRefreshPathTests(unittest.TestCase):
+    """The tip-refresh reconcile stage: memo reuse and fetch overlap."""
+
+    def test_poll_memo_hit_skips_full_reconcile_pass(self) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        with server.lock:
+            server._reorg_reconcile_trusted_memo[rpc.tip] = time.monotonic()
+
+        def unexpected_pass(**_kwargs: object) -> dict[str, object]:
+            raise AssertionError(
+                "memo-armed poll must not queue a serialized reconcile pass"
+            )
+
+        server.reconcile_prism_pool_blocks_once = (  # type: ignore[method-assign]
+            unexpected_pass
+        )
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 1)
+        # A memo hit never needs the prefetch worker.
+        self.assertIsNone(server._reconcile_prefetch_executor)
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_lookups_total{path="tip_refresh",source="memo_hit"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_tip_refresh_bundle_phase_seconds_count{phase="reorg_reconcile"} 1',
+            metrics,
+        )
+
+    def test_poll_overlaps_reconcile_with_template_fetch(self) -> None:
+        # Deadlock-free only when the reconcile pass and the template fetch
+        # genuinely run concurrently: the fetch refuses to return before the
+        # reconcile starts, and the reconcile refuses to return before the
+        # fetch starts.
+        fetch_started = threading.Event()
+        reconcile_running = threading.Event()
+
+        class OverlapProbeRpc(FakeRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblocktemplate":
+                    fetch_started.set()
+                    assert reconcile_running.wait(5.0), (
+                        "reconcile prefetch did not start while the template "
+                        "fetch was in flight"
+                    )
+                return super().call(method, params)
+
+        template = base_template()
+        rpc = OverlapProbeRpc(template, tip=str(template["previousblockhash"]))
+        server, _ = coordinator(template=template)
+        server.rpc = rpc
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        reconciled_tips: list[str] = []
+
+        def fake_ensure(tip_hash: str) -> bool:
+            reconciled_tips.append(tip_hash)
+            reconcile_running.set()
+            assert fetch_started.wait(5.0), (
+                "template fetch did not start while the reconcile pass was "
+                "in flight"
+            )
+            # A real trusted pass arms the per-tip memo; the join validates
+            # the overlapped result against that armed entry.
+            with server.lock:
+                server._reorg_reconcile_trusted_memo[tip_hash] = time.monotonic()
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            fake_ensure
+        )
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 1)
+        self.assertEqual(reconciled_tips, [rpc.tip])
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_lookups_total{path="tip_refresh",source="overlap"} 1',
+            metrics,
+        )
+
+    def test_poll_reconciles_snapshot_tip_serially_when_tip_moves_before_fetch(
+        self,
+    ) -> None:
+        # The cheap probe observed a tip that was replaced before the
+        # template fetch. The prefetched pass proved the superseded hash, so
+        # the poll must reconcile the snapshot's newer tip on its own thread.
+        template = base_template()
+        new_tip = str(template["previousblockhash"])
+        old_tip = "ab" * 32
+
+        class MovingTipRpc(FakeRpc):
+            def __init__(self) -> None:
+                super().__init__(template, tip=new_tip)
+                self.best_tip_calls = 0
+
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getbestblockhash":
+                    self.best_tip_calls += 1
+                    if self.best_tip_calls == 1:
+                        self.calls.append(method)
+                        return old_tip
+                return super().call(method, params)
+
+        rpc = MovingTipRpc()
+        server, _ = coordinator(template=template)
+        server.rpc = rpc
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        reconcile_calls: list[str] = []
+        prefetch_drained = threading.Event()
+
+        def fake_ensure(tip_hash: str) -> bool:
+            reconcile_calls.append(tip_hash)
+            if tip_hash == old_tip:
+                prefetch_drained.set()
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            fake_ensure
+        )
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 1)
+        self.assertTrue(prefetch_drained.wait(5.0))
+        self.assertIn(new_tip, reconcile_calls)
+        self.assertEqual(
+            sorted(reconcile_calls),
+            sorted([old_tip, new_tip]),
+        )
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_lookups_total{path="tip_refresh",source="serial"} 1',
+            metrics,
+        )
+
+    def test_poll_reproves_when_memo_evicted_during_template_fetch(self) -> None:
+        # A tip that flips away and back during the template fetch evicts
+        # the memo entry so post-flip pool-block state is re-proven. The
+        # join must judge the memo at join time, never the pre-fetch probe.
+        template = base_template()
+        server, _ = coordinator(template=template)
+        server.reorg_reconciler_enabled = True
+        tip = str(template["previousblockhash"])
+
+        class EvictingRpc(FakeRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblocktemplate":
+                    # Models a detection during the fetch unarming the memo.
+                    with server.lock:
+                        server._reorg_reconcile_trusted_memo.clear()
+                return super().call(method, params)
+
+        rpc = EvictingRpc(template, tip=tip)
+        server.rpc = rpc
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        with server.lock:
+            server._reorg_reconcile_trusted_memo[tip] = time.monotonic()
+        reconcile_calls: list[str] = []
+
+        def fake_ensure(tip_hash: str) -> bool:
+            reconcile_calls.append(tip_hash)
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            fake_ensure
+        )
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 1)
+        self.assertEqual(reconcile_calls, [tip])
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_lookups_total{path="tip_refresh",source="serial"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_lookups_total{path="tip_refresh",source="memo_hit"} 0',
+            metrics,
+        )
+
+    def test_poll_reproves_when_memo_rearmed_across_detection_epoch(self) -> None:
+        # A pass whose execution straddles a flip away and back can re-arm
+        # the memo after the flip-back (the latest detected hash matches
+        # again), but its proof belongs to the closed epoch. The join must
+        # refuse memo entries when the detection epoch moved mid-fetch.
+        template = base_template()
+        server, _ = coordinator(template=template)
+        server.reorg_reconciler_enabled = True
+        tip = str(template["previousblockhash"])
+
+        class FlipBackRpc(FakeRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblocktemplate":
+                    # Models a flip away and back detected during the fetch
+                    # (two epoch bumps) with a straddling pass re-arming the
+                    # memo for the same hash afterwards.
+                    with server.lock:
+                        server.tip_detection_epoch = (
+                            int(getattr(server, "tip_detection_epoch", 0)) + 2
+                        )
+                        server._reorg_reconcile_trusted_memo[tip] = (
+                            time.monotonic()
+                        )
+                return super().call(method, params)
+
+        rpc = FlipBackRpc(template, tip=tip)
+        server.rpc = rpc
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        with server.lock:
+            server._reorg_reconcile_trusted_memo[tip] = time.monotonic()
+        reconcile_calls: list[str] = []
+
+        def fake_ensure(tip_hash: str) -> bool:
+            reconcile_calls.append(tip_hash)
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            fake_ensure
+        )
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 1)
+        self.assertEqual(reconcile_calls, [tip])
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_lookups_total{path="tip_refresh",source="serial"} 1',
+            metrics,
+        )
+
+    def test_overlap_join_blocks_when_trust_flips_after_prefetch(self) -> None:
+        # The prefetched pass proves trust when it runs, up to a fetch
+        # window earlier. Headers running ahead without a best-hash change
+        # (an arriving reorg, no detection) must still block the refresh at
+        # the join, matching the memo branch's live trust check.
+        template = base_template()
+        server, _ = coordinator(template=template)
+        server.reorg_reconciler_enabled = True
+        tip = str(template["previousblockhash"])
+
+        class TrustFlipRpc(FakeRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblocktemplate":
+                    # Headers run ahead after the fetch: untrusted view with
+                    # no tip detection (epoch unchanged).
+                    self.blockchain_info["headers"] = 101
+                return super().call(method, params)
+
+        rpc = TrustFlipRpc(template, tip=tip)
+        server.rpc = rpc
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            lambda _tip: True
+        )
+
+        try:
+            with self.assertRaises(TemplateRefreshBlocked) as raised:
+                server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertIn("untrusted", str(raised.exception))
+        self.assertIsNone(state.active_job)
+
+    def test_reconcile_prefetch_slot_is_reused_across_failed_attempts(self) -> None:
+        # A refresh attempt that dies before its join (template-RPC outage)
+        # must not queue another serialized pass per retry: the slot holds
+        # at most one outstanding prefetch, reused for the same tip and
+        # replaced (with the queued task cancelled) on a tip change.
+        server, _ = coordinator()
+        server.reorg_reconciler_enabled = True
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_ensure(tip_hash: str) -> bool:
+            started.set()
+            assert release.wait(5.0)
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            slow_ensure
+        )
+        try:
+            first = server._submit_reconcile_prefetch("aa" * 32)
+            assert first is not None
+            self.assertTrue(started.wait(5.0))
+            second = server._submit_reconcile_prefetch("aa" * 32)
+            self.assertIs(second, first)
+            third = server._submit_reconcile_prefetch("bb" * 32)
+            assert third is not None
+            self.assertIsNot(third, first)
+            fourth = server._submit_reconcile_prefetch("cc" * 32)
+            assert fourth is not None
+            self.assertIsNot(fourth, third)
+            self.assertTrue(third.cancelled())
+            release.set()
+            self.assertTrue(first.result(5.0))
+            self.assertTrue(fourth.result(5.0))
+        finally:
+            release.set()
+            server.shutdown_reconcile_prefetch_executor()
+
+    def test_job_build_memo_lookups_are_counted(self) -> None:
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        with server.lock:
+            server._reorg_reconcile_trusted_memo[rpc.tip] = time.monotonic()
+
+        self.assertTrue(server.ensure_reorg_reconciled_for_current_tip())
+
+        with server.lock:
+            server._reorg_reconcile_trusted_memo[rpc.tip] = (
+                time.monotonic() - 100.0
+            )
+        serial_tips: list[str] = []
+
+        def fake_ensure(tip_hash: str) -> bool:
+            serial_tips.append(tip_hash)
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            fake_ensure
+        )
+
+        self.assertTrue(server.ensure_reorg_reconciled_for_current_tip())
+
+        self.assertEqual(serial_tips, [rpc.tip])
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_lookups_total{path="job_build",source="memo_hit"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_lookups_total{path="job_build",source="serial"} 1',
+            metrics,
+        )
+
+    def test_poll_falls_back_to_serial_reconcile_after_prefetch_shutdown(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.reorg_reconciler_enabled = True
+        state = client(1)
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        server.shutdown_reconcile_prefetch_executor()
+        reconcile_calls: list[str] = []
+
+        def fake_ensure(tip_hash: str) -> bool:
+            reconcile_calls.append(tip_hash)
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            fake_ensure
+        )
+
+        try:
+            refreshed = server.poll_qbit_tip_template_once()
+        finally:
+            server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(refreshed, 1)
+        self.assertEqual(reconcile_calls, [rpc.tip])
+        self.assertIsNone(server._reconcile_prefetch_executor)
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_lookups_total{path="tip_refresh",source="serial"} 1',
+            metrics,
+        )
+
+
+class JobContextStampTests(unittest.TestCase):
+    def test_job_context_stamps_client_version_mask(self) -> None:
+        # Cross-connection resumes validate version bits against the mask
+        # negotiated on the delivering connection, so the context must
+        # record it at stamp time.
+        server, _ = coordinator()
+        install_fake_bundle_builder(server)
+        state = client(1)
+        state.version_mask = 0x1FFFE000
+
+        context = server.build_job_for_client(state, clean_jobs=True)
+
+        self.assertEqual(context.version_mask, 0x1FFFE000)
 
 
 if __name__ == "__main__":
