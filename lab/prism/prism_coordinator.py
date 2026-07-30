@@ -4522,21 +4522,29 @@ class PrismCoordinator:
             ):
                 # The armed artifact already carries exactly this
                 # window; keep its generation (no lookup re-key) but
-                # still treat the preparation as a success. A fresher
-                # anchor re-proved the same window, so advance the
-                # freshness clock in place -- otherwise a quiet share
-                # stream would cycle identical rebuilds forever without
-                # ever un-staling the armed artifact. The armed balances
-                # are kept: they are what the reuse fence hashes against
-                # the published payout state (including an accepted
-                # parent's preview patch).
-                if artifact_anchor_ms > current_anchor_ms:
-                    self._payout_ledger_artifact = dataclass_replace(
-                        current,
-                        accepted_share_count=artifact.accepted_share_count,
-                        prepared_monotonic=artifact.prepared_monotonic,
-                        snapshot_anchor_ms=artifact.snapshot_anchor_ms,
-                    )
+                # still treat the preparation as a success, and advance
+                # the freshness clock in place either way -- otherwise a
+                # quiet share stream, or a pending-commit floor pinning
+                # the anchor so every re-prove lands at the SAME anchor,
+                # would cycle identical rebuilds forever without ever
+                # un-staling the armed artifact. No fresher window is
+                # constructible while the window bytes are unchanged, so
+                # the re-walk that just re-proved them earns the credit.
+                # The armed balances are kept: they are what the reuse
+                # fence hashes against the published payout state
+                # (including an accepted parent's preview patch).
+                anchor_advanced = artifact_anchor_ms > current_anchor_ms
+                self._payout_ledger_artifact = dataclass_replace(
+                    current,
+                    accepted_share_count=artifact.accepted_share_count,
+                    prepared_monotonic=time.monotonic(),
+                    snapshot_anchor_ms=(
+                        artifact.snapshot_anchor_ms
+                        if anchor_advanced
+                        else current.snapshot_anchor_ms
+                    ),
+                )
+                if anchor_advanced:
                     return "refreshed", int(current.generation)
                 return "already_current", int(current.generation)
             template_artifacts = getattr(
@@ -4560,9 +4568,15 @@ class PrismCoordinator:
                 # re-seeded the live window.
                 return "discarded", None
         self._payout_ledger_artifact_generation += 1
+        # Freshness runs from the moment the window becomes reusable, not
+        # from build completion: a sync-seeded artifact is constructed
+        # mid-bundle-build and reaches cache publication only after the
+        # audit builder, so stamping here keeps the budget honest at every
+        # install site.
         self._payout_ledger_artifact = dataclass_replace(
             artifact,
             generation=self._payout_ledger_artifact_generation,
+            prepared_monotonic=time.monotonic(),
         )
         return "installed", int(self._payout_ledger_artifact_generation)
 
@@ -6866,9 +6880,17 @@ class PrismCoordinator:
                             == published_generation
                         ):
                             self._payout_ledger_artifact_generation += 1
+                            # Restamp freshness at the install: the candidate
+                            # artifact was built before publication, and the
+                            # delivery-gate drain between the two can outlive
+                            # the reuse budget -- a freshly published payout
+                            # generation must never arm an already-stale
+                            # artifact and force the next builds back through
+                            # the synchronous reward-window walk.
                             self._payout_ledger_artifact = dataclass_replace(
                                 prepared_artifact,
                                 generation=self._payout_ledger_artifact_generation,
+                                prepared_monotonic=time.monotonic(),
                             )
                         else:
                             self._payout_ledger_artifact = None

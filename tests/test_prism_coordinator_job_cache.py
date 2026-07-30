@@ -3133,6 +3133,113 @@ class JobBundleCacheTests(unittest.TestCase):
                 2,
             )
 
+    def test_equal_anchor_reprove_credits_freshness(self) -> None:
+        # A pending-commit floor pins the snapshot anchor, so a fence-failure
+        # rebuild re-proves the same window at the SAME anchor. That re-prove
+        # must advance the freshness clock: no fresher window is
+        # constructible while the floor holds, and rejecting the credit
+        # would re-walk the reward window (with backoff reset each round)
+        # until the audit ceiling -- the livelock shape this re-land
+        # removes.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        share = stamped_pending_share(now_ms() - 5)
+        server._ensure_pending_share_commit_state()
+        with server._pending_share_commit_lock:
+            server._pending_share_commit_floor[id(share)] = [
+                share,
+                time.monotonic(),
+                False,
+            ]
+        try:
+            server._prepare_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            with server._job_cache_lock:
+                armed = server._payout_ledger_artifact
+                assert armed is not None
+                server._payout_ledger_artifact = dataclass_replace(
+                    armed,
+                    prepared_monotonic=float(armed.prepared_monotonic) - 11.0,
+                )
+            self.assertIsNone(
+                server._usable_payout_ledger_artifact(
+                    server._payout_state_generation,
+                    artifacts.network_difficulty,
+                    rearm_on_fence_failure=False,
+                )
+            )
+
+            server._prepare_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            with server._job_cache_lock:
+                reproved = server._payout_ledger_artifact
+            assert reproved is not None
+            self.assertEqual(reproved.generation, armed.generation)
+            self.assertEqual(
+                reproved.snapshot_anchor_ms,
+                armed.snapshot_anchor_ms,
+            )
+            self.assertIsNotNone(
+                server._usable_payout_ledger_artifact(
+                    server._payout_state_generation,
+                    artifacts.network_difficulty,
+                )
+            )
+        finally:
+            server._finish_pending_share_commit(share)
+
+    def test_publication_restamps_candidate_artifact_freshness(self) -> None:
+        # A payout-state candidate builds its artifact before the atomic
+        # publication, and the delivery-gate drain between the two can
+        # outlive the reuse budget. The install must restamp freshness so a
+        # freshly published generation never arms an already-stale artifact.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        real_build = server._build_payout_ledger_artifact
+
+        def slow_publication_build(*args: object) -> object:
+            built = real_build(*args)
+            if built is None:
+                return None
+            return dataclass_replace(
+                built,
+                prepared_monotonic=time.monotonic() - 11.0,
+            )
+
+        server._build_payout_ledger_artifact = slow_publication_build  # type: ignore[method-assign]
+        parent_hash = str(rpc.template["previousblockhash"])
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        server._publish_accepted_block_payout_preview(
+            parent_hash,
+            [
+                {
+                    "recipient_id": "miner-a",
+                    "order_key": "miner-a",
+                    "p2mr_program_hex": "11" * 32,
+                    "balance_sats": 25,
+                }
+            ],
+        )
+
+        self.assertGreater(server._payout_state_generation, 0)
+        usable = server._usable_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        self.assertIsNotNone(usable)
+
     def test_generation_bump_does_not_scrap_in_flight_build(self) -> None:
         # 2026-07-29 regression: every differing window bumps the armed
         # artifact generation, and the in-build re-validation scrapped any
