@@ -24,6 +24,7 @@ from lab.prism import direct_stratum
 from lab.prism import prism_coordinator as prism_coordinator_module
 from lab.prism.prism_coordinator import (
     ClientState,
+    JobBuildAdmissionDeadlineExceeded,
     JobBuildSuperseded,
     MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES,
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
@@ -469,15 +470,15 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
             server._finish_pending_share_commit(share)
 
     def test_background_build_refuses_a_pathologically_old_floor(self) -> None:
-        # A floor held further below now than the reuse staleness bound (a
+        # A floor held further below now than the audit anchor ceiling (a
         # wedged writer or leaked release) would arm an artifact that is
-        # dead on arrival; refuse before paying the window walk so the
+        # born expired; refuse before paying the window walk so the
         # re-arm backoff paces retries.
         ledger = AnchorRecordingLedger()
         server, _rpc = coordinator(ledger=ledger)
         install_fake_bundle_builder(server)
         artifacts = server.current_template_artifacts()
-        share = stamped_pending_share(now_ms() - 30_000)
+        share = stamped_pending_share(now_ms() - 400_000)
         self._hold_floor(server, share)
         try:
             self.assertIsNone(
@@ -2573,15 +2574,14 @@ class JobBundleCacheTests(unittest.TestCase):
         with server._payout_artifact_executor_lock:
             self.assertIsNone(server._payout_artifact_requested)
 
-        # Age the armed window past the reuse staleness bound.
-        server.payout_artifact_max_anchor_age_seconds = 10.0
+        # Age the armed window past its reuse freshness budget.
+        server.payout_artifact_reuse_staleness_seconds = 10.0
         with server._job_cache_lock:
             armed = server._payout_ledger_artifact
             assert armed is not None
-            assert armed.snapshot_anchor_ms is not None
             server._payout_ledger_artifact = dataclass_replace(
                 armed,
-                snapshot_anchor_ms=int(armed.snapshot_anchor_ms) - 11_000,
+                prepared_monotonic=float(armed.prepared_monotonic) - 11.0,
             )
 
         self.assertIsNone(
@@ -2640,11 +2640,11 @@ class JobBundleCacheTests(unittest.TestCase):
         assert artifacts is not None
         server.payout_artifact_rearm_min_seconds = 5.0
 
-        # A pathologically old pending-commit floor aborts the rebuild
-        # before the window walk (the artifact would arm already past the
-        # staleness bound); each abort doubles the re-arm interval instead
-        # of retrying the reward-window walk at the floor forever.
-        share = stamped_pending_share(now_ms() - 30_000)
+        # A pending-commit floor older than the audit anchor ceiling aborts
+        # the rebuild before the window walk (the artifact would arm born
+        # expired); each abort doubles the re-arm interval instead of
+        # retrying the reward-window walk at the floor forever.
+        share = stamped_pending_share(now_ms() - 400_000)
         server._ensure_pending_share_commit_state()
         with server._pending_share_commit_lock:
             server._pending_share_commit_floor[id(share)] = [
@@ -2741,14 +2741,13 @@ class JobBundleCacheTests(unittest.TestCase):
             block_height=int(rpc.template["height"]) - 1,
         )
 
-        # Age the armed window past the reuse staleness bound.
+        # Age the armed window past its reuse freshness budget.
         with server._job_cache_lock:
             armed = server._payout_ledger_artifact
             assert armed is not None
-            assert armed.snapshot_anchor_ms is not None
             server._payout_ledger_artifact = dataclass_replace(
                 armed,
-                snapshot_anchor_ms=int(armed.snapshot_anchor_ms) - 11_000,
+                prepared_monotonic=float(armed.prepared_monotonic) - 11.0,
             )
 
         self.assertIsNone(
@@ -2762,7 +2761,9 @@ class JobBundleCacheTests(unittest.TestCase):
         # durable-confirmation call site.
         self.assertEqual(scheduled, [])
 
-    def test_artifact_reuse_is_bounded_by_anchor_age(self) -> None:
+    def test_artifact_reuse_bounded_by_install_age_and_anchor_ceiling(
+        self,
+    ) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
         artifacts = server.store_template_artifacts(dict(rpc.template))
@@ -2776,17 +2777,18 @@ class JobBundleCacheTests(unittest.TestCase):
         assert armed is not None
         assert armed.snapshot_anchor_ms is not None
 
-        # Inside the bound the artifact serves even though shares landed
-        # after its anchor: they belong to the next window by construction,
-        # so the moved durable count is irrelevant to reuse validity.
-        # (PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS wires this same
-        # attribute in __init__.)
-        server.payout_artifact_max_anchor_age_seconds = 5.0
+        # A freshly installed window serves even when its anchor is older
+        # than the freshness budget and shares landed after it: post-anchor
+        # shares belong to the next window by construction, and freshness is
+        # measured from prepared_monotonic -- never from the anchor, which
+        # predates the window walk. (The reuse-staleness and anchor-ceiling
+        # env knobs wire these same attributes in __init__.)
+        server.payout_artifact_reuse_staleness_seconds = 10.0
         server.ledger.miners = [*server.ledger.miners, "late-1", "late-2"]
         with server._job_cache_lock:
             server._payout_ledger_artifact = dataclass_replace(
                 armed,
-                snapshot_anchor_ms=int(armed.snapshot_anchor_ms) - 4_000,
+                snapshot_anchor_ms=int(armed.snapshot_anchor_ms) - 15_000,
             )
         self.assertIsNotNone(
             server._usable_payout_ledger_artifact(
@@ -2795,7 +2797,23 @@ class JobBundleCacheTests(unittest.TestCase):
             )
         )
 
-        # Past the bound the window is retired for new reuse decisions.
+        # Past the install-age budget the window is retired for new reuse
+        # decisions.
+        with server._job_cache_lock:
+            server._payout_ledger_artifact = dataclass_replace(
+                armed,
+                prepared_monotonic=float(armed.prepared_monotonic) - 11.0,
+            )
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+                rearm_on_fence_failure=False,
+            )
+        )
+
+        # The wall-clock anchor ceiling stays as the audit-facing backstop.
+        server.payout_artifact_max_anchor_age_seconds = 5.0
         with server._job_cache_lock:
             server._payout_ledger_artifact = dataclass_replace(
                 armed,
@@ -2826,7 +2844,7 @@ class JobBundleCacheTests(unittest.TestCase):
             assert armed.snapshot_anchor_ms is not None
             aged = dataclass_replace(
                 armed,
-                snapshot_anchor_ms=int(armed.snapshot_anchor_ms) - 11_000,
+                prepared_monotonic=float(armed.prepared_monotonic) - 11.0,
             )
             server._payout_ledger_artifact = aged
 
@@ -2906,27 +2924,89 @@ class JobBundleCacheTests(unittest.TestCase):
             selected.snapshot_anchor_ms,
         )
 
-    def test_cached_ready_bundle_respects_anchor_age_bound(self) -> None:
+    def test_generation_current_cached_bundle_serves_past_staleness(
+        self,
+    ) -> None:
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        first = server.store_template_artifacts(dict(rpc.template))
+        assert first is not None
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_executor_shutdown = True
+        # Freshness budget below the bundle-cache TTL so the two gates are
+        # distinguishable inside the TTL window.
+        server.payout_artifact_reuse_staleness_seconds = 5.0
+
+        server.shared_job_bundle(first, mode="ready")
+        self.assertEqual(recorded["calls"], 1)
+        with server._job_cache_lock:
+            armed = server._payout_ledger_artifact
+        assert armed is not None
+
+        # A bundle keyed to the currently armed artifact generation carries
+        # exactly the armed window: it keeps serving past the staleness
+        # budget (its window is as fresh as reuse itself), bounded upstream
+        # by the cache TTL.
+        second = server.store_template_artifacts(
+            base_template(height=11, prevhash="22" * 32)
+        )
+        assert second is not None
+        reused = server.shared_job_bundle(second, mode="ready")
+        self.assertEqual(reused.payout_artifact_generation, armed.generation)
+        self.assertEqual(recorded["calls"], 2)
+        with server._job_cache_lock:
+            for key, entry in list(server._job_bundle_cache.items()):
+                if entry.payout_artifact_generation == armed.generation:
+                    server._job_bundle_cache[key] = dataclass_replace(
+                        entry,
+                        built_monotonic=float(entry.built_monotonic) - 7.0,
+                    )
+        server.shared_job_bundle(second, mode="ready")
+        self.assertEqual(recorded["calls"], 2)
+
+    def test_cached_no_artifact_bundle_gates_on_build_age_not_anchor(
+        self,
+    ) -> None:
+        # 2026-07-29 regression companion: the gate must follow build age
+        # (freshness of the work) inside the audit ceiling, never the
+        # wall-clock anchor, which is frozen per template generation.
         server, rpc = coordinator()
         recorded = install_fake_bundle_builder(server)
         artifacts = server.store_template_artifacts(dict(rpc.template))
         assert artifacts is not None
         with server._payout_artifact_executor_lock:
             server._payout_artifact_executor_shutdown = True
+        server.payout_artifact_reuse_staleness_seconds = 5.0
 
-        first = server.shared_job_bundle(artifacts, mode="ready")
+        seeded = server.shared_job_bundle(artifacts, mode="ready")
         self.assertEqual(recorded["calls"], 1)
-        # Inside the bound the cached bundle keeps serving.
+
+        # Fresh build age serves from cache once the armed artifact is
+        # gone.
+        with server._job_cache_lock:
+            server._payout_ledger_artifact = None
         server.shared_job_bundle(artifacts, mode="ready")
         self.assertEqual(recorded["calls"], 1)
 
-        # The bundle cache TTL and the artifact staleness bound are
-        # independent knobs: an entry whose declared window anchor outlives
-        # the bound must stop serving even while its TTL is still running,
-        # or jobs would keep declaring an anchor older than the configured
-        # limit.
-        aged_anchor_ms = int(first.found_block["anchor_job_issued_at_ms"]) - 11_000
+        # Build age past the staleness budget rebuilds even though the
+        # bundle-cache TTL has not lapsed.
         with server._job_cache_lock:
+            server._payout_ledger_artifact = None
+            for key, entry in list(server._job_bundle_cache.items()):
+                server._job_bundle_cache[key] = dataclass_replace(
+                    entry,
+                    built_monotonic=float(entry.built_monotonic) - 7.0,
+                )
+        server.shared_job_bundle(artifacts, mode="ready")
+        self.assertEqual(recorded["calls"], 2)
+
+        # The audit ceiling on the declared anchor stays as the backstop
+        # even for a freshly built entry.
+        aged_anchor_ms = (
+            int(seeded.found_block["anchor_job_issued_at_ms"]) - 400_000
+        )
+        with server._job_cache_lock:
+            server._payout_ledger_artifact = None
             for key, entry in list(server._job_bundle_cache.items()):
                 aged_found_block = dict(entry.found_block)
                 aged_found_block["anchor_job_issued_at_ms"] = aged_anchor_ms
@@ -2934,16 +3014,491 @@ class JobBundleCacheTests(unittest.TestCase):
                     entry,
                     found_block=aged_found_block,
                 )
-            armed = server._payout_ledger_artifact
+        server.shared_job_bundle(artifacts, mode="ready")
+        self.assertEqual(recorded["calls"], 3)
+
+    def test_slow_window_walk_still_arms_reusable_artifact(self) -> None:
+        # 2026-07-29 regression: the reward-window walk takes multiple
+        # seconds at production volume, and freshness measured from the
+        # wall-clock anchor rejected every slow build on arrival. The walk
+        # here advances the wall clock past the freshness budget; the
+        # artifact must still arm, serve reuse, and reset the re-arm
+        # backoff.
+        clock = [now_ms()]
+
+        class SlowWalkLedger(FakeLedger):
+            def snapshot_at_job_issue(
+                self,
+                anchor_job_issued_at_ms: int,
+                *,
+                window_weight: int | None = None,
+            ) -> list[FakeShare]:
+                result = super().snapshot_at_job_issue(
+                    anchor_job_issued_at_ms,
+                    window_weight=window_weight,
+                )
+                clock[0] += 15_000
+                return result
+
+        server, rpc = coordinator(ledger=SlowWalkLedger())
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_rearm_backoff = 4
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock[0],
+        ):
+            server._prepare_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            with server._job_cache_lock:
+                armed = server._payout_ledger_artifact
+            self.assertIsNotNone(armed)
             assert armed is not None
             assert armed.snapshot_anchor_ms is not None
-            server._payout_ledger_artifact = dataclass_replace(
+            self.assertGreater(
+                clock[0] - int(armed.snapshot_anchor_ms),
+                10_000,
+            )
+            self.assertIs(
+                server._usable_payout_ledger_artifact(
+                    server._payout_state_generation,
+                    artifacts.network_difficulty,
+                ),
                 armed,
-                snapshot_anchor_ms=int(armed.snapshot_anchor_ms) - 11_000,
+            )
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(server._payout_artifact_rearm_backoff, 1)
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_payout_artifact_events_total{event="installed"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_payout_artifact_events_total{event="built"} 1',
+            metrics,
+        )
+
+    def test_born_expired_install_paces_backoff_instead_of_resetting(
+        self,
+    ) -> None:
+        # A walk that outlives the audit ceiling arms nothing. Crediting it
+        # as a success reset the re-arm backoff to the floor and re-walked
+        # the reward window continuously -- the 2026-07-29 livelock. It
+        # must pace exactly like a failed preparation.
+        clock = [now_ms()]
+
+        class GlacialWalkLedger(FakeLedger):
+            def snapshot_at_job_issue(
+                self,
+                anchor_job_issued_at_ms: int,
+                *,
+                window_weight: int | None = None,
+            ) -> list[FakeShare]:
+                result = super().snapshot_at_job_issue(
+                    anchor_job_issued_at_ms,
+                    window_weight=window_weight,
+                )
+                clock[0] += 400_000
+                return result
+
+        server, rpc = coordinator(ledger=GlacialWalkLedger())
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock[0],
+        ):
+            server._prepare_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            with server._job_cache_lock:
+                self.assertIsNone(server._payout_ledger_artifact)
+            with server._payout_artifact_executor_lock:
+                self.assertEqual(server._payout_artifact_rearm_backoff, 2)
+            server._prepare_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            with server._payout_artifact_executor_lock:
+                self.assertEqual(server._payout_artifact_rearm_backoff, 4)
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(
+                server.payout_artifact_event_counts["born_expired"],
+                2,
             )
 
-        server.shared_job_bundle(artifacts, mode="ready")
-        self.assertEqual(recorded["calls"], 2)
+    def test_equal_anchor_reprove_credits_freshness(self) -> None:
+        # A pending-commit floor pins the snapshot anchor, so a fence-failure
+        # rebuild re-proves the same window at the SAME anchor. That re-prove
+        # must advance the freshness clock: no fresher window is
+        # constructible while the floor holds, and rejecting the credit
+        # would re-walk the reward window (with backoff reset each round)
+        # until the audit ceiling -- the livelock shape this re-land
+        # removes.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        share = stamped_pending_share(now_ms() - 5)
+        server._ensure_pending_share_commit_state()
+        with server._pending_share_commit_lock:
+            server._pending_share_commit_floor[id(share)] = [
+                share,
+                time.monotonic(),
+                False,
+            ]
+        try:
+            server._prepare_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            with server._job_cache_lock:
+                armed = server._payout_ledger_artifact
+                assert armed is not None
+                server._payout_ledger_artifact = dataclass_replace(
+                    armed,
+                    prepared_monotonic=float(armed.prepared_monotonic) - 11.0,
+                )
+            self.assertIsNone(
+                server._usable_payout_ledger_artifact(
+                    server._payout_state_generation,
+                    artifacts.network_difficulty,
+                    rearm_on_fence_failure=False,
+                )
+            )
+
+            server._prepare_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+            with server._job_cache_lock:
+                reproved = server._payout_ledger_artifact
+            assert reproved is not None
+            self.assertEqual(reproved.generation, armed.generation)
+            self.assertEqual(
+                reproved.snapshot_anchor_ms,
+                armed.snapshot_anchor_ms,
+            )
+            self.assertIsNotNone(
+                server._usable_payout_ledger_artifact(
+                    server._payout_state_generation,
+                    artifacts.network_difficulty,
+                )
+            )
+        finally:
+            server._finish_pending_share_commit(share)
+
+    def test_publication_restamps_candidate_artifact_freshness(self) -> None:
+        # A payout-state candidate builds its artifact before the atomic
+        # publication, and the delivery-gate drain between the two can
+        # outlive the reuse budget. The install must restamp freshness so a
+        # freshly published generation never arms an already-stale artifact.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        real_build = server._build_payout_ledger_artifact
+
+        def slow_publication_build(*args: object) -> object:
+            built = real_build(*args)
+            if built is None:
+                return None
+            return dataclass_replace(
+                built,
+                prepared_monotonic=time.monotonic() - 11.0,
+            )
+
+        server._build_payout_ledger_artifact = slow_publication_build  # type: ignore[method-assign]
+        parent_hash = str(rpc.template["previousblockhash"])
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        server._publish_accepted_block_payout_preview(
+            parent_hash,
+            [
+                {
+                    "recipient_id": "miner-a",
+                    "order_key": "miner-a",
+                    "p2mr_program_hex": "11" * 32,
+                    "balance_sats": 25,
+                }
+            ],
+        )
+
+        self.assertGreater(server._payout_state_generation, 0)
+        usable = server._usable_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        self.assertIsNotNone(usable)
+
+    def test_usable_probe_survives_equal_window_freshness_restamp(
+        self,
+    ) -> None:
+        # An equal-window re-prove restamps the armed artifact by replacing
+        # the object while a reuse probe is hashing balances outside the
+        # cache lock. The probe must treat the restamped copy as the same
+        # armed window instead of failing closed into a synchronous
+        # reward-window walk: under a pinned pending-commit floor the
+        # restamp IS the intentional recovery path, so the race is routine.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            armed = server._payout_ledger_artifact
+        assert armed is not None
+
+        real_sha256 = prism_coordinator_module.canonical_json_sha256
+        restamped_once = [False]
+
+        def restamp_during_hash(value: object) -> str:
+            if not restamped_once[0]:
+                restamped_once[0] = True
+                self.assertTrue(
+                    server._install_payout_ledger_artifact(
+                        dataclass_replace(
+                            armed,
+                            generation=0,
+                            prepared_monotonic=time.monotonic(),
+                        )
+                    )
+                )
+            return real_sha256(value)
+
+        with patch.object(
+            prism_coordinator_module,
+            "canonical_json_sha256",
+            restamp_during_hash,
+        ):
+            usable = server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        self.assertTrue(restamped_once[0])
+        with server._job_cache_lock:
+            restamped = server._payout_ledger_artifact
+        assert restamped is not None
+        self.assertIsNot(restamped, armed)
+        self.assertIsNotNone(usable)
+        self.assertIs(usable, restamped)
+        self.assertEqual(restamped.generation, armed.generation)
+
+    def test_publication_discards_born_expired_candidate_artifact(
+        self,
+    ) -> None:
+        # Candidate construction plus the delivery-gate drain can push the
+        # candidate artifact's declared anchor past the audit ceiling. The
+        # atomic publication must apply the same born-expired admission rule
+        # as _install_payout_ledger_artifact: arming the artifact would fail
+        # every reuse probe on anchor age -- with the re-arm suppressed
+        # while the accepted preview awaits durability -- instead of letting
+        # the post-publication probe schedule recovery.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        real_build = server._build_payout_ledger_artifact
+        ceiling_ms = server._payout_artifact_max_anchor_age_ms()
+
+        def expired_anchor_build(*args: object) -> object:
+            built = real_build(*args)
+            if built is None:
+                return None
+            assert built.snapshot_anchor_ms is not None
+            return dataclass_replace(
+                built,
+                snapshot_anchor_ms=int(built.snapshot_anchor_ms)
+                - int(ceiling_ms)
+                - 1_000,
+            )
+
+        server._build_payout_ledger_artifact = expired_anchor_build  # type: ignore[method-assign]
+        parent_hash = str(rpc.template["previousblockhash"])
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        generation_before = server._payout_state_generation
+        server._publish_accepted_block_payout_preview(
+            parent_hash,
+            [
+                {
+                    "recipient_id": "miner-a",
+                    "order_key": "miner-a",
+                    "p2mr_program_hex": "11" * 32,
+                    "balance_sats": 25,
+                }
+            ],
+        )
+        self.assertGreater(server._payout_state_generation, generation_before)
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+        with server._payout_artifact_executor_lock:
+            born_expired = int(
+                server.payout_artifact_event_counts.get("born_expired", 0)
+            )
+        self.assertGreaterEqual(born_expired, 1)
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+
+    def test_publication_records_installed_event(self) -> None:
+        # The atomic publication arms the candidate artifact through its own
+        # pointer swap, not _install_payout_ledger_artifact. It must still
+        # count in the installed lifecycle event family, or every
+        # publication-path install is invisible to the observability the
+        # event counter exists for.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        with server._payout_artifact_executor_lock:
+            installed_before = int(
+                server.payout_artifact_event_counts.get("installed", 0)
+            )
+        parent_hash = str(rpc.template["previousblockhash"])
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        server._publish_accepted_block_payout_preview(
+            parent_hash,
+            [
+                {
+                    "recipient_id": "miner-a",
+                    "order_key": "miner-a",
+                    "p2mr_program_hex": "11" * 32,
+                    "balance_sats": 25,
+                }
+            ],
+        )
+        with server._job_cache_lock:
+            self.assertIsNotNone(server._payout_ledger_artifact)
+        with server._payout_artifact_executor_lock:
+            installed_after = int(
+                server.payout_artifact_event_counts.get("installed", 0)
+            )
+        self.assertEqual(installed_after, installed_before + 1)
+
+    def test_generation_bump_does_not_scrap_in_flight_build(self) -> None:
+        # 2026-07-29 regression: every differing window bumps the armed
+        # artifact generation, and the in-build re-validation scrapped any
+        # build whose selected artifact lost the slot -- a rebuild storm at
+        # production share rates. A build must finish on the copy it
+        # selected: its window stays audit-reproducible at its declared
+        # anchor while the payout generation and published balances hold.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            selected = server._payout_ledger_artifact
+        assert selected is not None
+        assert selected.snapshot_anchor_ms is not None
+
+        fresher_window = [
+            {"share_seq": seq, "miner_id": "miner-a"} for seq in (1, 2, 3, 4)
+        ]
+        fresher = dataclass_replace(
+            selected,
+            generation=0,
+            accepted_share_count=4,
+            shares_json=tuple(fresher_window),
+            snapshot_anchor_ms=int(selected.snapshot_anchor_ms) + 5,
+            share_snapshot_sha256=canonical_json_sha256(fresher_window),
+        )
+        self.assertTrue(server._install_payout_ledger_artifact(fresher))
+        with server._job_cache_lock:
+            bumped = server._payout_ledger_artifact
+        assert bumped is not None
+        self.assertGreater(bumped.generation, selected.generation)
+
+        server.ledger.snapshot_calls = 0
+        bundle = server.build_shared_job_bundle(
+            artifacts,
+            worker(),
+            payout_artifact=selected,
+        )
+        self.assertEqual(server.ledger.snapshot_calls, 0)
+        self.assertEqual(
+            bundle.found_block["anchor_job_issued_at_ms"],
+            selected.snapshot_anchor_ms,
+        )
+        self.assertEqual(bundle.shares_json, list(selected.shares_json))
+
+    def test_rebuilt_bundle_serves_under_aged_template_generation(
+        self,
+    ) -> None:
+        # 2026-07-29 regression: issued_at_ms is frozen per template
+        # generation and predates the walk, so a wall-clock anchor gate on
+        # cached bundles declared every rebuilt bundle dead on arrival once
+        # its template generation outlived the bound. Below the audit
+        # ceiling, cache service must follow build age, not anchor age.
+        server, rpc = coordinator()
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        with server._payout_artifact_executor_lock:
+            server._payout_artifact_executor_shutdown = True
+        with server._job_cache_lock:
+            server._job_build_issued_at_ms[artifacts.generation] = (
+                now_ms() - 20_000
+            )
+
+        built = server.shared_job_bundle(artifacts, mode="ready")
+        self.assertEqual(recorded["calls"], 1)
+        self.assertEqual(
+            built.found_block["anchor_job_issued_at_ms"],
+            built.issued_at_ms,
+        )
+
+        served = server.shared_job_bundle(artifacts, mode="ready")
+        self.assertEqual(recorded["calls"], 1)
+        self.assertEqual(served.issued_at_ms, built.issued_at_ms)
+
+    def test_admission_deadline_fails_fast_and_visibly(self) -> None:
+        server, _rpc = coordinator()
+        server.routine_admission_deadline_seconds = 0.05
+        server._publication_priority_scheduled_locked = (  # type: ignore[method-assign]
+            lambda: True
+        )
+
+        with self.assertRaises(JobBuildAdmissionDeadlineExceeded) as raised:
+            server._begin_routine_job_build_preparation(
+                request_source="initial",
+                cancelled=None,
+            )
+
+        # The deadline is coordination churn, not a failure budget event:
+        # callers retry with their normal pacing.
+        self.assertIsInstance(raised.exception, TemplateRefreshBlocked)
+        with server._job_build_scheduler_lock:
+            self.assertEqual(
+                server.initial_job_prepared_work_counts["admission_deadline"],
+                1,
+            )
 
     def test_reused_anchor_bundle_preview_matches_fresh_build_through_guard(
         self,
