@@ -6797,6 +6797,7 @@ class PrismCoordinator:
         schedule_retry = False
         active_to_cancel: _FanoutCancellation | None = None
         publication_born_expired: tuple[int | None, int] | None = None
+        publication_installed: tuple[int, int, int] | None = None
         publish_started = 0.0
         with self._job_cache_lock:
             with self.lock:
@@ -6928,6 +6929,11 @@ class PrismCoordinator:
                                 generation=self._payout_ledger_artifact_generation,
                                 prepared_monotonic=time.monotonic(),
                             )
+                            publication_installed = (
+                                self._payout_ledger_artifact_generation,
+                                candidate_anchor_age_ms,
+                                len(prepared_artifact.shares_json),
+                            )
                         else:
                             if (
                                 prepared_artifact is not None
@@ -7023,6 +7029,23 @@ class PrismCoordinator:
                 payout_state_generation=int(published_generation),
                 anchor_age_ms=born_expired_age_ms,
                 window_shares=born_expired_shares,
+                during_publication=True,
+            )
+        if publication_installed is not None:
+            # The pointer swap above is an install site that bypasses
+            # _install_payout_ledger_artifact; record it in the same event
+            # family or the publication path stays invisible to the
+            # lifecycle observability this counter exists for.
+            installed_generation, installed_age_ms, installed_shares = (
+                publication_installed
+            )
+            self._record_payout_artifact_event("installed")
+            self._payout_artifact_log(
+                "payout_artifact_installed",
+                generation=int(installed_generation),
+                payout_state_generation=int(published_generation),
+                anchor_age_ms=installed_age_ms,
+                window_shares=installed_shares,
                 during_publication=True,
             )
         # A publication is a fresh start for speculative preparation: the

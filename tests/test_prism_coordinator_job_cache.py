@@ -3359,6 +3359,45 @@ class JobBundleCacheTests(unittest.TestCase):
             )
         )
 
+    def test_publication_records_installed_event(self) -> None:
+        # The atomic publication arms the candidate artifact through its own
+        # pointer swap, not _install_payout_ledger_artifact. It must still
+        # count in the installed lifecycle event family, or every
+        # publication-path install is invisible to the observability the
+        # event counter exists for.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        with server._payout_artifact_executor_lock:
+            installed_before = int(
+                server.payout_artifact_event_counts.get("installed", 0)
+            )
+        parent_hash = str(rpc.template["previousblockhash"])
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        server._publish_accepted_block_payout_preview(
+            parent_hash,
+            [
+                {
+                    "recipient_id": "miner-a",
+                    "order_key": "miner-a",
+                    "p2mr_program_hex": "11" * 32,
+                    "balance_sats": 25,
+                }
+            ],
+        )
+        with server._job_cache_lock:
+            self.assertIsNotNone(server._payout_ledger_artifact)
+        with server._payout_artifact_executor_lock:
+            installed_after = int(
+                server.payout_artifact_event_counts.get("installed", 0)
+            )
+        self.assertEqual(installed_after, installed_before + 1)
+
     def test_generation_bump_does_not_scrap_in_flight_build(self) -> None:
         # 2026-07-29 regression: every differing window bumps the armed
         # artifact generation, and the in-build re-validation scrapped any
