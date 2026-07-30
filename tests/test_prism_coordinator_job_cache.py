@@ -3240,6 +3240,125 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         self.assertIsNotNone(usable)
 
+    def test_usable_probe_survives_equal_window_freshness_restamp(
+        self,
+    ) -> None:
+        # An equal-window re-prove restamps the armed artifact by replacing
+        # the object while a reuse probe is hashing balances outside the
+        # cache lock. The probe must treat the restamped copy as the same
+        # armed window instead of failing closed into a synchronous
+        # reward-window walk: under a pinned pending-commit floor the
+        # restamp IS the intentional recovery path, so the race is routine.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            armed = server._payout_ledger_artifact
+        assert armed is not None
+
+        real_sha256 = prism_coordinator_module.canonical_json_sha256
+        restamped_once = [False]
+
+        def restamp_during_hash(value: object) -> str:
+            if not restamped_once[0]:
+                restamped_once[0] = True
+                self.assertTrue(
+                    server._install_payout_ledger_artifact(
+                        dataclass_replace(
+                            armed,
+                            generation=0,
+                            prepared_monotonic=time.monotonic(),
+                        )
+                    )
+                )
+            return real_sha256(value)
+
+        with patch.object(
+            prism_coordinator_module,
+            "canonical_json_sha256",
+            restamp_during_hash,
+        ):
+            usable = server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        self.assertTrue(restamped_once[0])
+        with server._job_cache_lock:
+            restamped = server._payout_ledger_artifact
+        assert restamped is not None
+        self.assertIsNot(restamped, armed)
+        self.assertIsNotNone(usable)
+        self.assertIs(usable, restamped)
+        self.assertEqual(restamped.generation, armed.generation)
+
+    def test_publication_discards_born_expired_candidate_artifact(
+        self,
+    ) -> None:
+        # Candidate construction plus the delivery-gate drain can push the
+        # candidate artifact's declared anchor past the audit ceiling. The
+        # atomic publication must apply the same born-expired admission rule
+        # as _install_payout_ledger_artifact: arming the artifact would fail
+        # every reuse probe on anchor age -- with the re-arm suppressed
+        # while the accepted preview awaits durability -- instead of letting
+        # the post-publication probe schedule recovery.
+        server, rpc = coordinator()
+        install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        real_build = server._build_payout_ledger_artifact
+        ceiling_ms = server._payout_artifact_max_anchor_age_ms()
+
+        def expired_anchor_build(*args: object) -> object:
+            built = real_build(*args)
+            if built is None:
+                return None
+            assert built.snapshot_anchor_ms is not None
+            return dataclass_replace(
+                built,
+                snapshot_anchor_ms=int(built.snapshot_anchor_ms)
+                - int(ceiling_ms)
+                - 1_000,
+            )
+
+        server._build_payout_ledger_artifact = expired_anchor_build  # type: ignore[method-assign]
+        parent_hash = str(rpc.template["previousblockhash"])
+        server._begin_accepted_block_payout_preview(
+            parent_hash,
+            block_height=int(rpc.template["height"]) - 1,
+        )
+        generation_before = server._payout_state_generation
+        server._publish_accepted_block_payout_preview(
+            parent_hash,
+            [
+                {
+                    "recipient_id": "miner-a",
+                    "order_key": "miner-a",
+                    "p2mr_program_hex": "11" * 32,
+                    "balance_sats": 25,
+                }
+            ],
+        )
+        self.assertGreater(server._payout_state_generation, generation_before)
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+        with server._payout_artifact_executor_lock:
+            born_expired = int(
+                server.payout_artifact_event_counts.get("born_expired", 0)
+            )
+        self.assertGreaterEqual(born_expired, 1)
+        self.assertIsNone(
+            server._usable_payout_ledger_artifact(
+                server._payout_state_generation,
+                artifacts.network_difficulty,
+            )
+        )
+
     def test_generation_bump_does_not_scrap_in_flight_build(self) -> None:
         # 2026-07-29 regression: every differing window bumps the armed
         # artifact generation, and the in-build re-validation scrapped any

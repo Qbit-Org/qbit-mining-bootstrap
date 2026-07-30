@@ -4752,11 +4752,36 @@ class PrismCoordinator:
         balances_sha256 = canonical_json_sha256(artifact.prior_balances)
         with self._job_cache_lock:
             if (
-                self._payout_ledger_artifact is not artifact
-                or self._payout_state_generation != payout_state_generation
+                self._payout_state_generation != payout_state_generation
                 or self._published_payout_state.artifact is not published_artifact
             ):
                 return None
+            latest = self._payout_ledger_artifact
+            if latest is not artifact:
+                # An equal-window freshness restamp (already_current /
+                # refreshed) replaces the armed object while this probe was
+                # hashing balances. The restamp keeps the generation, the
+                # window bytes, and the balances object, and only moves the
+                # freshness stamp (and possibly the anchor) forward, so the
+                # validity established above still holds for the restamped
+                # copy; failing closed here would turn the intentional
+                # pinned-floor recovery path into a spurious synchronous
+                # reward-window walk. A real re-key changes the generation
+                # or the window sha and still fails closed.
+                if (
+                    latest is None
+                    or latest.generation != artifact.generation
+                    or latest.payout_state_generation
+                    != artifact.payout_state_generation
+                    or latest.network_difficulty != artifact.network_difficulty
+                    or latest.share_snapshot_sha256 is None
+                    or latest.share_snapshot_sha256
+                    != artifact.share_snapshot_sha256
+                    or latest.snapshot_anchor_ms is None
+                    or latest.prior_balances is not artifact.prior_balances
+                ):
+                    return None
+                artifact = latest
             if balances_sha256 != published_artifact.prior_balances_sha256:
                 # A candidate can carry a ledger snapshot prepared before its
                 # payout state is published. Never keep retrying that stale
@@ -6771,6 +6796,7 @@ class PrismCoordinator:
         published_generation: int | None = None
         schedule_retry = False
         active_to_cancel: _FanoutCancellation | None = None
+        publication_born_expired: tuple[int | None, int] | None = None
         publish_started = 0.0
         with self._job_cache_lock:
             with self.lock:
@@ -6874,10 +6900,20 @@ class PrismCoordinator:
                                 self._accepted_block_payout_preview_condition.notify_all()
                         self._payout_state_generation = published_generation
                         prepared_artifact = candidate.ledger_artifact
+                        candidate_anchor_age_ms = (
+                            None
+                            if prepared_artifact is None
+                            or prepared_artifact.snapshot_anchor_ms is None
+                            else now_ms()
+                            - int(prepared_artifact.snapshot_anchor_ms)
+                        )
                         if (
                             prepared_artifact is not None
                             and prepared_artifact.payout_state_generation
                             == published_generation
+                            and candidate_anchor_age_ms is not None
+                            and candidate_anchor_age_ms
+                            <= self._payout_artifact_max_anchor_age_ms()
                         ):
                             self._payout_ledger_artifact_generation += 1
                             # Restamp freshness at the install: the candidate
@@ -6893,6 +6929,27 @@ class PrismCoordinator:
                                 prepared_monotonic=time.monotonic(),
                             )
                         else:
+                            if (
+                                prepared_artifact is not None
+                                and prepared_artifact.payout_state_generation
+                                == published_generation
+                            ):
+                                # Same admission rule as
+                                # _install_payout_ledger_artifact: candidate
+                                # construction plus the delivery-gate drain
+                                # can push the declared anchor past the
+                                # audit ceiling, and arming such a
+                                # BORN-EXPIRED artifact would fail every
+                                # reuse probe on anchor age -- with the
+                                # re-arm suppressed while an accepted
+                                # preview awaits durability. Discard it; the
+                                # post-publication probe schedules
+                                # preparation (or the durable-confirmation
+                                # path resumes it once the preview lands).
+                                publication_born_expired = (
+                                    candidate_anchor_age_ms,
+                                    len(prepared_artifact.shares_json),
+                                )
                             self._payout_ledger_artifact = None
                         self._published_payout_state = PublishedPayoutState(
                             generation=published_generation,
@@ -6958,6 +7015,16 @@ class PrismCoordinator:
         if published_generation is None:
             self._record_discarded_payout_candidate()
             return None
+        if publication_born_expired is not None:
+            born_expired_age_ms, born_expired_shares = publication_born_expired
+            self._record_payout_artifact_event("born_expired")
+            self._payout_artifact_log(
+                "payout_artifact_born_expired",
+                payout_state_generation=int(published_generation),
+                anchor_age_ms=born_expired_age_ms,
+                window_shares=born_expired_shares,
+                during_publication=True,
+            )
         # A publication is a fresh start for speculative preparation: the
         # candidate artifact installs through the atomic pointer swap above
         # (not _install_payout_ledger_artifact), so whatever re-arm backoff
