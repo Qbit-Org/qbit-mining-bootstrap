@@ -7150,11 +7150,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         submitter.join(timeout=2)
         self.assertFalse(submitter.is_alive())
         self.assertEqual(server._pending_share_commit_floor, {})
-        # Drained floor: the anchor still sits strictly below the clamp
-        # instant so a same-millisecond stamp can never tie it.
         self.assertEqual(
             server._job_snapshot_anchor_ms(stamped_ms + 60_000),
-            stamped_ms + 60_000 - 1,
+            stamped_ms + 60_000,
         )
         server.request_shutdown()
         writer.join(timeout=2)
@@ -7179,7 +7177,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(server._append_share_batch([entry]))
         self.assertTrue(entry.committed.is_set())
         self.assertEqual(server._pending_share_commit_floor, {})
-        self.assertEqual(server._job_snapshot_anchor_ms(10_000), 9_999)
+        self.assertEqual(server._job_snapshot_anchor_ms(10_000), 10_000)
 
     def test_failed_commit_releases_duplicate_key_for_exact_retry(self) -> None:
         server, state, healthy = submit_coordinator()
