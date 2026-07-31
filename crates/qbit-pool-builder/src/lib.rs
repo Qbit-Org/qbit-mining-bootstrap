@@ -35,6 +35,10 @@ pub enum BuilderError {
         recipient_id: String,
         reason: String,
     },
+    #[error("pinned first output {recipient_id} is not among the coinbase entitlements")]
+    PinnedFirstOutputMissing { recipient_id: String },
+    #[error("pinned first output {recipient_id} matches multiple coinbase entitlements")]
+    PinnedFirstOutputAmbiguous { recipient_id: String },
     #[error("coinbase height must fit in u32")]
     HeightOverflow,
     #[error("coinbase scriptSig length {0} exceeds {MAX_COINBASE_SCRIPT_SIG_LEN} bytes")]
@@ -66,6 +70,18 @@ pub struct CoinbaseBuildRequest {
     pub witness_merkle_leaves_hex: Vec<String>,
     #[serde(default)]
     pub coinbase_script_sig_suffix_hex: Option<String>,
+    /// Settlement rule escape hatch: the matching entitlement is emitted at
+    /// vout 0 while every other output keeps canonical
+    /// (order_key, recipient_id, p2mr_program_hex) ordering after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_first_output: Option<PinnedFirstOutput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PinnedFirstOutput {
+    pub recipient_id: String,
+    pub order_key: String,
+    pub p2mr_program_hex: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -339,6 +355,10 @@ fn allocate_outputs(request: &CoinbaseBuildRequest) -> Result<Vec<AllocatedOutpu
 
     let mut entitlements = request.entitlements.clone();
     entitlements.sort_by(compare_entitlements);
+    if let Some(pinned) = &request.pinned_first_output {
+        let pinned_index = pinned_entitlement_index(&entitlements, pinned)?;
+        entitlements[..=pinned_index].rotate_right(1);
+    }
 
     let total_weight = entitlements.iter().try_fold(0_u128, |sum, entitlement| {
         if entitlement.weight == 0 {
@@ -435,6 +455,31 @@ fn allocate_outputs(request: &CoinbaseBuildRequest) -> Result<Vec<AllocatedOutpu
     }
 
     Ok(outputs)
+}
+
+fn pinned_entitlement_index(
+    entitlements: &[WeightedEntitlement],
+    pinned: &PinnedFirstOutput,
+) -> Result<usize, BuilderError> {
+    let mut matches = entitlements.iter().enumerate().filter_map(|(index, entitlement)| {
+        let is_match = entitlement.recipient_id == pinned.recipient_id
+            && entitlement.order_key == pinned.order_key
+            && entitlement
+                .p2mr_program_hex
+                .eq_ignore_ascii_case(&pinned.p2mr_program_hex);
+        is_match.then_some(index)
+    });
+    let pinned_index = matches
+        .next()
+        .ok_or_else(|| BuilderError::PinnedFirstOutputMissing {
+            recipient_id: pinned.recipient_id.clone(),
+        })?;
+    if matches.next().is_some() {
+        return Err(BuilderError::PinnedFirstOutputAmbiguous {
+            recipient_id: pinned.recipient_id.clone(),
+        });
+    }
+    Ok(pinned_index)
 }
 
 fn compare_entitlements(left: &WeightedEntitlement, right: &WeightedEntitlement) -> Ordering {
@@ -723,6 +768,7 @@ mod tests {
             witness_nonce_hex: None,
             witness_merkle_leaves_hex: Vec::new(),
             coinbase_script_sig_suffix_hex: None,
+            pinned_first_output: None,
         }
     }
 
@@ -869,6 +915,7 @@ mod tests {
                     witness_nonce_hex: None,
                     witness_merkle_leaves_hex: Vec::new(),
                     coinbase_script_sig_suffix_hex: None,
+                    pinned_first_output: None,
                 };
 
                 let manifest = build_manifest(request).unwrap();
@@ -912,6 +959,156 @@ mod tests {
             left.coinbase_script_sig_suffix_hex,
             "111111112222222222222222"
         );
+    }
+
+    fn pinned(entitlement: &WeightedEntitlement) -> PinnedFirstOutput {
+        PinnedFirstOutput {
+            recipient_id: entitlement.recipient_id.clone(),
+            order_key: entitlement.order_key.clone(),
+            p2mr_program_hex: entitlement.p2mr_program_hex.clone(),
+        }
+    }
+
+    #[test]
+    fn pinned_first_output_moves_to_vout_zero_and_keeps_canonical_tail() {
+        let entitlements = vec![
+            entitlement("miner-c", "03", 3, 1),
+            entitlement("miner-a", "01", 1, 1),
+            entitlement("pool-fee", "zz", 9, 1),
+            entitlement("miner-b", "02", 2, 1),
+        ];
+        let mut pinned_request = request(entitlements.clone());
+        pinned_request.pinned_first_output = Some(pinned(&entitlements[2]));
+
+        let manifest = build_manifest(pinned_request).unwrap();
+        assert_eq!(
+            manifest
+                .outputs
+                .iter()
+                .map(|out| (out.vout, out.recipient_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "pool-fee"), (1, "miner-a"), (2, "miner-b"), (3, "miner-c")]
+        );
+        assert!(manifest
+            .witness_commitment_script_hex
+            .starts_with("6a24aa21a9ed"));
+        assert!(manifest
+            .coinbase_tx_hex
+            .contains(&manifest.witness_commitment_script_hex));
+    }
+
+    #[test]
+    fn pinned_first_output_moves_early_sorting_entitlement_without_disturbing_others() {
+        let entitlements = vec![
+            entitlement("miner-c", "03", 3, 1),
+            entitlement("pool-fee", "00", 9, 1),
+            entitlement("miner-a", "01", 1, 1),
+            entitlement("miner-b", "02", 2, 1),
+        ];
+        let mut pinned_request = request(entitlements.clone());
+        pinned_request.pinned_first_output = Some(pinned(&entitlements[1]));
+
+        let manifest = build_manifest(pinned_request).unwrap();
+        assert_eq!(
+            manifest
+                .outputs
+                .iter()
+                .map(|out| out.recipient_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pool-fee", "miner-a", "miner-b", "miner-c"]
+        );
+    }
+
+    #[test]
+    fn pinned_first_output_preserves_allocation_amounts() {
+        let entitlements = vec![
+            entitlement("miner-b", "02", 2, 1),
+            entitlement("miner-a", "01", 1, 1),
+            entitlement("pool-fee", "zz", 9, 1),
+        ];
+        let mut canonical_request = request(entitlements.clone());
+        canonical_request.coinbase_value_sats = 10;
+        let mut pinned_request = canonical_request.clone();
+        pinned_request.pinned_first_output = Some(pinned(&entitlements[2]));
+
+        let canonical_manifest = build_manifest(canonical_request).unwrap();
+        let pinned_manifest = build_manifest(pinned_request).unwrap();
+
+        let mut canonical_amounts = canonical_manifest
+            .outputs
+            .iter()
+            .map(|out| (out.recipient_id.clone(), out.amount_sats))
+            .collect::<Vec<_>>();
+        let mut pinned_amounts = pinned_manifest
+            .outputs
+            .iter()
+            .map(|out| (out.recipient_id.clone(), out.amount_sats))
+            .collect::<Vec<_>>();
+        canonical_amounts.sort();
+        pinned_amounts.sort();
+        assert_eq!(canonical_amounts, pinned_amounts);
+        assert_eq!(pinned_manifest.outputs[0].recipient_id, "pool-fee");
+        assert_ne!(canonical_manifest.coinbase_txid, pinned_manifest.coinbase_txid);
+    }
+
+    #[test]
+    fn pinned_first_output_is_deterministic_across_input_order() {
+        let entitlements = vec![
+            entitlement("miner-c", "03", 3, 1),
+            entitlement("miner-a", "01", 1, 1),
+            entitlement("pool-fee", "zz", 9, 1),
+            entitlement("miner-b", "02", 2, 1),
+        ];
+        let mut shuffled = entitlements.clone();
+        shuffled.reverse();
+
+        let mut left_request = request(entitlements.clone());
+        left_request.pinned_first_output = Some(pinned(&entitlements[2]));
+        let mut right_request = request(shuffled);
+        right_request.pinned_first_output = Some(pinned(&entitlements[2]));
+
+        let key = ManifestSigningKey::from_seed_hex(SIGNING_SEED).unwrap();
+        let left = build_signed_manifest(left_request, &key).unwrap();
+        let right = build_signed_manifest(right_request, &key).unwrap();
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn pinned_first_output_missing_from_entitlements_is_rejected() {
+        let mut bad_request = request(vec![entitlement("miner-a", "01", 1, 1)]);
+        bad_request.pinned_first_output = Some(PinnedFirstOutput {
+            recipient_id: "pool-fee".to_string(),
+            order_key: "zz".to_string(),
+            p2mr_program_hex: program(9),
+        });
+        assert!(matches!(
+            build_manifest(bad_request),
+            Err(BuilderError::PinnedFirstOutputMissing { recipient_id }) if recipient_id == "pool-fee"
+        ));
+    }
+
+    #[test]
+    fn pinned_first_output_matching_duplicate_entitlements_is_rejected() {
+        let duplicate = entitlement("pool-fee", "zz", 9, 1);
+        let mut bad_request = request(vec![
+            entitlement("miner-a", "01", 1, 1),
+            duplicate.clone(),
+            duplicate.clone(),
+        ]);
+        bad_request.pinned_first_output = Some(pinned(&duplicate));
+        assert!(matches!(
+            build_manifest(bad_request),
+            Err(BuilderError::PinnedFirstOutputAmbiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn build_request_json_without_pinned_first_output_defaults_to_none() {
+        let serialized = serde_json::to_value(request(vec![entitlement("miner-a", "01", 1, 1)]))
+            .unwrap();
+        assert!(serialized.get("pinned_first_output").is_none());
+        let decoded: CoinbaseBuildRequest = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.pinned_first_output, None);
     }
 
     #[test]

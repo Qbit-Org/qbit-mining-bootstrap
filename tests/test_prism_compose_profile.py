@@ -50,6 +50,7 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_RESERVED_COINBASE_OUTPUTS": "1",
                 "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT": "25",
                 "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS": "13000",
+                "PRISM_COINBASE_OUTPUT_POLICY": "pool-fee-first",
                 "PRISM_CTV_BROADCASTER_ENABLED": "1",
                 "PRISM_CTV_BROADCASTER_WALLET": "fanout-broadcaster",
                 "PRISM_CTV_BROADCASTER_FEE_BITS": "0",
@@ -191,6 +192,7 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_RESERVED_COINBASE_OUTPUTS"], "1")
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT"], "25")
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_PREMIUM_BPS"], "13000")
+        self.assertEqual(env["PRISM_COINBASE_OUTPUT_POLICY"], "pool-fee-first")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_ENABLED"], "1")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_WALLET"], "fanout-broadcaster")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_FEE_BITS"], "0")

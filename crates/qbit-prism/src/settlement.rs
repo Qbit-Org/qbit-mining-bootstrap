@@ -184,6 +184,22 @@ pub fn select_settlement_mode(
     direct_floor_sats: u64,
     config: &SettlementModeConfig,
 ) -> Result<SettlementModeDecision, PrismError> {
+    select_settlement_mode_with_pinned_direct(recipients, direct_floor_sats, config, None)
+}
+
+/// Like [`select_settlement_mode`], but reserves one direct coinbase
+/// settlement slot for `pinned_direct` before amount-priority selection runs.
+///
+/// The pinned recipient is settled directly even when its amount is below
+/// `direct_floor_sats`, is never routed to a CTV fanout chunk, and consumes
+/// one `max_direct_coinbase_outputs` slot. Selection fails instead of
+/// demoting the pinned recipient when the output budget cannot hold it.
+pub fn select_settlement_mode_with_pinned_direct(
+    recipients: &[SettlementRecipient],
+    direct_floor_sats: u64,
+    config: &SettlementModeConfig,
+    pinned_direct: Option<&SettlementRecipient>,
+) -> Result<SettlementModeDecision, PrismError> {
     validate_config(config)?;
     if recipients.is_empty() {
         return Err(settlement_error("no recipients to settle"));
@@ -194,15 +210,28 @@ pub fn select_settlement_mode(
     canonical.sort_by(canonical_recipient_cmp);
     validate_recipients(&canonical)?;
 
+    let pinned_key = pinned_direct
+        .map(|pinned| resolve_pinned_direct_key(&canonical, pinned, config))
+        .transpose()?;
+    let pinned_direct_count = usize::from(pinned_key.is_some());
+
     let total_amount_sats = sum_amounts(&canonical)?;
     let mut direct_candidates = canonical
         .iter()
-        .filter(|recipient| recipient.amount_sats >= direct_floor_sats)
+        .filter(|recipient| {
+            recipient.amount_sats >= direct_floor_sats
+                && pinned_key.as_ref() != Some(&account_key(recipient))
+        })
         .cloned()
         .collect::<Vec<_>>();
     direct_candidates.sort_by(direct_priority_cmp);
 
-    let direct_count = select_direct_count(recipients.len(), direct_candidates.len(), config)?;
+    let direct_count = select_direct_count(
+        recipients.len(),
+        direct_candidates.len(),
+        config,
+        pinned_direct_count,
+    )?;
     let selected_direct_keys = direct_candidates
         .iter()
         .take(direct_count)
@@ -211,7 +240,8 @@ pub fn select_settlement_mode(
     let mut direct_recipients = Vec::new();
     let mut fanout_recipients = Vec::new();
     for recipient in canonical {
-        if selected_direct_keys.contains(&account_key(&recipient)) {
+        let key = account_key(&recipient);
+        if pinned_key.as_ref() == Some(&key) || selected_direct_keys.contains(&key) {
             direct_recipients.push(recipient);
         } else {
             fanout_recipients.push(recipient);
@@ -274,6 +304,7 @@ pub fn select_settlement_mode(
             direct_floor_sats,
             coinbase_settlement_output_count,
             config,
+            pinned_direct_count,
         ),
         direct_recipients,
         fanout_chunks,
@@ -548,15 +579,46 @@ fn fanout_fee_recipient_cmp(left: &FanoutFeeRecipient, right: &FanoutFeeRecipien
         .then_with(|| left.p2mr_program_hex.cmp(&right.p2mr_program_hex))
 }
 
+fn resolve_pinned_direct_key(
+    canonical: &[SettlementRecipient],
+    pinned: &SettlementRecipient,
+    config: &SettlementModeConfig,
+) -> Result<SettlementAccountKey, PrismError> {
+    if config.max_direct_coinbase_outputs == 0 {
+        return Err(settlement_error(
+            "pinned direct recipient requires max_direct_coinbase_outputs >= 1",
+        ));
+    }
+    let mut normalized = [pinned.clone()];
+    normalize_recipient_p2mr_programs(&mut normalized)?;
+    let key = account_key(&normalized[0]);
+    if !canonical
+        .iter()
+        .any(|recipient| account_key(recipient) == key)
+    {
+        return Err(settlement_error(format!(
+            "pinned direct recipient {} is not among the settlement recipients",
+            pinned.recipient_id
+        )));
+    }
+    Ok(key)
+}
+
 fn select_direct_count(
     total_recipient_count: usize,
     direct_candidate_count: usize,
     config: &SettlementModeConfig,
+    pinned_direct_count: usize,
 ) -> Result<usize, PrismError> {
-    let max_direct = direct_candidate_count.min(config.max_direct_coinbase_outputs);
+    let max_direct = direct_candidate_count.min(
+        config
+            .max_direct_coinbase_outputs
+            .saturating_sub(pinned_direct_count),
+    );
     for direct_count in (0..=max_direct).rev() {
         let fanout_recipient_count = total_recipient_count
-            .checked_sub(direct_count)
+            .checked_sub(pinned_direct_count)
+            .and_then(|count| count.checked_sub(direct_count))
             .ok_or_else(|| settlement_error("direct recipient count exceeded total recipients"))?;
         let fanout_chunk_count = fanout_chunk_count(
             fanout_recipient_count,
@@ -564,7 +626,8 @@ fn select_direct_count(
         )?;
         let coinbase_outputs = config
             .reserved_coinbase_outputs
-            .checked_add(direct_count)
+            .checked_add(pinned_direct_count)
+            .and_then(|count| count.checked_add(direct_count))
             .and_then(|count| count.checked_add(fanout_chunk_count))
             .ok_or_else(|| settlement_error("coinbase settlement output count overflowed"))?;
         if coinbase_outputs <= config.max_coinbase_settlement_outputs {
@@ -691,22 +754,29 @@ fn decision_reason(
     direct_floor_sats: u64,
     coinbase_settlement_outputs: usize,
     config: &SettlementModeConfig,
+    pinned_direct_count: usize,
 ) -> String {
-    if fanout_count == 0 {
-        return format!(
+    let reason = if fanout_count == 0 {
+        format!(
             "{direct_count} recipients meet the {direct_floor_sats}-sat direct floor and fit within the {}-output coinbase settlement cap",
             config.max_coinbase_settlement_outputs
-        );
-    }
-    if direct_count == 0 {
-        return format!(
+        )
+    } else if direct_count == 0 {
+        format!(
             "{fanout_count} recipients routed to {fanout_chunks} CTV fanout chunk(s) capped at {} recipients each; {coinbase_settlement_outputs} coinbase settlement outputs used",
             config.max_fanout_recipients_per_transaction
-        );
+        )
+    } else {
+        format!(
+            "{direct_count} recipients paid directly by largest-liability priority; {fanout_count} recipients routed to {fanout_chunks} CTV fanout chunk(s); {coinbase_settlement_outputs} of {} coinbase settlement outputs used",
+            config.max_coinbase_settlement_outputs
+        )
+    };
+    if pinned_direct_count == 0 {
+        return reason;
     }
     format!(
-        "{direct_count} recipients paid directly by largest-liability priority; {fanout_count} recipients routed to {fanout_chunks} CTV fanout chunk(s); {coinbase_settlement_outputs} of {} coinbase settlement outputs used",
-        config.max_coinbase_settlement_outputs
+        "{reason}; {pinned_direct_count} direct settlement slot(s) pinned by the coinbase output policy"
     )
 }
 
@@ -891,6 +961,7 @@ mod tests {
                     * DEFAULT_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION,
                 0,
                 &config,
+                0,
             )
             .unwrap(),
             0
@@ -901,6 +972,7 @@ mod tests {
                 + 1,
             0,
             &config,
+            0,
         )
         .unwrap_err()
         .to_string()
@@ -989,6 +1061,184 @@ mod tests {
             select_settlement_mode(&recipients, FLOOR, &capped_config(2, 0, 1_000, 0)).unwrap_err();
 
         assert!(err.to_string().contains("more than 2"));
+    }
+
+    #[test]
+    fn pinned_direct_recipient_is_direct_even_below_floor() {
+        let pinned = recipient("pool-fee", "ff", 25);
+        let recipients = vec![
+            recipient("miner-a", "01", 30_000),
+            recipient("miner-b", "02", 1_000),
+            pinned.clone(),
+        ];
+
+        let decision = select_settlement_mode_with_pinned_direct(
+            &recipients,
+            FLOOR,
+            &config(2, 1_000),
+            Some(&pinned),
+        )
+        .unwrap();
+
+        assert_eq!(decision.mode, SettlementMode::HybridCoinbaseCtvFanout);
+        assert_eq!(
+            recipient_names(&decision.direct_recipients),
+            ["miner-a", "pool-fee"]
+        );
+        assert_eq!(
+            fanout_chunk_names(&decision),
+            vec![vec!["miner-b".to_string()]]
+        );
+        assert!(decision
+            .reason
+            .contains("pinned by the coinbase output policy"));
+    }
+
+    #[test]
+    fn pinned_direct_recipient_consumes_a_direct_slot() {
+        let pinned = recipient("pool-fee", "ff", 25);
+        let recipients = vec![
+            recipient("miner-a", "01", 30_000),
+            recipient("miner-b", "02", 20_000),
+            pinned.clone(),
+        ];
+
+        let decision = select_settlement_mode_with_pinned_direct(
+            &recipients,
+            FLOOR,
+            &config(2, 1_000),
+            Some(&pinned),
+        )
+        .unwrap();
+
+        assert_eq!(
+            recipient_names(&decision.direct_recipients),
+            ["miner-a", "pool-fee"]
+        );
+        assert_eq!(
+            fanout_chunk_names(&decision),
+            vec![vec!["miner-b".to_string()]]
+        );
+        assert_eq!(decision.direct_recipient_count, 2);
+        assert_eq!(decision.coinbase_settlement_output_count, 3);
+    }
+
+    #[test]
+    fn pinned_direct_recipient_never_routes_to_fanout_even_at_the_cap() {
+        let pinned = recipient("pool-fee", "ffff", 1);
+        let mut recipients = (0..2_000)
+            .map(|index| recipient(&format!("miner-{index:05}"), &format!("{index:08}"), 1))
+            .collect::<Vec<_>>();
+        recipients.push(pinned.clone());
+
+        let decision = select_settlement_mode_with_pinned_direct(
+            &recipients,
+            FLOOR,
+            &capped_config(3, 1, 1_000, 0),
+            Some(&pinned),
+        )
+        .unwrap();
+
+        assert_eq!(decision.mode, SettlementMode::HybridCoinbaseCtvFanout);
+        assert_eq!(recipient_names(&decision.direct_recipients), ["pool-fee"]);
+        assert_eq!(decision.fanout_recipient_count, 2_000);
+        assert_eq!(decision.fanout_chunk_count, 2);
+        assert_eq!(decision.coinbase_settlement_output_count, 3);
+        assert!(decision
+            .fanout_chunks
+            .iter()
+            .all(|chunk| chunk.recipients.iter().all(|r| r.recipient_id != "pool-fee")));
+    }
+
+    #[test]
+    fn pinned_direct_recipient_missing_from_recipients_is_rejected() {
+        let recipients = vec![recipient("miner-a", "01", 30_000)];
+        let pinned = recipient("pool-fee", "ff", 25);
+
+        let err = select_settlement_mode_with_pinned_direct(
+            &recipients,
+            FLOOR,
+            &config(2, 1_000),
+            Some(&pinned),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("pinned direct recipient pool-fee is not among the settlement recipients"));
+    }
+
+    #[test]
+    fn pinned_direct_recipient_requires_a_direct_slot() {
+        let pinned = recipient("pool-fee", "ff", 25);
+        let recipients = vec![recipient("miner-a", "01", 30_000), pinned.clone()];
+
+        let err = select_settlement_mode_with_pinned_direct(
+            &recipients,
+            FLOOR,
+            &config(0, 1_000),
+            Some(&pinned),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("pinned direct recipient requires max_direct_coinbase_outputs >= 1"));
+    }
+
+    #[test]
+    fn pinned_direct_recipient_errors_when_budget_cannot_hold_the_pinned_slot() {
+        let pinned = recipient("pool-fee", "ffff", 1);
+        let mut recipients = (0..2_001)
+            .map(|index| recipient(&format!("miner-{index:05}"), &format!("{index:08}"), 1))
+            .collect::<Vec<_>>();
+        recipients.push(pinned.clone());
+
+        let err = select_settlement_mode_with_pinned_direct(
+            &recipients,
+            FLOOR,
+            &capped_config(3, 1, 1_000, 0),
+            Some(&pinned),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("more than 3"));
+    }
+
+    #[test]
+    fn pinned_partition_is_input_order_independent() {
+        let pinned = recipient("pool-fee", "ff", 25);
+        let recipients = vec![
+            recipient("miner-e", "05", 4_000),
+            recipient("miner-b", "02", 40_000),
+            recipient("miner-c", "03", 30_000),
+            pinned.clone(),
+            recipient("miner-a", "01", 50_000),
+            recipient("miner-d", "04", 5_000),
+        ];
+        let mut reversed = recipients.clone();
+        reversed.reverse();
+
+        let forward = select_settlement_mode_with_pinned_direct(
+            &recipients,
+            FLOOR,
+            &config(2, 2),
+            Some(&pinned),
+        )
+        .unwrap();
+        let backward = select_settlement_mode_with_pinned_direct(
+            &reversed,
+            FLOOR,
+            &config(2, 2),
+            Some(&pinned),
+        )
+        .unwrap();
+
+        assert_eq!(forward, backward);
+        assert_eq!(
+            recipient_names(&forward.direct_recipients),
+            ["miner-a", "pool-fee"]
+        );
     }
 
     #[test]
