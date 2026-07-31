@@ -349,6 +349,41 @@ Pool fees are optional. When enabled, configure `PRISM_POOL_FEE_ENABLED`,
 `PRISM_POOL_FEE_BPS`, and either `PRISM_POOL_FEE_ADDRESS` or
 `PRISM_POOL_FEE_P2MR_PROGRAM_HEX`.
 
+### Coinbase Output Ordering
+
+Coinbase payout outputs are ordered lexicographically by
+`(order_key, recipient_id, p2mr_program_hex)`, with the zero-value witness
+commitment always last. Miner outputs use the payout address as `order_key`,
+and CTV covenant outputs use synthetic `ctv-fanout-<index>` keys, so the pool
+fee lands wherever its `order_key` happens to sort and can even route through a
+CTV fanout chunk. `PRISM_COINBASE_OUTPUT_POLICY` makes the ordering rule
+explicit:
+
+```text
+PRISM_COINBASE_OUTPUT_POLICY=canonical|pool-fee-first
+```
+
+- **`canonical`** (default) preserves the historical ordering exactly.
+- **`pool-fee-first`** requires an enabled pool fee and, whenever the fee
+  output is positive, reserves one direct coinbase settlement slot for it,
+  never routes the fee through CTV fanout, and emits the fee at coinbase
+  `vout 0`. Direct miner and CTV covenant outputs keep canonical ordering
+  after it, and the witness commitment stays last. A sub-floor fee is still
+  settled directly, and job construction fails instead of demoting the fee
+  when the settlement output budget cannot hold the reserved slot.
+
+Unknown values are rejected at startup. The selected policy is committed in
+the payout policy manifest (and therefore in the on-chain audit commitment and
+signed audit bundle), so independent verifiers and downstream indexers can
+determine the intended ordering without operator-local environment
+configuration; `qbit-prism-audit-verify` enforces it and reports it as
+`coinbase_output_policy`.
+
+Switching policies changes the coinbase txid, manifest hashes, and CTV parent
+vouts prospectively, at job-construction time only. Blocks and persisted CTV
+artifacts built under the previous policy continue to verify under their
+original ordering.
+
 ## Direct Coinbase Settlement
 
 Without CTV settlement, PRISM pays selected accounts directly from the coinbase

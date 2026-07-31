@@ -897,6 +897,13 @@ def parse_stratum_password_options(password: str) -> tuple[Decimal | None, Decim
     return requested, requested_min
 
 
+# Coinbase output ordering policies accepted by PRISM_COINBASE_OUTPUT_POLICY.
+# "canonical" preserves the historical lexicographic output ordering;
+# "pool-fee-first" reserves a direct settlement slot for a positive pool fee
+# and emits it at coinbase vout 0.
+VALID_COINBASE_OUTPUT_POLICIES = frozenset({"canonical", "pool-fee-first"})
+
+
 def default_prism_payout_policy() -> dict[str, object]:
     policy: dict[str, object] = {
         "p2mr_spend_input_bytes": env_positive_int(
@@ -3575,6 +3582,12 @@ class PrismCoordinator:
             return cached
 
         policy = default_prism_payout_policy()
+        output_policy = env_optional("PRISM_COINBASE_OUTPUT_POLICY") or "canonical"
+        if output_policy not in VALID_COINBASE_OUTPUT_POLICIES:
+            raise SystemExit(
+                "PRISM_COINBASE_OUTPUT_POLICY must be one of: "
+                + ", ".join(sorted(VALID_COINBASE_OUTPUT_POLICIES))
+            )
         fee_bps_raw = env_optional("PRISM_POOL_FEE_BPS")
         fee_enabled = env_bool("PRISM_POOL_FEE_ENABLED", "0")
         fee_address = env_optional("PRISM_POOL_FEE_ADDRESS")
@@ -3588,6 +3601,11 @@ class PrismCoordinator:
         if not fee_enabled:
             if has_fee_config:
                 raise SystemExit("set PRISM_POOL_FEE_ENABLED=1 when configuring pool fees")
+            if output_policy == "pool-fee-first":
+                raise SystemExit(
+                    "PRISM_COINBASE_OUTPUT_POLICY=pool-fee-first requires PRISM_POOL_FEE_ENABLED=1"
+                    " and a configured pool fee"
+                )
             self._prism_payout_policy_cache = policy
             return policy
         if fee_bps_raw is None:
@@ -3631,6 +3649,10 @@ class PrismCoordinator:
             }
 
         policy["pool_fee_policy"] = fee_policy
+        if output_policy != "canonical":
+            # Omitted for canonical so canonical payloads and signed audit
+            # artifacts keep their historical bytes.
+            policy["coinbase_output_policy"] = output_policy
         self._prism_payout_policy_cache = policy
         return policy
 

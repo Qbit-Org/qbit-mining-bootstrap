@@ -3043,6 +3043,126 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "99" * 32,
         )
 
+    def test_prism_coinbase_output_policy_defaults_to_canonical_and_is_omitted(self) -> None:
+        server = coordinator()
+        server.rpc = AddressRpc(valid_address="tq1fee", script_byte="88")
+
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_POOL_FEE_ENABLED": "1",
+                "PRISM_POOL_FEE_BPS": "125",
+                "PRISM_POOL_FEE_ADDRESS": "tq1fee",
+            },
+            clear=True,
+        ):
+            policy = server.prism_payout_policy()
+
+        self.assertNotIn("coinbase_output_policy", policy)
+
+    def test_prism_coinbase_output_policy_explicit_canonical_is_omitted(self) -> None:
+        server = coordinator()
+        server.rpc = AddressRpc(valid_address="tq1fee", script_byte="88")
+
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_COINBASE_OUTPUT_POLICY": "canonical",
+                "PRISM_POOL_FEE_ENABLED": "1",
+                "PRISM_POOL_FEE_BPS": "125",
+                "PRISM_POOL_FEE_ADDRESS": "tq1fee",
+            },
+            clear=True,
+        ):
+            policy = server.prism_payout_policy()
+
+        self.assertNotIn("coinbase_output_policy", policy)
+
+    def test_prism_coinbase_output_policy_pool_fee_first_is_included(self) -> None:
+        server = coordinator()
+        server.rpc = AddressRpc(valid_address="tq1fee", script_byte="88")
+
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_COINBASE_OUTPUT_POLICY": "pool-fee-first",
+                "PRISM_POOL_FEE_ENABLED": "1",
+                "PRISM_POOL_FEE_BPS": "125",
+                "PRISM_POOL_FEE_ADDRESS": "tq1fee",
+            },
+            clear=True,
+        ):
+            policy = server.prism_payout_policy()
+
+        self.assertEqual(policy["coinbase_output_policy"], "pool-fee-first")
+        self.assertEqual(policy["pool_fee_policy"]["fee_bps"], 125)
+
+    def test_prism_coinbase_output_policy_rejects_unknown_values(self) -> None:
+        for invalid in ("fee-first", "POOL-FEE-FIRST", "canonical "):
+            with self.subTest(invalid=invalid), patch.dict(
+                os.environ,
+                {
+                    "PRISM_COINBASE_OUTPUT_POLICY": invalid,
+                    "PRISM_POOL_FEE_ENABLED": "1",
+                    "PRISM_POOL_FEE_BPS": "125",
+                    "PRISM_POOL_FEE_ADDRESS": "tq1fee",
+                },
+                clear=True,
+            ):
+                server = coordinator()
+                server.rpc = AddressRpc(valid_address="tq1fee")
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "PRISM_COINBASE_OUTPUT_POLICY must be one of: canonical, pool-fee-first",
+                ):
+                    server.prism_payout_policy()
+
+    def test_prism_coinbase_output_policy_pool_fee_first_requires_pool_fee(self) -> None:
+        cases = [
+            {"PRISM_COINBASE_OUTPUT_POLICY": "pool-fee-first"},
+            {
+                "PRISM_COINBASE_OUTPUT_POLICY": "pool-fee-first",
+                "PRISM_POOL_FEE_ENABLED": "0",
+            },
+        ]
+        for env_vars in cases:
+            with self.subTest(env_vars=env_vars), patch.dict(os.environ, env_vars, clear=True):
+                server = coordinator()
+                with self.assertRaisesRegex(SystemExit, "requires PRISM_POOL_FEE_ENABLED=1"):
+                    server.prism_payout_policy()
+
+    def test_build_audit_bundle_passes_coinbase_output_policy_to_cli_payload(self) -> None:
+        server = coordinator()
+        server.rpc = AddressRpc(valid_address="tq1fee", script_byte="99")
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        captured: dict[str, object] = {}
+
+        def fake_run(cmd: list[str], **kwargs: object) -> object:
+            captured["payload"] = json.loads(str(kwargs["input"]))
+            return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
+
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_COINBASE_OUTPUT_POLICY": "pool-fee-first",
+                "PRISM_POOL_FEE_ENABLED": "1",
+                "PRISM_POOL_FEE_BPS": "125",
+                "PRISM_POOL_FEE_ADDRESS": "tq1fee",
+            },
+            clear=True,
+        ), patch("lab.prism.prism_coordinator.subprocess.run", side_effect=fake_run):
+            server.build_audit_bundle(
+                shares=[],
+                found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+            )
+
+        payout_policy = captured["payload"]["payout_policy"]
+        self.assertEqual(payout_policy["coinbase_output_policy"], "pool-fee-first")
+        self.assertEqual(payout_policy["pool_fee_policy"]["fee_bps"], 125)
+
     def test_build_audit_bundle_passes_ctv_settlement_config_to_cli_payload(self) -> None:
         server = coordinator()
         server.signing_seed_hex = "42" * 32

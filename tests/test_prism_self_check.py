@@ -642,6 +642,59 @@ class PrismSelfCheckTests(unittest.TestCase):
         self.assertIn("live preflight required", fee_rows[0].detail)
         self.assertIn("Fresh chains", fee_rows[0].hint or "")
 
+    def test_static_checks_default_coinbase_output_policy_is_canonical(self) -> None:
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(self.valid_env(), reporter)
+
+        policy_rows = [row for row in reporter.rows if row.name == "coinbase.output_policy"]
+        self.assertEqual([row.status for row in policy_rows], ["PASS"])
+        self.assertEqual(policy_rows[0].detail, "canonical")
+
+    def test_static_checks_accept_pool_fee_first_with_enabled_pool_fee(self) -> None:
+        env = self.valid_env()
+        env.update(
+            {
+                "PRISM_COINBASE_OUTPUT_POLICY": "pool-fee-first",
+                "PRISM_POOL_FEE_ENABLED": "1",
+                "PRISM_POOL_FEE_BPS": "125",
+                "PRISM_POOL_FEE_ADDRESS": "tq1fee",
+            }
+        )
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        policy_rows = [row for row in reporter.rows if row.name == "coinbase.output_policy"]
+        self.assertEqual([row.status for row in policy_rows], ["PASS"])
+        self.assertEqual(policy_rows[0].detail, "pool-fee-first")
+
+    def test_static_checks_reject_pool_fee_first_without_pool_fee(self) -> None:
+        env = self.valid_env()
+        env["PRISM_COINBASE_OUTPUT_POLICY"] = "pool-fee-first"
+        reporter = self.self_check.Reporter()
+
+        self.self_check.static_checks(env, reporter)
+
+        self.assertIn(
+            ("FAIL", "coinbase.output_policy"),
+            {(row.status, row.name) for row in reporter.rows},
+        )
+
+    def test_static_checks_reject_unknown_coinbase_output_policy(self) -> None:
+        for invalid in ("fee-first", "POOL-FEE-FIRST"):
+            with self.subTest(invalid=invalid):
+                env = self.valid_env()
+                env["PRISM_COINBASE_OUTPUT_POLICY"] = invalid
+                reporter = self.self_check.Reporter()
+
+                self.self_check.static_checks(env, reporter)
+
+                self.assertIn(
+                    ("FAIL", "coinbase.output_policy"),
+                    {(row.status, row.name) for row in reporter.rows},
+                )
+
     def test_highdiff_probe_target_uses_published_host_port_only(self) -> None:
         # The published host mapping is the only valid probe target: falling
         # back to the container listen port could pass while miners cannot
