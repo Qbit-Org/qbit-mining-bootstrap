@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY docker/ckpool/qbit-regtest.patch /tmp/qbit-regtest.patch
 COPY docker/ckpool/qbit-signet-gbt.patch /tmp/qbit-signet-gbt.patch
+COPY docker/ckpool/qbit-rejects-observability.patch /tmp/qbit-rejects-observability.patch
 
 WORKDIR /src/ckpool
 RUN git init . \
@@ -32,7 +33,8 @@ RUN git init . \
     && git checkout FETCH_HEAD
 
 RUN git apply /tmp/qbit-regtest.patch \
-    && git apply /tmp/qbit-signet-gbt.patch
+    && git apply /tmp/qbit-signet-gbt.patch \
+    && git apply /tmp/qbit-rejects-observability.patch
 
 RUN ./autogen.sh \
     && ./configure \
