@@ -3138,10 +3138,6 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.ledger_attestation_signing_seed_hex = "43" * 32
         captured: dict[str, object] = {}
 
-        def fake_run(cmd: list[str], **kwargs: object) -> object:
-            captured["payload"] = json.loads(str(kwargs["input"]))
-            return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
-
         with patch.dict(
             os.environ,
             {
@@ -3151,7 +3147,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 "PRISM_POOL_FEE_ADDRESS": "tq1fee",
             },
             clear=True,
-        ), patch("lab.prism.prism_coordinator.subprocess.run", side_effect=fake_run):
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            fake_audit_bundle_popen(captured),
+        ):
             server.build_audit_bundle(
                 shares=[],
                 found_block={"block_height": 10, "coinbase_value_sats": 50_00000000},
