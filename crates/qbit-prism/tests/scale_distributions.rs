@@ -22,16 +22,18 @@
 //! No RNG crate is available in the workspace, so all distributions are
 //! constructed deterministically.
 
+use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
-    apply_estimated_proportional_fanout_fee, apply_payout_policy, build_maturity_entries,
+    apply_estimated_proportional_fanout_fee, apply_payout_policy,
+    build_audit_bundle_with_ctv_settlement_options, build_maturity_entries,
     build_prism_reward_manifest, current_carry_forward_balances, reverse_disconnected_blocks,
-    select_settlement_mode, update_maturity_states, AcceptedShare, CarryForwardBalance,
-    FanoutFeeRatePolicy, FoundBlock, PayoutMaturityState, PayoutPolicy, PayoutPolicyAccountType,
-    PayoutPolicyAction, PoolFeePolicy, PrismError, SettlementMode, SettlementModeConfig,
-    SettlementRecipient, DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS,
-    DEFAULT_DIRECT_COINBASE_PAYOUT_FLOOR_SATS, DEFAULT_MAX_COINBASE_SETTLEMENT_OUTPUTS,
-    DEFAULT_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION, DEFAULT_MAX_DIRECT_COINBASE_OUTPUTS,
-    QBIT_COINBASE_MATURITY_BLOCKS,
+    select_settlement_mode, update_maturity_states, verify_audit_bundle, AcceptedShare,
+    CarryForwardBalance, CoinbaseOutputPolicy, FanoutFeeRatePolicy, FoundBlock,
+    PayoutMaturityState, PayoutPolicy, PayoutPolicyAccountType, PayoutPolicyAction, PoolFeePolicy,
+    PrismError, SettlementMode, SettlementModeConfig, SettlementRecipient,
+    DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS, DEFAULT_DIRECT_COINBASE_PAYOUT_FLOOR_SATS,
+    DEFAULT_MAX_COINBASE_SETTLEMENT_OUTPUTS, DEFAULT_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION,
+    DEFAULT_MAX_DIRECT_COINBASE_OUTPUTS, QBIT_COINBASE_MATURITY_BLOCKS,
 };
 
 const ANCHOR_MS: i64 = 1_000_000;
@@ -519,6 +521,89 @@ fn scale_pool_fee_can_route_through_hybrid_settlement_without_miner_carry() {
     assert!(carry
         .iter()
         .all(|balance| balance.recipient_id != "pool-fee"));
+}
+
+#[test]
+fn scale_pool_fee_first_keeps_fee_direct_at_vout_zero_across_share_order() {
+    let n = 5_000;
+    let coinbase = n * 20_000;
+    let fee_bps: u16 = 200;
+    let ordered = equal_weight_shares(n);
+    let mut shuffled = ordered.clone();
+    shuffled.reverse();
+
+    let mut policy = PayoutPolicy::day_one_default();
+    policy.pool_fee_policy = Some(PoolFeePolicy {
+        fee_bps,
+        recipient_id: "pool-fee".to_string(),
+        order_key: "zzzzzzzz".to_string(),
+        p2mr_program_hex: program_hex(u64::MAX),
+    });
+    policy.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+
+    let signing_key = ManifestSigningKey::from_seed_hex(&"42".repeat(32)).unwrap();
+    let ledger_key = ManifestSigningKey::from_seed_hex(&"43".repeat(32)).unwrap();
+    let build = |shares: Vec<AcceptedShare>| {
+        build_audit_bundle_with_ctv_settlement_options(
+            shares,
+            found_block(n, coinbase),
+            Vec::new(),
+            policy.clone(),
+            DEFAULT_DIRECT_COINBASE_PAYOUT_FLOOR_SATS,
+            SettlementModeConfig::default(),
+            None,
+            None,
+            Vec::new(),
+            &signing_key,
+            &ledger_key,
+        )
+        .unwrap()
+    };
+
+    let from_ordered = build(ordered);
+    let from_shuffled = build(shuffled);
+    // Byte-identical settlement artifacts regardless of share input order.
+    // (`AuditBundle.shares` echoes the raw input order, so compare the
+    // derived artifacts rather than the whole bundle.)
+    assert_eq!(
+        from_ordered.signed_coinbase_manifest,
+        from_shuffled.signed_coinbase_manifest
+    );
+    assert_eq!(
+        from_ordered.payout_policy_manifest,
+        from_shuffled.payout_policy_manifest
+    );
+    assert_eq!(
+        from_ordered.settlement_mode_decision,
+        from_shuffled.settlement_mode_decision
+    );
+    assert_eq!(
+        from_ordered.ctv_fanout_manifest_set,
+        from_shuffled.ctv_fanout_manifest_set
+    );
+    assert_eq!(
+        from_ordered.audit_commitment_root_hex,
+        from_shuffled.audit_commitment_root_hex
+    );
+
+    let expected_fee = coinbase * u64::from(fee_bps) / 10_000;
+    let outputs = &from_ordered.signed_coinbase_manifest.manifest.outputs;
+    assert_eq!(outputs[0].recipient_id, "pool-fee");
+    assert_eq!(outputs[0].vout, 0);
+    assert_eq!(outputs[0].amount_sats, expected_fee);
+
+    let decision = from_ordered.settlement_mode_decision.as_ref().unwrap();
+    assert_eq!(decision.mode, SettlementMode::HybridCoinbaseCtvFanout);
+    assert!(decision
+        .direct_recipients
+        .iter()
+        .any(|recipient| recipient.recipient_id == "pool-fee"));
+    assert!(decision.fanout_chunks.iter().all(|chunk| chunk
+        .recipients
+        .iter()
+        .all(|recipient| recipient.recipient_id != "pool-fee")));
+
+    verify_audit_bundle(&from_ordered, &ledger_key.public_key_hex()).unwrap();
 }
 
 // ===========================================================================

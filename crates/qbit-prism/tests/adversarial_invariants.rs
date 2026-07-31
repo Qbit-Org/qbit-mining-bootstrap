@@ -128,6 +128,7 @@ fn t1a_coinbase_outputs_sum_to_coinbase_value_exactly() {
                 witness_nonce_hex: None,
                 witness_merkle_leaves_hex: Vec::new(),
                 coinbase_script_sig_suffix_hex: None,
+                pinned_first_output: None,
             };
             let m = build_manifest(req).unwrap();
             let sum: u64 = m.outputs.iter().map(|o| o.amount_sats).sum();
@@ -631,6 +632,7 @@ fn t7a_every_coinbase_output_is_p2mr_plus_one_op_return_witness_commitment() {
         witness_nonce_hex: None,
         witness_merkle_leaves_hex: Vec::new(),
         coinbase_script_sig_suffix_hex: None,
+        pinned_first_output: None,
     };
     let m = build_manifest(req).unwrap();
     // All miner outputs are P2MR.
@@ -662,6 +664,7 @@ fn t7b_coinbase_scriptsig_within_2_to_100_bytes_for_representative_heights() {
             witness_nonce_hex: None,
             witness_merkle_leaves_hex: Vec::new(),
             coinbase_script_sig_suffix_hex: None,
+            pinned_first_output: None,
         };
         let m = build_manifest(req).unwrap();
         let script = hex::decode(&m.coinbase_script_sig_hex).unwrap();
@@ -682,6 +685,7 @@ fn t7c_height_zero_rejected() {
         witness_nonce_hex: None,
         witness_merkle_leaves_hex: Vec::new(),
         coinbase_script_sig_suffix_hex: None,
+        pinned_first_output: None,
     };
     let err = build_manifest(req).unwrap_err();
     assert!(
@@ -711,6 +715,7 @@ fn t7d_500_output_coinbase_under_max_block_weight() {
         witness_nonce_hex: None,
         witness_merkle_leaves_hex: Vec::new(),
         coinbase_script_sig_suffix_hex: None,
+        pinned_first_output: None,
     };
     let m: PayoutManifest = build_manifest(req).unwrap();
     let tx_bytes = m.coinbase_tx_hex.len() / 2;
@@ -739,6 +744,7 @@ fn t7e_coinbase_weight_bytes_are_reported_separately_from_entitlement_weight() {
         witness_nonce_hex: None,
         witness_merkle_leaves_hex: Vec::new(),
         coinbase_script_sig_suffix_hex: None,
+        pinned_first_output: None,
     };
     let m = build_manifest(req).unwrap();
     // total_weight is the entitlement weight (42), NOT the tx byte weight.
@@ -774,6 +780,7 @@ fn t7f_builder_does_not_validate_p2mr_program_distinctness() {
         witness_nonce_hex: None,
         witness_merkle_leaves_hex: Vec::new(),
         coinbase_script_sig_suffix_hex: None,
+        pinned_first_output: None,
     };
     let m = build_manifest(req).unwrap();
     assert_eq!(m.outputs.len(), 2);
@@ -794,6 +801,7 @@ fn t7g_coinbase_is_byte_reproducible() {
         witness_nonce_hex: None,
         witness_merkle_leaves_hex: Vec::new(),
         coinbase_script_sig_suffix_hex: None,
+        pinned_first_output: None,
     };
     let a = build_manifest(req.clone()).unwrap();
     let b = build_manifest(req).unwrap();

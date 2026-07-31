@@ -607,7 +607,8 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
     else:
         reporter.pass_("mining.highdiff", "disabled (single stratum listener)")
 
-    if is_true(env_value(env, "PRISM_POOL_FEE_ENABLED", "0")):
+    pool_fee_enabled = is_true(env_value(env, "PRISM_POOL_FEE_ENABLED", "0"))
+    if pool_fee_enabled:
         fee_bps = env_value(env, "PRISM_POOL_FEE_BPS")
         fee_address = env_value(env, "PRISM_POOL_FEE_ADDRESS")
         fee_program = env_value(env, "PRISM_POOL_FEE_P2MR_PROGRAM_HEX")
@@ -619,6 +620,22 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
             reporter.pass_("pool.fee", f"enabled bps={fee_bps}")
     else:
         reporter.pass_("pool.fee", "disabled")
+
+    # No whitespace normalization: mirror the coordinator, which rejects any
+    # value outside the exact allowed strings.
+    output_policy = env_value(env, "PRISM_COINBASE_OUTPUT_POLICY", "canonical") or "canonical"
+    if output_policy not in {"canonical", "pool-fee-first"}:
+        reporter.fail(
+            "coinbase.output_policy",
+            "PRISM_COINBASE_OUTPUT_POLICY must be one of: canonical, pool-fee-first",
+        )
+    elif output_policy == "pool-fee-first" and not pool_fee_enabled:
+        reporter.fail(
+            "coinbase.output_policy",
+            "PRISM_COINBASE_OUTPUT_POLICY=pool-fee-first requires PRISM_POOL_FEE_ENABLED=1",
+        )
+    else:
+        reporter.pass_("coinbase.output_policy", output_policy)
 
     if is_true(env_value(env, "PRISM_CTV_SETTLEMENT_ENABLED", "0")):
         market_rate = env_value(

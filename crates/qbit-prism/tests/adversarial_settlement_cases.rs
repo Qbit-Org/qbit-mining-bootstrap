@@ -751,6 +751,7 @@ fn equal_weight_request(
         witness_nonce_hex: None,
         witness_merkle_leaves_hex: Vec::new(),
         coinbase_script_sig_suffix_hex: None,
+        pinned_first_output: None,
     }
 }
 

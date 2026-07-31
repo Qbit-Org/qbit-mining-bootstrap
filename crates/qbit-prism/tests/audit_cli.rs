@@ -1,7 +1,7 @@
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
     build_audit_bundle, canonical_audit_bundle_bytes, verify_audit_bundle, AcceptedShare,
-    AuditBundle, CarryForwardBalance, FoundBlock, PayoutPolicy,
+    AuditBundle, CarryForwardBalance, CoinbaseOutputPolicy, FoundBlock, PayoutPolicy,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -892,6 +892,147 @@ fn build_audit_bundle_cli_emits_ctv_settlement_bundle() {
         &bundle.ctv_fanout_manifest_set.as_ref().unwrap().manifests[0].commitment_witness_leaf_hex;
     assert!(bundle.audit_commitment_leaves_hex.contains(fanout_leaf));
     assert!(!bundle.witness_merkle_leaves_hex.contains(fanout_leaf));
+}
+
+fn pool_fee_first_cli_input(coinbase_output_policy: &str) -> serde_json::Value {
+    serde_json::json!({
+        "shares": [
+            {
+                "share_seq": 1,
+                "share_id": "share-1",
+                "miner_id": "miner-a",
+                "order_key": "01",
+                "p2mr_program_hex": "01".repeat(32),
+                "share_difficulty": 3,
+                "network_difficulty": 5,
+                "template_height": 100,
+                "job_id": "job-1",
+                "job_issued_at_ms": 1000,
+                "accepted_at_ms": 1000,
+                "ntime": 1800000000
+            },
+            {
+                "share_seq": 2,
+                "share_id": "share-2",
+                "miner_id": "miner-b",
+                "order_key": "02",
+                "p2mr_program_hex": "02".repeat(32),
+                "share_difficulty": 2,
+                "network_difficulty": 5,
+                "template_height": 100,
+                "job_id": "job-1",
+                "job_issued_at_ms": 1000,
+                "accepted_at_ms": 1000,
+                "ntime": 1800000000
+            }
+        ],
+        "found_block": {
+            "block_height": 101,
+            "coinbase_value_sats": 1000000,
+            "network_difficulty": 5,
+            "anchor_job_issued_at_ms": 1000
+        },
+        "payout_policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "target_feerate_sats_per_byte": 1,
+            "safety_multiplier": 4,
+            "pool_fee_policy": {
+                "fee_bps": 200,
+                "recipient_id": "pool-fee",
+                "order_key": "zzzzzzzz",
+                "p2mr_program_hex": "ff".repeat(32)
+            },
+            "coinbase_output_policy": coinbase_output_policy
+        },
+        "coinbase_script_sig_suffix_hex": "aaaaaaaa",
+        "ctv_settlement": {
+            "direct_floor_sats": 50000,
+            "config": {
+                "max_coinbase_settlement_outputs": 16,
+                "max_direct_coinbase_outputs": 2,
+                "max_fanout_recipients_per_transaction": 10,
+                "reserved_coinbase_outputs": 0
+            }
+        }
+    })
+}
+
+fn run_build_audit_bundle_cli(input: &serde_json::Value, tag: &str) -> std::process::Output {
+    let input_path = std::env::temp_dir().join(format!(
+        "qbit-prism-build-audit-bundle-{tag}-input-{}.json",
+        std::process::id()
+    ));
+    fs::write(&input_path, serde_json::to_vec(input).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&input_path);
+    output
+}
+
+#[test]
+fn build_audit_bundle_cli_honors_pool_fee_first_output_policy() {
+    let output = run_build_audit_bundle_cli(
+        &pool_fee_first_cli_input("pool-fee-first"),
+        "pool-fee-first",
+    );
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bundle: AuditBundle = serde_json::from_slice(&output.stdout).unwrap();
+    let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+
+    assert_eq!(
+        bundle.payout_policy_manifest.coinbase_output_policy,
+        CoinbaseOutputPolicy::PoolFeeFirst
+    );
+    assert_eq!(
+        report.coinbase_output_policy,
+        CoinbaseOutputPolicy::PoolFeeFirst
+    );
+    let outputs = &bundle.signed_coinbase_manifest.manifest.outputs;
+    assert_eq!(outputs[0].recipient_id, "pool-fee");
+    assert_eq!(outputs[0].vout, 0);
+    assert_eq!(outputs[0].amount_sats, 20_000);
+    let serialized_bundle = String::from_utf8(output.stdout).unwrap();
+    assert!(serialized_bundle.contains("\"coinbase_output_policy\": \"pool-fee-first\""));
+}
+
+#[test]
+fn build_audit_bundle_cli_rejects_unknown_coinbase_output_policy() {
+    let output = run_build_audit_bundle_cli(&pool_fee_first_cli_input("fee-first"), "bad-policy");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        stderr.contains("unknown variant") && stderr.contains("pool-fee-first"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn build_audit_bundle_cli_rejects_pool_fee_first_without_pool_fee_policy() {
+    let mut input = pool_fee_first_cli_input("pool-fee-first");
+    input["payout_policy"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pool_fee_policy");
+
+    let output = run_build_audit_bundle_cli(&input, "pool-fee-first-no-fee");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        stderr.contains("pool-fee-first coinbase output policy requires a configured pool fee"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
