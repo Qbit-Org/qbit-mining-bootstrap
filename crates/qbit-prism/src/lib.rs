@@ -110,6 +110,8 @@ pub enum PrismError {
     PoolFeeBpsTooHigh { fee_bps: u16 },
     #[error("pool fee account duplicates a miner payout account")]
     DuplicatePoolFeeAccount,
+    #[error("pool-fee-first coinbase output policy requires a configured pool fee policy")]
+    PoolFeeFirstRequiresPoolFee,
     #[error("no eligible shares at or before job issue time {anchor_job_issued_at_ms}")]
     EmptyWindow { anchor_job_issued_at_ms: i64 },
     #[error("duplicate carry-forward balance for recipient {recipient_id}")]
@@ -739,6 +741,12 @@ pub fn apply_payout_policy(
 ) -> Result<PayoutPolicyManifest, PrismError> {
     let min_output_sats = policy.min_output_sats()?;
     let mut pool_fee = pool_fee_manifest(reward_manifest.coinbase_value_sats, policy)?;
+    // A configured zero-bps fee stays valid (its output only appears when dust
+    // sweeps make it positive); a missing fee policy must fail instead of
+    // committing pool-fee-first on an artifact that cannot honor it.
+    if policy.coinbase_output_policy == CoinbaseOutputPolicy::PoolFeeFirst && pool_fee.is_none() {
+        return Err(PrismError::PoolFeeFirstRequiresPoolFee);
+    }
     let fee_amount_sats = pool_fee
         .as_ref()
         .map(|manifest| manifest.amount_sats)
@@ -4344,6 +4352,64 @@ mod tests {
             vec!["miner-a", "miner-b"]
         );
         verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+    }
+
+    #[test]
+    fn pool_fee_first_without_a_pool_fee_policy_is_rejected() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+        let mut policy = PayoutPolicy::day_one_default();
+        policy.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+
+        let err = build_audit_bundle(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            policy,
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, PrismError::PoolFeeFirstRequiresPoolFee));
+    }
+
+    #[test]
+    fn verifier_rejects_pool_fee_first_bundle_without_a_pool_fee_policy() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+
+        // A canonical no-fee bundle stamped as pool-fee-first after the fact
+        // must not verify: the committed policy has no pool-fee manifest to
+        // honor, which is distinct from a configured zero-bps fee.
+        let mut bundle = build_audit_bundle(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            PayoutPolicy::day_one_default(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+        bundle.payout_policy.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+        bundle.payout_policy_manifest.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+
+        let err = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap_err();
+        assert!(matches!(err, PrismError::PoolFeeFirstRequiresPoolFee));
     }
 
     #[test]

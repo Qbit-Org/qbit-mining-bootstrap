@@ -1019,6 +1019,23 @@ fn build_audit_bundle_cli_rejects_unknown_coinbase_output_policy() {
 }
 
 #[test]
+fn build_audit_bundle_cli_rejects_pool_fee_first_without_pool_fee_policy() {
+    let mut input = pool_fee_first_cli_input("pool-fee-first");
+    input["payout_policy"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pool_fee_policy");
+
+    let output = run_build_audit_bundle_cli(&input, "pool-fee-first-no-fee");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        stderr.contains("pool-fee-first coinbase output policy requires a configured pool fee"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn reorg_verify_cli_reverses_disconnected_immature_entries() {
     let fixture: Fixture = serde_json::from_str(include_str!(
         "../fixtures/power-law-accrual.prism-fixture.json"
