@@ -113,7 +113,7 @@ PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP = 16
 # artifact that was already expired on arrival -- the born-expired rebuild
 # livelock behind the 2026-07-29 rollback of the first anchor-scoped
 # deploy. Freshness starts when the window becomes reusable.
-DEFAULT_PRISM_PAYOUT_ARTIFACT_REUSE_STALENESS_SECONDS = 10.0
+DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS = 60.0
 # Audit-facing ceiling on how far a served window's declared anchor may
 # trail the live ledger, in wall-clock terms. Deliberately much looser than
 # the reuse-staleness knob: shares stamped after an anchor deterministically
@@ -2866,9 +2866,17 @@ class PrismCoordinator:
             "PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS",
             DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,
         )
-        self.payout_artifact_reuse_staleness_seconds = env_positive_float(
-            "PRISM_PAYOUT_ARTIFACT_REUSE_STALENESS_SECONDS",
-            DEFAULT_PRISM_PAYOUT_ARTIFACT_REUSE_STALENESS_SECONDS,
+        # Master kill-switch for the payout-artifact reuse line. Off
+        # restores the pre-reuse behavior (every ready build pays the
+        # synchronous reward-window walk and no background walks run), so a
+        # production regression is an env flip instead of a rollback.
+        self.payout_artifact_reuse_enabled = env_bool(
+            "PRISM_PAYOUT_ARTIFACT_REUSE",
+            "1",
+        )
+        self.payout_artifact_reanchor_seconds = env_positive_float(
+            "PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS",
+            DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS,
         )
         self.payout_artifact_max_anchor_age_seconds = env_positive_float(
             "PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS",
@@ -4627,6 +4635,10 @@ class PrismCoordinator:
         into the emptied slot and run the reward-window snapshot twice.
         """
         self._ensure_job_cache_state()
+        if not self._payout_artifact_reuse_active():
+            # Kill-switch: no background reward-window walks either -- the
+            # disabled state must match the pre-reuse deployment exactly.
+            return
         with self._payout_artifact_executor_lock:
             if self._payout_artifact_executor_shutdown:
                 return
@@ -4689,15 +4701,19 @@ class PrismCoordinator:
             * 1000.0
         )
 
-    def _payout_artifact_reuse_staleness_seconds(self) -> float:
-        """Monotonic freshness budget of an armed artifact, from install."""
+    def _payout_artifact_reanchor_seconds(self) -> float:
+        """Anchor age that triggers a background re-anchor while reuse keeps serving."""
         return float(
             getattr(
                 self,
-                "payout_artifact_reuse_staleness_seconds",
-                DEFAULT_PRISM_PAYOUT_ARTIFACT_REUSE_STALENESS_SECONDS,
+                "payout_artifact_reanchor_seconds",
+                DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS,
             )
         )
+
+    def _payout_artifact_reuse_active(self) -> bool:
+        """Master kill-switch (PRISM_PAYOUT_ARTIFACT_REUSE) for the reuse line."""
+        return bool(getattr(self, "payout_artifact_reuse_enabled", True))
 
     @staticmethod
     def _payout_artifact_log(event: str, **fields: object) -> None:
@@ -4723,18 +4739,28 @@ class PrismCoordinator:
     ) -> PayoutLedgerArtifact | None:
         """Return the armed artifact when reuse is valid for NEW work.
 
-        Validity is anchor-scoped: the artifact's window is exact at its own
-        snapshot anchor (which reused bundles declare), so shares landing
-        after the anchor never invalidate it -- they belong to the next
-        window by construction. Freshness is measured from the install
-        (prepared_monotonic), never from the anchor: the window walk itself
-        takes seconds at production volume, and an anchor-age freshness test
-        rejected every slow build on arrival -- the born-expired livelock
-        behind the 2026-07-29 rollback. The much looser wall-clock anchor
-        ceiling stays as the audit-facing backstop on how far a served
-        window may trail the live ledger.
+        Validity is anchor-scoped and EVENT-DRIVEN: the artifact's window is
+        exact at its own snapshot anchor (which reused bundles declare), so
+        shares landing after the anchor never invalidate it -- they belong
+        to the next window by construction -- and the artifact stays valid
+        until a payout event actually changes the state it snapshots (the
+        generation and balances fences below). Wall-clock time is NOT a
+        validity input below the audit ceiling: the 2026-07-29 rollback was
+        a 10s anchor-age budget rejecting every slow build on arrival, and
+        the 2026-07-30 brownout was the same budget moved to install time --
+        at production cadence (a shared build every 10-14s, a 4-8s window
+        walk) a 10s budget expires between consecutive builds, so every
+        build fell back to the synchronous reward-window walk while the
+        re-arm worker walked the same window in parallel. Past the
+        REANCHOR floor the probe schedules a debounced background re-anchor
+        but KEEPS SERVING the armed window; only past the audit ceiling
+        (the bound on how far a paid window may trail the live ledger --
+        post-anchor shares settle in the next window, none are lost) does
+        reuse fail closed.
         """
         self._ensure_job_cache_state()
+        if not self._payout_artifact_reuse_active():
+            return None
         with self._job_cache_lock:
             artifact = self._payout_ledger_artifact
             published_artifact = self._published_payout_state.artifact
@@ -4748,24 +4774,29 @@ class PrismCoordinator:
             # Without a recorded anchor the artifact cannot declare the
             # anchor reused bundles must stamp; fail closed.
             return None
-        if (
-            time.monotonic() - float(artifact.prepared_monotonic)
-            > self._payout_artifact_reuse_staleness_seconds()
-            or now_ms() - int(artifact.snapshot_anchor_ms)
-            > self._payout_artifact_max_anchor_age_ms()
-        ):
-            # The armed window outlived its freshness budget (or, under
-            # pathological build latency, its declared anchor crossed the
-            # audit ceiling). No payout event may arrive for a long time, so
-            # queue a bounded speculative rebuild that re-anchors the
-            # window; the aged artifact stays rejected here for new reuse
-            # decisions while in-flight builds keep the copy they selected.
+        anchor_age_ms = now_ms() - int(artifact.snapshot_anchor_ms)
+        if anchor_age_ms > self._payout_artifact_max_anchor_age_ms():
+            # The declared anchor crossed the audit ceiling; the window may
+            # no longer be served to new work. Queue a bounded speculative
+            # rebuild that re-anchors it; in-flight builds keep the copy
+            # they selected.
             if rearm_on_fence_failure:
                 self._rearm_payout_ledger_artifact_after_fence_failure(
                     payout_state_generation,
                     network_difficulty,
                 )
             return None
+        if anchor_age_ms > self._payout_artifact_reanchor_seconds() * 1000.0:
+            # Aging but valid: schedule the debounced background re-anchor
+            # and keep serving. The delivery path must never pay the
+            # synchronous reward-window walk while a correct armed window
+            # exists; the re-anchor swaps in a fresher window off the
+            # critical path.
+            if rearm_on_fence_failure:
+                self._rearm_payout_ledger_artifact_after_fence_failure(
+                    payout_state_generation,
+                    network_difficulty,
+                )
         if published_artifact is None:
             try:
                 published_artifact = self._current_payout_state_artifact()
@@ -4817,7 +4848,7 @@ class PrismCoordinator:
         payout_state_generation: int,
         network_difficulty: int,
     ) -> None:
-        """Debounced rebuild scheduling for an artifact past its freshness budget.
+        """Debounced rebuild scheduling for an artifact past the re-anchor floor or ceiling.
 
         The interval floor keeps the reward-window CTE from running
         continuously when artifacts age out faster than rebuilds complete.
@@ -7564,12 +7595,13 @@ class PrismCoordinator:
         if not self._job_bundle_payout_state_current(cached):
             return False
         if not cached.collection_only:
-            # Cached-ready-bundle freshness follows the same two-knob split
-            # as artifact reuse. The declared anchor is gated only by the
-            # audit CEILING: the anchor is frozen per template generation
-            # and predates the window walk, so a tight wall-clock gate here
-            # declared every rebuilt bundle dead on arrival once its
-            # template generation outlived the bound (2026-07-29 rollback).
+            # Cached-ready-bundle validity follows the same ceiling/floor
+            # split as artifact reuse. The declared anchor is gated only by
+            # the audit CEILING: the anchor is frozen per template
+            # generation and predates the window walk, so a tight
+            # wall-clock gate here declared every rebuilt bundle dead on
+            # arrival once its template generation outlived the bound
+            # (2026-07-29 rollback).
             found_block = getattr(cached, "found_block", None)
             declared_anchor_ms = (
                 found_block.get("anchor_job_issued_at_ms")
@@ -7581,13 +7613,17 @@ class PrismCoordinator:
                 > self._payout_artifact_max_anchor_age_ms()
             ):
                 return False
-            # Freshness proper: a bundle keyed to the currently armed
-            # artifact generation carries exactly the armed window, so it is
-            # as fresh as reuse itself. Every other ready bundle (
-            # no-artifact builds and survivors of a re-key) keeps serving
-            # only while its own build age sits inside the reuse-staleness
-            # budget, so a bundle-cache TTL that outlives the budget cannot
-            # keep an over-age window in circulation.
+            # A bundle keyed to the currently armed artifact generation
+            # carries exactly the armed window, so it serves for as long as
+            # reuse itself does (the armed artifact is event-invalidated by
+            # the payout fences and re-anchored in the background). Every
+            # other ready bundle (no-artifact builds and survivors of a
+            # re-key) carries a window nothing will re-anchor, so it keeps
+            # serving only inside the re-anchor floor -- its declared
+            # anchor is already ceiling-gated above, and a wall-clock
+            # budget tighter than the build cadence is exactly the
+            # 2026-07-30 brownout (every consecutive build fell back to the
+            # synchronous reward-window walk).
             if int(getattr(cached, "payout_artifact_generation", 0)) > 0:
                 with self._job_cache_lock:
                     armed = self._payout_ledger_artifact
@@ -7599,7 +7635,7 @@ class PrismCoordinator:
                     return True
             return (
                 time.monotonic() - float(cached.built_monotonic)
-                <= self._payout_artifact_reuse_staleness_seconds()
+                <= self._payout_artifact_reanchor_seconds()
             )
         # Collection bundles sign a synthetic bootstrap share containing the
         # exact template ntime. A clock-only observation keeps the stable work
