@@ -114,6 +114,25 @@ PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP = 16
 # livelock behind the 2026-07-29 rollback of the first anchor-scoped
 # deploy. Freshness starts when the window becomes reusable.
 DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS = 60.0
+
+
+def validate_payout_artifact_age_bounds(
+    max_anchor_age_seconds: float,
+    reanchor_seconds: float,
+) -> None:
+    """Refuse an anchor ceiling the background re-anchor cannot beat.
+
+    A ceiling at or below the re-anchor floor plus the debounce and the
+    multi-second window walk turns every reuse probe into a ceiling
+    rejection while the rebuild runs debounced in parallel -- mechanically
+    the 2026-07-30 walk-per-build brownout. The 2x floor requirement keeps
+    comfortable margin over that sum at any plausible walk duration.
+    """
+    if max_anchor_age_seconds <= 2.0 * reanchor_seconds:
+        raise SystemExit(
+            "PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS must exceed "
+            "2x PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS"
+        )
 # Audit-facing ceiling on how far a served window's declared anchor may
 # trail the live ledger, in wall-clock terms. Deliberately much looser than
 # the reuse-staleness knob: shares stamped after an anchor deterministically
@@ -1549,17 +1568,21 @@ class PayoutLedgerArtifact:
     # That declaration is also what makes reuse valid while shares keep
     # landing: a share stamped after this anchor deterministically belongs to
     # the next window (it is never lost), so the artifact stays
-    # audit-reproducible for as long as it serves. Reuse freshness is
-    # measured from prepared_monotonic (install time) -- never from this
-    # anchor, which predates the window walk -- while the much looser
-    # wall-clock anchor ceiling backstops how far a served window may trail
-    # the live ledger.
+    # audit-reproducible for as long as it serves. Validity is event-driven
+    # (the payout-generation and balances fences); wall-clock time only
+    # enters through the loose anchor ceiling that backstops how far a
+    # served window may trail the live ledger, never through install age.
     snapshot_anchor_ms: int | None = None
     # Canonical digest of shares_json. Cached bundles built before this
     # artifact was armed may only keep serving re-keyed lookups when their
     # own window digest matches; anything else must rebuild from the
     # artifact so a fresher window is never shadowed by older cached work.
     share_snapshot_sha256: str | None = None
+    # Canonical digest of prior_balances, memoized at construction. The
+    # reuse probe hashes the balances on every serving decision and the
+    # reused-build fences hash them twice more; the tuple is immutable, so
+    # the O(accounts) canonicalization is paid once here instead.
+    prior_balances_sha256: str | None = None
 
 
 def _share_window_spool_file() -> Any:
@@ -2881,6 +2904,10 @@ class PrismCoordinator:
         self.payout_artifact_max_anchor_age_seconds = env_positive_float(
             "PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS",
             DEFAULT_PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS,
+        )
+        validate_payout_artifact_age_bounds(
+            self.payout_artifact_max_anchor_age_seconds,
+            self.payout_artifact_reanchor_seconds,
         )
         self.routine_admission_deadline_seconds = env_positive_float(
             "PRISM_ROUTINE_ADMISSION_DEADLINE_SECONDS",
@@ -4391,6 +4418,7 @@ class PrismCoordinator:
             prepared_monotonic=time.monotonic(),
             snapshot_anchor_ms=snapshot_anchor_ms,
             share_snapshot_sha256=share_snapshot_sha256,
+            prior_balances_sha256=canonical_json_sha256(frozen_balances),
         )
 
     def _prepare_payout_ledger_artifact(
@@ -4474,6 +4502,11 @@ class PrismCoordinator:
         rewalk the reward window continuously: the livelock behind the
         2026-07-29 rollback.
         """
+        if not self._payout_artifact_reuse_active():
+            # Kill-switch: never arm. An armed artifact would churn install
+            # events while disabled and re-key the idle-bundle fast path to
+            # a generation the reuse probe refuses anyway.
+            return False
         anchor_age_ms = (
             None
             if artifact.snapshot_anchor_ms is None
@@ -4641,8 +4674,11 @@ class PrismCoordinator:
         """
         self._ensure_job_cache_state()
         if not self._payout_artifact_reuse_active():
-            # Kill-switch: no background reward-window walks either -- the
-            # disabled state must match the pre-reuse deployment exactly.
+            # Kill-switch: no background reward-window walks either. Off
+            # disables the reuse line -- probe refusals, no walks, no
+            # arming -- restoring pre-reuse delivery economics; the
+            # synchronous build path keeps the re-landed anchor-selection
+            # semantics rather than the pre-#102 count fences.
             return
         with self._payout_artifact_executor_lock:
             if self._payout_artifact_executor_shutdown:
@@ -4761,7 +4797,9 @@ class PrismCoordinator:
         but KEEPS SERVING the armed window; only past the audit ceiling
         (the bound on how far a paid window may trail the live ledger --
         post-anchor shares settle in the next window, none are lost) does
-        reuse fail closed.
+        reuse fail closed. The ceiling governs NEW reuse and issuance
+        decisions; an in-flight build keeps the window it already selected,
+        so a declared anchor slightly past the ceiling can still publish.
         """
         self._ensure_job_cache_state()
         if not self._payout_artifact_reuse_active():
@@ -4797,7 +4835,11 @@ class PrismCoordinator:
             # and keep serving. The delivery path must never pay the
             # synchronous reward-window walk while a correct armed window
             # exists; the re-anchor swaps in a fresher window off the
-            # critical path.
+            # critical path. Counted unconditionally so the canary can
+            # distinguish "serving past the floor, re-anchor pending" from
+            # "never crossing the floor" -- rearm_scheduled alone
+            # under-counts through the debounce and suppression paths.
+            self._record_payout_artifact_event("probe_past_floor")
             if rearm_on_fence_failure:
                 self._rearm_payout_ledger_artifact_after_fence_failure(
                     payout_state_generation,
@@ -4808,7 +4850,9 @@ class PrismCoordinator:
                 published_artifact = self._current_payout_state_artifact()
             except Exception:
                 return None
-        balances_sha256 = canonical_json_sha256(artifact.prior_balances)
+        balances_sha256 = artifact.prior_balances_sha256 or canonical_json_sha256(
+            artifact.prior_balances
+        )
         with self._job_cache_lock:
             if (
                 self._payout_state_generation != payout_state_generation
@@ -6186,11 +6230,16 @@ class PrismCoordinator:
             # The artifact was prepared before accepted-block persistence, so
             # replace only its balance view with the verified prospective
             # state. This allocation must stay outside delivery publication.
+            # The memoized balances digest must be re-derived with the patch:
+            # a stale digest would fail the reuse probe's balances fence
+            # against the very state this patch installs.
+            patched_balances = tuple(
+                self._materialize_prior_balance_preview(preview)
+            )
             ledger_artifact = dataclass_replace(
                 ledger_artifact,
-                prior_balances=tuple(
-                    self._materialize_prior_balance_preview(preview)
-                ),
+                prior_balances=patched_balances,
+                prior_balances_sha256=canonical_json_sha256(patched_balances),
             )
         return dataclass_replace(
             candidate,
@@ -6976,6 +7025,7 @@ class PrismCoordinator:
                         )
                         if (
                             prepared_artifact is not None
+                            and self._payout_artifact_reuse_active()
                             and prepared_artifact.payout_state_generation
                             == published_generation
                             and candidate_anchor_age_ms is not None
@@ -7003,6 +7053,7 @@ class PrismCoordinator:
                         else:
                             if (
                                 prepared_artifact is not None
+                                and self._payout_artifact_reuse_active()
                                 and prepared_artifact.payout_state_generation
                                 == published_generation
                             ):
@@ -8549,8 +8600,12 @@ class PrismCoordinator:
                     raise JobBuildSuperseded(
                         "published payout state unavailable before construction"
                     ) from exc
+            artifact_balances_sha256 = (
+                payout_artifact.prior_balances_sha256
+                or canonical_json_sha256(payout_artifact.prior_balances)
+            )
             if (
-                canonical_json_sha256(payout_artifact.prior_balances)
+                artifact_balances_sha256
                 != published_artifact.prior_balances_sha256
             ):
                 raise JobBuildSuperseded(
@@ -8558,7 +8613,7 @@ class PrismCoordinator:
                 )
             prior_balances = list(payout_artifact.prior_balances)
             if (
-                canonical_json_sha256(prior_balances)
+                artifact_balances_sha256
                 != build_request.key.payout_artifact_sha256
             ):
                 raise JobBuildSuperseded(
@@ -8661,6 +8716,7 @@ class PrismCoordinator:
             payout_artifact is None
             and snapshot_accepted_count is not None
             and shares
+            and self._payout_artifact_reuse_active()
         ):
             # This build already paid the full ledger read; carry the window
             # it produced so cache publication can arm it for builds arriving
@@ -8668,19 +8724,25 @@ class PrismCoordinator:
             # carries the published payout-state balances, not this bundle's
             # possibly parent-adjusted view: reuse re-applies the parent
             # override itself and the reuse fence hashes the artifact
-            # balances against the published payout artifact.
+            # balances against the published payout artifact. Skipped
+            # entirely under the kill-switch: nothing may arm while reuse
+            # is disabled.
+            seed_prior_balances = tuple(
+                build_request.payout_artifact.prior_balances()
+            )
             prepared_ledger_artifact = PayoutLedgerArtifact(
                 generation=0,
                 payout_state_generation=payout_state_generation,
                 network_difficulty=int(build_request.key.network_difficulty),
                 accepted_share_count=snapshot_accepted_count,
                 shares_json=tuple(shares),
-                prior_balances=tuple(
-                    build_request.payout_artifact.prior_balances()
-                ),
+                prior_balances=seed_prior_balances,
                 prepared_monotonic=time.monotonic(),
                 snapshot_anchor_ms=issued_at_ms,
                 share_snapshot_sha256=share_snapshot_sha256,
+                prior_balances_sha256=canonical_json_sha256(
+                    seed_prior_balances
+                ),
             )
         final_build_key = dataclass_replace(
             build_request.key,
@@ -19400,6 +19462,23 @@ class PrismCoordinator:
             != artifacts.previousblockhash
         ):
             return False
+        if not bundle.collection_only:
+            # Idle issuance is a NEW serving decision, so the audit ceiling
+            # applies here exactly as it does at the reuse probe and the
+            # cached-bundle lookup -- without this gate the idle fast path
+            # was the one issuance route that could hand out a window past
+            # the ceiling.
+            found_block = getattr(bundle, "found_block", None)
+            declared_anchor_ms = (
+                found_block.get("anchor_job_issued_at_ms")
+                if isinstance(found_block, dict)
+                else None
+            )
+            if declared_anchor_ms is not None and (
+                now_ms() - int(declared_anchor_ms)
+                > self._payout_artifact_max_anchor_age_ms()
+            ):
+                return False
         published_tip = self._published_payout_state.source_tip_hash
         if published_tip is not None and published_tip != artifacts.previousblockhash:
             return False
@@ -24230,6 +24309,7 @@ class PrismCoordinator:
                         "rearm_scheduled",
                         "served_reuse",
                         "probe_rejected_ceiling",
+                        "probe_past_floor",
                     )
                 ],
                 "# HELP qbit_prism_serve_builder_window_cache_total Daemon parsed share-window cache outcomes.",

@@ -2602,6 +2602,13 @@ class JobBundleCacheTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(executor.submissions, 1)
+            # Every past-floor probe counts, even when the rearm itself is
+            # debounced -- the canary needs "serving past the floor" to be
+            # visible independently of rearm_scheduled.
+            self.assertEqual(
+                server.payout_artifact_event_counts["probe_past_floor"],
+                1,
+            )
             # The one-slot worker dequeues the request; a served probe inside
             # the interval must not slip a duplicate into the emptied slot.
             server._payout_artifact_requested = None
@@ -2782,6 +2789,13 @@ class JobBundleCacheTests(unittest.TestCase):
             armed = server._payout_ledger_artifact
         assert armed is not None
         assert armed.snapshot_anchor_ms is not None
+        # The balances digest is memoized at construction so the serving
+        # probe and the reused-build fences never re-canonicalize the
+        # tuple on the request path.
+        self.assertEqual(
+            armed.prior_balances_sha256,
+            canonical_json_sha256(armed.prior_balances),
+        )
 
         # A window whose anchor is past the re-anchor floor still serves --
         # post-anchor shares belong to the next window by construction, and
@@ -2853,8 +2867,9 @@ class JobBundleCacheTests(unittest.TestCase):
 
         # Off: the probe refuses a perfectly valid armed artifact and the
         # scheduler runs no background reward-window walks -- the disabled
-        # state must match the pre-reuse deployment exactly, so a
-        # production regression is an env flip instead of a rollback.
+        # state restores pre-reuse delivery economics (the synchronous
+        # path keeps the re-landed anchor-selection semantics), so a
+        # delivery regression is an env flip instead of a rollback.
         server.payout_artifact_reuse_enabled = False
         self.assertIsNone(
             server._usable_payout_ledger_artifact(
@@ -2877,6 +2892,41 @@ class JobBundleCacheTests(unittest.TestCase):
                 server._payout_state_generation,
                 artifacts.network_difficulty,
             )
+        )
+
+        # Off also gates arming itself: a prepared window is discarded at
+        # install, so nothing churns install events or re-keys the idle
+        # bundle fast path to an unusable generation while disabled.
+        server.payout_artifact_reuse_enabled = False
+        with server._job_cache_lock:
+            server._payout_ledger_artifact = None
+        server._prepare_payout_ledger_artifact(
+            server._payout_state_generation,
+            artifacts.network_difficulty,
+        )
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+
+    def test_anchor_ceiling_must_clear_reanchor_floor(self) -> None:
+        # One env var used to be able to re-create the 2026-07-30 incident:
+        # a ceiling the background re-anchor cannot beat (floor + debounce +
+        # the window walk) rejects every probe while the rebuild runs
+        # debounced in parallel -- walk-per-build. __init__ refuses the
+        # configuration at startup through this validation.
+        with self.assertRaises(SystemExit):
+            prism_coordinator_module.validate_payout_artifact_age_bounds(
+                60.0,
+                60.0,
+            )
+        with self.assertRaises(SystemExit):
+            prism_coordinator_module.validate_payout_artifact_age_bounds(
+                120.0,
+                60.0,
+            )
+        # The default split (300s ceiling, 60s floor) passes.
+        prism_coordinator_module.validate_payout_artifact_age_bounds(
+            300.0,
+            60.0,
         )
 
     def test_in_flight_build_keeps_aged_artifact_it_already_selected(
@@ -3314,7 +3364,14 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         with server._job_cache_lock:
             armed = server._payout_ledger_artifact
-        assert armed is not None
+            assert armed is not None
+            # Strip the memoized balances digest: the race window this test
+            # drives opens while the probe hashes balances outside the cache
+            # lock, which only happens on the fallback path for artifacts
+            # without a memo (legacy or test-constructed). The restamp
+            # admission below must keep protecting that path.
+            armed = dataclass_replace(armed, prior_balances_sha256=None)
+            server._payout_ledger_artifact = armed
 
         real_sha256 = prism_coordinator_module.canonical_json_sha256
         restamped_once = [False]
