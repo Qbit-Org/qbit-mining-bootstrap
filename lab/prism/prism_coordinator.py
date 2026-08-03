@@ -4618,7 +4618,12 @@ class PrismCoordinator:
                 if request is None:
                     self._payout_artifact_future = None
                     return
-            self._prepare_payout_ledger_artifact(*request)
+            phases = self._job_build_phases()
+            phases.clear()
+            try:
+                self._prepare_payout_ledger_artifact(*request)
+            finally:
+                self._flush_job_build_phases(phases)
 
     def _schedule_payout_ledger_artifact_preparation(
         self,
@@ -5088,6 +5093,8 @@ class PrismCoordinator:
             None,
         )
         self._job_build_phase_local.bundle_build_control = control
+        phases = self._job_build_phases()
+        phases.clear()
         try:
             with localcontext(request.decimal_context):
                 return self.build_shared_job_bundle(
@@ -5100,6 +5107,7 @@ class PrismCoordinator:
                     build_request=request,
                 )
         finally:
+            self._flush_job_build_phases(phases)
             self._job_build_phase_local.bundle_build_control = previous_control
             with self._job_cache_lock:
                 if self._active_job_bundle_builds.get(control.key) is control:
@@ -7233,6 +7241,28 @@ class PrismCoordinator:
             for phase, duration in phases.items():
                 if phase in self.job_build_phase_seconds:
                     self.job_build_phase_seconds[phase] += duration
+
+    def _flush_job_build_phases(self, phases: dict[str, float]) -> None:
+        """Fold a worker thread's phase accruals into the exported counters.
+
+        Only the per-client delivery entry points clear and flush the
+        thread-local phase dict; the job-build executor and payout-artifact
+        preparation workers never passed through them, so the template/
+        ledger/assembly/bundle seconds they accrued were exported as
+        exactly 0.0 while production paid multi-second walks -- the blind
+        spot that misdirected the 2026-07-31 incident review. Build counts
+        and the duration histogram stay per-delivery; this folds phase
+        seconds only, and clears the dict so a long-lived worker thread
+        cannot double-report an earlier request's accruals.
+        """
+        if not phases:
+            return
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            for phase, duration in phases.items():
+                if phase in self.job_build_phase_seconds:
+                    self.job_build_phase_seconds[phase] += duration
+        phases.clear()
 
     def _reserve_template_artifact_generation(self) -> int:
         """Reserve template ordering when a fetch starts, not when it finishes."""
