@@ -4785,6 +4785,7 @@ class PrismCoordinator:
                     payout_state_generation,
                     network_difficulty,
                 )
+            self._record_payout_artifact_event("probe_rejected_ceiling")
             return None
         if anchor_age_ms > self._payout_artifact_reanchor_seconds() * 1000.0:
             # Aging but valid: schedule the debounced background re-anchor
@@ -4841,7 +4842,11 @@ class PrismCoordinator:
                 # shortcut; the synchronous path will take a fresh snapshot.
                 self._payout_ledger_artifact = None
                 return None
-            return artifact
+            served = artifact
+        # Recorded outside the cache lock the event counter's own lock
+        # ordering forbids nesting under.
+        self._record_payout_artifact_event("served_reuse")
+        return served
 
     def _rearm_payout_ledger_artifact_after_fence_failure(
         self,
@@ -13094,10 +13099,23 @@ class PrismCoordinator:
         finally:
             try:
                 self._record_tip_refresh_wave_outcome(outcome)
+                wave_elapsed = time.monotonic() - refresh_started
                 self._observe_tip_refresh_seconds(
                     "refresh",
-                    time.monotonic() - refresh_started,
+                    wave_elapsed,
                 )
+                if wave_elapsed > 1.0:
+                    # One line per slow wave (~1/min at current cadence).
+                    # Reconstructing wave latency by pairing blockwait lines
+                    # with "refreshed N client job(s)" lines cannot
+                    # attribute time or see superseded passes; this can.
+                    print(
+                        "prism coordinator: tip refresh wave "
+                        f"outcome={outcome} refreshed={total_refreshed} "
+                        f"passes={completed_passes} "
+                        f"elapsed={wave_elapsed:.3f}s",
+                        flush=True,
+                    )
             finally:
                 self._tip_refresh_singleflight_lock.release()
 
@@ -22724,6 +22742,30 @@ class PrismCoordinator:
                 if self._client_has_current_tip_job_locked(client)
             ]
             current = len(clients_with_current_work)
+            # Semantic currency alongside the strict gauge above: fingerprint
+            # and payout generation only, no template-generation or object
+            # identity terms. The strict predicate reads 0 whenever a
+            # generation was minted since the last fanout (it also gates
+            # mining health, so its fail-closed shape stays untouched);
+            # this gauge answers the operational question the 2026-07-31
+            # review had to reconstruct from share-acceptance rates --
+            # whether miners actually hold work for the current template
+            # content.
+            payout_generation_now = int(
+                getattr(self, "_payout_state_generation", 0)
+            )
+            semantic_current = sum(
+                1
+                for client in authorized_clients
+                if client.active_job is not None
+                and published_snapshot is not None
+                and getattr(client.active_job, "template_fingerprint", None)
+                == published_snapshot.template_fingerprint
+                and int(
+                    getattr(client.active_job, "payout_state_generation", -1)
+                )
+                == payout_generation_now
+            )
             pending_requests = list(self.pending_initial_jobs.values())
             pending = len(pending_requests)
             oldest_age = max(
@@ -22764,6 +22806,9 @@ class PrismCoordinator:
             )
             pending_limit = int(self.stratum_max_pending_initial_jobs)
             coverage = current / authorized if authorized else 1.0
+            semantic_coverage = (
+                semantic_current / authorized if authorized else 1.0
+            )
             cap_saturated = connection_limit > 0 and active >= connection_limit
             pending_saturated = pending >= pending_limit
             # A reconnect incident is operationally significant well before
@@ -22897,6 +22942,8 @@ class PrismCoordinator:
             ),
             "clients_with_current_tip_jobs": current,
             "current_tip_job_coverage": round(coverage, 6),
+            "clients_with_semantically_current_work": semantic_current,
+            "semantic_current_work_ratio": round(semantic_coverage, 6),
             "current_tip_coverage_gap_age_seconds": round(
                 delivery_failure_age,
                 3,
@@ -23378,6 +23425,9 @@ class PrismCoordinator:
             "# HELP qbit_prism_stratum_current_tip_job_coverage Ratio of authorized clients holding current-tip work.",
             "# TYPE qbit_prism_stratum_current_tip_job_coverage gauge",
             f"qbit_prism_stratum_current_tip_job_coverage {mining_metrics['current_tip_job_coverage']}",
+            "# HELP qbit_prism_stratum_semantic_current_work_ratio Ratio of authorized clients whose work matches the current template fingerprint and payout generation.",
+            "# TYPE qbit_prism_stratum_semantic_current_work_ratio gauge",
+            f"qbit_prism_stratum_semantic_current_work_ratio {mining_metrics['semantic_current_work_ratio']}",
             "# HELP qbit_prism_stratum_handler_threads Active per-connection Stratum handler threads.",
             "# TYPE qbit_prism_stratum_handler_threads gauge",
             f"qbit_prism_stratum_handler_threads {mining_metrics['handler_threads']}",
@@ -24148,6 +24198,8 @@ class PrismCoordinator:
                         "discarded",
                         "born_expired",
                         "rearm_scheduled",
+                        "served_reuse",
+                        "probe_rejected_ceiling",
                     )
                 ],
                 "# HELP qbit_prism_serve_builder_window_cache_total Daemon parsed share-window cache outcomes.",
