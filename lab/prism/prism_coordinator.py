@@ -10,6 +10,7 @@ from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError as FuturesCancelledError,
     Future,
+    InvalidStateError,
     ThreadPoolExecutor,
     wait,
 )
@@ -223,6 +224,11 @@ PRISM_INITIAL_JOB_SUBSCRIBE_POLL_SECONDS = 0.25
 DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS = 60.0
 DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS = 0.25
 DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
+# A flight whose executor future is finished normally leaves its slot inside
+# the future's done callback. The admission sweep only treats such a flight
+# as orphaned after this grace, so a callback that is merely between future
+# completion and slot cleanup is never mistaken for a dead one.
+PRISM_JOB_BUILD_ORPHAN_SWEEP_GRACE_SECONDS = 1.0
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 PRISM_VARDIFF_IDLE_RETARGET_MAX_WORKERS = 2
 MAX_PENDING_VARDIFF_IDLE_RETARGETS = 8
@@ -2715,6 +2721,9 @@ class _JobBuildRequest:
 class _JobBuildFlight:
     request: _JobBuildRequest
     future: Future[CachedJobBundle] | None = None
+    # First time the admission sweep saw this flight finished but still
+    # occupying its slot; eviction waits out the sweep grace from here.
+    orphan_observed_monotonic: float | None = None
 
 
 class _PayoutStatePublicationBlocked(TemplateRefreshBlocked):
@@ -4111,6 +4120,7 @@ class PrismCoordinator:
                 "completions": 0,
                 "supersessions": 0,
                 "obsolete_results": 0,
+                "orphan_evicted": 0,
             }
         if not hasattr(self, "job_build_priority_counts"):
             self.job_build_priority_counts = {
@@ -5225,6 +5235,18 @@ class PrismCoordinator:
     def _job_build_is_publication_critical(request: object) -> bool:
         return bool(getattr(request, "publication_critical", False))
 
+    @staticmethod
+    def _job_build_promise_done(request: object) -> bool:
+        """Whether a request's shared promise has already been resolved.
+
+        Reads defensively like the other request predicates: embedders and
+        tests plant lightweight request doubles without a promise, which are
+        never resolved-and-abandoned flights.
+        """
+
+        promise = getattr(request, "promise", None)
+        return promise is not None and promise.done()
+
     def _record_priority_admission_locked(
         self,
         request: _JobBuildRequest,
@@ -5479,12 +5501,14 @@ class PrismCoordinator:
         if (
             pending is not None
             and not pending.cancellation.is_set()
+            and not self._job_build_promise_done(pending)
             and self._job_build_is_publication_critical(pending)
         ):
             return True
         return any(
             flight is not None
             and not flight.request.cancellation.is_set()
+            and not self._job_build_promise_done(flight.request)
             and self._job_build_is_publication_critical(flight.request)
             for flight in (
                 self._job_build_active,
@@ -5535,6 +5559,134 @@ class PrismCoordinator:
             and progress_age <= progress_budget
         )
 
+    @staticmethod
+    def _resolve_cancelled_job_build_promise(
+        request: _JobBuildRequest,
+        reason: str,
+    ) -> None:
+        """Wake every waiter on a terminated flight's promise immediately.
+
+        Safe against the build's own completion: the done callback checks
+        ``promise.done()`` before resolving, so the first resolution wins and
+        a late build result for a cancelled flight is dropped exactly as it
+        was when the callback produced the exception itself.
+        """
+
+        promise = getattr(request, "promise", None)
+        if promise is None or promise.done():
+            return
+        if reason == "timeout":
+            promise.set_exception(
+                JobBuildCancelled("job build flight cancelled by timeout")
+            )
+            return
+        promise.set_exception(
+            JobBuildSuperseded(f"job build flight cancelled: {reason}")
+        )
+
+    @staticmethod
+    def _job_build_flight_outcome(
+        request: _JobBuildRequest,
+        future: Future[CachedJobBundle],
+    ) -> tuple[CachedJobBundle | None, BaseException | None]:
+        """Map a finished executor future onto the shared promise outcome."""
+
+        result: CachedJobBundle | None = None
+        error: BaseException | None = None
+        try:
+            result = future.result()
+            if request.cancellation.is_set():
+                if request.cancellation.reason == "timeout":
+                    error = JobBuildCancelled(
+                        "job build completed after its timeout"
+                    )
+                else:
+                    error = JobBuildSuperseded(
+                        "obsolete job build completed after cancellation"
+                    )
+        except BaseException as exc:  # noqa: BLE001 - delivered to all waiters
+            error = exc
+        return result, error
+
+    def _evict_orphaned_job_build_flights_locked(self) -> None:
+        """Evict finished flights whose completion never released their slot.
+
+        A flight's done callback resolves its promise, vacates its slot, and
+        promotes pending work. Done callbacks swallow exceptions, so if one
+        dies mid-pass the flight wedges: admission keeps treating the slot as
+        occupied, deferred requesters chain onto a promise nobody will ever
+        resolve, and promotion never runs again even though the executor is
+        idle. Sweep such flights out at admission time: resolve the promise
+        from the finished future so parked waiters wake, free the slot so the
+        next requester becomes the new owner, and promote any parked pending
+        request. A flight whose future is still queued or executing is never
+        touched; its own completion performs the normal cleanup.
+        """
+
+        grace_seconds = float(
+            getattr(
+                self,
+                "job_build_orphan_sweep_grace_seconds",
+                PRISM_JOB_BUILD_ORPHAN_SWEEP_GRACE_SECONDS,
+            )
+        )
+        now = time.monotonic()
+        evicted = False
+        for slot_name in ("_job_build_active", "_job_build_retiring"):
+            flight: _JobBuildFlight | None = getattr(self, slot_name)
+            if flight is None:
+                continue
+            # Embedders and tests plant lightweight flight doubles; read the
+            # lifecycle fields defensively like the rest of the scheduler.
+            future = getattr(flight, "future", None)
+            if future is not None and not future.done():
+                continue
+            observed = getattr(flight, "orphan_observed_monotonic", None)
+            if observed is None:
+                try:
+                    flight.orphan_observed_monotonic = now
+                except AttributeError:
+                    pass
+                continue
+            if now - observed < grace_seconds:
+                continue
+            request = flight.request
+            promise = getattr(request, "promise", None)
+            if promise is not None and not promise.done():
+                if future is None:
+                    self._resolve_cancelled_job_build_promise(
+                        request,
+                        "superseded",
+                    )
+                else:
+                    result, error = self._job_build_flight_outcome(
+                        request,
+                        future,
+                    )
+                    try:
+                        if error is not None:
+                            promise.set_exception(error)
+                        else:
+                            assert result is not None
+                            promise.set_result(result)
+                    except InvalidStateError:
+                        # The flight's own done callback won the resolution
+                        # race between our done() check and this set.
+                        pass
+            setattr(self, slot_name, None)
+            self.job_build_scheduler_counts["orphan_evicted"] += 1
+            evicted = True
+            print(
+                "prism coordinator: evicted orphaned job build flight "
+                f"slot={slot_name.removeprefix('_job_build_')} "
+                f"cancelled={flight.request.cancellation.is_set()} "
+                f"started={future is not None}",
+                flush=True,
+            )
+        if evicted:
+            self._promote_pending_job_build_locked()
+            self._job_build_priority_changed.set()
+
     def _cancel_job_build_flight_locked(
         self,
         flight: _JobBuildFlight,
@@ -5544,18 +5696,38 @@ class PrismCoordinator:
     ) -> bool:
         if not flight.request.cancellation.cancel(reason):
             return False
-        flight.request.superseded_monotonic = (
-            time.monotonic() if now is None else now
-        )
-        self.job_build_scheduler_counts["supersessions"] += 1
-        if reason == "publication priority":
-            self.job_build_priority_counts["routine_preempted"] += 1
-        self._job_build_priority_changed.set()
+        try:
+            flight.request.superseded_monotonic = (
+                time.monotonic() if now is None else now
+            )
+            self.job_build_scheduler_counts["supersessions"] += 1
+            if reason == "publication priority":
+                self.job_build_priority_counts["routine_preempted"] += 1
+        finally:
+            # A submitted future delivers the promise from its done callback
+            # when the build observes the cancellation and drains -- refresh
+            # drivers rely on that ordering to keep one heavy build in
+            # flight, and a completed-but-unswept future is the admission
+            # sweep's to resolve. A flight that never reached the executor
+            # has no callback at all: cancellation must wake its waiters
+            # itself or they burn their full wait deadline.
+            if getattr(flight, "future", None) is None:
+                self._resolve_cancelled_job_build_promise(
+                    flight.request,
+                    reason,
+                )
+            self._job_build_priority_changed.set()
         return True
 
     def _promote_pending_job_build_locked(self) -> None:
         pending = self._job_build_pending
         if pending is None:
+            return
+        if self._job_build_promise_done(pending):
+            # Every waiter has already been answered (eviction or a raced
+            # resolution); building it would spend a bounded executor slot on
+            # work nobody consumes.
+            self._job_build_pending = None
             return
         active = self._job_build_active
         retiring = self._job_build_retiring
@@ -5564,6 +5736,7 @@ class PrismCoordinator:
             and any(
                 flight is not None
                 and not flight.request.cancellation.is_set()
+                and not self._job_build_promise_done(flight.request)
                 and self._job_build_is_publication_critical(flight.request)
                 for flight in (active, retiring)
             )
@@ -5611,7 +5784,14 @@ class PrismCoordinator:
                 )
                 self._cancel_job_build_flight_locked(retiring, reason)
         self._job_build_pending = None
-        flight = self._start_job_build_locked(pending)
+        try:
+            flight = self._start_job_build_locked(pending)
+        except BaseException:
+            # The pending slot is already vacated: with no flight there is no
+            # done callback left that could ever resolve this promise for its
+            # waiters.
+            self._resolve_cancelled_job_build_promise(pending, "superseded")
+            raise
         self._job_build_active = flight
         self._arm_job_build_locked(flight)
 
@@ -5621,60 +5801,60 @@ class PrismCoordinator:
         future: Future[CachedJobBundle],
     ) -> None:
         request = flight.request
-        result: CachedJobBundle | None = None
-        error: BaseException | None = None
+        result, error = self._job_build_flight_outcome(request, future)
         try:
-            result = future.result()
-            if request.cancellation.is_set():
-                if request.cancellation.reason == "timeout":
-                    error = JobBuildCancelled(
-                        "job build completed after its timeout"
-                    )
-                else:
-                    error = JobBuildSuperseded(
-                        "obsolete job build completed after cancellation"
-                    )
-        except BaseException as exc:  # noqa: BLE001 - delivered to all waiters
-            error = exc
-        with self._job_build_scheduler_lock:
-            self.job_build_scheduler_counts["completions"] += 1
-            self.shared_bundle_preparation_count += 1
-            self.shared_bundle_preparation_seconds_sum += max(
-                0.0,
-                time.monotonic() - request.cancellation.started_monotonic,
-            )
-            if request.cancellation.cancelled_monotonic is not None:
-                elapsed = max(
+            with self._job_build_scheduler_lock:
+                self.job_build_scheduler_counts["completions"] += 1
+                self.shared_bundle_preparation_count += 1
+                self.shared_bundle_preparation_seconds_sum += max(
                     0.0,
-                    time.monotonic() - request.cancellation.cancelled_monotonic,
+                    time.monotonic() - request.cancellation.started_monotonic,
                 )
-                self.job_build_cancellation_seconds["sum"] += elapsed
-                self.job_build_cancellation_seconds["count"] += 1
-            coordination_cancelled = isinstance(error, JobBuildSuperseded) or (
-                request.cancellation.is_set()
-                and request.cancellation.reason != "timeout"
-            )
-            if error is not None and coordination_cancelled:
-                self.job_build_scheduler_counts["obsolete_results"] += 1
-                self.shared_bundle_build_counts["superseded"] += 1
-                with self._tip_refresh_metrics_lock:
-                    self.tip_refresh_superseded_results += 1
-            elif error is not None:
-                self.shared_bundle_build_counts["failed"] += 1
-            else:
-                self.shared_bundle_build_counts["completed"] += 1
-            if self._job_build_active is flight:
-                self._job_build_active = None
-            if self._job_build_retiring is flight:
-                self._job_build_retiring = None
-            self._promote_pending_job_build_locked()
-        if not request.promise.done():
-            if error is not None:
-                request.promise.set_exception(error)
-            else:
-                assert result is not None
-                request.promise.set_result(result)
-        self._job_build_priority_changed.set()
+                if request.cancellation.cancelled_monotonic is not None:
+                    elapsed = max(
+                        0.0,
+                        time.monotonic()
+                        - request.cancellation.cancelled_monotonic,
+                    )
+                    self.job_build_cancellation_seconds["sum"] += elapsed
+                    self.job_build_cancellation_seconds["count"] += 1
+                coordination_cancelled = isinstance(
+                    error, JobBuildSuperseded
+                ) or (
+                    request.cancellation.is_set()
+                    and request.cancellation.reason != "timeout"
+                )
+                if error is not None and coordination_cancelled:
+                    self.job_build_scheduler_counts["obsolete_results"] += 1
+                    self.shared_bundle_build_counts["superseded"] += 1
+                    with self._tip_refresh_metrics_lock:
+                        self.tip_refresh_superseded_results += 1
+                elif error is not None:
+                    self.shared_bundle_build_counts["failed"] += 1
+                else:
+                    self.shared_bundle_build_counts["completed"] += 1
+                if self._job_build_active is flight:
+                    self._job_build_active = None
+                if self._job_build_retiring is flight:
+                    self._job_build_retiring = None
+                self._promote_pending_job_build_locked()
+        finally:
+            # Done callbacks swallow exceptions, so a raise anywhere in the
+            # bookkeeping above must not skip promise resolution: an orphaned
+            # promise strands every joiner until its wait deadline and leaves
+            # a finished flight wedged in its slot with the executor idle.
+            try:
+                if not request.promise.done():
+                    if error is not None:
+                        request.promise.set_exception(error)
+                    else:
+                        assert result is not None
+                        request.promise.set_result(result)
+            except InvalidStateError:
+                # The admission sweep can resolve a wedged flight between the
+                # done() check and this set; either resolution wakes waiters.
+                pass
+            self._job_build_priority_changed.set()
 
     def _request_job_build(self, request: _JobBuildRequest) -> Future[CachedJobBundle]:
         self._ensure_job_cache_state()
@@ -5694,6 +5874,7 @@ class PrismCoordinator:
                         )
                     return request.promise
             self.job_build_scheduler_counts["requests"] += 1
+            self._evict_orphaned_job_build_flights_locked()
             active = self._job_build_active
             retiring = self._job_build_retiring
             pending = self._job_build_pending
@@ -5703,6 +5884,7 @@ class PrismCoordinator:
             if (
                 active is not None
                 and not active.request.cancellation.is_set()
+                and not self._job_build_promise_done(active.request)
                 and self._job_build_requests_can_share(active.request, request)
                 and self._job_build_can_inherit_publication_priority(
                     active.request,
@@ -5721,6 +5903,7 @@ class PrismCoordinator:
             if (
                 retiring is not None
                 and not retiring.request.cancellation.is_set()
+                and not self._job_build_promise_done(retiring.request)
                 and self._job_build_requests_can_share(retiring.request, request)
                 and self._job_build_can_inherit_publication_priority(
                     retiring.request,
@@ -5739,6 +5922,7 @@ class PrismCoordinator:
             if (
                 pending is not None
                 and not pending.cancellation.is_set()
+                and not self._job_build_promise_done(pending)
                 and self._job_build_requests_can_share(pending, request)
                 and self._job_build_can_inherit_publication_priority(
                     pending,
@@ -5821,9 +6005,29 @@ class PrismCoordinator:
                         request,
                     ):
                         self._job_build_pending = None
-                        flight = self._start_job_build_locked(pending)
+                        try:
+                            flight = self._start_job_build_locked(pending)
+                        except BaseException:
+                            # The pending slot is already vacated: with no
+                            # flight there is no done callback left that
+                            # could resolve this promise for its waiters.
+                            self._resolve_cancelled_job_build_promise(
+                                pending,
+                                "superseded",
+                            )
+                            raise
                         if retiring is None:
-                            replacement = self._start_job_build_locked(request)
+                            try:
+                                replacement = self._start_job_build_locked(
+                                    request
+                                )
+                            except BaseException:
+                                # The first start succeeded: slot and arm it
+                                # so its completion still resolves and sweeps
+                                # normally before this failure propagates.
+                                self._job_build_active = flight
+                                self._arm_job_build_locked(flight)
+                                raise
                             self._job_build_retiring = flight
                             self._job_build_active = replacement
                             self._arm_job_build_locked(flight)
@@ -6004,13 +6208,8 @@ class PrismCoordinator:
 
         with self._job_build_scheduler_lock:
             for flight in (self._job_build_active, self._job_build_retiring):
-                if (
-                    flight is not None
-                    and not keep(flight.request)
-                    and flight.request.cancellation.cancel(reason)
-                ):
-                    flight.request.superseded_monotonic = time.monotonic()
-                    self.job_build_scheduler_counts["supersessions"] += 1
+                if flight is not None and not keep(flight.request):
+                    self._cancel_job_build_flight_locked(flight, reason)
             pending = self._job_build_pending
             if pending is not None and not keep(pending):
                 pending.cancellation.cancel(reason)
@@ -24449,6 +24648,9 @@ class PrismCoordinator:
                 "# HELP qbit_prism_job_build_obsolete_results_total Obsolete build results discarded before cache or delivery.",
                 "# TYPE qbit_prism_job_build_obsolete_results_total counter",
                 f'qbit_prism_job_build_obsolete_results_total {int(scheduler_counts.get("obsolete_results", 0))}',
+                "# HELP qbit_prism_job_build_orphan_evicted_total Finished flights evicted from scheduler slots after their completion never released them.",
+                "# TYPE qbit_prism_job_build_orphan_evicted_total counter",
+                f'qbit_prism_job_build_orphan_evicted_total {int(scheduler_counts.get("orphan_evicted", 0))}',
                 "# HELP qbit_prism_job_build_active Current latest-generation build executions.",
                 "# TYPE qbit_prism_job_build_active gauge",
                 f"qbit_prism_job_build_active {active_builds}",
