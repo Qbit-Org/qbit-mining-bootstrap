@@ -217,6 +217,16 @@ DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS = 4
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
 PRISM_TIP_REFRESH_REENTRY_BACKOFF_SECONDS = 0.05
 PRISM_TIP_REFRESH_WAVE_PASS_BUDGET = 64
+# The overlapped reconcile pass runs ledger reads that can crawl while the
+# chain churns. The tip-refresh join must never park the poll loop on it
+# past the liveness budget: a bounded join leaves the pass running in its
+# single slot (the paced retry re-joins the same future) and keeps the poll
+# loop's heartbeat live while the pass catches up.
+PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS = 20.0
+# Ceiling for operator overrides of the join budget: a value at or above the
+# poll loop's failure/watchdog budgets would silently reinstate the very park
+# the bound exists to prevent.
+PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_CEILING_SECONDS = 60.0
 # Cancellation-check slice while an initial request rides a subscribed
 # publication-priority build promise. Promise completion wakes the waiter
 # immediately; this only bounds how stale a cancellation can go unnoticed.
@@ -4020,7 +4030,7 @@ class PrismCoordinator:
             # (for example a template-RPC outage) reuse it instead of
             # queueing another serialized pass per retry.
             self._reconcile_prefetch_pending: (
-                tuple[str, Future[bool]] | None
+                tuple[str, Future[bool], bool] | None
             ) = None
         if not hasattr(self, "reorg_reconcile_lookup_counts"):
             # Reconcile demand by (caller path, satisfying source), guarded
@@ -13646,7 +13656,9 @@ class PrismCoordinator:
                     and snapshot.bestblockhash == observed_best_tip
                 ):
                     reconcile_source = "overlap"
-                    reorg_reconciled = reconcile_prefetch.result()
+                    reorg_reconciled = self._join_reconcile_prefetch_bounded(
+                        reconcile_prefetch
+                    )
                     if reorg_reconciled and (
                         int(getattr(self, "tip_detection_epoch", 0))
                         != reconcile_detection_epoch
@@ -13654,12 +13666,12 @@ class PrismCoordinator:
                         # A detection interleaved the fetch (a flip away, or
                         # away and back to this same hash): cached proofs
                         # were evicted and the overlapped pass may have run
-                        # in the closed epoch. Re-prove on this thread.
+                        # in the closed epoch. Re-prove off-thread with the
+                        # same bounded join -- the crawl that slows the
+                        # overlap join slows this re-prove identically.
                         reconcile_source = "serial"
-                        reorg_reconciled = (
-                            self.ensure_reorg_reconciled_for_tip(
-                                snapshot.bestblockhash
-                            )
+                        reorg_reconciled = self._reconcile_snapshot_tip_bounded(
+                            snapshot.bestblockhash
                         )
                     # A trust flip after the pass completed (headers running
                     # ahead with no detection) is deliberately NOT re-checked
@@ -13673,12 +13685,16 @@ class PrismCoordinator:
                     if reconcile_prefetch is not None:
                         # The tip moved between the probe and the template
                         # fetch; the prefetched pass proved a superseded
-                        # hash. Reconcile the snapshot tip on this thread.
+                        # hash. Reconcile the snapshot tip off-thread with
+                        # the same bounded join: the crawl that slows the
+                        # overlap join reaches this branch through exactly
+                        # the churn that moves tips mid-fetch, and the poll
+                        # loop must never park on it here either.
                         self._discard_stale_reconcile_prefetch(
                             reconcile_prefetch
                         )
                         reconcile_prefetch = None
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                    reorg_reconciled = self._reconcile_snapshot_tip_bounded(
                         snapshot.bestblockhash
                     )
             except (ShutdownInProgress, FuturesCancelledError):
@@ -15385,18 +15401,29 @@ class PrismCoordinator:
         with self.lock:
             self.reorg_reconcile_lookup_counts[(path, source)] += 1
 
-    def _reconcile_prefetch_pass(self, tip_hash: str) -> bool:
+    def _reconcile_prefetch_pass(
+        self,
+        tip_hash: str,
+        prove: bool = False,
+    ) -> bool:
         """One prefetched reconcile, honoring the memo like the join does.
 
         A prefetch that queued behind a completed same-tip pass (abandoned
         refresh attempts reuse the slot, but a replaced tip can leave one
         queued) would otherwise re-run the full serialized pass for nothing.
+        A proving pass (the serial re-prove branches) bypasses the memo:
+        those branches exist precisely because the entry cannot be trusted.
         """
-        if self._reorg_reconcile_memo_fresh(tip_hash):
+        if not prove and self._reorg_reconcile_memo_fresh(tip_hash):
             return True
         return self.ensure_reorg_reconciled_for_tip(tip_hash)
 
-    def _submit_reconcile_prefetch(self, tip_hash: str) -> Future[bool] | None:
+    def _submit_reconcile_prefetch(
+        self,
+        tip_hash: str,
+        *,
+        prove: bool = False,
+    ) -> Future[bool] | None:
         """Run one reconcile pass on the prefetch worker so it overlaps the
         caller's template fetch.
 
@@ -15415,8 +15442,15 @@ class PrismCoordinator:
                 return None
             pending = self._reconcile_prefetch_pending
             if pending is not None:
-                pending_tip, pending_future = pending
-                if not pending_future.done() and pending_tip == tip_hash:
+                pending_tip, pending_future, pending_proves = pending
+                if (
+                    not pending_future.done()
+                    and pending_tip == tip_hash
+                    and (pending_proves or not prove)
+                ):
+                    # A proving pass satisfies both kinds of caller; a
+                    # memo-honoring pass cannot satisfy a prove request and
+                    # is replaced below like a tip change.
                     return pending_future
                 # Replaced tip or completed future: hand the old future off
                 # for disposal outside this lock -- cancellation runs done
@@ -15433,8 +15467,10 @@ class PrismCoordinator:
                 )
                 self._reconcile_prefetch_executor = executor
             try:
-                future = executor.submit(self._reconcile_prefetch_pass, tip_hash)
-                self._reconcile_prefetch_pending = (tip_hash, future)
+                future = executor.submit(
+                    self._reconcile_prefetch_pass, tip_hash, prove
+                )
+                self._reconcile_prefetch_pending = (tip_hash, future, prove)
             except RuntimeError:
                 # Executor shutdown raced this submit; the serial path
                 # covers it (after the stale future is disposed below).
@@ -15476,6 +15512,61 @@ class PrismCoordinator:
                 pass
 
         future.add_done_callback(_consume)
+
+    def _join_reconcile_prefetch_bounded(self, prefetch: Future[bool]) -> bool:
+        """Join a reconcile pass under the poll loop's bounded budget.
+
+        On a genuine expiry the pass keeps running in its single prefetch
+        slot -- the paced retry re-joins the same future -- and the timeout
+        surfaces the normal blocked-retry path, keeping the poll loop's
+        liveness heartbeat fed while the pass catches up. The budget is
+        clamped below the loop's failure budget so a misconfigured override
+        cannot reinstate the park this bound exists to prevent.
+        """
+
+        join_timeout = min(
+            PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_CEILING_SECONDS,
+            max(
+                0.001,
+                float(
+                    getattr(
+                        self,
+                        "reconcile_prefetch_join_timeout_seconds",
+                        PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS,
+                    )
+                ),
+            ),
+        )
+        try:
+            return prefetch.result(timeout=join_timeout)
+        except TimeoutError:
+            if prefetch.done():
+                # The pass itself raised TimeoutError (socket.timeout is
+                # TimeoutError here): not a join expiry. Propagate silently
+                # so diagnosis points at the pass, not the join.
+                raise
+            print(
+                "prism coordinator: reconcile prefetch join exceeded "
+                f"{join_timeout:g}s; retrying refresh pass while it "
+                "completes",
+                flush=True,
+            )
+            raise
+
+    def _reconcile_snapshot_tip_bounded(self, tip_hash: str) -> bool:
+        """Run a snapshot-tip re-prove off-thread with the bounded join.
+
+        The serial re-prove branches run the same crawling pass as the
+        overlapped prefetch; routing them through the prefetch slot gives
+        the poll loop one uniform bounded wait. Falls back to the direct
+        pass only when the prefetch executor has already been retired at
+        shutdown, whose exceptions the caller already maps to a clean exit.
+        """
+
+        prefetch = self._submit_reconcile_prefetch(tip_hash, prove=True)
+        if prefetch is None:
+            return self.ensure_reorg_reconciled_for_tip(tip_hash)
+        return self._join_reconcile_prefetch_bounded(prefetch)
 
     def shutdown_reconcile_prefetch_executor(self) -> None:
         self._ensure_job_cache_state()
