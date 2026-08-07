@@ -5608,7 +5608,7 @@ class PrismCoordinator:
             error = exc
         return result, error
 
-    def _evict_orphaned_job_build_flights_locked(self) -> None:
+    def _evict_orphaned_job_build_flights_locked(self) -> list[str]:
         """Evict finished flights whose completion never released their slot.
 
         A flight's done callback resolves its promise, vacates its slot, and
@@ -5621,8 +5621,13 @@ class PrismCoordinator:
         next requester becomes the new owner, and promote any parked pending
         request. A flight whose future is still queued or executing is never
         touched; its own completion performs the normal cleanup.
+
+        Returns the eviction log lines instead of printing them: the caller
+        holds the scheduler lock, and a blocked stdout must not stall
+        admission (the admission-deadline log follows the same discipline).
         """
 
+        eviction_logs: list[str] = []
         grace_seconds = float(
             getattr(
                 self,
@@ -5676,16 +5681,16 @@ class PrismCoordinator:
             setattr(self, slot_name, None)
             self.job_build_scheduler_counts["orphan_evicted"] += 1
             evicted = True
-            print(
+            eviction_logs.append(
                 "prism coordinator: evicted orphaned job build flight "
                 f"slot={slot_name.removeprefix('_job_build_')} "
                 f"cancelled={flight.request.cancellation.is_set()} "
-                f"started={future is not None}",
-                flush=True,
+                f"started={future is not None}"
             )
         if evicted:
             self._promote_pending_job_build_locked()
             self._job_build_priority_changed.set()
+        return eviction_logs
 
     def _cancel_job_build_flight_locked(
         self,
@@ -5695,6 +5700,14 @@ class PrismCoordinator:
         now: float | None = None,
     ) -> bool:
         if not flight.request.cancellation.cancel(reason):
+            # Already cancelled (possibly by its own deadline). A flight that
+            # never reached the executor still has no other resolver, so
+            # settle its waiters here instead of leaving them to the sweep.
+            if getattr(flight, "future", None) is None:
+                self._resolve_cancelled_job_build_promise(
+                    flight.request,
+                    flight.request.cancellation.reason or reason,
+                )
             return False
         try:
             flight.request.superseded_monotonic = (
@@ -5859,6 +5872,10 @@ class PrismCoordinator:
     def _request_job_build(self, request: _JobBuildRequest) -> Future[CachedJobBundle]:
         self._ensure_job_cache_state()
         with self._job_build_scheduler_lock:
+            eviction_logs = self._evict_orphaned_job_build_flights_locked()
+        for eviction_log in eviction_logs:
+            print(eviction_log, flush=True)
+        with self._job_build_scheduler_lock:
             if getattr(request, "idle_retarget", False):
                 with self.lock:
                     defer_idle = self._vardiff_idle_tip_divergence_locked()
@@ -5874,7 +5891,6 @@ class PrismCoordinator:
                         )
                     return request.promise
             self.job_build_scheduler_counts["requests"] += 1
-            self._evict_orphaned_job_build_flights_locked()
             active = self._job_build_active
             retiring = self._job_build_retiring
             pending = self._job_build_pending
@@ -5966,6 +5982,9 @@ class PrismCoordinator:
                     )
                     if blocker is not None
                     and not blocker.cancellation.is_set()
+                    # A resolved promise is not live priority work: deferring
+                    # on it wakes instantly and spins until the sweep evicts.
+                    and not self._job_build_promise_done(blocker)
                     and self._job_build_is_publication_critical(blocker)
                 )
                 if priority_blockers:
@@ -5986,6 +6005,7 @@ class PrismCoordinator:
                     if (
                         blocker is not None
                         and not blocker.cancellation.is_set()
+                        and not self._job_build_promise_done(blocker)
                         and self._ready_job_build_precedes_collection(
                             blocker,
                             request,
@@ -6224,8 +6244,18 @@ class PrismCoordinator:
         self._ensure_job_cache_state()
         with self._job_build_scheduler_lock:
             for flight in (self._job_build_active, self._job_build_retiring):
-                if flight is not None:
-                    flight.request.cancellation.cancel("shutdown")
+                if flight is None:
+                    continue
+                flight.request.cancellation.cancel("shutdown")
+                future = getattr(flight, "future", None)
+                if future is None or future.done():
+                    # A terminal future's callback has already run (or died)
+                    # and executor shutdown will not fire it again: this is
+                    # the last chance to settle the flight's waiters.
+                    self._resolve_cancelled_job_build_promise(
+                        flight.request,
+                        "shutdown",
+                    )
             pending = self._job_build_pending
             if pending is not None:
                 pending.cancellation.cancel("shutdown")

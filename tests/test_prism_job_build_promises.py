@@ -25,6 +25,7 @@ from lab.prism.prism_coordinator import (
 )
 from tests.test_prism_coordinator_job_cache import (
     coordinator,
+    install_fake_bundle_builder,
     synthetic_manifest_coinbase_hex,
     worker,
 )
@@ -258,6 +259,109 @@ class OrphanedFlightEvictionTests(_PromiseHarness):
         )
         release.set()
         owner_promise.result(timeout=10.0)
+
+
+class StructuralResolutionFaultInjectionTests(_PromiseHarness):
+    def test_poisoned_completion_bookkeeping_still_resolves_promise(self) -> None:
+        # The completion callback's promise resolution must survive a raise
+        # anywhere in its bookkeeping (done callbacks swallow exceptions, so
+        # without the try/finally the promise would strand until the sweep).
+        install_fake_bundle_builder(self.server)
+
+        def poisoned_promote() -> None:
+            raise RuntimeError("bookkeeping poisoned by test")
+
+        self.server._promote_pending_job_build_locked = (  # type: ignore[method-assign]
+            poisoned_promote
+        )
+        try:
+            owner = self.new_request()
+            promise = self.server._request_job_build(owner)
+            self.assertIsNotNone(promise.result(timeout=10.0))
+            # The sweep played no part: the callback itself resolved it.
+            self.assertEqual(
+                self.server.job_build_scheduler_counts["orphan_evicted"],
+                0,
+            )
+        finally:
+            del self.server._promote_pending_job_build_locked
+
+    def test_promote_start_failure_resolves_consumed_pending_promise(
+        self,
+    ) -> None:
+        # A pending request consumed by promotion whose executor start fails
+        # has no flight and therefore no completion callback left; promotion
+        # itself must settle the promise for its waiters.
+        pending = self.new_request()
+        self.server._job_build_pending = pending
+
+        def failing_start(request: _JobBuildRequest) -> _JobBuildFlight:
+            raise RuntimeError("executor unavailable")
+
+        self.server._start_job_build_locked = (  # type: ignore[method-assign]
+            failing_start
+        )
+        try:
+            with self.server._job_build_scheduler_lock:
+                with self.assertRaises(RuntimeError):
+                    self.server._promote_pending_job_build_locked()
+        finally:
+            del self.server._start_job_build_locked
+        self.assertIsNone(self.server._job_build_pending)
+        self.assertIsInstance(
+            pending.promise.exception(timeout=1.0),
+            JobBuildSuperseded,
+        )
+
+    def test_resolved_priority_corpse_does_not_defer_routine_requesters(
+        self,
+    ) -> None:
+        # A resolved-promise publication-critical corpse is not live priority
+        # work: deferring on its already-done promise would wake instantly
+        # and hot-spin until the sweep's grace elapses. The routine requester
+        # must take ownership through the normal supersession path instead.
+        entered, release, _recorded = install_gated_bundle_builder(self.server)
+        corpse_request = self.server._new_job_build_request(
+            self.artifacts,
+            self.identity,
+            mode="ready",
+            payout_state_generation=0,
+            cache_key=self.cache_key,
+            publication_critical=True,
+        )
+        corpse_request.promise.set_exception(
+            JobBuildSuperseded("resolved before the slot was released")
+        )
+        corpse_future: Future = Future()
+        corpse_future.set_exception(RuntimeError("builder thread died"))
+        self.server._job_build_active = _JobBuildFlight(
+            request=corpse_request,
+            future=corpse_future,
+        )
+
+        routine = self.new_request()
+        promise = self.server._request_job_build(routine)
+        self.assertIs(promise, routine.promise)
+        self.assertTrue(entered.wait(timeout=5.0))
+        release.set()
+        promise.result(timeout=10.0)
+
+    def test_shutdown_settles_terminal_corpse_waiters(self) -> None:
+        # Executor shutdown re-fires callbacks for queued and running
+        # futures, but a terminal future's callback never fires again:
+        # shutdown is the last chance to settle its waiters.
+        corpse = self.new_request()
+        corpse_future: Future = Future()
+        corpse_future.set_exception(RuntimeError("builder thread died"))
+        self.server._job_build_active = _JobBuildFlight(
+            request=corpse,
+            future=corpse_future,
+        )
+        self.server.shutdown_job_build_executor()
+        self.assertIsInstance(
+            corpse.promise.exception(timeout=1.0),
+            JobBuildSuperseded,
+        )
 
 
 class HealthySingleFlightTests(_PromiseHarness):
