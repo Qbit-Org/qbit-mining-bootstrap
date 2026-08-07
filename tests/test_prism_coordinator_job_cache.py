@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import queue
 import socket
@@ -7769,11 +7771,66 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
 
     def test_tip_refresh_join_bounds_a_stalled_reconcile_prefetch(self) -> None:
         # The overlap join must never park the poll loop on a crawling
-        # prefetched pass: it times out into the normal blocked-retry path,
-        # the slot retains the still-running future for the retry to
-        # re-join, and the pass completing unblocks the next poll.
+        # prefetched pass: it times out into the normal blocked-retry path
+        # within the CONFIGURED budget (not merely eventually), retries
+        # re-join the identical still-running future without starting
+        # another pass, and the pass completing unblocks the next poll.
         server, rpc = coordinator()
         server.reorg_reconciler_enabled = True
+        server.reconcile_prefetch_join_timeout_seconds = 0.05
+        started = threading.Event()
+        release = threading.Event()
+        pass_calls = [0]
+
+        def slow_ensure(tip_hash: str) -> bool:
+            pass_calls[0] += 1
+            started.set()
+            assert release.wait(10.0)
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            slow_ensure
+        )
+        try:
+            join_started = time.monotonic()
+            with self.assertRaises(TemplateRefreshBlocked):
+                server.poll_qbit_tip_template_once()
+            # Generous scheduler tolerance, but far below any hardcoded
+            # multi-second budget: the configured 0.05s must be what fired.
+            self.assertLess(time.monotonic() - join_started, 1.0)
+            self.assertTrue(started.is_set())
+            with server._reconcile_prefetch_executor_lock:
+                pending = server._reconcile_prefetch_pending
+            self.assertIsNotNone(pending)
+            assert pending is not None
+            first_future = pending[1]
+            self.assertFalse(first_future.done())
+
+            # A retry re-joins the same running future: same slot identity,
+            # no additional pass started.
+            with self.assertRaises(TemplateRefreshBlocked):
+                server.poll_qbit_tip_template_once()
+            with server._reconcile_prefetch_executor_lock:
+                pending_again = server._reconcile_prefetch_pending
+            assert pending_again is not None
+            self.assertIs(pending_again[1], first_future)
+            self.assertEqual(pass_calls[0], 1)
+
+            release.set()
+            self.assertTrue(first_future.result(5.0))
+            server.poll_qbit_tip_template_once()
+        finally:
+            release.set()
+            server.shutdown_reconcile_prefetch_executor()
+
+    def test_serial_reconcile_branch_uses_the_bounded_join(self) -> None:
+        # With the memo disabled no overlap prefetch exists, so the pass
+        # lands in the serial re-prove branch -- which must route through
+        # the same prefetch slot and bounded join instead of parking the
+        # poll loop synchronously inside a crawling pass.
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.reorg_reconcile_cache_seconds = 0.0
         server.reconcile_prefetch_join_timeout_seconds = 0.05
         started = threading.Event()
         release = threading.Event()
@@ -7790,7 +7847,7 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
             join_started = time.monotonic()
             with self.assertRaises(TemplateRefreshBlocked):
                 server.poll_qbit_tip_template_once()
-            self.assertLess(time.monotonic() - join_started, 5.0)
+            self.assertLess(time.monotonic() - join_started, 1.0)
             self.assertTrue(started.is_set())
             with server._reconcile_prefetch_executor_lock:
                 pending = server._reconcile_prefetch_pending
@@ -7803,6 +7860,33 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
             server.poll_qbit_tip_template_once()
         finally:
             release.set()
+            server.shutdown_reconcile_prefetch_executor()
+
+    def test_pass_raised_timeout_is_not_logged_as_join_expiry(self) -> None:
+        # socket.timeout IS builtins.TimeoutError: a pass that raises it
+        # completes the future exceptionally and must surface as an ordinary
+        # blocked pass -- not as a join expiry, which would misdirect
+        # operators toward the join while nothing is running.
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.reorg_reconcile_cache_seconds = 0.0
+        server.reconcile_prefetch_join_timeout_seconds = 5.0
+
+        def timing_out_ensure(tip_hash: str) -> bool:
+            raise TimeoutError("pass-owned timeout")
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            timing_out_ensure
+        )
+        try:
+            captured = io.StringIO()
+            join_started = time.monotonic()
+            with contextlib.redirect_stdout(captured):
+                with self.assertRaises(TemplateRefreshBlocked):
+                    server.poll_qbit_tip_template_once()
+            self.assertLess(time.monotonic() - join_started, 2.0)
+            self.assertNotIn("join exceeded", captured.getvalue())
+        finally:
             server.shutdown_reconcile_prefetch_executor()
 
     def test_reconcile_prefetch_slot_is_reused_across_failed_attempts(self) -> None:
