@@ -217,6 +217,12 @@ DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS = 4
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
 PRISM_TIP_REFRESH_REENTRY_BACKOFF_SECONDS = 0.05
 PRISM_TIP_REFRESH_WAVE_PASS_BUDGET = 64
+# The overlapped reconcile pass runs ledger reads that can crawl while the
+# chain churns. The tip-refresh join must never park the poll loop on it
+# past the liveness budget: a bounded join leaves the pass running in its
+# single slot (the paced retry re-joins the same future) and keeps the poll
+# loop's heartbeat live while the pass catches up.
+PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS = 20.0
 # Cancellation-check slice while an initial request rides a subscribed
 # publication-priority build promise. Promise completion wakes the waiter
 # immediately; this only bounds how stale a cancellation can go unnoticed.
@@ -13646,7 +13652,34 @@ class PrismCoordinator:
                     and snapshot.bestblockhash == observed_best_tip
                 ):
                     reconcile_source = "overlap"
-                    reorg_reconciled = reconcile_prefetch.result()
+                    join_timeout = max(
+                        0.001,
+                        float(
+                            getattr(
+                                self,
+                                "reconcile_prefetch_join_timeout_seconds",
+                                PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS,
+                            )
+                        ),
+                    )
+                    try:
+                        reorg_reconciled = reconcile_prefetch.result(
+                            timeout=join_timeout
+                        )
+                    except TimeoutError:
+                        # The pass is still running in its single prefetch
+                        # slot; the paced retry re-joins the same future
+                        # instead of queueing another pass. Converting the
+                        # unbounded park into the normal blocked-retry path
+                        # keeps the poll loop's liveness heartbeat fed while
+                        # the ledger read catches up.
+                        print(
+                            "prism coordinator: reconcile prefetch join "
+                            f"exceeded {join_timeout:.0f}s; retrying "
+                            "refresh pass while it completes",
+                            flush=True,
+                        )
+                        raise
                     if reorg_reconciled and (
                         int(getattr(self, "tip_detection_epoch", 0))
                         != reconcile_detection_epoch

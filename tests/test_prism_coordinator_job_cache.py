@@ -7767,6 +7767,44 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
         self.assertIn("untrusted", str(raised.exception))
         self.assertIsNone(state.active_job)
 
+    def test_tip_refresh_join_bounds_a_stalled_reconcile_prefetch(self) -> None:
+        # The overlap join must never park the poll loop on a crawling
+        # prefetched pass: it times out into the normal blocked-retry path,
+        # the slot retains the still-running future for the retry to
+        # re-join, and the pass completing unblocks the next poll.
+        server, rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.reconcile_prefetch_join_timeout_seconds = 0.05
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_ensure(tip_hash: str) -> bool:
+            started.set()
+            assert release.wait(10.0)
+            return True
+
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            slow_ensure
+        )
+        try:
+            join_started = time.monotonic()
+            with self.assertRaises(TemplateRefreshBlocked):
+                server.poll_qbit_tip_template_once()
+            self.assertLess(time.monotonic() - join_started, 5.0)
+            self.assertTrue(started.is_set())
+            with server._reconcile_prefetch_executor_lock:
+                pending = server._reconcile_prefetch_pending
+            self.assertIsNotNone(pending)
+            assert pending is not None
+            self.assertFalse(pending[1].done())
+
+            release.set()
+            self.assertTrue(pending[1].result(5.0))
+            server.poll_qbit_tip_template_once()
+        finally:
+            release.set()
+            server.shutdown_reconcile_prefetch_executor()
+
     def test_reconcile_prefetch_slot_is_reused_across_failed_attempts(self) -> None:
         # A refresh attempt that dies before its join (template-RPC outage)
         # must not queue another serialized pass per retry: the slot holds
