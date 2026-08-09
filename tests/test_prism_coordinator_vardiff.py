@@ -10357,7 +10357,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         server.watchdog_interval_seconds = 15.0
         return server
 
-    def test_block_candidate_progress_stamps_submitter_heartbeat(self) -> None:
+    def test_block_candidate_progress_stamps_only_on_submitter_thread(self) -> None:
         server = self._bare_coordinator()
         clock = {"now": 1000.0}
         with patch(
@@ -10369,53 +10369,109 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             self.assertEqual(
                 server._overdue_heartbeats(clock["now"]), ["block_submitter"]
             )
+            # Without a registered owner the helper never stamps.
+            server._record_block_candidate_progress()
+            self.assertEqual(
+                server._overdue_heartbeats(clock["now"]), ["block_submitter"]
+            )
+            # The owner thread's stamps clear the overdue state.
+            server._block_submitter_thread_ident = threading.get_ident()
             server._record_block_candidate_progress()
             self.assertEqual(server._overdue_heartbeats(clock["now"]), [])
 
-    def test_block_candidate_evidence_wait_is_excused_from_liveness_budget(
-        self,
-    ) -> None:
+    def test_client_thread_disposition_cannot_mask_frozen_submitter(self) -> None:
         server = self._bare_coordinator()
-        server.watchdog_timeout_seconds = 0.05
+        clock = {"now": 1000.0}
+        owner_ready = threading.Event()
+        release_owner = threading.Event()
+
+        def frozen_owner() -> None:
+            server._block_submitter_thread_ident = threading.get_ident()
+            server._record_heartbeat("block_submitter")
+            owner_ready.set()
+            release_owner.wait(5)
+
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            owner = threading.Thread(target=frozen_owner)
+            owner.start()
+            try:
+                self.assertTrue(owner_ready.wait(5))
+                clock["now"] += server.watchdog_timeout_seconds + 1.0
+                self.assertEqual(
+                    server._overdue_heartbeats(clock["now"]), ["block_submitter"]
+                )
+                # A client connection thread reaching a disposition boundary
+                # (synchronous below-target solve) must not refresh the
+                # frozen dedicated thread's liveness budget.
+                foreign = threading.Thread(
+                    target=server._record_block_candidate_progress
+                )
+                foreign.start()
+                foreign.join(5)
+                self.assertEqual(
+                    server._overdue_heartbeats(clock["now"]), ["block_submitter"]
+                )
+            finally:
+                release_owner.set()
+                owner.join(5)
+
+    def test_wedged_evidence_read_stays_watchdog_eligible(self) -> None:
+        server = self._bare_coordinator()
+        clock = {"now": 1000.0}
         entered = threading.Event()
         release = threading.Event()
-        results: list[tuple[int, int]] = []
 
-        def slow_stats() -> tuple[int, int]:
+        def wedged_stats() -> tuple[int, int]:
             entered.set()
             if not release.wait(5):
                 raise AssertionError("evidence read was not released")
             return (7, 3)
 
-        server.accepted_share_stats = slow_stats  # type: ignore[method-assign]
-        server._record_heartbeat("block_submitter")
-
-        reader = threading.Thread(
-            target=lambda: results.append(server._block_candidate_evidence_counts())
-        )
-        reader.start()
-        try:
-            self.assertTrue(entered.wait(5))
-            # The read outlives the liveness budget many times over without
-            # the submitter ever becoming watchdog-eligible.
-            deadline = time.monotonic() + 0.2
-            while time.monotonic() < deadline:
+        server.accepted_share_stats = wedged_stats  # type: ignore[method-assign]
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            server._record_heartbeat("block_submitter")
+            reader = threading.Thread(target=server.accepted_share_stats)
+            reader.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                clock["now"] += server.watchdog_timeout_seconds + 1.0
+                # A blocked evidence read is deliberately NOT excused from
+                # the liveness budget: exit-and-replay is the recovery path
+                # for a genuinely wedged ledger read, and no disposition
+                # code may pause the submitter's heartbeat to hide it.
                 self.assertEqual(
-                    server._overdue_heartbeats(time.monotonic()), []
+                    server._overdue_heartbeats(clock["now"]), ["block_submitter"]
                 )
-                time.sleep(0.01)
-        finally:
-            release.set()
-            reader.join(5)
+                self.assertNotIn("block_submitter", server._watchdog_pauses)
+            finally:
+                release.set()
+                reader.join(5)
 
-        self.assertFalse(reader.is_alive())
-        self.assertEqual(results, [(7, 3)])
-        # The resume stamp restarts the budget rather than extending the
-        # exemption: a genuinely silent submitter is eligible again.
-        self.assertEqual(
-            server._overdue_heartbeats(time.monotonic() + 1.0),
-            ["block_submitter"],
+    def test_metrics_include_accepted_stats_reconcile_status(self) -> None:
+        server = self._bare_coordinator()
+        server.ledger = SimpleNamespace(
+            accepted_stats_reconcile_status=lambda: {
+                "age_seconds": 12.5,
+                "failures": 3,
+            }
         )
+        lines = server._accepted_stats_reconcile_metric_lines()
+        self.assertIn(
+            "qbit_prism_accepted_stats_reconcile_failures_total 3", lines
+        )
+        self.assertIn(
+            "qbit_prism_accepted_stats_reconcile_age_seconds 12.500000", lines
+        )
+        # Ledgers without the accessor (file-backed, duck-typed) emit no
+        # reconcile lines rather than failing the scrape.
+        server.ledger = SimpleNamespace()
+        self.assertEqual(server._accepted_stats_reconcile_metric_lines(), [])
 
     def test_positive_float_env_rejects_non_finite_values(self) -> None:
         for raw in ("nan", "inf", "-inf"):

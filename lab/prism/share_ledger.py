@@ -1386,6 +1386,7 @@ class PsqlShareLedger:
         self._stats_note_buffer: dict[int, bool] | None = None
         self._stats_refreshed_monotonic: float | None = None
         self._stats_background_refresh_thread: Thread | None = None
+        self._stats_reconcile_failures = 0
         self._native = self._make_native_client(
             native_client_mode,
             database_url,
@@ -2252,7 +2253,34 @@ WHERE accepted;
         except BaseException:
             # Readers keep the last reconciled counters, which every append
             # still advances; the next expired read arms another attempt.
+            # Failures no longer surface as caller errors, so they are
+            # counted for accepted_stats_reconcile_status instead.
+            stats_lock = getattr(self, "_stats_lock", None)
+            if stats_lock is not None:
+                with stats_lock:
+                    self._stats_reconcile_failures = (
+                        getattr(self, "_stats_reconcile_failures", 0) + 1
+                    )
             traceback.print_exc()
+
+    def accepted_stats_reconcile_status(self) -> dict[str, float | int | None]:
+        """Expose reconcile liveness for metrics and alerting.
+
+        Serving maintained counters means a failing aggregate is no longer
+        visible as caller errors, and a wedged reconcile thread occupies the
+        single-flight slot until the process restarts. Both conditions
+        surface here: ``failures`` counts failed background passes, and
+        ``age_seconds`` grows while no reconcile publishes -- including
+        while one is wedged -- so alerting can page on either.
+        """
+        stats_lock = getattr(self, "_stats_lock", None)
+        if stats_lock is None:
+            return {"age_seconds": None, "failures": 0}
+        with stats_lock:
+            refreshed = self._stats_refreshed_monotonic
+            failures = int(getattr(self, "_stats_reconcile_failures", 0))
+        age = None if refreshed is None else max(0.0, time.monotonic() - refreshed)
+        return {"age_seconds": age, "failures": failures}
 
     def _query_accepted_share_stats(self) -> tuple[dict[str, int], int]:
         sql = """
