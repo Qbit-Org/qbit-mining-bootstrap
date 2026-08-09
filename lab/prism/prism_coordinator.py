@@ -22264,6 +22264,29 @@ class PrismCoordinator:
         with self._block_candidate_disposition(block_hash):
             return self._submit_block_candidate_serialized(candidate)
 
+    def _record_block_candidate_progress(self) -> None:
+        """Stamp the submitter heartbeat at a candidate-disposition boundary.
+
+        A disposition crosses several ledger and filesystem writes that slow
+        down together under database pressure. Stamping each completed phase
+        keeps a progressing disposition inside the liveness budget, while a
+        wedged phase still leaves the watchdog able to recover the process --
+        the same shape as the CTV broadcaster's per-row stamping.
+        """
+        self._record_heartbeat("block_submitter")
+
+    def _block_candidate_evidence_counts(self) -> tuple[int, int]:
+        """Read the evidence counters without tripping the liveness watchdog.
+
+        The counters are served from the ledger's maintained cache, but a
+        cold cache (first read after process start) runs the exact
+        full-history aggregate. That wait is legitimate work rather than a
+        hang, so it is excused from the liveness budget the way paused
+        subsystems are; the resume stamp restarts the budget afterwards.
+        """
+        with self._watchdog_paused("block_submitter"):
+            return self.accepted_share_stats()
+
     def _submit_block_candidate_serialized(
         self,
         candidate: PrismBlockCandidate,
@@ -22282,6 +22305,7 @@ class PrismCoordinator:
         block_hash = str(submission.block_hash_hex).lower()
         parent_hash = str(context.template["previousblockhash"])
         self._ensure_job_cache_state()
+        self._record_block_candidate_progress()
         # Every disposition (queue drain, synchronous below-target submit,
         # outbox replay, retained retry) marks its hash outstanding so tip
         # observations arriving on other threads can register acceptance.
@@ -22313,6 +22337,7 @@ class PrismCoordinator:
             )
             return False
         current_tip = str(self.rpc.call("getbestblockhash"))
+        self._record_block_candidate_progress()
         landed_height: int | None = None
         if current_tip.lower() == block_hash:
             landed_height = expected_height
@@ -22375,6 +22400,7 @@ class PrismCoordinator:
         if landed is None:
             return False
         final_bundle, report, persistence, confirmation = landed
+        self._record_block_candidate_progress()
         with self.lock:
             already_accounted = block_hash in self._accounted_accepted_block_hashes
         if already_accounted:
@@ -22391,6 +22417,7 @@ class PrismCoordinator:
                 manifest_set=ctv_manifest_set,
                 manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
             )
+        self._record_block_candidate_progress()
         final_bundle_path = (
             self.audit_dir
             / f"prism-live-audit-bundle-{expected_height}-{block_hash}.json"
@@ -22403,6 +22430,7 @@ class PrismCoordinator:
             persistence=persistence,
         )
         self.prune_audit_artifacts(keep_live_path=final_bundle_path)
+        self._record_block_candidate_progress()
         bundle_path = final_bundle_path
         if candidate.credit_share_on_accept:
             self.append_accepted_share(
@@ -22412,10 +22440,13 @@ class PrismCoordinator:
                 candidate.pending_share,
                 candidate_intent=self.block_candidate_intent(candidate),
             )
+        self._record_block_candidate_progress()
         # Aggregate counts only: materializing the whole share history
         # (all_shares) here would scan the full ledger twice per block,
         # and would grow without bound as the ledger grows.
-        evidence_share_count, evidence_distinct_miners = self.accepted_share_stats()
+        evidence_share_count, evidence_distinct_miners = (
+            self._block_candidate_evidence_counts()
+        )
         evidence = {
             "schema": "qbit.prism.live-stratum-evidence.v1",
             "block_hash": block_hash,
@@ -22432,6 +22463,7 @@ class PrismCoordinator:
             "job_share_count": len(context.shares_json),
         }
         self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        self._record_block_candidate_progress()
         with self.lock:
             newly_accounted = block_hash not in self._accounted_accepted_block_hashes
             if newly_accounted:

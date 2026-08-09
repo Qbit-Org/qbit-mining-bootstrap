@@ -12,13 +12,14 @@ import math
 import shlex
 import subprocess
 import time
+import traceback
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from threading import BoundedSemaphore, Lock
+from threading import BoundedSemaphore, Lock, Thread
 from typing import Any, Callable, Iterator
 
 from lab.prism.prism_tools import prism_tool_command
@@ -1384,6 +1385,7 @@ class PsqlShareLedger:
         self._stats_max_share_seq = 0
         self._stats_note_buffer: dict[int, bool] | None = None
         self._stats_refreshed_monotonic: float | None = None
+        self._stats_background_refresh_thread: Thread | None = None
         self._native = self._make_native_client(
             native_client_mode,
             database_url,
@@ -2150,6 +2152,15 @@ WHERE accepted;
         and the counters are reconciled against the database once per
         ``accepted_stats_cache_seconds`` in case anything mutated rows out of
         band (e.g. reorg reversals flipping ``accepted``).
+
+        Reconciliation never blocks a reader that already has counters: an
+        expired read returns the maintained counters immediately and arms a
+        single background refresh. The full-history aggregate takes minutes
+        on a grown ledger, and parking the first expired caller handed that
+        wait to whichever subsystem lost the race -- metrics scrapes,
+        readiness gates, and block-candidate evidence all read these
+        counters from latency-sensitive paths. Only the cold seed (no
+        counters yet) still waits for the exact aggregate.
         """
         ttl = getattr(self, "_accepted_stats_cache_seconds", 0.0)
         stats_lock = getattr(self, "_stats_lock", None)
@@ -2159,9 +2170,12 @@ WHERE accepted;
                 if (
                     self._stats_counts is not None
                     and self._stats_refreshed_monotonic is not None
-                    and now - self._stats_refreshed_monotonic <= ttl
                 ):
-                    return dict(self._stats_counts)
+                    if now - self._stats_refreshed_monotonic <= ttl:
+                        return dict(self._stats_counts)
+                    counters = dict(self._stats_counts)
+                    self._start_background_stats_reconcile_locked()
+                    return counters
         return self._refresh_accepted_share_stats()
 
     def _refresh_accepted_share_stats(self) -> dict[str, int]:
@@ -2212,6 +2226,33 @@ WHERE accepted;
                 self._stats_note_buffer = None
                 self._stats_refreshed_monotonic = time.monotonic()
                 return dict(self._stats_counts)
+
+    def _start_background_stats_reconcile_locked(self) -> None:
+        """Arm the reconcile aggregate unless one is already running.
+
+        Callers hold ``_stats_lock``. The thread slot, not
+        ``_stats_refresh_lock``, is the single-flight guard here: waiting on
+        the refresh lock would queue the caller behind the running
+        aggregate, which is exactly the wait the stale-serving read removes.
+        """
+        thread = getattr(self, "_stats_background_refresh_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        thread = Thread(
+            target=self._run_background_stats_reconcile,
+            name="prism-share-ledger-stats-reconcile",
+            daemon=True,
+        )
+        self._stats_background_refresh_thread = thread
+        thread.start()
+
+    def _run_background_stats_reconcile(self) -> None:
+        try:
+            self._refresh_accepted_share_stats()
+        except BaseException:
+            # Readers keep the last reconciled counters, which every append
+            # still advances; the next expired read arms another attempt.
+            traceback.print_exc()
 
     def _query_accepted_share_stats(self) -> tuple[dict[str, int], int]:
         sql = """

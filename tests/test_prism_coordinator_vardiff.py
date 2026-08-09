@@ -10357,6 +10357,66 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         server.watchdog_interval_seconds = 15.0
         return server
 
+    def test_block_candidate_progress_stamps_submitter_heartbeat(self) -> None:
+        server = self._bare_coordinator()
+        clock = {"now": 1000.0}
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            server._record_heartbeat("block_submitter")
+            clock["now"] += server.watchdog_timeout_seconds + 1.0
+            self.assertEqual(
+                server._overdue_heartbeats(clock["now"]), ["block_submitter"]
+            )
+            server._record_block_candidate_progress()
+            self.assertEqual(server._overdue_heartbeats(clock["now"]), [])
+
+    def test_block_candidate_evidence_wait_is_excused_from_liveness_budget(
+        self,
+    ) -> None:
+        server = self._bare_coordinator()
+        server.watchdog_timeout_seconds = 0.05
+        entered = threading.Event()
+        release = threading.Event()
+        results: list[tuple[int, int]] = []
+
+        def slow_stats() -> tuple[int, int]:
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("evidence read was not released")
+            return (7, 3)
+
+        server.accepted_share_stats = slow_stats  # type: ignore[method-assign]
+        server._record_heartbeat("block_submitter")
+
+        reader = threading.Thread(
+            target=lambda: results.append(server._block_candidate_evidence_counts())
+        )
+        reader.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            # The read outlives the liveness budget many times over without
+            # the submitter ever becoming watchdog-eligible.
+            deadline = time.monotonic() + 0.2
+            while time.monotonic() < deadline:
+                self.assertEqual(
+                    server._overdue_heartbeats(time.monotonic()), []
+                )
+                time.sleep(0.01)
+        finally:
+            release.set()
+            reader.join(5)
+
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(results, [(7, 3)])
+        # The resume stamp restarts the budget rather than extending the
+        # exemption: a genuinely silent submitter is eligible again.
+        self.assertEqual(
+            server._overdue_heartbeats(time.monotonic() + 1.0),
+            ["block_submitter"],
+        )
+
     def test_positive_float_env_rejects_non_finite_values(self) -> None:
         for raw in ("nan", "inf", "-inf"):
             with self.subTest(raw=raw), patch.dict(
