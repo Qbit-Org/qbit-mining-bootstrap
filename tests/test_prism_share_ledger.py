@@ -3496,6 +3496,16 @@ class AcceptedStatsCacheTests(unittest.TestCase):
             {"accepted_share_count": 10, "distinct_miner_count": 1},
         )
         time.sleep(0.06)
+        # The expired read stays non-blocking: it serves the maintained
+        # counters and arms the background reconcile that publishes the
+        # out-of-band correction.
+        self.assertEqual(
+            ledger.accepted_share_stats(),
+            {"accepted_share_count": 10, "distinct_miner_count": 1},
+        )
+        reconcile_thread = ledger._stats_background_refresh_thread
+        self.assertIsNotNone(reconcile_thread)
+        reconcile_thread.join(5)
         self.assertEqual(
             ledger.accepted_share_stats(),
             {"accepted_share_count": 4, "distinct_miner_count": 2},
@@ -3541,6 +3551,168 @@ class AcceptedStatsCacheTests(unittest.TestCase):
         self.assertIn("count(DISTINCT miner_id)", stats_sql)
         self.assertNotIn("json_agg(DISTINCT miner_id)", stats_sql)
 
+
+class AcceptedStatsBackgroundReconcileTests(unittest.TestCase):
+    def _expire_stats(self, ledger: CannedQueryPsqlShareLedger) -> None:
+        with ledger._stats_lock:
+            ledger._stats_refreshed_monotonic = (
+                time.monotonic() - ledger._accepted_stats_cache_seconds - 1.0
+            )
+
+    def test_expired_read_serves_counters_and_reconciles_in_background(self) -> None:
+        aggregate_started = threading.Event()
+        aggregate_can_return = threading.Event()
+
+        class SlowReconcileLedger(CannedQueryPsqlShareLedger):
+            block_aggregate = False
+
+            def _run_json(self, sql: str) -> Any:
+                if self.block_aggregate and "'max_share_seq'" in sql:
+                    self.queries.append(sql)
+                    aggregate_started.set()
+                    if not aggregate_can_return.wait(5):
+                        raise AssertionError("reconcile aggregate was not released")
+                    return stats_payload(40, 4, 12)
+                return super()._run_json(sql)
+
+        ledger = SlowReconcileLedger(
+            [
+                acquired_lease_result(),
+                stats_payload(10, 2, 10),
+                record_payload(3, share_seq=11, new_miner=True),
+                record_payload(4, share_seq=12),
+                record_payload(5, share_seq=13),
+            ],
+            accepted_stats_cache_seconds=60.0,
+        )
+        seeded = ledger.accepted_share_stats()
+        self.assertEqual(
+            seeded, {"accepted_share_count": 10, "distinct_miner_count": 2}
+        )
+        self.assertIsNone(ledger._stats_background_refresh_thread)
+
+        self._expire_stats(ledger)
+        ledger.block_aggregate = True
+
+        # The expired read returns a private copy of the maintained
+        # counters without waiting for the aggregate it armed.
+        stale = ledger.accepted_share_stats()
+        self.assertEqual(stale, seeded)
+        stale["accepted_share_count"] = -1
+        self.assertEqual(
+            ledger.accepted_share_stats()["accepted_share_count"], 10
+        )
+        self.assertTrue(aggregate_started.wait(5))
+        reconcile_thread = ledger._stats_background_refresh_thread
+        self.assertIsNotNone(reconcile_thread)
+        self.assertTrue(reconcile_thread.daemon)
+        try:
+            # While the aggregate is blocked, the serialized writer commits
+            # and readers observe its notes immediately -- and repeated
+            # expired reads reuse the single in-flight reconcile. The three
+            # appends straddle the reconcile snapshot's watermark of 12:
+            # sequences 11 and 12 are inside the snapshot, 13 is newer.
+            ledger.append(pending_share(3))
+            ledger.append(pending_share(4))
+            ledger.append(pending_share(5))
+            self.assertEqual(
+                ledger.accepted_share_stats(),
+                {"accepted_share_count": 13, "distinct_miner_count": 3},
+            )
+            self.assertIs(ledger._stats_background_refresh_thread, reconcile_thread)
+        finally:
+            aggregate_can_return.set()
+            reconcile_thread.join(5)
+        self.assertFalse(reconcile_thread.is_alive())
+
+        # The reconcile publishes aggregate plus replayed notes: sequences
+        # 11 and 12 sit at or below the snapshot watermark (12 exactly at
+        # the boundary guards the <= comparison) and are suppressed, while
+        # sequence 13 is replayed on top of the aggregate.
+        self.assertEqual(
+            ledger.accepted_share_stats(),
+            {"accepted_share_count": 41, "distinct_miner_count": 4},
+        )
+        aggregate_queries = [
+            sql for sql in ledger.queries if "'max_share_seq'" in sql
+        ]
+        self.assertEqual(len(aggregate_queries), 2)
+
+    def test_failed_background_reconcile_keeps_serving_and_rearms(self) -> None:
+        class FlakyReconcileLedger(CannedQueryPsqlShareLedger):
+            fail_aggregate = False
+
+            def _run_json(self, sql: str) -> Any:
+                if self.fail_aggregate and "'max_share_seq'" in sql:
+                    self.queries.append(sql)
+                    raise RuntimeError("reconcile aggregate failed")
+                return super()._run_json(sql)
+
+        ledger = FlakyReconcileLedger(
+            [
+                acquired_lease_result(),
+                stats_payload(10, 2, 10),
+                stats_payload(20, 3, 15),
+            ],
+            accepted_stats_cache_seconds=60.0,
+        )
+        seeded = ledger.accepted_share_stats()
+        self.assertEqual(
+            seeded, {"accepted_share_count": 10, "distinct_miner_count": 2}
+        )
+        status = ledger.accepted_stats_reconcile_status()
+        self.assertEqual(status["failures"], 0)
+        self.assertIsNotNone(status["age_seconds"])
+        self.assertLess(status["age_seconds"], 5.0)
+
+        self._expire_stats(ledger)
+        # Reconcile age keeps growing while no pass publishes, so alerting
+        # can see a stale (or wedged) reconcile that callers no longer feel.
+        self.assertGreater(
+            ledger.accepted_stats_reconcile_status()["age_seconds"], 60.0
+        )
+        ledger.fail_aggregate = True
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.traceback.print_exc"
+        ) as print_exc:
+            self.assertEqual(ledger.accepted_share_stats(), seeded)
+            failed_thread = ledger._stats_background_refresh_thread
+            self.assertIsNotNone(failed_thread)
+            failed_thread.join(5)
+        self.assertFalse(failed_thread.is_alive())
+        print_exc.assert_called_once()
+        self.assertEqual(
+            ledger.accepted_stats_reconcile_status()["failures"], 1
+        )
+
+        # The failure left the counters stale, so the next read arms a new
+        # reconcile; a successful pass then publishes the fresh aggregate.
+        ledger.fail_aggregate = False
+        self.assertEqual(ledger.accepted_share_stats(), seeded)
+        retry_thread = ledger._stats_background_refresh_thread
+        self.assertIsNot(retry_thread, failed_thread)
+        retry_thread.join(5)
+        self.assertEqual(
+            ledger.accepted_share_stats(),
+            {"accepted_share_count": 20, "distinct_miner_count": 3},
+        )
+        final_status = ledger.accepted_stats_reconcile_status()
+        self.assertEqual(final_status["failures"], 1)
+        self.assertLess(final_status["age_seconds"], 5.0)
+
+    def test_cold_seed_still_runs_exact_aggregate_synchronously(self) -> None:
+        ledger = CannedQueryPsqlShareLedger(
+            [acquired_lease_result(), stats_payload(5, 1, 4)],
+            accepted_stats_cache_seconds=60.0,
+        )
+        self.assertIsNone(
+            ledger.accepted_stats_reconcile_status()["age_seconds"]
+        )
+        self.assertEqual(
+            ledger.accepted_share_stats(),
+            {"accepted_share_count": 5, "distinct_miner_count": 1},
+        )
+        self.assertIsNone(ledger._stats_background_refresh_thread)
 
 
 if __name__ == "__main__":

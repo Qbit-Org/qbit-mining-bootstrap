@@ -20752,9 +20752,12 @@ class PrismCoordinator:
     def _wait_for_block_candidate_retry(self, delay_seconds: float) -> bool:
         """Wait for intentional backoff without impersonating stuck work.
 
-        Only this bounded retry wait refreshes the submitter heartbeat. SQL,
-        RPC, audit/finalization, and socket phases call no helper here, so a
-        genuinely blocked candidate phase remains watchdog-eligible.
+        Only this bounded retry wait and the owner-thread boundary stamps in
+        ``_record_block_candidate_progress`` refresh the submitter
+        heartbeat, and every boundary stamp follows completed work. SQL,
+        RPC, audit/finalization, and socket phases call no helper while they
+        run, so a genuinely blocked candidate phase remains
+        watchdog-eligible.
         """
         delay_seconds = max(0.0, float(delay_seconds))
         if delay_seconds <= 0:
@@ -20839,6 +20842,10 @@ class PrismCoordinator:
                     self._block_candidate_disposition_flights.pop(key, None)
 
     def block_submit_loop(self) -> None:
+        # Boundary stamps in _record_block_candidate_progress are gated to
+        # this thread so client-thread dispositions cannot refresh the
+        # submitter's liveness budget on its behalf.
+        self._block_submitter_thread_ident = threading.get_ident()
         while not self.stop_event.is_set():
             self._record_heartbeat("block_submitter")
             try:
@@ -22264,6 +22271,26 @@ class PrismCoordinator:
         with self._block_candidate_disposition(block_hash):
             return self._submit_block_candidate_serialized(candidate)
 
+    def _record_block_candidate_progress(self) -> None:
+        """Stamp the submitter heartbeat at a candidate-disposition boundary.
+
+        Stamps come only from the dedicated submitter thread: dispositions
+        also run on client connection threads (synchronous below-target
+        solves), and a stamp from those threads would refresh the
+        ``block_submitter`` budget while the dedicated thread might be
+        wedged elsewhere. A disposition crosses several ledger and
+        filesystem writes that slow down together under database pressure;
+        stamping each completed phase on the owner thread keeps a
+        progressing disposition inside the liveness budget while a wedged
+        phase still leaves the watchdog able to recover the process -- the
+        same shape as the CTV broadcaster's per-row stamping, whose name
+        likewise maps to a single thread.
+        """
+        owner = getattr(self, "_block_submitter_thread_ident", None)
+        if owner is None or threading.get_ident() != owner:
+            return
+        self._record_heartbeat("block_submitter")
+
     def _submit_block_candidate_serialized(
         self,
         candidate: PrismBlockCandidate,
@@ -22286,6 +22313,7 @@ class PrismCoordinator:
         # outbox replay, retained retry) marks its hash outstanding so tip
         # observations arriving on other threads can register acceptance.
         self._register_outstanding_block_candidate(block_hash)
+        self._record_block_candidate_progress()
         with self.lock:
             pool_closed = (
                 self.accepted_block_count >= self.max_blocks
@@ -22313,6 +22341,7 @@ class PrismCoordinator:
             )
             return False
         current_tip = str(self.rpc.call("getbestblockhash"))
+        self._record_block_candidate_progress()
         landed_height: int | None = None
         if current_tip.lower() == block_hash:
             landed_height = expected_height
@@ -22375,6 +22404,7 @@ class PrismCoordinator:
         if landed is None:
             return False
         final_bundle, report, persistence, confirmation = landed
+        self._record_block_candidate_progress()
         with self.lock:
             already_accounted = block_hash in self._accounted_accepted_block_hashes
         if already_accounted:
@@ -22391,6 +22421,7 @@ class PrismCoordinator:
                 manifest_set=ctv_manifest_set,
                 manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
             )
+            self._record_block_candidate_progress()
         final_bundle_path = (
             self.audit_dir
             / f"prism-live-audit-bundle-{expected_height}-{block_hash}.json"
@@ -22403,6 +22434,7 @@ class PrismCoordinator:
             persistence=persistence,
         )
         self.prune_audit_artifacts(keep_live_path=final_bundle_path)
+        self._record_block_candidate_progress()
         bundle_path = final_bundle_path
         if candidate.credit_share_on_accept:
             self.append_accepted_share(
@@ -22412,9 +22444,15 @@ class PrismCoordinator:
                 candidate.pending_share,
                 candidate_intent=self.block_candidate_intent(candidate),
             )
+            self._record_block_candidate_progress()
         # Aggregate counts only: materializing the whole share history
         # (all_shares) here would scan the full ledger twice per block,
-        # and would grow without bound as the ledger grows.
+        # and would grow without bound as the ledger grows. The counters are
+        # served from the ledger's maintained cache; a cold cache (first
+        # read after process start) runs the exact aggregate synchronously
+        # and stays watchdog-eligible on purpose, so a wedged read keeps the
+        # exit-and-replay recovery path instead of hanging the disposition
+        # invisibly.
         evidence_share_count, evidence_distinct_miners = self.accepted_share_stats()
         evidence = {
             "schema": "qbit.prism.live-stratum-evidence.v1",
@@ -22432,6 +22470,7 @@ class PrismCoordinator:
             "job_share_count": len(context.shares_json),
         }
         self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        self._record_block_candidate_progress()
         with self.lock:
             newly_accounted = block_hash not in self._accounted_accepted_block_hashes
             if newly_accounted:
@@ -23684,6 +23723,33 @@ class PrismCoordinator:
             f"qbit_prism_block_submitter_retry_backoff_seconds {backoff_delay:.6f}",
         ]
 
+    def _accepted_stats_reconcile_metric_lines(self) -> list[str]:
+        """Surface reconcile liveness now that failures no longer raise.
+
+        Serving maintained counters means a failing or wedged reconcile is
+        invisible to callers, so its age and failure count must be visible
+        to scrapes for alerting instead.
+        """
+        status_fn = getattr(self.ledger, "accepted_stats_reconcile_status", None)
+        if not callable(status_fn):
+            return []
+        status = status_fn()
+        lines = [
+            "# HELP qbit_prism_accepted_stats_reconcile_failures_total Failed background accepted-stats reconcile passes.",
+            "# TYPE qbit_prism_accepted_stats_reconcile_failures_total counter",
+            f"qbit_prism_accepted_stats_reconcile_failures_total {int(status.get('failures') or 0)}",
+        ]
+        age = status.get("age_seconds")
+        if age is not None:
+            lines.extend(
+                [
+                    "# HELP qbit_prism_accepted_stats_reconcile_age_seconds Seconds since the accepted-share counters were last reconciled against the ledger.",
+                    "# TYPE qbit_prism_accepted_stats_reconcile_age_seconds gauge",
+                    f"qbit_prism_accepted_stats_reconcile_age_seconds {float(age):.6f}",
+                ]
+            )
+        return lines
+
     def metrics_payload(self) -> str:
         ledger_metrics = self.ledger.metrics()
         audit_metrics = self.audit_artifact_metrics()
@@ -23802,6 +23868,7 @@ class PrismCoordinator:
             "# HELP qbit_prism_accepted_shares_total Accepted shares recorded by the canonical PRISM ledger.",
             "# TYPE qbit_prism_accepted_shares_total counter",
             f"qbit_prism_accepted_shares_total {accepted_share_count}",
+            *self._accepted_stats_reconcile_metric_lines(),
             "# HELP qbit_prism_submitted_shares_total Stratum share submissions seen by the PRISM coordinator.",
             "# TYPE qbit_prism_submitted_shares_total counter",
             f"qbit_prism_submitted_shares_total {submitted_share_count}",
