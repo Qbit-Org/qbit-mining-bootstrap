@@ -26743,7 +26743,9 @@ class PrismCoordinator:
                 revalidated_append_epoch = revalidation_base_epoch
             landed = self._land_and_confirm_block_candidate(
                 candidate,
-                current_tip=current_tip,
+                # Fresh-attempt classification may use the stamped parent, but
+                # payout reconciliation must follow the observed post-submit tip.
+                current_tip=observed_tip,
                 already_active=already_active,
                 worker=worker,
                 node_submission=node_submission,

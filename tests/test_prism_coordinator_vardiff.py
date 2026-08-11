@@ -8856,6 +8856,65 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.persisted), 1)
         self.assertEqual(len(ledger.confirmed), 1)
 
+    def test_successful_fast_lane_reconciles_observed_post_submit_tip(self) -> None:
+        parent_hash = "00" * 32
+        block_hash = "cd" * 32
+        server, state, ledger = submit_coordinator(tip=parent_hash)
+        server.stop_after_block = False
+        server.max_blocks = 10
+        server.rpc = SubmitAcceptingTemplateRpc(
+            old_tip=parent_hash,
+            block_hash=block_hash,
+            ledger=ledger,
+        )
+        reconciled: list[tuple[str, bool]] = []
+        landing_inputs: list[tuple[str, bool]] = []
+
+        def reconcile(
+            tip_hash: str,
+            *,
+            _coalesce_same_tip: bool = True,
+        ) -> bool:
+            reconciled.append((tip_hash, _coalesce_same_tip))
+            return True
+
+        original_land = server._land_and_confirm_block_candidate
+
+        def observe_landing(
+            candidate: PrismBlockCandidate,
+            **kwargs: object,
+        ) -> object:
+            landing_inputs.append(
+                (str(kwargs["current_tip"]), bool(kwargs["already_active"]))
+            )
+            return original_land(candidate, **kwargs)  # type: ignore[arg-type]
+
+        server.ensure_reorg_reconciled_for_tip = reconcile  # type: ignore[method-assign]
+        server._land_and_confirm_block_candidate = observe_landing  # type: ignore[method-assign]
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: verified_audit_report()
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            accepted = server.submit_block_candidate(
+                block_candidate(server, state, submission)
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(landing_inputs, [(block_hash, False)])
+        self.assertEqual(reconciled, [(block_hash, False)])
+
     def test_submitter_offers_block_before_writer_admission_with_rpc_deadline(self) -> None:
         server, state, _ledger = submit_coordinator()
         server.block_submit_rpc_timeout_seconds = 0.75
