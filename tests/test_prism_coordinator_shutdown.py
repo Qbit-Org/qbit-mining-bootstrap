@@ -84,6 +84,35 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
 
         thread.assert_not_called()
 
+    def test_lease_heartbeat_start_fails_closed_when_required_guard_lost(
+        self,
+    ) -> None:
+        class LostGuardAtStartupLedger(HeartbeatLeaseLedger):
+            writer_lease_fast_adoption_capable = False
+
+        server = coordinator(LostGuardAtStartupLedger())
+
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
+            self.assertIsNone(server._start_ledger_lease_heartbeat())
+
+        hard_exit.assert_called_once()
+
+    def test_lease_heartbeat_start_skips_guardless_ledger_without_exit(
+        self,
+    ) -> None:
+        server = coordinator(RecordingLeaseLedger())
+
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
+            self.assertIsNone(server._start_ledger_lease_heartbeat())
+
+        hard_exit.assert_not_called()
+
     def test_external_side_effect_gate_fails_closed_after_guard_loss(self) -> None:
         class LostGuardLedger(HeartbeatLeaseLedger):
             def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:

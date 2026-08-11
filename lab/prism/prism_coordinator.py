@@ -11032,12 +11032,35 @@ class PrismCoordinator:
         if existing is not None and existing.is_alive():
             return existing
         ledger = getattr(self, "ledger", None)
+        guard_required = bool(
+            getattr(ledger, "writer_lease_guard_required", False)
+        )
         if not bool(
             getattr(ledger, "writer_lease_fast_adoption_capable", False)
         ):
+            if guard_required:
+                # The session token published to the lease row promises a
+                # guarded heartbeat session, but the advisory guard is already
+                # gone (for example the dedicated connection dropped between
+                # ledger construction and serve()). Continuing would let a
+                # replacement adopt the lease after one silence window while
+                # this process keeps running as a fenced zombie.
+                self._ledger_lease_heartbeat_hard_exit(
+                    "prism coordinator: writer lease guard was lost before "
+                    "the lease heartbeat started; hard-exiting so a "
+                    "replacement does not adopt while this process is live",
+                    include_traceback=False,
+                )
             return None
         renew = getattr(ledger, "renew_writer_lease_heartbeat", None)
         if renew is None:
+            if guard_required:
+                self._ledger_lease_heartbeat_hard_exit(
+                    "prism coordinator: writer lease guard requires a "
+                    "heartbeat but the ledger cannot renew on the guarded "
+                    "session; hard-exiting instead of running unguarded",
+                    include_traceback=False,
+                )
             return None
         armed_started_monotonic = time.monotonic()
         self._ledger_lease_heartbeat_last_success_monotonic = (
