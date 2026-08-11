@@ -631,6 +631,7 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             )
             assert advanced is not None
             self.assertEqual(advanced.window_build_mode, "incremental")
+            self.assertTrue(server._install_payout_ledger_artifact(advanced))
             anchor_ms = int(advanced.snapshot_anchor_ms)
 
             entry = self.replay_shaped_append_entry(
@@ -639,6 +640,17 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             )
             self.assertTrue(server._append_share_batch([entry]))
             self.assertIsNone(server._incremental_payout_artifact_window)
+            with server._job_cache_lock:
+                self.assertIsNone(server._payout_ledger_artifact)
+            self.assertFalse(server._install_payout_ledger_artifact(advanced))
+            self.assertIsNone(
+                server._cached_found_block_payout_artifact(
+                    base_generation=0,
+                    artifact_payout_state_generation=1,
+                    network_difficulty=artifacts.network_difficulty,
+                    fallback_reason="prepare_lock_busy",
+                )
+            )
 
             clock_ms[0] = 1_000_040
             rebuilt = server._build_payout_ledger_artifact(
@@ -657,6 +669,128 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             {str(share["share_id"]) for share in rebuilt.shares_json},
         )
 
+    def test_late_append_disarms_before_prepare_lock_is_available(self) -> None:
+        server, _ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            artifact = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert artifact is not None
+            self.assertTrue(server._install_payout_ledger_artifact(artifact))
+            anchor_ms = int(artifact.snapshot_anchor_ms)
+            pending = stamped_pending_share(anchor_ms - 10)
+
+            server._payout_state_prepare_lock.acquire()
+            # Exercise the artifact anchor independently: an already-cold
+            # incremental cache must not hide an unsafe armed artifact.
+            server._incremental_payout_artifact_window = None
+            invalidation_finished = threading.Event()
+
+            def invalidate() -> None:
+                server._invalidate_incremental_payout_window_for_append(
+                    pending
+                )
+                invalidation_finished.set()
+
+            thread = threading.Thread(target=invalidate)
+            thread.start()
+            try:
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    with server._job_cache_lock:
+                        if server._payout_ledger_artifact is None:
+                            break
+                    time.sleep(0.001)
+                with server._job_cache_lock:
+                    self.assertIsNone(server._payout_ledger_artifact)
+                    self.assertGreater(
+                        server._payout_ledger_append_invalidation_epoch,
+                        artifact.append_invalidation_epoch,
+                    )
+                self.assertFalse(invalidation_finished.is_set())
+                self.assertFalse(
+                    server._install_payout_ledger_artifact(artifact)
+                )
+            finally:
+                server._payout_state_prepare_lock.release()
+                thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(invalidation_finished.is_set())
+
+    def test_atomic_publication_rejects_pre_append_artifact(self) -> None:
+        server, _ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            candidate = server._current_payout_state_candidate()
+            stale = candidate.ledger_artifact
+            assert stale is not None
+            anchor_ms = int(stale.snapshot_anchor_ms)
+            server._invalidate_incremental_payout_window_for_append(
+                stamped_pending_share(anchor_ms - 10)
+            )
+            with server._payout_artifact_executor_lock:
+                server._payout_artifact_executor_shutdown = True
+            published = server._publish_payout_state_candidate(candidate)
+
+        self.assertIsNotNone(published)
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+            self.assertGreater(
+                server._payout_ledger_append_invalidation_epoch,
+                stale.append_invalidation_epoch,
+            )
+
+    def test_late_append_supersedes_in_flight_sync_seed_bundle(self) -> None:
+        server, _ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            artifact = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert artifact is not None
+            self.assertTrue(server._install_payout_ledger_artifact(artifact))
+            pending = stamped_pending_share(
+                int(artifact.snapshot_anchor_ms) - 10
+            )
+
+            def invalidating_builder(**kwargs: object) -> dict[str, object]:
+                server._invalidate_incremental_payout_window_for_append(
+                    pending
+                )
+                suffix_hex = str(kwargs["coinbase_script_sig_suffix_hex"])
+                return {
+                    "found_block": dict(kwargs["found_block"]),
+                    "payout_policy_manifest": {"accounts": []},
+                    "signed_coinbase_manifest": {
+                        "manifest": {
+                            "coinbase_tx_hex": synthetic_manifest_coinbase_hex(
+                                suffix_hex
+                            ),
+                        }
+                    },
+                }
+
+            server.build_audit_bundle = invalidating_builder  # type: ignore[method-assign]
+            with self.assertRaises(JobBuildSuperseded):
+                server.build_shared_job_bundle(
+                    artifacts,
+                    worker(),
+                    payout_artifact=None,
+                )
+
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+
     def test_normal_append_preserves_incremental_window(self) -> None:
         server, ledger, artifacts = self.configured_server()
         clock_ms = [1_000_000]
@@ -670,6 +804,13 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             assert initial is not None
             cached = server._incremental_payout_artifact_window
             self.assertIsNotNone(cached)
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+            with server._job_cache_lock:
+                armed = server._payout_ledger_artifact
+                append_epoch = (
+                    server._payout_ledger_append_invalidation_epoch
+                )
+            self.assertIsNotNone(armed)
 
             entry = self.replay_shaped_append_entry(
                 accepted_at_ms=1_000_010,
@@ -677,6 +818,19 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             )
             self.assertTrue(server._append_share_entry(entry))
             self.assertIs(server._incremental_payout_artifact_window, cached)
+            with server._job_cache_lock:
+                self.assertIs(server._payout_ledger_artifact, armed)
+                self.assertEqual(
+                    server._payout_ledger_append_invalidation_epoch,
+                    append_epoch,
+                )
+            self.assertIs(
+                server._usable_payout_ledger_artifact(
+                    0,
+                    artifacts.network_difficulty,
+                ),
+                armed,
+            )
 
             server.payout_artifact_min_build_interval_seconds = 0.0
             clock_ms[0] = 1_000_020

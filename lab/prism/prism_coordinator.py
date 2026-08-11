@@ -1308,6 +1308,7 @@ class PrismJobContext:
     payout_state_generation: int = 0
     prospective_prior_balances: tuple[tuple[str, str, str, int], ...] | None = None
     payout_artifact_generation: int = 0
+    payout_append_invalidation_epoch: int = 0
     connection_id: int = 0
     authorization_generation: int = 0
     difficulty_generation: int = 0
@@ -1465,6 +1466,7 @@ class JobBuildKey:
     ledger_signing_key_sha256: str
     numeric_context_sha256: str
     share_snapshot_sha256: str = ""
+    payout_append_invalidation_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -1648,6 +1650,14 @@ class PayoutLedgerArtifact:
     # reused-build fences hash them twice more; the tuple is immutable, so
     # the O(accounts) canonicalization is paid once here instead.
     prior_balances_sha256: str | None = None
+    # Internal coordination token. A late-visible append can invalidate a
+    # previously exact anchored window without changing payout generation.
+    # Artifacts prepared before that append may never be armed again.
+    append_invalidation_epoch: int = field(
+        default=0,
+        compare=False,
+        repr=False,
+    )
     # Build-path diagnostics only. They do not participate in artifact
     # equality or any signed/wire representation.
     window_build_mode: str | None = field(default=None, compare=False, repr=False)
@@ -1672,6 +1682,7 @@ class _IncrementalPayoutArtifactWindow:
     refreshed_monotonic: float
     full_rescan_monotonic: float
     full_rescan_attempt_monotonic: float
+    append_invalidation_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -4056,6 +4067,11 @@ class PrismCoordinator:
             self._payout_ledger_artifact: PayoutLedgerArtifact | None = None
         if not hasattr(self, "_payout_ledger_artifact_generation"):
             self._payout_ledger_artifact_generation = 0
+        if not hasattr(self, "_payout_ledger_append_invalidation_epoch"):
+            # Guarded by _job_cache_lock. Unlike payout generation, this
+            # advances only when a newly visible row predates an anchored
+            # share window and makes pre-append work unsafe to publish.
+            self._payout_ledger_append_invalidation_epoch = 0
         if not hasattr(self, "_incremental_payout_artifact_window"):
             # Guarded by _payout_state_prepare_lock. It is independent of the
             # published artifact generation: normal generation bumps retag
@@ -4538,6 +4554,7 @@ class PrismCoordinator:
         snapshot_window_weight: int,
         reason: str,
         observed_monotonic: float,
+        append_invalidation_epoch: int,
     ) -> _PayoutWindowMaterialization:
         """Run the exact ledger oracle and atomically replace cached pages."""
 
@@ -4583,6 +4600,7 @@ class PrismCoordinator:
                 refreshed_monotonic=observed_monotonic,
                 full_rescan_monotonic=observed_monotonic,
                 full_rescan_attempt_monotonic=observed_monotonic,
+                append_invalidation_epoch=append_invalidation_epoch,
             )
         )
         return _PayoutWindowMaterialization(
@@ -4602,6 +4620,7 @@ class PrismCoordinator:
         snapshot_window_weight: int,
         force_full_rescan: bool,
         bypass_build_interval: bool,
+        append_invalidation_epoch: int,
         reused_prior_balances_sha256: str | None = None,
     ) -> _PayoutWindowMaterialization:
         """Return an exact window using debounce, delta folding, or the oracle.
@@ -4625,6 +4644,13 @@ class PrismCoordinator:
                 self._incremental_payout_artifact_window_invalidation_reason
                 or "cold_start"
             )
+        elif cached.append_invalidation_epoch != append_invalidation_epoch:
+            # Append invalidation is published without waiting for this
+            # preparation lock. A build that acquires the lock first must not
+            # advance the pre-append cache under the new epoch.
+            self._incremental_payout_artifact_window = None
+            cached = None
+            full_reason = "late_visible_append"
         elif cached.window.window_weight != int(snapshot_window_weight):
             self._incremental_payout_artifact_window = None
             self._incremental_payout_artifact_window_invalidation_reason = None
@@ -4642,6 +4668,7 @@ class PrismCoordinator:
                 snapshot_window_weight=snapshot_window_weight,
                 reason=full_reason or "cache_invalidated",
                 observed_monotonic=observed,
+                append_invalidation_epoch=append_invalidation_epoch,
             )
             self._incremental_payout_artifact_window_invalidation_reason = None
             return materialized
@@ -4669,6 +4696,7 @@ class PrismCoordinator:
                 snapshot_window_weight=snapshot_window_weight,
                 reason="delta_api_unavailable",
                 observed_monotonic=observed,
+                append_invalidation_epoch=append_invalidation_epoch,
             )
 
         try:
@@ -4689,6 +4717,7 @@ class PrismCoordinator:
                 snapshot_window_weight=snapshot_window_weight,
                 reason="incremental_invariant_failed",
                 observed_monotonic=observed,
+                append_invalidation_epoch=append_invalidation_epoch,
             )
 
         if delta_records or stats.expired_rows:
@@ -4711,6 +4740,7 @@ class PrismCoordinator:
             full_rescan_attempt_monotonic=(
                 cached.full_rescan_attempt_monotonic
             ),
+            append_invalidation_epoch=append_invalidation_epoch,
         )
         mode = "incremental"
         check_reason: str | None = None
@@ -4785,6 +4815,7 @@ class PrismCoordinator:
                     refreshed_monotonic=observed,
                     full_rescan_monotonic=observed,
                     full_rescan_attempt_monotonic=observed,
+                    append_invalidation_epoch=append_invalidation_epoch,
                 )
                 mode = "self_check_match" if matched else "self_check_mismatch"
                 check_reason = "periodic_self_check"
@@ -4843,6 +4874,9 @@ class PrismCoordinator:
                         != self._payout_state_generation
                     ):
                         return None
+                    append_invalidation_epoch = int(
+                        self._payout_ledger_append_invalidation_epoch
+                    )
                     published_payout_artifact = (
                         self._published_payout_state.artifact
                     )
@@ -4892,6 +4926,7 @@ class PrismCoordinator:
                     snapshot_window_weight=snapshot_window_weight,
                     force_full_rescan=force_full_rescan,
                     bypass_build_interval=bypass_build_interval,
+                    append_invalidation_epoch=append_invalidation_epoch,
                     reused_prior_balances_sha256=(
                         published_payout_artifact.prior_balances_sha256
                         if reuse_published_balances
@@ -4981,6 +5016,7 @@ class PrismCoordinator:
             snapshot_anchor_ms=materialized.snapshot_anchor_ms,
             share_snapshot_sha256=materialized.share_snapshot_sha256,
             prior_balances_sha256=canonical_json_sha256(frozen_balances),
+            append_invalidation_epoch=append_invalidation_epoch,
             window_build_mode=materialized.mode,
             window_delta_rows=materialized.stats.added_rows,
             window_expired_rows=materialized.stats.expired_rows,
@@ -5156,7 +5192,11 @@ class PrismCoordinator:
         artifact: PayoutLedgerArtifact,
     ) -> tuple[str, int | None]:
         """Ordering core of the install; returns (outcome, armed generation)."""
-        if artifact.payout_state_generation != self._payout_state_generation:
+        if (
+            artifact.payout_state_generation != self._payout_state_generation
+            or artifact.append_invalidation_epoch
+            != self._payout_ledger_append_invalidation_epoch
+        ):
             return "discarded", None
         current = self._payout_ledger_artifact
         if (
@@ -5429,10 +5469,15 @@ class PrismCoordinator:
         with self._job_cache_lock:
             artifact = self._payout_ledger_artifact
             published_artifact = self._published_payout_state.artifact
+            append_invalidation_epoch = (
+                self._payout_ledger_append_invalidation_epoch
+            )
         if (
             artifact is None
             or artifact.payout_state_generation != payout_state_generation
             or artifact.network_difficulty != int(network_difficulty)
+            or artifact.append_invalidation_epoch
+            != append_invalidation_epoch
         ):
             return None
         if artifact.snapshot_anchor_ms is None:
@@ -5479,6 +5524,8 @@ class PrismCoordinator:
             if (
                 self._payout_state_generation != payout_state_generation
                 or self._published_payout_state.artifact is not published_artifact
+                or self._payout_ledger_append_invalidation_epoch
+                != artifact.append_invalidation_epoch
             ):
                 return None
             latest = self._payout_ledger_artifact
@@ -5504,6 +5551,8 @@ class PrismCoordinator:
                     != artifact.share_snapshot_sha256
                     or latest.snapshot_anchor_ms is None
                     or latest.prior_balances is not artifact.prior_balances
+                    or latest.append_invalidation_epoch
+                    != artifact.append_invalidation_epoch
                 ):
                     return None
                 artifact = latest
@@ -6906,6 +6955,17 @@ class PrismCoordinator:
             return bool(
                 bundle.payout_state_generation == self._payout_state_generation
                 and bundle.build_key is not None
+                and (
+                    bundle.collection_only
+                    or int(
+                        getattr(
+                            bundle.build_key,
+                            "payout_append_invalidation_epoch",
+                            0,
+                        )
+                    )
+                    == self._payout_ledger_append_invalidation_epoch
+                )
                 and artifact is not None
                 and bundle.build_key.payout_artifact_sha256
                 == artifact.prior_balances_sha256
@@ -7711,6 +7771,11 @@ class PrismCoordinator:
         with self._job_cache_lock:
             artifact = self._payout_ledger_artifact
             generation_current = base_generation == self._payout_state_generation
+            append_epoch_current = bool(
+                artifact is not None
+                and artifact.append_invalidation_epoch
+                == self._payout_ledger_append_invalidation_epoch
+            )
         anchor_age_ms = (
             None
             if artifact is None or artifact.snapshot_anchor_ms is None
@@ -7718,6 +7783,7 @@ class PrismCoordinator:
         )
         if (
             not generation_current
+            or not append_epoch_current
             or artifact is None
             or artifact.payout_state_generation != base_generation
             or artifact.network_difficulty != int(network_difficulty)
@@ -8029,6 +8095,8 @@ class PrismCoordinator:
                             and self._payout_artifact_reuse_active()
                             and prepared_artifact.payout_state_generation
                             == published_generation
+                            and prepared_artifact.append_invalidation_epoch
+                            == self._payout_ledger_append_invalidation_epoch
                             and candidate_anchor_age_ms is not None
                             and candidate_anchor_age_ms
                             <= self._payout_artifact_max_anchor_age_ms()
@@ -8057,6 +8125,8 @@ class PrismCoordinator:
                                 and self._payout_artifact_reuse_active()
                                 and prepared_artifact.payout_state_generation
                                 == published_generation
+                                and prepared_artifact.append_invalidation_epoch
+                                == self._payout_ledger_append_invalidation_epoch
                             ):
                                 # Same admission rule as
                                 # _install_payout_ledger_artifact: candidate
@@ -8870,6 +8940,9 @@ class PrismCoordinator:
         )
         with self._job_cache_lock:
             issued_at_ms = self._job_build_issued_at_ms.get(artifacts.generation)
+            current_append_invalidation_epoch = int(
+                self._payout_ledger_append_invalidation_epoch
+            )
         if issued_at_ms is None:
             # The issued time doubles as the audit window anchor, so it
             # must not cover a stamped share whose commit is still in
@@ -8891,6 +8964,13 @@ class PrismCoordinator:
                     )
                     while len(self._job_build_issued_at_ms) > 128:
                         self._job_build_issued_at_ms.popitem(last=False)
+        build_append_invalidation_epoch = (
+            int(payout_ledger_artifact.append_invalidation_epoch)
+            if mode == "ready" and payout_ledger_artifact is not None
+            else current_append_invalidation_epoch
+            if mode == "ready"
+            else 0
+        )
         build_key = JobBuildKey(
             best_tip_hash=artifacts.previousblockhash,
             previous_block_hash=artifacts.previousblockhash,
@@ -8932,6 +9012,9 @@ class PrismCoordinator:
                 ).encode()
             ).hexdigest(),
             numeric_context_sha256=numeric_context_sha256,
+            payout_append_invalidation_epoch=(
+                build_append_invalidation_epoch
+            ),
         )
         immutable_identity: tuple[object, ...] = (
             cache_key,
@@ -8946,6 +9029,7 @@ class PrismCoordinator:
             build_key.signing_key_sha256,
             build_key.ledger_signing_key_sha256,
             build_key.numeric_context_sha256,
+            build_key.payout_append_invalidation_epoch,
         )
         return _JobBuildRequest(
             key=build_key,
@@ -9041,6 +9125,11 @@ class PrismCoordinator:
             if (
                 built.payout_state_generation != self._payout_state_generation
                 or built.build_key is None
+                or (
+                    not built.collection_only
+                    and built.build_key.payout_append_invalidation_epoch
+                    != self._payout_ledger_append_invalidation_epoch
+                )
                 or published_artifact is None
                 or built.build_key.payout_artifact_sha256
                 != published_artifact.prior_balances_sha256
@@ -9417,6 +9506,14 @@ class PrismCoordinator:
                     payout_current = (
                         built.payout_state_generation
                         == self._payout_state_generation
+                        and (
+                            built.collection_only
+                            or (
+                                built.build_key is not None
+                                and built.build_key.payout_append_invalidation_epoch
+                                == self._payout_ledger_append_invalidation_epoch
+                            )
+                        )
                     )
                 with self.lock:
                     published_snapshot = getattr(
@@ -9595,9 +9692,19 @@ class PrismCoordinator:
             with self._job_cache_lock:
                 current_payout_state_generation = self._payout_state_generation
                 published_artifact = self._published_payout_state.artifact
+                current_append_invalidation_epoch = (
+                    self._payout_ledger_append_invalidation_epoch
+                )
             if current_payout_state_generation != payout_state_generation:
                 raise JobBuildSuperseded(
                     "payout generation changed before construction"
+                )
+            if (
+                payout_artifact.append_invalidation_epoch
+                != current_append_invalidation_epoch
+            ):
+                raise JobBuildSuperseded(
+                    "payout window invalidated before construction"
                 )
             if published_artifact is None:
                 try:
@@ -9643,6 +9750,8 @@ class PrismCoordinator:
                         )
                     if (
                         payout_state_generation != self._payout_state_generation
+                        or build_request.key.payout_append_invalidation_epoch
+                        != self._payout_ledger_append_invalidation_epoch
                         or published_artifact is None
                         or published_artifact.prior_balances_sha256
                         != build_request.key.payout_artifact_sha256
@@ -9749,6 +9858,9 @@ class PrismCoordinator:
                 prior_balances_sha256=canonical_json_sha256(
                     seed_prior_balances
                 ),
+                append_invalidation_epoch=(
+                    build_request.key.payout_append_invalidation_epoch
+                ),
             )
         final_build_key = dataclass_replace(
             build_request.key,
@@ -9852,6 +9964,15 @@ class PrismCoordinator:
         )
         self._job_build_checkpoint("serialization", cancellation)
         self._job_build_checkpoint("bundle_publication", cancellation)
+        if resolved_mode == "ready":
+            with self._job_cache_lock:
+                if (
+                    final_build_key.payout_append_invalidation_epoch
+                    != self._payout_ledger_append_invalidation_epoch
+                ):
+                    raise JobBuildSuperseded(
+                        "payout window invalidated before bundle publication"
+                    )
         phases["bundle"] = phases.get("bundle", 0.0) + (time.monotonic() - started)
         return CachedJobBundle(
             key=key,
@@ -9934,6 +10055,17 @@ class PrismCoordinator:
             payout_state_generation=cached.payout_state_generation,
             prospective_prior_balances=cached.prospective_prior_balances,
             payout_artifact_generation=cached.payout_artifact_generation,
+            payout_append_invalidation_epoch=(
+                int(
+                    getattr(
+                        cached.build_key,
+                        "payout_append_invalidation_epoch",
+                        0,
+                    )
+                )
+                if cached.build_key is not None
+                else 0
+            ),
             connection_id=client.connection_id,
             authorization_generation=int(
                 getattr(client, "authorization_generation", 0)
@@ -11576,6 +11708,20 @@ class PrismCoordinator:
                 with self._job_cache_lock:
                     payout_current = (
                         bundle.payout_state_generation == self._payout_state_generation
+                        and (
+                            bundle.collection_only
+                            or (
+                                bundle.build_key is not None
+                                and int(
+                                    getattr(
+                                        bundle.build_key,
+                                        "payout_append_invalidation_epoch",
+                                        0,
+                                    )
+                                )
+                                == self._payout_ledger_append_invalidation_epoch
+                            )
+                        )
                     )
                 if not payout_current or not self._issuance_artifacts_current(artifacts):
                     return None
@@ -13744,6 +13890,14 @@ class PrismCoordinator:
             and token.build_key.template_generation == snapshot.template_generation
             and token.build_key.payout_state_generation
             == token.payout_state_generation
+            and token.build_key.payout_append_invalidation_epoch
+            == int(
+                getattr(
+                    self,
+                    "_payout_ledger_append_invalidation_epoch",
+                    0,
+                )
+            )
             and token.payout_state_generation
             == int(getattr(self, "_payout_state_generation", 0))
             and published is not None
@@ -18303,6 +18457,9 @@ class PrismCoordinator:
         # outside this admission boundary.
         with self._job_cache_lock:
             current_payout_generation = self._payout_state_generation
+            current_append_invalidation_epoch = (
+                self._payout_ledger_append_invalidation_epoch
+            )
             published_tip = self._published_payout_state.source_tip_hash
             publication_blocked = self._payout_state_publication_blocked
             context_payout_generation = int(
@@ -18311,6 +18468,12 @@ class PrismCoordinator:
                     "payout_state_generation",
                     current_payout_generation,
                 )
+            )
+            context_append_invalidation_epoch = int(
+                getattr(context, "payout_append_invalidation_epoch", 0)
+            )
+            context_collection_only = bool(
+                getattr(context, "collection_only", False)
             )
         context_template = getattr(context, "template", None)
         context_parent = (
@@ -18355,6 +18518,11 @@ class PrismCoordinator:
             not publication_blocked
             and context_payout_generation == current_payout_generation
             and (
+                context_collection_only
+                or context_append_invalidation_epoch
+                == current_append_invalidation_epoch
+            )
+            and (
                 published_tip is None
                 or context_parent == published_tip
                 # Reconciliation can source payout state at the detected tip
@@ -18367,7 +18535,14 @@ class PrismCoordinator:
         )
         payout_gate_started = time.monotonic()
         with self._payout_state_delivery_gate.delivery_cancelable(
-            lambda: context_payout_generation != self._payout_state_generation,
+            lambda: (
+                context_payout_generation != self._payout_state_generation
+                or (
+                    not context_collection_only
+                    and context_append_invalidation_epoch
+                    != self._payout_ledger_append_invalidation_epoch
+                )
+            ),
             generation=context_payout_generation,
             priority=priority_delivery,
         ) as payout_admitted:
@@ -18469,8 +18644,15 @@ class PrismCoordinator:
                             return False
                         with self.lock:
                             return commit_context_locked()
-                with self.lock:
-                    return commit_context_locked()
+                with self._job_cache_lock:
+                    if (
+                        not context_collection_only
+                        and context_append_invalidation_epoch
+                        != self._payout_ledger_append_invalidation_epoch
+                    ):
+                        return False
+                    with self.lock:
+                        return commit_context_locked()
 
             if commit_guard_lock is None:
                 committed = commit_context()
@@ -20637,42 +20819,79 @@ class PrismCoordinator:
         self,
         pending_share: PendingShare,
     ) -> None:
-        """Discard a window that predates a newly visible eligible row.
+        """Disarm payout work that predates a newly visible eligible row.
 
         Normal submissions hold the pending-share commit floor, so their
         accepted timestamp remains above the cached anchor until the row is
         durable. Durable replay reconstructs the original timestamps without
-        that process-local floor. If both stamps are already covered by the
-        cached anchor, the delta query cannot discover the late-visible row;
-        the next materialization must therefore use the full oracle.
+        that process-local floor. If both stamps are already covered by an
+        incremental or armed-artifact anchor, the snapshot cannot discover
+        the late-visible row. Publish the invalidation without waiting for an
+        in-flight oracle walk, then clear the incremental cache under its own
+        lock; the epoch prevents pre-append work from re-arming meanwhile.
         """
 
+        self._ensure_job_cache_state()
+
+        def predates(anchor_ms: int | None) -> bool:
+            return bool(
+                anchor_ms is not None
+                and int(pending_share.job_issued_at_ms) <= anchor_ms
+                and int(pending_share.accepted_at_ms) <= anchor_ms
+            )
+
+        # The incremental pointer is immutable and replaced atomically. Its
+        # owning lock is deliberately not acquired here: an urgent append
+        # must disarm the separately guarded artifact even while a long oracle
+        # build owns _payout_state_prepare_lock.
         cached = getattr(self, "_incremental_payout_artifact_window", None)
-        if cached is None:
-            return
-        anchor_ms = int(cached.window.anchor_job_issued_at_ms)
-        if (
-            int(pending_share.job_issued_at_ms) > anchor_ms
-            or int(pending_share.accepted_at_ms) > anchor_ms
-        ):
-            return
-        with self._payout_state_prepare_lock:
-            # A build may have replaced the cache while the append completed.
-            # Recheck the current anchor under its owning lock before clearing
-            # it, and never replace another path's already-cold state/reason.
-            cached = self._incremental_payout_artifact_window
-            if cached is None:
-                return
-            anchor_ms = int(cached.window.anchor_job_issued_at_ms)
-            if (
-                int(pending_share.job_issued_at_ms) > anchor_ms
-                or int(pending_share.accepted_at_ms) > anchor_ms
+        with self._job_cache_lock:
+            artifact = self._payout_ledger_artifact
+            cached_anchor_ms = (
+                None
+                if cached is None
+                else int(cached.window.anchor_job_issued_at_ms)
+            )
+            artifact_anchor_ms = (
+                None
+                if artifact is None or artifact.snapshot_anchor_ms is None
+                else int(artifact.snapshot_anchor_ms)
+            )
+            if not (
+                predates(cached_anchor_ms)
+                or predates(artifact_anchor_ms)
             ):
                 return
-            self._incremental_payout_artifact_window = None
-            self._incremental_payout_artifact_window_invalidation_reason = (
-                "late_visible_append"
+            self._payout_ledger_append_invalidation_epoch += 1
+            invalidation_epoch = int(
+                self._payout_ledger_append_invalidation_epoch
             )
+            self._payout_ledger_artifact = None
+
+        with self._payout_state_prepare_lock:
+            cached = self._incremental_payout_artifact_window
+            if cached is None:
+                self._incremental_payout_artifact_window_invalidation_reason = (
+                    "late_visible_append"
+                )
+                return
+            anchor_ms = int(cached.window.anchor_job_issued_at_ms)
+            if cached.append_invalidation_epoch >= invalidation_epoch:
+                # A post-invalidation build already replaced the cache.
+                return
+            if predates(anchor_ms):
+                self._incremental_payout_artifact_window = None
+                self._incremental_payout_artifact_window_invalidation_reason = (
+                    "late_visible_append"
+                )
+            else:
+                # The armed artifact was affected but this older incremental
+                # anchor was not. Retag it so a later delta build can preserve
+                # the exact append-only window instead of forcing an oracle.
+                self._incremental_payout_artifact_window = dataclass_replace(
+                    cached,
+                    append_invalidation_epoch=invalidation_epoch,
+                )
 
     @ledger_writer_operation("share_persistence")
     def append_accepted_share(
@@ -21165,6 +21384,17 @@ class PrismCoordinator:
         if (
             bundle.build_key is None
             or payout_artifact is None
+            or (
+                not bundle.collection_only
+                and int(
+                    getattr(
+                        bundle.build_key,
+                        "payout_append_invalidation_epoch",
+                        0,
+                    )
+                )
+                != self._payout_ledger_append_invalidation_epoch
+            )
             or bundle.build_key.payout_artifact_sha256
             != payout_artifact.prior_balances_sha256
         ):
