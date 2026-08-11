@@ -23930,9 +23930,10 @@ class PrismCoordinator:
                 "_accounted_accepted_block_hashes",
                 set(),
             )
-            pool_closed = (
-                self.accepted_block_count >= self.max_blocks
-                and block_hash not in accounted_hashes
+            accepted_count = int(self.accepted_block_count)
+            pool_closed = block_hash not in accounted_hashes and (
+                accepted_count >= int(self.max_blocks)
+                or (bool(self.stop_after_block) and accepted_count >= 1)
             )
         if pool_closed:
             return _BlockCandidateNodeSubmission(attempted=False)
@@ -24022,6 +24023,10 @@ class PrismCoordinator:
                 )
                 return accepted
             try:
+                if not self._reserve_block_fast_lane_slot(block_hash):
+                    raise RuntimeError(
+                        "block candidate is waiting for fast-lane capacity"
+                    )
                 node_submission = self._node_submission_for_candidate(candidate)
                 self._mark_block_candidate_attempted(block_hash)
                 with self._block_submitter_ledger_statement_timeout_scope():
@@ -24252,7 +24257,7 @@ class PrismCoordinator:
                 )
 
     def _reserve_block_fast_lane_slot(self, block_hash: str) -> bool:
-        """Reserve configured pool capacity before asynchronous accounting."""
+        """Reserve pool capacity while a node offer awaits terminal accounting."""
         key = block_hash.lower()
         with self.lock:
             reservations = getattr(self, "_block_fast_lane_reservations", None)
@@ -26534,9 +26539,13 @@ class PrismCoordinator:
             self._clear_accepted_block_payout_preview(block_hash)
             return True
         with self.lock:
+            accepted_count = int(self.accepted_block_count)
             pool_closed = (
-                self.accepted_block_count >= self.max_blocks
-                and block_hash not in self._accounted_accepted_block_hashes
+                block_hash not in self._accounted_accepted_block_hashes
+                and (
+                    accepted_count >= int(self.max_blocks)
+                    or (bool(self.stop_after_block) and accepted_count >= 1)
+                )
             )
         if pool_closed and self._block_candidate_chain_probe(
             block_hash,

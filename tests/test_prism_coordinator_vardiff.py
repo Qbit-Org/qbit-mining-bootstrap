@@ -10004,6 +10004,30 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.rejection_counts_by_reason[PRISM_REJECTION_POOL_CLOSED], 0)
         self.assertEqual(ledger.persisted, [])
 
+    def test_block_submitter_honors_stop_after_block_above_one_block_capacity(
+        self,
+    ) -> None:
+        server, state, ledger = submit_coordinator()
+        server.accepted_block_count = 1
+        server.max_blocks = 2
+        server.stop_after_block = True
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="de" * 32,
+            block_hex="00",
+        )
+
+        accepted = server.submit_block_candidate(
+            block_candidate(server, state, submission)
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_POOL_CLOSED],
+            1,
+        )
+        self.assertEqual(ledger.persisted, [])
+
     def test_block_worthy_share_is_credited_and_enqueued_before_block_submission(self) -> None:
         # The share ack must never wait on the block path: a block-worthy
         # share that met its target is credited immediately and the candidate
@@ -13176,6 +13200,37 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         self.assertEqual(server.accepted_block_count, 1)
         self.assertNotIn(block_hash, server._block_fast_lane_reservations)
         self.assertTrue(server._reserve_block_fast_lane_slot("e3" * 32))
+
+    def test_synchronous_candidate_waits_for_fast_lane_capacity(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server.max_blocks = 1
+        server.stop_after_block = True
+        reserved_hash = "e4" * 32
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex="e5" * 32,
+                block_hex="e5",
+                share_pass=False,
+                block_pass=True,
+            ),
+            credit_share_on_accept=True,
+        )
+        server._ensure_block_candidate_disposition_state()
+        self.assertTrue(server._reserve_block_fast_lane_slot(reserved_hash))
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: (_ for _ in ()).throw(
+                AssertionError("capacity-blocked candidate must not reach qbitd")
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "fast-lane capacity"):
+            server._submit_synchronous_block_candidate(candidate)
+
+        self.assertIs(server._retry_block_candidate, candidate)
+        self.assertEqual(server._block_fast_lane_reservations, {reserved_hash})
 
     def test_block_submitter_retry_wait_heartbeats_in_bounded_slices(self) -> None:
         server = self._bare_coordinator()
