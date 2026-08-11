@@ -4354,6 +4354,185 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(ledger.rows[0]["chain_state"], "inactive")
         self.assertIn(("inactive", pool_block_hash, 10), ledger.events)
 
+    def test_lost_mutation_response_publishes_fresh_balances_with_forced_rescan(
+        self,
+    ) -> None:
+        tip = "5e" * 32
+        pool_block_hash = "af" * 32
+
+        class LostResponseLedger(ReorgLedger):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.prior_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.prior_balance_reads += 1
+                if any(row["chain_state"] == "confirmed" for row in self.rows):
+                    return [
+                        {
+                            "recipient_id": "stale-carry",
+                            "order_key": "01:stale-carry",
+                            "p2mr_program_hex": "44" * 32,
+                            "balance_sats": 546,
+                        }
+                    ]
+                return []
+
+            def mark_pool_block_inactive(
+                self,
+                *,
+                block_hash: str,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                result = super().mark_pool_block_inactive(
+                    block_hash=block_hash,
+                    active_tip_height=active_tip_height,
+                )
+                if int(result["inactive_count"]):
+                    raise ConnectionError("mutation response lost")
+                return result
+
+        ledger = LostResponseLedger()
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        forced_rescans: list[bool] = []
+        original_prepare = server._prepared_payout_state_candidate
+
+        def record_prepare(
+            captured: tuple[int, int, str | None, str, float],
+            *,
+            force_full_window_rescan: bool = False,
+            bypass_build_interval: bool = False,
+        ) -> object:
+            forced_rescans.append(force_full_window_rescan)
+            return original_prepare(
+                captured,
+                force_full_window_rescan=force_full_window_rescan,
+                bypass_build_interval=bypass_build_interval,
+            )
+
+        server._prepared_payout_state_candidate = record_prepare  # type: ignore[method-assign]
+
+        first = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+        self.assertEqual(first["published_generation"], 1)
+        with server._job_cache_lock:
+            initially_published = server._published_payout_state.artifact
+        assert initially_published is not None
+        self.assertEqual(len(initially_published.prior_balances()), 0)
+
+        ledger.rows.append(
+            {
+                "block_hash": pool_block_hash,
+                "block_height": 12,
+                "chain_state": "confirmed",
+                "maturity_state": "immature",
+            }
+        )
+        # Rebuild the current generation's immutable state so the test starts
+        # from balances that predate the lost-response mutation.
+        with server._job_cache_lock:
+            server._published_payout_state = dataclass_replace(
+                server._published_payout_state,
+                artifact=None,
+            )
+        stale_published = server._current_payout_state_artifact()
+        self.assertEqual(len(stale_published.prior_balances()), 1)
+        reads_before_error = ledger.prior_balance_reads
+        forced_rescans.clear()
+
+        with self.assertRaisesRegex(ConnectionError, "mutation response lost"):
+            server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+
+        with server._job_cache_lock:
+            healed_state = server._published_payout_state
+        assert healed_state.artifact is not None
+        self.assertEqual(healed_state.generation, 2)
+        self.assertEqual(healed_state.artifact.prior_balances(), [])
+        self.assertEqual(ledger.prior_balance_reads, reads_before_error + 1)
+        self.assertEqual(forced_rescans, [True])
+        self.assertEqual(ledger.rows[0]["chain_state"], "inactive")
+
+    def test_read_phase_reconcile_failure_does_not_force_balance_rescan(
+        self,
+    ) -> None:
+        tip = "5f" * 32
+
+        class PrefetchFailureLedger(ReorgLedger):
+            fail_prefetch = False
+
+            def __init__(self) -> None:
+                super().__init__([])
+                self.prior_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.prior_balance_reads += 1
+                return []
+
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                if self.fail_prefetch:
+                    raise TimeoutError("reconcile prefetch join exceeded 20s")
+                return super().reorg_watch_blocks(
+                    active_tip_height=active_tip_height
+                )
+
+        ledger = PrefetchFailureLedger()
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        first = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+        self.assertEqual(first["published_generation"], 1)
+        reads_before_failure = ledger.prior_balance_reads
+        with server._job_cache_lock:
+            generation_before_failure = server._published_payout_state.generation
+
+        forced_rescans: list[bool] = []
+        original_prepare = server._prepared_payout_state_candidate
+
+        def record_prepare(
+            captured: tuple[int, int, str | None, str, float],
+            *,
+            force_full_window_rescan: bool = False,
+            bypass_build_interval: bool = False,
+        ) -> object:
+            forced_rescans.append(force_full_window_rescan)
+            return original_prepare(
+                captured,
+                force_full_window_rescan=force_full_window_rescan,
+                bypass_build_interval=bypass_build_interval,
+            )
+
+        server._prepared_payout_state_candidate = record_prepare  # type: ignore[method-assign]
+        ledger.fail_prefetch = True
+
+        with self.assertRaisesRegex(
+            TimeoutError,
+            "reconcile prefetch join exceeded 20s",
+        ):
+            server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+
+        with server._job_cache_lock:
+            generation_after_failure = server._published_payout_state.generation
+        self.assertEqual(forced_rescans, [])
+        self.assertEqual(ledger.prior_balance_reads, reads_before_failure)
+        self.assertEqual(generation_after_failure, generation_before_failure)
+
     def test_concurrent_same_tip_reconciles_share_one_pass(self) -> None:
         tip = "5c" * 32
         entered = threading.Event()

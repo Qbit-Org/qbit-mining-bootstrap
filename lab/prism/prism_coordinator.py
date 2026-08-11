@@ -17174,6 +17174,7 @@ class PrismCoordinator:
                     prepared_started = time.monotonic()
                     captured_source = self._capture_payout_state_source()
                     payout_changed = False
+                    payout_mutation_attempted = False
                     inactive_blocks = 0
                     reactivated_blocks = 0
                     matured_payouts = 0
@@ -17225,6 +17226,7 @@ class PrismCoordinator:
                                     chain_state = str(row.get("chain_state", ""))
                                     if block_height > active_tip_height:
                                         if chain_state == "confirmed":
+                                            payout_mutation_attempted = True
                                             inactive = (
                                                 self.ledger.mark_pool_block_inactive(
                                                     block_hash=block_hash,
@@ -17251,6 +17253,7 @@ class PrismCoordinator:
                                         on_active_chain
                                         and chain_state == "inactive"
                                     ):
+                                        payout_mutation_attempted = True
                                         reactivated = (
                                             self.ledger.reactivate_pool_block(
                                                 block_hash=block_hash,
@@ -17272,6 +17275,7 @@ class PrismCoordinator:
                                         not on_active_chain
                                         and chain_state == "confirmed"
                                     ):
+                                        payout_mutation_attempted = True
                                         inactive = (
                                             self.ledger.mark_pool_block_inactive(
                                                 block_hash=block_hash,
@@ -17293,6 +17297,7 @@ class PrismCoordinator:
                                     None,
                                 )
                                 if callable(mark_mature):
+                                    payout_mutation_attempted = True
                                     matured = mark_mature(
                                         active_tip_height=active_tip_height
                                     )
@@ -17332,6 +17337,13 @@ class PrismCoordinator:
                         # preparation lock is released. Publication drains old
                         # socket sends afterward without blocking new ledger
                         # preparation or snapshot acquisition.
+                        if payout_mutation_attempted:
+                            # A mutator can commit server-side and still raise
+                            # locally when its response is lost. The observed
+                            # row counts are then unavailable, so conservatively
+                            # force the same ledger re-read as a confirmed
+                            # mutation. Read-only failures never reach this flag.
+                            payout_changed = True
                         if payout_changed:
                             error_candidate = (
                                 self._prepared_payout_state_candidate(
