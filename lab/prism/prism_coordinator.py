@@ -4899,6 +4899,20 @@ class PrismCoordinator:
                         else None
                     ),
                 )
+                if materialized.balance_check_mismatch:
+                    # Emit at detection time: a later, unrelated artifact
+                    # serialization or stats failure must not hide the oracle
+                    # alarm that already invalidated reuse.
+                    self._record_payout_artifact_event(
+                        "balance_check_mismatch"
+                    )
+                    self._payout_artifact_log(
+                        "payout_artifact_balance_check_mismatch",
+                        payout_state_generation=int(
+                            artifact_payout_state_generation
+                        ),
+                        balance_check_mismatch=True,
+                    )
                 window_build_seconds = time.monotonic() - window_started
                 if materialized.balance_check_prior_balances is not None:
                     # The periodic oracle already paid for the live aggregate.
@@ -4992,8 +5006,6 @@ class PrismCoordinator:
         }
         if materialized.full_rescan_reason is not None:
             log_fields["full_rescan_reason"] = materialized.full_rescan_reason
-        if materialized.balance_check_mismatch:
-            self._record_payout_artifact_event("balance_check_mismatch")
         if materialized.mode == "debounced":
             self._record_payout_artifact_event("debounced")
             self._payout_artifact_log(

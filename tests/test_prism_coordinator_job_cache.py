@@ -954,7 +954,7 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
         mismatch_logs = [
             entry
             for entry in build_logs
-            if entry.get("balance_check_mismatch") is True
+            if entry["event"] == "payout_artifact_balance_check_mismatch"
         ]
         self.assertEqual(len(mismatch_logs), 1)
 
