@@ -1329,8 +1329,19 @@ class _NativePostgresLeaseGuard:
     def held(self) -> bool:
         return self._held and not self._closed and not self._connection.closed
 
-    def run_json(self, sql: str) -> Any:
+    def run_json(
+        self,
+        sql: str,
+        *,
+        on_query_start: Callable[[], None] | None = None,
+    ) -> Any:
         with self._query_lock:
+            # Queries on this session serialize behind the periodic heartbeat
+            # and any concurrent caller. The callback marks the moment the
+            # serialized slot is acquired, so callers can budget queue wait
+            # and statement execution separately.
+            if on_query_start is not None:
+                on_query_start()
             if not self.held:
                 raise RuntimeError("postgres writer lease guard is not held")
             row = self._connection.execute(sql).fetchone()
@@ -6714,14 +6725,27 @@ SELECT COALESCE(
         """
         return self._renew_writer_lease_with(self._run_fenced_json)
 
-    def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
-        """Refresh on the session that holds the writer advisory guard."""
+    def renew_writer_lease_heartbeat(
+        self,
+        *,
+        on_query_start: Callable[[], None] | None = None,
+    ) -> dict[str, int | str]:
+        """Refresh on the session that holds the writer advisory guard.
+
+        ``on_query_start`` fires once the guarded session's serialized query
+        slot is acquired, letting callers budget queue wait separately from
+        statement execution.
+        """
         if not self.writer_lease_fast_adoption_capable:
             raise RuntimeError("writer session is not heartbeat-capable")
         guard = self._writer_lease_guard
         if guard is None:
             raise RuntimeError("postgres writer lease guard is not held")
-        return self._renew_writer_lease_with(guard.run_json)
+        if on_query_start is None:
+            return self._renew_writer_lease_with(guard.run_json)
+        return self._renew_writer_lease_with(
+            lambda sql: guard.run_json(sql, on_query_start=on_query_start)
+        )
 
     def _renew_writer_lease_with(
         self,

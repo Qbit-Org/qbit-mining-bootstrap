@@ -54,7 +54,13 @@ class HeartbeatLeaseLedger(RecordingLeaseLedger):
         self.renew_thread: threading.Thread | None = None
         self.renewed = threading.Event()
 
-    def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
+    def renew_writer_lease_heartbeat(
+        self,
+        *,
+        on_query_start=None,
+    ) -> dict[str, int | str]:
+        if on_query_start is not None:
+            on_query_start()
         self.renew_calls += 1
         self.renew_thread = threading.current_thread()
         self.renewed.set()
@@ -225,6 +231,90 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         hard_exit.assert_called_once()
         if ledger.renew_thread is not None:
             ledger.renew_thread.join(0.2)
+
+    def test_external_fence_survives_guard_queue_contention(self) -> None:
+        guard_query_lock = threading.Lock()
+        holder_ready = threading.Event()
+        release_holder = threading.Event()
+
+        class ContendedGuardLedger(HeartbeatLeaseLedger):
+            def renew_writer_lease_heartbeat(
+                self,
+                *,
+                on_query_start=None,
+            ) -> dict[str, int | str]:
+                with guard_query_lock:
+                    return super().renew_writer_lease_heartbeat(
+                        on_query_start=on_query_start
+                    )
+
+        def hold_guard_like_inflight_heartbeat() -> None:
+            with guard_query_lock:
+                holder_ready.set()
+                release_holder.wait(1)
+
+        ledger = ContendedGuardLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_external_fence_timeout_seconds = 0.05
+        server.ledger_lease_heartbeat_failure_seconds = 0.75
+        holder = threading.Thread(target=hold_guard_like_inflight_heartbeat)
+        holder.start()
+        self.assertTrue(holder_ready.wait(0.2))
+        unblock = threading.Timer(0.15, release_holder.set)
+        unblock.start()
+
+        try:
+            with patch.object(
+                server,
+                "_ledger_lease_heartbeat_hard_exit",
+            ) as hard_exit:
+                server._require_fresh_ledger_lease_for_external_side_effect(
+                    "submitblock"
+                )
+        finally:
+            release_holder.set()
+            unblock.cancel()
+            holder.join(1.0)
+
+        hard_exit.assert_not_called()
+        self.assertEqual(ledger.renew_calls, 1)
+
+    def test_external_fence_bounds_queue_wait_by_failure_budget(self) -> None:
+        release_queue_slot = threading.Event()
+
+        class QueuedForeverLedger(HeartbeatLeaseLedger):
+            def renew_writer_lease_heartbeat(
+                self,
+                *,
+                on_query_start=None,
+            ) -> dict[str, int | str]:
+                release_queue_slot.wait(1)
+                return super().renew_writer_lease_heartbeat(
+                    on_query_start=on_query_start
+                )
+
+        server = coordinator(QueuedForeverLedger())
+        server.ledger_lease_external_fence_timeout_seconds = 0.02
+        server.ledger_lease_heartbeat_failure_seconds = 0.05
+
+        started = time.monotonic()
+        try:
+            with patch.object(
+                server,
+                "_ledger_lease_heartbeat_hard_exit",
+            ) as hard_exit, self.assertRaisesRegex(
+                ShutdownInProgress,
+                "writer lease guard verification timed out",
+            ):
+                server._require_fresh_ledger_lease_for_external_side_effect(
+                    "ctv_submitpackage"
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            release_queue_slot.set()
+
+        self.assertLess(elapsed, 0.5)
+        hard_exit.assert_called_once()
 
     def test_fast_adoptable_lease_renews_on_dedicated_heartbeat_thread(self) -> None:
         ledger = HeartbeatLeaseLedger()

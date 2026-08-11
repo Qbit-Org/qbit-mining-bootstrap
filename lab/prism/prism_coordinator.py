@@ -22,6 +22,7 @@ from functools import wraps
 import hashlib
 import heapq
 import http.client
+import inspect
 import json
 import math
 import os
@@ -11327,12 +11328,45 @@ class PrismCoordinator:
                 )
             ),
         )
+        # The guarded session serializes this verification behind the periodic
+        # heartbeat and any concurrent fence, and the execution budget above
+        # tracks the guard's statement timeout. Waiting for the serialized
+        # query slot must not consume that budget, or a fence arriving during
+        # an in-flight renewal hard-exits a coordinator whose session is still
+        # healthy. The queue wait gets the heartbeat failure budget instead: a
+        # guard session that cannot complete queued work within it is already
+        # being declared dead by the heartbeat monitor.
+        queue_timeout_seconds = max(
+            timeout_seconds,
+            float(
+                getattr(
+                    self,
+                    "ledger_lease_heartbeat_failure_seconds",
+                    DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_FAILURE_SECONDS,
+                )
+            ),
+        )
+        query_started = threading.Event()
+        try:
+            renew_reports_query_start = (
+                "on_query_start" in inspect.signature(renew).parameters
+            )
+        except (TypeError, ValueError):
+            renew_reports_query_start = False
+        if not renew_reports_query_start:
+            # A renewal that cannot report when its query slot was acquired
+            # keeps the previous behavior: the whole budget covers both.
+            query_started.set()
+
         outcome: queue.Queue[BaseException | None] = queue.Queue(maxsize=1)
         verification_started_monotonic = time.monotonic()
 
         def verify_exact_session() -> None:
             try:
-                renew()
+                if renew_reports_query_start:
+                    renew(on_query_start=query_started.set)
+                else:
+                    renew()
             except BaseException as exc:
                 outcome.put(exc)
             else:
@@ -11355,6 +11389,20 @@ class PrismCoordinator:
                 f"writer lease guard verification could not start before {component}"
             ) from exc
 
+        queue_deadline = verification_started_monotonic + queue_timeout_seconds
+        while not query_started.is_set() and thread.is_alive():
+            remaining = queue_deadline - time.monotonic()
+            if remaining <= 0.0:
+                self._ledger_lease_heartbeat_hard_exit(
+                    "prism coordinator: refusing external side effect from "
+                    f"{component}; exact-session verification could not "
+                    f"start within {queue_timeout_seconds:g}s",
+                    include_traceback=False,
+                )
+                raise ShutdownInProgress(
+                    f"writer lease guard verification timed out before {component}"
+                )
+            thread.join(min(0.01, remaining))
         thread.join(timeout_seconds)
         if thread.is_alive():
             self._ledger_lease_heartbeat_hard_exit(
