@@ -669,6 +669,128 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             {str(share["share_id"]) for share in rebuilt.shares_json},
         )
 
+    def test_replay_append_during_cold_scan_invalidates_inflight_walk(
+        self,
+    ) -> None:
+        # A cold-start walk exposes no cached window or armed artifact while
+        # its ledger read runs. A replayed row committing mid-walk with
+        # timestamps below the walk's anchor must still record an
+        # invalidation, or the walk installs a window that can never
+        # rediscover the row through delta reads.
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        entry = self.replay_shaped_append_entry(
+            accepted_at_ms=999_950,
+            block_hash_hex="55" * 32,
+        )
+        original_snapshot = ledger.snapshot_at_job_issue
+        raced = threading.Event()
+        append_threads: list[threading.Thread] = []
+
+        def racing_snapshot(
+            anchor_job_issued_at_ms: int,
+            *,
+            window_weight: int | None = None,
+        ) -> list[object]:
+            # Capture the read result first: the replayed row committing
+            # afterwards models a database snapshot taken before the commit.
+            records = original_snapshot(
+                anchor_job_issued_at_ms,
+                window_weight=window_weight,
+            )
+            if not raced.is_set():
+                raced.set()
+                thread = threading.Thread(
+                    target=server._append_share_batch,
+                    args=([entry],),
+                )
+                thread.start()
+                append_threads.append(thread)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    with server._job_cache_lock:
+                        if server._payout_ledger_append_invalidation_epoch:
+                            break
+                    time.sleep(0.001)
+            return records
+
+        ledger.snapshot_at_job_issue = racing_snapshot  # type: ignore[method-assign]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertEqual(initial.window_build_mode, "full_rescan")
+            self.assertNotIn(
+                entry.pending_share.share_id,
+                {str(share["share_id"]) for share in initial.shares_json},
+            )
+            self.assertTrue(append_threads)
+            append_threads[0].join(timeout=2.0)
+            self.assertFalse(append_threads[0].is_alive())
+            with server._job_cache_lock:
+                self.assertEqual(
+                    server._payout_ledger_append_invalidation_epoch, 1
+                )
+            self.assertFalse(server._install_payout_ledger_artifact(initial))
+            with server._job_cache_lock:
+                self.assertIsNone(server._payout_ledger_artifact)
+
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            clock_ms[0] = 1_000_040
+            rebuilt = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+
+        assert rebuilt is not None
+        self.assertEqual(rebuilt.window_build_mode, "full_rescan")
+        self.assertEqual(
+            rebuilt.window_full_rescan_reason,
+            "late_visible_append",
+        )
+        self.assertIn(
+            entry.pending_share.share_id,
+            {str(share["share_id"]) for share in rebuilt.shares_json},
+        )
+
+    def test_inflight_scan_anchor_records_invalidation_without_windows(
+        self,
+    ) -> None:
+        # Directly exercise the published in-flight anchor: with no cached
+        # window and no armed artifact, only a predating append may advance
+        # the epoch, and fresh shares above the anchor must leave the walk
+        # undisturbed.
+        server, _ledger, _artifacts = self.configured_server()
+        server._ensure_job_cache_state()
+        predating = stamped_pending_share(999_950)
+        fresh = stamped_pending_share(1_000_050)
+
+        server._invalidate_incremental_payout_window_for_append(predating)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 0)
+
+        with server._job_cache_lock:
+            server._payout_window_inflight_scan_anchor_ms = 999_999
+        try:
+            server._invalidate_incremental_payout_window_for_append(fresh)
+            with server._job_cache_lock:
+                self.assertEqual(
+                    server._payout_ledger_append_invalidation_epoch, 0
+                )
+            server._invalidate_incremental_payout_window_for_append(predating)
+        finally:
+            with server._job_cache_lock:
+                server._payout_window_inflight_scan_anchor_ms = None
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+        self.assertEqual(
+            server._incremental_payout_artifact_window_invalidation_reason,
+            "late_visible_append",
+        )
+
     def test_late_append_disarms_before_prepare_lock_is_available(self) -> None:
         server, _ledger, artifacts = self.configured_server()
         clock_ms = [1_000_000]

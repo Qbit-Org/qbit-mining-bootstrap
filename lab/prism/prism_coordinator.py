@@ -4072,6 +4072,15 @@ class PrismCoordinator:
             # advances only when a newly visible row predates an anchored
             # share window and makes pre-append work unsafe to publish.
             self._payout_ledger_append_invalidation_epoch = 0
+        if not hasattr(self, "_payout_window_inflight_scan_anchor_ms"):
+            # Guarded by _job_cache_lock. The anchor of the ledger window
+            # walk currently in flight, published before the read begins.
+            # A late-visible append can predate this anchor while no
+            # completed window or armed artifact exposes one, and the
+            # walk's database snapshot may already exclude the row; the
+            # append-side invalidation must still advance the epoch so the
+            # walk's result cannot arm or serve.
+            self._payout_window_inflight_scan_anchor_ms: int | None = None
         if not hasattr(self, "_incremental_payout_artifact_window"):
             # Guarded by _payout_state_prepare_lock. It is independent of the
             # published artifact generation: normal generation bumps retag
@@ -4921,19 +4930,32 @@ class PrismCoordinator:
                     # share-commit liveness watchdog owns recovery.
                     return None
                 window_started = time.monotonic()
-                materialized = self._incremental_payout_window_materialization(
-                    snapshot_anchor_ms=snapshot_anchor_ms,
-                    snapshot_window_weight=snapshot_window_weight,
-                    force_full_rescan=force_full_rescan,
-                    bypass_build_interval=bypass_build_interval,
-                    append_invalidation_epoch=append_invalidation_epoch,
-                    reused_prior_balances_sha256=(
-                        published_payout_artifact.prior_balances_sha256
-                        if reuse_published_balances
-                        and published_payout_artifact is not None
-                        else None
-                    ),
-                )
+                with self._job_cache_lock:
+                    # Publish the walk's anchor before the ledger read: a
+                    # late-visible append committing mid-walk can predate it
+                    # while a cold or forcibly cleared cache exposes no other
+                    # anchor, and the walk's database snapshot may already
+                    # exclude the row.
+                    self._payout_window_inflight_scan_anchor_ms = int(
+                        snapshot_anchor_ms
+                    )
+                try:
+                    materialized = self._incremental_payout_window_materialization(
+                        snapshot_anchor_ms=snapshot_anchor_ms,
+                        snapshot_window_weight=snapshot_window_weight,
+                        force_full_rescan=force_full_rescan,
+                        bypass_build_interval=bypass_build_interval,
+                        append_invalidation_epoch=append_invalidation_epoch,
+                        reused_prior_balances_sha256=(
+                            published_payout_artifact.prior_balances_sha256
+                            if reuse_published_balances
+                            and published_payout_artifact is not None
+                            else None
+                        ),
+                    )
+                finally:
+                    with self._job_cache_lock:
+                        self._payout_window_inflight_scan_anchor_ms = None
                 if materialized.balance_check_mismatch:
                     # Emit at detection time: a later, unrelated artifact
                     # serialization or stats failure must not hide the oracle
@@ -9774,14 +9796,27 @@ class PrismCoordinator:
                         # land above it and belong to the next window), so
                         # no bracket around the read is needed.
                         snapshot_accepted_count = int(accepted_now)
-                records = (
-                    self.ledger.snapshot_at_job_issue(
-                        issued_at_ms,
-                        window_weight=snapshot_window_weight,
-                    )
-                    if resolved_mode == "ready"
-                    else []
-                )
+                if resolved_mode == "ready":
+                    with self._job_cache_lock:
+                        # Publish the read's frozen anchor: a late-visible
+                        # append committing mid-read predates it without
+                        # holding the pending floor, and this read's database
+                        # snapshot may already exclude the row. The recorded
+                        # invalidation epoch keeps the resulting bundle and
+                        # its seeded artifact from arming or serving.
+                        self._payout_window_inflight_scan_anchor_ms = int(
+                            issued_at_ms
+                        )
+                    try:
+                        records = self.ledger.snapshot_at_job_issue(
+                            issued_at_ms,
+                            window_weight=snapshot_window_weight,
+                        )
+                    finally:
+                        with self._job_cache_lock:
+                            self._payout_window_inflight_scan_anchor_ms = None
+                else:
+                    records = []
                 # An accepted parent's prospective carry state supersedes the
                 # published artifact for children built on that parent; the
                 # published balances remain the fallback for ordinary tips.
@@ -20843,10 +20878,15 @@ class PrismCoordinator:
         # The incremental pointer is immutable and replaced atomically. Its
         # owning lock is deliberately not acquired here: an urgent append
         # must disarm the separately guarded artifact even while a long oracle
-        # build owns _payout_state_prepare_lock.
-        cached = getattr(self, "_incremental_payout_artifact_window", None)
+        # build owns _payout_state_prepare_lock. Reading it under
+        # _job_cache_lock orders the read against the in-flight scan anchor:
+        # a window walk installs its incremental pointer before clearing the
+        # published anchor under this lock, so a walk that could have missed
+        # this row always exposes its anchor to the predates() checks below.
         with self._job_cache_lock:
+            cached = getattr(self, "_incremental_payout_artifact_window", None)
             artifact = self._payout_ledger_artifact
+            inflight_anchor_ms = self._payout_window_inflight_scan_anchor_ms
             cached_anchor_ms = (
                 None
                 if cached is None
@@ -20860,6 +20900,7 @@ class PrismCoordinator:
             if not (
                 predates(cached_anchor_ms)
                 or predates(artifact_anchor_ms)
+                or predates(inflight_anchor_ms)
             ):
                 return
             self._payout_ledger_append_invalidation_epoch += 1
