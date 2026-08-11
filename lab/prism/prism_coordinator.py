@@ -24770,13 +24770,19 @@ class PrismCoordinator:
                     try:
                         node_submission = self._node_submission_for_candidate(candidate)
                     except BaseException:
-                        self._release_block_candidate_disposition(lease)
+                        try:
+                            self._retain_block_candidate_for_retry(candidate)
+                        finally:
+                            self._release_block_candidate_disposition(lease)
                         raise
             else:
                 try:
                     node_submission = self._node_submission_for_candidate(candidate)
                 except BaseException:
-                    self._release_block_candidate_disposition(lease)
+                    try:
+                        self._retain_block_candidate_for_retry(candidate)
+                    finally:
+                        self._release_block_candidate_disposition(lease)
                     raise
         else:
             node_submission = _BlockCandidateNodeSubmission(attempted=False)
@@ -24790,7 +24796,10 @@ class PrismCoordinator:
             try:
                 enqueued = self._enqueue_block_accounting_task(task)
             except BaseException:
-                self._release_block_candidate_disposition(lease)
+                try:
+                    self._retain_block_candidate_for_retry(candidate)
+                finally:
+                    self._release_block_candidate_disposition(lease)
                 raise
             if enqueued:
                 transferred = True

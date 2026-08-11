@@ -13232,6 +13232,87 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         self.assertIs(server._retry_block_candidate, candidate)
         self.assertEqual(server._block_fast_lane_reservations, {reserved_hash})
 
+    def test_node_offer_exception_retains_reserved_candidate(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server.max_blocks = 1
+        server.stop_after_block = True
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex="e6" * 32,
+                block_hex="e6",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        block_hash = candidate.submission.block_hash_hex
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: (_ for _ in ()).throw(
+                RuntimeError("node offer bookkeeping failed")
+            )
+        )
+        server.enqueue_block_candidate(candidate)
+
+        with self.assertRaisesRegex(RuntimeError, "node offer bookkeeping failed"):
+            server.submit_next_block_candidate(defer_accounting=True)
+
+        self.assertIs(server._retry_block_candidate, candidate)
+        self.assertIn(block_hash, server._block_fast_lane_reservations)
+        self.assertFalse(server._reserve_block_fast_lane_slot("e7" * 32))
+        lease = server._claim_block_candidate_disposition(
+            block_hash,
+            blocking=False,
+        )
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        server._release_block_candidate_disposition(lease)
+
+    def test_accounting_enqueue_exception_retains_reserved_candidate(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server.max_blocks = 1
+        server.stop_after_block = True
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex="e8" * 32,
+                block_hex="e8",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        block_hash = candidate.submission.block_hash_hex
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: SimpleNamespace(
+                attempted=True,
+                result=None,
+                error=None,
+            )
+        )
+        server._enqueue_block_accounting_task = (  # type: ignore[method-assign]
+            lambda _task: (_ for _ in ()).throw(
+                RuntimeError("accounting enqueue failed")
+            )
+        )
+        server.enqueue_block_candidate(candidate)
+
+        with self.assertRaisesRegex(RuntimeError, "accounting enqueue failed"):
+            server.submit_next_block_candidate(defer_accounting=True)
+
+        self.assertIs(server._retry_block_candidate, candidate)
+        self.assertIn(block_hash, server._block_fast_lane_reservations)
+        self.assertFalse(server._reserve_block_fast_lane_slot("e9" * 32))
+        lease = server._claim_block_candidate_disposition(
+            block_hash,
+            blocking=False,
+        )
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        server._release_block_candidate_disposition(lease)
+
     def test_block_submitter_retry_wait_heartbeats_in_bounded_slices(self) -> None:
         server = self._bare_coordinator()
         server.watchdog_timeout_seconds = 0.3
