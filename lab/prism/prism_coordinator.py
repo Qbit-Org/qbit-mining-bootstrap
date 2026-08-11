@@ -1685,6 +1685,11 @@ class _PayoutWindowMaterialization:
     record_count: int
     stats: IncrementalWindowAdvanceStats
     full_rescan_reason: str | None = None
+    balance_check_prior_balances: tuple[dict[str, object], ...] | None = field(
+        default=None,
+        repr=False,
+    )
+    balance_check_mismatch: bool = False
 
 
 def _share_window_spool_file() -> Any:
@@ -4068,6 +4073,16 @@ class PrismCoordinator:
             self._incremental_payout_artifact_window_invalidation_reason: (
                 str | None
             ) = None
+        if not hasattr(
+            self,
+            "_payout_prior_balances_reuse_invalidated_sha256",
+        ):
+            # Guarded by _payout_state_prepare_lock. A periodic balance oracle
+            # mismatch keeps the stale published digest off the reuse path
+            # until a later publication installs a different digest.
+            self._payout_prior_balances_reuse_invalidated_sha256: str | None = (
+                None
+            )
         if not hasattr(self, "_pending_share_commit_lock"):
             self._pending_share_commit_lock = threading.Lock()
         if not hasattr(self, "_pending_share_commit_floor"):
@@ -4307,6 +4322,7 @@ class PrismCoordinator:
                     "self_check_match",
                     "self_check_mismatch",
                     "self_check_failed",
+                    "balance_check_mismatch",
                     "found_block_cached",
                     "installed",
                     "refreshed",
@@ -4586,6 +4602,7 @@ class PrismCoordinator:
         snapshot_window_weight: int,
         force_full_rescan: bool,
         bypass_build_interval: bool,
+        reused_prior_balances_sha256: str | None = None,
     ) -> _PayoutWindowMaterialization:
         """Return an exact window using debounce, delta folding, or the oracle.
 
@@ -4697,6 +4714,8 @@ class PrismCoordinator:
         )
         mode = "incremental"
         check_reason: str | None = None
+        balance_check_prior_balances: tuple[dict[str, object], ...] | None = None
+        balance_check_mismatch = False
         full_rescan_seconds = float(
             getattr(
                 self,
@@ -4725,6 +4744,40 @@ class PrismCoordinator:
                 matched = full_retained == advanced_window.records()
                 shares_json = full_window.json_records()
                 digest = canonical_json_sha256(shares_json)
+                if reused_prior_balances_sha256 is not None:
+                    checked_balances = tuple(
+                        self.ledger.current_prior_balances()
+                    )
+                    checked_balances_sha256 = canonical_json_sha256(
+                        checked_balances
+                    )
+                    if (
+                        checked_balances_sha256
+                        != reused_prior_balances_sha256
+                    ):
+                        balance_check_prior_balances = checked_balances
+                        balance_check_mismatch = True
+                        self._payout_prior_balances_reuse_invalidated_sha256 = (
+                            reused_prior_balances_sha256
+                        )
+                        # Equal-window refreshes intentionally retain their
+                        # armed balances. Drop the stale artifact so the fresh
+                        # balance read cannot be discarded as a window-only
+                        # no-op when this build is installed.
+                        with self._job_cache_lock:
+                            armed = self._payout_ledger_artifact
+                            if armed is not None:
+                                armed_balances_sha256 = (
+                                    armed.prior_balances_sha256
+                                    or canonical_json_sha256(
+                                        armed.prior_balances
+                                    )
+                                )
+                                if (
+                                    armed_balances_sha256
+                                    == reused_prior_balances_sha256
+                                ):
+                                    self._payout_ledger_artifact = None
                 advanced = _IncrementalPayoutArtifactWindow(
                     window=full_window,
                     shares_json=shares_json,
@@ -4756,6 +4809,8 @@ class PrismCoordinator:
             record_count=sum(len(page.records) for page in advanced.window.pages),
             stats=stats,
             full_rescan_reason=check_reason,
+            balance_check_prior_balances=balance_check_prior_balances,
+            balance_check_mismatch=balance_check_mismatch,
         )
 
     def _build_payout_ledger_artifact(
@@ -4791,6 +4846,28 @@ class PrismCoordinator:
                     published_payout_artifact = (
                         self._published_payout_state.artifact
                     )
+                invalidated_balances_sha256 = (
+                    self._payout_prior_balances_reuse_invalidated_sha256
+                )
+                if (
+                    invalidated_balances_sha256 is not None
+                    and published_payout_artifact is not None
+                    and published_payout_artifact.prior_balances_sha256
+                    != invalidated_balances_sha256
+                ):
+                    # A later publication installed a different balance
+                    # snapshot, so the digest that failed its oracle check can
+                    # no longer enter this generation's reuse path.
+                    self._payout_prior_balances_reuse_invalidated_sha256 = None
+                    invalidated_balances_sha256 = None
+                reuse_published_balances = bool(
+                    not force_full_rescan
+                    and published_payout_artifact is not None
+                    and published_payout_artifact.generation
+                    == expected_payout_state_generation
+                    and published_payout_artifact.prior_balances_sha256
+                    != invalidated_balances_sha256
+                )
                 snapshot_window_weight = (
                     PRISM_REWARD_WINDOW_MULTIPLIER
                     * PRISM_SNAPSHOT_WINDOW_MARGIN
@@ -4815,14 +4892,24 @@ class PrismCoordinator:
                     snapshot_window_weight=snapshot_window_weight,
                     force_full_rescan=force_full_rescan,
                     bypass_build_interval=bypass_build_interval,
+                    reused_prior_balances_sha256=(
+                        published_payout_artifact.prior_balances_sha256
+                        if reuse_published_balances
+                        and published_payout_artifact is not None
+                        else None
+                    ),
                 )
                 window_build_seconds = time.monotonic() - window_started
-                if (
-                    not force_full_rescan
-                    and published_payout_artifact is not None
-                    and published_payout_artifact.generation
-                    == expected_payout_state_generation
-                ):
+                if materialized.balance_check_prior_balances is not None:
+                    # The periodic oracle already paid for the live aggregate.
+                    # Use that exact result rather than issuing a duplicate
+                    # carry query in the mismatch build.
+                    prior_balances = (
+                        materialized.balance_check_prior_balances
+                    )
+                    prior_balances_source = "ledger"
+                elif reuse_published_balances:
+                    assert published_payout_artifact is not None
                     # Prior balances are generation-owned immutable state.
                     # Normal share-window refreshes cannot change them, so
                     # reuse the exact published bytes instead of aggregating
@@ -4901,9 +4988,12 @@ class PrismCoordinator:
             "during_publication": bool(during_publication),
             "build_interval_bypassed": bool(bypass_build_interval),
             "prior_balances_source": prior_balances_source,
+            "balance_check_mismatch": materialized.balance_check_mismatch,
         }
         if materialized.full_rescan_reason is not None:
             log_fields["full_rescan_reason"] = materialized.full_rescan_reason
+        if materialized.balance_check_mismatch:
+            self._record_payout_artifact_event("balance_check_mismatch")
         if materialized.mode == "debounced":
             self._record_payout_artifact_event("debounced")
             self._payout_artifact_log(
@@ -26005,6 +26095,7 @@ class PrismCoordinator:
                         "self_check_match",
                         "self_check_mismatch",
                         "self_check_failed",
+                        "balance_check_mismatch",
                         "found_block_cached",
                         "installed",
                         "refreshed",

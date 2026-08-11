@@ -838,6 +838,126 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             forced.share_snapshot_sha256,
         )
 
+    def test_periodic_self_check_invalidates_drifted_published_balances(
+        self,
+    ) -> None:
+        class DriftingCarryLedger(IncrementalRecordingLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.balance_sats = 546
+                self.prior_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.prior_balance_reads += 1
+                return [
+                    {
+                        "recipient_id": "carry",
+                        "order_key": "01:carry",
+                        "p2mr_program_hex": "66" * 32,
+                        "balance_sats": self.balance_sats,
+                    }
+                ]
+
+        ledger = DriftingCarryLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        server.payout_artifact_full_rescan_seconds = 3_600.0
+        clock_ms = [1_000_000]
+        monotonic_seconds = [100.0]
+        build_logs: list[dict[str, object]] = []
+        server._payout_artifact_log = (  # type: ignore[method-assign]
+            lambda event, **fields: build_logs.append(
+                {"event": event, **fields}
+            )
+        )
+
+        with (
+            patch(
+                "lab.prism.prism_coordinator.now_ms",
+                side_effect=lambda: clock_ms[0],
+            ),
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: monotonic_seconds[0],
+            ),
+        ):
+            published = server._current_payout_state_artifact()
+            initial = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+            )
+            assert initial is not None
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+
+            ledger.balance_sats = 777
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            monotonic_seconds[0] = 3_701.0
+            checked = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+            )
+
+            with server._job_cache_lock:
+                self.assertIsNone(server._payout_ledger_artifact)
+
+            # The mismatch gate persists while the published generation still
+            # carries the rejected digest, so even the next non-self-check
+            # build must read the ledger instead of resuming byte reuse.
+            clock_ms[0] = 1_000_030
+            monotonic_seconds[0] = 3_702.0
+            following = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+            )
+
+        assert checked is not None and following is not None
+        self.assertEqual(checked.window_build_mode, "self_check_match")
+        self.assertEqual(checked.prior_balances[0]["balance_sats"], 777)
+        self.assertEqual(following.prior_balances[0]["balance_sats"], 777)
+        self.assertEqual(ledger.prior_balance_reads, 3)
+        self.assertEqual(ledger.full_snapshot_calls, 2)
+        self.assertEqual(
+            server._payout_prior_balances_reuse_invalidated_sha256,
+            published.prior_balances_sha256,
+        )
+        self.assertEqual(
+            server.payout_artifact_event_counts["balance_check_mismatch"],
+            1,
+        )
+        self.assertEqual(
+            server.payout_artifact_event_counts["self_check_match"],
+            1,
+        )
+        built_sources = [
+            entry["prior_balances_source"]
+            for entry in build_logs
+            if entry["event"] == "payout_artifact_built"
+        ]
+        self.assertEqual(built_sources, ["published", "ledger", "ledger"])
+        mismatch_logs = [
+            entry
+            for entry in build_logs
+            if entry.get("balance_check_mismatch") is True
+        ]
+        self.assertEqual(len(mismatch_logs), 1)
+
     def test_incremental_and_forced_full_artifacts_match_with_carry_boundaries(
         self,
     ) -> None:
