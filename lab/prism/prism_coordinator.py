@@ -11784,6 +11784,28 @@ class PrismCoordinator:
         def cancelled() -> bool:
             return self._initial_request_cancelled(request)
 
+        def bundle_payout_stale() -> bool:
+            # Unlocked at the gate (a cancellation hint, exactly like direct
+            # delivery's callback); authoritative only when re-read under
+            # _job_cache_lock at the commit boundary below.
+            return (
+                bundle.payout_state_generation != self._payout_state_generation
+                or (
+                    not bundle.collection_only
+                    and (
+                        bundle.build_key is None
+                        or int(
+                            getattr(
+                                bundle.build_key,
+                                "payout_append_invalidation_epoch",
+                                0,
+                            )
+                        )
+                        != self._payout_ledger_append_invalidation_epoch
+                    )
+                )
+            )
+
         if not self._acquire_client_job_lock(client, cancelled):
             return False
         try:
@@ -11794,7 +11816,7 @@ class PrismCoordinator:
             self._ensure_job_cache_state()
             gate_started = time.monotonic()
             with self._payout_delivery(
-                cancelled,
+                lambda: cancelled() or bundle_payout_stale(),
                 generation=bundle.payout_state_generation,
             ) as admitted:
                 self._observe_payout_gate_admission(
@@ -11813,23 +11835,7 @@ class PrismCoordinator:
                     # publication into a disconnect-reconnect-rebuild loop.
                     return None
                 with self._job_cache_lock:
-                    payout_current = (
-                        bundle.payout_state_generation == self._payout_state_generation
-                        and (
-                            bundle.collection_only
-                            or (
-                                bundle.build_key is not None
-                                and int(
-                                    getattr(
-                                        bundle.build_key,
-                                        "payout_append_invalidation_epoch",
-                                        0,
-                                    )
-                                )
-                                == self._payout_ledger_append_invalidation_epoch
-                            )
-                        )
-                    )
+                    payout_current = not bundle_payout_stale()
                 if not payout_current or not self._issuance_artifacts_current(artifacts):
                     return None
                 # Difficulty state precedes coordinator admission everywhere.
@@ -11837,41 +11843,48 @@ class PrismCoordinator:
                 # this delivery; it must never make initial-job delivery hold
                 # the global control-plane lock while waiting.
                 with self._client_vardiff_lock(client):
-                    with self.lock:
-                        if not self._initial_request_current_locked(request):
-                            return False
-                        context = self.stamp_job_for_client(
-                            client,
-                            bundle,
-                            clean_jobs=True,
-                        )
-                        if not self._admit_client_tip_refresh_epoch_locked(
-                            client,
-                            context.tip_refresh_epoch_sequence,
-                        ):
-                            # The fence blocks only strictly older epochs, so
-                            # this connection already registered newer refresh
-                            # work whose delivery the epoch machinery owns.
-                            # Retrying here can spin until the initial-job
-                            # deadline disconnects an already-served client;
-                            # complete a request that newer current-tip work
-                            # satisfies instead.
-                            self.note_initial_job_delivered(client)
-                            if (
-                                self.pending_initial_jobs.get(client)
-                                is not request
-                            ):
-                                return False
+                    # The Vardiff wait happens after the payout check above; a
+                    # late-visible append can invalidate the bundle during it.
+                    # Mirror direct delivery: the live epoch re-read and the
+                    # stamp are one commit boundary under _job_cache_lock.
+                    with self._job_cache_lock:
+                        if bundle_payout_stale():
                             return None
-                        client.active_job = context
-                        for job_id in tuple(client.active_job_ids):
-                            self.bury_evicted_job(client, job_id, prune=False)
-                            self.jobs.pop(job_id, None)
-                        client.active_job_ids.clear()
-                        self.prune_evicted_job_graveyard(force=False)
-                        self.jobs[context.job.job_id] = context
-                        client.active_job_ids.add(context.job.job_id)
-                        self.prune_client_active_jobs(client)
+                        with self.lock:
+                            if not self._initial_request_current_locked(request):
+                                return False
+                            context = self.stamp_job_for_client(
+                                client,
+                                bundle,
+                                clean_jobs=True,
+                            )
+                            if not self._admit_client_tip_refresh_epoch_locked(
+                                client,
+                                context.tip_refresh_epoch_sequence,
+                            ):
+                                # The fence blocks only strictly older epochs, so
+                                # this connection already registered newer refresh
+                                # work whose delivery the epoch machinery owns.
+                                # Retrying here can spin until the initial-job
+                                # deadline disconnects an already-served client;
+                                # complete a request that newer current-tip work
+                                # satisfies instead.
+                                self.note_initial_job_delivered(client)
+                                if (
+                                    self.pending_initial_jobs.get(client)
+                                    is not request
+                                ):
+                                    return False
+                                return None
+                            client.active_job = context
+                            for job_id in tuple(client.active_job_ids):
+                                self.bury_evicted_job(client, job_id, prune=False)
+                                self.jobs.pop(job_id, None)
+                            client.active_job_ids.clear()
+                            self.prune_evicted_job_graveyard(force=False)
+                            self.jobs[context.job.job_id] = context
+                            client.active_job_ids.add(context.job.job_id)
+                            self.prune_client_active_jobs(client)
 
                 self.send_job_update(client, context.job)
                 mark_delivered = getattr(admitted, "mark_delivered", None)
