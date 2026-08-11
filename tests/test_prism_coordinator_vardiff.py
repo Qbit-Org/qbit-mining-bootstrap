@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import inspect
 import json
 import os
 import queue
@@ -9173,20 +9174,22 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
             ledger.append_batch([(pending, server.block_candidate_intent(candidate))])
 
-        self.assertEqual(server.replay_pending_block_candidates(), 2)
-        first = server.block_candidate_queue.get_nowait()
-        second = server.block_candidate_queue.get_nowait()
+        self.assertEqual(server.replay_pending_block_candidates(), 3)
+        self.assertTrue(server.block_candidate_queue.empty())
+        first = server._block_replay_candidate_queue.get_nowait()
+        second = server._block_replay_candidate_queue.get_nowait()
+        third = server._block_replay_candidate_queue.get_nowait()
         self.assertEqual(
-            [first.submission.block_hash_hex, second.submission.block_hash_hex],
-            ["aa" * 32, "bb" * 32],
+            [
+                first.submission.block_hash_hex,
+                second.submission.block_hash_hex,
+                third.submission.block_hash_hex,
+            ],
+            ["aa" * 32, "bb" * 32, "cc" * 32],
         )
         ledger.mark_block_candidate_submitted(block_hash="aa" * 32)
         ledger.mark_block_candidate_abandoned(block_hash="bb" * 32, error="stale")
-
-        self.assertEqual(server.replay_pending_block_candidates(), 1)
-        replayed = server.block_candidate_queue.get_nowait()
-        self.assertEqual(replayed.submission.block_hash_hex, "cc" * 32)
-        self.assertEqual(replayed.pending_share.share_id, "miner-a:" + "cc" * 32)
+        self.assertEqual(third.pending_share.share_id, "miner-a:" + "cc" * 32)
 
     def test_candidate_intent_avoids_duplicate_template_transaction_bodies(self) -> None:
         server, state, _ledger = submit_coordinator()
@@ -9968,6 +9971,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 server.block_candidate_retry_delays = {durable_hash: 1.0}
 
                 self.assertEqual(server.replay_pending_block_candidates(), 0)
+                # Malformed-row cleanup is lower-priority maintenance, so it
+                # cannot form an N x database-timeout convoy ahead of valid
+                # recovered blocks on the node-offer lane.
+                self.assertTrue(
+                    server._run_one_invalid_block_candidate_quarantine()
+                )
 
                 self.assertEqual(ledger.pending_block_candidates(), [])
                 self.assertNotIn(durable_hash, server.block_candidate_retry_delays)
@@ -11949,6 +11958,971 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                 release_mark.set()
         self.assertFalse(submitter.is_alive())
 
+    def test_accounting_saturation_does_not_convoy_node_offers(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server.max_blocks = 10
+        server.stop_after_block = False
+        server.block_candidate_retry_initial_seconds = 0.01
+        server._block_accounting_queue = queue.PriorityQueue(maxsize=1)
+        entered_accounting = threading.Event()
+        release_accounting = threading.Event()
+        submitted: list[str] = []
+
+        class RecordingRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    submitted.append(str((params or [""])[0]))
+                    return None
+                return super().call(method, params)
+
+        server.rpc = RecordingRpc("00" * 32)
+
+        def blocked_accounting(
+            _candidate: PrismBlockCandidate,
+            **_kwargs: object,
+        ) -> bool:
+            entered_accounting.set()
+            release_accounting.wait(5)
+            return True
+
+        server._call_block_candidate_writer = blocked_accounting  # type: ignore[method-assign]
+        for tag in ("a1", "b2", "c3", "d4"):
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="00",
+                    block_hash_hex=tag * 32,
+                    block_hex=tag,
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+            server.enqueue_block_candidate(candidate)
+
+        submitter = threading.Thread(target=server.block_submit_loop)
+        with patch("builtins.print"):
+            submitter.start()
+            try:
+                self.assertTrue(entered_accounting.wait(1))
+                deadline = time.monotonic() + 2
+                while len(submitted) < 4 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(submitted, ["a1", "b2", "c3", "d4"])
+            finally:
+                server.stop_event.set()
+                release_accounting.set()
+                submitter.join(2)
+                accounting = getattr(server, "_block_accounting_thread", None)
+                if accounting is not None:
+                    accounting.join(2)
+        self.assertFalse(submitter.is_alive())
+
+    def test_replay_batch_reaches_node_while_oldest_accounting_stalls(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server.max_blocks = 10
+        server.stop_after_block = False
+        submitted: list[str] = []
+        release_accounting = threading.Event()
+        entered_accounting = threading.Event()
+
+        for index, tag in enumerate(("a5", "b6"), start=1):
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="00",
+                    block_hash_hex=tag * 32,
+                    block_hex=tag,
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+            pending = PendingShare(
+                share_id=f"miner-a:{tag * 32}",
+                miner_id="miner-a",
+                order_key="miner-a",
+                p2mr_program_hex="11" * 32,
+                share_difficulty=1,
+                network_difficulty=1,
+                template_height=9,
+                job_id="job-1",
+                job_issued_at_ms=1,
+                accepted_at_ms=index,
+                ntime=1,
+            )
+            candidate = dataclass_replace(candidate, pending_share=pending)
+            ledger.append_batch(
+                [(pending, server.block_candidate_intent(candidate))]
+            )
+
+        self.assertEqual(server.replay_pending_block_candidates(), 2)
+
+        class RecordingRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    submitted.append(str((params or [""])[0]))
+                    return None
+                return super().call(method, params)
+
+        server.rpc = RecordingRpc("00" * 32)
+
+        def blocked_accounting(
+            _candidate: PrismBlockCandidate,
+            **_kwargs: object,
+        ) -> bool:
+            entered_accounting.set()
+            release_accounting.wait(5)
+            return True
+
+        server._call_block_candidate_writer = blocked_accounting  # type: ignore[method-assign]
+        submitter = threading.Thread(target=server.block_submit_loop)
+        with patch("builtins.print"):
+            submitter.start()
+            try:
+                self.assertTrue(entered_accounting.wait(1))
+                deadline = time.monotonic() + 2
+                while len(submitted) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(submitted, ["a5", "b6"])
+            finally:
+                server.stop_event.set()
+                release_accounting.set()
+                submitter.join(2)
+                accounting = getattr(server, "_block_accounting_thread", None)
+                if accounting is not None:
+                    accounting.join(2)
+
+    def test_stuck_rpc_worker_pool_requests_nonzero_restart(self) -> None:
+        server, _state, _recording = submit_coordinator()
+        server.block_submit_stuck_call_exit_seconds = 0.04
+        release = threading.Event()
+        entered: list[str] = []
+
+        class IgnoringRpc:
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                entered.append(str((params or [""])[0]))
+                release.wait(5)
+                return None
+
+        server.rpc = IgnoringRpc()
+        try:
+            for tag in ("11", "22"):
+                with self.assertRaises(TimeoutError):
+                    server._run_submitblock_rpc_with_hard_deadline(
+                        block_hash=tag * 32,
+                        block_hex=tag,
+                        timeout_seconds=0.01,
+                    )
+            time.sleep(0.05)
+            with self.assertRaises(TimeoutError):
+                server._run_submitblock_rpc_with_hard_deadline(
+                    block_hash="33" * 32,
+                    block_hex="33",
+                    timeout_seconds=0.01,
+                )
+            self.assertEqual(entered, ["11", "22"])
+            self.assertTrue(server.stop_event.is_set())
+            self.assertTrue(server._fatal_exit_requested)
+        finally:
+            release.set()
+
+    def test_stuck_ledger_worker_pool_requests_nonzero_restart(self) -> None:
+        server, _state, _recording = submit_coordinator()
+        server.block_submit_db_timeout_seconds = 0.01
+        server.block_submit_stuck_call_exit_seconds = 0.04
+        release = threading.Event()
+        entered: list[str] = []
+
+        def blocking_operation(tag: str) -> str:
+            entered.append(tag)
+            release.wait(5)
+            return tag
+
+        try:
+            for tag in ("one", "two"):
+                with self.assertRaises(TimeoutError):
+                    server._run_block_submitter_ledger_call(
+                        (tag,),
+                        f"test-{tag}",
+                        lambda tag=tag: blocking_operation(tag),
+                    )
+            time.sleep(0.05)
+            with self.assertRaises(TimeoutError):
+                server._run_block_submitter_ledger_call(
+                    ("three",),
+                    "test-three",
+                    lambda: blocking_operation("three"),
+                )
+            self.assertEqual(entered, ["one", "two"])
+            self.assertTrue(server.stop_event.is_set())
+            self.assertTrue(server._fatal_exit_requested)
+        finally:
+            release.set()
+
+    def test_one_stuck_ledger_call_does_not_restart_with_spare_capacity(self) -> None:
+        server, _state, _recording = submit_coordinator()
+        server.block_submit_db_timeout_seconds = 0.01
+        server.block_submit_stuck_call_exit_seconds = 0.04
+        release = threading.Event()
+        entered = threading.Event()
+
+        def blocking_operation() -> None:
+            entered.set()
+            release.wait(5)
+
+        try:
+            with self.assertRaises(TimeoutError):
+                server._run_block_submitter_ledger_call(
+                    ("same-key",),
+                    "same-key",
+                    blocking_operation,
+                )
+            self.assertTrue(entered.wait(1))
+            time.sleep(0.05)
+            with self.assertRaises(TimeoutError):
+                server._run_block_submitter_ledger_call(
+                    ("same-key",),
+                    "same-key",
+                    blocking_operation,
+                )
+            self.assertFalse(server.stop_event.is_set())
+            self.assertFalse(getattr(server, "_fatal_exit_requested", False))
+        finally:
+            release.set()
+
+    def test_two_stuck_ledger_calls_restart_on_existing_key_retry(self) -> None:
+        server, _state, _recording = submit_coordinator()
+        server.block_submit_db_timeout_seconds = 0.01
+        server.block_submit_stuck_call_exit_seconds = 0.04
+        release = threading.Event()
+        entered: list[str] = []
+
+        def blocking_operation(tag: str) -> None:
+            entered.append(tag)
+            release.wait(5)
+
+        try:
+            for tag in ("one", "two"):
+                with self.assertRaises(TimeoutError):
+                    server._run_block_submitter_ledger_call(
+                        (tag,),
+                        tag,
+                        lambda tag=tag: blocking_operation(tag),
+                    )
+            time.sleep(0.05)
+            # No third key is required: a retry reusing either poisoned call
+            # still observes that every bounded worker slot is exhausted.
+            with self.assertRaises(TimeoutError):
+                server._run_block_submitter_ledger_call(
+                    ("one",),
+                    "one",
+                    lambda: blocking_operation("one"),
+                )
+            self.assertEqual(entered, ["one", "two"])
+            self.assertTrue(server.stop_event.is_set())
+            self.assertTrue(server._fatal_exit_requested)
+        finally:
+            release.set()
+
+    def test_watchdog_starts_before_synchronous_startup_work(self) -> None:
+        source = inspect.getsource(PrismCoordinator._serve_with_listener_stack)
+        watchdog_start = source.index("target=self.watchdog_loop")
+
+        self.assertEqual(source.count("target=self.watchdog_loop"), 1)
+        self.assertLess(watchdog_start, source.index("self.prewarm_startup_jobs"))
+        self.assertLess(watchdog_start, source.index("self.replay_recovered_shares"))
+
+    def test_watchdog_hard_exits_when_fatal_stop_wins_during_startup(self) -> None:
+        server = self._bare_coordinator()
+        server._fatal_exit_requested = True
+        server.stop_event.set()
+
+        with patch("lab.prism.prism_coordinator.os._exit") as hard_exit:
+            server.watchdog_loop()
+
+        hard_exit.assert_called_once_with(1)
+
+    def test_parent_retry_displacement_preserves_durable_descendant(self) -> None:
+        server, state, _recording = submit_coordinator()
+
+        def candidate_at(tag: str, height: int) -> PrismBlockCandidate:
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="00",
+                    block_hash_hex=tag * 32,
+                    block_hex=tag,
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+            context = SimpleNamespace(**vars(candidate.context))
+            context.template = {**candidate.context.template, "height": height}
+            return dataclass_replace(
+                candidate,
+                context=context,
+                durable_replay=True,
+            )
+
+        descendant = candidate_at("b8", 11)
+        parent = candidate_at("a8", 10)
+        descendant_hash = descendant.submission.block_hash_hex
+        server._ensure_block_candidate_disposition_state()
+        server._ensure_block_replay_state()
+        server._block_replay_inflight_hashes.add(descendant_hash)
+        with server.lock:
+            server._retry_block_candidate = descendant
+            server._merge_block_candidate_retry_locked(
+                "_retry_block_candidate",
+                parent,
+            )
+
+        self.assertIs(server._retry_block_candidate, parent)
+        self.assertIs(
+            server._block_disposition_waiting_retries[descendant_hash],
+            descendant,
+        )
+
+        # Once the parent reaches a terminal state, the descendant's preserved
+        # wakeup is selected even though durable replay still deduplicates it.
+        with server.lock:
+            server._retry_block_candidate = None
+        captured: list[object] = []
+        server.max_blocks = 10
+        server.stop_after_block = False
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: SimpleNamespace(
+                attempted=True,
+                result="duplicate",
+                error=None,
+            )
+        )
+        server._enqueue_block_accounting_task = (  # type: ignore[method-assign]
+            lambda task: (captured.append(task), True)[1]
+        )
+
+        self.assertTrue(server.submit_next_block_candidate(defer_accounting=True))
+        self.assertEqual(len(captured), 1)
+        task = captured[0]
+        self.assertIs(task.candidate, descendant)
+        server._release_block_candidate_disposition(task.disposition_lease)
+
+    def test_synchronous_waiter_joins_finalize_only_registry(self) -> None:
+        server, state, _recording = submit_coordinator()
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="c8" * 32,
+                block_hex="c8",
+                share_pass=False,
+                block_pass=True,
+            ),
+            credit_share_on_accept=True,
+        )
+        block_hash = candidate.submission.block_hash_hex
+        server._block_candidate_finalize_retries = {}
+        server._block_candidate_finalize_retries[block_hash] = (True, "")
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: (_ for _ in ()).throw(
+                AssertionError("finalize-only retry must not call qbitd")
+            )
+        )
+        finalized: list[dict[str, object]] = []
+
+        def finalize(
+            _candidate: PrismBlockCandidate,
+            **kwargs: object,
+        ) -> bool:
+            finalized.append(kwargs)
+            return True
+
+        server._finalize_block_candidate = finalize  # type: ignore[method-assign]
+
+        self.assertTrue(server._submit_synchronous_block_candidate(candidate))
+        self.assertEqual(len(finalized), 1)
+        self.assertTrue(finalized[0]["accepted"])
+        self.assertEqual(finalized[0]["block_hash"], block_hash)
+
+    def test_synchronous_waiter_preserves_finalize_only_abandonment(self) -> None:
+        server, state, _recording = submit_coordinator()
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="c9" * 32,
+                block_hex="c9",
+                share_pass=False,
+                block_pass=True,
+            ),
+            credit_share_on_accept=True,
+        )
+        block_hash = candidate.submission.block_hash_hex
+        server._block_candidate_finalize_retries = {
+            block_hash: (False, "terminal rejection")
+        }
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: (_ for _ in ()).throw(
+                AssertionError("finalize-only retry must not call qbitd")
+            )
+        )
+        finalized: list[dict[str, object]] = []
+        server._finalize_block_candidate = (  # type: ignore[method-assign]
+            lambda _candidate, **kwargs: (finalized.append(kwargs), True)[1]
+        )
+
+        self.assertFalse(server._submit_synchronous_block_candidate(candidate))
+        self.assertEqual(len(finalized), 1)
+        self.assertFalse(finalized[0]["accepted"])
+        self.assertEqual(finalized[0]["error"], "terminal rejection")
+
+    def test_synchronous_abandon_rejects_prepared_state_before_outbox(self) -> None:
+        server, state, ledger = submit_coordinator()
+        block_hash = "ca" * 32
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex=block_hash,
+                block_hex="ca",
+                share_pass=False,
+                block_pass=True,
+            ),
+            credit_share_on_accept=True,
+        )
+        events: list[str] = []
+        prepared = {"value": True}
+
+        def pool_block_state(*, block_hash: str) -> dict[str, str]:
+            self.assertEqual(block_hash, candidate.submission.block_hash_hex)
+            events.append("state")
+            return {
+                "chain_state": "prepared" if prepared["value"] else "rejected",
+                "maturity_state": "immature",
+            }
+
+        def reject_prepared_block(**_kwargs: object) -> dict[str, object]:
+            events.append("reject")
+            prepared["value"] = False
+            return {"backend": "fake", "rejected_count": 1}
+
+        def mark_abandoned(**_kwargs: object) -> bool:
+            events.append("abandon")
+            return True
+
+        ledger.pool_block_state = pool_block_state  # type: ignore[attr-defined]
+        ledger.reject_prepared_block = reject_prepared_block  # type: ignore[method-assign]
+        ledger.mark_block_candidate_abandoned = mark_abandoned  # type: ignore[attr-defined]
+
+        class CleanupRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                return super().call(method, params)
+
+        server.rpc = CleanupRpc("00" * 32)
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: SimpleNamespace(
+                attempted=False,
+                result=None,
+                error=None,
+            )
+        )
+        server._mark_block_candidate_attempted = (  # type: ignore[method-assign]
+            lambda _block_hash: True
+        )
+
+        def stage_terminal_rejection(
+            _candidate: PrismBlockCandidate,
+            *,
+            node_submission: object,
+        ) -> bool:
+            self.assertIsNotNone(node_submission)
+            outcome = server._block_candidate_outcome
+            outcome.reason = PRISM_REJECTION_POOL_CLOSED
+            outcome.error = "pool is no longer accepting blocks"
+            outcome.stale_job_class = None
+            return False
+
+        server._submit_block_candidate_serialized = (  # type: ignore[method-assign]
+            stage_terminal_rejection
+        )
+
+        self.assertFalse(server._submit_synchronous_block_candidate(candidate))
+        self.assertEqual(events, ["state", "reject", "abandon"])
+        self.assertEqual(
+            server.block_candidate_abandoned_counts,
+            {PRISM_REJECTION_POOL_CLOSED: 1},
+        )
+        self.assertFalse(server._block_candidate_terminal_outcome(block_hash))
+
+    def test_synchronous_cleanup_failure_keeps_candidate_pending(self) -> None:
+        server, state, ledger = submit_coordinator()
+        block_hash = "cb" * 32
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex=block_hash,
+                block_hex="cb",
+                share_pass=False,
+                block_pass=True,
+            ),
+            credit_share_on_accept=True,
+        )
+        events: list[str] = []
+        ledger.pool_block_state = (  # type: ignore[attr-defined]
+            lambda *, block_hash: {
+                "chain_state": "prepared",
+                "maturity_state": "immature",
+            }
+        )
+
+        def fail_reject(**_kwargs: object) -> dict[str, object]:
+            events.append("reject")
+            raise RuntimeError("postgres unavailable")
+
+        def unexpected_abandon(**_kwargs: object) -> bool:
+            events.append("abandon")
+            return True
+
+        ledger.reject_prepared_block = fail_reject  # type: ignore[method-assign]
+        ledger.mark_block_candidate_abandoned = unexpected_abandon  # type: ignore[attr-defined]
+
+        class CleanupRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                return super().call(method, params)
+
+        server.rpc = CleanupRpc("00" * 32)
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: SimpleNamespace(
+                attempted=False,
+                result=None,
+                error=None,
+            )
+        )
+        server._mark_block_candidate_attempted = (  # type: ignore[method-assign]
+            lambda _block_hash: True
+        )
+
+        def stage_terminal_rejection(
+            _candidate: PrismBlockCandidate,
+            *,
+            node_submission: object,
+        ) -> bool:
+            self.assertIsNotNone(node_submission)
+            outcome = server._block_candidate_outcome
+            outcome.reason = PRISM_REJECTION_POOL_CLOSED
+            outcome.error = "pool is no longer accepting blocks"
+            outcome.stale_job_class = None
+            return False
+
+        server._submit_block_candidate_serialized = (  # type: ignore[method-assign]
+            stage_terminal_rejection
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "could not reject prepared state for terminal candidate",
+        ):
+            server._submit_synchronous_block_candidate(candidate)
+
+        self.assertEqual(events, ["reject"])
+        self.assertIs(server._retry_block_candidate, candidate)
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
+        self.assertIsNone(server._block_candidate_terminal_outcome(block_hash))
+        self.assertEqual(
+            server._block_candidate_outcome.reason,
+            PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+        )
+
+    def test_restart_resubmit_honors_terminal_abandoned_outbox(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        block_hash = "e8" * 32
+        submission = SimpleNamespace(
+            header_hex="aa" * 80,
+            coinbase_tx_hex="00",
+            block_hash_hex=block_hash,
+            block_hex="e8",
+            share_pass=False,
+            block_pass=True,
+        )
+        first_pending = server.pending_share_from_submission(
+            context=server.jobs["job-1"],
+            submission=submission,
+            ntime_hex="00000001",
+        )
+        first_candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=first_pending,
+            credit_share_on_accept=True,
+        )
+        self.assertTrue(
+            ledger.persist_block_candidate_intent(
+                server.block_candidate_intent(first_candidate)
+            )
+        )
+        self.assertTrue(
+            ledger.mark_block_candidate_abandoned(
+                block_hash=block_hash,
+                error="terminal before restart",
+            )
+        )
+        server._finish_pending_share_commit(first_pending)
+        submitblock_calls: list[str] = []
+
+        class NoResubmitRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    submitblock_calls.append(str((params or [""])[0]))
+                    return None
+                return super().call(method, params)
+
+        server.rpc = NoResubmitRpc("00" * 32)
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            with self.assertRaises(StratumError) as raised:
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+
+        self.assertEqual(raised.exception.code, 23)
+        self.assertEqual(submitblock_calls, [])
+        self.assertEqual(ledger._block_candidate_outbox[block_hash]["state"], "abandoned")
+        self.assertEqual(len(ledger), 0)
+
+    def test_restart_resubmit_coalesces_terminal_submitted_outbox(self) -> None:
+        first_server, first_state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        first_server.ledger = ledger
+        block_hash = "f8" * 32
+        submission = SimpleNamespace(
+            header_hex="ab" * 80,
+            coinbase_tx_hex="00",
+            block_hash_hex=block_hash,
+            block_hex="f8",
+            share_pass=True,
+            block_pass=True,
+        )
+        first_pending = PendingShare(
+            share_id=f"miner-a:{block_hash}",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=7,
+            network_difficulty=1,
+            template_height=9,
+            job_id="job-1",
+            job_issued_at_ms=12345,
+            accepted_at_ms=1,
+            ntime=1,
+        )
+        first_candidate = block_candidate(
+            first_server,
+            first_state,
+            submission,
+            pending_share=first_pending,
+        )
+        first_record = ledger.append_batch(
+            [
+                (
+                    first_pending,
+                    first_server.block_candidate_intent(first_candidate),
+                )
+            ]
+        )[0]
+        self.assertTrue(first_record.newly_inserted)
+        self.assertTrue(
+            ledger.mark_block_candidate_submitted(block_hash=block_hash)
+        )
+
+        # Model a clean restart: volatile duplicate/disposition state is gone,
+        # while the ledger and terminal candidate outbox remain authoritative.
+        server, state, _recording = submit_coordinator()
+        server.ledger = ledger
+        submitblock_calls: list[str] = []
+
+        class NoResubmitRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    submitblock_calls.append(str((params or [""])[0]))
+                    return None
+                return super().call(method, params)
+
+        server.rpc = NoResubmitRpc("00" * 32)
+        with patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission,
+        ):
+            self.assertFalse(
+                server.handle_submit(
+                    state,
+                    ["miner-a", "job-1", "00" * 8, "00000001", "00000002"],
+                )
+            )
+
+        self.assertEqual(submitblock_calls, [])
+        self.assertEqual(
+            ledger._block_candidate_outbox[block_hash]["state"], "submitted"
+        )
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger._shares[0].accepted_at_ms, 1)
+        self.assertTrue(server.block_candidate_queue.empty())
+        self.assertEqual(
+            server.worker_share_counts["miner-a"],
+            {"submitted": 1, "accepted": 0, "grace": 0},
+        )
+
+    def test_exact_share_replay_does_not_repeat_process_credit(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        block_hash = "d8" * 32
+        submission = SimpleNamespace(
+            coinbase_tx_hex="00",
+            block_hash_hex=block_hash,
+            block_hex="d8",
+            share_pass=True,
+            block_pass=True,
+        )
+        pending = PendingShare(
+            share_id=f"miner-a:{block_hash}",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=9,
+            job_id="job-1",
+            job_issued_at_ms=12345,
+            accepted_at_ms=12346,
+            ntime=1,
+        )
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        intent = server.block_candidate_intent(candidate)
+        worker_credits: list[str] = []
+        vardiff_credits: list[str] = []
+        server.note_worker_accepted_share = (  # type: ignore[method-assign]
+            lambda worker, _policy: worker_credits.append(worker)
+        )
+        server.note_vardiff_accepted_share = (  # type: ignore[method-assign]
+            lambda _client, job: vardiff_credits.append(job.job_id)
+        )
+
+        self.assertEqual(
+            server.append_accepted_share(
+                state,
+                candidate.context,
+                submission,
+                pending,
+                candidate_intent=intent,
+            ),
+            "pending",
+        )
+        self.assertEqual(
+            server.append_accepted_share(
+                state,
+                candidate.context,
+                submission,
+                pending,
+                candidate_intent=intent,
+            ),
+            "pending",
+        )
+
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(worker_credits, ["miner-a"])
+        self.assertEqual(vardiff_credits, ["job-1"])
+
+    def test_same_hash_busy_lease_preserves_retry_behind_live_work(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server.block_candidate_retry_initial_seconds = 0.0
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="a7" * 32,
+                block_hex="a7",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        block_hash = candidate.submission.block_hash_hex
+        lease = server._claim_block_candidate_disposition(
+            block_hash,
+            blocking=True,
+        )
+        assert lease is not None
+        server._retry_block_candidate = candidate
+        server._ensure_block_replay_state()
+        server._block_replay_inflight_hashes.add(block_hash)
+        try:
+            self.assertTrue(
+                server.submit_next_block_candidate(defer_accounting=True)
+            )
+            self.assertIsNone(server._retry_block_candidate)
+            self.assertIs(
+                server._block_disposition_waiting_retries[block_hash],
+                candidate,
+            )
+        finally:
+            server._release_block_candidate_disposition(lease)
+
+        captured: list[object] = []
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: SimpleNamespace(
+                attempted=True,
+                result="duplicate",
+                error=None,
+            )
+        )
+        server._enqueue_block_accounting_task = (  # type: ignore[method-assign]
+            lambda task: (captured.append(task), True)[1]
+        )
+        self.assertTrue(server.submit_next_block_candidate(defer_accounting=True))
+        self.assertEqual(len(captured), 1)
+        task = captured[0]
+        server._release_block_candidate_disposition(task.disposition_lease)
+
+    def test_permanently_closed_pool_hands_outbox_to_accounting(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server.max_blocks = 1
+        server.accepted_block_count = 1
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="f2" * 32,
+                block_hex="f2",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        captured: list[object] = []
+        server._enqueue_block_accounting_task = (  # type: ignore[method-assign]
+            lambda task: (captured.append(task), True)[1]
+        )
+        server.rpc = SimpleNamespace(
+            call=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("closed pool must not call submitblock")
+            )
+        )
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate(defer_accounting=True))
+        self.assertEqual(len(captured), 1)
+        task = captured[0]
+        self.assertFalse(task.node_submission.attempted)
+        self.assertIsNone(getattr(server, "_retry_block_candidate", None))
+        server._release_block_candidate_disposition(task.disposition_lease)
+
+    def test_accounted_block_replaces_its_capacity_reservation(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server.max_blocks = 2
+        server.stop_after_block = False
+        block_hash = "e2" * 32
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="e2",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        server._ensure_block_candidate_disposition_state()
+        server._block_fast_lane_reservations.add(block_hash)
+        server._land_and_confirm_block_candidate = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: (
+                verified_block_bundle(),
+                verified_audit_report(),
+                {"persisted": True},
+                {"confirmed_count": 1},
+            )
+        )
+        server.accepted_share_stats = lambda: (0, 0)  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            self.assertTrue(
+                server._submit_block_candidate_serialized(
+                    candidate,
+                    node_submission=SimpleNamespace(
+                        attempted=True,
+                        result=None,
+                        error=None,
+                    ),
+                )
+            )
+
+        self.assertEqual(server.accepted_block_count, 1)
+        self.assertNotIn(block_hash, server._block_fast_lane_reservations)
+        self.assertTrue(server._reserve_block_fast_lane_slot("e3" * 32))
+
     def test_block_submitter_retry_wait_heartbeats_in_bounded_slices(self) -> None:
         server = self._bare_coordinator()
         server.watchdog_timeout_seconds = 0.3
@@ -13287,19 +14261,26 @@ class PrismStampedJobFloorTests(unittest.TestCase):
 
         class ObservedDispositionLock:
             def __init__(self) -> None:
-                self.lock = threading.RLock()
+                self.lock = threading.Lock()
 
-            def __enter__(self) -> ObservedDispositionLock:
+            def acquire(
+                self,
+                blocking: bool = True,
+                timeout: float = -1,
+            ) -> bool:
                 if threading.current_thread() is replay_thread:
                     if self.lock.acquire(blocking=False):
-                        return self
+                        return True
                     # A failed non-blocking acquisition proves the accepted
                     # attempt still owns this exact same-hash guard.
                     replay_guard_blocked.set()
-                self.lock.acquire()
-                return self
+                if not blocking:
+                    return self.lock.acquire(blocking=False)
+                if timeout < 0:
+                    return self.lock.acquire()
+                return self.lock.acquire(timeout=timeout)
 
-            def __exit__(self, *_args: object) -> None:
+            def release(self) -> None:
                 self.lock.release()
 
         server._ensure_block_candidate_disposition_state()
@@ -14484,6 +15465,12 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         ledger.pool_block_state = durable_block_state  # type: ignore[attr-defined]
 
         self.assertEqual(server.replay_pending_block_candidates(), 3)
+        replayed = [
+            server._block_replay_candidate_queue.get_nowait()
+            for _ in range(3)
+        ]
+        for candidate in replayed:
+            server._restore_replayed_candidate_acceptance_evidence(candidate)
 
         self.assertIn(accepted_hash, server._tip_observed_accepted_block_hashes)
         self.assertIn(accepted_hash, server._outstanding_block_candidate_hashes)
@@ -14679,9 +15666,9 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         self.assertFalse(accepted_race_won)
         outcome = getattr(server, "_block_candidate_outcome", None)
         self.assertEqual(getattr(outcome, "reason", None), "block-stale")
-        self.assertEqual(
-            server.block_candidate_abandoned_counts["block-stale"],
-            1,
+        self.assertNotIn(
+            "block-stale",
+            server.block_candidate_abandoned_counts,
         )
         self.assertEqual(
             getattr(server, "block_candidate_accept_pending_defer_count", 0),
@@ -14711,9 +15698,9 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         )
 
         self.assertFalse(accepted_race_won)
-        self.assertEqual(
-            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
-            1,
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
         )
         self.assertNotIn(block_hash, server._outstanding_block_candidate_hashes)
 
@@ -14721,6 +15708,13 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         # must not register acceptance evidence for the sealed hash.
         self.assertTrue(server.observe_tip_for_refresh(block_hash))
         self.assertNotIn(block_hash, server._tip_observed_accepted_block_hashes)
+        outcome = getattr(server, "_block_candidate_outcome", None)
+        self.assertIsNotNone(outcome)
+        server._record_committed_block_candidate_abandonment(block_hash, outcome)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+            1,
+        )
 
     def test_observation_during_prepared_row_rejection_cannot_split_state(self) -> None:
         # The exact round-3 interleaving at the post-persist site: a
@@ -14863,6 +15857,10 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             self.assertIn(
                 block_hash, server._outstanding_block_candidate_hashes
             )
+            self.assertNotIn(
+                "block-stale",
+                server.block_candidate_abandoned_counts,
+            )
 
             # Blockwait reports the pool's own hash during the backoff gap:
             # the evidence registers instead of vanishing behind the seal.
@@ -14871,6 +15869,26 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
                 block_hash, server._tip_observed_accepted_block_hashes
             )
             self.assertEqual(abandoned, [])
+
+            # The retry can subsequently prove the candidate active and
+            # complete as submitted. The earlier reversible seals must never
+            # leave a contradictory abandonment count behind.
+            ledger.persist_accepted_block = real_persist  # type: ignore[method-assign]
+            rpc.tip = block_hash
+            rpc.height = 10
+            rpc.active[block_hash] = 10
+            rpc.getblockhash_override = None
+            recovered_candidate = self._retained_candidate(server)
+            self.assertTrue(
+                server._submit_next_block_candidate_writer(recovered_candidate)
+            )
+            self.assertEqual(submitted, [block_hash])
+            self.assertEqual(abandoned, [])
+            self.assertEqual(server.accepted_block_count, 1)
+            self.assertNotIn(
+                "block-stale",
+                server.block_candidate_abandoned_counts,
+            )
 
     def test_pool_closed_gate_requires_probe_proven_acceptance(self) -> None:
         # Bugbot: observation evidence alone must not open the pool-closed

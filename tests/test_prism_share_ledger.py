@@ -423,9 +423,15 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger = SingleWriterShareLedger()
         first = pending_share(1)
         duplicate = pending_share(2).__class__(**{**pending_share(2).__dict__, "share_id": first.share_id})
+        later_stamp = first.__class__(
+            **{**first.__dict__, "accepted_at_ms": first.accepted_at_ms + 42}
+        )
 
         self.assertEqual(ledger.append(first).share_seq, 1)
-        self.assertEqual(ledger.append(first).share_seq, 1)
+        replay = ledger.append(later_stamp)
+        self.assertEqual(replay.share_seq, 1)
+        self.assertFalse(replay.newly_inserted)
+        self.assertEqual(replay.accepted_at_ms, first.accepted_at_ms)
         with self.assertRaisesRegex(ValueError, "payload mismatch"):
             ledger.append(duplicate)
 
@@ -443,6 +449,8 @@ class PrismShareLedgerTests(unittest.TestCase):
         records = ledger.append_batch([(share, intent)])
 
         self.assertEqual(records[0].share_seq, 1)
+        self.assertTrue(records[0].newly_inserted)
+        self.assertEqual(records[0].candidate_outbox_state, "pending")
         self.assertEqual(ledger.pending_block_candidates(), [intent])
         self.assertEqual(
             ledger.pending_block_candidate_rows(),
@@ -450,12 +458,27 @@ class PrismShareLedgerTests(unittest.TestCase):
         )
         # Exact replay returns the original row and does not duplicate outbox
         # work. A changed intent with the same hash is rejected as corruption.
-        self.assertEqual(ledger.append_batch([(share, intent)])[0].share_seq, 1)
+        replay = ledger.append_batch([(share, intent)])[0]
+        self.assertEqual(replay.share_seq, 1)
+        self.assertFalse(replay.newly_inserted)
+        self.assertEqual(replay.candidate_outbox_state, "pending")
         with self.assertRaisesRegex(ValueError, "candidate payload mismatch"):
             ledger.append_batch([(share, {**intent, "block_hex": "01"})])
         self.assertEqual(len(ledger), 1)
         self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="ab" * 32))
         self.assertEqual(ledger.pending_block_candidates(), [])
+        later_share = share.__class__(
+            **{**share.__dict__, "accepted_at_ms": share.accepted_at_ms + 42}
+        )
+        terminal_replay = ledger.append_batch([(later_share, intent)])[0]
+        self.assertFalse(terminal_replay.newly_inserted)
+        self.assertEqual(terminal_replay.candidate_outbox_state, "submitted")
+        self.assertFalse(
+            ledger.mark_block_candidate_abandoned(
+                block_hash="ab" * 32,
+                error="must not invert terminal state",
+            )
+        )
 
     def test_pending_candidate_age_distinguishes_first_attempt(self) -> None:
         ledger = SingleWriterShareLedger()
@@ -527,8 +550,12 @@ class PrismShareLedgerTests(unittest.TestCase):
         retry_share = pending_share(1, accepted_at_ms=2_042)
         retry_intent = {**intent, "pending_share": dict(retry_share.__dict__)}
 
-        self.assertTrue(ledger.persist_block_candidate_intent(intent))
-        self.assertFalse(ledger.persist_block_candidate_intent(retry_intent))
+        first_persist = ledger.persist_block_candidate_intent(intent)
+        retry_persist = ledger.persist_block_candidate_intent(retry_intent)
+        self.assertTrue(first_persist)
+        self.assertEqual(first_persist.state, "pending")
+        self.assertFalse(retry_persist)
+        self.assertEqual(retry_persist.state, "pending")
         self.assertEqual(ledger.pending_block_candidates(), [intent])
         with self.assertRaisesRegex(ValueError, "candidate payload mismatch"):
             ledger.persist_block_candidate_intent({**retry_intent, "block_hex": "01"})
@@ -541,6 +568,10 @@ class PrismShareLedgerTests(unittest.TestCase):
             ledger.pending_block_candidate_rows(),
             [{"block_hash": "ef" * 32, "candidate": intent}],
         )
+        self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="ef" * 32))
+        terminal_persist = ledger.persist_block_candidate_intent(retry_intent)
+        self.assertFalse(terminal_persist)
+        self.assertEqual(terminal_persist.state, "submitted")
 
     def test_concurrent_append_still_has_one_canonical_sequence(self) -> None:
         ledger = SingleWriterShareLedger()
@@ -998,6 +1029,8 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("inserted_candidates AS", query)
         self.assertIn("qbit_block_candidate_outbox", query)
         self.assertIn("duplicate share_id payload mismatch", query)
+        self.assertIn("'candidate_outbox_state'", query)
+        self.assertNotIn("ledger.accepted_at IS DISTINCT", query)
         self.assertEqual(query.count("SELECT CASE"), 1)
 
     def test_postgres_candidate_only_intent_forces_durable_fenced_commit(self) -> None:
@@ -1016,6 +1049,7 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("set_config('synchronous_commit', 'on', true)", query)
         self.assertIn("qbit_ledger_writer_lease", query)
         self.assertIn("qbit_block_candidate_outbox", query)
+        self.assertIn("SELECT candidate_sha256, state", query)
 
     def test_postgres_pending_candidate_rows_keep_authoritative_outbox_key(self) -> None:
         intent = {

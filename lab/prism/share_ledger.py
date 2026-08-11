@@ -16,7 +16,7 @@ import traceback
 import uuid
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -73,6 +73,16 @@ class AcceptedShareRecord:
     accepted_at_ms: int
     ntime: int
     credit_policy: str | None = None
+    # Append-result metadata is deliberately excluded from the durable/public
+    # share identity. It lets the coordinator make process-local accounting
+    # idempotent and observe the candidate state from the same transaction
+    # that established the pre-submit outbox boundary.
+    newly_inserted: bool = field(default=True, compare=False, repr=False)
+    candidate_outbox_state: str | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def to_prism_json(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -424,6 +434,15 @@ class IncrementalShareWindow:
         )
 
 
+@dataclass(frozen=True)
+class BlockCandidateIntentPersistResult:
+    inserted: bool
+    state: str
+
+    def __bool__(self) -> bool:
+        return self.inserted
+
+
 class SingleWriterShareLedger:
     """Assigns canonical share_seq values and returns immutable snapshots.
 
@@ -469,7 +488,7 @@ class SingleWriterShareLedger:
             if pending.share_id in self._share_ids:
                 existing = self._shares_by_id[pending.share_id]
                 if self._pending_matches_record(pending, existing, credit_policy=credit_policy):
-                    return replace(existing)
+                    return replace(existing, newly_inserted=False)
                 raise ValueError("duplicate share_id payload mismatch")
             record = AcceptedShareRecord(
                 share_seq=self._next_share_seq,
@@ -509,7 +528,9 @@ class SingleWriterShareLedger:
             and int(pending.template_height) == int(record.template_height)
             and pending.job_id == record.job_id
             and int(pending.job_issued_at_ms) == int(record.job_issued_at_ms)
-            and int(pending.accepted_at_ms) == int(record.accepted_at_ms)
+            # accepted_at_ms is assigned when the coordinator receives an
+            # attempt. An exact header replay after restart gets a fresh stamp;
+            # the original durable row remains authoritative.
             and int(pending.ntime) == int(record.ntime)
             and credit_policy == record.credit_policy
         )
@@ -562,6 +583,7 @@ class SingleWriterShareLedger:
 
             for pending, candidate in entries:
                 existing = self._shares_by_id.get(pending.share_id)
+                newly_inserted = existing is None
                 if existing is None:
                     credit_policy = validate_credit_policy(pending.credit_policy)
                     existing = AcceptedShareRecord(
@@ -583,7 +605,7 @@ class SingleWriterShareLedger:
                     self._share_ids.add(pending.share_id)
                     self._shares_by_id[pending.share_id] = existing
                     self._next_share_seq += 1
-                records.append(replace(existing))
+                candidate_state: str | None = None
                 if candidate is not None:
                     block_hash = str(candidate["block_hash_hex"]).lower()
                     self._block_candidate_outbox.setdefault(
@@ -600,9 +622,22 @@ class SingleWriterShareLedger:
                         },
                     )
                     self._block_candidate_outbox[block_hash]["share_id"] = pending.share_id
+                    candidate_state = str(
+                        self._block_candidate_outbox[block_hash]["state"]
+                    )
+                records.append(
+                    replace(
+                        existing,
+                        newly_inserted=newly_inserted,
+                        candidate_outbox_state=candidate_state,
+                    )
+                )
         return records
 
-    def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
+    def persist_block_candidate_intent(
+        self,
+        candidate: dict[str, Any],
+    ) -> BlockCandidateIntentPersistResult:
         """Persist candidate work before a below-share-target synchronous submit."""
         block_hash = str(candidate.get("block_hash_hex", "")).lower()
         if not block_hash:
@@ -613,7 +648,10 @@ class SingleWriterShareLedger:
             if existing is not None:
                 if existing["candidate_sha256"] != candidate_sha256:
                     raise ValueError("block candidate payload mismatch")
-                return False
+                return BlockCandidateIntentPersistResult(
+                    inserted=False,
+                    state=str(existing["state"]),
+                )
             self._block_candidate_outbox[block_hash] = {
                 "block_hash": block_hash,
                 "share_id": None,
@@ -624,7 +662,10 @@ class SingleWriterShareLedger:
                 "last_error": None,
                 "created_monotonic": time.monotonic(),
             }
-            return True
+            return BlockCandidateIntentPersistResult(
+                inserted=True,
+                state="pending",
+            )
 
     def pending_block_candidates(self, *, limit: int = 32) -> list[dict[str, Any]]:
         return [
@@ -694,7 +735,7 @@ class SingleWriterShareLedger:
     def _finish_block_candidate(self, *, block_hash: str, state: str, error: str | None) -> bool:
         with self._lock:
             row = self._block_candidate_outbox.get(block_hash.lower())
-            if row is None:
+            if row is None or row["state"] != "pending":
                 return False
             row["state"] = state
             row["last_error"] = error
@@ -2354,7 +2395,6 @@ share_mismatch AS (
        OR ledger.template_height IS DISTINCT FROM (data->>'template_height')::bigint
        OR ledger.job_id IS DISTINCT FROM data->>'job_id'
        OR ledger.job_issued_at IS DISTINCT FROM to_timestamp((data->>'job_issued_at_ms')::double precision / 1000.0)
-       OR ledger.accepted_at IS DISTINCT FROM to_timestamp((data->>'accepted_at_ms')::double precision / 1000.0)
        OR ledger.ntime IS DISTINCT FROM (data->>'ntime')::bigint
        OR ledger.credit_policy IS DISTINCT FROM data->>'credit_policy'
 ),
@@ -2369,6 +2409,17 @@ candidate_mismatch AS (
            OR (outbox.candidate IS NOT NULL
                AND (outbox.candidate #- '{{pending_share,accepted_at_ms}}')
                    IS DISTINCT FROM (payload.candidate #- '{{pending_share,accepted_at_ms}}')))
+),
+candidate_states AS (
+    SELECT
+        payload.ordinality,
+        CASE
+            WHEN payload.candidate IS NULL THEN NULL
+            ELSE COALESCE(outbox.state, 'pending')
+        END AS candidate_outbox_state
+    FROM payload
+    LEFT JOIN qbit_block_candidate_outbox outbox
+      ON outbox.block_hash = payload.candidate->>'block_hash_hex'
 ),
 batch_ok AS (
     SELECT 1 AS ok
@@ -2422,9 +2473,10 @@ inserted_candidates AS (
 records AS (
     SELECT
         ledger.*, payload.ordinality, false AS newly_inserted,
-        false AS new_miner
+        false AS new_miner, candidate_states.candidate_outbox_state
     FROM payload
     JOIN qbit_share_ledger ledger ON ledger.share_id = payload.data->>'share_id'
+    JOIN candidate_states ON candidate_states.ordinality = payload.ordinality
     UNION ALL
     SELECT
         inserted_shares.*, payload.ordinality, true AS newly_inserted,
@@ -2442,9 +2494,11 @@ records AS (
             FROM inserted_shares earlier_insert
             WHERE earlier_insert.miner_id = inserted_shares.miner_id
               AND earlier_insert.share_seq < inserted_shares.share_seq
-        ) AS new_miner
+        ) AS new_miner,
+        candidate_states.candidate_outbox_state
     FROM inserted_shares
     JOIN payload ON payload.data->>'share_id' = inserted_shares.share_id
+    JOIN candidate_states ON candidate_states.ordinality = payload.ordinality
 )
 SELECT CASE
     WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
@@ -2476,7 +2530,8 @@ SELECT CASE
                 'ntime', records.ntime,
                 'credit_policy', records.credit_policy,
                 'newly_inserted', records.newly_inserted,
-                'new_miner', records.new_miner
+                'new_miner', records.new_miner,
+                'candidate_outbox_state', records.candidate_outbox_state
             ) ORDER BY records.ordinality)
             FROM records
         )
@@ -2503,7 +2558,10 @@ END;
                     )
             return parsed
 
-    def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
+    def persist_block_candidate_intent(
+        self,
+        candidate: dict[str, Any],
+    ) -> BlockCandidateIntentPersistResult:
         """Persist candidate work that is not yet eligible for share credit."""
         block_hash = str(candidate.get("block_hash_hex", "")).lower()
         if not block_hash:
@@ -2526,7 +2584,7 @@ lease AS (
     RETURNING writer_id
 ),
 existing AS (
-    SELECT candidate_sha256
+    SELECT candidate_sha256, state
     FROM qbit_block_candidate_outbox
     WHERE block_hash = {self._text_literal(block_hash)}
 ),
@@ -2551,13 +2609,19 @@ SELECT CASE
     ) THEN
         json_build_object('error', 'block candidate payload mismatch')
     ELSE
-        json_build_object('inserted', (SELECT count(*) FROM inserted))
+        json_build_object(
+            'inserted', (SELECT count(*) FROM inserted),
+            'state', COALESCE((SELECT state FROM existing), 'pending')
+        )
 END;
 """
         result = self._run_fenced_json(sql)
         if "error" in result:
             raise RuntimeError(str(result["error"]))
-        return int(result.get("inserted", 0)) > 0
+        return BlockCandidateIntentPersistResult(
+            inserted=int(result.get("inserted", 0)) > 0,
+            state=str(result.get("state", "pending")),
+        )
 
     def pending_block_candidates(self, *, limit: int = 32) -> list[dict[str, Any]]:
         return [
@@ -7658,6 +7722,12 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             credit_policy=(
                 str(payload["credit_policy"])
                 if payload.get("credit_policy") is not None
+                else None
+            ),
+            newly_inserted=bool(payload.get("newly_inserted", True)),
+            candidate_outbox_state=(
+                str(payload["candidate_outbox_state"])
+                if payload.get("candidate_outbox_state") is not None
                 else None
             ),
         )
