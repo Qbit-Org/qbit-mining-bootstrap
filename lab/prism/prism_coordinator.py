@@ -68,6 +68,9 @@ from lab.prism.share_ledger import (
     DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
     DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
+    IncrementalShareWindow,
+    IncrementalWindowAdvanceStats,
+    IncrementalWindowFallback,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -118,6 +121,14 @@ PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP = 16
 # livelock behind the 2026-07-29 rollback of the first anchor-scoped
 # deploy. Freshness starts when the window becomes reusable.
 DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS = 60.0
+# Normal generations may reuse the last materialized window until this floor
+# elapses. Found-block settlement bypasses the floor; the default follows the
+# existing re-anchor cadence so one knob continues to describe the expected
+# freshness rhythm when the new setting is absent.
+DEFAULT_PRISM_PAYOUT_ARTIFACT_MIN_BUILD_INTERVAL_SECONDS = 60.0
+# A full oracle pass periodically checks the append-only delta assumption.
+# Reorg/carry mutations and invariant failures force this path immediately.
+DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS = 3_600.0
 
 
 def validate_payout_artifact_age_bounds(
@@ -1634,6 +1645,42 @@ class PayoutLedgerArtifact:
     # reused-build fences hash them twice more; the tuple is immutable, so
     # the O(accounts) canonicalization is paid once here instead.
     prior_balances_sha256: str | None = None
+    # Build-path diagnostics only. They do not participate in artifact
+    # equality or any signed/wire representation.
+    window_build_mode: str | None = field(default=None, compare=False, repr=False)
+    window_delta_rows: int = field(default=0, compare=False, repr=False)
+    window_expired_rows: int = field(default=0, compare=False, repr=False)
+    window_touched_pages: int = field(default=0, compare=False, repr=False)
+    window_build_seconds: float = field(default=0.0, compare=False, repr=False)
+    window_full_rescan_reason: str | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+
+@dataclass(frozen=True)
+class _IncrementalPayoutArtifactWindow:
+    """Coordinator-owned exact window plus its canonical materialization."""
+
+    window: IncrementalShareWindow
+    shares_json: tuple[dict[str, object], ...] = field(repr=False)
+    share_snapshot_sha256: str
+    refreshed_monotonic: float
+    full_rescan_monotonic: float
+
+
+@dataclass(frozen=True)
+class _PayoutWindowMaterialization:
+    """One exact share-window materialization and bounded-work metadata."""
+
+    shares_json: tuple[dict[str, object], ...] = field(repr=False)
+    share_snapshot_sha256: str
+    snapshot_anchor_ms: int
+    mode: str
+    record_count: int
+    stats: IncrementalWindowAdvanceStats
+    full_rescan_reason: str | None = None
 
 
 def _share_window_spool_file() -> Any:
@@ -2963,6 +3010,14 @@ class PrismCoordinator:
             "PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS",
             DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS,
         )
+        self.payout_artifact_min_build_interval_seconds = env_positive_float(
+            "PRISM_PAYOUT_ARTIFACT_MIN_BUILD_INTERVAL_SECONDS",
+            self.payout_artifact_reanchor_seconds,
+        )
+        self.payout_artifact_full_rescan_seconds = env_positive_float(
+            "PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS",
+            DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS,
+        )
         self.payout_artifact_max_anchor_age_seconds = env_positive_float(
             "PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS",
             DEFAULT_PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS,
@@ -2971,6 +3026,14 @@ class PrismCoordinator:
             self.payout_artifact_max_anchor_age_seconds,
             self.payout_artifact_reanchor_seconds,
         )
+        if (
+            self.payout_artifact_min_build_interval_seconds
+            >= self.payout_artifact_max_anchor_age_seconds
+        ):
+            raise SystemExit(
+                "PRISM_PAYOUT_ARTIFACT_MIN_BUILD_INTERVAL_SECONDS must be "
+                "less than PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS"
+            )
         self.routine_admission_deadline_seconds = env_positive_float(
             "PRISM_ROUTINE_ADMISSION_DEADLINE_SECONDS",
             DEFAULT_PRISM_ROUTINE_ADMISSION_DEADLINE_SECONDS,
@@ -3984,6 +4047,13 @@ class PrismCoordinator:
             self._payout_ledger_artifact: PayoutLedgerArtifact | None = None
         if not hasattr(self, "_payout_ledger_artifact_generation"):
             self._payout_ledger_artifact_generation = 0
+        if not hasattr(self, "_incremental_payout_artifact_window"):
+            # Guarded by _payout_state_prepare_lock. It is independent of the
+            # published artifact generation: normal generation bumps retag
+            # the same immutable share window without another ledger walk.
+            self._incremental_payout_artifact_window: (
+                _IncrementalPayoutArtifactWindow | None
+            ) = None
         if not hasattr(self, "_pending_share_commit_lock"):
             self._pending_share_commit_lock = threading.Lock()
         if not hasattr(self, "_pending_share_commit_floor"):
@@ -4215,6 +4285,12 @@ class PrismCoordinator:
                 for event in (
                     "built",
                     "build_aborted",
+                    "debounced",
+                    "incremental",
+                    "full_rescan",
+                    "self_check_match",
+                    "self_check_mismatch",
+                    "self_check_failed",
                     "installed",
                     "refreshed",
                     "already_current",
@@ -4405,11 +4481,252 @@ class PrismCoordinator:
             if control.process is process:
                 control.process = None
 
+    @staticmethod
+    def _incremental_window_records_supported(records: Sequence[object]) -> bool:
+        """Whether a ledger snapshot exposes the append-only window contract."""
+
+        required = (
+            "share_seq",
+            "share_id",
+            "share_difficulty",
+            "job_issued_at_ms",
+            "accepted_at_ms",
+            "to_prism_json",
+        )
+        return bool(records) and all(
+            all(hasattr(record, attribute) for attribute in required)
+            for record in records
+        )
+
+    def _full_payout_window_materialization(
+        self,
+        *,
+        snapshot_anchor_ms: int,
+        snapshot_window_weight: int,
+        reason: str,
+        observed_monotonic: float,
+    ) -> _PayoutWindowMaterialization:
+        """Run the exact ledger oracle and atomically replace cached pages."""
+
+        records = list(
+            self.ledger.snapshot_at_job_issue(
+                snapshot_anchor_ms,
+                window_weight=snapshot_window_weight,
+            )
+        )
+        zero_stats = IncrementalWindowAdvanceStats(
+            added_rows=0,
+            expired_rows=0,
+            touched_pages=0,
+        )
+        if not self._incremental_window_records_supported(records):
+            # Small test/custom ledgers predating the delta contract retain the
+            # legacy full-read behavior. Production ledger records always
+            # expose the complete AcceptedShareRecord shape.
+            self._incremental_payout_artifact_window = None
+            shares_json = tuple(record.to_prism_json() for record in records)
+            return _PayoutWindowMaterialization(
+                shares_json=shares_json,
+                share_snapshot_sha256=canonical_json_sha256(shares_json),
+                snapshot_anchor_ms=int(snapshot_anchor_ms),
+                mode="full_rescan",
+                record_count=len(records),
+                stats=zero_stats,
+                full_rescan_reason=reason,
+            )
+
+        window = IncrementalShareWindow.from_full_snapshot(
+            records,
+            anchor_job_issued_at_ms=snapshot_anchor_ms,
+            window_weight=snapshot_window_weight,
+        )
+        retained = window.records()
+        shares_json = tuple(record.to_prism_json() for record in retained)
+        digest = canonical_json_sha256(shares_json)
+        self._incremental_payout_artifact_window = (
+            _IncrementalPayoutArtifactWindow(
+                window=window,
+                shares_json=shares_json,
+                share_snapshot_sha256=digest,
+                refreshed_monotonic=observed_monotonic,
+                full_rescan_monotonic=observed_monotonic,
+            )
+        )
+        return _PayoutWindowMaterialization(
+            shares_json=shares_json,
+            share_snapshot_sha256=digest,
+            snapshot_anchor_ms=int(snapshot_anchor_ms),
+            mode="full_rescan",
+            record_count=len(retained),
+            stats=zero_stats,
+            full_rescan_reason=reason,
+        )
+
+    def _incremental_payout_window_materialization(
+        self,
+        *,
+        snapshot_anchor_ms: int,
+        snapshot_window_weight: int,
+        force_full_rescan: bool,
+        bypass_build_interval: bool,
+    ) -> _PayoutWindowMaterialization:
+        """Return an exact window using debounce, delta folding, or the oracle.
+
+        Must run under ``_payout_state_prepare_lock``. The cache replacement
+        happens only after a complete materialization, except an explicit
+        forced invalidation clears it before the oracle so a failed reorg
+        check cannot later resume from unverified append-only state.
+        """
+
+        observed = time.monotonic()
+        cached = self._incremental_payout_artifact_window
+        full_reason: str | None = None
+        if force_full_rescan:
+            self._incremental_payout_artifact_window = None
+            cached = None
+            full_reason = "reconcile_invalidation"
+        elif cached is None:
+            full_reason = "cold_start"
+        elif cached.window.window_weight != int(snapshot_window_weight):
+            self._incremental_payout_artifact_window = None
+            cached = None
+            full_reason = "network_difficulty_changed"
+        elif snapshot_anchor_ms < cached.window.anchor_job_issued_at_ms:
+            self._incremental_payout_artifact_window = None
+            cached = None
+            full_reason = "anchor_regression"
+
+        if cached is None:
+            return self._full_payout_window_materialization(
+                snapshot_anchor_ms=snapshot_anchor_ms,
+                snapshot_window_weight=snapshot_window_weight,
+                reason=full_reason or "cache_invalidated",
+                observed_monotonic=observed,
+            )
+
+        min_interval = self._payout_artifact_min_build_interval_seconds()
+        if (
+            not bypass_build_interval
+            and observed - cached.refreshed_monotonic < min_interval
+        ):
+            return _PayoutWindowMaterialization(
+                shares_json=cached.shares_json,
+                share_snapshot_sha256=cached.share_snapshot_sha256,
+                snapshot_anchor_ms=cached.window.anchor_job_issued_at_ms,
+                mode="debounced",
+                record_count=sum(
+                    len(page.records) for page in cached.window.pages
+                ),
+                stats=IncrementalWindowAdvanceStats(0, 0, 0),
+            )
+
+        delta_reader = getattr(self.ledger, "snapshot_between_job_issues", None)
+        if not callable(delta_reader):
+            return self._full_payout_window_materialization(
+                snapshot_anchor_ms=snapshot_anchor_ms,
+                snapshot_window_weight=snapshot_window_weight,
+                reason="delta_api_unavailable",
+                observed_monotonic=observed,
+            )
+
+        try:
+            delta_records = list(
+                delta_reader(
+                    cached.window.anchor_job_issued_at_ms,
+                    snapshot_anchor_ms,
+                )
+            )
+            advanced_window, stats = cached.window.advance(
+                delta_records,
+                anchor_job_issued_at_ms=snapshot_anchor_ms,
+            )
+        except (IncrementalWindowFallback, ValueError):
+            self._incremental_payout_artifact_window = None
+            return self._full_payout_window_materialization(
+                snapshot_anchor_ms=snapshot_anchor_ms,
+                snapshot_window_weight=snapshot_window_weight,
+                reason="incremental_invariant_failed",
+                observed_monotonic=observed,
+            )
+
+        if delta_records or stats.expired_rows:
+            retained = advanced_window.records()
+            shares_json = tuple(record.to_prism_json() for record in retained)
+            digest = canonical_json_sha256(shares_json)
+        else:
+            shares_json = cached.shares_json
+            digest = cached.share_snapshot_sha256
+
+        advanced = _IncrementalPayoutArtifactWindow(
+            window=advanced_window,
+            shares_json=shares_json,
+            share_snapshot_sha256=digest,
+            refreshed_monotonic=observed,
+            full_rescan_monotonic=cached.full_rescan_monotonic,
+        )
+        mode = "incremental"
+        check_reason: str | None = None
+        full_rescan_seconds = float(
+            getattr(
+                self,
+                "payout_artifact_full_rescan_seconds",
+                DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS,
+            )
+        )
+        if observed - cached.full_rescan_monotonic >= full_rescan_seconds:
+            try:
+                full_records = list(
+                    self.ledger.snapshot_at_job_issue(
+                        snapshot_anchor_ms,
+                        window_weight=snapshot_window_weight,
+                    )
+                )
+                full_window = IncrementalShareWindow.from_full_snapshot(
+                    full_records,
+                    anchor_job_issued_at_ms=snapshot_anchor_ms,
+                    window_weight=snapshot_window_weight,
+                )
+                full_retained = full_window.records()
+                matched = full_retained == advanced_window.records()
+                shares_json = tuple(
+                    record.to_prism_json() for record in full_retained
+                )
+                digest = canonical_json_sha256(shares_json)
+                advanced = _IncrementalPayoutArtifactWindow(
+                    window=full_window,
+                    shares_json=shares_json,
+                    share_snapshot_sha256=digest,
+                    refreshed_monotonic=observed,
+                    full_rescan_monotonic=observed,
+                )
+                mode = "self_check_match" if matched else "self_check_mismatch"
+                check_reason = "periodic_self_check"
+            except Exception:
+                # The already-validated delta remains usable. Leave the old
+                # full-rescan timestamp in place so the next eligible build
+                # retries the oracle instead of suppressing it for an hour.
+                mode = "incremental_self_check_failed"
+                check_reason = "periodic_self_check_failed"
+
+        self._incremental_payout_artifact_window = advanced
+        return _PayoutWindowMaterialization(
+            shares_json=advanced.shares_json,
+            share_snapshot_sha256=advanced.share_snapshot_sha256,
+            snapshot_anchor_ms=advanced.window.anchor_job_issued_at_ms,
+            mode=mode,
+            record_count=sum(len(page.records) for page in advanced.window.pages),
+            stats=stats,
+            full_rescan_reason=check_reason,
+        )
+
     def _build_payout_ledger_artifact(
         self,
         expected_payout_state_generation: int,
         artifact_payout_state_generation: int,
         network_difficulty: int,
+        force_full_rescan: bool = False,
+        bypass_build_interval: bool = False,
+        during_publication: bool = False,
     ) -> PayoutLedgerArtifact | None:
         """Build a stable ledger snapshot without publishing it.
 
@@ -4421,7 +4738,9 @@ class PrismCoordinator:
         window; concurrent writers therefore never invalidate this attempt.
         """
         self._ensure_job_cache_state()
+        build_started = time.monotonic()
         ledger_started = time.monotonic()
+        materialized: _PayoutWindowMaterialization
         try:
             with self._payout_state_prepare_lock:
                 with self._job_cache_lock:
@@ -4448,12 +4767,14 @@ class PrismCoordinator:
                     # walk: the re-arm backoff paces retries and the
                     # share-commit liveness watchdog owns recovery.
                     return None
-                records = list(
-                    self.ledger.snapshot_at_job_issue(
-                        snapshot_anchor_ms,
-                        window_weight=snapshot_window_weight,
-                    )
+                window_started = time.monotonic()
+                materialized = self._incremental_payout_window_materialization(
+                    snapshot_anchor_ms=snapshot_anchor_ms,
+                    snapshot_window_weight=snapshot_window_weight,
+                    force_full_rescan=force_full_rescan,
+                    bypass_build_interval=bypass_build_interval,
                 )
+                window_build_seconds = time.monotonic() - window_started
                 prior_balances = self.ledger.current_prior_balances()
             accepted_share_count, _ = self.accepted_share_stats()
         except Exception:
@@ -4465,17 +4786,16 @@ class PrismCoordinator:
                 "ledger_snapshot",
                 time.monotonic() - ledger_started,
             )
-        if not records:
+        if not materialized.shares_json:
             return None
         copy_started = time.monotonic()
-        shares_json = tuple(record.to_prism_json() for record in records)
+        shares_json = materialized.shares_json
         frozen_balances = tuple(prior_balances)
-        share_snapshot_sha256 = canonical_json_sha256(shares_json)
         self._observe_tip_refresh_build_phase(
             "serialization_copy",
             time.monotonic() - copy_started,
         )
-        return PayoutLedgerArtifact(
+        artifact = PayoutLedgerArtifact(
             generation=0,
             payout_state_generation=artifact_payout_state_generation,
             network_difficulty=int(network_difficulty),
@@ -4483,10 +4803,53 @@ class PrismCoordinator:
             shares_json=shares_json,
             prior_balances=frozen_balances,
             prepared_monotonic=time.monotonic(),
-            snapshot_anchor_ms=snapshot_anchor_ms,
-            share_snapshot_sha256=share_snapshot_sha256,
+            snapshot_anchor_ms=materialized.snapshot_anchor_ms,
+            share_snapshot_sha256=materialized.share_snapshot_sha256,
             prior_balances_sha256=canonical_json_sha256(frozen_balances),
+            window_build_mode=materialized.mode,
+            window_delta_rows=materialized.stats.added_rows,
+            window_expired_rows=materialized.stats.expired_rows,
+            window_touched_pages=materialized.stats.touched_pages,
+            window_build_seconds=window_build_seconds,
+            window_full_rescan_reason=materialized.full_rescan_reason,
         )
+        build_seconds = time.monotonic() - build_started
+        log_fields: dict[str, object] = {
+            "payout_state_generation": int(artifact_payout_state_generation),
+            "duration_seconds": round(build_seconds, 3),
+            "window_build_seconds": round(window_build_seconds, 3),
+            "window_build_mode": materialized.mode,
+            "window_shares": materialized.record_count,
+            "delta_rows": materialized.stats.added_rows,
+            "expired_rows": materialized.stats.expired_rows,
+            "touched_pages": materialized.stats.touched_pages,
+            "anchor_age_ms": now_ms() - materialized.snapshot_anchor_ms,
+            "during_publication": bool(during_publication),
+            "build_interval_bypassed": bool(bypass_build_interval),
+        }
+        if materialized.full_rescan_reason is not None:
+            log_fields["full_rescan_reason"] = materialized.full_rescan_reason
+        if materialized.mode == "debounced":
+            self._record_payout_artifact_event("debounced")
+            self._payout_artifact_log(
+                "payout_artifact_build_debounced",
+                **log_fields,
+            )
+        else:
+            self._record_payout_artifact_event("built")
+            if materialized.mode == "full_rescan":
+                self._record_payout_artifact_event("full_rescan")
+            elif materialized.mode == "self_check_match":
+                self._record_payout_artifact_event("self_check_match")
+            elif materialized.mode == "self_check_mismatch":
+                self._record_payout_artifact_event("self_check_mismatch")
+            elif materialized.mode == "incremental_self_check_failed":
+                self._record_payout_artifact_event("incremental")
+                self._record_payout_artifact_event("self_check_failed")
+            else:
+                self._record_payout_artifact_event("incremental")
+            self._payout_artifact_log("payout_artifact_built", **log_fields)
+        return artifact
 
     def _prepare_payout_ledger_artifact(
         self,
@@ -4519,18 +4882,6 @@ class PrismCoordinator:
                     PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP,
                 )
             return
-        self._record_payout_artifact_event("built")
-        self._payout_artifact_log(
-            "payout_artifact_built",
-            payout_state_generation=int(payout_state_generation),
-            duration_seconds=round(build_seconds, 3),
-            window_shares=len(artifact.shares_json),
-            anchor_age_ms=(
-                None
-                if artifact.snapshot_anchor_ms is None
-                else now_ms() - int(artifact.snapshot_anchor_ms)
-            ),
-        )
         if not self._install_payout_ledger_artifact(artifact):
             # A discarded install -- born expired after a slow walk, an
             # ordering loss to a fresher window, or a generation change --
@@ -4816,6 +5167,17 @@ class PrismCoordinator:
                 self,
                 "payout_artifact_reanchor_seconds",
                 DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS,
+            )
+        )
+
+    def _payout_artifact_min_build_interval_seconds(self) -> float:
+        """Minimum normal cadence; found-block settlement bypasses it."""
+
+        return float(
+            getattr(
+                self,
+                "payout_artifact_min_build_interval_seconds",
+                self._payout_artifact_reanchor_seconds(),
             )
         )
 
@@ -6449,7 +6811,10 @@ class PrismCoordinator:
                 invalidated_monotonic=time.monotonic(),
             )
             if reserved is None:
-                candidate = self._current_payout_state_candidate()
+                candidate = self._prepared_payout_state_candidate(
+                    self._capture_payout_state_source(),
+                    bypass_build_interval=True,
+                )
             else:
                 candidate = self._prepared_payout_state_candidate(reserved)
             candidate = self._accepted_block_preview_candidate(
@@ -6475,7 +6840,10 @@ class PrismCoordinator:
                 )
                 for _attempt in range(max_retries):
                     candidate = self._accepted_block_preview_candidate(
-                        self._current_payout_state_candidate(),
+                        self._prepared_payout_state_candidate(
+                            self._capture_payout_state_source(),
+                            bypass_build_interval=True,
+                        ),
                         block_hash=key,
                         preview=serialized,
                     )
@@ -6657,7 +7025,9 @@ class PrismCoordinator:
                 invalidated_monotonic=time.monotonic(),
             )
             candidate = self._prepared_payout_state_candidate(
-                reserved if reserved is not None else self._capture_payout_state_source()
+                reserved if reserved is not None else self._capture_payout_state_source(),
+                force_full_window_rescan=True,
+                bypass_build_interval=True,
             )
             candidate = dataclass_replace(
                 candidate,
@@ -6680,7 +7050,11 @@ class PrismCoordinator:
                 )
                 for _attempt in range(max_retries):
                     candidate = dataclass_replace(
-                        self._current_payout_state_candidate(),
+                        self._prepared_payout_state_candidate(
+                            self._capture_payout_state_source(),
+                            force_full_window_rescan=True,
+                            bypass_build_interval=True,
+                        ),
                         accepted_block_hash=key,
                         accepted_block_withdrawal=True,
                         accepted_block_height=existing.block_height,
@@ -7031,6 +7405,9 @@ class PrismCoordinator:
     def _prepared_payout_state_candidate(
         self,
         captured: tuple[int, int, str | None, str, float],
+        *,
+        force_full_window_rescan: bool = False,
+        bypass_build_interval: bool = False,
     ) -> PayoutStateCandidate:
         base_generation, source_generation, source_tip, cause, invalidated = captured
         ledger_artifact: PayoutLedgerArtifact | None = None
@@ -7044,6 +7421,19 @@ class PrismCoordinator:
                 base_generation,
                 base_generation + 1,
                 template_artifacts.network_difficulty,
+                (
+                    force_full_window_rescan
+                    or cause == "accepted_block_preview_withdrawn"
+                ),
+                (
+                    bypass_build_interval
+                    or cause
+                    in {
+                        "accepted_block_preview",
+                        "accepted_block_preview_withdrawn",
+                    }
+                ),
+                True,
             )
         return PayoutStateCandidate(
             base_generation=base_generation,
@@ -7223,6 +7613,16 @@ class PrismCoordinator:
                     balances=self._materialize_prior_balance_preview(
                         candidate.accepted_block_preview
                     ),
+                )
+            elif candidate.ledger_artifact is not None:
+                # Candidate preparation captured balances under the same
+                # ledger fence as its share window. Reuse that immutable copy
+                # instead of issuing the carry-forward aggregate twice during
+                # every publication.
+                artifact = self._payout_state_artifact_from_balances(
+                    generation=candidate.base_generation + 1,
+                    source_generation=candidate.source_generation,
+                    balances=list(candidate.ledger_artifact.prior_balances),
                 )
             else:
                 artifact = self._prepare_payout_state_artifact(
@@ -16591,7 +16991,8 @@ class PrismCoordinator:
                                 ):
                                     candidate_to_publish = (
                                         self._prepared_payout_state_candidate(
-                                            captured_source
+                                            captured_source,
+                                            force_full_window_rescan=payout_changed,
                                         )
                                     )
                             else:
@@ -16701,7 +17102,8 @@ class PrismCoordinator:
                                     # discard it.
                                     candidate_to_publish = (
                                         self._prepared_payout_state_candidate(
-                                            captured_source
+                                            captured_source,
+                                            force_full_window_rescan=payout_changed,
                                         )
                                     )
                     except Exception:
@@ -16715,7 +17117,8 @@ class PrismCoordinator:
                         if payout_changed:
                             error_candidate = (
                                 self._prepared_payout_state_candidate(
-                                    captured_source
+                                    captured_source,
+                                    force_full_window_rescan=True,
                                 )
                             )
                             self._block_payout_state_publication(force=True)

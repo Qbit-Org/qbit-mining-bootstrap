@@ -358,6 +358,25 @@ class PrismShareLedgerTests(unittest.TestCase):
             ["share-1"],
         )
 
+    def test_job_issue_delta_returns_each_newly_eligible_share_once(self) -> None:
+        ledger = SingleWriterShareLedger()
+        ledger.append(
+            pending_share(1, job_issued_at_ms=1_000, accepted_at_ms=1_001)
+        )
+        ledger.append(
+            pending_share(2, job_issued_at_ms=1_000, accepted_at_ms=1_006)
+        )
+        ledger.append(
+            pending_share(3, job_issued_at_ms=1_006, accepted_at_ms=1_004)
+        )
+        ledger.append(
+            pending_share(4, job_issued_at_ms=1_007, accepted_at_ms=1_007)
+        )
+
+        delta = ledger.snapshot_between_job_issues(1_005, 1_006)
+
+        self.assertEqual([share.share_id for share in delta], ["share-2", "share-3"])
+
     def test_rejects_zero_difficulty_share(self) -> None:
         ledger = SingleWriterShareLedger()
         share = pending_share(1)
@@ -1253,6 +1272,17 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(snapshots, [[]])
         self.assertIn("WITH RECURSIVE pages", ledger.queries[0])
+
+    def test_postgres_job_snapshot_delta_uses_disjoint_timestamp_ranges(self) -> None:
+        ledger = QueryCapturePsqlShareLedger()
+
+        self.assertEqual(ledger.snapshot_between_job_issues(1_000, 2_000), [])
+
+        sql = ledger.queries[0]
+        self.assertIn("ledger.accepted_at >", sql)
+        self.assertIn("ledger.job_issued_at >", sql)
+        self.assertIn("UNION ALL", sql)
+        self.assertIn("ORDER BY share_seq ASC", sql)
 
     def test_postgres_read_concurrency_must_be_positive(self) -> None:
         with self.assertRaisesRegex(ValueError, "read_concurrency"):

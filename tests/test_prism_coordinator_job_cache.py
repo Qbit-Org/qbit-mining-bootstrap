@@ -341,6 +341,59 @@ class AnchorRecordingLedger(FakeLedger):
         )
 
 
+class IncrementalRecordingLedger(SingleWriterShareLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.full_snapshot_calls = 0
+        self.delta_snapshot_calls = 0
+
+    def snapshot_at_job_issue(
+        self,
+        anchor_job_issued_at_ms: int,
+        *,
+        window_weight: int | None = None,
+    ) -> list[object]:
+        self.full_snapshot_calls += 1
+        return super().snapshot_at_job_issue(
+            anchor_job_issued_at_ms,
+            window_weight=window_weight,
+        )
+
+    def snapshot_between_job_issues(
+        self,
+        previous_anchor_job_issued_at_ms: int,
+        anchor_job_issued_at_ms: int,
+    ) -> list[object]:
+        self.delta_snapshot_calls += 1
+        return super().snapshot_between_job_issues(
+            previous_anchor_job_issued_at_ms,
+            anchor_job_issued_at_ms,
+        )
+
+
+def append_incremental_share(
+    ledger: SingleWriterShareLedger,
+    *,
+    share_seq: int,
+    accepted_at_ms: int,
+) -> None:
+    ledger.append(
+        PendingShare(
+            share_id=f"incremental-{share_seq}",
+            miner_id=f"miner-{share_seq % 3}",
+            order_key=f"miner-{share_seq % 3}",
+            p2mr_program_hex=f"{share_seq % 256:02x}" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=9,
+            job_id=f"job-{share_seq}",
+            job_issued_at_ms=accepted_at_ms - 1,
+            accepted_at_ms=accepted_at_ms,
+            ntime=1_700_000_000 + share_seq,
+        )
+    )
+
+
 class SnapshotAnchorFloorTests(unittest.TestCase):
     def _hold_floor(self, server: PrismCoordinator, share: PendingShare) -> None:
         server._ensure_pending_share_commit_state()
@@ -515,6 +568,183 @@ class SnapshotAnchorFloorTests(unittest.TestCase):
             )
         finally:
             server._finish_pending_share_commit(share)
+
+
+class IncrementalPayoutArtifactTests(unittest.TestCase):
+    def configured_server(
+        self,
+    ) -> tuple[PrismCoordinator, IncrementalRecordingLedger, object]:
+        ledger = IncrementalRecordingLedger()
+        append_incremental_share(ledger, share_seq=1, accepted_at_ms=999_900)
+        append_incremental_share(ledger, share_seq=2, accepted_at_ms=999_910)
+        append_incremental_share(ledger, share_seq=3, accepted_at_ms=999_920)
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        server.payout_artifact_min_build_interval_seconds = 60.0
+        server.payout_artifact_full_rescan_seconds = 3_600.0
+        return server, ledger, artifacts
+
+    def test_debounce_then_delta_and_forced_full_rescan(self) -> None:
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertEqual(initial.window_build_mode, "full_rescan")
+            self.assertEqual(ledger.full_snapshot_calls, 1)
+
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            debounced = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert debounced is not None
+            self.assertEqual(debounced.window_build_mode, "debounced")
+            self.assertEqual(ledger.full_snapshot_calls, 1)
+            self.assertEqual(ledger.delta_snapshot_calls, 0)
+            self.assertEqual(len(debounced.shares_json), 3)
+
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            advanced = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert advanced is not None
+            self.assertEqual(advanced.window_build_mode, "incremental")
+            self.assertEqual(advanced.window_delta_rows, 1)
+            self.assertEqual(ledger.delta_snapshot_calls, 1)
+            self.assertEqual(len(advanced.shares_json), 4)
+
+            forced = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+                True,
+            )
+            assert forced is not None
+            self.assertEqual(forced.window_build_mode, "full_rescan")
+            self.assertEqual(
+                forced.window_full_rescan_reason,
+                "reconcile_invalidation",
+            )
+            self.assertEqual(ledger.full_snapshot_calls, 2)
+
+    def test_periodic_self_check_compares_delta_to_full_oracle(self) -> None:
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            self.assertIsNotNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            server.payout_artifact_full_rescan_seconds = 0.0
+
+            checked = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+
+        assert checked is not None
+        self.assertEqual(checked.window_build_mode, "self_check_match")
+        self.assertEqual(ledger.delta_snapshot_calls, 1)
+        self.assertEqual(ledger.full_snapshot_calls, 2)
+
+    def test_fifteen_second_generation_bumps_refresh_once_per_minute(self) -> None:
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        monotonic_seconds = [100.0]
+        modes: list[str | None] = []
+        with (
+            patch(
+                "lab.prism.prism_coordinator.now_ms",
+                side_effect=lambda: clock_ms[0],
+            ),
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: monotonic_seconds[0],
+            ),
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            modes.append(initial.window_build_mode)
+            for bump in range(1, 5):
+                monotonic_seconds[0] = 100.0 + (15.0 * bump)
+                clock_ms[0] = 1_000_000 + (15_000 * bump)
+                append_incremental_share(
+                    ledger,
+                    share_seq=3 + bump,
+                    accepted_at_ms=clock_ms[0] - 2,
+                )
+                built = server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+                assert built is not None
+                modes.append(built.window_build_mode)
+
+        self.assertEqual(
+            modes,
+            ["full_rescan", "debounced", "debounced", "debounced", "incremental"],
+        )
+        self.assertEqual(ledger.full_snapshot_calls, 1)
+        self.assertEqual(ledger.delta_snapshot_calls, 1)
+
+    def test_found_block_candidate_bypasses_normal_interval(self) -> None:
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            self.assertIsNotNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            candidate = server._prepared_payout_state_candidate(
+                (
+                    0,
+                    1,
+                    str(server.rpc.tip),
+                    "accepted_block_preview",
+                    time.monotonic(),
+                )
+            )
+
+        artifact = candidate.ledger_artifact
+        assert artifact is not None
+        self.assertEqual(artifact.window_build_mode, "incremental")
+        self.assertEqual(artifact.window_delta_rows, 1)
+        self.assertEqual(ledger.delta_snapshot_calls, 1)
+        self.assertEqual(len(artifact.shares_json), 4)
+
 
 def mark_progress_healthy(server: PrismCoordinator) -> None:
     snapshot = server.fetch_qbit_tip_template_snapshot()

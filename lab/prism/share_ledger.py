@@ -110,6 +110,243 @@ class PendingShare:
     credit_policy: str | None = None
 
 
+class IncrementalWindowFallback(RuntimeError):
+    """The cached payout window cannot be advanced from an append-only delta."""
+
+
+@dataclass(frozen=True)
+class IncrementalWindowAdvanceStats:
+    """Bounded work performed while advancing one cached payout window."""
+
+    added_rows: int
+    expired_rows: int
+    touched_pages: int
+
+
+@dataclass(frozen=True)
+class _IncrementalShareWindowPage:
+    records: tuple[AcceptedShareRecord, ...]
+    total_difficulty: int
+
+    @classmethod
+    def from_records(
+        cls,
+        records: tuple[AcceptedShareRecord, ...],
+    ) -> _IncrementalShareWindowPage:
+        return cls(
+            records=records,
+            total_difficulty=sum(int(record.share_difficulty) for record in records),
+        )
+
+
+@dataclass(frozen=True)
+class IncrementalShareWindow:
+    """Immutable paged cache of the exact whole-share payout-window superset.
+
+    Pages are stable in ascending ``share_seq`` order. Normal advancement only
+    extends the newest page and expires weight from the oldest pages; retained
+    interior pages are never revisited. The final whole share crossing
+    ``window_weight`` is deliberately retained, matching the Postgres oracle.
+    """
+
+    anchor_job_issued_at_ms: int
+    window_weight: int
+    page_size: int
+    pages: tuple[_IncrementalShareWindowPage, ...]
+    total_difficulty: int
+
+    @classmethod
+    def from_full_snapshot(
+        cls,
+        records: list[AcceptedShareRecord] | tuple[AcceptedShareRecord, ...],
+        *,
+        anchor_job_issued_at_ms: int,
+        window_weight: int,
+        page_size: int = 4096,
+    ) -> IncrementalShareWindow:
+        """Build cache state from the full-rescan oracle.
+
+        The in-memory ledger intentionally returns an unbounded eligible
+        history, while Postgres already returns the bounded superset. Applying
+        the exact crossing-row cutoff here makes both backends identical.
+        """
+
+        anchor_job_issued_at_ms = int(anchor_job_issued_at_ms)
+        window_weight = int(window_weight)
+        page_size = int(page_size)
+        if window_weight <= 0:
+            raise ValueError("window_weight must be positive")
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+
+        eligible = sorted(
+            (
+                record
+                for record in records
+                if int(record.job_issued_at_ms) <= anchor_job_issued_at_ms
+                and int(record.accepted_at_ms) <= anchor_job_issued_at_ms
+            ),
+            key=lambda record: int(record.share_seq),
+        )
+        prior_seq: int | None = None
+        share_ids: set[str] = set()
+        for record in eligible:
+            share_seq = int(record.share_seq)
+            if prior_seq is not None and share_seq <= prior_seq:
+                raise ValueError("full payout window contains duplicate share_seq")
+            if record.share_id in share_ids:
+                raise ValueError("full payout window contains duplicate share_id")
+            if int(record.share_difficulty) <= 0:
+                raise ValueError("full payout window contains non-positive difficulty")
+            prior_seq = share_seq
+            share_ids.add(record.share_id)
+
+        start = len(eligible)
+        retained_weight = 0
+        for index in range(len(eligible) - 1, -1, -1):
+            if retained_weight >= window_weight:
+                break
+            retained_weight += int(eligible[index].share_difficulty)
+            start = index
+        retained = tuple(eligible[start:])
+        pages = tuple(
+            _IncrementalShareWindowPage.from_records(
+                retained[offset : offset + page_size]
+            )
+            for offset in range(0, len(retained), page_size)
+        )
+        return cls(
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            window_weight=window_weight,
+            page_size=page_size,
+            pages=pages,
+            total_difficulty=retained_weight,
+        )
+
+    def records(self) -> tuple[AcceptedShareRecord, ...]:
+        return tuple(record for page in self.pages for record in page.records)
+
+    def advance(
+        self,
+        delta_records: list[AcceptedShareRecord]
+        | tuple[AcceptedShareRecord, ...],
+        *,
+        anchor_job_issued_at_ms: int,
+    ) -> tuple[IncrementalShareWindow, IncrementalWindowAdvanceStats]:
+        """Fold one newly eligible append delta and expire only the old edge."""
+
+        anchor_job_issued_at_ms = int(anchor_job_issued_at_ms)
+        if anchor_job_issued_at_ms < self.anchor_job_issued_at_ms:
+            raise IncrementalWindowFallback("snapshot anchor moved backwards")
+
+        delta = tuple(delta_records)
+        prior_seq = (
+            int(self.pages[-1].records[-1].share_seq) if self.pages else None
+        )
+        prior_delta_seq: int | None = None
+        for record in delta:
+            share_seq = int(record.share_seq)
+            if int(record.share_difficulty) <= 0:
+                raise IncrementalWindowFallback(
+                    "delta contains non-positive share difficulty"
+                )
+            if (
+                int(record.job_issued_at_ms) > anchor_job_issued_at_ms
+                or int(record.accepted_at_ms) > anchor_job_issued_at_ms
+            ):
+                raise IncrementalWindowFallback(
+                    "delta contains a share ineligible at the new anchor"
+                )
+            if (
+                int(record.job_issued_at_ms) <= self.anchor_job_issued_at_ms
+                and int(record.accepted_at_ms) <= self.anchor_job_issued_at_ms
+            ):
+                raise IncrementalWindowFallback(
+                    "delta repeats a share eligible at the previous anchor"
+                )
+            if prior_seq is not None and share_seq <= prior_seq:
+                raise IncrementalWindowFallback(
+                    "newly eligible share is not an append"
+                )
+            if prior_delta_seq is not None and share_seq <= prior_delta_seq:
+                raise IncrementalWindowFallback("delta share_seq order is not increasing")
+            prior_delta_seq = share_seq
+
+        # Copy page references, never their retained contents. ``touched`` is
+        # intentionally defined as pre-existing retained boundary pages whose
+        # records must be inspected or rewritten; newly allocated append pages
+        # and pages expired wholesale are not part of the retained interior.
+        pages = list(self.pages)
+        touched_existing_pages: set[int] = set()
+        delta_offset = 0
+        if delta and pages and len(pages[-1].records) < self.page_size:
+            available = self.page_size - len(pages[-1].records)
+            appended = delta[:available]
+            if appended:
+                pages[-1] = _IncrementalShareWindowPage.from_records(
+                    pages[-1].records + appended
+                )
+                delta_offset = len(appended)
+                touched_existing_pages.add(len(self.pages) - 1)
+        while delta_offset < len(delta):
+            page_records = delta[delta_offset : delta_offset + self.page_size]
+            pages.append(_IncrementalShareWindowPage.from_records(page_records))
+            delta_offset += len(page_records)
+
+        total_difficulty = self.total_difficulty + sum(
+            int(record.share_difficulty) for record in delta
+        )
+        expired_rows = 0
+        first_retained_page = 0
+        while (
+            first_retained_page < len(pages)
+            and total_difficulty
+            - pages[first_retained_page].total_difficulty
+            >= self.window_weight
+        ):
+            page = pages[first_retained_page]
+            total_difficulty -= page.total_difficulty
+            expired_rows += len(page.records)
+            first_retained_page += 1
+        original_page_offset = first_retained_page
+        if first_retained_page:
+            pages = pages[first_retained_page:]
+
+        if pages:
+            first_page = pages[0]
+            partial_expired = 0
+            while (
+                partial_expired < len(first_page.records)
+                and total_difficulty
+                - int(first_page.records[partial_expired].share_difficulty)
+                >= self.window_weight
+            ):
+                total_difficulty -= int(
+                    first_page.records[partial_expired].share_difficulty
+                )
+                partial_expired += 1
+            if partial_expired:
+                pages[0] = _IncrementalShareWindowPage.from_records(
+                    first_page.records[partial_expired:]
+                )
+                expired_rows += partial_expired
+                if original_page_offset < len(self.pages):
+                    touched_existing_pages.add(original_page_offset)
+
+        advanced = IncrementalShareWindow(
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            window_weight=self.window_weight,
+            page_size=self.page_size,
+            pages=tuple(pages),
+            total_difficulty=total_difficulty,
+        )
+        return advanced, IncrementalWindowAdvanceStats(
+            added_rows=len(delta),
+            expired_rows=expired_rows,
+            touched_pages=len(touched_existing_pages),
+        )
+
+
 class SingleWriterShareLedger:
     """Assigns canonical share_seq values and returns immutable snapshots.
 
@@ -403,6 +640,31 @@ class SingleWriterShareLedger:
                 for share in self._shares
                 if share.job_issued_at_ms <= anchor_job_issued_at_ms
                 and share.accepted_at_ms <= anchor_job_issued_at_ms
+            ]
+
+    def snapshot_between_job_issues(
+        self,
+        previous_anchor_job_issued_at_ms: int,
+        anchor_job_issued_at_ms: int,
+    ) -> list[AcceptedShareRecord]:
+        """Return shares becoming eligible between two inclusive anchors."""
+
+        previous_anchor = int(previous_anchor_job_issued_at_ms)
+        anchor = int(anchor_job_issued_at_ms)
+        if anchor < previous_anchor:
+            raise ValueError("snapshot anchor moved backwards")
+        if anchor == previous_anchor:
+            return []
+        with self._lock:
+            return [
+                replace(share)
+                for share in self._shares
+                if share.job_issued_at_ms <= anchor
+                and share.accepted_at_ms <= anchor
+                and (
+                    share.job_issued_at_ms > previous_anchor
+                    or share.accepted_at_ms > previous_anchor
+                )
             ]
 
     def all_shares(self) -> list[AcceptedShareRecord]:
@@ -2284,6 +2546,67 @@ FROM rows;
         # Job construction is a retry-safe MVCC read. Use the independent read
         # pool so an accepted block's fenced bulk write cannot stall replacement
         # work behind the single-writer connection lock.
+        return [
+            self._record_from_json(item)
+            for item in self._run_read_json(sql)
+        ]
+
+    def snapshot_between_job_issues(
+        self,
+        previous_anchor_job_issued_at_ms: int,
+        anchor_job_issued_at_ms: int,
+    ) -> list[AcceptedShareRecord]:
+        """Return only shares that became anchor-eligible since a snapshot.
+
+        The disjoint UNION branches let Postgres use the accepted-at and
+        job-issued-at indexes independently. A share belongs to exactly one
+        branch according to which timestamp crossed the previous anchor;
+        rows already eligible at that anchor cannot reappear.
+        """
+
+        previous_anchor_ms = int(previous_anchor_job_issued_at_ms)
+        anchor_ms = int(anchor_job_issued_at_ms)
+        if anchor_ms < previous_anchor_ms:
+            raise ValueError("snapshot anchor moved backwards")
+        if anchor_ms == previous_anchor_ms:
+            return []
+        previous_anchor = (
+            f"to_timestamp(({previous_anchor_ms}::double precision / 1000.0))"
+        )
+        anchor = f"to_timestamp(({anchor_ms}::double precision / 1000.0))"
+        sql = f"""
+WITH rows AS (
+    SELECT ledger.*
+    FROM qbit_share_ledger ledger
+    WHERE ledger.accepted
+      AND ledger.accepted_at > {previous_anchor}
+      AND ledger.accepted_at <= {anchor}
+      AND ledger.job_issued_at <= {anchor}
+    UNION ALL
+    SELECT ledger.*
+    FROM qbit_share_ledger ledger
+    WHERE ledger.accepted
+      AND ledger.job_issued_at > {previous_anchor}
+      AND ledger.job_issued_at <= {anchor}
+      AND ledger.accepted_at <= {previous_anchor}
+)
+SELECT COALESCE(json_agg(json_build_object(
+    'share_seq', share_seq,
+    'share_id', share_id,
+    'miner_id', miner_id,
+    'order_key', payout_order_key,
+    'p2mr_program_hex', encode(p2mr_program, 'hex'),
+    'share_difficulty', share_difficulty::text,
+    'network_difficulty', network_difficulty::text,
+    'template_height', template_height,
+    'job_id', job_id,
+    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
+    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
+    'ntime', ntime,
+    'credit_policy', credit_policy
+) ORDER BY share_seq ASC), '[]'::json)
+FROM rows;
+"""
         return [
             self._record_from_json(item)
             for item in self._run_read_json(sql)
