@@ -657,6 +657,9 @@ def install_idle_job_cache(
         payout_state_generation=0,
         build_key=SimpleNamespace(
             payout_artifact_sha256=payout_artifact_sha256,
+            payout_append_invalidation_epoch=(
+                server._payout_ledger_append_invalidation_epoch
+            ),
         ),
     )
     with server._job_cache_lock:
