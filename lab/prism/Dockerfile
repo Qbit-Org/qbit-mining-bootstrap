@@ -30,4 +30,6 @@ RUN cargo build --locked --release -p qbit-prism --bins
 
 ENV PRISM_TOOL_BIN_DIR=/app/target/release
 
+# Keep Python as PID 1 so watchdog os._exit(1) reaches Docker unchanged. Any
+# future wrapper must exec the coordinator or explicitly propagate its status.
 CMD ["python3", "-m", "lab.prism.prism_coordinator"]

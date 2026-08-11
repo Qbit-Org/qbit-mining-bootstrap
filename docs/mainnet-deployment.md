@@ -351,6 +351,37 @@ each refresh wave converge on the latest observed tip epoch; payout and trust
 publication fences remain authoritative. Monitor refresh-wave outcomes and
 delivery coverage during rollout, and return the setting to `0` to roll back.
 
+### PRISM Watchdog Exit Forensics
+
+The PRISM image has no entrypoint or init wrapper: its exec-form Dockerfile
+command starts `python3 -m lab.prism.prism_coordinator` directly as container
+PID 1, and neither Compose file overrides that command. Consequently a
+watchdog `os._exit(1)` is delivered to Docker as status 1; there is no
+repository wrapper that can translate it to zero. The development profile's
+`restart: on-failure` depends on that status, while the production override's
+`restart: unless-stopped` restarts unexpected status-0 and status-1 exits.
+
+Do not use a post-restart `.State.ExitCode` value as the prior watchdog exit
+status. `docker inspect` exposes the container's current execution state, not
+an invocation history, and can show zero after the replacement process is
+already running. Capture the daemon's `die` event for the failing invocation
+instead, and retain it with the incident record:
+
+```sh
+docker events \
+  --since '<incident-start-rfc3339>' \
+  --until '<incident-end-rfc3339>' \
+  --filter type=container \
+  --filter container='<prism-container-name-or-id>' \
+  --filter event=die \
+  --format '{{json .Actor.Attributes}}'
+```
+
+The event attributes contain the invocation's `exitCode`. If no historical
+`die` event was retained, the watchdog's flushed "Exiting non-zero" log plus a
+later running-state `ExitCode=0` cannot establish that Python returned zero;
+record the discrepancy as missing event-time evidence.
+
 ### CTV At Genesis
 
 A chain with no confirmed transaction history cannot produce a useful
