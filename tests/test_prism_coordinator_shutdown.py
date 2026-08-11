@@ -115,6 +115,52 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         self.assertEqual(ledger.renew_calls, 1)
         self.assertIsNot(ledger.renew_thread, threading.current_thread())
 
+    def test_external_side_effect_gate_does_not_regress_freshness_stamp(
+        self,
+    ) -> None:
+        ledger = HeartbeatLeaseLedger()
+        server = coordinator(ledger)
+        verification_started_monotonic = 100.0
+        fresher_heartbeat_monotonic = 101.0
+        original_join = threading.Thread.join
+
+        def join_then_publish_fresher_heartbeat(
+            thread: threading.Thread,
+            timeout: float | None = None,
+        ) -> None:
+            original_join(thread, timeout)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(ledger.renewed.is_set())
+            server._ledger_lease_heartbeat_last_success_monotonic = (
+                fresher_heartbeat_monotonic
+            )
+
+        with patch.object(
+            prism_coordinator.time,
+            "monotonic",
+            return_value=verification_started_monotonic,
+        ), patch.object(
+            prism_coordinator.threading.Thread,
+            "join",
+            new=join_then_publish_fresher_heartbeat,
+        ), patch(
+            "lab.prism.prism_coordinator.os._exit",
+            side_effect=AssertionError("unexpected hard exit"),
+        ) as process_exit, patch.object(
+            server,
+            "_watchdog_hard_exit",
+        ) as watchdog_hard_exit:
+            server._require_fresh_ledger_lease_for_external_side_effect(
+                "submitblock"
+            )
+
+        self.assertEqual(
+            server._ledger_lease_heartbeat_last_success_monotonic,
+            fresher_heartbeat_monotonic,
+        )
+        process_exit.assert_not_called()
+        watchdog_hard_exit.assert_not_called()
+
     def test_external_side_effect_gate_bounds_blocked_guard_verification(self) -> None:
         verification_started = threading.Event()
         release_verification = threading.Event()

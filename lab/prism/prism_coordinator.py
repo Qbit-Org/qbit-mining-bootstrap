@@ -11004,6 +11004,29 @@ class PrismCoordinator:
             return ("stratum_accept",)
         return tuple(profile.heartbeat_name for profile in profiles)
 
+    def _record_ledger_lease_heartbeat_success(
+        self,
+        renewal_started_monotonic: float,
+    ) -> None:
+        """Advance the conservative freshness edge without regression."""
+        freshness_lock = self.__dict__.setdefault(
+            "_ledger_lease_heartbeat_freshness_lock",
+            threading.Lock(),
+        )
+        with freshness_lock:
+            last_success = getattr(
+                self,
+                "_ledger_lease_heartbeat_last_success_monotonic",
+                None,
+            )
+            if (
+                last_success is None
+                or renewal_started_monotonic > last_success
+            ):
+                self._ledger_lease_heartbeat_last_success_monotonic = (
+                    renewal_started_monotonic
+                )
+
     def _start_ledger_lease_heartbeat(self) -> threading.Thread | None:
         existing = getattr(self, "_ledger_lease_heartbeat_thread", None)
         if existing is not None and existing.is_alive():
@@ -11130,7 +11153,7 @@ class PrismCoordinator:
             # The database row was refreshed no earlier than call start. Using
             # that conservative edge prevents a delayed response from making
             # local freshness look newer than PostgreSQL's updated_at.
-            self._ledger_lease_heartbeat_last_success_monotonic = (
+            self._record_ledger_lease_heartbeat_success(
                 renew_started_monotonic
             )
             ready = getattr(self, "_ledger_lease_heartbeat_ready", None)
@@ -11322,7 +11345,7 @@ class PrismCoordinator:
 
         # Use the call-start time so scheduler delay never makes this success
         # appear fresher than the database response actually proves.
-        self._ledger_lease_heartbeat_last_success_monotonic = (
+        self._record_ledger_lease_heartbeat_success(
             verification_started_monotonic
         )
 
