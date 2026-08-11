@@ -97,15 +97,42 @@ success.
 The in-memory candidate queue is only a bounded wakeup path. Queue saturation
 coalesces wakeups; it cannot delete an outbox row. Before opening Stratum
 listeners and whenever the queue drains, the coordinator replays pending rows.
+Once a durable candidate is dequeued, its qbit `submitblock` RPC is the fast
+lane: it runs before the attempt-marker write, accepted-block writer admission,
+audit construction, or payout publication. An in-memory wakeup is also drained
+before querying the recovery outbox. This priority isolation means a newly
+found block cannot queue behind a payout-artifact writer already waiting for
+admission; accounting remains serialized only after the node has seen the
+candidate.
+
+`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` bounds the fast-lane RPC (default 1
+second). `PRISM_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS` gives each later Postgres
+statement and local ledger gate a fresh deadline (default 1 second); direct
+outbox reads and mutations additionally use a single-flight wrapper so a
+driver that ignores its deadline cannot accumulate retry threads. Timeouts
+leave the row pending and enter the ordinary candidate backoff. Contended
+submit-path locks are acquired in heartbeat slices and identify the lock in a
+periodic diagnostic controlled by `PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS`
+(default 5 seconds).
+
 Successful submissions become `submitted`; candidates that definitively lose
 their tip race or fail validation become `abandoned`. If the process exits
-after `submitblock` but before finalizing the row, restart recognizes the
-candidate as the active tip and completes the idempotent confirmation path.
+after `submitblock` but before the attempt marker or terminal outbox update,
+restart resubmits the same bytes. qbit's accepted-duplicate response is a
+successful landing signal; block-hash-keyed ledger persistence and the
+finalize-only registry keep accounting and terminal side effects exactly once.
+Restart can also recognize the candidate as the active tip and complete the
+same idempotent confirmation path.
 Transient RPC, audit, and ledger outcomes remain pending and retry with an
 exponential delay starting at 250 milliseconds and capped at 30 seconds. They
 do not increment terminal abandonment counters. Replay carries the database
 row's block hash separately from candidate JSON, so malformed payloads can be
 quarantined by their authoritative outbox key instead of replaying forever.
+
+The block submitter heartbeat carries its current phase, including replay
+query, node RPC, lock admission, audit, persistence, and finalization. A stale
+watchdog diagnostic therefore reports a label such as
+`block_submitter:replay-outbox-query` instead of only the thread name.
 
 When a network-valid hash is below a listener's advertised share target, the
 coordinator first stores a candidate-only intent, submits it synchronously, and

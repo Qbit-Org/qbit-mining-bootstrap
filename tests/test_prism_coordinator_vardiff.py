@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -292,6 +293,13 @@ class TipRpc(FakeRpc):
             return self.tip
         if method == "getblockheader":
             raise RuntimeError("qbit RPC getblockheader failed: -5 Block not found")
+        return super().call(method, params)
+
+
+class RejectingSubmitTipRpc(TipRpc):
+    def call(self, method: str, params: list[object] | None = None) -> object:
+        if method == "submitblock":
+            return "bad-prevblk"
         return super().call(method, params)
 
 
@@ -8051,7 +8059,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
 
         self.assertFalse(accepted)
-        self.assertEqual(submit_calls, [])
+        # Node propagation is the fast lane: the durable descendant is offered
+        # to qbitd before payout/accounting notices the ancestor transition.
+        # Its accounting still defers until that ancestor is durable.
+        self.assertEqual(submit_calls, ["submitblock"])
         self.assertEqual(ledger.persisted, [])
         self.assertEqual(
             server._block_candidate_outcome.reason,
@@ -8842,6 +8853,63 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.persisted), 1)
         self.assertEqual(len(ledger.confirmed), 1)
 
+    def test_submitter_offers_block_before_writer_admission_with_rpc_deadline(self) -> None:
+        server, state, _ledger = submit_coordinator()
+        server.block_submit_rpc_timeout_seconds = 0.75
+        order: list[object] = []
+
+        class TimeoutRecordingRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    order.append(("submitblock", timeout))
+                    return None
+                return super().call(method, params)
+
+        class WriterAdmission:
+            def __enter__(self) -> None:
+                order.append("writer-admission")
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="ce" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        server.rpc = TimeoutRecordingRpc("00" * 32)
+        server._writer_operation = lambda _component: WriterAdmission()  # type: ignore[method-assign]
+
+        def account(
+            _candidate: PrismBlockCandidate,
+            *,
+            node_submission: object,
+        ) -> bool:
+            order.append("accounting")
+            self.assertIsNone(getattr(node_submission, "result"))
+            return True
+
+        server._submit_next_block_candidate_writer = account  # type: ignore[method-assign]
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        self.assertEqual(
+            order,
+            [("submitblock", 0.75), "writer-admission", "accounting"],
+        )
+
     def test_block_submit_histogram_measures_landed_to_rpc_interval(self) -> None:
         # The race-critical span (candidate landed -> submitblock returned)
         # must be observed exactly once per attempted submit, independent of
@@ -8922,6 +8990,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         submission = SimpleNamespace(
             header_hex="aa" * 80,
             block_hash_hex="cc" * 32,
+            block_hex="00",
             share_pass=True,
             block_pass=True,
         )
@@ -8937,7 +9006,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(len(ledger.all_shares()), 1)
         # The tip moves before the submitter drains the candidate.
-        server.rpc = TipRpc(new_tip)
+        server.rpc = RejectingSubmitTipRpc(new_tip)
 
         self.assertTrue(server.submit_next_block_candidate())
 
@@ -9456,7 +9525,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             block_hash,
             block_height=10,
         )
-        server.rpc = TipRpc(new_tip)
+        server.rpc = RejectingSubmitTipRpc(new_tip)
         server.enqueue_block_candidate(candidate)
 
         self.assertTrue(server.submit_next_block_candidate())
@@ -9575,7 +9644,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         server.submit_block_candidate = accepting_submit  # type: ignore[method-assign]
         original_finish = ledger.mark_block_candidate_submitted
+        original_mark_attempted = ledger.mark_block_candidate_attempted
         finish_attempts = 0
+        attempt_marks = 0
+
+        def mark_attempted(*, block_hash: str) -> bool:
+            nonlocal attempt_marks
+            attempt_marks += 1
+            return original_mark_attempted(block_hash=block_hash)
 
         def flaky_finish(*, block_hash: str) -> bool:
             nonlocal finish_attempts
@@ -9584,6 +9660,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 raise RuntimeError("ledger unavailable")
             return original_finish(block_hash=block_hash)
 
+        ledger.mark_block_candidate_attempted = mark_attempted  # type: ignore[method-assign]
         ledger.mark_block_candidate_submitted = flaky_finish  # type: ignore[method-assign]
         waits: list[float] = []
         with patch.object(
@@ -9609,6 +9686,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         ):
             self.assertAlmostEqual(observed, expected)
         self.assertEqual(finish_attempts, 5)
+        self.assertEqual(attempt_marks, 1)
         self.assertEqual(submit_calls, 1)
         self.assertNotIn(candidate.submission.block_hash_hex, server.block_candidate_retry_delays)
         self.assertEqual(server.block_candidate_abandoned_counts, {})
@@ -9617,6 +9695,121 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn(
             "qbit_prism_block_candidate_retries_total 4",
             server.metrics_payload(),
+        )
+
+    def test_crash_after_submit_before_attempt_mark_replays_duplicate_once(self) -> None:
+        parent_hash = "00" * 32
+        block_hash = "cf" * 32
+        ledger = SingleWriterShareLedger()
+        first, state, _recording = submit_coordinator(tip=parent_hash)
+        first.ledger = ledger
+        first.stop_after_block = False
+        first.max_blocks = 10
+        pending = self._pending_append("submit-before-mark-crash").pending_share
+        candidate = block_candidate(
+            first,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        intent = first.block_candidate_intent(candidate)
+        ledger.append_batch([(pending, intent)])
+
+        class RestartAwareRpc(FakeRpc):
+            def __init__(self) -> None:
+                self.submit_results: list[object] = []
+
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    result = None if not self.submit_results else "duplicate"
+                    self.submit_results.append(result)
+                    return result
+                if method == "getbestblockhash":
+                    return parent_hash
+                if method == "getblockhash":
+                    return block_hash
+                if method == "getblockcount":
+                    return 9
+                return super().call(method, params)
+
+        rpc = RestartAwareRpc()
+        first.rpc = rpc
+        original_mark = ledger.mark_block_candidate_attempted
+
+        def crash_before_mark(*, block_hash: str) -> bool:
+            raise SystemExit(f"simulated crash before marking {block_hash}")
+
+        ledger.mark_block_candidate_attempted = crash_before_mark  # type: ignore[method-assign]
+        first.enqueue_block_candidate(candidate)
+        with self.assertRaisesRegex(SystemExit, "simulated crash"):
+            first.submit_next_block_candidate()
+
+        self.assertEqual(rpc.submit_results, [None])
+        self.assertEqual(ledger.pending_block_candidates(), [intent])
+        self.assertEqual(
+            ledger._block_candidate_outbox[block_hash]["attempt_count"],
+            0,
+        )
+
+        ledger.mark_block_candidate_attempted = original_mark  # type: ignore[method-assign]
+        persisted_calls = 0
+        confirmed_calls = 0
+        original_persist = ledger.persist_accepted_block
+        original_confirm = ledger.confirm_accepted_block
+
+        def persist_once(**kwargs: object) -> dict[str, object]:
+            nonlocal persisted_calls
+            persisted_calls += 1
+            return original_persist(**kwargs)
+
+        def confirm_once(**kwargs: object) -> dict[str, object]:
+            nonlocal confirmed_calls
+            confirmed_calls += 1
+            return original_confirm(**kwargs)
+
+        ledger.persist_accepted_block = persist_once  # type: ignore[method-assign]
+        ledger.confirm_accepted_block = confirm_once  # type: ignore[method-assign]
+
+        restarted, _restart_state, _recording = submit_coordinator(tip=parent_hash)
+        restarted.ledger = ledger
+        restarted.rpc = rpc
+        restarted.stop_after_block = False
+        restarted.max_blocks = 10
+        with tempfile.TemporaryDirectory() as tempdir:
+            restarted.audit_dir = Path(tempdir)
+            restarted.evidence_path = Path(tempdir) / "evidence.json"
+            restarted.ledger_writer_public_key_hex = "aa" * 32
+            restarted.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            restarted.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+
+            self.assertEqual(restarted.replay_pending_block_candidates(), 1)
+            self.assertTrue(restarted.submit_next_block_candidate())
+            self.assertEqual(restarted.replay_pending_block_candidates(), 0)
+
+        self.assertEqual(rpc.submit_results, [None, "duplicate"])
+        self.assertEqual(persisted_calls, 1)
+        self.assertEqual(confirmed_calls, 1)
+        self.assertEqual(restarted.accepted_block_count, 1)
+        self.assertEqual(ledger.pending_block_candidates(), [])
+        self.assertEqual(
+            ledger._block_candidate_outbox[block_hash]["state"],
+            "submitted",
         )
 
     def test_abandon_finalize_failure_counts_one_abandonment(self) -> None:
@@ -11616,6 +11809,23 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "PRISM_WATCHDOG_TIMEOUT_SECONDS must be finite"):
                     env_positive_float("PRISM_WATCHDOG_TIMEOUT_SECONDS", 120.0)
 
+    def test_audit_verifier_subprocess_has_explicit_timeout(self) -> None:
+        server = self._bare_coordinator()
+        server.bundle_build_timeout_seconds = 0.25
+        with patch(
+            "lab.prism.prism_coordinator.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("audit-verify", 0.25),
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "timed out after 0.25s"):
+                server.verify_bundle(
+                    Path("candidate.json"),
+                    "00",
+                    "11" * 32,
+                    expected_coinbase_value_sats=1,
+                )
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
+
     def test_overdue_heartbeats_flags_only_stale_subsystems(self) -> None:
         server = self._bare_coordinator()
         server._record_heartbeat("stratum_accept")
@@ -11628,6 +11838,116 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             server._heartbeats["qbit_blockpoll"] = now - 1_000.0
 
         self.assertEqual(server._overdue_heartbeats(now), ["qbit_blockpoll"])
+
+    def test_overdue_submitter_heartbeat_names_the_stuck_phase(self) -> None:
+        server = self._bare_coordinator()
+        clock = {"now": 1_000.0}
+        server._block_submitter_thread_ident = threading.get_ident()
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            server._record_block_submitter_phase("replay-outbox-query")
+            clock["now"] += server.watchdog_timeout_seconds + 1.0
+            self.assertEqual(
+                server._overdue_heartbeats(clock["now"]),
+                ["block_submitter:replay-outbox-query"],
+            )
+
+    def test_sixty_second_attempt_mark_stall_does_not_delay_rpc_or_heartbeat(self) -> None:
+        server, state, recording = submit_coordinator()
+        entered_mark = threading.Event()
+        release_mark = threading.Event()
+        submitted = threading.Event()
+
+        class StallingLedger(RecordingLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.mark_calls = 0
+
+            def mark_block_candidate_attempted(self, *, block_hash: str) -> bool:
+                self.mark_calls += 1
+                entered_mark.set()
+                release_mark.wait(60.0)
+                return True
+
+        class DeadlineRpc(SubmitRpc):
+            def __init__(self, ledger: RecordingLedger) -> None:
+                super().__init__(
+                    tip="00" * 32,
+                    block_hash="d2" * 32,
+                    ledger=ledger,
+                )
+                self.timeouts: list[float | None] = []
+
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    self.timeouts.append(timeout)
+                    submitted.set()
+                    if len(self.timeouts) > 1:
+                        return "duplicate"
+                return super().call(method, params)
+
+        ledger = StallingLedger()
+        server.ledger = ledger
+        rpc = DeadlineRpc(ledger)
+        server.rpc = rpc
+        server.block_submit_rpc_timeout_seconds = 0.4
+        server.block_submit_db_timeout_seconds = 0.05
+        server.block_candidate_retry_initial_seconds = 0.01
+        server.block_candidate_retry_max_seconds = 0.01
+        server.watchdog_timeout_seconds = 0.2
+        server._heartbeats = {}
+        server._heartbeat_phases = {}
+        server._watchdog_pauses = {}
+        server._heartbeats_lock = threading.Lock()
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="d2" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        server.enqueue_block_candidate(candidate)
+        started = time.monotonic()
+        submitter = threading.Thread(target=server.block_submit_loop)
+        with patch("builtins.print"):
+            submitter.start()
+            try:
+                self.assertTrue(submitted.wait(2.0))
+                self.assertLess(time.monotonic() - started, 2.0)
+                self.assertTrue(entered_mark.wait(1.0))
+                with server._heartbeats_lock:
+                    first_heartbeat = server._heartbeats["block_submitter"]
+                heartbeat_deadline = time.monotonic() + 1.0
+                while time.monotonic() < heartbeat_deadline:
+                    with server._heartbeats_lock:
+                        latest_heartbeat = server._heartbeats["block_submitter"]
+                    if latest_heartbeat > first_heartbeat:
+                        break
+                    time.sleep(0.01)
+                self.assertGreater(latest_heartbeat, first_heartbeat)
+                self.assertEqual(
+                    server._overdue_heartbeats(time.monotonic()),
+                    [],
+                )
+                self.assertEqual(ledger.mark_calls, 1)
+                self.assertEqual(rpc.timeouts[0], 0.4)
+            finally:
+                server.stop_event.set()
+                submitter.join(2.0)
+                release_mark.set()
+        self.assertFalse(submitter.is_alive())
 
     def test_block_submitter_retry_wait_heartbeats_in_bounded_slices(self) -> None:
         server = self._bare_coordinator()
@@ -13052,7 +13372,10 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             synchronous_thread = threading.Thread(target=submit_synchronously)
             synchronous_thread.start()
             try:
-                self.assertTrue(accepted_tail_paused.wait(5))
+                self.assertTrue(
+                    accepted_tail_paused.wait(5),
+                    msg=f"synchronous submit exited early: {errors!r}",
+                )
                 self.assertTrue(durable_confirmation.is_set())
                 self.assertEqual(len(ledger), 1)
                 self.assertEqual(len(ledger.pending_block_candidates()), 1)
@@ -13438,6 +13761,10 @@ class LostAckSubmitRpc(FakeRpc):
         if method == "submitblock":
             self.submitblock_calls += 1
             block_hash = self.hash_by_hex[str((params or [""])[0])]
+            if block_hash in self.active:
+                return "duplicate"
+            if self.racing_tip is not None:
+                return "bad-prevblk"
             self.height += 1
             self.active[block_hash] = self.height
             self.tip = block_hash
@@ -13645,7 +13972,7 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
 
             self.assertEqual(submitted, [block_hash])
             self.assertEqual(abandoned, [])
-            self.assertEqual(rpc.submitblock_calls, 1)
+            self.assertEqual(rpc.submitblock_calls, 3)
             self.assertIn(block_hash, server._accounted_accepted_block_hashes)
             self.assertEqual(server.accepted_block_count, 1)
             self.assertEqual(len(ledger.persisted), 1)

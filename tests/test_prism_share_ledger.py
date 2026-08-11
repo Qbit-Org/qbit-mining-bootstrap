@@ -30,6 +30,7 @@ from lab.prism.share_ledger import (
     AUDIT_BUNDLE_V2_SCHEMA,
     PendingShare,
     PsqlShareLedger,
+    LedgerOperationTimeout,
     AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
     SingleWriterShareLedger,
@@ -3814,6 +3815,105 @@ def stats_payload(
 
 
 class NativeClientSelectionTests(unittest.TestCase):
+    def test_operation_timeout_bounds_local_writer_lock_admission(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        gate = threading.Lock()
+        gate.acquire()
+        started = time.monotonic()
+        try:
+            with ledger.operation_timeout(0.02):
+                with self.assertRaisesRegex(
+                    LedgerOperationTimeout,
+                    "writer lock",
+                ):
+                    with ledger._operation_gate(gate, "writer lock"):
+                        self.fail("contended writer lock unexpectedly acquired")
+        finally:
+            gate.release()
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_statement_timeout_refreshes_for_each_database_step(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        clock = {"now": 10.0}
+
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with ledger.statement_timeout(0.5):
+                self.assertEqual(ledger._remaining_operation_timeout(), 0.5)
+                clock["now"] += 60.0
+                self.assertEqual(ledger._remaining_operation_timeout(), 0.5)
+
+    def test_subprocess_operation_timeout_sets_client_and_server_deadlines(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+        completed = unittest.mock.Mock(returncode=0, stdout="{}\n", stderr="")
+
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ) as run:
+            with ledger.operation_timeout(0.5):
+                self.assertEqual(ledger._run_sql("SELECT '{}'::json;"), "{}\n")
+
+        kwargs = run.call_args.kwargs
+        self.assertGreater(float(kwargs["timeout"]), 0.0)
+        self.assertLessEqual(float(kwargs["timeout"]), 0.5)
+        self.assertEqual(kwargs["env"]["PGCONNECT_TIMEOUT"], "1")
+        self.assertIn("statement_timeout=", kwargs["env"]["PGOPTIONS"])
+        self.assertIn("lock_timeout=", kwargs["env"]["PGOPTIONS"])
+
+    def test_native_operation_timeout_is_transaction_local(self) -> None:
+        class OperationalError(Exception):
+            pass
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+        executions: list[str] = []
+        borrowed_with: list[float | None] = []
+
+        class FakeConnection:
+            @contextlib.contextmanager
+            def transaction(self) -> Any:
+                yield
+
+            def execute(self, sql: str) -> FakeConnection:
+                executions.append(sql)
+                return self
+
+            def fetchone(self) -> tuple[object]:
+                return ({"ok": True},)
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+
+        @contextlib.contextmanager
+        def connection(*, timeout_seconds: float | None = None) -> Any:
+            borrowed_with.append(timeout_seconds)
+            yield FakeConnection()
+
+        client.connection = connection  # type: ignore[method-assign]
+
+        self.assertEqual(
+            client.run_json("SELECT json_build_object('ok', true)", timeout_seconds=0.5),
+            {"ok": True},
+        )
+        self.assertEqual(len(borrowed_with), 1)
+        self.assertIsNotNone(borrowed_with[0])
+        self.assertGreater(float(borrowed_with[0]), 0.0)
+        self.assertLessEqual(float(borrowed_with[0]), 0.5)
+        self.assertRegex(executions[0], r"^SET LOCAL statement_timeout = '\d+ms'$")
+        self.assertRegex(executions[1], r"^SET LOCAL lock_timeout = '\d+ms'$")
+        self.assertEqual(executions[2], "SELECT json_build_object('ok', true)")
+
     def test_database_url_extraction_variants(self) -> None:
         self.assertEqual(
             database_url_from_psql_command(["psql", "postgres://u:p@h:5432/db"]),

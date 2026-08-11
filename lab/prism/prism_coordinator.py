@@ -465,6 +465,16 @@ PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
 )
 DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS = 0.25
 DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
+# The node fast lane is intentionally shorter than the normal ten-second RPC
+# budget: an ambiguous timeout leaves the durable outbox pending and replay
+# safely submits the same hash again.
+DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS = 1.0
+# Every PostgreSQL operation reached by the submitter inherits this deadline.
+# Direct outbox calls also run behind a coordinator-side single-flight guard,
+# so a driver that ignores the deadline cannot freeze the submitter thread.
+DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS = 1.0
+BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS = 0.25
+DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS = 5.0
 # How long an own-hash tip observation keeps protecting a block candidate
 # from terminal abandonment while instantaneous chain probes disagree
 # (transient sibling/fork views during quick-succession blocks, RPC blips).
@@ -525,12 +535,17 @@ class _ObservedRLock:
     metrics are meant to diagnose.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        wait_observer: Callable[[float], None] | None = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._metrics_lock = threading.Lock()
         self._contention_count = 0
         self._wait_seconds_sum = 0.0
         self._wait_seconds_max = 0.0
+        self._wait_observer = wait_observer
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         if not blocking:
@@ -538,7 +553,25 @@ class _ObservedRLock:
         if self._lock.acquire(blocking=False):
             return True
         started = time.monotonic()
-        acquired = self._lock.acquire(blocking=True, timeout=timeout)
+        observer = self._wait_observer
+        if observer is None:
+            acquired = self._lock.acquire(blocking=True, timeout=timeout)
+        else:
+            deadline = None if timeout < 0 else started + max(0.0, timeout)
+            acquired = False
+            while not acquired:
+                wait_slice = BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    wait_slice = min(wait_slice, remaining)
+                acquired = self._lock.acquire(
+                    blocking=True,
+                    timeout=wait_slice,
+                )
+                if not acquired:
+                    observer(max(0.0, time.monotonic() - started))
         waited = max(0.0, time.monotonic() - started)
         with self._metrics_lock:
             self._contention_count += 1
@@ -1251,8 +1284,14 @@ class JsonRpc:
         attempt_count = (
             1 if method in _QBIT_RPC_NO_TRANSPORT_RETRY_METHODS else 2
         )
+        deadline = time.monotonic() + max(0.001, float(timeout))
         for attempt in range(attempt_count):
-            conn = self._acquire_connection(timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if last_exc is not None:
+                    raise last_exc
+                raise TimeoutError(f"qbit RPC {method} timed out")
+            conn = self._acquire_connection(remaining)
             try:
                 conn.request("POST", path, body=body, headers=headers)
                 response = conn.getresponse()
@@ -1389,6 +1428,28 @@ class _BlockCandidateDispositionFlight:
 
     lock: threading.RLock = field(default_factory=threading.RLock)
     users: int = 0
+
+
+@dataclass(frozen=True)
+class _BlockCandidateNodeSubmission:
+    """Result of the latency-critical qbitd fast-lane call."""
+
+    attempted: bool
+    result: object = None
+    error: BaseException | None = None
+
+
+@dataclass
+class _BlockSubmitterLedgerCall:
+    """One still-running direct outbox call, reused across paced retries."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    result: object = None
+    error: BaseException | None = None
+
+
+class BlockSubmitterDatabaseTimeout(TimeoutError):
+    """A submitter ledger phase exceeded its coordinator-side deadline."""
 
 
 @dataclass(frozen=True)
@@ -2614,10 +2675,25 @@ class CoordinatorShutdownController:
         self.active_writers[component] = self.active_writers.get(component, 0) + 1
         return _WriterOperationToken(self, component)
 
-    def enter_writer(self, component: str) -> _WriterOperationToken:
+    def enter_writer(
+        self,
+        component: str,
+        *,
+        wait_callback: Callable[[], None] | None = None,
+    ) -> _WriterOperationToken:
         depth = self._thread_writer_depth()
-        with self.condition:
-            token = self._admit_writer_locked(component, inherited=depth > 0)
+        if wait_callback is None:
+            with self.condition:
+                token = self._admit_writer_locked(component, inherited=depth > 0)
+        else:
+            while not self.condition.acquire(
+                timeout=BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS
+            ):
+                wait_callback()
+            try:
+                token = self._admit_writer_locked(component, inherited=depth > 0)
+            finally:
+                self.condition.release()
         self.local.writer_depth = depth + 1
         return token
 
@@ -2961,6 +3037,18 @@ class PrismCoordinator:
         self.blockwait_timeout_seconds = env_positive_float(
             "PRISM_BLOCKWAIT_TIMEOUT_SECONDS",
             DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS,
+        )
+        self.block_submit_rpc_timeout_seconds = env_positive_float(
+            "PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS",
+            DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS,
+        )
+        self.block_submit_db_timeout_seconds = env_positive_float(
+            "PRISM_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS",
+            DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS,
+        )
+        self.block_submit_lock_wait_log_seconds = env_positive_float(
+            "PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS",
+            DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS,
         )
         # An own-hash tip observation is acceptance evidence even when the
         # direct submitblock ack was lost; this window bounds how long that
@@ -3314,7 +3402,9 @@ class PrismCoordinator:
         self.ctv_broadcaster_processed_rows_total = 0
         self._ctv_fanout_market_fee_rate_cache: dict[tuple[int | None, str | None], int] = {}
         self.ctv_fanout_broadcast_daemon: CtvFanoutBroadcastDaemon | None = None
-        self.lock = _ObservedRLock()
+        self.lock = _ObservedRLock(
+            wait_observer=self._observe_coordinator_lock_wait,
+        )
         self.clients: set[ClientState] = set()
         self.connection_limit_rejection_counts = {"global": 0, "username": 0}
         self.peak_active_connection_count = 0
@@ -3440,6 +3530,11 @@ class PrismCoordinator:
         self._block_submitter_backoff_started_monotonic: float | None = None
         self._block_submitter_backoff_deadline_monotonic: float | None = None
         self._block_submitter_backoff_delay_seconds = 0.0
+        self._block_submitter_ledger_calls_lock = threading.Lock()
+        self._block_submitter_ledger_calls: dict[
+            tuple[object, ...], _BlockSubmitterLedgerCall
+        ] = {}
+        self._block_submitter_last_lock_wait_log_monotonic = 0.0
         # Terminal candidates whose durable outbox update failed; replays for
         # these run finalize-only (see _finalize_block_candidate).
         self._block_candidate_finalize_retries: dict[str, tuple[bool, str]] = {}
@@ -3534,6 +3629,7 @@ class PrismCoordinator:
         # container/systemd restart policy recovers a *hung* coordinator (a
         # healthcheck alone does not restart it under plain compose).
         self._heartbeats: dict[str, float] = {}
+        self._heartbeat_phases: dict[str, str] = {}
         self._watchdog_pauses: dict[str, int] = {}
         self._heartbeats_lock = threading.Lock()
         self.watchdog_enabled = env_bool("PRISM_WATCHDOG_ENABLED", "1")
@@ -10390,6 +10486,8 @@ class PrismCoordinator:
             self._heartbeats_lock = threading.Lock()
         if not hasattr(self, "_heartbeats"):
             self._heartbeats = {}
+        if not hasattr(self, "_heartbeat_phases"):
+            self._heartbeat_phases = {}
         if not hasattr(self, "_watchdog_pauses"):
             self._watchdog_pauses = {}
 
@@ -12136,20 +12234,118 @@ class PrismCoordinator:
         while not self.stop_event.wait(1.0):
             self.sweep_initial_job_timeouts()
 
-    def _record_heartbeat(self, name: str) -> None:
+    def _record_heartbeat(self, name: str, *, phase: str | None = None) -> None:
         self._ensure_watchdog_state()
         with self._heartbeats_lock:
             self._heartbeats[name] = time.monotonic()
+            if phase is not None:
+                self._heartbeat_phases[name] = phase
+
+    def _record_block_submitter_heartbeat(self, phase: str) -> None:
+        """Record a phase while preserving one-argument heartbeat embedders."""
+        heartbeat = self._record_heartbeat
+        try:
+            heartbeat("block_submitter", phase=phase)
+        except TypeError as exc:
+            # Preserve the historical one-argument heartbeat seam used by
+            # focused embedders. Do not hide TypeErrors raised by a heartbeat
+            # implementation that did accept the keyword.
+            if "unexpected keyword argument 'phase'" not in str(exc):
+                raise
+            heartbeat("block_submitter")
+
+    def _record_block_submitter_phase(self, phase: str) -> None:
+        """Stamp a named phase only from the dedicated submitter owner."""
+        owner = getattr(self, "_block_submitter_thread_ident", None)
+        if owner is None or threading.get_ident() != owner:
+            return
+        self._block_submitter_phase = phase
+        self._record_block_submitter_heartbeat(phase)
+
+    def _record_block_submitter_wait(self, phase: str) -> None:
+        """Heartbeat owner waits while preserving lightweight test behavior."""
+        owner = getattr(self, "_block_submitter_thread_ident", None)
+        if owner is None:
+            self._record_heartbeat("block_submitter")
+            return
+        self._record_block_submitter_phase(phase)
+
+    def _observe_coordinator_lock_wait(self, elapsed_seconds: float) -> None:
+        """Keep a sliced coordinator-lock wait visible and watchdog-safe."""
+        owner = getattr(self, "_block_submitter_thread_ident", None)
+        if owner is None or threading.get_ident() != owner:
+            return
+        current_phase = getattr(self, "_block_submitter_phase", "unknown")
+        wait_phase = f"wait-lock:coordinator-state:{current_phase}"
+        self._record_block_submitter_heartbeat(wait_phase)
+        now = time.monotonic()
+        log_interval = float(
+            getattr(
+                self,
+                "block_submit_lock_wait_log_seconds",
+                DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS,
+            )
+        )
+        last_log = float(
+            getattr(self, "_block_submitter_last_lock_wait_log_monotonic", 0.0)
+        )
+        if last_log <= 0 or now - last_log >= log_interval:
+            self._block_submitter_last_lock_wait_log_monotonic = now
+            print(
+                "prism coordinator: block submitter waiting on lock "
+                f"lock=coordinator-state phase={current_phase} "
+                f"elapsed={elapsed_seconds:.3f}s",
+                flush=True,
+            )
+
+    def _acquire_block_submitter_lock(self, lock: Any, name: str) -> None:
+        """Acquire a submit-path lock in heartbeat/logging slices."""
+        owner = getattr(self, "_block_submitter_thread_ident", None)
+        if owner is not None and threading.get_ident() != owner:
+            lock.acquire()
+            return
+        started = time.monotonic()
+        last_log = started
+        log_interval = float(
+            getattr(
+                self,
+                "block_submit_lock_wait_log_seconds",
+                DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS,
+            )
+        )
+        while not lock.acquire(
+            timeout=BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS
+        ):
+            phase = f"wait-lock:{name}"
+            self._record_block_submitter_wait(phase)
+            now = time.monotonic()
+            if now - last_log >= log_interval:
+                print(
+                    "prism coordinator: block submitter waiting on lock "
+                    f"lock={name} elapsed={now - started:.3f}s",
+                    flush=True,
+                )
+                last_log = now
+
+    @contextmanager
+    def _block_submitter_lock(self, lock: Any, name: str) -> Iterator[None]:
+        self._acquire_block_submitter_lock(lock, name)
+        try:
+            yield
+        finally:
+            lock.release()
 
     def _overdue_heartbeats(self, now: float) -> list[str]:
         self._ensure_watchdog_state()
         with self._heartbeats_lock:
             paused = set(self._watchdog_pauses)
-            return sorted(
-                name
-                for name, last in self._heartbeats.items()
-                if name not in paused and now - last > self.watchdog_timeout_seconds
-            )
+            overdue: list[str] = []
+            for name, last in self._heartbeats.items():
+                if name in paused or now - last <= self.watchdog_timeout_seconds:
+                    continue
+                phase = self._heartbeat_phases.get(name)
+                overdue.append(f"{name}:{phase}" if phase else name)
+            return sorted(overdue)
 
     def _pause_watchdog_heartbeat(self, name: str) -> None:
         self._ensure_watchdog_state()
@@ -12171,6 +12367,7 @@ class PrismCoordinator:
         self._ensure_watchdog_state()
         with self._heartbeats_lock:
             self._heartbeats.pop(name, None)
+            self._heartbeat_phases.pop(name, None)
             self._watchdog_pauses.pop(name, None)
 
     def _registered_watchdog_heartbeat_names(self, *names: str) -> tuple[str, ...]:
@@ -12820,7 +13017,21 @@ class PrismCoordinator:
     @contextmanager
     def _writer_operation(self, component: str) -> Iterator[None]:
         controller = self._ensure_shutdown_controller()
-        token = controller.enter_writer(component)
+        owner = getattr(self, "_block_submitter_thread_ident", None)
+        submitter_owner = owner is not None and threading.get_ident() == owner
+        phase = f"writer-admission:{component}"
+        if submitter_owner:
+            self._record_block_submitter_phase(phase)
+        if submitter_owner:
+            token = controller.enter_writer(
+                component,
+                wait_callback=lambda: self._record_block_submitter_phase(phase),
+            )
+        else:
+            # Keep the historical one-argument seam for focused embedders and
+            # test controllers; only the dedicated submitter needs sliced
+            # admission heartbeats.
+            token = controller.enter_writer(component)
         try:
             yield
         finally:
@@ -20339,6 +20550,16 @@ class PrismCoordinator:
                 assert process.stdin is not None
                 input_byte_count = 0
                 worker_deadline = build_deadline
+                killed_process_wait_seconds = max(
+                    0.001,
+                    float(
+                        getattr(
+                            self,
+                            "job_build_cancel_grace_seconds",
+                            DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS,
+                        )
+                    ),
+                )
                 coordinator = self
 
                 class _CancelableInput:
@@ -20506,7 +20727,10 @@ class PrismCoordinator:
                         process.kill()
                     except ProcessLookupError:
                         pass
-                    process.wait()
+                    try:
+                        process.wait(timeout=killed_process_wait_seconds)
+                    except subprocess.TimeoutExpired:
+                        pass
                     if isinstance(
                         exc,
                         (JobBuildCancelled, _JobBundleBuildSuperseded),
@@ -20537,7 +20761,9 @@ class PrismCoordinator:
                 terminated = False
                 returncode: int | None = None
                 if cancellation is None and not hasattr(process, "poll"):
-                    returncode = process.wait()
+                    returncode = process.wait(
+                        timeout=max(0.001, worker_deadline - time.monotonic())
+                    )
                 else:
                     while returncode is None:
                         returncode = process.poll()
@@ -20568,14 +20794,24 @@ class PrismCoordinator:
                                 )
                             except subprocess.TimeoutExpired:
                                 process.kill()
-                                returncode = process.wait()
+                                try:
+                                    returncode = process.wait(
+                                        timeout=killed_process_wait_seconds
+                                    )
+                                except subprocess.TimeoutExpired:
+                                    returncode = process.poll()
                             with self._job_build_scheduler_lock:
                                 self.job_build_worker_counts["terminations"] += 1
                                 self._job_build_worker_restart_pending = True
                             break
                         if time.monotonic() >= worker_deadline:
                             process.kill()
-                            returncode = process.wait()
+                            try:
+                                returncode = process.wait(
+                                    timeout=killed_process_wait_seconds
+                                )
+                            except subprocess.TimeoutExpired:
+                                returncode = process.poll()
                             with self._tip_refresh_metrics_lock:
                                 self.tip_refresh_worker_failures += 1
                             raise RuntimeError(
@@ -20939,7 +21175,14 @@ class PrismCoordinator:
             try:
                 candidate_intent = self.block_candidate_intent(candidate)
                 if callable(persist_intent):
-                    persist_intent(candidate_intent)
+                    self._run_block_submitter_ledger_call(
+                        (
+                            "persist-candidate-intent",
+                            str(candidate.submission.block_hash_hex).lower(),
+                        ),
+                        "persist-candidate-intent",
+                        lambda: persist_intent(candidate_intent),
+                    )
             except BaseException:
                 # No retry slot is safe until the pre-submit outbox boundary is
                 # durable. Let the miner retry this submission instead. Without
@@ -20949,10 +21192,15 @@ class PrismCoordinator:
                 self._forget_recent_share_key(share_key)
                 raise
             try:
+                node_submission = self._node_submission_for_candidate(candidate)
                 self._mark_block_candidate_attempted(
                     str(candidate.submission.block_hash_hex).lower()
                 )
-                block_landed = self.submit_block_candidate(candidate)
+                with self._block_submitter_ledger_statement_timeout_scope():
+                    block_landed = self._account_block_candidate_after_node_submit(
+                        candidate,
+                        node_submission,
+                    )
             except BaseException:
                 self._retain_block_candidate_for_retry(candidate)
                 self._forget_recent_share_key(share_key)
@@ -20973,30 +21221,19 @@ class PrismCoordinator:
                 if reason not in retryable_reasons:
                     # This process will never credit the candidate share now:
                     # release its snapshot anchor floor entry before the
-                    # terminal outbox update. If that update fails, durable
-                    # replay may run in this process with a reconstructed
-                    # PendingShare; append-side cache invalidation protects its
-                    # original stamps without retaining an old anchor floor.
-                    self._finish_pending_share_commit(candidate.pending_share)
-                    finish = getattr(self.ledger, "mark_block_candidate_abandoned", None)
-                    if callable(finish):
-                        abandon_error = (
-                            getattr(outcome, "error", None)
-                            if outcome is not None
-                            else None
-                        )
-                        finish(
-                            block_hash=submission.block_hash_hex,
-                            error=abandon_error or reason,
-                        )
-                    # Once the durable outbox cannot replay this candidate,
-                    # its landed-transition tombstone no longer protects a
-                    # crash seam and would otherwise accumulate forever.
-                    self._clear_accepted_block_payout_preview(
-                        submission.block_hash_hex
+                    # terminal outbox update, whose failure would still leave
+                    # only restart replay (a fresh PendingShare) to credit it.
+                    abandon_error = (
+                        getattr(outcome, "error", None)
+                        if outcome is not None
+                        else None
                     )
-                    self._discard_outstanding_block_candidate(
-                        str(submission.block_hash_hex)
+                    self._finalize_block_candidate(
+                        candidate,
+                        block_hash=str(submission.block_hash_hex).lower(),
+                        accepted=False,
+                        error=str(abandon_error or reason),
+                        outcome=outcome,
                     )
                 self._forget_recent_share_key(share_key)
                 self.reject_stratum(
@@ -21006,11 +21243,16 @@ class PrismCoordinator:
                     worker=worker_name,
                 )
             else:
-                finish = getattr(self.ledger, "mark_block_candidate_submitted", None)
-                if callable(finish):
-                    finish(block_hash=submission.block_hash_hex)
-                self._discard_outstanding_block_candidate(
-                    str(submission.block_hash_hex)
+                outcome = getattr(self, "_block_candidate_outcome", None)
+                if outcome is None:
+                    outcome = threading.local()
+                    self._block_candidate_outcome = outcome
+                self._finalize_block_candidate(
+                    candidate,
+                    block_hash=str(submission.block_hash_hex).lower(),
+                    accepted=True,
+                    error="",
+                    outcome=outcome,
                 )
                 if evicted_entry is not None:
                     self.note_evicted_job_submit(
@@ -23001,16 +23243,32 @@ class PrismCoordinator:
     @ledger_writer_operation("accepted_block_handling")
     def replay_pending_block_candidates(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
+        self._record_block_submitter_phase("replay-check-memory")
         with self.lock:
             if getattr(self, "_retry_block_candidate", None) is not None:
                 return 0
+        # A live wakeup is already the lowest-latency route to qbitd. Never
+        # park it behind the outbox query that exists only to recover missing
+        # wakeups after queue pressure or restart.
+        queue_obj = getattr(self, "block_candidate_queue", None)
+        if queue_obj is not None and not queue_obj.empty():
+            return 0
         pending_rows = getattr(self.ledger, "pending_block_candidate_rows", None)
         if callable(pending_rows):
-            durable_rows = pending_rows(limit=MAX_PENDING_BLOCK_CANDIDATES)
+            durable_rows = self._run_block_submitter_ledger_call(
+                ("replay-outbox-query",),
+                "replay-outbox-query",
+                lambda: pending_rows(limit=MAX_PENDING_BLOCK_CANDIDATES),
+            )
         else:
             pending = getattr(self.ledger, "pending_block_candidates", None)
             if not callable(pending):
                 return 0
+            pending_intents = self._run_block_submitter_ledger_call(
+                ("replay-outbox-query",),
+                "replay-outbox-query",
+                lambda: pending(limit=MAX_PENDING_BLOCK_CANDIDATES),
+            )
             durable_rows = [
                 {
                     "block_hash": (
@@ -23020,11 +23278,9 @@ class PrismCoordinator:
                     ),
                     "candidate": intent,
                 }
-                for intent in pending(limit=MAX_PENDING_BLOCK_CANDIDATES)
+                for intent in pending_intents
             ]
-        queue_obj = getattr(self, "block_candidate_queue", None)
-        if queue_obj is not None and not queue_obj.empty():
-            return 0
+        self._record_block_submitter_phase("replay-restore")
         queued = 0
         for durable_row in durable_rows:
             durable_block_hash = ""
@@ -23057,7 +23313,13 @@ class PrismCoordinator:
                 try:
                     state_reader = getattr(self.ledger, "pool_block_state", None)
                     if callable(state_reader):
-                        block_state = state_reader(block_hash=durable_block_hash)
+                        block_state = self._run_block_submitter_ledger_call(
+                            ("replay-pool-block-state", durable_block_hash),
+                            "replay-pool-block-state",
+                            lambda block_hash=durable_block_hash, reader=state_reader: reader(
+                                block_hash=block_hash
+                            ),
+                        )
                 except Exception:
                     traceback.print_exc()
                     block_state = None
@@ -23106,9 +23368,13 @@ class PrismCoordinator:
                 quarantine = getattr(self.ledger, "mark_block_candidate_abandoned", None)
                 if durable_block_hash and callable(quarantine):
                     try:
-                        quarantined = quarantine(
-                            block_hash=durable_block_hash,
-                            error="invalid durable candidate intent",
+                        quarantined = self._run_block_submitter_ledger_call(
+                            ("replay-quarantine", durable_block_hash),
+                            "replay-quarantine",
+                            lambda block_hash=durable_block_hash, finish=quarantine: finish(
+                                block_hash=block_hash,
+                                error="invalid durable candidate intent",
+                            ),
                         )
                         self._clear_accepted_block_payout_preview(
                             durable_block_hash
@@ -23141,15 +23407,117 @@ class PrismCoordinator:
         if not hasattr(self, "_block_submitter_backoff_delay_seconds"):
             self._block_submitter_backoff_delay_seconds = 0.0
 
+    def _ensure_block_submitter_ledger_call_state(self) -> None:
+        if not hasattr(self, "_block_submitter_ledger_calls_lock"):
+            self._block_submitter_ledger_calls_lock = threading.Lock()
+        if not hasattr(self, "_block_submitter_ledger_calls"):
+            self._block_submitter_ledger_calls = {}
+
+    def _block_submitter_db_timeout(self) -> float:
+        return max(
+            0.001,
+            float(
+                getattr(
+                    self,
+                    "block_submit_db_timeout_seconds",
+                    DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS,
+                )
+            ),
+        )
+
+    @contextmanager
+    def _block_submitter_ledger_timeout_scope(self) -> Iterator[None]:
+        """Apply the submitter's PostgreSQL deadline when the ledger supports it."""
+        operation_timeout = getattr(self.ledger, "operation_timeout", None)
+        if not callable(operation_timeout):
+            yield
+            return
+        with operation_timeout(self._block_submitter_db_timeout()):
+            yield
+
+    @contextmanager
+    def _block_submitter_ledger_statement_timeout_scope(self) -> Iterator[None]:
+        """Give each post-submit ledger step a fresh short deadline."""
+        statement_timeout = getattr(self.ledger, "statement_timeout", None)
+        if callable(statement_timeout):
+            with statement_timeout(self._block_submitter_db_timeout()):
+                yield
+            return
+        # Duck-typed ledgers predating per-statement scopes still receive a
+        # bounded operation, even though their budget spans the whole tail.
+        with self._block_submitter_ledger_timeout_scope():
+            yield
+
+    def _run_block_submitter_ledger_call(
+        self,
+        key: tuple[object, ...],
+        phase: str,
+        operation: Callable[[], Any],
+    ) -> Any:
+        """Run one direct outbox call without letting its driver wedge us.
+
+        A timed-out call remains registered and is reused by the next paced
+        retry. This bounds the coordinator-side wait without spawning an
+        unbounded pile of threads when a fake/misbehaving driver ignores the
+        real PostgreSQL statement deadline. Candidate outbox mutations are
+        idempotent, so a late completion converges with replay.
+        """
+        self._ensure_block_submitter_ledger_call_state()
+        with self._block_submitter_ledger_calls_lock:
+            call = self._block_submitter_ledger_calls.get(key)
+            if call is None:
+                call = _BlockSubmitterLedgerCall()
+                self._block_submitter_ledger_calls[key] = call
+
+                def run() -> None:
+                    try:
+                        with self._block_submitter_ledger_timeout_scope():
+                            call.result = operation()
+                    except BaseException as exc:
+                        call.error = exc
+                    finally:
+                        call.done.set()
+
+                threading.Thread(
+                    target=run,
+                    name=f"prism-block-ledger-{phase}",
+                    daemon=True,
+                ).start()
+
+        timeout_seconds = self._block_submitter_db_timeout()
+        deadline = time.monotonic() + timeout_seconds
+        while not call.done.is_set():
+            self._record_block_submitter_wait(phase)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(
+                    "prism coordinator: block submitter ledger phase timed out "
+                    f"phase={phase} timeout={timeout_seconds:g}s",
+                    flush=True,
+                )
+                raise BlockSubmitterDatabaseTimeout(
+                    f"{phase} exceeded {timeout_seconds:g}s"
+                )
+            call.done.wait(
+                min(
+                    remaining,
+                    BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS,
+                )
+            )
+        self._record_block_submitter_wait(f"{phase}:complete")
+        with self._block_submitter_ledger_calls_lock:
+            if self._block_submitter_ledger_calls.get(key) is call:
+                self._block_submitter_ledger_calls.pop(key, None)
+        if call.error is not None:
+            raise call.error
+        return call.result
+
     def _wait_for_block_candidate_retry(self, delay_seconds: float) -> bool:
         """Wait for intentional backoff without impersonating stuck work.
 
-        Only this bounded retry wait and the owner-thread boundary stamps in
-        ``_record_block_candidate_progress`` refresh the submitter
-        heartbeat, and every boundary stamp follows completed work. SQL,
-        RPC, audit/finalization, and socket phases call no helper while they
-        run, so a genuinely blocked candidate phase remains
-        watchdog-eligible.
+        Retry waits heartbeat in bounded slices. Direct outbox calls and lock
+        admission use the same phase-aware pattern; work that is not covered
+        by an explicit deadline remains watchdog-eligible.
         """
         delay_seconds = max(0.0, float(delay_seconds))
         if delay_seconds <= 0:
@@ -23163,7 +23531,7 @@ class PrismCoordinator:
         remaining = delay_seconds
         try:
             while remaining > 0:
-                self._record_heartbeat("block_submitter")
+                self._record_block_submitter_wait("retry-backoff")
                 wait_slice = min(
                     remaining,
                     BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS,
@@ -23171,7 +23539,7 @@ class PrismCoordinator:
                 if self.stop_event.wait(wait_slice):
                     return True
                 remaining = max(0.0, remaining - wait_slice)
-            self._record_heartbeat("block_submitter")
+            self._record_block_submitter_wait("retry-backoff:complete")
             return False
         finally:
             with self._block_submitter_retry_state_lock:
@@ -23182,7 +23550,146 @@ class PrismCoordinator:
     def _mark_block_candidate_attempted(self, block_hash: str) -> None:
         mark_attempted = getattr(self.ledger, "mark_block_candidate_attempted", None)
         if callable(mark_attempted):
-            mark_attempted(block_hash=block_hash)
+            self._run_block_submitter_ledger_call(
+                ("mark-attempted", block_hash),
+                "mark-attempted",
+                lambda: mark_attempted(block_hash=block_hash),
+            )
+
+    def _rpc_call_with_timeout(
+        self,
+        method: str,
+        params: list[object],
+        *,
+        timeout_seconds: float,
+    ) -> Any:
+        """Pass an explicit timeout to production RPCs and capable test doubles."""
+        call = self.rpc.call
+        supports_timeout = isinstance(self.rpc, JsonRpc)
+        if not supports_timeout:
+            try:
+                parameters = inspect.signature(call).parameters.values()
+                supports_timeout = any(
+                    parameter.name == "timeout"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+            except (TypeError, ValueError):
+                supports_timeout = False
+        if supports_timeout:
+            return call(method, params, timeout=timeout_seconds)
+        return call(method, params)
+
+    def _submit_block_candidate_to_node(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> _BlockCandidateNodeSubmission:
+        """Offer the durable candidate to qbitd before any accounting work."""
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        self._register_outstanding_block_candidate(block_hash)
+        self._record_block_submitter_phase("submitblock-rpc")
+        timeout_seconds = max(
+            0.001,
+            float(
+                getattr(
+                    self,
+                    "block_submit_rpc_timeout_seconds",
+                    DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS,
+                )
+            ),
+        )
+        try:
+            result = self._rpc_call_with_timeout(
+                "submitblock",
+                [candidate.submission.block_hex],
+                timeout_seconds=timeout_seconds,
+            )
+        except BaseException as exc:
+            self._record_block_submitter_phase("submitblock-rpc:error")
+            return _BlockCandidateNodeSubmission(
+                attempted=True,
+                error=exc,
+            )
+        self._record_block_submitter_phase("submitblock-rpc:complete")
+        landed_monotonic = getattr(candidate, "landed_monotonic", None)
+        if landed_monotonic is not None:
+            self._observe_block_submit_seconds(
+                time.monotonic() - float(landed_monotonic)
+            )
+        return _BlockCandidateNodeSubmission(
+            attempted=True,
+            result=result,
+        )
+
+    def _node_submission_for_candidate(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> _BlockCandidateNodeSubmission:
+        """Choose the node fast lane unless the pool was already closed."""
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        self._record_block_submitter_phase("fast-lane-admission")
+        with self.lock:
+            accounted_hashes = getattr(
+                self,
+                "_accounted_accepted_block_hashes",
+                set(),
+            )
+            pool_closed = (
+                self.accepted_block_count >= self.max_blocks
+                and block_hash not in accounted_hashes
+            )
+        if pool_closed:
+            return _BlockCandidateNodeSubmission(attempted=False)
+        return self._submit_block_candidate_to_node(candidate)
+
+    def _node_submission_for_direct_candidate(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> _BlockCandidateNodeSubmission:
+        """Preserve active-replay semantics for non-queue embedders.
+
+        The dedicated submitter always uses the unconditional fast lane. A
+        direct caller can instead be resuming a durable active ancestor, for
+        which another submit is unnecessary and some integrations do not
+        retain block bytes. This compatibility probe is not on the incident
+        queue-to-node path.
+        """
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        expected_height = int(candidate.context.template["height"])
+        try:
+            if str(self.rpc.call("getbestblockhash")).lower() == block_hash:
+                return _BlockCandidateNodeSubmission(attempted=False)
+        except Exception:
+            pass
+        try:
+            if self.active_block_candidate_height(block_hash) == expected_height:
+                return _BlockCandidateNodeSubmission(attempted=False)
+        except Exception:
+            pass
+        if not hasattr(candidate.submission, "block_hex"):
+            return _BlockCandidateNodeSubmission(attempted=False)
+        return self._node_submission_for_candidate(candidate)
+
+    def _account_block_candidate_after_node_submit(
+        self,
+        candidate: PrismBlockCandidate,
+        node_submission: _BlockCandidateNodeSubmission,
+    ) -> bool:
+        """Pass fast-lane evidence while tolerating legacy test embedders."""
+        submit = self.submit_block_candidate
+        supports_node_submission = True
+        try:
+            parameters = inspect.signature(submit).parameters.values()
+            supports_node_submission = any(
+                parameter.name == "node_submission"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            pass
+        if supports_node_submission:
+            return bool(submit(candidate, node_submission=node_submission))
+        return bool(submit(candidate))
 
     def _ensure_block_candidate_disposition_state(self) -> None:
         """Backfill same-hash submission guards for lightweight embedders."""
@@ -23212,7 +23719,10 @@ class PrismCoordinator:
         """
         key = block_hash.lower()
         self._ensure_block_candidate_disposition_state()
-        with self._block_candidate_disposition_registry_lock:
+        with self._block_submitter_lock(
+            self._block_candidate_disposition_registry_lock,
+            "candidate-disposition-registry",
+        ):
             flight = self._block_candidate_disposition_flights.get(key)
             if flight is None:
                 flight = _BlockCandidateDispositionFlight()
@@ -23221,10 +23731,21 @@ class PrismCoordinator:
         try:
             # Never hold the registry lock while waiting on the hash-specific
             # guard: unrelated candidates must remain independent.
-            with flight.lock:
+            guard = (
+                self._block_submitter_lock(
+                    flight.lock,
+                    f"candidate-disposition:{key}",
+                )
+                if hasattr(flight.lock, "acquire")
+                else flight.lock
+            )
+            with guard:
                 yield
         finally:
-            with self._block_candidate_disposition_registry_lock:
+            with self._block_submitter_lock(
+                self._block_candidate_disposition_registry_lock,
+                "candidate-disposition-registry",
+            ):
                 flight.users -= 1
                 if (
                     flight.users == 0
@@ -23239,14 +23760,44 @@ class PrismCoordinator:
         # submitter's liveness budget on its behalf.
         self._block_submitter_thread_ident = threading.get_ident()
         while not self.stop_event.is_set():
-            self._record_heartbeat("block_submitter")
+            self._record_block_submitter_phase("loop")
             try:
+                # The in-memory wakeup is already backed by the durable
+                # outbox. Drain it before any recovery query so a saturated
+                # database cannot delay the first node submission.
+                with self.lock:
+                    retry_ready = (
+                        getattr(self, "_retry_block_candidate", None) is not None
+                    )
+                queue_obj = getattr(self, "block_candidate_queue", None)
+                wakeup_ready = (
+                    queue_obj is not None and not queue_obj.empty()
+                )
+                if (retry_ready or wakeup_ready) and self.submit_next_block_candidate():
+                    continue
                 self.replay_pending_block_candidates()
                 self.submit_next_block_candidate(timeout=1.0)
             except ShutdownInProgress:
                 # Admission can close after the loop condition. Durable block
                 # candidates remain in the outbox for the replacement writer.
                 return
+            except Exception:
+                phase = getattr(self, "_block_submitter_phase", "unknown")
+                print(
+                    "prism coordinator: block submitter iteration failed "
+                    f"phase={phase}; durable candidates remain pending",
+                    flush=True,
+                )
+                traceback.print_exc()
+                retry_delay = float(
+                    getattr(
+                        self,
+                        "block_candidate_retry_initial_seconds",
+                        DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS,
+                    )
+                )
+                if self._wait_for_block_candidate_retry(retry_delay):
+                    return
 
     def submit_next_block_candidate(self, timeout: float | None = None) -> bool:
         """Dequeue and land one block candidate; returns True when one ran.
@@ -23254,6 +23805,7 @@ class PrismCoordinator:
         The block-submitter loop calls this continuously; tests call it
         directly to drain the queue deterministically.
         """
+        self._record_block_submitter_phase("dequeue-retry")
         with self.lock:
             candidate = getattr(self, "_retry_block_candidate", None)
             if candidate is not None:
@@ -23263,6 +23815,7 @@ class PrismCoordinator:
             if queue_obj is None:
                 return False
             try:
+                self._record_block_submitter_phase("dequeue-queue")
                 if timeout is None:
                     candidate = queue_obj.get_nowait()
                 else:
@@ -23275,9 +23828,24 @@ class PrismCoordinator:
             outcome = threading.local()
             self._block_candidate_outcome = outcome
         outcome.refresh_client = None
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        self._record_block_submitter_phase("finalize-registry")
+        with self.lock:
+            registry = getattr(self, "_block_candidate_finalize_retries", None)
+            pending_finalize = (
+                registry.get(block_hash) if registry is not None else None
+            )
+        node_submission = (
+            None
+            if pending_finalize is not None
+            else self._node_submission_for_candidate(candidate)
+        )
         try:
             with self._writer_operation("accepted_block_handling"):
-                ran = self._submit_next_block_candidate_writer(candidate)
+                ran = self._submit_next_block_candidate_writer(
+                    candidate,
+                    node_submission=node_submission,
+                )
                 refresh_client = getattr(outcome, "refresh_client", None)
                 outcome.refresh_client = None
         except ShutdownInProgress:
@@ -23298,6 +23866,8 @@ class PrismCoordinator:
     def _submit_next_block_candidate_writer(
         self,
         candidate: PrismBlockCandidate,
+        *,
+        node_submission: _BlockCandidateNodeSubmission | None = None,
     ) -> bool:
         """Land one dequeued block candidate inside writer admission."""
         outcome = getattr(self, "_block_candidate_outcome", None)
@@ -23307,6 +23877,26 @@ class PrismCoordinator:
         outcome.reason = None
         outcome.error = None
         block_hash = str(candidate.submission.block_hash_hex).lower()
+        self._record_block_submitter_phase("finalize-registry")
+        with self.lock:
+            registry = getattr(self, "_block_candidate_finalize_retries", None)
+            pending_finalize = (
+                registry.get(block_hash) if registry is not None else None
+            )
+        if pending_finalize is not None:
+            # Finalize-only replay: node submission, terminal accounting, and
+            # payout persistence already completed on the pass that armed
+            # this entry. It bypasses both submitblock and attempt marking.
+            accepted, error = pending_finalize
+            return self._finalize_block_candidate(
+                candidate,
+                block_hash=block_hash,
+                accepted=accepted,
+                error=error,
+                outcome=outcome,
+            )
+        if node_submission is None:
+            node_submission = self._node_submission_for_candidate(candidate)
         try:
             self._mark_block_candidate_attempted(block_hash)
         except Exception:
@@ -23321,30 +23911,15 @@ class PrismCoordinator:
                 self._next_block_candidate_retry_delay(block_hash)
             )
             return True
-        with self.lock:
-            registry = getattr(self, "_block_candidate_finalize_retries", None)
-            pending_finalize = (
-                registry.get(block_hash) if registry is not None else None
-            )
-        if pending_finalize is not None:
-            # Finalize-only replay: submission, terminal accounting, and
-            # payout persistence already completed on the pass that armed
-            # this entry; only the durable outbox update remains. Re-running
-            # submit_block_candidate here would recount terminal
-            # abandonments and redo the accepted-path audit/persist work
-            # once per paced retry.
-            accepted, error = pending_finalize
-            return self._finalize_block_candidate(
-                candidate,
-                block_hash=block_hash,
-                accepted=accepted,
-                error=error,
-                outcome=outcome,
-            )
         accepted = False
         error = "candidate became stale or submission failed"
         try:
-            accepted = self.submit_block_candidate(candidate)
+            self._record_block_submitter_phase("accounting")
+            with self._block_submitter_ledger_statement_timeout_scope():
+                accepted = self._account_block_candidate_after_node_submit(
+                    candidate,
+                    node_submission,
+                )
         except Exception:
             error = "candidate submission raised an exception"
             print(
@@ -23423,6 +23998,7 @@ class PrismCoordinator:
         so terminal abandonment accounting stays once-per-candidate and an
         accepted candidate's audit/persist work is not redone per retry.
         """
+        self._record_block_submitter_phase("finalize-preview")
         self._clear_accepted_block_payout_preview(
             block_hash,
             invalidate_published=not accepted,
@@ -23436,9 +24012,17 @@ class PrismCoordinator:
         if callable(finish):
             try:
                 if accepted:
-                    finish(block_hash=block_hash)
+                    self._run_block_submitter_ledger_call(
+                        ("finalize", block_hash, "submitted"),
+                        "finalize-outbox-submitted",
+                        lambda: finish(block_hash=block_hash),
+                    )
                 else:
-                    finish(block_hash=block_hash, error=error)
+                    self._run_block_submitter_ledger_call(
+                        ("finalize", block_hash, "abandoned"),
+                        "finalize-outbox-abandoned",
+                        lambda: finish(block_hash=block_hash, error=error),
+                    )
                     # The invalidation tombstone is needed until the durable
                     # outbox becomes terminal. A normal return (including an
                     # already-terminal/missing row) means there is no pending
@@ -24066,7 +24650,10 @@ class PrismCoordinator:
         try:
             yield
         finally:
-            self._payout_balance_mutation_lock.acquire()
+            self._acquire_block_submitter_lock(
+                self._payout_balance_mutation_lock,
+                "payout-balance-mutation",
+            )
 
     def _replayed_payout_window_reproducible(
         self,
@@ -24130,6 +24717,7 @@ class PrismCoordinator:
         current_tip: str,
         already_active: bool,
         worker: str | None,
+        node_submission: _BlockCandidateNodeSubmission,
         revalidated_append_epoch: int | None = None,
     ) -> tuple[
         dict[str, Any],
@@ -24142,10 +24730,10 @@ class PrismCoordinator:
         The balance serializer spans the last prior-state check through durable
         confirmation. Reconciliation therefore cannot change the base beneath
         the accepted coinbase, while ordinary job delivery remains unblocked.
-        submitblock always runs first; the audit bundle build and verification
-        then execute with the serializer temporarily released (the landed
-        fence stays armed), so neither block announcement nor job delivery
-        waits on audit construction.
+        The caller has already run submitblock on the lock/DB-free fast lane.
+        The audit bundle build and verification execute with the serializer
+        temporarily released (the landed fence stays armed), so neither block
+        announcement nor job delivery waits on audit construction.
         """
         context = candidate.context
         submission = candidate.submission
@@ -24156,7 +24744,10 @@ class PrismCoordinator:
         durable_payout_state = bool(
             getattr(self.ledger, "durable_payout_state", False)
         )
-        with self._payout_balance_mutation_lock:
+        with self._block_submitter_lock(
+            self._payout_balance_mutation_lock,
+            "payout-balance-mutation",
+        ):
             if self._defer_for_pending_parent_payout_transition(
                 block_hash=block_hash,
                 parent_hash=parent_hash,
@@ -24316,7 +24907,7 @@ class PrismCoordinator:
                     stale_job_class="balance_stale",
                 )
                 return None
-            if not already_active:
+            if not already_active and not node_submission.attempted:
                 before_height = int(self.rpc.call("getblockcount"))
                 if before_height + 1 != expected_height:
                     self._abandon_block_candidate(
@@ -24327,7 +24918,8 @@ class PrismCoordinator:
                         expected_height=expected_height,
                     )
                     return None
-                # Register before submitblock can expose this hash as the new
+            if not already_active:
+                # Register before a fallback submitblock can expose this hash as the new
                 # tip. Child builders will wait for the verified preview rather
                 # than reading balances that omit their new parent.
                 self._begin_accepted_block_payout_preview(
@@ -24341,61 +24933,54 @@ class PrismCoordinator:
                     block_hash,
                     block_height=expected_height,
                 )
-                self._record_heartbeat("block_submitter")
-                self._require_fresh_ledger_lease_for_external_side_effect(
-                    "submitblock"
-                )
-                # The epoch fence above is advisory: it releases the lock
-                # after one read, so an append-side bump could still commit
-                # between that read and the RPC below. This one is
-                # authoritative -- the bump acquires the same fence lock, so
-                # holding it across submitblock means no late-visible append
-                # can advance the epoch between this comparison and the
-                # block entering qbitd. The lock spans exactly one RPC and
-                # only on this boundary; ordinary share commits never touch
-                # it (the append side takes it only for rows that predate a
-                # live anchor, and this landing's own declared anchor stays
-                # exposed for the landing's duration).
-                result: object = None
-                append_epoch_raced = False
-                if (
-                    effective_append_epoch is None
-                    or getattr(context, "collection_only", False)
-                ):
-                    result = self.rpc.call(
-                        "submitblock", [submission.block_hex]
+                if not node_submission.attempted:
+                    self._require_fresh_ledger_lease_for_external_side_effect(
+                        "submitblock"
                     )
-                else:
-                    with self._payout_append_landing_fence_lock:
-                        with self._job_cache_lock:
-                            live_append_epoch = int(
-                                self._payout_ledger_append_invalidation_epoch
-                            )
-                        if live_append_epoch != effective_append_epoch:
-                            append_epoch_raced = True
-                        else:
-                            result = self.rpc.call(
-                                "submitblock", [submission.block_hex]
-                            )
-                if append_epoch_raced:
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_STALE_JOB,
-                        "payout window was invalidated by a late-visible share append",
-                        block_hash=block_hash,
-                        worker=worker,
-                        expected_height=expected_height,
-                        stale_job_class="append_epoch_stale",
-                    )
-                    return None
-                self._record_heartbeat("block_submitter")
-                landed_monotonic = getattr(candidate, "landed_monotonic", None)
-                if landed_monotonic is not None:
-                    # Observed for every attempt whose RPC returned, accepted
-                    # or rejected: a rejected race is exactly the tail this
-                    # histogram exists to expose.
-                    self._observe_block_submit_seconds(
-                        time.monotonic() - float(landed_monotonic)
-                    )
+                    # The epoch fence above is advisory: it releases the lock
+                    # after one read, so an append-side bump could still commit
+                    # between that read and the RPC below. This one is
+                    # authoritative -- the bump acquires the same fence lock, so
+                    # holding it across submitblock means no late-visible append
+                    # can advance the epoch between this comparison and the
+                    # block entering qbitd. The lock spans exactly one RPC and
+                    # only on this boundary; ordinary share commits never touch
+                    # it (the append side takes it only for rows that predate a
+                    # live anchor, and this landing's own declared anchor stays
+                    # exposed for the landing's duration).
+                    append_epoch_raced = False
+                    if (
+                        effective_append_epoch is None
+                        or getattr(context, "collection_only", False)
+                    ):
+                        node_submission = self._submit_block_candidate_to_node(
+                            candidate
+                        )
+                    else:
+                        with self._payout_append_landing_fence_lock:
+                            with self._job_cache_lock:
+                                live_append_epoch = int(
+                                    self._payout_ledger_append_invalidation_epoch
+                                )
+                            if live_append_epoch != effective_append_epoch:
+                                append_epoch_raced = True
+                            else:
+                                node_submission = (
+                                    self._submit_block_candidate_to_node(candidate)
+                                )
+                    if append_epoch_raced:
+                        self._abandon_block_candidate(
+                            PRISM_REJECTION_STALE_JOB,
+                            "payout window was invalidated by a late-visible share append",
+                            block_hash=block_hash,
+                            worker=worker,
+                            expected_height=expected_height,
+                            stale_job_class="append_epoch_stale",
+                        )
+                        return None
+                if node_submission.error is not None:
+                    raise node_submission.error
+                result = node_submission.result
                 if result not in (None, "duplicate"):
                     self._abandon_block_candidate(
                         PRISM_REJECTION_SUBMITBLOCK_REJECTED,
@@ -24445,7 +25030,7 @@ class PrismCoordinator:
                     return None
                 self._publish_accepted_block_payout_preview(block_hash, preview)
 
-            self._record_heartbeat("block_submitter")
+            self._record_block_submitter_phase("audit-build")
             # The bundle derives only from inputs frozen on the candidate
             # (share window, prior balances, extranonces, template fields),
             # so the serializer is released around the builder/verifier
@@ -24519,6 +25104,7 @@ class PrismCoordinator:
             payout_commit_source: int | None = None
             try:
                 with self._payout_balance_serializer_released():
+                    self._record_block_submitter_phase("audit-verify")
                     report = self.verify_bundle(
                         candidate_bundle_path,
                         submission.coinbase_tx_hex,
@@ -24539,7 +25125,7 @@ class PrismCoordinator:
                             prior_balances=context.prior_balances,
                         )
                     )
-                self._record_heartbeat("block_submitter")
+                self._record_block_submitter_phase("audit-verify:complete")
                 if not already_confirmed:
                     if preview is None and durable_payout_state:
                         live_prior_balances = self.settlement_balances_by_program(
@@ -24587,6 +25173,7 @@ class PrismCoordinator:
                 # and bulk SQL without owning the delivery gate.
                 payout_commit_started = time.monotonic()
                 payout_commit_source = self._capture_payout_state_source()[1]
+                self._record_block_submitter_phase("persist-accepted-block")
                 persistence = self.ledger.persist_accepted_block(
                     block_hash=submission.block_hash_hex,
                     block_height=expected_height,
@@ -24595,7 +25182,7 @@ class PrismCoordinator:
                     audit_report=report,
                     canonical_bundle_path=persistence_canonical_bundle_path,
                 )
-                self._record_heartbeat("block_submitter")
+                self._record_block_submitter_phase("persist-accepted-block:complete")
                 active_hash = str(
                     self.rpc.call("getblockhash", [expected_height])
                 ).lower()
@@ -24788,7 +25375,12 @@ class PrismCoordinator:
                     pass
 
     @ledger_writer_operation("accepted_block_handling")
-    def submit_block_candidate(self, candidate: PrismBlockCandidate) -> bool:
+    def submit_block_candidate(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        node_submission: _BlockCandidateNodeSubmission | None = None,
+    ) -> bool:
         """Land one block candidate, then finalize its audit and payout state.
 
         Runs on the block-submitter thread (tests call it synchronously). It
@@ -24801,10 +25393,18 @@ class PrismCoordinator:
         after that finalization completes.
         """
         block_hash = str(candidate.submission.block_hash_hex).lower()
+        if node_submission is None:
+            node_submission = self._node_submission_for_direct_candidate(candidate)
         with self._block_candidate_disposition(block_hash):
-            return self._submit_block_candidate_serialized(candidate)
+            return self._submit_block_candidate_serialized(
+                candidate,
+                node_submission=node_submission,
+            )
 
-    def _record_block_candidate_progress(self) -> None:
+    def _record_block_candidate_progress(
+        self,
+        phase: str = "accounting-progress",
+    ) -> None:
         """Stamp the submitter heartbeat at a candidate-disposition boundary.
 
         Stamps come only from the dedicated submitter thread: dispositions
@@ -24822,11 +25422,13 @@ class PrismCoordinator:
         owner = getattr(self, "_block_submitter_thread_ident", None)
         if owner is None or threading.get_ident() != owner:
             return
-        self._record_heartbeat("block_submitter")
+        self._record_block_submitter_phase(phase)
 
     def _submit_block_candidate_serialized(
         self,
         candidate: PrismBlockCandidate,
+        *,
+        node_submission: _BlockCandidateNodeSubmission,
     ) -> bool:
         """Process a candidate while its same-hash disposition guard is held."""
         outcome = getattr(self, "_block_candidate_outcome", None)
@@ -24846,7 +25448,16 @@ class PrismCoordinator:
         # outbox replay, retained retry) marks its hash outstanding so tip
         # observations arriving on other threads can register acceptance.
         self._register_outstanding_block_candidate(block_hash)
-        self._record_block_candidate_progress()
+        self._record_block_candidate_progress("disposition-start")
+        if (
+            self._block_candidate_acceptance_recorded(block_hash)
+            and node_submission.error is not None
+        ):
+            # A concurrent same-hash pass completed the success tail while
+            # this duplicate-safe node offer waited for disposition. Do not
+            # recreate its payout transition or accounting work.
+            self._clear_accepted_block_payout_preview(block_hash)
+            return True
         with self.lock:
             pool_closed = (
                 self.accepted_block_count >= self.max_blocks
@@ -24873,8 +25484,24 @@ class PrismCoordinator:
                 expected_height=expected_height,
             )
             return False
-        current_tip = str(self.rpc.call("getbestblockhash"))
-        self._record_block_candidate_progress()
+        self._record_block_candidate_progress("current-tip-rpc")
+        observed_tip = str(self.rpc.call("getbestblockhash"))
+        self._record_block_candidate_progress("current-tip-rpc:complete")
+        # A successful or transport-ambiguous fast-lane call can change the
+        # tip before this post-submit probe. It is still a *fresh* attempt,
+        # not an active replay: run the normal validation/persistence tail
+        # against the candidate's stamped parent. A later getblockhash check
+        # proves a successful acknowledgement, while an ambiguous transport
+        # outcome stays pending for duplicate-safe replay. Duplicate replies
+        # are replay evidence and retain the live-tip classification.
+        fresh_or_uncertain_submit = bool(
+            node_submission.attempted
+            and (
+                node_submission.error is not None
+                or node_submission.result is None
+            )
+        )
+        current_tip = parent_hash if fresh_or_uncertain_submit else observed_tip
         landed_height: int | None = None
         if current_tip.lower() == block_hash:
             landed_height = expected_height
@@ -24928,6 +25555,20 @@ class PrismCoordinator:
                 stale_job_class="tip_moved",
             )
             return accepted_race_won
+        if (
+            node_submission.attempted
+            and node_submission.error is None
+            and node_submission.result not in (None, "duplicate")
+            and not already_active
+        ):
+            self._abandon_block_candidate(
+                PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                f"submitblock rejected candidate: {node_submission.result}",
+                block_hash=block_hash,
+                worker=worker,
+                expected_height=expected_height,
+            )
+            return False
         # A reconstructed candidate revalidates BEFORE the balance
         # serializer: the audit share-window replay is the slow oracle walk
         # and takes the ledger writer lock, so running it inside
@@ -25012,6 +25653,7 @@ class PrismCoordinator:
                 current_tip=current_tip,
                 already_active=already_active,
                 worker=worker,
+                node_submission=node_submission,
                 revalidated_append_epoch=revalidated_append_epoch,
             )
         finally:
@@ -25019,7 +25661,7 @@ class PrismCoordinator:
         if landed is None:
             return False
         final_bundle, report, persistence, confirmation = landed
-        self._record_block_candidate_progress()
+        self._record_block_candidate_progress("durable-accounting:complete")
         with self.lock:
             already_accounted = block_hash in self._accounted_accepted_block_hashes
         if already_accounted:
@@ -25036,7 +25678,7 @@ class PrismCoordinator:
                 manifest_set=ctv_manifest_set,
                 manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
             )
-            self._record_block_candidate_progress()
+            self._record_block_candidate_progress("ctv-manifest-persist:complete")
         final_bundle_path = (
             self.audit_dir
             / f"prism-live-audit-bundle-{expected_height}-{block_hash}.json"
@@ -25049,7 +25691,7 @@ class PrismCoordinator:
             persistence=persistence,
         )
         self.prune_audit_artifacts(keep_live_path=final_bundle_path)
-        self._record_block_candidate_progress()
+        self._record_block_candidate_progress("audit-envelope-write:complete")
         bundle_path = final_bundle_path
         if candidate.credit_share_on_accept:
             self.append_accepted_share(
@@ -25072,7 +25714,7 @@ class PrismCoordinator:
                     template_artifacts.network_difficulty,
                     bypass_build_interval=True,
                 )
-            self._record_block_candidate_progress()
+            self._record_block_candidate_progress("accepted-share-credit:complete")
         # Aggregate counts only: materializing the whole share history
         # (all_shares) here would scan the full ledger twice per block,
         # and would grow without bound as the ledger grows. The counters are
@@ -25098,7 +25740,7 @@ class PrismCoordinator:
             "job_share_count": len(context.shares_json),
         }
         self.evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
-        self._record_block_candidate_progress()
+        self._record_block_candidate_progress("evidence-write:complete")
         with self.lock:
             newly_accounted = block_hash not in self._accounted_accepted_block_hashes
             if newly_accounted:
@@ -25268,22 +25910,39 @@ class PrismCoordinator:
         *,
         expected_coinbase_value_sats: int,
     ) -> dict[str, Any]:
-        completed = subprocess.run(
-            prism_tool_command("qbit-prism-audit-verify")
-            + [
-                str(bundle_path),
-                "--coinbase-tx-hex",
-                coinbase_tx_hex,
-                "--ledger-writer-public-key-hex",
-                ledger_writer_public_key_hex,
-                "--expected-coinbase-value-sats",
-                str(expected_coinbase_value_sats),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+        timeout_seconds = max(
+            0.001,
+            float(
+                getattr(
+                    self,
+                    "bundle_build_timeout_seconds",
+                    DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
+                )
+            ),
         )
+        try:
+            completed = subprocess.run(
+                prism_tool_command("qbit-prism-audit-verify")
+                + [
+                    str(bundle_path),
+                    "--coinbase-tx-hex",
+                    coinbase_tx_hex,
+                    "--ledger-writer-public-key-hex",
+                    ledger_writer_public_key_hex,
+                    "--expected-coinbase-value-sats",
+                    str(expected_coinbase_value_sats),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "qbit-prism-audit-verify timed out after "
+                f"{timeout_seconds:g}s"
+            ) from exc
         if completed.returncode != 0:
             raise RuntimeError(f"qbit-prism-audit-verify failed: {completed.stderr}")
         return json.loads(completed.stdout)

@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from threading import BoundedSemaphore, Lock, Thread
+from threading import BoundedSemaphore, Lock, Thread, local
 from typing import Any, Callable, Iterator
 
 from lab.prism.prism_tools import prism_tool_command
@@ -40,6 +40,10 @@ DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE = 512
 WRITER_LEASE_HEARTBEAT_SESSION_PREFIX = "heartbeat-v1:"
 DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS = 1.0
 VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
+
+
+class LedgerOperationTimeout(TimeoutError):
+    """A caller-scoped PostgreSQL deadline expired before work completed."""
 
 
 class _AuditShareSegmentConflict(RuntimeError):
@@ -1565,13 +1569,25 @@ class _NativePostgresClient:
     def pool_size(self) -> int:
         return self._pool_size
 
-    def _connect(self) -> Any:
-        return self._psycopg.connect(self._conninfo, autocommit=True)
+    def _connect(self, timeout_seconds: float | None = None) -> Any:
+        kwargs: dict[str, Any] = {"autocommit": True}
+        if timeout_seconds is not None:
+            # libpq accepts integral connect_timeout seconds. Rounding up keeps
+            # sub-second statement budgets valid without silently disabling
+            # the connection deadline.
+            kwargs["connect_timeout"] = max(1, math.ceil(timeout_seconds))
+        return self._psycopg.connect(self._conninfo, **kwargs)
 
     @contextmanager
-    def connection(self) -> Iterator[Any]:
+    def connection(self, *, timeout_seconds: float | None = None) -> Iterator[Any]:
         """Borrow a pooled connection; discard it if the caller raises."""
-        self._slots.acquire()
+        started = time.monotonic()
+        if timeout_seconds is None:
+            acquired = self._slots.acquire()
+        else:
+            acquired = self._slots.acquire(timeout=max(0.0, timeout_seconds))
+        if not acquired:
+            raise LedgerOperationTimeout("timed out waiting for a postgres pool slot")
         conn = None
         try:
             with self._idle_lock:
@@ -1580,7 +1596,13 @@ class _NativePostgresClient:
                 if self._idle:
                     conn = self._idle.pop()
             if conn is None or conn.closed:
-                conn = self._connect()
+                connect_timeout = timeout_seconds
+                if connect_timeout is not None:
+                    connect_timeout = max(
+                        0.001,
+                        connect_timeout - (time.monotonic() - started),
+                    )
+                conn = self._connect(connect_timeout)
             yield conn
         except BaseException:
             if conn is not None:
@@ -1604,7 +1626,13 @@ class _NativePostgresClient:
         finally:
             self._slots.release()
 
-    def run_json(self, sql: str, *, retry_safe: bool = False) -> Any:
+    def run_json(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> Any:
         """Run one JSON-returning statement.
 
         An ``OperationalError`` does not reveal whether PostgreSQL committed
@@ -1613,10 +1641,46 @@ class _NativePostgresClient:
         mutation fails after the first ambiguous execution.
         """
         attempts = 2 if retry_safe else 1
+        deadline = (
+            None
+            if timeout_seconds is None
+            else time.monotonic() + max(0.0, timeout_seconds)
+        )
         for attempt in range(attempts):
             try:
-                with self.connection() as conn:
-                    row = conn.execute(sql).fetchone()
+                remaining = (
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+                if remaining is not None and remaining <= 0:
+                    raise LedgerOperationTimeout("postgres statement deadline expired")
+                connection = (
+                    self.connection()
+                    if remaining is None
+                    else self.connection(timeout_seconds=remaining)
+                )
+                with connection as conn:
+                    if deadline is None:
+                        row = conn.execute(sql).fetchone()
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise LedgerOperationTimeout(
+                                "postgres statement deadline expired"
+                            )
+                        timeout_ms = max(1, int(remaining * 1000))
+                        # SET LOCAL confines both guards to this explicit
+                        # transaction, so pooled connections cannot leak a
+                        # submitter-specific deadline into unrelated work.
+                        with conn.transaction():
+                            conn.execute(
+                                f"SET LOCAL statement_timeout = '{timeout_ms}ms'"
+                            )
+                            conn.execute(
+                                f"SET LOCAL lock_timeout = '{timeout_ms}ms'"
+                            )
+                            row = conn.execute(sql).fetchone()
                 return parse_single_json_value(row[0] if row else None)
             except self._psycopg.OperationalError as exc:
                 if attempt + 1 >= attempts:
@@ -1790,6 +1854,8 @@ class PsqlShareLedger:
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
         self._lease_adoption_silence_seconds = lease_adoption_silence_seconds
+        self._operation_timeout_local = local()
+        self._statement_timeout_local = local()
         self._lock = Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         self._audit_body_dir = Path(audit_body_dir) if audit_body_dir else None
@@ -1971,6 +2037,116 @@ class PsqlShareLedger:
     def backend_name(self) -> str:
         return "postgres-psql"
 
+    @contextmanager
+    def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:
+        """Bound PostgreSQL and local admission for the current thread.
+
+        The block submitter uses this scope for direct outbox operations.
+        Nested scopes keep the earliest deadline, so helper calls cannot
+        accidentally widen the caller's liveness budget.
+        """
+        timeout_seconds = float(timeout_seconds)
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("operation timeout must be finite and positive")
+        timeout_local = getattr(self, "_operation_timeout_local", None)
+        if timeout_local is None:
+            timeout_local = local()
+            self._operation_timeout_local = timeout_local
+        previous = getattr(timeout_local, "deadline", None)
+        deadline = time.monotonic() + timeout_seconds
+        timeout_local.deadline = (
+            deadline if previous is None else min(float(previous), deadline)
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del timeout_local.deadline
+                except AttributeError:
+                    pass
+            else:
+                timeout_local.deadline = previous
+
+    @contextmanager
+    def statement_timeout(self, timeout_seconds: float) -> Iterator[None]:
+        """Apply a fresh bound to each lock admission and SQL statement.
+
+        Unlike ``operation_timeout``, this budget does not start counting down
+        across non-database work between calls. The block accounting tail can
+        therefore build and verify an audit bundle before giving each later
+        Postgres step its own short deadline.
+        """
+        timeout_seconds = float(timeout_seconds)
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("statement timeout must be finite and positive")
+        timeout_local = getattr(self, "_statement_timeout_local", None)
+        if timeout_local is None:
+            timeout_local = local()
+            self._statement_timeout_local = timeout_local
+        previous = getattr(timeout_local, "timeout_seconds", None)
+        timeout_local.timeout_seconds = (
+            timeout_seconds
+            if previous is None
+            else min(float(previous), timeout_seconds)
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del timeout_local.timeout_seconds
+                except AttributeError:
+                    pass
+            else:
+                timeout_local.timeout_seconds = previous
+
+    def _remaining_operation_timeout(self) -> float | None:
+        timeout_local = getattr(self, "_operation_timeout_local", None)
+        deadline = (
+            getattr(timeout_local, "deadline", None)
+            if timeout_local is not None
+            else None
+        )
+        statement_timeout_local = getattr(
+            self,
+            "_statement_timeout_local",
+            None,
+        )
+        statement_timeout_seconds = (
+            getattr(statement_timeout_local, "timeout_seconds", None)
+            if statement_timeout_local is not None
+            else None
+        )
+        if deadline is None:
+            return (
+                None
+                if statement_timeout_seconds is None
+                else float(statement_timeout_seconds)
+            )
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            raise LedgerOperationTimeout("postgres operation deadline expired")
+        if statement_timeout_seconds is not None:
+            remaining = min(remaining, float(statement_timeout_seconds))
+        return remaining
+
+    @contextmanager
+    def _operation_gate(self, gate: Any, name: str) -> Iterator[None]:
+        """Acquire a ledger lock/semaphore within the caller's deadline."""
+        remaining = self._remaining_operation_timeout()
+        acquired = (
+            gate.acquire()
+            if remaining is None
+            else gate.acquire(timeout=max(0.0, remaining))
+        )
+        if not acquired:
+            raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+        try:
+            yield
+        finally:
+            gate.release()
+
     def append(self, pending: PendingShare) -> AcceptedShareRecord:
         if pending.share_difficulty <= 0:
             raise ValueError("share_difficulty must be positive")
@@ -2076,7 +2252,7 @@ END;
         # Serialize the single writer through its durable commit and cache note.
         # Stats reconciliation uses a separate read connection plus a share-seq
         # watermark, so it never acquires this writer lock.
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             result = self._run_json(sql)
             if "error" in result:
                 raise RuntimeError(str(result["error"]))
@@ -2307,7 +2483,7 @@ SELECT CASE
     )
 END;
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             result = self._run_json(sql)
             if "error" in result:
                 raise RuntimeError(str(result["error"]))
@@ -2409,7 +2585,7 @@ FROM (
     LIMIT {int(limit)}
 ) pending;
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             return list(self._run_retry_safe_read_json(sql))
 
     def block_candidate_pending_metrics(self) -> dict[str, int | float]:
@@ -2432,7 +2608,7 @@ SELECT json_build_object(
 FROM qbit_block_candidate_outbox
 WHERE state = 'pending';
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             metrics = self._run_retry_safe_read_json(sql)
         return {
             "pending_count": int(metrics.get("pending_count", 0)),
@@ -2720,7 +2896,7 @@ SELECT COALESCE(json_agg(json_build_object(
 FROM qbit_share_ledger
 WHERE accepted;
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             return [
                 self._record_from_json(item)
                 for item in self._run_retry_safe_read_json(sql)
@@ -2925,7 +3101,7 @@ SELECT COALESCE(json_agg(json_build_object(
 FROM qbit_current_owed_balances()
 WHERE owed_balance_sats > 0;
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             balances = self._run_retry_safe_read_json(sql)
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
@@ -2986,7 +3162,7 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM qbit_current_carry_forward_balances();
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             balances = self._run_retry_safe_read_json(sql)
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
@@ -2994,7 +3170,7 @@ FROM qbit_current_carry_forward_balances();
 
     def carry_forward_integrity_report(self) -> dict[str, object]:
         sql = "SELECT qbit_carry_forward_integrity_report();"
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             report = self._run_retry_safe_read_json(sql)
             audit_head = self._carry_forward_audit_head_locked()
         report["backend"] = "postgres-psql"
@@ -3079,7 +3255,7 @@ FROM qbit_audit_share_window(
     {int(network_difficulty)}::numeric
 );
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             for key in (
@@ -3109,7 +3285,7 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM qbit_audit_block_payouts({self._text_literal(block_hash)});
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["carry_forward_balance_sats"] = int(row["carry_forward_balance_sats"])
@@ -3144,7 +3320,7 @@ FROM (
 JOIN qbit_pool_blocks block
   ON block.block_hash = payout.block_hash;
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["carry_forward_balance_sats"] = int(row["carry_forward_balance_sats"])
@@ -3653,7 +3829,7 @@ SELECT COALESCE(
     'null'::json
 );
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             row = self._run_retry_safe_read_json(sql)
         return self._resolve_audit_bundle_row(row)
 
@@ -3684,7 +3860,7 @@ SELECT COALESCE(
     'null'::json
 );
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             row = self._run_retry_safe_read_json(sql)
         return self._resolve_audit_bundle_row(row)
 
@@ -4481,7 +4657,7 @@ SELECT json_build_object(
     'ctv_fanouts_failed', (SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE settlement_status = 'failed')
 );
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             metrics = self._run_retry_safe_read_json(sql)
         report = {str(key): int(value) for key, value in metrics.items()}
         report["shares"] = accepted_share_count
@@ -6747,7 +6923,7 @@ SELECT json_build_object(
     )
 );
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             result = self._run_retry_safe_read_json(sql)
         if not isinstance(result, dict):
             raise RuntimeError("pool block state query returned non-object JSON")
@@ -6773,7 +6949,7 @@ WHERE chain_state IN ('confirmed', 'inactive')
   AND maturity_state = 'immature'
 ;
 """
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["block_height"] = int(row["block_height"])
@@ -6855,21 +7031,28 @@ END;
 
     def __len__(self) -> int:
         sql = "SELECT json_build_object('count', count(*)) FROM qbit_share_ledger WHERE accepted;"
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             return int(self._run_retry_safe_read_json(sql)["count"])
 
     def _run_fenced_json(self, sql: str) -> Any:
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             return self._run_json(sql)
 
     def _run_read_json(self, sql: str) -> Any:
-        with self._read_semaphore:
+        with self._operation_gate(self._read_semaphore, "read slot"):
             return self._run_retry_safe_read_json(sql)
 
     def _run_retry_safe_read_json(self, sql: str) -> Any:
         native = getattr(self, "_native", None)
         if native is not None:
-            return native.run_json(sql, retry_safe=True)
+            timeout_seconds = self._remaining_operation_timeout()
+            if timeout_seconds is None:
+                return native.run_json(sql, retry_safe=True)
+            return native.run_json(
+                sql,
+                retry_safe=True,
+                timeout_seconds=timeout_seconds,
+            )
         return self._run_json(sql)
 
     def _ensure_writer_lease(self) -> None:
@@ -7390,7 +7573,10 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
     def _run_json(self, sql: str) -> Any:
         native = getattr(self, "_native", None)
         if native is not None:
-            return native.run_json(sql)
+            timeout_seconds = self._remaining_operation_timeout()
+            if timeout_seconds is None:
+                return native.run_json(sql)
+            return native.run_json(sql, timeout_seconds=timeout_seconds)
         output = self._run_sql(sql).strip()
         if not output:
             raise RuntimeError("psql query returned no JSON")
@@ -7413,14 +7599,40 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             "--no-align",
             "--quiet",
         ]
-        completed = subprocess.run(
-            cmd,
-            input=sql,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        timeout_seconds = self._remaining_operation_timeout()
+        run_kwargs: dict[str, Any] = {}
+        if timeout_seconds is not None:
+            timeout_ms = max(1, int(timeout_seconds * 1000))
+            subprocess_env = dict(os.environ)
+            existing_options = subprocess_env.get("PGOPTIONS", "").strip()
+            timeout_options = (
+                f"-c statement_timeout={timeout_ms}ms "
+                f"-c lock_timeout={timeout_ms}ms"
+            )
+            subprocess_env["PGOPTIONS"] = " ".join(
+                option for option in (existing_options, timeout_options) if option
+            )
+            subprocess_env["PGCONNECT_TIMEOUT"] = str(
+                max(1, math.ceil(timeout_seconds))
+            )
+            run_kwargs = {
+                "env": subprocess_env,
+                "timeout": timeout_seconds,
+            }
+        try:
+            completed = subprocess.run(
+                cmd,
+                input=sql,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                **run_kwargs,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise LedgerOperationTimeout(
+                f"psql operation exceeded {timeout_seconds:g}s"
+            ) from exc
         if completed.returncode != 0:
             raise RuntimeError(
                 "psql command failed "
