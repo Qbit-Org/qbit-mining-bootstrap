@@ -4970,6 +4970,25 @@ class PrismCoordinator:
                         ),
                         balance_check_mismatch=True,
                     )
+                if (
+                    materialized.balance_check_mismatch
+                    and materialized.balance_check_prior_balances is not None
+                    and published_payout_artifact is not None
+                ):
+                    # The oracle refuted the published balance snapshot, so
+                    # invalidating reuse alone is not enough: consumers keyed
+                    # to the published digest (the armed-artifact fence, new
+                    # build keys, and the synchronous fallback) would keep
+                    # serving the refuted bytes until an unrelated generation
+                    # change. Publish the repaired balances for the same
+                    # generation so this build's artifact can arm and serve.
+                    self._publish_self_check_repaired_balances(
+                        expected_payout_state_generation,
+                        stale_prior_balances_sha256=(
+                            published_payout_artifact.prior_balances_sha256
+                        ),
+                        balances=materialized.balance_check_prior_balances,
+                    )
                 window_build_seconds = time.monotonic() - window_started
                 if materialized.balance_check_prior_balances is not None:
                     # The periodic oracle already paid for the live aggregate.
@@ -5736,6 +5755,59 @@ class PrismCoordinator:
             prior_balances_sha256=hashlib.sha256(balances_json.encode()).hexdigest(),
             prepared_monotonic=time.monotonic(),
         )
+
+    def _publish_self_check_repaired_balances(
+        self,
+        expected_payout_state_generation: int,
+        *,
+        stale_prior_balances_sha256: str,
+        balances: Sequence[dict[str, object]],
+    ) -> bool:
+        """Replace the published balance snapshot the periodic oracle refuted.
+
+        The published artifact is otherwise immutable for its generation, but
+        a confirmed drift means its bytes no longer match the durable ledger
+        (a payout mutation whose response was lost). Swapping in the repaired
+        balances re-keys new work to the corrected digest; work keyed to the
+        refuted digest is superseded by the existing balance fences exactly
+        as on a generation change. Only the exact refuted snapshot is
+        replaced: any concurrent publication wins the guarded swap.
+        """
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            source_generation = self._published_payout_state.source_generation
+        repaired = self._payout_state_artifact_from_balances(
+            generation=int(expected_payout_state_generation),
+            source_generation=int(source_generation),
+            balances=list(balances),
+        )
+        with self._job_cache_lock:
+            published = self._published_payout_state
+            current = published.artifact
+            if (
+                self._payout_state_publication_blocked
+                or self._payout_state_generation
+                != expected_payout_state_generation
+                or published.generation != expected_payout_state_generation
+                or published.source_generation != source_generation
+                or current is None
+                or current.generation != expected_payout_state_generation
+                or current.prior_balances_sha256
+                != stale_prior_balances_sha256
+            ):
+                return False
+            self._published_payout_state = dataclass_replace(
+                published,
+                artifact=repaired,
+            )
+        self._record_payout_artifact_event("balance_repair_published")
+        self._payout_artifact_log(
+            "payout_artifact_balance_repair_published",
+            payout_state_generation=int(expected_payout_state_generation),
+            stale_prior_balances_sha256=stale_prior_balances_sha256,
+            repaired_prior_balances_sha256=repaired.prior_balances_sha256,
+        )
+        return True
 
     def _current_payout_state_artifact(
         self,
