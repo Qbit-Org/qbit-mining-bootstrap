@@ -11122,6 +11122,14 @@ class PrismCoordinator:
             if failed.is_set():
                 return
             failed.set()
+            # This thread now proceeds to _watchdog_hard_exit and stays parked
+            # there until os._exit; it can never issue another renewal. The
+            # release worker must not join it, or a heartbeat/monitor-driven
+            # exit deadlocks against its own release and burns the exit budget
+            # before the fresh-connection lease release can run.
+            self._ledger_lease_heartbeat_exit_thread = (
+                threading.current_thread()
+            )
         # Never write to stdout/stderr before arming the hard-exit path. A full
         # container log pipe can block a flush forever, leaving writer
         # admission open and the old process alive. Keep the detail in memory
@@ -11244,18 +11252,32 @@ class PrismCoordinator:
             getattr(self, "_ledger_lease_heartbeat_thread", None),
             getattr(self, "_ledger_lease_heartbeat_monitor_thread", None),
         )
+        # A heartbeat or monitor thread that armed the hard exit is blocked in
+        # _watchdog_hard_exit joining the very release worker that runs this
+        # method. It has already stopped renewing forever, so treat it as
+        # stopped instead of deadlocking against it until the deadline.
+        exit_thread = getattr(
+            self,
+            "_ledger_lease_heartbeat_exit_thread",
+            None,
+        )
         if deadline is None:
             deadline = (
                 time.monotonic()
                 + DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS
             )
         for thread in threads:
-            if thread is None or thread is threading.current_thread():
+            if (
+                thread is None
+                or thread is threading.current_thread()
+                or thread is exit_thread
+            ):
                 continue
             thread.join(max(0.0, deadline - time.monotonic()))
         return all(
             thread is None
             or thread is threading.current_thread()
+            or thread is exit_thread
             or not thread.is_alive()
             for thread in threads
         )

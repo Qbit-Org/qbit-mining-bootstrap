@@ -261,6 +261,36 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
 
         hard_exit.assert_called_once_with("lease_heartbeat", timeout_seconds=0.1)
 
+    def test_heartbeat_hard_exit_does_not_deadlock_lease_release(self) -> None:
+        released = threading.Event()
+        exited = threading.Event()
+
+        class FailingReleaseLedger(HeartbeatLeaseLedger):
+            def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
+                raise RuntimeError("database unavailable")
+
+            def release_writer_lease_fresh_connection(self) -> bool:
+                released.set()
+                return True
+
+        server = coordinator(FailingReleaseLedger())
+
+        with patch("builtins.print"), patch("traceback.print_exc"), patch(
+            "lab.prism.prism_coordinator.os._exit",
+            side_effect=lambda _code: exited.set(),
+        ):
+            thread = threading.Thread(target=server.ledger_lease_heartbeat_loop)
+            server._ledger_lease_heartbeat_thread = thread
+            thread.start()
+            self.assertTrue(exited.wait(1.0))
+            thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        # The heartbeat thread that armed the exit is parked joining the
+        # release worker; the release must still reach the database instead
+        # of burning the exit budget joining that same thread.
+        self.assertTrue(released.is_set())
+
     def test_lease_heartbeat_hard_exit_never_waits_on_blocked_output(self) -> None:
         server = coordinator(HeartbeatLeaseLedger())
         release_print = threading.Event()
