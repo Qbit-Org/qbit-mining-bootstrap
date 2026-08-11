@@ -13442,11 +13442,11 @@ class PrismCoordinator:
             )
         if self.audit_bind and self.audit_port:
             self.start_audit_server()
-        # Recover one block candidate before accepting Stratum connections.
-        # Start its qbitd fast lane immediately afterward: startup job prewarm
-        # may depend on a slow ledger/backend, but it must never postpone an
-        # already-durable block offer to the node.
-        if not self._run_startup_writer_replay(self.replay_pending_block_candidates):
+        # Make a best-effort attempt to recover one block candidate before
+        # accepting Stratum connections. If a slow ledger exhausts the short
+        # database budget, finish startup and let the dedicated submitter loop
+        # retry every durable outbox row with its ordinary paced backoff.
+        if not self._run_startup_block_candidate_replay():
             return
         if self.stop_event.is_set():
             return
@@ -13607,6 +13607,22 @@ class PrismCoordinator:
                 self.drain_non_writer_components(drain_threads)
             return False
         return True
+
+    def _run_startup_block_candidate_replay(self) -> bool:
+        """Run best-effort pre-accept replay without dying on a slow ledger."""
+        try:
+            return self._run_startup_writer_replay(
+                self.replay_pending_block_candidates
+            )
+        except TimeoutError:
+            print(
+                "prism coordinator: startup block candidate replay timed out "
+                "phase=replay-outbox-query "
+                f"timeout={self._block_submitter_db_timeout():g}s; "
+                "continuing startup; block submitter loop will retry",
+                flush=True,
+            )
+            return True
 
     def accept_loop(self, server: socket.socket, profile: StratumListenerProfile) -> None:
         while not self.stop_event.is_set():

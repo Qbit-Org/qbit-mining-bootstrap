@@ -3902,6 +3902,51 @@ class NativeClientSelectionTests(unittest.TestCase):
         self.assertEqual(kwargs["env"]["PGCONNECT_TIMEOUT"], "1")
         self.assertIn("statement_timeout=", kwargs["env"]["PGOPTIONS"])
         self.assertIn("lock_timeout=", kwargs["env"]["PGOPTIONS"])
+        self.assertIn("VERBOSITY=verbose", run.call_args.args[0])
+
+    def test_subprocess_server_deadlines_raise_operation_timeout(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+        deadline_errors = (
+            "ERROR:  57014: canceling statement due to statement timeout",
+            "FEHLER:  57014: Anweisung wegen Zeitüberschreitung abgebrochen",
+            "ERROR:  55P03: canceling statement due to lock timeout",
+            "FEHLER:  55P03: Anweisung wegen Zeitüberschreitung abgebrochen",
+            "psql: error: connection to server failed: timeout expired",
+        )
+
+        for stderr in deadline_errors:
+            with self.subTest(stderr=stderr), unittest.mock.patch(
+                "lab.prism.share_ledger.subprocess.run",
+                return_value=unittest.mock.Mock(
+                    returncode=3,
+                    stdout="",
+                    stderr=stderr,
+                ),
+            ):
+                with ledger.operation_timeout(0.5):
+                    with self.assertRaises(LedgerOperationTimeout):
+                        ledger._run_sql("SELECT '{}'::json;")
+
+    def test_subprocess_hard_error_remains_runtime_error(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+        completed = unittest.mock.Mock(
+            returncode=3,
+            stdout="",
+            stderr="ERROR: permission denied for table qbit_block_candidate_outbox",
+        )
+
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ), ledger.operation_timeout(0.5):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                ledger._run_sql("SELECT '{}'::json;")
 
     def test_native_operation_timeout_is_transaction_local(self) -> None:
         class OperationalError(Exception):
@@ -3947,6 +3992,48 @@ class NativeClientSelectionTests(unittest.TestCase):
         self.assertRegex(executions[0], r"^SET LOCAL statement_timeout = '\d+ms'$")
         self.assertRegex(executions[1], r"^SET LOCAL lock_timeout = '\d+ms'$")
         self.assertEqual(executions[2], "SELECT json_build_object('ok', true)")
+
+    def test_native_server_deadline_raises_operation_timeout(self) -> None:
+        class OperationalError(Exception):
+            pass
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+
+        class FakeConnection:
+            def __init__(self, error: OperationalError):
+                self.error = error
+
+            @contextlib.contextmanager
+            def transaction(self) -> Any:
+                yield
+
+            def execute(self, sql: str) -> FakeConnection:
+                if sql.startswith("SET LOCAL"):
+                    return self
+                raise self.error
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+
+        deadline_errors = (
+            ("57014", "canceling statement due to statement timeout"),
+            ("55P03", "Anweisung wegen Zeitüberschreitung abgebrochen"),
+        )
+        for sqlstate, message in deadline_errors:
+            with self.subTest(sqlstate=sqlstate):
+                error = OperationalError(message)
+                error.sqlstate = sqlstate  # type: ignore[attr-defined]
+
+                @contextlib.contextmanager
+                def connection(*, timeout_seconds: float | None = None) -> Any:
+                    yield FakeConnection(error)
+
+                client.connection = connection  # type: ignore[method-assign]
+                with self.assertRaises(LedgerOperationTimeout):
+                    client.run_json("SELECT '{}'::json", timeout_seconds=0.5)
 
     def test_database_url_extraction_variants(self) -> None:
         self.assertEqual(

@@ -46,6 +46,33 @@ class LedgerOperationTimeout(TimeoutError):
     """A caller-scoped PostgreSQL deadline expired before work completed."""
 
 
+def _is_postgres_deadline_error(error: BaseException | str) -> bool:
+    """Recognize backend cancellations caused by an armed caller deadline."""
+    message = str(error).casefold()
+    sqlstate = getattr(error, "sqlstate", None)
+    if sqlstate is None:
+        sqlstate = getattr(getattr(error, "diag", None), "sqlstate", None)
+    normalized_sqlstate = str(sqlstate or "").upper()
+    if normalized_sqlstate in {"57014", "55P03"}:
+        return True
+    # psql's verbose mode exposes SQLSTATE even when lc_messages localizes the
+    # text. This helper is called only while our statement/lock deadlines are
+    # armed, and ledger SQL does not use NOWAIT, so scoped 55P03 is a timeout.
+    if "57014:" in message or "55p03:" in message:
+        return True
+    return any(
+        marker in message
+        for marker in (
+            "canceling statement due to statement timeout",
+            "canceling statement due to lock timeout",
+            "connection timeout expired",
+            "timeout expired",
+            "connection timed out",
+            "operation timed out",
+        )
+    )
+
+
 class _AuditShareSegmentConflict(RuntimeError):
     """A share sequence is bound to more than one audit payload."""
 
@@ -1724,6 +1751,10 @@ class _NativePostgresClient:
                             row = conn.execute(sql).fetchone()
                 return parse_single_json_value(row[0] if row else None)
             except self._psycopg.OperationalError as exc:
+                if timeout_seconds is not None and _is_postgres_deadline_error(exc):
+                    raise LedgerOperationTimeout(
+                        f"postgres operation exceeded {timeout_seconds:g}s"
+                    ) from exc
                 if attempt + 1 >= attempts:
                     raise RuntimeError(f"postgres query failed: {exc}") from exc
         raise AssertionError("unreachable")
@@ -7659,6 +7690,8 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             "--no-psqlrc",
             "--set",
             "ON_ERROR_STOP=1",
+            "--set",
+            "VERBOSITY=verbose",
             "--tuples-only",
             "--no-align",
             "--quiet",
@@ -7698,9 +7731,14 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
                 f"psql operation exceeded {timeout_seconds:g}s"
             ) from exc
         if completed.returncode != 0:
+            stderr = completed.stderr.strip()
+            if timeout_seconds is not None and _is_postgres_deadline_error(stderr):
+                raise LedgerOperationTimeout(
+                    f"psql operation exceeded {timeout_seconds:g}s"
+                )
             raise RuntimeError(
                 "psql command failed "
-                f"(exit {completed.returncode}): {completed.stderr.strip()}"
+                f"(exit {completed.returncode}): {stderr}"
             )
         return completed.stdout
 

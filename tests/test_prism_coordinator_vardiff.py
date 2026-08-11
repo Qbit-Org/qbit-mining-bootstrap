@@ -25,6 +25,7 @@ from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism.share_ledger import (
     PendingShare,
+    PsqlShareLedger,
     SingleWriterShareLedger,
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
 )
@@ -61,6 +62,7 @@ from lab.prism.prism_coordinator import (
     TemplateRefreshBlocked,
     TemplateRefreshSuperseded,
     PrismCoordinator,
+    ShutdownInProgress,
     WorkerIdentity,
     _FanoutCancellation,
     _ObservedRLock,
@@ -12106,6 +12108,258 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                 accounting = getattr(server, "_block_accounting_thread", None)
                 if accounting is not None:
                     accounting.join(2)
+
+    def test_startup_block_replay_timeout_starts_submitter_and_converges(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server.max_blocks = 10
+        server.stop_after_block = False
+        server.block_submit_db_timeout_seconds = 0.01
+        server.block_candidate_retry_initial_seconds = 0.01
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        block_hash = "e5" * 32
+        pending = PendingShare(
+            share_id=f"miner-a:{block_hash}",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=9,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=1,
+            ntime=1,
+        )
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex=block_hash,
+                block_hex="e5",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+
+        query_started = threading.Event()
+        release_query = threading.Event()
+        query_calls = 0
+        startup_call: list[object] = []
+        original_pending_rows = ledger.pending_block_candidate_rows
+
+        def slow_pending_rows(*, limit: int = 32) -> list[dict[str, object]]:
+            nonlocal query_calls
+            query_calls += 1
+            if query_calls == 1:
+                with server._block_submitter_ledger_calls_lock:
+                    startup_call.append(
+                        server._block_submitter_ledger_calls[
+                            ("replay-outbox-query",)
+                        ]
+                    )
+                query_started.set()
+                if not release_query.wait(5):
+                    raise AssertionError("timed out waiting to release outbox query")
+            return original_pending_rows(limit=limit)
+
+        ledger.pending_block_candidate_rows = slow_pending_rows  # type: ignore[method-assign]
+        original_record_wait = server._record_block_submitter_wait
+        loop_reuse_waiting = threading.Event()
+
+        def observed_record_wait(phase: str) -> None:
+            original_record_wait(phase)
+            if (
+                phase == "replay-outbox-query"
+                and getattr(server, "_block_submitter_thread_ident", None)
+                == threading.get_ident()
+            ):
+                loop_reuse_waiting.set()
+
+        server._record_block_submitter_wait = observed_record_wait  # type: ignore[method-assign]
+
+        submitted: list[str] = []
+
+        class RecordingRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    submitted.append(str((params or [""])[0]))
+                    return None
+                return super().call(method, params)
+
+        server.rpc = RecordingRpc("00" * 32)
+        accounted: list[str] = []
+
+        def account_candidate(
+            replayed: PrismBlockCandidate,
+            **_kwargs: object,
+        ) -> bool:
+            replayed_hash = replayed.submission.block_hash_hex
+            accounted.append(replayed_hash)
+            ledger.mark_block_candidate_submitted(block_hash=replayed_hash)
+            server.stop_event.set()
+            return True
+
+        server._call_block_candidate_writer = account_candidate  # type: ignore[method-assign]
+
+        profile = SimpleNamespace(heartbeat_name="stratum_accept_default")
+        listener_closed = threading.Event()
+        listener = SimpleNamespace(close=listener_closed.set)
+        server.listener_profiles = [profile]
+        server.bind = "127.0.0.1"
+        server.port = 0
+        server.min_ready_miners = 1
+        server.audit_bind = None
+        server.audit_port = 0
+        server.hot_path_log_enabled = False
+        server.blockwait_enabled = False
+        server.vardiff_idle_sweep_seconds = 0.0
+        server.stratum_initial_job_timeout_seconds = 0.0
+        server.watchdog_enabled = False
+        server.watchdog_interval_seconds = 0.1
+        server.template_refresh_failure_exit_seconds = 120.0
+        server.coordination_blocked_exit_seconds = 120.0
+        server.open_stratum_listeners = (  # type: ignore[method-assign]
+            lambda _stack: [(listener, profile)]
+        )
+        server.validate_live_chain_identity = lambda: None  # type: ignore[method-assign]
+        server.validate_live_template_and_fee_policy = lambda: None  # type: ignore[method-assign]
+        server.prism_payout_policy = lambda: {}  # type: ignore[method-assign]
+        server.prewarm_startup_jobs = lambda: None  # type: ignore[method-assign]
+        server.watchdog_loop = lambda: None  # type: ignore[method-assign]
+        server.blockpoll_loop = lambda: None  # type: ignore[method-assign]
+        server.replay_recovered_shares = lambda: 0  # type: ignore[method-assign]
+        server.share_append_loop = lambda: None  # type: ignore[method-assign]
+        server.shutdown = lambda *, reason="graceful": True  # type: ignore[method-assign]
+
+        def drain_threads(threads: list[tuple[threading.Thread, float]]) -> None:
+            for thread, timeout in threads:
+                thread.join(timeout)
+
+        server.drain_non_writer_components = drain_threads  # type: ignore[method-assign]
+
+        def accept_after_startup(_listener: object, _profile: object) -> None:
+            self.assertTrue(loop_reuse_waiting.wait(2))
+            self.assertIsNotNone(
+                getattr(server, "_block_submitter_thread_ident", None)
+            )
+            self.assertTrue(query_started.wait(1))
+            # The loop is waiting on the exact startup call while that worker
+            # remains blocked; no replacement query was spawned.
+            with server._block_submitter_ledger_calls_lock:
+                self.assertIs(
+                    server._block_submitter_ledger_calls.get(
+                        ("replay-outbox-query",)
+                    ),
+                    startup_call[0],
+                )
+            self.assertEqual(query_calls, 1)
+            release_query.set()
+            deadline = time.monotonic() + 2
+            while not accounted and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(accounted)
+
+        server.accept_loop = accept_after_startup  # type: ignore[method-assign]
+
+        try:
+            with patch("builtins.print") as printed:
+                server._serve_with_listener_stack(SimpleNamespace())  # type: ignore[arg-type]
+        finally:
+            server.stop_event.set()
+            release_query.set()
+
+        ledger.pending_block_candidate_rows = original_pending_rows  # type: ignore[method-assign]
+        startup_logs = [
+            " ".join(str(value) for value in call.args)
+            for call in printed.call_args_list
+        ]
+        self.assertTrue(
+            any(
+                "prism coordinator: startup block candidate replay timed out "
+                "phase=replay-outbox-query timeout=0.01s" in message
+                for message in startup_logs
+            )
+        )
+        self.assertTrue(query_started.is_set())
+        self.assertTrue(listener_closed.is_set())
+        self.assertEqual(submitted, ["e5"])
+        self.assertEqual(accounted, [block_hash])
+        self.assertEqual(ledger.pending_block_candidates(), [])
+
+    def test_startup_block_replay_catches_psql_server_timeout(self) -> None:
+        server, _state, _recording = submit_coordinator()
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+
+        def timed_out_rows(*, limit: int = 32) -> list[dict[str, object]]:
+            ledger._run_sql(f"SELECT {limit};")
+            return []
+
+        ledger.pending_block_candidate_rows = timed_out_rows  # type: ignore[method-assign]
+        server.ledger = ledger
+        completed = subprocess.CompletedProcess(
+            args=["psql"],
+            returncode=3,
+            stdout="",
+            stderr=(
+                "ERROR:  57014: canceling statement due to statement timeout"
+            ),
+        )
+        with patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ), patch("builtins.print") as printed:
+            self.assertTrue(server._run_startup_block_candidate_replay())
+
+        startup_logs = [
+            " ".join(str(value) for value in call.args)
+            for call in printed.call_args_list
+        ]
+        self.assertTrue(
+            any(
+                "startup block candidate replay timed out "
+                "phase=replay-outbox-query" in message
+                for message in startup_logs
+            )
+        )
+
+    def test_startup_block_replay_keeps_hard_database_errors_fatal(self) -> None:
+        server, _state, _recording = submit_coordinator()
+
+        def failed_rows(*, limit: int = 32) -> list[dict[str, object]]:
+            raise RuntimeError(f"postgres failed limit={limit}")
+
+        server.ledger = SimpleNamespace(
+            pending_block_candidate_rows=failed_rows,
+        )
+        with self.assertRaisesRegex(RuntimeError, "postgres failed"):
+            server._run_startup_block_candidate_replay()
+
+    def test_startup_block_replay_preserves_shutdown_stop(self) -> None:
+        server = self._bare_coordinator()
+
+        def shutdown_replay() -> int:
+            raise ShutdownInProgress("shutdown won")
+
+        server.replay_pending_block_candidates = shutdown_replay  # type: ignore[method-assign]
+
+        self.assertFalse(server._run_startup_block_candidate_replay())
 
     def test_stuck_rpc_worker_pool_requests_nonzero_restart(self) -> None:
         server, _state, _recording = submit_coordinator()
