@@ -11008,11 +11008,12 @@ class PrismCoordinator:
         existing = getattr(self, "_ledger_lease_heartbeat_thread", None)
         if existing is not None and existing.is_alive():
             return existing
+        ledger = getattr(self, "ledger", None)
         if not bool(
-            getattr(self.ledger, "writer_lease_fast_adoption_capable", False)
+            getattr(ledger, "writer_lease_fast_adoption_capable", False)
         ):
             return None
-        renew = getattr(self.ledger, "renew_writer_lease_heartbeat", None)
+        renew = getattr(ledger, "renew_writer_lease_heartbeat", None)
         if renew is None:
             return None
         armed_started_monotonic = time.monotonic()
@@ -11095,7 +11096,8 @@ class PrismCoordinator:
 
     def ledger_lease_heartbeat_loop(self) -> None:
         """Keep fast-adoptable sessions visibly live on an isolated DB path."""
-        renew = getattr(self.ledger, "renew_writer_lease_heartbeat", None)
+        ledger = getattr(self, "ledger", None)
+        renew = getattr(ledger, "renew_writer_lease_heartbeat", None)
         if renew is None:
             return
         interval_seconds = float(
@@ -11231,11 +11233,12 @@ class PrismCoordinator:
         RPC. The advisory session remains held across the RPC in the ordinary
         case; see the deployment guide for the residual post-check pause risk.
         """
+        ledger = getattr(self, "ledger", None)
         if not bool(
-            getattr(self.ledger, "writer_lease_guard_required", False)
+            getattr(ledger, "writer_lease_guard_required", False)
         ):
             return
-        renew = getattr(self.ledger, "renew_writer_lease_heartbeat", None)
+        renew = getattr(ledger, "renew_writer_lease_heartbeat", None)
         if renew is None:
             self._ledger_lease_heartbeat_hard_exit(
                 "prism coordinator: refusing external side effect from "
@@ -11589,13 +11592,14 @@ class PrismCoordinator:
             )
             return False
 
+        ledger = getattr(self, "ledger", None)
         release = (
-            getattr(self.ledger, "release_writer_lease_fresh_connection", None)
+            getattr(ledger, "release_writer_lease_fresh_connection", None)
             if fresh_connection
             else None
         )
         if release is None:
-            release = getattr(self.ledger, "release_writer_lease", None)
+            release = getattr(ledger, "release_writer_lease", None)
         shutdown_log(
             "lease_release_attempt",
             supported=release is not None,

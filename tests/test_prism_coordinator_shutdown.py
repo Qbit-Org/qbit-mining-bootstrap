@@ -76,6 +76,14 @@ def coordinator(
 
 
 class PrismCoordinatorShutdownTests(unittest.TestCase):
+    def test_lease_heartbeat_start_without_ledger_is_noop(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+
+        with patch.object(prism_coordinator.threading, "Thread") as thread:
+            self.assertIsNone(server._start_ledger_lease_heartbeat())
+
+        thread.assert_not_called()
+
     def test_external_side_effect_gate_fails_closed_after_guard_loss(self) -> None:
         class LostGuardLedger(HeartbeatLeaseLedger):
             def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
