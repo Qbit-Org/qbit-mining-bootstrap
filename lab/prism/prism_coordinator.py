@@ -66,9 +66,11 @@ from lab.prism.share_ledger import (
     DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
     DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
     DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+    DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
+    WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
     sha256_json_hex,
 )
 
@@ -265,6 +267,21 @@ DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS = 15.0
 # The release worker is daemonized and the watchdog hard-exits at this total
 # wall-clock deadline whether quiescence or the fresh DB connection completes.
 DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS = 5.0
+# A fast-adoptable coordinator renews four times inside the one-second silence
+# proof required by PsqlShareLedger. This runs through a dedicated connection,
+# not the ordinary ledger lock or shared native pool.
+DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_SECONDS = (
+    DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS / 4
+)
+# The monitor kills a coordinator before PostgreSQL can observe the full
+# adoption silence if the heartbeat query itself wedges. Its short release
+# budget keeps the old process gone before a successor is allowed to CAS.
+DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_FAILURE_SECONDS = (
+    DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS * 0.75
+)
+DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_MONITOR_SECONDS = 0.05
+DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_EXIT_TIMEOUT_SECONDS = 0.1
+DEFAULT_PRISM_LEDGER_LEASE_EXTERNAL_FENCE_TIMEOUT_SECONDS = 0.5
 DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS = 120
 DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS = 900.0
 # The reward window is 8x network difficulty (must match PRISM_WINDOW_MULTIPLIER
@@ -1130,6 +1147,17 @@ def _compact_share_payload(
     return identities, compact_shares
 
 
+_QBIT_RPC_NO_TRANSPORT_RETRY_METHODS = frozenset(
+    {
+        "getnewaddress",
+        "sendrawtransaction",
+        "signrawtransactionwithwallet",
+        "submitblock",
+        "submitpackage",
+    }
+)
+
+
 class JsonRpc:
     def __init__(self, *, host: str, port: int, user: str, password: str):
         self.host = host
@@ -1189,15 +1217,17 @@ class JsonRpc:
             "Content-Type": "application/json",
             "User-Agent": "qbit-prism-coordinator/0.1",
         }
-        # One retry with a fresh connection on a transport error. The usual
-        # cause is the server having closed an idle keep-alive connection, in
-        # which case the request never reached qbitd, so retrying is safe; the
-        # only state-changing RPC (submitblock) is idempotent (duplicate ->
-        # "duplicate") regardless. A second failure raises to the caller, which
-        # treats it as backend-rpc-unavailable (a rejected share/block, never a
-        # lost or double-counted block).
+        # Read-only calls retry once with a fresh connection after a transport
+        # error, normally an idle keep-alive that qbitd closed. Mutating calls
+        # never retry inside this method: their writer-lease fence applies to
+        # the outer call, so an invisible second POST could otherwise run after
+        # that lease was lost. Durable block/CTV workflows retry later as a new
+        # fully fenced operation and reconcile an uncertain first result.
         last_exc: Exception | None = None
-        for attempt in range(2):
+        attempt_count = (
+            1 if method in _QBIT_RPC_NO_TRANSPORT_RETRY_METHODS else 2
+        )
+        for attempt in range(attempt_count):
             conn = self._acquire_connection(timeout)
             try:
                 conn.request("POST", path, body=body, headers=headers)
@@ -1206,7 +1236,7 @@ class JsonRpc:
             except (http.client.HTTPException, OSError) as exc:
                 last_exc = exc
                 self._drop_connection()
-                if attempt == 0:
+                if attempt + 1 < attempt_count:
                     continue
                 raise
             if response.status != 200:
@@ -3660,6 +3690,10 @@ class PrismCoordinator:
             raise SystemExit(
                 "PRISM_LEDGER_WRITER_SESSION_TOKEN requires "
                 "PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN=1 for local tests"
+            )
+        if writer_session_token is None:
+            writer_session_token = (
+                f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}{uuid.uuid4().hex}"
             )
         audit_body_dir = getattr(self, "audit_dir", None)
         return PsqlShareLedger(
@@ -10970,6 +11004,325 @@ class PrismCoordinator:
             return ("stratum_accept",)
         return tuple(profile.heartbeat_name for profile in profiles)
 
+    def _start_ledger_lease_heartbeat(self) -> threading.Thread | None:
+        existing = getattr(self, "_ledger_lease_heartbeat_thread", None)
+        if existing is not None and existing.is_alive():
+            return existing
+        if not bool(
+            getattr(self.ledger, "writer_lease_fast_adoption_capable", False)
+        ):
+            return None
+        renew = getattr(self.ledger, "renew_writer_lease_heartbeat", None)
+        if renew is None:
+            return None
+        armed_started_monotonic = time.monotonic()
+        self._ledger_lease_heartbeat_last_success_monotonic = (
+            armed_started_monotonic
+        )
+        self._ledger_lease_heartbeat_failed = threading.Event()
+        self._ledger_lease_heartbeat_failure_lock = threading.Lock()
+        self._ledger_lease_heartbeat_ready = threading.Event()
+        self._ledger_lease_heartbeat_stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self.ledger_lease_heartbeat_loop,
+            name="prism-ledger-lease-heartbeat",
+            daemon=True,
+        )
+        self._ledger_lease_heartbeat_thread = thread
+        thread.start()
+        monitor_thread = threading.Thread(
+            target=self.ledger_lease_heartbeat_monitor_loop,
+            name="prism-ledger-lease-heartbeat-monitor",
+            daemon=True,
+        )
+        monitor_thread.start()
+        self._ledger_lease_heartbeat_monitor_thread = monitor_thread
+        failure_seconds = float(
+            getattr(
+                self,
+                "ledger_lease_heartbeat_failure_seconds",
+                DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_FAILURE_SECONDS,
+            )
+        )
+        while not self._ledger_lease_heartbeat_ready.wait(0.01):
+            if self._ledger_lease_heartbeat_failed.is_set():
+                return None
+            if time.monotonic() - armed_started_monotonic < failure_seconds:
+                continue
+            self._ledger_lease_heartbeat_hard_exit(
+                "prism coordinator: initial ledger lease heartbeat did not "
+                "complete before startup fencing deadline",
+                include_traceback=False,
+            )
+            return None
+        return thread
+
+    def _ledger_lease_heartbeat_hard_exit(
+        self,
+        message: str,
+        *,
+        include_traceback: bool,
+    ) -> None:
+        failure_lock = self.__dict__.setdefault(
+            "_ledger_lease_heartbeat_failure_lock",
+            threading.Lock(),
+        )
+        with failure_lock:
+            failed = self.__dict__.setdefault(
+                "_ledger_lease_heartbeat_failed",
+                threading.Event(),
+            )
+            if failed.is_set():
+                return
+            failed.set()
+        # Never write to stdout/stderr before arming the hard-exit path. A full
+        # container log pipe can block a flush forever, leaving writer
+        # admission open and the old process alive. Keep the detail in memory
+        # for tests/embedders whose patched hard-exit returns; the real process
+        # exits and Docker's die event is the authoritative diagnostic.
+        self._ledger_lease_heartbeat_failure_reason = message
+        self._ledger_lease_heartbeat_failure_has_traceback = include_traceback
+        self._watchdog_hard_exit(
+            "lease_heartbeat",
+            timeout_seconds=float(
+                getattr(
+                    self,
+                    "ledger_lease_heartbeat_exit_timeout_seconds",
+                    DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_EXIT_TIMEOUT_SECONDS,
+                )
+            ),
+        )
+
+    def ledger_lease_heartbeat_loop(self) -> None:
+        """Keep fast-adoptable sessions visibly live on an isolated DB path."""
+        renew = getattr(self.ledger, "renew_writer_lease_heartbeat", None)
+        if renew is None:
+            return
+        interval_seconds = float(
+            getattr(
+                self,
+                "ledger_lease_heartbeat_seconds",
+                DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_SECONDS,
+            )
+        )
+        heartbeat_stop = getattr(
+            self,
+            "_ledger_lease_heartbeat_stop_event",
+            None,
+        )
+        if heartbeat_stop is None:
+            heartbeat_stop = threading.Event()
+            self._ledger_lease_heartbeat_stop_event = heartbeat_stop
+        while not heartbeat_stop.is_set():
+            renew_started_monotonic = time.monotonic()
+            try:
+                renew()
+            except Exception:
+                self._ledger_lease_heartbeat_hard_exit(
+                    "prism coordinator: ledger lease heartbeat failed; "
+                    "hard-exiting so this process cannot outlive its "
+                    "fast-adoptable session",
+                    include_traceback=True,
+                )
+                return
+            # The database row was refreshed no earlier than call start. Using
+            # that conservative edge prevents a delayed response from making
+            # local freshness look newer than PostgreSQL's updated_at.
+            self._ledger_lease_heartbeat_last_success_monotonic = (
+                renew_started_monotonic
+            )
+            ready = getattr(self, "_ledger_lease_heartbeat_ready", None)
+            if ready is not None:
+                ready.set()
+            if heartbeat_stop.wait(interval_seconds):
+                return
+
+    def ledger_lease_heartbeat_monitor_loop(self) -> None:
+        failure_seconds = float(
+            getattr(
+                self,
+                "ledger_lease_heartbeat_failure_seconds",
+                DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_FAILURE_SECONDS,
+            )
+        )
+        monitor_seconds = float(
+            getattr(
+                self,
+                "ledger_lease_heartbeat_monitor_seconds",
+                DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_MONITOR_SECONDS,
+            )
+        )
+        heartbeat_stop = getattr(
+            self,
+            "_ledger_lease_heartbeat_stop_event",
+            None,
+        )
+        if heartbeat_stop is None:
+            heartbeat_stop = threading.Event()
+            self._ledger_lease_heartbeat_stop_event = heartbeat_stop
+        while not heartbeat_stop.wait(monitor_seconds):
+            last_success = float(
+                getattr(
+                    self,
+                    "_ledger_lease_heartbeat_last_success_monotonic",
+                    time.monotonic(),
+                )
+            )
+            age_seconds = max(0.0, time.monotonic() - last_success)
+            if age_seconds < failure_seconds:
+                continue
+            self._ledger_lease_heartbeat_hard_exit(
+                "prism coordinator: ledger lease heartbeat stopped making "
+                f"progress for {age_seconds:.3f}s; hard-exiting before its "
+                "session becomes fast-adoptable",
+                include_traceback=False,
+            )
+            return
+
+    def _stop_ledger_lease_heartbeat(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        heartbeat_stop = getattr(
+            self,
+            "_ledger_lease_heartbeat_stop_event",
+            None,
+        )
+        if heartbeat_stop is None:
+            return True
+        heartbeat_stop.set()
+        threads = (
+            getattr(self, "_ledger_lease_heartbeat_thread", None),
+            getattr(self, "_ledger_lease_heartbeat_monitor_thread", None),
+        )
+        if deadline is None:
+            deadline = (
+                time.monotonic()
+                + DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS
+            )
+        for thread in threads:
+            if thread is None or thread is threading.current_thread():
+                continue
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return all(
+            thread is None
+            or thread is threading.current_thread()
+            or not thread.is_alive()
+            for thread in threads
+        )
+
+    def _require_fresh_ledger_lease_for_external_side_effect(
+        self,
+        component: str,
+    ) -> None:
+        """Synchronously verify the exact guarded session before an RPC effect.
+
+        The periodic heartbeat is an early process-liveness detector, not an
+        authorization oracle: CLOCK_MONOTONIC may not advance across host
+        suspend, and a PostgreSQL connection object does not necessarily know
+        its server session died until the next I/O. Every external mutation
+        therefore performs a bounded renewal on the session holding the
+        advisory guard. A daemon worker bounds a dead network path even when
+        the driver's server-side statement timeout cannot.
+
+        PostgreSQL and qbitd are independent systems, so this remains a
+        preflight fence rather than an atomic transaction with the subsequent
+        RPC. The advisory session remains held across the RPC in the ordinary
+        case; see the deployment guide for the residual post-check pause risk.
+        """
+        if not bool(
+            getattr(self.ledger, "writer_lease_guard_required", False)
+        ):
+            return
+        renew = getattr(self.ledger, "renew_writer_lease_heartbeat", None)
+        if renew is None:
+            self._ledger_lease_heartbeat_hard_exit(
+                "prism coordinator: refusing external side effect from "
+                f"{component}; exact-session verification is unavailable",
+                include_traceback=False,
+            )
+            raise ShutdownInProgress(
+                f"writer lease guard verification is unavailable before {component}"
+            )
+
+        timeout_seconds = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "ledger_lease_external_fence_timeout_seconds",
+                    DEFAULT_PRISM_LEDGER_LEASE_EXTERNAL_FENCE_TIMEOUT_SECONDS,
+                )
+            ),
+        )
+        outcome: queue.Queue[BaseException | None] = queue.Queue(maxsize=1)
+        verification_started_monotonic = time.monotonic()
+
+        def verify_exact_session() -> None:
+            try:
+                renew()
+            except BaseException as exc:
+                outcome.put(exc)
+            else:
+                outcome.put(None)
+
+        try:
+            thread = threading.Thread(
+                target=verify_exact_session,
+                name="prism-ledger-lease-external-fence",
+                daemon=True,
+            )
+            thread.start()
+        except BaseException as exc:
+            self._ledger_lease_heartbeat_hard_exit(
+                "prism coordinator: refusing external side effect from "
+                f"{component}; could not start exact-session verification",
+                include_traceback=False,
+            )
+            raise ShutdownInProgress(
+                f"writer lease guard verification could not start before {component}"
+            ) from exc
+
+        thread.join(timeout_seconds)
+        if thread.is_alive():
+            self._ledger_lease_heartbeat_hard_exit(
+                "prism coordinator: refusing external side effect from "
+                f"{component}; exact-session verification exceeded "
+                f"{timeout_seconds:g}s",
+                include_traceback=False,
+            )
+            raise ShutdownInProgress(
+                f"writer lease guard verification timed out before {component}"
+            )
+
+        try:
+            error = outcome.get_nowait()
+        except queue.Empty as exc:
+            self._ledger_lease_heartbeat_hard_exit(
+                "prism coordinator: refusing external side effect from "
+                f"{component}; exact-session verification returned no result",
+                include_traceback=False,
+            )
+            raise ShutdownInProgress(
+                f"writer lease guard verification failed before {component}"
+            ) from exc
+        if error is not None:
+            self._ledger_lease_heartbeat_hard_exit(
+                "prism coordinator: refusing external side effect from "
+                f"{component}; exact-session verification failed",
+                include_traceback=False,
+            )
+            raise ShutdownInProgress(
+                f"writer lease guard verification failed before {component}"
+            ) from error
+
+        # Use the call-start time so scheduler delay never makes this success
+        # appear fresher than the database response actually proves.
+        self._ledger_lease_heartbeat_last_success_monotonic = (
+            verification_started_monotonic
+        )
+
     @contextmanager
     def _watchdog_paused(self, *names: str) -> Iterator[None]:
         for name in names:
@@ -10990,23 +11343,18 @@ class PrismCoordinator:
                 publication_budget,
             ) = self._publication_watchdog_state(now)
             if publication_failure == "coordination":
-                print(
+                self._watchdog_failure_detail = (
                     "prism coordinator: publication-progress watchdog firing; "
                     "template refresh remained coordination-blocked past the "
                     f"coordination budget={coordination_budget:g}s "
-                    f"streak_age={coordination_age:.3f}s. "
-                    "Exiting non-zero so the restart policy recovers the process.",
-                    flush=True,
+                    f"streak_age={coordination_age:.3f}s"
                 )
                 self._watchdog_hard_exit("coordination")
             if publication_failure == "publication":
-                print(
+                self._watchdog_failure_detail = (
                     "prism coordinator: publication-progress watchdog firing; "
                     "current tip/generation remained unpublished past the "
-                    f"template refresh failure budget="
-                    f"{publication_budget:g}s. "
-                    "Exiting non-zero so the restart policy recovers the process.",
-                    flush=True,
+                    f"template refresh failure budget={publication_budget:g}s"
                 )
                 self._watchdog_hard_exit("publication")
             overdue = (
@@ -11015,43 +11363,45 @@ class PrismCoordinator:
                 else []
             )
             if overdue:
-                print(
+                self._watchdog_failure_detail = (
                     "prism coordinator: liveness watchdog firing; unresponsive "
-                    f"subsystems={overdue} timeout={self.watchdog_timeout_seconds:g}s. "
-                    "Exiting non-zero so the restart policy recovers the process.",
-                    flush=True,
+                    f"subsystems={overdue} "
+                    f"timeout={self.watchdog_timeout_seconds:g}s"
                 )
                 # Queued shares have not been acknowledged. Miners reconnect
                 # and retry them after restart; exact-payload replay is
                 # idempotent if Postgres committed just before this exit.
                 self._watchdog_hard_exit("liveness")
 
-    def _watchdog_hard_exit(self, reason: str) -> None:
+    def _watchdog_hard_exit(
+        self,
+        reason: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         """Bound a fresh-thread lease release, then terminate unconditionally."""
-        timeout_seconds = float(
-            getattr(
-                self,
-                "watchdog_lease_release_timeout_seconds",
-                DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS,
+        try:
+            if timeout_seconds is None:
+                timeout_seconds = float(
+                    getattr(
+                        self,
+                        "watchdog_lease_release_timeout_seconds",
+                        DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS,
+                    )
+                )
+            deadline = time.monotonic() + max(0.0, timeout_seconds)
+            release_thread = threading.Thread(
+                target=self._watchdog_release_ledger_lease,
+                args=(reason, deadline),
+                name="prism-watchdog-lease-release",
+                daemon=True,
             )
-        )
-        deadline = time.monotonic() + max(0.0, timeout_seconds)
-        release_thread = threading.Thread(
-            target=self._watchdog_release_ledger_lease,
-            args=(reason, deadline),
-            name="prism-watchdog-lease-release",
-            daemon=True,
-        )
-        release_thread.start()
-        release_thread.join(max(0.0, deadline - time.monotonic()))
-        if release_thread.is_alive():
-            self._shutdown_log(
-                "watchdog_lease_release_deadline",
-                reason=reason,
-                timeout_seconds=timeout_seconds,
-                outcome="timeout",
-            )
-        os._exit(1)
+            release_thread.start()
+            release_thread.join(max(0.0, deadline - time.monotonic()))
+        finally:
+            # Nothing, including timeout logging or thread-start failure, may
+            # extend or suppress the watchdog's terminal action.
+            os._exit(1)
 
     def _watchdog_release_ledger_lease(
         self,
@@ -11064,43 +11414,57 @@ class PrismCoordinator:
         may belong to the subsystem that triggered the watchdog. Closing
         writer admission plus the controller's tracked-writer barrier retains
         the graceful path's release-withheld invariant without that lock.
+
+        Any best-effort diagnostic is emitted only after lease handling on this
+        daemon worker. A blocked container log pipe may park the worker, but it
+        cannot precede the release attempt or extend the caller's hard deadline.
         """
         controller = self._ensure_shutdown_controller()
         controller.request_shutdown(None)
         self.stop_event.set()
         if not controller.begin_shutdown(f"watchdog_{reason}"):
-            return controller.wait_for_lease_handling()
+            handled = controller.wait_for_lease_handling()
+            self._watchdog_exit_diagnostic(reason, lease_handled=handled)
+            return handled
 
-        self._shutdown_log(
-            "shutdown_start",
-            reason=f"watchdog_{reason}",
-            signal=None,
-            writer_quiescence_timeout_seconds=max(
-                0.0,
-                deadline - time.monotonic(),
-            ),
-        )
-        quiesced, elapsed, blockers = controller.wait_for_writer_quiescence(
+        quiesced, _elapsed, _blockers = controller.wait_for_writer_quiescence(
             max(0.0, deadline - time.monotonic())
         )
-        self._shutdown_log(
-            "writer_quiescence",
-            duration_seconds=round(elapsed, 6),
-            outcome="success" if quiesced else "timeout",
-            blockers=blockers,
-        )
         if not quiesced:
-            for component, active_count in blockers.items():
-                self._shutdown_log(
-                    "lease_release_withheld",
-                    component=component,
-                    active_operations=active_count,
-                    reason="watchdog_writer_quiescence_timeout",
-                )
+            self._watchdog_exit_diagnostic(reason, lease_handled=False)
             return False
         if time.monotonic() >= deadline:
+            self._watchdog_exit_diagnostic(reason, lease_handled=False)
             return False
-        return self.release_ledger_lease(fresh_connection=True)
+        handled = self.release_ledger_lease(
+            fresh_connection=True,
+            deadline=deadline,
+            emit_logs=False,
+        )
+        self._watchdog_exit_diagnostic(reason, lease_handled=handled)
+        return handled
+
+    def _watchdog_exit_diagnostic(
+        self,
+        reason: str,
+        *,
+        lease_handled: bool,
+    ) -> None:
+        """Best-effort logging after the watchdog's safety-critical work."""
+        detail = (
+            getattr(self, "_ledger_lease_heartbeat_failure_reason", None)
+            if reason == "lease_heartbeat"
+            else getattr(self, "_watchdog_failure_detail", None)
+        )
+        try:
+            print(
+                (detail or f"prism coordinator: {reason} watchdog firing")
+                + ". Exiting non-zero so the restart policy recovers the process. "
+                + f"lease_handled={lease_handled}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
     def _ensure_shutdown_controller(self) -> CoordinatorShutdownController:
         controller = getattr(self, "_shutdown_controller", None)
@@ -11188,23 +11552,42 @@ class PrismCoordinator:
             return False
         return self.release_ledger_lease()
 
-    def release_ledger_lease(self, *, fresh_connection: bool = False) -> bool:
+    def release_ledger_lease(
+        self,
+        *,
+        fresh_connection: bool = False,
+        deadline: float | None = None,
+        emit_logs: bool = True,
+    ) -> bool:
         """Release a quiesced writer lease at most once.
 
         The exact-session database fence makes an already-absent lease safe.
         Exceptions remain best-effort: they are observable, never retried from
         a duplicate finally block, and leave TTL fencing intact.
         """
+        shutdown_log: Callable[..., None] = (
+            self._shutdown_log if emit_logs else lambda *_args, **_kwargs: None
+        )
         controller = self._ensure_shutdown_controller()
         claimed, blockers = controller.claim_lease_release()
         if not claimed:
             if blockers:
-                self._shutdown_log(
+                shutdown_log(
                     "lease_release_withheld",
                     reason="active_writer_operations",
                     blockers=blockers,
                 )
             return controller.lease_release_succeeded
+
+        if not self._stop_ledger_lease_heartbeat(deadline=deadline):
+            controller.finish_lease_release("failure", 0.0)
+            shutdown_log(
+                "lease_release",
+                duration_seconds=0.0,
+                outcome="heartbeat_stop_timeout",
+                released=False,
+            )
+            return False
 
         release = (
             getattr(self.ledger, "release_writer_lease_fresh_connection", None)
@@ -11213,14 +11596,14 @@ class PrismCoordinator:
         )
         if release is None:
             release = getattr(self.ledger, "release_writer_lease", None)
-        self._shutdown_log(
+        shutdown_log(
             "lease_release_attempt",
             supported=release is not None,
             fresh_connection=fresh_connection,
         )
         if release is None:
             controller.finish_lease_release("unsupported", 0.0)
-            self._shutdown_log(
+            shutdown_log(
                 "lease_release",
                 duration_seconds=0.0,
                 outcome="unsupported",
@@ -11233,19 +11616,20 @@ class PrismCoordinator:
         except Exception:
             elapsed = max(0.0, time.monotonic() - started)
             controller.finish_lease_release("failure", elapsed)
-            self._shutdown_log(
+            shutdown_log(
                 "lease_release",
                 duration_seconds=round(elapsed, 6),
                 outcome="failure",
                 released=False,
             )
-            traceback.print_exc()
+            if emit_logs:
+                traceback.print_exc()
             return False
         elapsed = max(0.0, time.monotonic() - started)
         outcome = "success" if released else "not_held"
         controller.finish_lease_release(outcome, elapsed)
         snapshot = controller.snapshot()
-        self._shutdown_log(
+        shutdown_log(
             "lease_release",
             duration_seconds=round(elapsed, 6),
             outcome=outcome,
@@ -11348,6 +11732,7 @@ class PrismCoordinator:
             self._serve_with_listener_stack(listener_stack)
 
     def _serve_with_listener_stack(self, listener_stack: ExitStack) -> None:
+        lease_heartbeat_thread = self._start_ledger_lease_heartbeat()
         # Listeners come up first: connections complete their TCP handshake in
         # the kernel backlog while the rest of startup runs, so a fast restart
         # never bounces miners with connection refused. accept() still starts
@@ -11450,6 +11835,15 @@ class PrismCoordinator:
             (blockpoll_thread, 1.0),
             (block_submitter_thread, 1.0),
         ]
+        if lease_heartbeat_thread is not None:
+            drain_threads.append((lease_heartbeat_thread, 1.0))
+            lease_heartbeat_monitor_thread = getattr(
+                self,
+                "_ledger_lease_heartbeat_monitor_thread",
+                None,
+            )
+            if lease_heartbeat_monitor_thread is not None:
+                drain_threads.append((lease_heartbeat_monitor_thread, 1.0))
         if blockwait_thread is not None:
             drain_threads.append((blockwait_thread, 1.0))
         if vardiff_idle_sweep_thread is not None:
@@ -12171,6 +12565,9 @@ class PrismCoordinator:
         broadcaster = CtvFanoutBroadcaster(
             self.rpc.call,
             funding_wallet=self.ctv_broadcaster_wallet,
+            before_external_side_effect=(
+                self._require_fresh_ledger_lease_for_external_side_effect
+            ),
         )
         return CtvFanoutBroadcastDaemon(
             self.ledger,
@@ -21948,6 +22345,9 @@ class PrismCoordinator:
                     block_height=expected_height,
                 )
                 self._record_heartbeat("block_submitter")
+                self._require_fresh_ledger_lease_for_external_side_effect(
+                    "submitblock"
+                )
                 result = self.rpc.call("submitblock", [submission.block_hex])
                 self._record_heartbeat("block_submitter")
                 landed_monotonic = getattr(candidate, "landed_monotonic", None)

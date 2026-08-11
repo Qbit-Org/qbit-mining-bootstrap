@@ -31,6 +31,12 @@ AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA = "qbit.prism.window-completeness-proof.v
 DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
 DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
 DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
+# Only the coordinator assigns this prefix, and PsqlShareLedger preserves it
+# only after acquiring the writer/epoch advisory guard. Other ledger users and
+# psql-only deployments retain ordinary TTL fencing and are never treated as
+# fast-adoptable merely because they share an identity with a replacement.
+WRITER_LEASE_HEARTBEAT_SESSION_PREFIX = "heartbeat-v1:"
+DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS = 1.0
 VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
 
 
@@ -1176,6 +1182,17 @@ def database_url_from_psql_command(command: list[str]) -> str | None:
     return None
 
 
+def _writer_lease_advisory_lock_key(writer_id: str, writer_epoch: int) -> int:
+    """Return a stable signed bigint key namespaced to the PRISM writer lease."""
+    digest = hashlib.sha256(
+        b"qbit-prism-writer-lease\0"
+        + writer_id.encode("utf-8")
+        + b"\0"
+        + str(writer_epoch).encode("ascii")
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
 class _NativePostgresClient:
     """Persistent pooled psycopg client for the share ledger.
 
@@ -1279,6 +1296,58 @@ class _NativePostgresClient:
                 pass
 
 
+class _NativePostgresLeaseGuard:
+    """Hold one writer identity's PostgreSQL session advisory lock.
+
+    Unlike the ordinary native pool, this connection is never transparently
+    replaced: losing it also loses the advisory lock and must fence the owning
+    coordinator. The lease heartbeat runs on this same isolated session.
+    """
+
+    def __init__(self, conninfo: str, advisory_lock_key: int):
+        import psycopg  # deferred: psql-only users retain TTL fencing
+
+        self._connection = psycopg.connect(
+            conninfo,
+            autocommit=True,
+            connect_timeout=2,
+            options="-c statement_timeout=500",
+        )
+        self._advisory_lock_key = advisory_lock_key
+        self._query_lock = Lock()
+        self._closed = False
+        self._held = False
+
+    def try_acquire(self) -> bool:
+        row = self._connection.execute(
+            f"SELECT pg_try_advisory_lock({self._advisory_lock_key})"
+        ).fetchone()
+        self._held = bool(row and row[0])
+        return self._held
+
+    @property
+    def held(self) -> bool:
+        return self._held and not self._closed and not self._connection.closed
+
+    def run_json(self, sql: str) -> Any:
+        with self._query_lock:
+            if not self.held:
+                raise RuntimeError("postgres writer lease guard is not held")
+            row = self._connection.execute(sql).fetchone()
+            return parse_single_json_value(row[0] if row else None)
+
+    def close(self) -> None:
+        """Close the session, releasing its advisory lock server-side."""
+        if self._closed:
+            return
+        self._closed = True
+        self._held = False
+        try:
+            self._connection.close()
+        except Exception:
+            pass
+
+
 def parse_single_json_value(value: object) -> Any:
     """Normalize a one-row/one-column JSON query result.
 
@@ -1317,6 +1386,7 @@ class PsqlShareLedger:
         lease_retry_sleep: Callable[[float], None] | None = None,
         lease_retry_max_sleep_seconds: float = 15.0,
         lease_ttl_seconds: float = 60.0,
+        lease_adoption_silence_seconds: float = DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
         read_concurrency: int = 4,
         accepted_stats_cache_seconds: float = 60.0,
         reward_window_cache_seconds: float = 30.0,
@@ -1340,6 +1410,12 @@ class PsqlShareLedger:
         lease_ttl_seconds = float(lease_ttl_seconds)
         if not math.isfinite(lease_ttl_seconds) or lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be finite and positive")
+        lease_adoption_silence_seconds = float(lease_adoption_silence_seconds)
+        if (
+            not math.isfinite(lease_adoption_silence_seconds)
+            or lease_adoption_silence_seconds <= 0
+        ):
+            raise ValueError("lease_adoption_silence_seconds must be finite and positive")
         read_concurrency = int(read_concurrency)
         if read_concurrency <= 0:
             raise ValueError("read_concurrency must be positive")
@@ -1359,10 +1435,7 @@ class PsqlShareLedger:
         self._lease_retry_sleep = lease_retry_sleep or time.sleep
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
-        # A failed compare-and-swap proves that this exact predecessor session
-        # renewed after we observed it. Do not immediately race the same live
-        # session again; ordinary expiry polling remains the safe fallback.
-        self._lease_adoption_refused_session_token: str | None = None
+        self._lease_adoption_silence_seconds = lease_adoption_silence_seconds
         self._lock = Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         self._audit_body_dir = Path(audit_body_dir) if audit_body_dir else None
@@ -1396,10 +1469,16 @@ class PsqlShareLedger:
             database_url,
             read_concurrency=read_concurrency,
         )
-        if initialize_schema:
-            path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
-            self._run_script(path.read_text(encoding="utf-8"))
-        self._ensure_writer_lease()
+        self._writer_lease_guard: _NativePostgresLeaseGuard | None = None
+        try:
+            self._initialize_writer_lease_guard(database_url)
+            if initialize_schema:
+                path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
+                self._run_script(path.read_text(encoding="utf-8"))
+            self._ensure_writer_lease()
+        except BaseException:
+            self.close()
+            raise
 
     def _make_native_client(
         self,
@@ -1435,6 +1514,57 @@ class PsqlShareLedger:
             # by the owning daemon's startup line via execution_backend.
             return None
 
+    def _make_writer_lease_guard(
+        self,
+        database_url: str | None,
+    ) -> _NativePostgresLeaseGuard | None:
+        if self._native is None:
+            return None
+        conninfo = database_url or database_url_from_psql_command(self._command)
+        if conninfo is None:
+            return None
+        return _NativePostgresLeaseGuard(
+            conninfo,
+            _writer_lease_advisory_lock_key(self._writer_id, self._writer_epoch),
+        )
+
+    def _initialize_writer_lease_guard(self, database_url: str | None) -> None:
+        if not self._writer_session_token.startswith(
+            WRITER_LEASE_HEARTBEAT_SESSION_PREFIX
+        ):
+            return
+        warned = False
+        while True:
+            guard = self._make_writer_lease_guard(database_url)
+            if guard is None:
+                # A psql subprocess cannot retain a session advisory lock.
+                # Downgrade before publishing the token so other processes
+                # conservatively retain TTL fencing for this owner.
+                self._writer_session_token = uuid.uuid4().hex
+                print(
+                    "prism ledger writer fast adoption disabled: persistent "
+                    "native PostgreSQL connection unavailable; using TTL fencing",
+                    flush=True,
+                )
+                return
+            try:
+                acquired = guard.try_acquire()
+            except Exception:
+                guard.close()
+                raise
+            if acquired:
+                self._writer_lease_guard = guard
+                return
+            guard.close()
+            if not warned:
+                print(
+                    "prism ledger writer guard held by a live same-identity "
+                    "coordinator; waiting before lease acquisition",
+                    flush=True,
+                )
+                warned = True
+            self._lease_retry_sleep(self._lease_retry_min_sleep_seconds)
+
     @property
     def execution_backend(self) -> str:
         if getattr(self, "_native", None) is not None:
@@ -1446,6 +1576,35 @@ class PsqlShareLedger:
         native = getattr(self, "_native", None)
         if native is not None:
             native.close()
+        self._close_writer_lease_guard()
+
+    def _close_writer_lease_guard(self) -> None:
+        guard = getattr(self, "_writer_lease_guard", None)
+        if guard is None:
+            return
+        self._writer_lease_guard = None
+        guard.close()
+
+    @property
+    def writer_lease_fast_adoption_capable(self) -> bool:
+        guard = getattr(self, "_writer_lease_guard", None)
+        return bool(
+            self._writer_session_token.startswith(
+                WRITER_LEASE_HEARTBEAT_SESSION_PREFIX
+            )
+            and guard is not None
+            and guard.held
+        )
+
+    @property
+    def writer_lease_guard_required(self) -> bool:
+        return self._writer_session_token.startswith(
+            WRITER_LEASE_HEARTBEAT_SESSION_PREFIX
+        )
+
+    @property
+    def writer_lease_last_refresh_monotonic(self) -> float | None:
+        return getattr(self, "_writer_lease_last_refresh_monotonic", None)
 
     @property
     def backend_name(self) -> str:
@@ -6293,24 +6452,32 @@ END;
 
     def _ensure_writer_lease(self) -> None:
         while True:
+            acquire_started_monotonic = time.monotonic()
             result = self._try_acquire_writer_lease()
             if result.get("acquired"):
+                self._writer_lease_last_refresh_monotonic = (
+                    acquire_started_monotonic
+                )
                 return
             if self._can_adopt_writer_lease(result):
                 observed_session = str(result["writer_session_token"])
+                adoption_started_monotonic = time.monotonic()
                 adoption = self._try_adopt_writer_lease(result)
                 if adoption.get("acquired"):
+                    self._writer_lease_last_refresh_monotonic = (
+                        adoption_started_monotonic
+                    )
                     print(
                         "prism ledger writer lease adopted from same-identity "
                         f"predecessor session={observed_session}",
                         flush=True,
                     )
                     return
-                # The CAS can lose because the observed holder renewed, was
-                # released, or was replaced. Only a still-current exact
-                # session is known live and must not be challenged again.
-                if adoption.get("writer_session_token") == observed_session:
-                    self._lease_adoption_refused_session_token = observed_session
+                # A CAS loss may mean the predecessor renewed concurrently or
+                # another replacement won. Re-observe the returned owner and
+                # require a fresh full silence interval before another CAS;
+                # permanently refusing this token would recreate the TTL
+                # outage if that renewal were its final act before dying.
                 result = adoption
             if not self._can_wait_for_writer_lease(result):
                 raise RuntimeError(
@@ -6320,6 +6487,9 @@ END;
                     f"until {result.get('lease_expires_at')}"
                 )
             wait_seconds = max(0.0, float(result.get("lease_wait_seconds") or 0.0))
+            adoption_wait_seconds = self._writer_lease_adoption_wait_seconds(result)
+            if adoption_wait_seconds is not None:
+                wait_seconds = min(wait_seconds, adoption_wait_seconds)
             sleep_seconds = min(
                 self._lease_retry_max_sleep_seconds,
                 max(self._lease_retry_min_sleep_seconds, wait_seconds),
@@ -6390,6 +6560,10 @@ SELECT COALESCE(
             'writer_session_token', writer_session_token,
             'lease_expires_at', lease_expires_at::text,
             'lease_updated_at', updated_at::text,
+            'lease_age_seconds', GREATEST(
+                0,
+                EXTRACT(EPOCH FROM (clock_timestamp() - updated_at))
+            ),
             'lease_wait_seconds', GREATEST(
                 0,
                 EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp()))
@@ -6406,24 +6580,52 @@ SELECT COALESCE(
         return result
 
     def _can_adopt_writer_lease(self, result: dict[str, Any]) -> bool:
+        wait_seconds = self._writer_lease_adoption_wait_seconds(result)
+        return wait_seconds is not None and wait_seconds <= 0
+
+    def _writer_lease_adoption_wait_seconds(
+        self,
+        result: dict[str, Any],
+    ) -> float | None:
+        """Return time until one heartbeat-capable predecessor is adoptable.
+
+        A timestamp CAS alone only orders database mutations; it does not prove
+        that a live, idle predecessor cannot still perform an external wallet
+        or node RPC before its next fenced write. Fast adoption is therefore
+        restricted to coordinator sessions guarded by the same writer/epoch
+        PostgreSQL advisory lock. This process cannot reach this method until
+        that predecessor's guard session is gone. PostgreSQL must additionally
+        report the exact session unchanged for several heartbeat periods before
+        the CAS, giving a holder whose guard connection failed time to self-exit.
+        A renewing live twin retains the guard and cannot reach lease polling.
+        """
         observed_session = result.get("writer_session_token")
-        return bool(
-            self._can_wait_for_writer_lease(result)
-            and observed_session
+        if not (
+            self.writer_lease_fast_adoption_capable
+            and self._can_wait_for_writer_lease(result)
+            and isinstance(observed_session, str)
+            and observed_session.startswith(WRITER_LEASE_HEARTBEAT_SESSION_PREFIX)
             and observed_session != self._writer_session_token
-            and observed_session != self._lease_adoption_refused_session_token
             and result.get("lease_updated_at") is not None
-        )
+        ):
+            return None
+        try:
+            age_seconds = float(result.get("lease_age_seconds"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(age_seconds) or age_seconds < 0:
+            return None
+        return max(0.0, self._lease_adoption_silence_seconds - age_seconds)
 
     def _try_adopt_writer_lease(self, observed: dict[str, Any]) -> dict[str, Any]:
         """Fence and replace one observed same-identity predecessor session.
 
-        Every ledger mutation renews the singleton lease row for its exact
-        session in the same SQL statement as the mutation. PostgreSQL row-lock
-        ordering therefore makes this compare-and-swap the split-brain fence:
-        a predecessor renewal that wins first changes ``updated_at`` and makes
-        this update affect zero rows; if this update wins first, every later
-        predecessor mutation sees a different session and is fenced out.
+        The caller first proves the heartbeat-capable predecessor has been
+        silent for the configured interval. PostgreSQL row-lock ordering then
+        makes this compare-and-swap the final database fence: a predecessor
+        renewal that wins first changes ``updated_at`` and makes this update
+        affect zero rows; if this update wins first, every later predecessor
+        mutation sees a different session and is fenced out.
         """
         payload = {
             "writer_id": self._writer_id,
@@ -6470,6 +6672,10 @@ SELECT COALESCE(
             'writer_session_token', writer_session_token,
             'lease_expires_at', lease_expires_at::text,
             'lease_updated_at', updated_at::text,
+            'lease_age_seconds', GREATEST(
+                0,
+                EXTRACT(EPOCH FROM (clock_timestamp() - updated_at))
+            ),
             'lease_wait_seconds', GREATEST(
                 0,
                 EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp()))
@@ -6506,6 +6712,21 @@ SELECT COALESCE(
         holds the lease, matching the fenced-write failure mode so a fenced-out
         writer still fails fast.
         """
+        return self._renew_writer_lease_with(self._run_fenced_json)
+
+    def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
+        """Refresh on the session that holds the writer advisory guard."""
+        if not self.writer_lease_fast_adoption_capable:
+            raise RuntimeError("writer session is not heartbeat-capable")
+        guard = self._writer_lease_guard
+        if guard is None:
+            raise RuntimeError("postgres writer lease guard is not held")
+        return self._renew_writer_lease_with(guard.run_json)
+
+    def _renew_writer_lease_with(
+        self,
+        run_json: Callable[[str], Any],
+    ) -> dict[str, int | str]:
         payload = {
             "writer_id": self._writer_id,
             "writer_epoch": self._writer_epoch,
@@ -6536,7 +6757,9 @@ SELECT CASE
         )
 END;
 """
-        result = self._run_fenced_json(sql)
+        result = run_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError("psql writer lease renewal returned non-object JSON")
         if "error" in result:
             raise RuntimeError(str(result["error"]))
         return {"backend": str(result["backend"]), "renewed_count": int(result["renewed_count"])}
@@ -6584,10 +6807,16 @@ released AS (
 )
 SELECT json_build_object('released', (SELECT count(*) FROM released));
 """
-        result = run_json(sql)
-        if not isinstance(result, dict):
-            raise RuntimeError("psql writer lease release returned non-object JSON")
-        return int(result.get("released", 0)) > 0
+        try:
+            result = run_json(sql)
+            if not isinstance(result, dict):
+                raise RuntimeError("psql writer lease release returned non-object JSON")
+            return int(result.get("released", 0)) > 0
+        finally:
+            # The owning coordinator calls release only after writer admission
+            # and the lease heartbeat are stopped. Releasing this session lock
+            # is the final handoff that lets a successor enter fast adoption.
+            self._close_writer_lease_guard()
 
     def _run_fresh_connection_json(self, sql: str) -> Any:
         output = self._run_sql(sql).strip()

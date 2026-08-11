@@ -44,6 +44,23 @@ class WatchdogLeaseLedger(RecordingLeaseLedger):
         return self.release_writer_lease()
 
 
+class HeartbeatLeaseLedger(RecordingLeaseLedger):
+    writer_lease_fast_adoption_capable = True
+    writer_lease_guard_required = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.renew_calls = 0
+        self.renew_thread: threading.Thread | None = None
+        self.renewed = threading.Event()
+
+    def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
+        self.renew_calls += 1
+        self.renew_thread = threading.current_thread()
+        self.renewed.set()
+        return {"backend": "recording", "renewed_count": 1}
+
+
 def coordinator(
     ledger: object | None = None,
     *,
@@ -59,6 +76,206 @@ def coordinator(
 
 
 class PrismCoordinatorShutdownTests(unittest.TestCase):
+    def test_external_side_effect_gate_fails_closed_after_guard_loss(self) -> None:
+        class LostGuardLedger(HeartbeatLeaseLedger):
+            def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
+                raise RuntimeError("postgres session was lost during host suspend")
+
+        server = coordinator(LostGuardLedger())
+
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit, self.assertRaisesRegex(
+            ShutdownInProgress,
+            "writer lease guard verification failed",
+        ):
+            server._require_fresh_ledger_lease_for_external_side_effect(
+                "submitblock"
+            )
+
+        hard_exit.assert_called_once()
+
+    def test_external_side_effect_gate_allows_fresh_guarded_session(self) -> None:
+        ledger = HeartbeatLeaseLedger()
+        server = coordinator(ledger)
+
+        server._require_fresh_ledger_lease_for_external_side_effect(
+            "submitblock"
+        )
+
+        self.assertEqual(ledger.renew_calls, 1)
+        self.assertIsNot(ledger.renew_thread, threading.current_thread())
+
+    def test_external_side_effect_gate_bounds_blocked_guard_verification(self) -> None:
+        verification_started = threading.Event()
+        release_verification = threading.Event()
+
+        class BlockingGuardLedger(HeartbeatLeaseLedger):
+            def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
+                verification_started.set()
+                release_verification.wait(1)
+                return {"backend": "recording", "renewed_count": 1}
+
+        ledger = BlockingGuardLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_external_fence_timeout_seconds = 0.01
+
+        try:
+            started = time.monotonic()
+            with patch.object(
+                server,
+                "_ledger_lease_heartbeat_hard_exit",
+            ) as hard_exit, self.assertRaisesRegex(
+                ShutdownInProgress,
+                "writer lease guard verification timed out",
+            ):
+                server._require_fresh_ledger_lease_for_external_side_effect(
+                    "ctv_submitpackage"
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            release_verification.set()
+
+        self.assertTrue(verification_started.is_set())
+        self.assertLess(elapsed, 0.1)
+        hard_exit.assert_called_once()
+        if ledger.renew_thread is not None:
+            ledger.renew_thread.join(0.2)
+
+    def test_fast_adoptable_lease_renews_on_dedicated_heartbeat_thread(self) -> None:
+        ledger = HeartbeatLeaseLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+
+        thread = server._start_ledger_lease_heartbeat()
+        self.assertIsNotNone(thread)
+        self.assertTrue(ledger.renewed.wait(0.2))
+        server.stop_event.set()
+        assert thread is not None
+        time.sleep(0.02)
+        self.assertTrue(thread.is_alive())
+        self.assertTrue(server._stop_ledger_lease_heartbeat())
+        thread.join(0.2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertGreaterEqual(ledger.renew_calls, 1)
+        self.assertIs(ledger.renew_thread, thread)
+        self.assertIsNot(ledger.renew_thread, threading.current_thread())
+
+    def test_lease_heartbeat_failure_uses_bounded_hard_exit_path(self) -> None:
+        class FailingHeartbeatLedger(HeartbeatLeaseLedger):
+            def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
+                raise RuntimeError("database unavailable")
+
+        server = coordinator(FailingHeartbeatLedger())
+
+        with patch("builtins.print"), patch("traceback.print_exc"), patch.object(
+            server,
+            "_watchdog_hard_exit",
+        ) as hard_exit:
+            server.ledger_lease_heartbeat_loop()
+
+        hard_exit.assert_called_once_with("lease_heartbeat", timeout_seconds=0.1)
+
+    def test_lease_heartbeat_hard_exit_never_waits_on_blocked_output(self) -> None:
+        server = coordinator(HeartbeatLeaseLedger())
+        release_print = threading.Event()
+        hard_exit_called = threading.Event()
+
+        def blocking_print(*_args: object, **_kwargs: object) -> None:
+            release_print.wait(1)
+
+        with patch("builtins.print", side_effect=blocking_print) as print_call, patch.object(
+            server,
+            "_watchdog_hard_exit",
+            side_effect=lambda *_args, **_kwargs: hard_exit_called.set(),
+        ) as hard_exit:
+            caller = threading.Thread(
+                target=server._ledger_lease_heartbeat_hard_exit,
+                args=("heartbeat failed",),
+                kwargs={"include_traceback": False},
+            )
+            caller.start()
+            reached_hard_exit = hard_exit_called.wait(0.1)
+            release_print.set()
+            caller.join(0.2)
+
+        self.assertTrue(reached_hard_exit)
+        self.assertFalse(caller.is_alive())
+        print_call.assert_not_called()
+        hard_exit.assert_called_once_with("lease_heartbeat", timeout_seconds=0.1)
+
+    def test_heartbeat_start_waits_for_first_exact_session_renewal(self) -> None:
+        renew_started = threading.Event()
+        release_renew = threading.Event()
+
+        class ArmingHeartbeatLedger(HeartbeatLeaseLedger):
+            def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
+                renew_started.set()
+                release_renew.wait(1)
+                return {"backend": "recording", "renewed_count": 1}
+
+        server = coordinator(ArmingHeartbeatLedger())
+        result: list[threading.Thread | None] = []
+        starter = threading.Thread(
+            target=lambda: result.append(server._start_ledger_lease_heartbeat())
+        )
+        starter.start()
+        self.assertTrue(renew_started.wait(0.2))
+        time.sleep(0.02)
+        self.assertTrue(starter.is_alive())
+
+        release_renew.set()
+        starter.join(0.2)
+        self.assertFalse(starter.is_alive())
+        self.assertEqual(len(result), 1)
+        self.assertIsNotNone(result[0])
+        self.assertTrue(server._stop_ledger_lease_heartbeat())
+
+    def test_stalled_lease_heartbeat_exits_before_adoption_silence(self) -> None:
+        renew_started = threading.Event()
+        release_renew = threading.Event()
+
+        class BlockingHeartbeatLedger(HeartbeatLeaseLedger):
+            def renew_writer_lease_heartbeat(self) -> dict[str, int | str]:
+                renew_started.set()
+                release_renew.wait(1)
+                return {"backend": "recording", "renewed_count": 1}
+
+        server = coordinator(BlockingHeartbeatLedger())
+        server.ledger_lease_heartbeat_failure_seconds = 0.03
+        server.ledger_lease_heartbeat_monitor_seconds = 0.005
+        server.ledger_lease_heartbeat_exit_timeout_seconds = 0.01
+        thread: threading.Thread | None = None
+
+        try:
+            with patch("builtins.print"), patch.object(
+                server,
+                "_watchdog_hard_exit",
+            ) as hard_exit:
+                thread = server._start_ledger_lease_heartbeat()
+                self.assertTrue(renew_started.wait(0.2))
+                deadline = time.monotonic() + 0.2
+                while not hard_exit.called and time.monotonic() < deadline:
+                    time.sleep(0.001)
+
+                hard_exit.assert_called_once_with(
+                    "lease_heartbeat",
+                    timeout_seconds=0.01,
+                )
+        finally:
+            release_renew.set()
+            heartbeat_stop = getattr(
+                server,
+                "_ledger_lease_heartbeat_stop_event",
+                None,
+            )
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if thread is not None:
+                thread.join(0.2)
+
     def test_watchdog_exit_releases_on_fresh_thread_within_deadline(self) -> None:
         ledger = WatchdogLeaseLedger()
         server = coordinator(ledger)
@@ -79,6 +296,53 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         self.assertIsNotNone(ledger.release_thread)
         self.assertIsNot(ledger.release_thread, watchdog_thread)
         self.assertEqual(ledger.release_thread.name, "prism-watchdog-lease-release")
+
+    def test_all_watchdog_branches_arm_exit_without_blocking_output(self) -> None:
+        cases = (
+            ("coordination", ("coordination", 2.0, 1.0, 1.0), []),
+            ("publication", ("publication", 0.0, 1.0, 1.0), []),
+            ("liveness", (None, 0.0, 1.0, 1.0), ["block_submitter"]),
+        )
+        for expected_reason, publication_state, overdue in cases:
+            with self.subTest(reason=expected_reason):
+                server = coordinator()
+                server.watchdog_interval_seconds = 0.0
+                server.watchdog_timeout_seconds = 300.0
+                server.watchdog_enabled = True
+                server._publication_watchdog_state = (  # type: ignore[method-assign]
+                    lambda _now, state=publication_state: state
+                )
+                server._overdue_heartbeats = (  # type: ignore[method-assign]
+                    lambda _now, value=overdue: value
+                )
+                release_print = threading.Event()
+                hard_exit_called = threading.Event()
+
+                def blocking_print(*_args: object, **_kwargs: object) -> None:
+                    release_print.wait(1)
+
+                def hard_exit(reason: str) -> None:
+                    self.assertEqual(reason, expected_reason)
+                    hard_exit_called.set()
+                    raise SystemExit(1)
+
+                with patch(
+                    "builtins.print",
+                    side_effect=blocking_print,
+                ) as print_call, patch.object(
+                    server,
+                    "_watchdog_hard_exit",
+                    side_effect=hard_exit,
+                ):
+                    caller = threading.Thread(target=server.watchdog_loop)
+                    caller.start()
+                    reached_hard_exit = hard_exit_called.wait(0.1)
+                    release_print.set()
+                    caller.join(0.2)
+
+                self.assertTrue(reached_hard_exit)
+                self.assertFalse(caller.is_alive())
+                print_call.assert_not_called()
 
     def test_watchdog_exit_hard_exits_when_fresh_db_release_hangs(self) -> None:
         release_started = threading.Event()
@@ -111,6 +375,74 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         self.assertLess(elapsed, 0.2)
         self.assertTrue(release_finished.wait(0.2))
 
+    def test_watchdog_release_never_waits_on_shutdown_logging(self) -> None:
+        ledger = WatchdogLeaseLedger()
+        server = coordinator(ledger)
+        server.watchdog_lease_release_timeout_seconds = 0.05
+        release_log = threading.Event()
+
+        def blocking_log(*_args: object, **_kwargs: object) -> None:
+            release_log.wait(1)
+
+        try:
+            with patch.object(
+                server,
+                "_shutdown_log",
+                side_effect=blocking_log,
+            ) as shutdown_log, patch("builtins.print"), patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=SystemExit(1),
+            ), self.assertRaises(SystemExit):
+                server._watchdog_hard_exit("liveness")
+            released_before_log_unblocked = ledger.released.is_set()
+        finally:
+            release_log.set()
+
+        self.assertTrue(released_before_log_unblocked)
+        shutdown_log.assert_not_called()
+
+    def test_watchdog_blocked_diagnostic_cannot_extend_exit_deadline(self) -> None:
+        ledger = WatchdogLeaseLedger()
+        server = coordinator(ledger)
+        server.watchdog_lease_release_timeout_seconds = 0.02
+        diagnostic_started = threading.Event()
+        release_diagnostic = threading.Event()
+
+        def blocking_print(*_args: object, **_kwargs: object) -> None:
+            diagnostic_started.set()
+            release_diagnostic.wait(1)
+
+        started = time.monotonic()
+        try:
+            with patch("builtins.print", side_effect=blocking_print), patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=SystemExit(1),
+            ), self.assertRaises(SystemExit):
+                server._watchdog_hard_exit("liveness")
+            elapsed = time.monotonic() - started
+        finally:
+            release_diagnostic.set()
+            if ledger.release_thread is not None:
+                ledger.release_thread.join(0.2)
+
+        self.assertTrue(ledger.released.is_set())
+        self.assertTrue(diagnostic_started.is_set())
+        self.assertLess(elapsed, 0.2)
+
+    def test_watchdog_exit_hard_exits_when_release_thread_cannot_start(self) -> None:
+        server = coordinator()
+
+        with patch(
+            "lab.prism.prism_coordinator.threading.Thread",
+            side_effect=RuntimeError("cannot start new thread"),
+        ), patch(
+            "lab.prism.prism_coordinator.os._exit",
+            side_effect=SystemExit(1),
+        ) as hard_exit, self.assertRaises(SystemExit):
+            server._watchdog_hard_exit("liveness")
+
+        hard_exit.assert_called_once_with(1)
+
     def test_watchdog_exit_withholds_release_while_writer_is_active(self) -> None:
         ledger = WatchdogLeaseLedger()
         server = coordinator(ledger)
@@ -136,6 +468,34 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
 
         self.assertEqual(ledger.release_calls, 0)
 
+    def test_withheld_shutdown_keeps_lease_heartbeat_alive(self) -> None:
+        ledger = HeartbeatLeaseLedger()
+        server = coordinator(ledger, timeout=0.02)
+        server.ledger_lease_heartbeat_seconds = 0.005
+        heartbeat_thread = server._start_ledger_lease_heartbeat()
+        self.assertIsNotNone(heartbeat_thread)
+        controller = server._ensure_shutdown_controller()
+        active_writer = controller.reserve_writer("accepted_block_handling")
+        renewals_before_shutdown = ledger.renew_calls
+
+        try:
+            with patch("builtins.print"):
+                self.assertFalse(server.shutdown(reason="active_writer"))
+            deadline = time.monotonic() + 0.1
+            while (
+                ledger.renew_calls <= renewals_before_shutdown
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+
+            self.assertGreater(ledger.renew_calls, renewals_before_shutdown)
+            assert heartbeat_thread is not None
+            self.assertTrue(heartbeat_thread.is_alive())
+            self.assertEqual(ledger.release_calls, 0)
+        finally:
+            active_writer.finish()
+            self.assertTrue(server._stop_ledger_lease_heartbeat())
+
     def test_normal_shutdown_releases_lease_promptly_and_exports_metrics(self) -> None:
         ledger = RecordingLeaseLedger()
         server = coordinator(ledger)
@@ -157,6 +517,27 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             'qbit_prism_shutdown_lease_release_total{outcome="success"} 1',
             metrics,
         )
+
+    def test_safe_release_stops_lease_heartbeat_before_database_handoff(self) -> None:
+        release_saw_heartbeat_alive: list[bool] = []
+
+        class OrderedHeartbeatLedger(HeartbeatLeaseLedger):
+            def release_writer_lease(self) -> bool:
+                heartbeat = getattr(server, "_ledger_lease_heartbeat_thread", None)
+                release_saw_heartbeat_alive.append(
+                    bool(heartbeat is not None and heartbeat.is_alive())
+                )
+                return super().release_writer_lease()
+
+        ledger = OrderedHeartbeatLedger()
+        server = coordinator(ledger)
+        self.assertIsNotNone(server._start_ledger_lease_heartbeat())
+
+        with patch("builtins.print"):
+            self.assertTrue(server.shutdown(reason="ordered_release"))
+
+        self.assertEqual(release_saw_heartbeat_alive, [False])
+        self.assertEqual(ledger.release_calls, 1)
 
     def test_blocked_non_writer_drain_starts_only_after_lease_release(self) -> None:
         ledger = RecordingLeaseLedger()

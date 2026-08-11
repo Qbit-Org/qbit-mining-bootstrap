@@ -155,10 +155,12 @@ class CtvFanoutBroadcaster:
         *,
         funding_wallet: str | None = None,
         maturity: int = COINBASE_MATURITY,
+        before_external_side_effect: Callable[[str], None] | None = None,
     ) -> None:
         self._rpc = rpc_call
         self.funding_wallet = funding_wallet
         self.maturity = maturity
+        self._before_external_side_effect = before_external_side_effect
         self._parent_spender_by_outpoint: dict[tuple[str, int], str] = {}
         self._parent_spender_scanned_min_height: int | None = None
         self._parent_spender_scanned_max_height: int | None = None
@@ -328,6 +330,10 @@ class CtvFanoutBroadcaster:
 
     # -- broadcasting ------------------------------------------------------
 
+    def _fence_external_side_effect(self, operation: str) -> None:
+        if self._before_external_side_effect is not None:
+            self._before_external_side_effect(operation)
+
     def _select_funding_utxo(self, required_sats: int) -> dict[str, Any]:
         if self.funding_wallet is None:
             raise BroadcasterError("funding wallet is required for CPFP fee sponsorship")
@@ -349,6 +355,7 @@ class CtvFanoutBroadcaster:
         if artifact.anchor_vout is None:
             raise BroadcasterError("fanout has no CPFP anchor")
         funding = self._select_funding_utxo(fee_sats)
+        self._fence_external_side_effect("ctv_wallet_getnewaddress")
         change_address = self._rpc("getnewaddress", ["", "p2mr"], wallet=self.funding_wallet)
         change_spk = self._rpc("getaddressinfo", [change_address], wallet=self.funding_wallet)[
             "scriptPubKey"
@@ -372,6 +379,7 @@ class CtvFanoutBroadcaster:
                 "amount": 0,
             }
         ]
+        self._fence_external_side_effect("ctv_wallet_sign")
         signed = self._rpc(
             "signrawtransactionwithwallet",
             [unsigned_hex, anchor_prevtx],
@@ -382,11 +390,13 @@ class CtvFanoutBroadcaster:
         return str(signed["hex"]), unsigned_hex
 
     def _submit_package(self, artifact: FanoutArtifact, signed_child_hex: str) -> dict[str, Any]:
+        self._fence_external_side_effect("ctv_submitpackage")
         return self._rpc(
             "submitpackage", [[artifact.fanout_tx_hex, signed_child_hex], 0]
         )
 
     def _submit_parent(self, artifact: FanoutArtifact, *, detail: str) -> BroadcastAttempt:
+        self._fence_external_side_effect("ctv_sendrawtransaction")
         txid = str(self._rpc("sendrawtransaction", [artifact.fanout_tx_hex]))
         submitted = txid.lower() == artifact.fanout_txid.lower()
         return BroadcastAttempt(
