@@ -4058,6 +4058,16 @@ class PrismCoordinator:
             self._incremental_payout_artifact_window: (
                 _IncrementalPayoutArtifactWindow | None
             ) = None
+        if not hasattr(
+            self,
+            "_incremental_payout_artifact_window_invalidation_reason",
+        ):
+            # Guarded by _payout_state_prepare_lock. Explicit append-side
+            # invalidations leave a one-shot diagnostic for the oracle build
+            # that replaces the discarded incremental window.
+            self._incremental_payout_artifact_window_invalidation_reason: (
+                str | None
+            ) = None
         if not hasattr(self, "_pending_share_commit_lock"):
             self._pending_share_commit_lock = threading.Lock()
         if not hasattr(self, "_pending_share_commit_floor"):
@@ -4590,26 +4600,34 @@ class PrismCoordinator:
         full_reason: str | None = None
         if force_full_rescan:
             self._incremental_payout_artifact_window = None
+            self._incremental_payout_artifact_window_invalidation_reason = None
             cached = None
             full_reason = "reconcile_invalidation"
         elif cached is None:
-            full_reason = "cold_start"
+            full_reason = (
+                self._incremental_payout_artifact_window_invalidation_reason
+                or "cold_start"
+            )
         elif cached.window.window_weight != int(snapshot_window_weight):
             self._incremental_payout_artifact_window = None
+            self._incremental_payout_artifact_window_invalidation_reason = None
             cached = None
             full_reason = "network_difficulty_changed"
         elif snapshot_anchor_ms < cached.window.anchor_job_issued_at_ms:
             self._incremental_payout_artifact_window = None
+            self._incremental_payout_artifact_window_invalidation_reason = None
             cached = None
             full_reason = "anchor_regression"
 
         if cached is None:
-            return self._full_payout_window_materialization(
+            materialized = self._full_payout_window_materialization(
                 snapshot_anchor_ms=snapshot_anchor_ms,
                 snapshot_window_weight=snapshot_window_weight,
                 reason=full_reason or "cache_invalidated",
                 observed_monotonic=observed,
             )
+            self._incremental_payout_artifact_window_invalidation_reason = None
+            return materialized
 
         min_interval = self._payout_artifact_min_build_interval_seconds()
         if (
@@ -20209,8 +20227,10 @@ class PrismCoordinator:
                 if reason not in retryable_reasons:
                     # This process will never credit the candidate share now:
                     # release its snapshot anchor floor entry before the
-                    # terminal outbox update, whose failure would still leave
-                    # only restart replay (a fresh PendingShare) to credit it.
+                    # terminal outbox update. If that update fails, durable
+                    # replay may run in this process with a reconstructed
+                    # PendingShare; append-side cache invalidation protects its
+                    # original stamps without retaining an old anchor floor.
                     self._finish_pending_share_commit(candidate.pending_share)
                     finish = getattr(self.ledger, "mark_block_candidate_abandoned", None)
                     if callable(finish):
@@ -20499,6 +20519,47 @@ class PrismCoordinator:
             ]
         return pending
 
+    def _invalidate_incremental_payout_window_for_append(
+        self,
+        pending_share: PendingShare,
+    ) -> None:
+        """Discard a window that predates a newly visible eligible row.
+
+        Normal submissions hold the pending-share commit floor, so their
+        accepted timestamp remains above the cached anchor until the row is
+        durable. Durable replay reconstructs the original timestamps without
+        that process-local floor. If both stamps are already covered by the
+        cached anchor, the delta query cannot discover the late-visible row;
+        the next materialization must therefore use the full oracle.
+        """
+
+        cached = getattr(self, "_incremental_payout_artifact_window", None)
+        if cached is None:
+            return
+        anchor_ms = int(cached.window.anchor_job_issued_at_ms)
+        if (
+            int(pending_share.job_issued_at_ms) > anchor_ms
+            or int(pending_share.accepted_at_ms) > anchor_ms
+        ):
+            return
+        with self._payout_state_prepare_lock:
+            # A build may have replaced the cache while the append completed.
+            # Recheck the current anchor under its owning lock before clearing
+            # it, and never replace another path's already-cold state/reason.
+            cached = self._incremental_payout_artifact_window
+            if cached is None:
+                return
+            anchor_ms = int(cached.window.anchor_job_issued_at_ms)
+            if (
+                int(pending_share.job_issued_at_ms) > anchor_ms
+                or int(pending_share.accepted_at_ms) > anchor_ms
+            ):
+                return
+            self._incremental_payout_artifact_window = None
+            self._incremental_payout_artifact_window_invalidation_reason = (
+                "late_visible_append"
+            )
+
     @ledger_writer_operation("share_persistence")
     def append_accepted_share(
         self,
@@ -20635,6 +20696,9 @@ class PrismCoordinator:
             hot_path_log = getattr(self, "hot_path_log_enabled", False)
             for entry, record in zip(batch, records, strict=True):
                 entry.record = record
+                self._invalidate_incremental_payout_window_for_append(
+                    entry.pending_share
+                )
                 if hot_path_log:
                     print(
                         "prism coordinator: accepted share "
@@ -20752,6 +20816,7 @@ class PrismCoordinator:
         for pending in pendings:
             try:
                 self.ledger.append(pending)
+                self._invalidate_incremental_payout_window_for_append(pending)
                 replayed += 1
             except Exception as exc:
                 if "duplicate share_id" in str(exc):
@@ -20835,6 +20900,9 @@ class PrismCoordinator:
                     return False
                 backoff_seconds = min(backoff_seconds * 2, 5.0)
                 self._record_heartbeat("share_writer")
+        self._invalidate_incremental_payout_window_for_append(
+            entry.pending_share
+        )
         if getattr(self, "hot_path_log_enabled", False):
             print(
                 "prism coordinator: accepted share "
