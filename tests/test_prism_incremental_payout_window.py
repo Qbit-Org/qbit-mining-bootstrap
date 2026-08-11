@@ -9,6 +9,7 @@ import random
 import unittest
 from dataclasses import replace
 from typing import Iterable, Sequence
+from unittest.mock import patch
 
 from lab.prism.share_ledger import (
     AcceptedShareRecord,
@@ -169,11 +170,11 @@ class IncrementalShareWindowGoldenTests(unittest.TestCase):
             tuple(sorted(record.share_seq for record in incremental_records)),
         )
 
-        incremental_json = tuple(record.to_prism_json() for record in incremental_records)
+        incremental_json = window.json_records()
         oracle_json = tuple(record.to_prism_json() for record in oracle_records)
-        self.assertEqual(incremental_json, oracle_json)
+        self.assertEqual(tuple(incremental_json), oracle_json)
         self.assertEqual(
-            canonical_json_sha256(incremental_json),
+            incremental_json.canonical_json_sha256(),
             canonical_json_sha256(oracle_json),
         )
 
@@ -496,7 +497,7 @@ class IncrementalShareWindowGoldenTests(unittest.TestCase):
         anchor_ms = 2_000_000
         initial_count = 90_000
         delta_count = 500
-        page_size = 4_096
+        page_size = 512
         initial = tuple(
             accepted_share(
                 share_seq,
@@ -524,10 +525,29 @@ class IncrementalShareWindowGoldenTests(unittest.TestCase):
             for share_seq in range(initial_count + 1, initial_count + delta_count + 1)
         )
 
-        window, stats = window.advance(
-            delta,
-            anchor_job_issued_at_ms=anchor_ms + 1,
-        )
+        initial_pages = window.pages
+        prism_json_calls = 0
+        original_to_prism_json = AcceptedShareRecord.to_prism_json
+
+        def counting_to_prism_json(
+            record: AcceptedShareRecord,
+        ) -> dict[str, object]:
+            nonlocal prism_json_calls
+            prism_json_calls += 1
+            return original_to_prism_json(record)
+
+        with patch.object(
+            AcceptedShareRecord,
+            "to_prism_json",
+            autospec=True,
+            side_effect=counting_to_prism_json,
+        ):
+            window, stats = window.advance(
+                delta,
+                anchor_job_issued_at_ms=anchor_ms + 1,
+            )
+            incremental_json = window.json_records()
+            incremental_digest = incremental_json.canonical_json_sha256()
 
         self.assert_stats_shape(stats)
         self.assertEqual(stats.added_rows, delta_count)
@@ -536,17 +556,28 @@ class IncrementalShareWindowGoldenTests(unittest.TestCase):
         # inspected or rewritten. Fully expired and newly allocated pages do
         # not count; any larger value exposes retained-interior page work.
         self.assertLessEqual(stats.touched_pages, 2)
+        # Production materialization reuses JSON fragments on every retained
+        # page. Only the two changed edge pages plus a new delta page invoke
+        # per-share conversion; the ~89.5k retained interior is untouched.
+        self.assertLessEqual(prism_json_calls, 2 * page_size)
+        self.assertGreaterEqual(
+            sum(
+                1
+                for page in window.pages
+                if any(page is initial_page for initial_page in initial_pages)
+            ),
+            len(initial_pages) - 2,
+        )
         expected = full_rescan_oracle(
             (*initial, *delta),
             anchor_job_issued_at_ms=anchor_ms + 1,
             window_weight=initial_count,
         )
         self.assertEqual(window.records(), expected)
-        incremental_json = tuple(record.to_prism_json() for record in window.records())
         expected_json = tuple(record.to_prism_json() for record in expected)
-        self.assertEqual(incremental_json, expected_json)
+        self.assertEqual(tuple(incremental_json), expected_json)
         self.assertEqual(
-            canonical_json_sha256(incremental_json),
+            incremental_digest,
             canonical_json_sha256(expected_json),
         )
         self.assertEqual(len(window.records()), initial_count)

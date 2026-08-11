@@ -3,7 +3,7 @@
 
 Covers the coordinator changes that flatten the first-notify tail: initial
 requests subscribing to in-flight publication-priority builds, retryable
-payout-gate non-admission, per-generation share-window serialization caching,
+payout-gate non-admission, content-addressed share-window serialization caching,
 worker-count env knobs, and hashrate-ordered tip-refresh fanout admission.
 """
 
@@ -313,7 +313,7 @@ class RetryablePayoutGateTests(unittest.TestCase):
 
 
 class ShareWindowSerializationCacheTests(unittest.TestCase):
-    def test_cache_hits_within_generation_and_invalidates_on_bump(self) -> None:
+    def test_generation_retags_reuse_and_content_change_invalidates(self) -> None:
         server, _rpc = coordinator()
         shares = window_shares()
         artifact = payout_ledger_artifact(shares)
@@ -341,7 +341,7 @@ class ShareWindowSerializationCacheTests(unittest.TestCase):
             json.loads(compact_json),
             [list(entry) for entry in expected_compact],
         )
-        # Fragments encode once per generation and are reused verbatim.
+        # Fragments encode once per canonical window and are reused verbatim.
         self.assertIs(first.compact_fragments(shares)[0], identities_json)
 
         artifact_bump = dataclasses.replace(artifact, generation=2)
@@ -349,19 +349,33 @@ class ShareWindowSerializationCacheTests(unittest.TestCase):
             artifact_bump,
             shares,
         )
-        self.assertIsNot(rebuilt, first)
+        self.assertIs(rebuilt, first)
 
         payout_bump = dataclasses.replace(
             artifact,
             generation=3,
             payout_state_generation=artifact.payout_state_generation + 1,
         )
-        self.assertIsNot(
+        self.assertIs(
             server._share_window_serialization_for_artifact(
                 payout_bump,
                 shares,
             ),
             rebuilt,
+        )
+
+        changed_shares = [*shares, window_shares(5)[-1]]
+        changed = payout_ledger_artifact(
+            changed_shares,
+            generation=4,
+            payout_state_generation=1,
+        )
+        self.assertIsNot(
+            server._share_window_serialization_for_artifact(
+                changed,
+                changed_shares,
+            ),
+            first,
         )
 
     def test_concurrent_builders_share_one_digest_computation(self) -> None:

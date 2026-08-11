@@ -669,6 +669,153 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
         self.assertEqual(ledger.delta_snapshot_calls, 1)
         self.assertEqual(ledger.full_snapshot_calls, 2)
 
+    def test_periodic_self_check_replaces_divergent_delta_with_full_bytes(
+        self,
+    ) -> None:
+        class OmittingDeltaLedger(IncrementalRecordingLedger):
+            def snapshot_between_job_issues(
+                self,
+                previous_anchor_job_issued_at_ms: int,
+                anchor_job_issued_at_ms: int,
+            ) -> list[object]:
+                del previous_anchor_job_issued_at_ms, anchor_job_issued_at_ms
+                self.delta_snapshot_calls += 1
+                return []
+
+        ledger = OmittingDeltaLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            self.assertIsNotNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            server.payout_artifact_full_rescan_seconds = 0.0
+            repaired = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            forced = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+                True,
+            )
+
+        assert repaired is not None and forced is not None
+        self.assertEqual(repaired.window_build_mode, "self_check_mismatch")
+        self.assertEqual(list(repaired.shares_json), list(forced.shares_json))
+        self.assertEqual(
+            repaired.share_snapshot_sha256,
+            forced.share_snapshot_sha256,
+        )
+
+    def test_incremental_and_forced_full_artifacts_match_with_carry_boundaries(
+        self,
+    ) -> None:
+        class CarryLedger(IncrementalRecordingLedger):
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                return [
+                    {
+                        "recipient_id": "below",
+                        "order_key": "01:below",
+                        "p2mr_program_hex": "11" * 32,
+                        "balance_sats": 545,
+                    },
+                    {
+                        "recipient_id": "at",
+                        "order_key": "02:at",
+                        "p2mr_program_hex": "22" * 32,
+                        "balance_sats": 546,
+                    },
+                    {
+                        "recipient_id": "above",
+                        "order_key": "03:above",
+                        "p2mr_program_hex": "33" * 32,
+                        "balance_sats": 547,
+                    },
+                ]
+
+        ledger = CarryLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            self.assertIsNotNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            incremental = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            forced = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+                True,
+            )
+
+        assert incremental is not None and forced is not None
+        incremental_bytes = canonical_json_text(
+            {
+                "shares": list(incremental.shares_json),
+                "prior_balances": list(incremental.prior_balances),
+            }
+        ).encode()
+        forced_bytes = canonical_json_text(
+            {
+                "shares": list(forced.shares_json),
+                "prior_balances": list(forced.prior_balances),
+            }
+        ).encode()
+        self.assertEqual(incremental_bytes, forced_bytes)
+        self.assertEqual(
+            incremental.share_snapshot_sha256,
+            forced.share_snapshot_sha256,
+        )
+        self.assertEqual(
+            incremental.prior_balances_sha256,
+            forced.prior_balances_sha256,
+        )
+
     def test_fifteen_second_generation_bumps_refresh_once_per_minute(self) -> None:
         server, ledger, artifacts = self.configured_server()
         clock_ms = [1_000_000]
@@ -727,6 +874,219 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
                 share_seq=4,
                 accepted_at_ms=1_000_010,
             )
+            # Even an overdue routine oracle must be deferred from the
+            # immediate found-block publication path.
+            server.payout_artifact_full_rescan_seconds = 0.0
+            clock_ms[0] = 1_000_020
+            candidate = server._prepared_payout_state_candidate(
+                (
+                    0,
+                    1,
+                    str(server.rpc.tip),
+                    "accepted_block_preview",
+                    time.monotonic(),
+                )
+            )
+            candidate = server._accepted_block_preview_candidate(
+                candidate,
+                block_hash="44" * 32,
+                preview=(("winner", "01:winner", "55" * 32, 546),),
+            )
+
+        artifact = candidate.ledger_artifact
+        assert artifact is not None
+        self.assertEqual(artifact.window_build_mode, "incremental")
+        self.assertEqual(artifact.window_delta_rows, 1)
+        self.assertEqual(ledger.delta_snapshot_calls, 1)
+        self.assertEqual(ledger.full_snapshot_calls, 1)
+        self.assertEqual(len(artifact.shares_json), 4)
+
+    def test_failed_periodic_oracle_is_spaced_from_next_delta_build(self) -> None:
+        class FailingOracleLedger(IncrementalRecordingLedger):
+            fail_full_snapshot = False
+
+            def snapshot_at_job_issue(
+                self,
+                anchor_job_issued_at_ms: int,
+                *,
+                window_weight: int | None = None,
+            ) -> list[object]:
+                if self.fail_full_snapshot:
+                    self.full_snapshot_calls += 1
+                    raise RuntimeError("oracle unavailable")
+                return super().snapshot_at_job_issue(
+                    anchor_job_issued_at_ms,
+                    window_weight=window_weight,
+                )
+
+        ledger = FailingOracleLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        server.payout_artifact_full_rescan_seconds = 10.0
+        clock_ms = [1_000_000]
+        monotonic_seconds = [100.0]
+        with (
+            patch(
+                "lab.prism.prism_coordinator.now_ms",
+                side_effect=lambda: clock_ms[0],
+            ),
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: monotonic_seconds[0],
+            ),
+        ):
+            self.assertIsNotNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            ledger.fail_full_snapshot = True
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            monotonic_seconds[0] = 110.0
+            failed_check = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert failed_check is not None
+            self.assertEqual(
+                failed_check.window_build_mode,
+                "incremental_self_check_failed",
+            )
+
+            append_incremental_share(
+                ledger,
+                share_seq=5,
+                accepted_at_ms=1_000_021,
+            )
+            clock_ms[0] = 1_000_030
+            monotonic_seconds[0] = 111.0
+            next_delta = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+
+        assert next_delta is not None
+        self.assertEqual(next_delta.window_build_mode, "incremental")
+        self.assertEqual(ledger.full_snapshot_calls, 2)
+
+    def test_found_block_reuses_armed_window_when_prepare_lock_is_busy(
+        self,
+    ) -> None:
+        class BusyPrepareLock:
+            def acquire(self, blocking: bool = True) -> bool:
+                self.assert_nonblocking(blocking)
+                return False
+
+            @staticmethod
+            def assert_nonblocking(blocking: bool) -> None:
+                if blocking:
+                    raise AssertionError("found-block path attempted to wait")
+
+            def release(self) -> None:
+                raise AssertionError("unacquired lock was released")
+
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+            server._payout_state_prepare_lock = BusyPrepareLock()  # type: ignore[assignment]
+            candidate = server._prepared_payout_state_candidate(
+                (
+                    0,
+                    1,
+                    str(server.rpc.tip),
+                    "accepted_block_preview",
+                    time.monotonic(),
+                )
+            )
+            candidate = server._accepted_block_preview_candidate(
+                candidate,
+                block_hash="44" * 32,
+                preview=(("winner", "01:winner", "55" * 32, 546),),
+            )
+
+        artifact = candidate.ledger_artifact
+        assert artifact is not None
+        self.assertEqual(artifact.window_build_mode, "found_block_cached")
+        self.assertEqual(artifact.payout_state_generation, 1)
+        self.assertEqual(
+            list(artifact.prior_balances),
+            [
+                {
+                    "recipient_id": "winner",
+                    "order_key": "01:winner",
+                    "p2mr_program_hex": "55" * 32,
+                    "balance_sats": 546,
+                }
+            ],
+        )
+        self.assertEqual(ledger.full_snapshot_calls, 1)
+        self.assertEqual(ledger.delta_snapshot_calls, 0)
+        self.assertEqual(
+            server.payout_artifact_event_counts["found_block_cached"],
+            1,
+        )
+
+    def test_found_block_build_failure_is_visible_and_reuses_exact_window(
+        self,
+    ) -> None:
+        class FailingDeltaLedger(IncrementalRecordingLedger):
+            fail_delta = False
+
+            def snapshot_between_job_issues(
+                self,
+                previous_anchor_job_issued_at_ms: int,
+                anchor_job_issued_at_ms: int,
+            ) -> list[object]:
+                if self.fail_delta:
+                    self.delta_snapshot_calls += 1
+                    raise RuntimeError("delta unavailable")
+                return super().snapshot_between_job_issues(
+                    previous_anchor_job_issued_at_ms,
+                    anchor_job_issued_at_ms,
+                )
+
+        ledger = FailingDeltaLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+            ledger.fail_delta = True
             clock_ms[0] = 1_000_020
             candidate = server._prepared_payout_state_candidate(
                 (
@@ -740,10 +1100,75 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
 
         artifact = candidate.ledger_artifact
         assert artifact is not None
-        self.assertEqual(artifact.window_build_mode, "incremental")
-        self.assertEqual(artifact.window_delta_rows, 1)
-        self.assertEqual(ledger.delta_snapshot_calls, 1)
-        self.assertEqual(len(artifact.shares_json), 4)
+        self.assertEqual(artifact.window_build_mode, "found_block_cached")
+        self.assertEqual(
+            server.payout_artifact_event_counts["build_aborted"],
+            1,
+        )
+        self.assertEqual(
+            server.payout_artifact_event_counts["found_block_cached"],
+            1,
+        )
+
+    def test_old_anchor_does_not_rearm_before_window_cadence(self) -> None:
+        class RecordingExecutor:
+            def __init__(self) -> None:
+                self.submissions = 0
+
+            def submit(self, _fn: object) -> Future[None]:
+                self.submissions += 1
+                return Future()
+
+        server, _ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        monotonic_seconds = [100.0]
+        with (
+            patch(
+                "lab.prism.prism_coordinator.now_ms",
+                side_effect=lambda: clock_ms[0],
+            ),
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: monotonic_seconds[0],
+            ),
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+            executor = RecordingExecutor()
+            with server._payout_artifact_executor_lock:
+                server._payout_artifact_executor = executor  # type: ignore[assignment]
+
+            # A pending-share floor can leave the declared anchor old even
+            # though its exact pages were just re-proved. Past-floor probes
+            # must not enqueue five-second debounced balance-only builds.
+            clock_ms[0] = 1_061_000
+            monotonic_seconds[0] = 105.0
+            self.assertIsNotNone(
+                server._usable_payout_ledger_artifact(
+                    0,
+                    artifacts.network_difficulty,
+                )
+            )
+            with server._payout_artifact_executor_lock:
+                self.assertIsNone(server._payout_artifact_requested)
+
+            monotonic_seconds[0] = 160.0
+            self.assertIsNotNone(
+                server._usable_payout_ledger_artifact(
+                    0,
+                    artifacts.network_difficulty,
+                )
+            )
+
+        with server._payout_artifact_executor_lock:
+            self.assertEqual(
+                server._payout_artifact_requested,
+                (0, int(artifacts.network_difficulty)),
+            )
+            self.assertEqual(executor.submissions, 1)
 
 
 def mark_progress_healthy(server: PrismCoordinator) -> None:
@@ -3155,6 +3580,13 @@ class JobBundleCacheTests(unittest.TestCase):
                 120.0,
                 60.0,
             )
+        # The same margin applies to a custom build cadence; validating only
+        # the re-anchor floor allowed 299s builds under a 300s ceiling.
+        with self.assertRaises(SystemExit):
+            prism_coordinator_module.validate_payout_artifact_age_bounds(
+                300.0,
+                299.0,
+            )
         # The default split (300s ceiling, 60s floor) passes.
         prism_coordinator_module.validate_payout_artifact_age_bounds(
             300.0,
@@ -3414,6 +3846,18 @@ class JobBundleCacheTests(unittest.TestCase):
         )
         self.assertIn(
             'qbit_prism_payout_artifact_events_total{event="built"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_payout_artifact_events_total{event="incremental"}',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_payout_artifact_events_total{event="self_check_failed"}',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_payout_artifact_events_total{event="found_block_cached"}',
             metrics,
         )
 
@@ -7160,7 +7604,7 @@ class ShareWindowSpoolTests(unittest.TestCase):
             self._expected_payload(shares, height=11),
         )
 
-    def test_generation_rotation_retires_spool_after_last_lease(self) -> None:
+    def test_content_rotation_retires_spool_after_last_lease(self) -> None:
         server = self._coordinator()
         shares = [spool_share(seq) for seq in range(1, 4)]
         first = server._share_window_serialization_for_artifact(
@@ -7173,9 +7617,10 @@ class ShareWindowSpoolTests(unittest.TestCase):
         spool_file, spool_size = lease
         self.assertGreater(spool_size, 0)
 
+        changed_shares = [*shares, spool_share(4)]
         second = server._share_window_serialization_for_artifact(
-            self._ledger_artifact(shares, generation=2),
-            shares,
+            self._ledger_artifact(changed_shares, generation=2),
+            changed_shares,
         )
         self.assertIsNot(second, first)
         # Retired: no new leases, but the in-flight transfer keeps the
@@ -7184,6 +7629,21 @@ class ShareWindowSpoolTests(unittest.TestCase):
         self.assertFalse(spool_file.closed)
         first.release_spooled_tail()
         self.assertTrue(spool_file.closed)
+
+    def test_generation_retag_reuses_content_keyed_serialization(self) -> None:
+        server = self._coordinator()
+        shares = [spool_share(seq) for seq in range(1, 4)]
+
+        first = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+        second = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=2),
+            shares,
+        )
+
+        self.assertIs(second, first)
 
     def test_shutdown_retires_current_spool(self) -> None:
         server = self._coordinator()

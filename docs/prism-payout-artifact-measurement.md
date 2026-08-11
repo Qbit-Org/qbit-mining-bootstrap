@@ -11,11 +11,42 @@ Keep all raw CSV and log extracts with the rollout evidence.
 
 ## 1. Capture `pg_stat_statements`
 
-Run this immediately before and after each observation window and save the
-output as CSV:
+Run both captures immediately before and after each observation window. Save
+the reset timestamp beside each CSV; any change in `stats_reset` invalidates
+the subtraction (restart the observation window instead of comparing across a
+Postgres restart or statistics reset):
+
+```sql
+SELECT now() AT TIME ZONE 'UTC' AS captured_at_utc, stats_reset
+FROM pg_stat_statements_info;
+```
+
+The capture keeps the overall top 25 plus every known full-window, delta, and
+carry-balance query even when one falls outside the top-N at one boundary:
 
 ```sql
 COPY (
+    WITH normalized AS (
+        SELECT
+            queryid,
+            calls,
+            total_exec_time,
+            mean_exec_time,
+            rows,
+            shared_blks_hit,
+            shared_blks_read,
+            shared_blk_read_time,
+            temp_blks_read,
+            temp_blks_written,
+            regexp_replace(query, E'\\s+', ' ', 'g') AS normalized_query
+        FROM pg_stat_statements
+        WHERE dbid = (
+            SELECT oid FROM pg_database WHERE datname = current_database()
+        )
+    ), ranked AS (
+        SELECT *, row_number() OVER (ORDER BY total_exec_time DESC) AS total_rank
+        FROM normalized
+    )
     SELECT
         now() AT TIME ZONE 'UTC' AS captured_at_utc,
         queryid,
@@ -28,21 +59,28 @@ COPY (
         shared_blk_read_time,
         temp_blks_read,
         temp_blks_written,
-        left(regexp_replace(query, E'\\s+', ' ', 'g'), 500) AS query
-    FROM pg_stat_statements
-    WHERE dbid = (
-        SELECT oid FROM pg_database WHERE datname = current_database()
-    )
+        left(normalized_query, 500) AS query
+    FROM ranked
+    WHERE total_rank <= 25
+       OR normalized_query LIKE '%WITH RECURSIVE pages AS (%'
+       OR (
+           normalized_query LIKE '%qbit_share_ledger%'
+           AND normalized_query LIKE '%accepted_at > to_timestamp%'
+           AND normalized_query LIKE '%job_issued_at > to_timestamp%'
+       )
+       OR normalized_query LIKE '%qbit_current_carry_forward_balances()%'
     ORDER BY total_exec_time DESC
-    LIMIT 25
 ) TO STDOUT WITH (FORMAT CSV, HEADER TRUE);
 ```
 
 For each `queryid`, subtract the opening snapshot from the closing snapshot.
 Report calls, total execution time, shared blocks read, shared-block read time,
 and temp blocks. Calculate the interval mean as
-`total_exec_time_delta / calls_delta`. Keep both the overall top 25 and a
-filtered view for the normalized query beginning `WITH RECURSIVE pages AS (`.
+`total_exec_time_delta / calls_delta`. Keep separate filtered views for the
+pages oracle, delta query, and carry aggregate. If a captured queryid is absent
+from the explicit filters at either boundary, mark it not comparable and fix
+the capture before the next window; top-N membership alone must never imply a
+zero counter.
 
 Expected after rollout: the pages CTE runs only for cold start, explicit
 reconcile/correction fallback, invariant fallback, and periodic self-check. It
@@ -54,6 +92,11 @@ Take `anchor_ms`, `window_shares`, and network difficulty from one coordinator
 build event. Set `window_weight` to `16 * network_difficulty`. Use the same
 window weight before and after rollout. Run the following in `psql`, supplying
 integer variables `anchor_ms` and `window_weight`:
+
+`EXPLAIN ANALYZE` executes the query. Prefer a production replica with
+representative data; otherwise run off-peak with operator approval and retain
+the statement timeout below. It is read-only, but it can still consume material
+I/O and CPU.
 
 ```sql
 BEGIN READ ONLY;
@@ -181,15 +224,20 @@ blocker and must be investigated even though runtime resets to the full oracle.
 
 ### Time spent building during publication
 
-Set `PRISM_OBSERVATION_SECONDS` to the exact interval length. Debounced retags
-have their own event and are intentionally excluded:
+Set `PRISM_OBSERVATION_SECONDS` to the exact interval length. Include actual
+builds, debounced retags (which still read carry balances), publication aborts,
+and cached found-block fallbacks so the duty calculation cannot hide remaining
+publication work:
 
 ```sh
 jq -s --argjson seconds "$PRISM_OBSERVATION_SECONDS" '
   [.[]
-   | select(.event == "payout_artifact_built")
+   | select(.event == "payout_artifact_built"
+            or .event == "payout_artifact_build_debounced"
+            or .event == "payout_artifact_build_aborted"
+            or .event == "payout_artifact_found_block_cached")
    | select(.during_publication == true)
-   | .duration_seconds]
+   | (.duration_seconds // 0)]
   | {
       publication_build_seconds: (add // 0),
       observation_seconds: $seconds,

@@ -14,6 +14,7 @@ import subprocess
 import time
 import traceback
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA = "qbit.prism.window-completeness-proof.v
 DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
 DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
 DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
+DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE = 512
 # Only the coordinator assigns this prefix, and PsqlShareLedger preserves it
 # only after acquiring the writer/epoch advisory guard. Other ledger users and
 # psql-only deployments retain ordinary TTL fencing and are never treated as
@@ -127,16 +129,81 @@ class IncrementalWindowAdvanceStats:
 class _IncrementalShareWindowPage:
     records: tuple[AcceptedShareRecord, ...]
     total_difficulty: int
+    prism_json_records: tuple[dict[str, object], ...]
+    canonical_json_items: bytes
 
     @classmethod
     def from_records(
         cls,
         records: tuple[AcceptedShareRecord, ...],
     ) -> _IncrementalShareWindowPage:
+        prism_json_records = tuple(record.to_prism_json() for record in records)
         return cls(
             records=records,
             total_difficulty=sum(int(record.share_difficulty) for record in records),
+            prism_json_records=prism_json_records,
+            canonical_json_items=b",".join(
+                json.dumps(
+                    record,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode()
+                for record in prism_json_records
+            ),
         )
+
+
+@dataclass(frozen=True)
+class IncrementalShareJsonSequence(Sequence[dict[str, object]]):
+    """Immutable JSON view backed by the payout window's persistent pages.
+
+    Advancing a window allocates JSON only for append/head boundary pages.
+    Iteration remains wire-identical to the historical flat tuple, while the
+    canonical digest streams already-encoded page fragments without calling
+    ``to_prism_json`` on retained shares.
+    """
+
+    pages: tuple[_IncrementalShareWindowPage, ...]
+    record_count: int
+
+    def __len__(self) -> int:
+        return self.record_count
+
+    def __iter__(self) -> Iterator[dict[str, object]]:
+        for page in self.pages:
+            yield from page.prism_json_records
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> dict[str, object] | tuple[dict[str, object], ...]:
+        if isinstance(index, slice):
+            return tuple(self)[index]
+        resolved = index
+        if resolved < 0:
+            resolved += self.record_count
+        if resolved < 0 or resolved >= self.record_count:
+            raise IndexError(index)
+        for page in self.pages:
+            if resolved < len(page.prism_json_records):
+                return page.prism_json_records[resolved]
+            resolved -= len(page.prism_json_records)
+        raise IndexError(index)
+
+    def canonical_json_sha256(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"[")
+        needs_separator = False
+        for page in self.pages:
+            if not page.canonical_json_items:
+                continue
+            if needs_separator:
+                digest.update(b",")
+            digest.update(page.canonical_json_items)
+            needs_separator = True
+        digest.update(b"]")
+        return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -162,13 +229,13 @@ class IncrementalShareWindow:
         *,
         anchor_job_issued_at_ms: int,
         window_weight: int,
-        page_size: int = 4096,
+        page_size: int = DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
     ) -> IncrementalShareWindow:
         """Build cache state from the full-rescan oracle.
 
-        The in-memory ledger intentionally returns an unbounded eligible
-        history, while Postgres already returns the bounded superset. Applying
-        the exact crossing-row cutoff here makes both backends identical.
+        Applying the exact crossing-row cutoff here normalizes full-oracle
+        implementations and also provides the authoritative reset after an
+        incremental invariant failure.
         """
 
         anchor_job_issued_at_ms = int(anchor_job_issued_at_ms)
@@ -225,6 +292,12 @@ class IncrementalShareWindow:
 
     def records(self) -> tuple[AcceptedShareRecord, ...]:
         return tuple(record for page in self.pages for record in page.records)
+
+    def json_records(self) -> IncrementalShareJsonSequence:
+        return IncrementalShareJsonSequence(
+            pages=self.pages,
+            record_count=sum(len(page.records) for page in self.pages),
+        )
 
     def advance(
         self,
@@ -630,17 +703,25 @@ class SingleWriterShareLedger:
         *,
         window_weight: int | None = None,
     ) -> list[AcceptedShareRecord]:
-        # window_weight is a bound hint for the large Postgres ledger; the
-        # in-memory ledger is small, so it returns the full eligible set (a
-        # superset of the reward window, which is digest-neutral).
-        del window_weight
         with self._lock:
-            return [
+            eligible = [
                 replace(share)
                 for share in self._shares
                 if share.job_issued_at_ms <= anchor_job_issued_at_ms
                 and share.accepted_at_ms <= anchor_job_issued_at_ms
             ]
+        if window_weight is None:
+            return eligible
+        # Match the Postgres oracle's exact whole-share crossing rule. This
+        # keeps synchronous and incremental artifacts byte-identical in local
+        # and embedded deployments instead of treating the bound as a hint.
+        return list(
+            IncrementalShareWindow.from_full_snapshot(
+                eligible,
+                anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+                window_weight=int(window_weight),
+            ).records()
+        )
 
     def snapshot_between_job_issues(
         self,

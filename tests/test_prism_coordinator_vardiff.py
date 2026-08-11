@@ -4250,7 +4250,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
     def _reconcile_coordinator_with_artifact_counter(
         ledger: ReorgLedger,
         rpc: ReorgRpc,
-    ) -> tuple[PrismCoordinator, list[tuple[int, int]]]:
+    ) -> tuple[PrismCoordinator, list[tuple[int, int, bool]]]:
         """Coordinator armed so candidate preparation would build an artifact."""
         server = coordinator()
         server.reorg_reconciler_enabled = True
@@ -4262,17 +4262,22 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server._payout_artifact_executor_shutdown = True
         server._pool_ready_latched = True
         server._template_artifacts = SimpleNamespace(network_difficulty=1)
-        build_calls: list[tuple[int, int]] = []
+        build_calls: list[tuple[int, int, bool]] = []
 
         def fake_build(
             expected_payout_state_generation: int,
             artifact_payout_state_generation: int,
             network_difficulty: int,
+            force_full_rescan: bool = False,
+            bypass_build_interval: bool = False,
+            during_publication: bool = False,
         ) -> None:
+            del network_difficulty, bypass_build_interval, during_publication
             build_calls.append(
                 (
                     expected_payout_state_generation,
                     artifact_payout_state_generation,
+                    force_full_rescan,
                 )
             )
             return None
@@ -4296,6 +4301,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         first = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
         self.assertEqual(first["published_generation"], 1)
         self.assertEqual(len(build_calls), 1)
+        self.assertFalse(build_calls[0][2])
 
         second = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
 
@@ -4344,6 +4350,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(second["inactive_blocks"], 1)
         self.assertEqual(second["published_generation"], 2)
         self.assertEqual(len(build_calls), 2)
+        self.assertTrue(build_calls[1][2])
         self.assertEqual(ledger.rows[0]["chain_state"], "inactive")
         self.assertIn(("inactive", pool_block_hash, 10), ledger.events)
 
