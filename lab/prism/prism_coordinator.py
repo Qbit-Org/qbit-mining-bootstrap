@@ -4770,6 +4770,9 @@ class PrismCoordinator:
                         != self._payout_state_generation
                     ):
                         return None
+                    published_payout_artifact = (
+                        self._published_payout_state.artifact
+                    )
                 snapshot_window_weight = (
                     PRISM_REWARD_WINDOW_MULTIPLIER
                     * PRISM_SNAPSHOT_WINDOW_MARGIN
@@ -4796,7 +4799,24 @@ class PrismCoordinator:
                     bypass_build_interval=bypass_build_interval,
                 )
                 window_build_seconds = time.monotonic() - window_started
-                prior_balances = self.ledger.current_prior_balances()
+                if (
+                    not force_full_rescan
+                    and published_payout_artifact is not None
+                    and published_payout_artifact.generation
+                    == expected_payout_state_generation
+                ):
+                    # Prior balances are generation-owned immutable state.
+                    # Normal share-window refreshes cannot change them, so
+                    # reuse the exact published bytes instead of aggregating
+                    # the 1.3M-row carry tables on every debounced generation.
+                    # Reconcile/withdrawal mutations force a ledger read.
+                    prior_balances = (
+                        published_payout_artifact.prior_balances()
+                    )
+                    prior_balances_source = "published"
+                else:
+                    prior_balances = self.ledger.current_prior_balances()
+                    prior_balances_source = "ledger"
             accepted_share_count, _ = self.accepted_share_stats()
         except Exception as exc:
             # Artifact preparation is speculative. The synchronous bundle path
@@ -4862,6 +4882,7 @@ class PrismCoordinator:
             "anchor_age_ms": now_ms() - materialized.snapshot_anchor_ms,
             "during_publication": bool(during_publication),
             "build_interval_bypassed": bool(bypass_build_interval),
+            "prior_balances_source": prior_balances_source,
         }
         if materialized.full_rescan_reason is not None:
             log_fields["full_rescan_reason"] = materialized.full_rescan_reason

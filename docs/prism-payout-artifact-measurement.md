@@ -86,6 +86,10 @@ Expected after rollout: the pages CTE runs only for cold start, explicit
 reconcile/correction fallback, invariant fallback, and periodic self-check. It
 should disappear from steady-state top consumers.
 
+The carry-balance aggregate should likewise be limited to cold publication or
+forced payout mutations. Normal and debounced artifact logs should report
+`prior_balances_source:"published"`.
+
 ## 2. Explain the full-rescan oracle
 
 Take `anchor_ms`, `window_shares`, and network difficulty from one coordinator
@@ -225,9 +229,8 @@ blocker and must be investigated even though runtime resets to the full oracle.
 ### Time spent building during publication
 
 Set `PRISM_OBSERVATION_SECONDS` to the exact interval length. Include actual
-builds, debounced retags (which still read carry balances), publication aborts,
-and cached found-block fallbacks so the duty calculation cannot hide remaining
-publication work:
+builds, debounced retags, publication aborts, and cached found-block fallbacks
+so the duty calculation cannot hide remaining publication work:
 
 ```sh
 jq -s --argjson seconds "$PRISM_OBSERVATION_SECONDS" '
@@ -301,6 +304,7 @@ sidecar failures, zero normal-operation reconcile-prefetch timeouts, and
 | Full pages-CTE calls/hour | | | Cold/correction/check only |
 | Pages-CTE execution time/hour | | | Near-zero background |
 | Pages-CTE shared blocks read/hour | | | Near-zero background |
+| Carry-balance aggregate calls/hour | | | Cold/payout mutation only |
 | Reconcile-prefetch >20s events/hour | | | 0 |
 | Sidecar subscribe failures/hour | 50–115 | | Approximately 0 background |
 | `PrismStratumCheckFailureRateHigh` | Firing | | Clear |

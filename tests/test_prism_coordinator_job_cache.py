@@ -816,6 +816,69 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             forced.prior_balances_sha256,
         )
 
+    def test_normal_refresh_reuses_generation_owned_prior_balances(self) -> None:
+        class CountingCarryLedger(IncrementalRecordingLedger):
+            prior_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.prior_balance_reads += 1
+                return [
+                    {
+                        "recipient_id": "carry",
+                        "order_key": "01:carry",
+                        "p2mr_program_hex": "66" * 32,
+                        "balance_sats": 545,
+                    }
+                ]
+
+        ledger = CountingCarryLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            published = server._current_payout_state_artifact()
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            incremental = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            forced = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+                True,
+            )
+
+        assert initial is not None and incremental is not None and forced is not None
+        self.assertEqual(ledger.prior_balance_reads, 2)
+        self.assertEqual(
+            initial.prior_balances_sha256,
+            published.prior_balances_sha256,
+        )
+        self.assertEqual(
+            incremental.prior_balances_sha256,
+            published.prior_balances_sha256,
+        )
+
     def test_fifteen_second_generation_bumps_refresh_once_per_minute(self) -> None:
         server, ledger, artifacts = self.configured_server()
         clock_ms = [1_000_000]
