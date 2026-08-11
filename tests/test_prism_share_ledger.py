@@ -984,6 +984,27 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         self.assertFalse(ledger.release_writer_lease())
 
+    def test_watchdog_release_uses_fresh_psql_connection_path(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._writer_id = "writer-a"
+        ledger._writer_epoch = 7
+        ledger._writer_session_token = "session-a"
+
+        with unittest.mock.patch.object(
+            ledger,
+            "_run_fenced_json",
+            side_effect=AssertionError("shared fenced path must not run"),
+        ) as fenced, unittest.mock.patch.object(
+            ledger,
+            "_run_sql",
+            return_value='{"released": 1}\n',
+        ) as fresh:
+            self.assertTrue(ledger.release_writer_lease_fresh_connection())
+
+        fenced.assert_not_called()
+        fresh.assert_called_once()
+        self.assertIn("UPDATE qbit_ledger_writer_lease", fresh.call_args.args[0])
+
     def test_renew_writer_lease_refreshes_only_held_identity(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
             [acquired_lease(), {"backend": "postgres-psql", "renewed_count": 1}],

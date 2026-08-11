@@ -261,6 +261,10 @@ DEFAULT_SHARE_COMMIT_BATCH_SIZE = 64
 DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS = 5.0
 DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS = 15.0
 DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS = 15.0
+# A watchdog release must never turn a wedged DB path into a second outage.
+# The release worker is daemonized and the watchdog hard-exits at this total
+# wall-clock deadline whether quiescence or the fresh DB connection completes.
+DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS = 5.0
 DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS = 120
 DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS = 900.0
 # The reward window is 8x network difficulty (must match PRISM_WINDOW_MULTIPLIER
@@ -2522,9 +2526,17 @@ class CoordinatorShutdownController:
         with self.condition:
             return self.phase != "running"
 
-    def wait_for_writer_quiescence(self) -> tuple[bool, float, dict[str, int]]:
+    def wait_for_writer_quiescence(
+        self,
+        timeout_seconds: float | None = None,
+    ) -> tuple[bool, float, dict[str, int]]:
         started = time.monotonic()
-        deadline = started + self.writer_quiescence_timeout_seconds
+        timeout = (
+            self.writer_quiescence_timeout_seconds
+            if timeout_seconds is None
+            else max(0.0, float(timeout_seconds))
+        )
+        deadline = started + timeout
         with self.condition:
             while self.active_writers:
                 remaining = deadline - time.monotonic()
@@ -10986,7 +10998,7 @@ class PrismCoordinator:
                     "Exiting non-zero so the restart policy recovers the process.",
                     flush=True,
                 )
-                os._exit(1)
+                self._watchdog_hard_exit("coordination")
             if publication_failure == "publication":
                 print(
                     "prism coordinator: publication-progress watchdog firing; "
@@ -10996,7 +11008,7 @@ class PrismCoordinator:
                     "Exiting non-zero so the restart policy recovers the process.",
                     flush=True,
                 )
-                os._exit(1)
+                self._watchdog_hard_exit("publication")
             overdue = (
                 self._overdue_heartbeats(now)
                 if getattr(self, "watchdog_enabled", True)
@@ -11012,7 +11024,83 @@ class PrismCoordinator:
                 # Queued shares have not been acknowledged. Miners reconnect
                 # and retry them after restart; exact-payload replay is
                 # idempotent if Postgres committed just before this exit.
-                os._exit(1)
+                self._watchdog_hard_exit("liveness")
+
+    def _watchdog_hard_exit(self, reason: str) -> None:
+        """Bound a fresh-thread lease release, then terminate unconditionally."""
+        timeout_seconds = float(
+            getattr(
+                self,
+                "watchdog_lease_release_timeout_seconds",
+                DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS,
+            )
+        )
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        release_thread = threading.Thread(
+            target=self._watchdog_release_ledger_lease,
+            args=(reason, deadline),
+            name="prism-watchdog-lease-release",
+            daemon=True,
+        )
+        release_thread.start()
+        release_thread.join(max(0.0, deadline - time.monotonic()))
+        if release_thread.is_alive():
+            self._shutdown_log(
+                "watchdog_lease_release_deadline",
+                reason=reason,
+                timeout_seconds=timeout_seconds,
+                outcome="timeout",
+            )
+        os._exit(1)
+
+    def _watchdog_release_ledger_lease(
+        self,
+        reason: str,
+        deadline: float,
+    ) -> bool:
+        """Use only the shutdown controller and a fresh DB connection.
+
+        Do not call ``shutdown`` here: cancellation takes ``self.lock``, which
+        may belong to the subsystem that triggered the watchdog. Closing
+        writer admission plus the controller's tracked-writer barrier retains
+        the graceful path's release-withheld invariant without that lock.
+        """
+        controller = self._ensure_shutdown_controller()
+        controller.request_shutdown(None)
+        self.stop_event.set()
+        if not controller.begin_shutdown(f"watchdog_{reason}"):
+            return controller.wait_for_lease_handling()
+
+        self._shutdown_log(
+            "shutdown_start",
+            reason=f"watchdog_{reason}",
+            signal=None,
+            writer_quiescence_timeout_seconds=max(
+                0.0,
+                deadline - time.monotonic(),
+            ),
+        )
+        quiesced, elapsed, blockers = controller.wait_for_writer_quiescence(
+            max(0.0, deadline - time.monotonic())
+        )
+        self._shutdown_log(
+            "writer_quiescence",
+            duration_seconds=round(elapsed, 6),
+            outcome="success" if quiesced else "timeout",
+            blockers=blockers,
+        )
+        if not quiesced:
+            for component, active_count in blockers.items():
+                self._shutdown_log(
+                    "lease_release_withheld",
+                    component=component,
+                    active_operations=active_count,
+                    reason="watchdog_writer_quiescence_timeout",
+                )
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        return self.release_ledger_lease(fresh_connection=True)
 
     def _ensure_shutdown_controller(self) -> CoordinatorShutdownController:
         controller = getattr(self, "_shutdown_controller", None)
@@ -11100,7 +11188,7 @@ class PrismCoordinator:
             return False
         return self.release_ledger_lease()
 
-    def release_ledger_lease(self) -> bool:
+    def release_ledger_lease(self, *, fresh_connection: bool = False) -> bool:
         """Release a quiesced writer lease at most once.
 
         The exact-session database fence makes an already-absent lease safe.
@@ -11118,10 +11206,17 @@ class PrismCoordinator:
                 )
             return controller.lease_release_succeeded
 
-        release = getattr(self.ledger, "release_writer_lease", None)
+        release = (
+            getattr(self.ledger, "release_writer_lease_fresh_connection", None)
+            if fresh_connection
+            else None
+        )
+        if release is None:
+            release = getattr(self.ledger, "release_writer_lease", None)
         self._shutdown_log(
             "lease_release_attempt",
             supported=release is not None,
+            fresh_connection=fresh_connection,
         )
         if release is None:
             controller.finish_lease_release("unsupported", 0.0)

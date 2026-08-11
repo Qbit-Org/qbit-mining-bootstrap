@@ -6542,8 +6542,20 @@ END;
         return {"backend": str(result["backend"]), "renewed_count": int(result["renewed_count"])}
 
     def release_writer_lease(self) -> bool:
-        """Expire this writer's lease so a same-identity replacement can take
-        over immediately instead of waiting out the lease TTL.
+        """Expire this writer's lease through the normal fenced DB path."""
+        return self._release_writer_lease_with(self._run_fenced_json)
+
+    def release_writer_lease_fresh_connection(self) -> bool:
+        """Expire this writer's lease through a one-shot psql connection.
+
+        The watchdog uses this path because its shared ledger lock or native
+        connection pool may be held by the subsystem that stopped making
+        progress. ``_run_sql`` forks psql without touching either resource.
+        """
+        return self._release_writer_lease_with(self._run_fresh_connection_json)
+
+    def _release_writer_lease_with(self, run_json: Callable[[str], Any]) -> bool:
+        """Run the one exact-session release implementation with ``run_json``.
 
         Best-effort, intended for graceful shutdown. Only the exact
         ``(writer_id, writer_epoch, writer_session_token)`` this process holds is
@@ -6572,10 +6584,16 @@ released AS (
 )
 SELECT json_build_object('released', (SELECT count(*) FROM released));
 """
-        result = self._run_fenced_json(sql)
+        result = run_json(sql)
         if not isinstance(result, dict):
             raise RuntimeError("psql writer lease release returned non-object JSON")
         return int(result.get("released", 0)) > 0
+
+    def _run_fresh_connection_json(self, sql: str) -> Any:
+        output = self._run_sql(sql).strip()
+        if not output:
+            raise RuntimeError("psql query returned no JSON")
+        return json.loads(output.splitlines()[-1])
 
     def _run_json(self, sql: str) -> Any:
         native = getattr(self, "_native", None)

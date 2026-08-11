@@ -34,6 +34,16 @@ class RecordingLeaseLedger:
         return True
 
 
+class WatchdogLeaseLedger(RecordingLeaseLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_thread: threading.Thread | None = None
+
+    def release_writer_lease_fresh_connection(self) -> bool:
+        self.release_thread = threading.current_thread()
+        return self.release_writer_lease()
+
+
 def coordinator(
     ledger: object | None = None,
     *,
@@ -49,6 +59,83 @@ def coordinator(
 
 
 class PrismCoordinatorShutdownTests(unittest.TestCase):
+    def test_watchdog_exit_releases_on_fresh_thread_within_deadline(self) -> None:
+        ledger = WatchdogLeaseLedger()
+        server = coordinator(ledger)
+        server.watchdog_lease_release_timeout_seconds = 0.2
+        watchdog_thread = threading.current_thread()
+
+        started = time.monotonic()
+        with patch("builtins.print"), patch(
+            "lab.prism.prism_coordinator.os._exit",
+            side_effect=SystemExit(1),
+        ) as hard_exit, self.assertRaises(SystemExit):
+            server._watchdog_hard_exit("liveness")
+        elapsed = time.monotonic() - started
+
+        hard_exit.assert_called_once_with(1)
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(ledger.release_calls, 1)
+        self.assertIsNotNone(ledger.release_thread)
+        self.assertIsNot(ledger.release_thread, watchdog_thread)
+        self.assertEqual(ledger.release_thread.name, "prism-watchdog-lease-release")
+
+    def test_watchdog_exit_hard_exits_when_fresh_db_release_hangs(self) -> None:
+        release_started = threading.Event()
+        unblock_release = threading.Event()
+        release_finished = threading.Event()
+
+        class BlockingLedger(RecordingLeaseLedger):
+            def release_writer_lease_fresh_connection(self) -> bool:
+                release_started.set()
+                unblock_release.wait(1)
+                release_finished.set()
+                return True
+
+        server = coordinator(BlockingLedger())
+        server.watchdog_lease_release_timeout_seconds = 0.02
+
+        started = time.monotonic()
+        try:
+            with patch("builtins.print"), patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=SystemExit(1),
+            ) as hard_exit, self.assertRaises(SystemExit):
+                server._watchdog_hard_exit("publication")
+        finally:
+            unblock_release.set()
+        elapsed = time.monotonic() - started
+
+        hard_exit.assert_called_once_with(1)
+        self.assertTrue(release_started.is_set())
+        self.assertLess(elapsed, 0.2)
+        self.assertTrue(release_finished.wait(0.2))
+
+    def test_watchdog_exit_withholds_release_while_writer_is_active(self) -> None:
+        ledger = WatchdogLeaseLedger()
+        server = coordinator(ledger)
+        server.watchdog_lease_release_timeout_seconds = 0.02
+        controller = server._ensure_shutdown_controller()
+        active_writer = controller.reserve_writer("block_submitter")
+
+        try:
+            with patch("builtins.print"), patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=SystemExit(1),
+            ), self.assertRaises(SystemExit):
+                server._watchdog_hard_exit("liveness")
+            deadline = time.monotonic() + 0.2
+            while (
+                not controller.snapshot()["lease_release_withheld"]
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+            self.assertTrue(controller.snapshot()["lease_release_withheld"])
+        finally:
+            active_writer.finish()
+
+        self.assertEqual(ledger.release_calls, 0)
+
     def test_normal_shutdown_releases_lease_promptly_and_exports_metrics(self) -> None:
         ledger = RecordingLeaseLedger()
         server = coordinator(ledger)
