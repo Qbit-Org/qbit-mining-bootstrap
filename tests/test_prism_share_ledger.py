@@ -137,8 +137,9 @@ def held_lease(
     writer_epoch: int = 1,
     session: str = "old-session",
     wait_seconds: float = 5.0,
+    updated_at: str | None = None,
 ) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
         "acquired": False,
         "writer_id": writer_id,
         "writer_epoch": writer_epoch,
@@ -146,6 +147,9 @@ def held_lease(
         "lease_expires_at": "2026-06-26 19:50:22.233718+00",
         "lease_wait_seconds": wait_seconds,
     }
+    if updated_at is not None:
+        result["lease_updated_at"] = updated_at
+    return result
 
 
 class FakeLeasePsqlShareLedger(PsqlShareLedger):
@@ -154,9 +158,10 @@ class FakeLeasePsqlShareLedger(PsqlShareLedger):
         self.lease_queries: list[str] = []
         self.sleeps: list[float] = []
         kwargs.setdefault("native_client_mode", "0")
+        retry_sleep = kwargs.pop("lease_retry_sleep", self.sleeps.append)
         super().__init__(
             psql_command="psql postgresql://example.invalid/qbit",
-            lease_retry_sleep=self.sleeps.append,
+            lease_retry_sleep=retry_sleep,
             lease_retry_max_sleep_seconds=1.0,
             **kwargs,
         )
@@ -3005,6 +3010,80 @@ class PrismShareLedgerTests(unittest.TestCase):
             stdout.getvalue(),
         )
         self.assertIn("holder writer=writer-a epoch=1 session=old-session", stdout.getvalue())
+
+    def test_postgres_startup_adopts_stale_same_identity_session_immediately(self) -> None:
+        updated_at = "2026-06-26 19:49:22.233718+00"
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            ledger = FakeLeasePsqlShareLedger(
+                [
+                    held_lease(updated_at=updated_at),
+                    acquired_lease(session="new-session") | {"adopted": True},
+                ],
+                writer_id="writer-a",
+                writer_epoch=1,
+                writer_session_token="new-session",
+            )
+
+        self.assertEqual(ledger.sleeps, [])
+        self.assertEqual(len(ledger.lease_queries), 2)
+        adoption_query = ledger.lease_queries[1]
+        self.assertIn("observed_writer_session_token", adoption_query)
+        self.assertIn("observed_lease_updated_at", adoption_query)
+        self.assertIn("qbit_ledger_writer_lease.updated_at =", adoption_query)
+        self.assertIn("old-session", adoption_query)
+        self.assertIn(updated_at, adoption_query)
+        self.assertIn("adopted from same-identity predecessor", stdout.getvalue())
+
+    def test_postgres_startup_refuses_same_session_after_concurrent_renewal(self) -> None:
+        first_updated_at = "2026-06-26 19:49:22.233718+00"
+        renewed_updated_at = "2026-06-26 19:49:23.233718+00"
+        sleeps: list[float] = []
+
+        class StopAfterRenewalObserved(RuntimeError):
+            pass
+
+        def stop_after_second_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) == 2:
+                raise StopAfterRenewalObserved
+
+        ledger = FakeLeasePsqlShareLedger.__new__(FakeLeasePsqlShareLedger)
+        with self.assertRaises(StopAfterRenewalObserved):
+            ledger.__init__(
+                [
+                    held_lease(updated_at=first_updated_at),
+                    held_lease(updated_at=renewed_updated_at),
+                    held_lease(updated_at=renewed_updated_at),
+                ],
+                writer_id="writer-a",
+                writer_epoch=1,
+                writer_session_token="new-session",
+                lease_retry_sleep=stop_after_second_sleep,
+            )
+
+        self.assertEqual(sleeps, [1.0, 1.0])
+        self.assertEqual(len(ledger.lease_queries), 3)
+        self.assertIn("observed_lease_updated_at", ledger.lease_queries[1])
+        self.assertNotIn("observed_lease_updated_at", ledger.lease_queries[2])
+
+    def test_postgres_startup_never_adopts_different_writer_or_epoch(self) -> None:
+        for holder in (
+            held_lease(writer_id="writer-b", updated_at="2026-06-26 19:49:22+00"),
+            held_lease(writer_epoch=2, updated_at="2026-06-26 19:49:22+00"),
+        ):
+            with self.subTest(holder=holder):
+                ledger = FakeLeasePsqlShareLedger.__new__(FakeLeasePsqlShareLedger)
+                with self.assertRaisesRegex(RuntimeError, "qbit ledger writer lease is held by"):
+                    ledger.__init__(
+                        [holder],
+                        writer_id="writer-a",
+                        writer_epoch=1,
+                        writer_session_token="new-session",
+                    )
+                self.assertEqual(len(ledger.lease_queries), 1)
+                self.assertNotIn("observed_lease_updated_at", ledger.lease_queries[0])
 
     def test_postgres_startup_refuses_another_active_writer_lease(self) -> None:
         stdout = io.StringIO()

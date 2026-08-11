@@ -1359,6 +1359,10 @@ class PsqlShareLedger:
         self._lease_retry_sleep = lease_retry_sleep or time.sleep
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
+        # A failed compare-and-swap proves that this exact predecessor session
+        # renewed after we observed it. Do not immediately race the same live
+        # session again; ordinary expiry polling remains the safe fallback.
+        self._lease_adoption_refused_session_token: str | None = None
         self._lock = Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         self._audit_body_dir = Path(audit_body_dir) if audit_body_dir else None
@@ -6292,6 +6296,22 @@ END;
             result = self._try_acquire_writer_lease()
             if result.get("acquired"):
                 return
+            if self._can_adopt_writer_lease(result):
+                observed_session = str(result["writer_session_token"])
+                adoption = self._try_adopt_writer_lease(result)
+                if adoption.get("acquired"):
+                    print(
+                        "prism ledger writer lease adopted from same-identity "
+                        f"predecessor session={observed_session}",
+                        flush=True,
+                    )
+                    return
+                # The CAS can lose because the observed holder renewed, was
+                # released, or was replaced. Only a still-current exact
+                # session is known live and must not be challenged again.
+                if adoption.get("writer_session_token") == observed_session:
+                    self._lease_adoption_refused_session_token = observed_session
+                result = adoption
             if not self._can_wait_for_writer_lease(result):
                 raise RuntimeError(
                     "qbit ledger writer lease is held by "
@@ -6369,6 +6389,7 @@ SELECT COALESCE(
             'writer_epoch', writer_epoch,
             'writer_session_token', writer_session_token,
             'lease_expires_at', lease_expires_at::text,
+            'lease_updated_at', updated_at::text,
             'lease_wait_seconds', GREATEST(
                 0,
                 EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp()))
@@ -6382,6 +6403,86 @@ SELECT COALESCE(
         result = self._run_json(sql)
         if not isinstance(result, dict):
             raise RuntimeError("psql writer lease query returned non-object JSON")
+        return result
+
+    def _can_adopt_writer_lease(self, result: dict[str, Any]) -> bool:
+        observed_session = result.get("writer_session_token")
+        return bool(
+            self._can_wait_for_writer_lease(result)
+            and observed_session
+            and observed_session != self._writer_session_token
+            and observed_session != self._lease_adoption_refused_session_token
+            and result.get("lease_updated_at") is not None
+        )
+
+    def _try_adopt_writer_lease(self, observed: dict[str, Any]) -> dict[str, Any]:
+        """Fence and replace one observed same-identity predecessor session.
+
+        Every ledger mutation renews the singleton lease row for its exact
+        session in the same SQL statement as the mutation. PostgreSQL row-lock
+        ordering therefore makes this compare-and-swap the split-brain fence:
+        a predecessor renewal that wins first changes ``updated_at`` and makes
+        this update affect zero rows; if this update wins first, every later
+        predecessor mutation sees a different session and is fenced out.
+        """
+        payload = {
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+            "observed_writer_session_token": observed.get("writer_session_token"),
+            "observed_lease_updated_at": observed.get("lease_updated_at"),
+        }
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+adopted AS (
+    UPDATE qbit_ledger_writer_lease
+    SET writer_session_token = data->>'writer_session_token',
+        lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'observed_writer_session_token'
+      AND qbit_ledger_writer_lease.updated_at = (data->>'observed_lease_updated_at')::timestamptz
+      AND qbit_ledger_writer_lease.lease_expires_at > clock_timestamp()
+    RETURNING writer_id, writer_epoch, writer_session_token
+)
+SELECT COALESCE(
+    (
+        SELECT json_build_object(
+            'acquired', true,
+            'adopted', true,
+            'writer_id', writer_id,
+            'writer_epoch', writer_epoch,
+            'writer_session_token', writer_session_token
+        )
+        FROM adopted
+    ),
+    (
+        SELECT json_build_object(
+            'acquired', false,
+            'adopted', false,
+            'writer_id', writer_id,
+            'writer_epoch', writer_epoch,
+            'writer_session_token', writer_session_token,
+            'lease_expires_at', lease_expires_at::text,
+            'lease_updated_at', updated_at::text,
+            'lease_wait_seconds', GREATEST(
+                0,
+                EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp()))
+            )
+        )
+        FROM qbit_ledger_writer_lease
+        WHERE singleton
+    )
+);
+"""
+        result = self._run_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError("psql writer lease adoption query returned non-object JSON")
         return result
 
     def _can_wait_for_writer_lease(self, result: dict[str, Any]) -> bool:
