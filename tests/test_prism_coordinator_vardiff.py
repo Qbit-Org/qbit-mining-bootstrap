@@ -7399,13 +7399,15 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
     def test_block_submit_aborts_when_append_invalidation_races_the_landing(
         self,
     ) -> None:
-        # An append-side invalidation landing between the advisory epoch
-        # fence and submitblock must still abort the landing: the
-        # authoritative fence holds the same lock the bump takes, so the
-        # bump cannot slip past both. The bump here is driven through the
-        # REAL invalidation path from the getblockcount hook -- with no
-        # armed artifact or in-flight walk in the harness, it fires only
-        # because the landing exposed its own declared anchor.
+        # Node propagation is the fast lane: the block is offered to qbitd
+        # before payout accounting notices anything, so an append-side
+        # invalidation racing the landing can no longer block submitblock.
+        # It must still abort the ACCOUNTING: the landing's epoch fences
+        # fail closed before the audit bundle or any payout persistence.
+        # The bump here is driven through the REAL invalidation path from
+        # the drain hook -- with no armed artifact or in-flight walk in the
+        # harness, it fires only because the landing exposed its own
+        # declared anchor.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         server.ledger = ledger
@@ -7422,31 +7424,35 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         late_append = self._pending_append("late-during-landing").pending_share
 
-        class RaceRpc(TipRpc):
-            def __init__(rpc_self, tip: str) -> None:
-                super().__init__(tip)
-                rpc_self.race_fired = False
+        race_fired: list[bool] = []
+        original_drain = server._await_unfenced_appends_predating_anchor
 
+        def racing_drain(anchor_ms: int) -> None:
+            original_drain(anchor_ms)
+            if not race_fired:
+                race_fired.append(True)
+                server._invalidate_incremental_payout_window_for_append(
+                    late_append
+                )
+
+        server._await_unfenced_appends_predating_anchor = racing_drain  # type: ignore[method-assign]
+
+        submitblock_calls: list[object] = []
+
+        class RecordingSubmitRpc(TipRpc):
             def call(
                 rpc_self,
                 method: str,
                 params: list[object] | None = None,
             ) -> object:
                 if method == "getblockcount":
-                    if not rpc_self.race_fired:
-                        rpc_self.race_fired = True
-                        server._invalidate_incremental_payout_window_for_append(
-                            late_append
-                        )
                     return 9
                 if method == "submitblock":
-                    raise AssertionError(
-                        "submitblock must not run after a racing append "
-                        "invalidation"
-                    )
+                    submitblock_calls.append(params)
+                    return None
                 return super().call(method, params)
 
-        server.rpc = RaceRpc("00" * 32)
+        server.rpc = RecordingSubmitRpc("00" * 32)
         submission = SimpleNamespace(
             coinbase_tx_hex="c0ffee",
             block_hash_hex="da" * 32,
@@ -7465,7 +7471,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.enqueue_block_candidate(candidate)
 
         self.assertTrue(server.submit_next_block_candidate())
-        self.assertTrue(server.rpc.race_fired)
+        self.assertEqual(race_fired, [True])
+        # The fast lane offered the block before the race could be observed.
+        self.assertEqual(submitblock_calls, [["00"]])
         with server._job_cache_lock:
             self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
         self.assertEqual(server.stale_share_count, 0)
@@ -7489,16 +7497,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
     ) -> None:
         # The durable replay rebases a reconstructed candidate onto the live
         # epoch sequence as of the revalidation read; an epoch advanced
-        # after that read must still abort the landing at the authoritative
-        # fence even though the replayed window itself matched.
+        # after that read must still abort the landing's ACCOUNTING at the
+        # epoch fence even though the replayed window itself matched. The
+        # node offer itself is the fast lane and is not gated: the block
+        # reaches qbitd, but no audit bundle or payout persistence follows.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         ledger.durable_payout_state = True  # type: ignore[attr-defined]
-        ledger.audit_share_window = (  # type: ignore[method-assign]
-            lambda *, anchor_job_issued_at_ms, network_difficulty: [
-                {"share_id": "recorded-window-share"}
-            ]
-        )
+
+        race_fired: list[bool] = []
+
+        def racing_audit_share_window(
+            *, anchor_job_issued_at_ms: int, network_difficulty: int
+        ) -> list[dict[str, object]]:
+            # The epoch advances only after the revalidation base read,
+            # i.e. while the replayed-window walk itself is in flight.
+            if not race_fired:
+                race_fired.append(True)
+                with server._job_cache_lock:
+                    server._payout_ledger_append_invalidation_epoch += 1
+            return [{"share_id": "recorded-window-share"}]
+
+        ledger.audit_share_window = racing_audit_share_window  # type: ignore[method-assign]
         server.ledger = ledger
         context = server.jobs["job-1"]
         context.shares_json = [{"share_id": "recorded-window-share"}]
@@ -7513,30 +7533,22 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
         )
 
-        class RaceRpc(TipRpc):
-            def __init__(rpc_self, tip: str) -> None:
-                super().__init__(tip)
-                rpc_self.race_fired = False
+        submitblock_calls: list[object] = []
 
+        class RecordingSubmitRpc(TipRpc):
             def call(
                 rpc_self,
                 method: str,
                 params: list[object] | None = None,
             ) -> object:
                 if method == "getblockcount":
-                    if not rpc_self.race_fired:
-                        rpc_self.race_fired = True
-                        with server._job_cache_lock:
-                            server._payout_ledger_append_invalidation_epoch += 1
                     return 9
                 if method == "submitblock":
-                    raise AssertionError(
-                        "submitblock must not run after a racing append "
-                        "invalidation"
-                    )
+                    submitblock_calls.append(params)
+                    return None
                 return super().call(method, params)
 
-        server.rpc = RaceRpc("00" * 32)
+        server.rpc = RecordingSubmitRpc("00" * 32)
         submission = SimpleNamespace(
             coinbase_tx_hex="c0ffee",
             block_hash_hex="db" * 32,
@@ -7556,7 +7568,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server.enqueue_block_candidate(candidate)
 
         self.assertTrue(server.submit_next_block_candidate())
-        self.assertTrue(server.rpc.race_fired)
+        self.assertEqual(race_fired, [True])
+        # The fast lane offered the replayed block before revalidation ran.
+        self.assertEqual(submitblock_calls, [["00"]])
         self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
         self.assertEqual(
             server.stale_job_abandon_counts,
@@ -7573,10 +7587,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self,
     ) -> None:
         # A replay-shaped append holds the landing fence across the durable
-        # commit itself, not only across its epoch bump. A landing that
-        # arrives while that commit is in flight must wait at the fence and
+        # commit itself, not only across its epoch bump. The node offer is
+        # the fast lane and does not wait, but a landing whose offer is
+        # already in must still wait at the fence before ACCOUNTING and
         # abort on the bumped epoch -- never verify the pre-bump epoch and
-        # submit a coinbase whose window omits the row that just became
+        # account a coinbase whose window omits the row that just became
         # durable.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
@@ -7659,10 +7674,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             daemon=True,
         )
         landing.start()
-        # Give the landing time to run up against the fence; with the commit
-        # still gated it must not have entered submitblock.
+        # Give the landing time to run up against the fence: the fast-lane
+        # node offer already went out, but with the commit still gated the
+        # landing must not have reached a terminal accounting decision.
         time.sleep(0.05)
-        self.assertEqual(submitblock_calls, [])
+        self.assertEqual(submitblock_calls, [["00"]])
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
 
         release_commit.set()
         writer.join(timeout=10.0)
@@ -7671,8 +7688,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(landing.is_alive())
 
         # The bump landed together with the durable append; the landing
-        # observed it and abandoned instead of submitting.
-        self.assertEqual(submitblock_calls, [])
+        # observed it and abandoned its accounting instead of persisting a
+        # payout window that omits the durable predating share.
+        self.assertEqual(submitblock_calls, [["00"]])
         self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
         with server._job_cache_lock:
             self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
@@ -7691,16 +7709,17 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "payout window was invalidated by a late-visible share append",
         )
 
-    def test_predating_append_stays_undurable_while_landing_holds_submit_fence(
+    def test_predating_append_commits_while_fast_lane_offer_is_in_flight(
         self,
     ) -> None:
-        # The other side of the fence boundary: while a landing holds the
-        # fence across submitblock, a predating append's durable commit --
-        # not only its epoch bump -- must wait for the RPC to return. The
-        # old ordering let the row become durable mid-RPC while its bump
-        # queued behind the fence, so the authoritative epoch check could
-        # not observe the invalidation and the coinbase entered qbitd
-        # underpaying a durable share no refresh wave can unsubmit.
+        # The other side of the fence boundary flipped with the node fast
+        # lane: submitblock no longer holds the landing fence, so a
+        # predating append's durable commit does NOT wait for the RPC to
+        # return. The row may become durable mid-offer with its epoch bump
+        # landing under the fence; the landing's post-offer accounting
+        # fences (not the offer itself) are what observe the invalidation.
+        # Here the node rejects the block outright, so the rejection -- not
+        # the epoch race -- terminally abandons the candidate.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         server.ledger = ledger
@@ -7765,9 +7784,9 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertTrue(server.submit_next_block_candidate())
 
-        # The append could not make the row durable while the fence-guarded
-        # RPC was in flight; it committed and bumped only afterwards.
-        self.assertEqual(durable_mid_rpc, [False])
+        # The fast-lane RPC holds no fence, so the predating row became
+        # durable while the offer was still in flight.
+        self.assertEqual(durable_mid_rpc, [True])
         self.assertTrue(append_threads)
         append_threads[0].join(timeout=10.0)
         self.assertFalse(append_threads[0].is_alive())
@@ -7882,9 +7901,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 server._payout_unfenced_append_inflight_stamps, {}
             )
         # The drained append's bump landed before the landing's epoch
-        # fences, so the candidate was abandoned instead of entering
-        # submitblock with a coinbase omitting the durable predating share.
-        self.assertEqual(submitblock_calls, [])
+        # fences, so the accounting was abandoned instead of persisting a
+        # payout window omitting the durable predating share. The node
+        # offer itself is the fast lane and had already gone out.
+        self.assertEqual(submitblock_calls, [["00"]])
         self.assertEqual(
             server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
             1,
@@ -7990,9 +8010,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(server.submit_next_block_candidate())
 
         # The bump already happened at commit time, so the landing's epoch
-        # fence rejects the pre-append window instead of submitting a
-        # coinbase that omits the durable predating share.
-        self.assertEqual(submitblock_calls, [])
+        # fence rejects the pre-append window instead of accounting a
+        # coinbase that omits the durable predating share. The node offer
+        # itself is the fast lane and had already gone out.
+        self.assertEqual(submitblock_calls, [["00"]])
         self.assertEqual(
             server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
             1,

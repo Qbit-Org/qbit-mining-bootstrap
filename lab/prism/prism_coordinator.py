@@ -26006,6 +26006,7 @@ class PrismCoordinator:
                     block_hash,
                     block_height=expected_height,
                 )
+                fallback_submit_under_fence = not node_submission.attempted
                 if not node_submission.attempted:
                     self._require_fresh_ledger_lease_for_external_side_effect(
                         "submitblock"
@@ -26063,6 +26064,34 @@ class PrismCoordinator:
                         expected_height=expected_height,
                     )
                     return None
+                if (
+                    not fallback_submit_under_fence
+                    and effective_append_epoch is not None
+                    and not getattr(context, "collection_only", False)
+                ):
+                    # The fast lane offered this block to qbitd without any
+                    # ledger synchronization, so the landing fence can no
+                    # longer gate submitblock itself. It still gates the
+                    # accounting decision: wait out any fenced predating
+                    # append whose durable commit is in flight (the commit
+                    # holds this lock across its epoch bump) and fail closed
+                    # if the live epoch moved past the window this
+                    # candidate's coinbase paid.
+                    with self._payout_append_landing_fence_lock:
+                        with self._job_cache_lock:
+                            live_append_epoch = int(
+                                self._payout_ledger_append_invalidation_epoch
+                            )
+                    if live_append_epoch != effective_append_epoch:
+                        self._abandon_block_candidate(
+                            PRISM_REJECTION_STALE_JOB,
+                            "payout window was invalidated by a late-visible share append",
+                            block_hash=block_hash,
+                            worker=worker,
+                            expected_height=expected_height,
+                            stale_job_class="append_epoch_stale",
+                        )
+                        return None
                 active_hash = str(
                     self.rpc.call("getblockhash", [expected_height])
                 ).lower()
