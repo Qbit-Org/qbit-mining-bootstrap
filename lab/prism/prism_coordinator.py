@@ -18789,6 +18789,29 @@ class PrismCoordinator:
             context_collection_only = bool(
                 getattr(context, "collection_only", False)
             )
+            context_payout_artifact_sha256 = getattr(
+                context,
+                "payout_artifact_sha256",
+                None,
+            )
+
+        def context_payout_digest_stale() -> bool:
+            # A periodic self-check repair swaps the published balance
+            # snapshot in place: the payout generation and append epoch both
+            # survive the swap, so only the digest identifies a context still
+            # keyed to the refuted balances. Contexts without a digest defer
+            # to the generation fence. Unlocked at the gate (a cancellation
+            # hint); authoritative when re-read under _job_cache_lock at the
+            # commit boundary below.
+            if context_payout_artifact_sha256 is None:
+                return False
+            published_artifact = self._published_payout_state.artifact
+            return (
+                published_artifact is None
+                or context_payout_artifact_sha256
+                != published_artifact.prior_balances_sha256
+            )
+
         context_template = getattr(context, "template", None)
         context_parent = (
             str(context_template.get("previousblockhash", ""))
@@ -18851,6 +18874,7 @@ class PrismCoordinator:
         with self._payout_state_delivery_gate.delivery_cancelable(
             lambda: (
                 context_payout_generation != self._payout_state_generation
+                or context_payout_digest_stale()
                 or (
                     not context_collection_only
                     and context_append_invalidation_epoch
@@ -18959,7 +18983,7 @@ class PrismCoordinator:
                         with self.lock:
                             return commit_context_locked()
                 with self._job_cache_lock:
-                    if (
+                    if context_payout_digest_stale() or (
                         not context_collection_only
                         and context_append_invalidation_epoch
                         != self._payout_ledger_append_invalidation_epoch

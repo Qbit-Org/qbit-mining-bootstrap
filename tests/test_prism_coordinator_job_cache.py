@@ -1613,6 +1613,64 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
         self.assertTrue(server._tip_refresh_pending_event.is_set())
         self.assertTrue(server._tip_refresh_retry.is_set())
 
+    def test_direct_delivery_rechecks_published_digest_at_commit(self) -> None:
+        # A periodic self-check repair swaps the published balance snapshot
+        # in place: neither the payout generation nor the append epoch moves,
+        # so only the digest identifies a direct-delivery context keyed to
+        # the refuted balances. When the repair lands after the build but
+        # before the commit boundary, the delivery must re-check the digest
+        # or the miner's active job carries the refuted allocation.
+        server, _ledger, _artifacts = self.configured_server()
+        install_fake_bundle_builder(server)
+        server._ensure_tip_refresh_state()
+        state = client(1)
+        sent: list[dict[str, object]] = []
+        state.send = sent.append  # type: ignore[method-assign]
+        original_build_job_for_client = server.build_job_for_client
+        repaired = False
+
+        def repair_after_build(*args: object, **kwargs: object) -> object:
+            nonlocal repaired
+            context = original_build_job_for_client(*args, **kwargs)  # type: ignore[arg-type]
+            if not repaired:
+                repaired = True
+                with server._job_cache_lock:
+                    published = server._published_payout_state.artifact
+                assert published is not None
+                self.assertEqual(
+                    context.payout_artifact_sha256,
+                    published.prior_balances_sha256,
+                )
+                self.assertTrue(
+                    server._publish_self_check_repaired_balances(
+                        0,
+                        stale_prior_balances_sha256=(
+                            published.prior_balances_sha256
+                        ),
+                        balances=[
+                            {
+                                "recipient_id": "carry",
+                                "order_key": "01:carry",
+                                "p2mr_program_hex": "66" * 32,
+                                "balance_sats": 999,
+                            }
+                        ],
+                    )
+                )
+            return context
+
+        server.build_job_for_client = repair_after_build  # type: ignore[method-assign]
+
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: 1_000_000,
+        ):
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(sent, [])
+        self.assertIsNone(state.active_job)
+        self.assertEqual(state.active_job_ids, set())
+        self.assertEqual(server.jobs, {})
+
     def test_incremental_and_forced_full_artifacts_match_with_carry_boundaries(
         self,
     ) -> None:
