@@ -361,7 +361,10 @@ fenced writes hold it for entire transactions, and accepted-block persistence
 can legitimately exceed the guard's statement timeout. It renews the lease TTL
 only while that tuple is uncontended (`SKIP LOCKED`), so an idle coordinator —
 no fenced writes and the CTV broadcaster disabled — still keeps its lease from
-expiring under a different writer identity's expiry claim. A
+expiring under a different writer identity's expiry claim. If the committed row
+is already expired and the renewal was lock-blocked, verification fails closed:
+the skipped lock may be an in-flight expiry claim, and a stale committed token
+read is not proof of liveness. A
 replacement must acquire the guard and then wait one full silence interval
 measured both from the lease row's last update and from its own guard
 acquisition before its exact-session CAS, so a predecessor that just lost its

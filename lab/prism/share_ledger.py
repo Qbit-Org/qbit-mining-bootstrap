@@ -7196,6 +7196,16 @@ SELECT COALESCE(
         without queueing while a fenced transaction holds it (that
         transaction refreshes the TTL itself when it commits).
 
+        A skipped renewal is only trustworthy while the committed row is
+        unexpired. Once ``lease_expires_at`` has lapsed, a lock we skipped
+        may be a different-identity ``_try_acquire_writer_lease`` taking the
+        row through its expiry CAS, and the stale committed snapshot would
+        still name this session until that claim commits. The locking
+        renewal used to catch exactly this by queueing and re-evaluating
+        after the claimant committed; the non-blocking spelling recovers it
+        by failing closed whenever the renewal was lock-blocked and the
+        committed row was already expired.
+
         ``on_query_start`` fires once the guarded session's serialized query
         slot is acquired, letting callers budget queue wait separately from
         statement execution.
@@ -7259,7 +7269,16 @@ SELECT json_build_object(
           AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
           AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
     ),
-    'lease_renewed_count', (SELECT count(*) FROM renewed)
+    'lease_renewed_count', (SELECT count(*) FROM renewed),
+    'lease_expired', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+          AND qbit_ledger_writer_lease.lease_expires_at <= clock_timestamp()
+    )
 );
 """
         if on_query_start is None:
@@ -7280,6 +7299,16 @@ SELECT json_build_object(
             renewed_count = int(result.get("lease_renewed_count", 0))
         except (TypeError, ValueError):
             renewed_count = 0
+        if renewed_count == 0 and result.get("lease_expired"):
+            # The committed row still names this session but its TTL has
+            # lapsed and the tuple lock we declined to wait on may belong to
+            # a different-identity expiry claim whose commit would land right
+            # after this snapshot. A stale token read is not proof of
+            # liveness here; fail closed like the queueing renewal used to.
+            raise RuntimeError(
+                "writer lease is expired and its renewal was lock-blocked; "
+                "a competing expiry claim may be in flight"
+            )
         return {
             "backend": str(result["backend"]),
             "verified_count": 1,
