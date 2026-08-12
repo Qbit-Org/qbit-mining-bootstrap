@@ -21,7 +21,11 @@ from unittest.mock import patch
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
-from lab.prism.share_ledger import PendingShare, SingleWriterShareLedger
+from lab.prism.share_ledger import (
+    PendingShare,
+    SingleWriterShareLedger,
+    WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
+)
 from lab.prism.prism_coordinator import (
     CachedJobBundle,
     CachedTemplateArtifacts,
@@ -4864,6 +4868,24 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(ledger.backend_name, "postgres-psql")
         self.assertEqual(fake_ledger.call_args.kwargs["writer_session_token"], "fixed-session")
+
+    def test_generated_coordinator_session_advertises_heartbeat_capability(self) -> None:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        env = {
+            "PRISM_POSTGRES_PSQL_COMMAND": "psql postgresql://example.invalid/qbit",
+        }
+
+        with patch.dict(os.environ, env, clear=True), patch(
+            "lab.prism.prism_coordinator.PsqlShareLedger"
+        ) as fake_ledger:
+            fake_ledger.return_value = SimpleNamespace(backend_name="postgres-psql")
+            server.make_ledger()
+
+        self.assertTrue(
+            fake_ledger.call_args.kwargs["writer_session_token"].startswith(
+                WRITER_LEASE_HEARTBEAT_SESSION_PREFIX
+            )
+        )
 
     def test_same_tip_retention_requires_connection_derived_production_bound(self) -> None:
         with self.assertRaisesRegex(

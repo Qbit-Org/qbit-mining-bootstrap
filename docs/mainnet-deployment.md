@@ -351,6 +351,65 @@ each refresh wave converge on the latest observed tip epoch; payout and trust
 publication fences remain authoritative. Monitor refresh-wave outcomes and
 delivery coverage during rollout, and return the setting to `0` to roll back.
 
+PRISM's fast same-identity restart path requires the default native PostgreSQL
+client (`PRISM_POSTGRES_NATIVE_CLIENT=auto` or `1`). Each coordinator holds a
+dedicated PostgreSQL advisory guard for its writer ID and epoch and renews the
+lease on that isolated session. A replacement must acquire the guard and then
+observe one second without a predecessor renewal before its exact-session CAS.
+This prevents a live or paused twin from being fenced merely because it is
+idle. A psql-only deployment cannot retain a session guard, logs that fast
+adoption is disabled, and conservatively falls back to the configured lease
+TTL. Keep generated session tokens in production; fixed tokens remain a local
+test-only facility.
+
+Before each mutating qbitd or wallet RPC, the coordinator performs a bounded
+exact-session renewal on that advisory-guard connection. This makes a lost
+session or a host suspend/resume fail closed before the usual RPC path. It is a
+preflight fence, not an atomic transaction across PostgreSQL and qbitd: a
+process paused after verification and resumed after its database session was
+lost could still reach the independent RPC target. Mutating RPCs do not use the
+JSON-RPC client's transparent transport retry; durable block/CTV retry starts a
+new fenced operation instead. Broadcast and block-submit RPCs deduplicate
+identical payloads, which limits the effect, but separately built CTV fee
+children can still conflict. Operators must not manually start a replacement
+with the same writer identity when predecessor termination is uncertain,
+especially during a PostgreSQL restart or network partition. Strict elimination
+of that residual window requires qbitd/wallet RPCs to validate a fencing
+generation supplied by the coordinator.
+
+### PRISM Watchdog Exit Forensics
+
+The PRISM image has no entrypoint or init wrapper: its exec-form Dockerfile
+command starts `python3 -m lab.prism.prism_coordinator` directly as container
+PID 1, and neither Compose file overrides that command. Consequently a
+watchdog `os._exit(1)` is delivered to Docker as status 1; there is no
+repository wrapper that can translate it to zero. The development profile's
+`restart: on-failure` depends on that status, while the production override's
+`restart: unless-stopped` restarts unexpected status-0 and status-1 exits.
+
+Do not use a post-restart `.State.ExitCode` value as the prior watchdog exit
+status. `docker inspect` exposes the container's current execution state, not
+an invocation history, and can show zero after the replacement process is
+already running. Capture the daemon's `die` event for the failing invocation
+instead, and retain it with the incident record:
+
+```sh
+docker events \
+  --since '<incident-start-rfc3339>' \
+  --until '<incident-end-rfc3339>' \
+  --filter type=container \
+  --filter container='<prism-container-name-or-id>' \
+  --filter event=die \
+  --format '{{json .Actor.Attributes}}'
+```
+
+The event attributes contain the invocation's `exitCode`. The hard-exit path
+does not flush stdout/stderr before arming termination because a full container
+log pipe could otherwise suppress the watchdog itself. If no historical `die`
+event was retained, a later running-state `ExitCode=0` cannot establish the
+prior invocation's status; record the discrepancy as missing event-time
+evidence.
+
 ### CTV At Genesis
 
 A chain with no confirmed transaction history cannot produce a useful

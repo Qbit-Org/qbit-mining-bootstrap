@@ -882,6 +882,55 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
             self.assertEqual(len(constructed), 2)  # reconnected once
             self.assertEqual(constructed[1].requests, 1)
 
+    def test_json_rpc_never_transparently_retries_mutating_methods(self) -> None:
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.sock = None
+                self.requests = 0
+                self.closed = False
+
+            def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
+                self.requests += 1
+                raise ConnectionResetError("result is uncertain")
+
+            def close(self) -> None:
+                self.closed = True
+
+        methods = (
+            "getnewaddress",
+            "sendrawtransaction",
+            "signrawtransactionwithwallet",
+            "submitblock",
+            "submitpackage",
+        )
+        for method in methods:
+            with self.subTest(method=method):
+                constructed: list[FakeConnection] = []
+
+                def make_connection(
+                    host: str,
+                    port: int,
+                    timeout: float,
+                ) -> FakeConnection:
+                    connection = FakeConnection(host, port, timeout)
+                    constructed.append(connection)
+                    return connection
+
+                rpc = JsonRpc(
+                    host="127.0.0.1",
+                    port=18452,
+                    user="u",
+                    password="p",
+                )
+                with patch("http.client.HTTPConnection", make_connection), self.assertRaises(
+                    ConnectionResetError
+                ):
+                    rpc.call(method)
+
+                self.assertEqual(len(constructed), 1)
+                self.assertEqual(constructed[0].requests, 1)
+                self.assertTrue(constructed[0].closed)
+
 
 if __name__ == "__main__":
     unittest.main()
