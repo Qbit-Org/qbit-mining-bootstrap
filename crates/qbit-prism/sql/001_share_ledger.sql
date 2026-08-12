@@ -488,52 +488,91 @@ RETURNS TABLE (
 LANGUAGE sql
 STABLE
 AS $$
-    WITH RECURSIVE eligible AS (
-        (
-            SELECT
-                ledger.*,
-                ledger.share_difficulty::numeric AS cumulative_difficulty
-            FROM qbit_share_ledger ledger
-            WHERE ledger.accepted
-              AND ledger.job_issued_at <= anchor_job_issued_at
-              AND ledger.accepted_at <= anchor_job_issued_at
-            ORDER BY ledger.share_seq DESC
-            LIMIT 1
-        )
+    -- Walk the accepted history newest-first in 4096-row index pages to find
+    -- the window cutoff in O(window) instead of one lateral probe per share,
+    -- then rank only the rows at or above the cutoff. The cutoff must be
+    -- consumed as a scalar subquery: joined in as a relation it degrades to a
+    -- post-join filter over the whole pkey walk, while the scalar form
+    -- becomes an InitPlan the index scan uses as its start bound.
+    --
+    -- The page-granular stop relies on share_difficulty being NOT NULL and
+    -- strictly positive (schema CHECK): positivity keeps the cumulative
+    -- weight strictly increasing, which guarantees the crossing row lies
+    -- inside the last fetched page. Relaxing that constraint requires
+    -- revisiting this walk and the matching one in lab/prism/share_ledger.py.
+    WITH RECURSIVE pages AS (
+        SELECT page.min_share_seq,
+               page.page_weight,
+               page.page_weight AS cumulative_weight
+        FROM LATERAL (
+            SELECT min(page_rows.share_seq) AS min_share_seq,
+                   COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+            FROM (
+                SELECT ledger.share_seq, ledger.share_difficulty
+                FROM qbit_share_ledger ledger
+                WHERE ledger.accepted
+                  AND ledger.job_issued_at <= anchor_job_issued_at
+                  AND ledger.accepted_at <= anchor_job_issued_at
+                ORDER BY ledger.share_seq DESC
+                LIMIT 4096
+            ) page_rows
+        ) page
         UNION ALL
-        SELECT
-            next_ledger.*,
-            eligible.cumulative_difficulty + next_ledger.share_difficulty AS cumulative_difficulty
-        FROM eligible
+        SELECT page.min_share_seq,
+               page.page_weight,
+               pages.cumulative_weight + page.page_weight
+        FROM pages
         CROSS JOIN LATERAL (
-            SELECT ledger.*
-            FROM qbit_share_ledger ledger
-            WHERE ledger.accepted
-              AND ledger.job_issued_at <= anchor_job_issued_at
-              AND ledger.accepted_at <= anchor_job_issued_at
-              AND ledger.share_seq < eligible.share_seq
-            ORDER BY ledger.share_seq DESC
-            LIMIT 1
-        ) next_ledger
-        WHERE eligible.cumulative_difficulty < window_weight
+            SELECT min(page_rows.share_seq) AS min_share_seq,
+                   COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+            FROM (
+                SELECT ledger.share_seq, ledger.share_difficulty
+                FROM qbit_share_ledger ledger
+                WHERE ledger.accepted
+                  AND ledger.job_issued_at <= anchor_job_issued_at
+                  AND ledger.accepted_at <= anchor_job_issued_at
+                  AND ledger.share_seq < pages.min_share_seq
+                ORDER BY ledger.share_seq DESC
+                LIMIT 4096
+            ) page_rows
+        ) page
+        WHERE pages.cumulative_weight < window_weight
+          AND pages.min_share_seq IS NOT NULL
+    ),
+    page_cutoff AS (
+        SELECT min(min_share_seq) AS min_share_seq
+        FROM pages
+        WHERE min_share_seq IS NOT NULL
+    ),
+    ranked AS (
+        SELECT ledger.*,
+               sum(ledger.share_difficulty) OVER (
+                   ORDER BY ledger.share_seq DESC
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               )::numeric AS cumulative_difficulty
+        FROM qbit_share_ledger ledger
+        WHERE ledger.accepted
+          AND ledger.job_issued_at <= anchor_job_issued_at
+          AND ledger.accepted_at <= anchor_job_issued_at
+          AND ledger.share_seq >= (SELECT min_share_seq FROM page_cutoff)
     )
     SELECT
-        eligible.share_seq,
-        eligible.share_id,
-        eligible.miner_id,
-        eligible.payout_order_key,
-        eligible.p2mr_program,
-        eligible.share_difficulty,
+        ranked.share_seq,
+        ranked.share_id,
+        ranked.miner_id,
+        ranked.payout_order_key,
+        ranked.p2mr_program,
+        ranked.share_difficulty,
         CASE
-            WHEN eligible.cumulative_difficulty <= window_weight THEN eligible.share_difficulty
-            ELSE eligible.share_difficulty - (eligible.cumulative_difficulty - window_weight)
+            WHEN ranked.cumulative_difficulty <= window_weight THEN ranked.share_difficulty
+            ELSE ranked.share_difficulty - (ranked.cumulative_difficulty - window_weight)
         END AS counted_difficulty,
-        eligible.job_issued_at,
-        eligible.accepted_at,
-        eligible.credit_policy
-    FROM eligible
-    WHERE eligible.cumulative_difficulty - eligible.share_difficulty < window_weight
-    ORDER BY eligible.share_seq DESC;
+        ranked.job_issued_at,
+        ranked.accepted_at,
+        ranked.credit_policy
+    FROM ranked
+    WHERE ranked.cumulative_difficulty - ranked.share_difficulty < window_weight
+    ORDER BY ranked.share_seq DESC;
 $$;
 
 CREATE OR REPLACE FUNCTION qbit_shares_since_template_height(

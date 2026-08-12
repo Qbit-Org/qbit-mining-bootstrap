@@ -275,6 +275,32 @@ assert_equal(
     "audit window excludes future-accepted old-job share",
 )
 
+# Eligible shares at this anchor, newest first: share-3 (difficulty 103,
+# cumulative 103), share-2 (102, cumulative 205), share-1 (101, cumulative
+# 306). The bounded snapshot must include the share that crosses the window
+# weight and nothing past it.
+for weight, expected_ids in [
+    (1, ["share-3"]),
+    (103, ["share-3"]),
+    (104, ["share-2", "share-3"]),
+    (205, ["share-2", "share-3"]),
+    (206, ["share-1", "share-2", "share-3"]),
+]:
+    bounded = ledger.snapshot_at_job_issue(1_700_000_001_300, window_weight=weight)
+    assert_equal(
+        [share.share_id for share in bounded],
+        expected_ids,
+        f"bounded snapshot crossing behavior at window weight {weight}",
+    )
+assert_equal(
+    [
+        share.share_id
+        for share in ledger.snapshot_at_job_issue(1_700_000_001_300, window_weight=10**9)
+    ],
+    [share.share_id for share in ledger.snapshot_at_job_issue(1_700_000_001_300)],
+    "bounded snapshot with beyond-history weight matches the unbounded snapshot",
+)
+
 try:
     PsqlShareLedger(psql_command=psql, writer_id="writer-a", writer_epoch=2)
 except RuntimeError as exc:
@@ -1346,6 +1372,94 @@ WHERE block_hash = '""" + external_block_hash + """';
         "externalized conflicting duplicate does not write an orphan body file",
     )
 
-print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity")
+# Everything above runs on fixtures far smaller than one 4096-row cutoff page,
+# so the recursive page step of the bounded window readers never executes.
+# Seed enough unit-difficulty shares that the paged cutoff walk must cross page
+# boundaries, then pin exact crossing behavior for both readers. With every
+# share_difficulty = 1 the descending cumulative weight at the i-th newest
+# share is exactly i, so a window weight of W must return precisely the W
+# newest shares (all 9000 when W exceeds the history).
+replacement._run_sql(
+    """
+DELETE FROM qbit_block_candidate_outbox;
+DELETE FROM qbit_share_ledger;
+ALTER SEQUENCE qbit_share_ledger_share_seq_seq RESTART WITH 1;
+INSERT INTO qbit_share_ledger (
+    share_id, miner_id, payout_order_key, p2mr_program,
+    share_difficulty, network_difficulty, template_height, job_id,
+    job_issued_at, ntime, accepted_at, accepted, writer_id, writer_epoch
+)
+SELECT
+    'bulk-' || g,
+    'miner-' || (g % 5),
+    lpad((g % 5)::text, 4, '0'),
+    decode(md5(g::text) || md5((g + 7)::text), 'hex'),
+    1,
+    1000,
+    10,
+    'job-bulk',
+    to_timestamp(1700000000) + (g * interval '1 millisecond'),
+    1700000000,
+    to_timestamp(1700000000) + (g * interval '1 millisecond'),
+    TRUE,
+    'writer-bulk',
+    1
+FROM generate_series(1, 9000) AS g;
+ANALYZE qbit_share_ledger;
+"""
+)
+bulk_anchor_ms = 1_700_000_010_000
+for weight, expected_len in [
+    (4095, 4095),
+    (4096, 4096),
+    (4097, 4097),
+    (8192, 8192),
+    (8193, 8193),
+    (9000, 9000),
+    (12000, 9000),
+]:
+    bounded = replacement.snapshot_at_job_issue(bulk_anchor_ms, window_weight=weight)
+    assert_equal(
+        len(bounded),
+        expected_len,
+        f"multi-page bounded snapshot row count at window weight {weight}",
+    )
+    assert_equal(
+        bounded[0].share_id,
+        f"bulk-{9000 - expected_len + 1}",
+        f"multi-page bounded snapshot oldest row at window weight {weight}",
+    )
+    assert_equal(
+        bounded[-1].share_id,
+        "bulk-9000",
+        f"multi-page bounded snapshot newest row at window weight {weight}",
+    )
+assert_equal(
+    len(replacement.snapshot_at_job_issue(bulk_anchor_ms)),
+    9000,
+    "multi-page unbounded snapshot matches the beyond-history bounded snapshot",
+)
+for network_difficulty, expected_len in [(512, 4096), (1024, 8192), (1025, 8200)]:
+    bulk_window = replacement.audit_share_window(
+        anchor_job_issued_at_ms=bulk_anchor_ms,
+        network_difficulty=network_difficulty,
+    )
+    assert_equal(
+        len(bulk_window),
+        expected_len,
+        f"multi-page audit window row count at network difficulty {network_difficulty}",
+    )
+    assert_equal(
+        bulk_window[0]["share_id"],
+        "bulk-9000",
+        f"multi-page audit window newest row at network difficulty {network_difficulty}",
+    )
+    assert_equal(
+        bulk_window[-1]["share_id"],
+        f"bulk-{9000 - expected_len + 1}",
+        f"multi-page audit window crossing row at network difficulty {network_difficulty}",
+    )
+
+print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity multipage-window=9000")
 PY
 )
