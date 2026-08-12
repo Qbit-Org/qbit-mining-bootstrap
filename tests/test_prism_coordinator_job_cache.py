@@ -669,6 +669,67 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             {str(share["share_id"]) for share in rebuilt.shares_json},
         )
 
+    def test_replay_shaped_batch_commits_under_the_landing_fence(self) -> None:
+        # The durable append and its epoch bump must share the landing fence
+        # boundary: a bump that only starts after append_batch() returned
+        # leaves a gap where a landing verifies the pre-bump epoch and enters
+        # submitblock with the row already durable but unpaid. A batch holding
+        # a replay-shaped row therefore holds the fence across the ledger
+        # commit itself; an ordinary batch stays off the lock entirely.
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            clock_ms[0] = 1_000_020
+            advanced = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert advanced is not None
+            self.assertTrue(server._install_payout_ledger_artifact(advanced))
+            anchor_ms = int(advanced.snapshot_anchor_ms)
+
+            fence_held_during_commit: list[bool] = []
+            original_append_batch = ledger.append_batch
+
+            def recording_append_batch(entries: list[object]) -> list[object]:
+                fence_held_during_commit.append(
+                    server._payout_append_landing_fence_lock.locked()
+                )
+                return original_append_batch(entries)
+
+            ledger.append_batch = recording_append_batch  # type: ignore[method-assign]
+
+            fresh = self.replay_shaped_append_entry(
+                accepted_at_ms=anchor_ms + 50,
+                block_hash_hex="88" * 32,
+            )
+            self.assertTrue(server._append_share_batch([fresh]))
+            self.assertEqual(fence_held_during_commit, [False])
+            with server._job_cache_lock:
+                self.assertEqual(
+                    server._payout_ledger_append_invalidation_epoch, 0
+                )
+
+            predating = self.replay_shaped_append_entry(
+                accepted_at_ms=anchor_ms - 10,
+                block_hash_hex="99" * 32,
+            )
+            self.assertTrue(server._append_share_batch([predating]))
+            self.assertEqual(fence_held_during_commit, [False, True])
+            with server._job_cache_lock:
+                self.assertEqual(
+                    server._payout_ledger_append_invalidation_epoch, 1
+                )
+                self.assertIsNone(server._payout_ledger_artifact)
+            self.assertIsNone(server._incremental_payout_artifact_window)
+
     def test_replay_append_during_cold_scan_invalidates_inflight_walk(
         self,
     ) -> None:

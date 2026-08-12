@@ -7554,6 +7554,128 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "payout window was invalidated by a late-visible share append",
         )
 
+    def test_landing_blocked_by_fenced_append_aborts_on_bumped_epoch(
+        self,
+    ) -> None:
+        # A replay-shaped append holds the landing fence across the durable
+        # commit itself, not only across its epoch bump. A landing that
+        # arrives while that commit is in flight must wait at the fence and
+        # abort on the bumped epoch -- never verify the pre-bump epoch and
+        # submit a coinbase whose window omits the row that just became
+        # durable.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError(
+                "audit bundle must not be built after a fenced append "
+                "invalidated the payout window"
+            )
+        )
+
+        submitblock_calls: list[object] = []
+
+        class RecordingSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    submitblock_calls.append(params)
+                    return None
+                return super().call(method, params)
+
+        server.rpc = RecordingSubmitRpc("00" * 32)
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="dc" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("landing-vs-fenced-append").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        # Expose a live anchor the late row predates, as an armed window
+        # would: the writer's pre-commit peek must fire before any landing
+        # is in flight to declare its own anchor.
+        anchor_token = server._expose_inflight_scan_anchor(12000)
+        self.addCleanup(server._retire_inflight_scan_anchor, anchor_token)
+
+        commit_entered = threading.Event()
+        release_commit = threading.Event()
+        self.addCleanup(release_commit.set)
+        original_append_batch = ledger.append_batch
+
+        def gated_append_batch(entries: list[object]) -> list[object]:
+            commit_entered.set()
+            release_commit.wait(timeout=10.0)
+            return original_append_batch(entries)
+
+        ledger.append_batch = gated_append_batch  # type: ignore[method-assign]
+        late_entry = self._pending_append("late-fenced-append")
+        writer = threading.Thread(
+            target=server._append_share_batch,
+            args=([late_entry],),
+            daemon=True,
+        )
+        writer.start()
+        self.assertTrue(commit_entered.wait(timeout=10.0))
+        # The fence is held while the predating row's commit is in flight.
+        self.assertTrue(server._payout_append_landing_fence_lock.locked())
+
+        landing = threading.Thread(
+            target=server.submit_next_block_candidate,
+            daemon=True,
+        )
+        landing.start()
+        # Give the landing time to run up against the fence; with the commit
+        # still gated it must not have entered submitblock.
+        time.sleep(0.05)
+        self.assertEqual(submitblock_calls, [])
+
+        release_commit.set()
+        writer.join(timeout=10.0)
+        self.assertFalse(writer.is_alive())
+        landing.join(timeout=10.0)
+        self.assertFalse(landing.is_alive())
+
+        # The bump landed together with the durable append; the landing
+        # observed it and abandoned instead of submitting.
+        self.assertEqual(submitblock_calls, [])
+        self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+            1,
+        )
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+
     def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
         self,
     ) -> None:

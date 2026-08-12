@@ -21224,6 +21224,137 @@ class PrismCoordinator:
         with self._job_cache_lock:
             self._payout_window_inflight_scan_anchors.pop(int(token), None)
 
+    @staticmethod
+    def _pending_share_predates_anchor(
+        pending_share: PendingShare,
+        anchor_ms: int | None,
+    ) -> bool:
+        return bool(
+            anchor_ms is not None
+            and int(pending_share.job_issued_at_ms) <= anchor_ms
+            and int(pending_share.accepted_at_ms) <= anchor_ms
+        )
+
+    def _pending_share_predates_live_anchor_locked(
+        self,
+        pending_share: PendingShare,
+    ) -> bool:
+        # Caller holds _job_cache_lock. The incremental pointer is
+        # immutable and replaced atomically; its owning lock is
+        # deliberately not acquired here, because an urgent append must
+        # disarm the separately guarded artifact even while a long
+        # oracle build owns _payout_state_prepare_lock. Reading it under
+        # _job_cache_lock orders the read against the in-flight scan
+        # anchors: a window walk makes its result visible (the
+        # incremental pointer, or the armed artifact's install fence)
+        # before retiring its exposed anchor under this lock, so a walk
+        # that could have missed this row always exposes an anchor to
+        # the predates checks below.
+        predates = self._pending_share_predates_anchor
+        cached = getattr(self, "_incremental_payout_artifact_window", None)
+        artifact = self._payout_ledger_artifact
+        inflight_anchors_ms = tuple(
+            self._payout_window_inflight_scan_anchors.values()
+        )
+        cached_anchor_ms = (
+            None
+            if cached is None
+            else int(cached.window.anchor_job_issued_at_ms)
+        )
+        artifact_anchor_ms = (
+            None
+            if artifact is None or artifact.snapshot_anchor_ms is None
+            else int(artifact.snapshot_anchor_ms)
+        )
+        return bool(
+            predates(pending_share, cached_anchor_ms)
+            or predates(pending_share, artifact_anchor_ms)
+            or any(
+                predates(pending_share, anchor_ms)
+                for anchor_ms in inflight_anchors_ms
+            )
+        )
+
+    @contextmanager
+    def _landing_fence_for_predating_append(
+        self,
+        pending_shares: list[PendingShare],
+    ) -> Iterator[bool]:
+        """Hold the landing fence across a durable append of predating rows.
+
+        An epoch bump that only starts after its row is durable leaves a
+        gap: a landing can acquire the fence, verify the pre-bump epoch,
+        and enter submitblock after the row committed but before the bump
+        starts, still landing a coinbase whose window omits the durable
+        share. Any append whose rows predate a live anchor therefore takes
+        the fence BEFORE the ledger commit and holds it through the epoch
+        bump, so the durable append and its invalidation land on the same
+        side of a landing's fence-guarded epoch-check-and-submit boundary.
+        Ordinary share commits stay off the lock entirely: the unfenced
+        peek here fires only for the rare replay-shaped append. Yields
+        whether the fence is held so the caller can thread it into
+        _record_late_visible_payout_append.
+        """
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            fence_needed = any(
+                self._pending_share_predates_live_anchor_locked(pending)
+                for pending in pending_shares
+            )
+        if not fence_needed:
+            yield False
+            return
+        with self._payout_append_landing_fence_lock:
+            yield True
+
+    def _record_late_visible_payout_append(
+        self,
+        pending_share: PendingShare,
+        *,
+        landing_fence_owned: bool = False,
+    ) -> int | None:
+        """Advance the append-invalidation epoch for a newly durable row.
+
+        Two-phase bump. The unfenced peek keeps ordinary share commits off
+        the landing fence lock entirely; only a row that predates a live
+        anchor re-checks and bumps under it. Holding that lock for the bump
+        is what makes the landing's final epoch fence authoritative: a bump
+        cannot commit while a landing sits between its last epoch read and
+        submitblock, so the invalidation lands either before that read
+        (candidate abandoned) or after the RPC returns (the refresh wave
+        retires the job). The predicate re-runs under the lock because the
+        anchor set may have moved during the unfenced gap. A caller that
+        already holds the fence around the durable commit itself
+        (landing_fence_owned) bumps without re-acquiring.
+
+        Returns the advanced epoch, or None when no live anchor predates
+        the row. The caller must follow a non-None return with
+        _retire_payout_windows_for_late_append OUTSIDE the fence: that step
+        waits on _payout_state_prepare_lock, which a long oracle build can
+        hold, and the wait must not block landings.
+        """
+        self._ensure_job_cache_state()
+
+        def bump_if_predating_locked() -> int | None:
+            with self._job_cache_lock:
+                if not self._pending_share_predates_live_anchor_locked(
+                    pending_share
+                ):
+                    return None
+                self._payout_ledger_append_invalidation_epoch += 1
+                self._payout_ledger_artifact = None
+                return int(self._payout_ledger_append_invalidation_epoch)
+
+        if landing_fence_owned:
+            return bump_if_predating_locked()
+        with self._job_cache_lock:
+            if not self._pending_share_predates_live_anchor_locked(
+                pending_share
+            ):
+                return None
+        with self._payout_append_landing_fence_lock:
+            return bump_if_predating_locked()
+
     def _invalidate_incremental_payout_window_for_append(
         self,
         pending_share: PendingShare,
@@ -21238,79 +21369,41 @@ class PrismCoordinator:
         the late-visible row. Publish the invalidation without waiting for an
         in-flight oracle walk, then clear the incremental cache under its own
         lock; the epoch prevents pre-append work from re-arming meanwhile.
+
+        This wrapper serves post-commit callers that do not hold the landing
+        fence; the durable append paths take the fence around the commit via
+        _landing_fence_for_predating_append and call the bump and retire
+        steps directly.
+        """
+        invalidation_epoch = self._record_late_visible_payout_append(
+            pending_share
+        )
+        if invalidation_epoch is None:
+            return
+        self._retire_payout_windows_for_late_append(
+            pending_share, invalidation_epoch
+        )
+
+    def _retire_payout_windows_for_late_append(
+        self,
+        pending_share: PendingShare,
+        invalidation_epoch: int,
+    ) -> None:
+        """Disarm cached payout windows after a late-append epoch bump.
+
+        Runs outside the landing fence. Active jobs stamped against the
+        pre-append window still pass the generation and digest fences; only
+        epoch-aware reselection replaces them. Schedule the same refresh wave
+        a repair publication schedules, and do it before the prepare-lock
+        wait below so a long oracle build holding that lock cannot delay
+        superseding the stale jobs.
         """
 
-        self._ensure_job_cache_state()
-
         def predates(anchor_ms: int | None) -> bool:
-            return bool(
-                anchor_ms is not None
-                and int(pending_share.job_issued_at_ms) <= anchor_ms
-                and int(pending_share.accepted_at_ms) <= anchor_ms
+            return self._pending_share_predates_anchor(
+                pending_share, anchor_ms
             )
 
-        def predates_live_anchor_locked() -> bool:
-            # Caller holds _job_cache_lock. The incremental pointer is
-            # immutable and replaced atomically; its owning lock is
-            # deliberately not acquired here, because an urgent append must
-            # disarm the separately guarded artifact even while a long
-            # oracle build owns _payout_state_prepare_lock. Reading it under
-            # _job_cache_lock orders the read against the in-flight scan
-            # anchors: a window walk makes its result visible (the
-            # incremental pointer, or the armed artifact's install fence)
-            # before retiring its exposed anchor under this lock, so a walk
-            # that could have missed this row always exposes an anchor to
-            # the predates() checks below.
-            cached = getattr(self, "_incremental_payout_artifact_window", None)
-            artifact = self._payout_ledger_artifact
-            inflight_anchors_ms = tuple(
-                self._payout_window_inflight_scan_anchors.values()
-            )
-            cached_anchor_ms = (
-                None
-                if cached is None
-                else int(cached.window.anchor_job_issued_at_ms)
-            )
-            artifact_anchor_ms = (
-                None
-                if artifact is None or artifact.snapshot_anchor_ms is None
-                else int(artifact.snapshot_anchor_ms)
-            )
-            return bool(
-                predates(cached_anchor_ms)
-                or predates(artifact_anchor_ms)
-                or any(
-                    predates(anchor_ms) for anchor_ms in inflight_anchors_ms
-                )
-            )
-
-        # Two-phase bump. The unfenced peek keeps ordinary share commits off
-        # the landing fence lock entirely; only a row that predates a live
-        # anchor re-checks and bumps under it. Holding that lock for the bump
-        # is what makes the landing's final epoch fence authoritative: a bump
-        # cannot commit while a landing sits between its last epoch read and
-        # submitblock, so the invalidation lands either before that read
-        # (candidate abandoned) or after the RPC returns (the refresh wave
-        # retires the job). The predicate re-runs under the lock because the
-        # anchor set may have moved during the unfenced gap.
-        with self._job_cache_lock:
-            if not predates_live_anchor_locked():
-                return
-        with self._payout_append_landing_fence_lock:
-            with self._job_cache_lock:
-                if not predates_live_anchor_locked():
-                    return
-                self._payout_ledger_append_invalidation_epoch += 1
-                invalidation_epoch = int(
-                    self._payout_ledger_append_invalidation_epoch
-                )
-                self._payout_ledger_artifact = None
-
-        # Active jobs stamped against the pre-append window still pass the
-        # generation and digest fences; only epoch-aware reselection replaces
-        # them. Schedule the same refresh wave a repair publication schedules,
-        # and do it before the prepare-lock wait below so a long oracle build
-        # holding that lock cannot delay superseding the stale jobs.
         self._mark_tip_refresh_pending(invalidation_epoch)
         self._schedule_tip_refresh_retry()
 
@@ -21461,24 +21554,43 @@ class PrismCoordinator:
     def _append_share_batch(self, batch: list[PendingShareAppend]) -> bool:
         """Commit a writer batch, then release every waiting submitter."""
         try:
-            append_batch = getattr(self.ledger, "append_batch", None)
-            if callable(append_batch):
-                records = append_batch(
-                    [(entry.pending_share, entry.candidate_intent) for entry in batch]
+            invalidations: list[tuple[PendingShare, int]] = []
+            # A batch holding a replay-shaped row commits under the landing
+            # fence: the durable append and its epoch bump must land on the
+            # same side of a landing's fence-guarded submit, or the landing
+            # can verify the pre-bump epoch after the row is already durable
+            # (see _landing_fence_for_predating_append).
+            with self._landing_fence_for_predating_append(
+                [entry.pending_share for entry in batch]
+            ) as fence_owned:
+                append_batch = getattr(self.ledger, "append_batch", None)
+                if callable(append_batch):
+                    records = append_batch(
+                        [(entry.pending_share, entry.candidate_intent) for entry in batch]
+                    )
+                else:
+                    # Compatibility for lightweight test/tool ledgers. Production's
+                    # Postgres ledger always supplies the atomic batch method.
+                    records = [self.ledger.append(entry.pending_share) for entry in batch]
+                if len(records) != len(batch):
+                    raise RuntimeError("share ledger returned an incomplete commit batch")
+                for entry, record in zip(batch, records, strict=True):
+                    entry.record = record
+                    invalidation_epoch = self._record_late_visible_payout_append(
+                        entry.pending_share,
+                        landing_fence_owned=fence_owned,
+                    )
+                    if invalidation_epoch is not None:
+                        invalidations.append(
+                            (entry.pending_share, invalidation_epoch)
+                        )
+            for pending_share, invalidation_epoch in invalidations:
+                self._retire_payout_windows_for_late_append(
+                    pending_share, invalidation_epoch
                 )
-            else:
-                # Compatibility for lightweight test/tool ledgers. Production's
-                # Postgres ledger always supplies the atomic batch method.
-                records = [self.ledger.append(entry.pending_share) for entry in batch]
-            if len(records) != len(batch):
-                raise RuntimeError("share ledger returned an incomplete commit batch")
-            hot_path_log = getattr(self, "hot_path_log_enabled", False)
-            for entry, record in zip(batch, records, strict=True):
-                entry.record = record
-                self._invalidate_incremental_payout_window_for_append(
-                    entry.pending_share
-                )
-                if hot_path_log:
+            if getattr(self, "hot_path_log_enabled", False):
+                for entry in batch:
+                    record = entry.record
                     print(
                         "prism coordinator: accepted share "
                         f"seq={record.share_seq} miner={entry.username} job={entry.job_id} "
