@@ -21056,8 +21056,10 @@ class PrismCoordinator:
             # Append-invalidation epochs are process-local counters, so a
             # stamp from the process that built this candidate is meaningless
             # after a restart. The negative sentinel tells the landing epoch
-            # fence to stand down; cross-restart payout drift stays governed
-            # by the content-based prior-balance fence.
+            # fence to stand down and instead revalidate the recorded window
+            # against the durable ledger at its declared anchor (carry
+            # balances do not move on a share append, so the prior-balance
+            # fence alone cannot see an omitted late row).
             payout_append_invalidation_epoch=-1,
         )
         return PrismBlockCandidate(
@@ -23719,6 +23721,61 @@ class PrismCoordinator:
         finally:
             self._payout_balance_mutation_lock.acquire()
 
+    def _replayed_payout_window_reproducible(
+        self,
+        context: PrismJobContext,
+    ) -> bool:
+        """Whether a reconstructed candidate's payout window replays intact.
+
+        Append-invalidation epochs are process-local, so the landing epoch
+        fence stands down for a candidate rebuilt from durable intent. The
+        durable ledger is the surviving authority instead: the reward-window
+        contract keeps the share window replayable at the artifact's declared
+        anchor, so a share row that became durably visible only after the
+        recorded window walk -- on either side of a restart -- appears in the
+        replayed window while the recorded coinbase omits it. Only omissions
+        fail the candidate: an appended row leaves the tip, height, and carry
+        balances untouched, which is exactly why no other landing fence can
+        see it, while a recorded row absent from the replay is not this
+        hazard (share rows are append-only, and drift from settled payout
+        state is governed by the reorg and prior-balance fences).
+        """
+        found_block = getattr(context, "found_block", None)
+        anchor_ms = (
+            found_block.get("anchor_job_issued_at_ms")
+            if isinstance(found_block, dict)
+            else None
+        )
+        network_difficulty = (
+            found_block.get("network_difficulty")
+            if isinstance(found_block, dict)
+            else None
+        )
+        audit_share_window = getattr(self.ledger, "audit_share_window", None)
+        if (
+            anchor_ms is None
+            or network_difficulty is None
+            or not callable(audit_share_window)
+        ):
+            # Fail closed: a candidate whose window cannot be replayed at a
+            # declared anchor cannot prove its coinbase pays the window the
+            # durable ledger requires.
+            return False
+        durable_rows = audit_share_window(
+            anchor_job_issued_at_ms=int(anchor_ms),
+            network_difficulty=int(network_difficulty),
+        )
+        recorded_share_ids = {
+            str(row.get("share_id"))
+            for row in context.shares_json
+            if isinstance(row, dict)
+        }
+        return all(
+            str(row.get("share_id")) in recorded_share_ids
+            for row in durable_rows
+            if isinstance(row, dict)
+        )
+
     def _land_and_confirm_block_candidate(
         self,
         candidate: PrismBlockCandidate,
@@ -23888,6 +23945,46 @@ class PrismCoordinator:
                     stale_job_class="append_epoch_stale",
                 )
                 return None
+            # A negative stamp is a candidate reconstructed from durable
+            # intent: the epoch fence above stood down because its comparison
+            # is process-local, but the hazard it guards against survives the
+            # restart -- a share append that became durably visible after the
+            # recorded window walk leaves the tip, height, and carry balances
+            # (every fence below) untouched while the recorded coinbase
+            # underpays the appended share. Replay the audit window at the
+            # intent's declared anchor and fail closed when it surfaces a
+            # share the recorded window omitted. A failed replay read defers
+            # the candidate for retry instead of abandoning it terminally.
+            if (
+                durable_payout_state
+                and not already_active
+                and not getattr(context, "collection_only", False)
+                and context_append_epoch < 0
+            ):
+                try:
+                    window_reproducible = (
+                        self._replayed_payout_window_reproducible(context)
+                    )
+                except Exception:
+                    traceback.print_exc()
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                        "durable share-window replay failed for the "
+                        "reconstructed candidate",
+                        block_hash=block_hash,
+                        worker=worker,
+                    )
+                    return None
+                if not window_reproducible:
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_STALE_JOB,
+                        "replayed payout window omits a durably appended share",
+                        block_hash=block_hash,
+                        worker=worker,
+                        expected_height=expected_height,
+                        stale_job_class="append_epoch_stale",
+                    )
+                    return None
             if (
                 durable_payout_state
                 and not already_active

@@ -7189,13 +7189,158 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         # Epochs are process-local: a candidate reconstructed from durable
         # intent carries no meaningful stamp, so an epoch advanced by this
         # process's own share replay must not abandon the recovered block.
-        # Cross-restart payout drift stays governed by the content-based
-        # prior-balance fence.
+        # Cross-restart payout drift is governed by the durable share-window
+        # replay and prior-balance fences instead.
         server, state, ledger = submit_coordinator()
         server.stop_after_block = False
         server.max_blocks = 10
         block_hash = "cd" * 32
         pending = self._pending_append("replayed-epoch").pending_share
+        original = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            ),
+            pending_share=pending,
+        )
+        candidate = server.block_candidate_from_intent(
+            server.block_candidate_intent(original)
+        )
+        self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
+        server._ensure_job_cache_state()
+        with server._job_cache_lock:
+            server._payout_ledger_append_invalidation_epoch += 1
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            accepted = server.submit_block_candidate(candidate)
+
+        self.assertTrue(accepted)
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
+        self.assertEqual(len(ledger.persisted), 1)
+        self.assertEqual(len(ledger.confirmed), 1)
+
+    def test_replayed_block_candidate_rejects_window_omitting_durable_append(
+        self,
+    ) -> None:
+        # Epochs are process-local, so a reconstructed candidate is exempt
+        # from the epoch fence -- but the late-visible append that fence
+        # guards against survives the restart in the durable ledger. A carry
+        # balance does not move on a share append, so the prior-balance fence
+        # cannot see it either; replaying the audit window at the intent's
+        # declared anchor must fail the landing when it surfaces a share the
+        # recorded coinbase omitted.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        ledger.durable_payout_state = True  # type: ignore[attr-defined]
+        window_calls: list[tuple[int, int]] = []
+
+        def durable_window(
+            *,
+            anchor_job_issued_at_ms: int,
+            network_difficulty: int,
+        ) -> list[dict[str, object]]:
+            window_calls.append((anchor_job_issued_at_ms, network_difficulty))
+            return [
+                {"share_id": "recorded-window-share"},
+                {"share_id": "late-appended-share"},
+            ]
+
+        ledger.audit_share_window = durable_window  # type: ignore[method-assign]
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.shares_json = [{"share_id": "recorded-window-share"}]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError(
+                "audit bundle must not be built from a payout window omitting "
+                "a durably appended share"
+            )
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="ec" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("replayed-window-omission").pending_share
+        original = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        intent = server.block_candidate_intent(original)
+        candidate = server.block_candidate_from_intent(intent)
+        self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
+        ledger.append_batch([(pending, intent)])
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        self.assertEqual(window_calls, [(12000, 1)])
+        # The share was already accepted at submit time, so a lost block is a
+        # block-abandonment, not a stale share rejection.
+        self.assertEqual(server.stale_share_count, 0)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "replayed payout window omits a durably appended share",
+        )
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="append_epoch_stale"} 1',
+            metrics,
+        )
+
+    def test_replayed_block_candidate_lands_when_durable_window_replays_intact(
+        self,
+    ) -> None:
+        # The durable revalidation is a fence against omitted appends, not a
+        # new obstacle to recovery: when the audit window at the declared
+        # anchor replays exactly the recorded shares, the reconstructed
+        # candidate still lands -- even while this process's own live epoch
+        # has advanced past the meaningless replayed stamp.
+        server, state, ledger = submit_coordinator()
+        server.stop_after_block = False
+        server.max_blocks = 10
+        ledger.durable_payout_state = True
+        ledger.audit_share_window = (  # type: ignore[attr-defined]
+            lambda *, anchor_job_issued_at_ms, network_difficulty: [
+                {"share_id": "recorded-window-share"}
+            ]
+        )
+        context = server.jobs["job-1"]
+        context.shares_json = [{"share_id": "recorded-window-share"}]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        block_hash = "cf" * 32
+        pending = self._pending_append("replayed-durable-window").pending_share
         original = block_candidate(
             server,
             state,
