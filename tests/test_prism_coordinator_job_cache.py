@@ -1549,6 +1549,70 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             server.client_tip_changed_for_snapshot(state, snapshot)
         )
 
+    def test_late_append_invalidation_supersedes_active_jobs(self) -> None:
+        # A late-visible append advances only the append epoch: the payout
+        # generation and published digest both survive, so an active job
+        # mining the pre-append window passes every other fence. The
+        # invalidation must schedule a refresh wave, the reselection must
+        # identify the job by its stamped epoch, and the replacement must
+        # retire it clean -- otherwise miners keep working (and can solve a
+        # block from) a window that omitted the late share until some
+        # unrelated tip event.
+        server, _ledger, _artifacts = self.configured_server()
+        install_fake_bundle_builder(server)
+        server._ensure_tip_refresh_state()
+        state = client(1)
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: 1_000_000,
+        ):
+            bundle = server.build_shared_job_bundle(
+                server.current_template_artifacts(),
+                worker(),
+            )
+            context = server.stamp_job_for_client(
+                state,
+                bundle,
+                clean_jobs=True,
+            )
+        state.active_job = context
+        snapshot = SimpleNamespace(
+            bestblockhash=str(bundle.template["previousblockhash"]),
+            previousblockhash=str(bundle.template["previousblockhash"]),
+            template_fingerprint=bundle.template_fingerprint,
+        )
+        self.assertFalse(
+            server.client_needs_tip_template_refresh(state, snapshot)
+        )
+        self.assertFalse(
+            server.client_tip_changed_for_snapshot(state, snapshot)
+        )
+
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: 1_000_000,
+        ):
+            token = server._expose_inflight_scan_anchor(999_999)
+        try:
+            server._invalidate_incremental_payout_window_for_append(
+                stamped_pending_share(999_950)
+            )
+        finally:
+            server._retire_inflight_scan_anchor(token)
+        with server._job_cache_lock:
+            self.assertEqual(
+                server._payout_ledger_append_invalidation_epoch, 1
+            )
+
+        self.assertTrue(
+            server.client_needs_tip_template_refresh(state, snapshot)
+        )
+        self.assertTrue(
+            server.client_tip_changed_for_snapshot(state, snapshot)
+        )
+        self.assertTrue(server._tip_refresh_pending_event.is_set())
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
     def test_incremental_and_forced_full_artifacts_match_with_carry_boundaries(
         self,
     ) -> None:

@@ -18006,6 +18006,23 @@ class PrismCoordinator:
                 and context_payout_artifact_sha256
                 != published_payout_artifact.prior_balances_sha256
             )
+            # A late-visible append advances only the epoch: the generation
+            # and digest survive, yet the job's window omitted the late row
+            # (possibly a replayed winning share). Collection jobs settle
+            # solver-pays-all and are exempt, as at every other epoch fence.
+            or (
+                not getattr(context, "collection_only", False)
+                and int(
+                    getattr(context, "payout_append_invalidation_epoch", 0)
+                )
+                != int(
+                    getattr(
+                        self,
+                        "_payout_ledger_append_invalidation_epoch",
+                        0,
+                    )
+                )
+            )
         )
         if active_needs_refresh:
             return True
@@ -18124,6 +18141,22 @@ class PrismCoordinator:
                 and published_payout_artifact is not None
                 and context_payout_artifact_sha256
                 != published_payout_artifact.prior_balances_sha256
+            )
+            # Likewise for append-epoch skew: the replacement window covers
+            # the late-visible row, so the job mining the pre-append window
+            # must not stay admissible beside it.
+            or (
+                not getattr(context, "collection_only", False)
+                and int(
+                    getattr(context, "payout_append_invalidation_epoch", 0)
+                )
+                != int(
+                    getattr(
+                        self,
+                        "_payout_ledger_append_invalidation_epoch",
+                        0,
+                    )
+                )
             )
         )
 
@@ -21196,6 +21229,14 @@ class PrismCoordinator:
                 self._payout_ledger_append_invalidation_epoch
             )
             self._payout_ledger_artifact = None
+
+        # Active jobs stamped against the pre-append window still pass the
+        # generation and digest fences; only epoch-aware reselection replaces
+        # them. Schedule the same refresh wave a repair publication schedules,
+        # and do it before the prepare-lock wait below so a long oracle build
+        # holding that lock cannot delay superseding the stale jobs.
+        self._mark_tip_refresh_pending(invalidation_epoch)
+        self._schedule_tip_refresh_retry()
 
         with self._payout_state_prepare_lock:
             cached = self._incremental_payout_artifact_window
