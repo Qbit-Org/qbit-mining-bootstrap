@@ -353,17 +353,26 @@ delivery coverage during rollout, and return the setting to `0` to roll back.
 
 PRISM's fast same-identity restart path requires the default native PostgreSQL
 client (`PRISM_POSTGRES_NATIVE_CLIENT=auto` or `1`). Each coordinator holds a
-dedicated PostgreSQL advisory guard for its writer ID and epoch and renews the
-lease on that isolated session. A replacement must acquire the guard and then
-observe one second without a predecessor renewal before its exact-session CAS.
-This prevents a live or paused twin from being fenced merely because it is
-idle. A psql-only deployment cannot retain a session guard, logs that fast
-adoption is disabled, and conservatively falls back to the configured lease
-TTL. Keep generated session tokens in production; fixed tokens remain a local
-test-only facility.
+dedicated PostgreSQL advisory guard for its writer ID and epoch and
+periodically proves that isolated session live with a non-locking check (the
+session answers, still holds the advisory lock, and the committed lease row
+still names it). The heartbeat never updates the lease row itself: fenced
+writes hold that tuple's row lock for entire transactions, and accepted-block
+persistence can legitimately exceed the guard's statement timeout. A
+replacement must acquire the guard and then wait one full silence interval
+measured both from the lease row's last update and from its own guard
+acquisition before its exact-session CAS, so a predecessor that just lost its
+guard always has time to self-fence even when a long transaction left its
+lease row looking stale. This prevents a live or paused twin from being fenced
+merely because it is idle. A psql-only deployment cannot retain a session
+guard, logs that fast adoption is disabled, and conservatively falls back to
+the configured lease TTL. Keep generated session tokens in production; fixed
+tokens remain a local test-only facility.
 
-Before each mutating qbitd or wallet RPC, the coordinator performs a bounded
-exact-session renewal on that advisory-guard connection. This makes a lost
+Before each mutating qbitd or wallet RPC, the coordinator performs the same
+bounded non-locking exact-session verification on that advisory-guard
+connection, so the fence never contends with an in-flight accepted-block
+transaction on the lease tuple. This makes a lost
 session or a host suspend/resume fail closed before the usual RPC path. It is a
 preflight fence, not an atomic transaction across PostgreSQL and qbitd: a
 process paused after verification and resumed after its database session was

@@ -67,6 +67,65 @@ class HeartbeatLeaseLedger(RecordingLeaseLedger):
         return {"backend": "recording", "renewed_count": 1}
 
 
+class GuardVerifyLeaseLedger(RecordingLeaseLedger):
+    """Fake ledger with the non-locking guarded-session verification.
+
+    ``lease_row_lock`` models the qbit_ledger_writer_lease tuple lock a
+    fenced write holds for its entire transaction. The verification never
+    needs it; the legacy locking renewal would (and in production died on
+    the guard's statement timeout — the block-39416 restart loop), so this
+    fake fails the test outright if the coordinator still calls it.
+    """
+
+    writer_lease_fast_adoption_capable = True
+    writer_lease_guard_required = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lease_row_lock = threading.Lock()
+        self.fenced_write_started = threading.Event()
+        self.verified = threading.Event()
+        self.verify_calls = 0
+        self.verify_calls_during_fenced_write = 0
+        self.renew_calls = 0
+        self.guard_lost = False
+
+    def verify_writer_lease_guard_session(
+        self,
+        *,
+        on_query_start=None,
+    ) -> dict[str, int | str]:
+        if on_query_start is not None:
+            on_query_start()
+        if self.guard_lost:
+            raise RuntimeError("postgres writer lease guard is not held")
+        self.verify_calls += 1
+        if self.lease_row_lock.locked():
+            self.verify_calls_during_fenced_write += 1
+        self.verified.set()
+        return {"backend": "recording", "verified_count": 1}
+
+    def renew_writer_lease_heartbeat(
+        self,
+        *,
+        on_query_start=None,
+    ) -> dict[str, int | str]:
+        self.renew_calls += 1
+        raise AssertionError(
+            "lease-row renewal must not run on the guarded session"
+        )
+
+    def persist_accepted_block(
+        self,
+        *,
+        duration_seconds: float,
+    ) -> dict[str, int | str]:
+        with self.lease_row_lock:
+            self.fenced_write_started.set()
+            time.sleep(duration_seconds)
+        return {"backend": "recording", "block_row_count": 1}
+
+
 def coordinator(
     ledger: object | None = None,
     *,
@@ -335,6 +394,130 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         self.assertGreaterEqual(ledger.renew_calls, 1)
         self.assertIs(ledger.renew_thread, thread)
         self.assertIsNot(ledger.renew_thread, threading.current_thread())
+
+    def test_heartbeat_prefers_non_locking_guard_verification(self) -> None:
+        ledger = GuardVerifyLeaseLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+
+        thread = server._start_ledger_lease_heartbeat()
+        self.assertIsNotNone(thread)
+        self.assertTrue(ledger.verified.wait(0.2))
+        self.assertTrue(server._stop_ledger_lease_heartbeat())
+        assert thread is not None
+        thread.join(0.2)
+
+        self.assertGreaterEqual(ledger.verify_calls, 1)
+        self.assertEqual(ledger.renew_calls, 0)
+
+    def test_heartbeat_survives_fenced_write_holding_lease_row_past_timeout(self) -> None:
+        """Regression: block-39416 restart loop.
+
+        persist_accepted_block holds the lease tuple for several multiples of
+        the guard's statement timeout and of the heartbeat failure budget
+        (production: 1.7s versus 0.5s/0.75s, scaled here). The heartbeat must
+        keep passing throughout, no hard exit fires, and the fenced write
+        completes.
+        """
+        ledger = GuardVerifyLeaseLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+        server.ledger_lease_heartbeat_failure_seconds = 0.1
+        server.ledger_lease_heartbeat_monitor_seconds = 0.005
+
+        with patch(
+            "lab.prism.prism_coordinator.os._exit",
+            side_effect=AssertionError("unexpected hard exit"),
+        ) as process_exit, patch.object(
+            server,
+            "_watchdog_hard_exit",
+        ) as hard_exit:
+            thread = server._start_ledger_lease_heartbeat()
+            self.assertIsNotNone(thread)
+            self.assertTrue(ledger.verified.wait(0.2))
+
+            result = ledger.persist_accepted_block(duration_seconds=0.3)
+
+            assert thread is not None
+            self.assertTrue(thread.is_alive())
+            self.assertTrue(server._stop_ledger_lease_heartbeat())
+            thread.join(0.2)
+
+        self.assertEqual(result, {"backend": "recording", "block_row_count": 1})
+        self.assertGreaterEqual(ledger.verify_calls_during_fenced_write, 1)
+        self.assertEqual(ledger.renew_calls, 0)
+        process_exit.assert_not_called()
+        hard_exit.assert_not_called()
+
+    def test_heartbeat_hard_exits_promptly_after_guard_connection_loss(self) -> None:
+        ledger = GuardVerifyLeaseLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+        exited = threading.Event()
+
+        with patch("builtins.print"), patch("traceback.print_exc"), patch.object(
+            server,
+            "_watchdog_hard_exit",
+            side_effect=lambda *_args, **_kwargs: exited.set(),
+        ) as hard_exit:
+            thread = server._start_ledger_lease_heartbeat()
+            self.assertIsNotNone(thread)
+            self.assertTrue(ledger.verified.wait(0.2))
+
+            ledger.guard_lost = True
+            self.assertTrue(exited.wait(0.5))
+            assert thread is not None
+            thread.join(0.5)
+            server._ledger_lease_heartbeat_stop_event.set()
+
+        hard_exit.assert_called_once_with("lease_heartbeat", timeout_seconds=0.1)
+
+    def test_external_fence_is_non_locking_during_accepted_block_persistence(self) -> None:
+        ledger = GuardVerifyLeaseLedger()
+        server = coordinator(ledger)
+        # Tighter than the fenced write's duration: a fence that queued on
+        # the lease tuple would time out and hard-exit here.
+        server.ledger_lease_external_fence_timeout_seconds = 0.05
+        persist_thread = threading.Thread(
+            target=ledger.persist_accepted_block,
+            kwargs={"duration_seconds": 0.3},
+        )
+        persist_thread.start()
+        self.assertTrue(ledger.fenced_write_started.wait(0.5))
+
+        try:
+            with patch.object(
+                server,
+                "_ledger_lease_heartbeat_hard_exit",
+            ) as hard_exit:
+                server._require_fresh_ledger_lease_for_external_side_effect(
+                    "submitblock"
+                )
+        finally:
+            persist_thread.join(1.0)
+
+        self.assertFalse(persist_thread.is_alive())
+        hard_exit.assert_not_called()
+        self.assertGreaterEqual(ledger.verify_calls_during_fenced_write, 1)
+        self.assertEqual(ledger.renew_calls, 0)
+
+    def test_external_fence_fails_closed_after_guard_loss_with_verification(self) -> None:
+        ledger = GuardVerifyLeaseLedger()
+        ledger.guard_lost = True
+        server = coordinator(ledger)
+
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit, self.assertRaisesRegex(
+            ShutdownInProgress,
+            "writer lease guard verification failed",
+        ):
+            server._require_fresh_ledger_lease_for_external_side_effect(
+                "submitblock"
+            )
+
+        hard_exit.assert_called_once()
 
     def test_lease_heartbeat_failure_uses_bounded_hard_exit_path(self) -> None:
         class FailingHeartbeatLedger(HeartbeatLeaseLedger):
@@ -789,7 +972,10 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         server = coordinator(ledger, timeout=1)
         server.share_append_queue = queue.Queue(maxsize=2)
         entry = PendingShareAppend(
-            pending_share=SimpleNamespace(),
+            pending_share=SimpleNamespace(
+                job_issued_at_ms=0,
+                accepted_at_ms=0,
+            ),
             username="miner-a",
             job_id="job-a",
             block_hash_hex="aa" * 32,
@@ -838,7 +1024,10 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         allow_enqueue = threading.Event()
 
         entry = PendingShareAppend(
-            pending_share=SimpleNamespace(),
+            pending_share=SimpleNamespace(
+                job_issued_at_ms=0,
+                accepted_at_ms=0,
+            ),
             username="miner-a",
             job_id="job-a",
             block_hash_hex="aa" * 32,
@@ -883,7 +1072,10 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         server.share_commit_linger_seconds = 0
         server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
         entry = PendingShareAppend(
-            pending_share=SimpleNamespace(),
+            pending_share=SimpleNamespace(
+                job_issued_at_ms=0,
+                accepted_at_ms=0,
+            ),
             username="miner-a",
             job_id="job-a",
             block_hash_hex="aa" * 32,
