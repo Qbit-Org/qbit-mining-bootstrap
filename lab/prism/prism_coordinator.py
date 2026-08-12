@@ -1309,6 +1309,12 @@ class PrismJobContext:
     prospective_prior_balances: tuple[tuple[str, str, str, int], ...] | None = None
     payout_artifact_generation: int = 0
     payout_append_invalidation_epoch: int = 0
+    # Digest of the published prior-balance snapshot this job's payouts are
+    # keyed to. A periodic self-check repair replaces the published snapshot
+    # in place -- the payout generation and append epoch both survive the
+    # swap -- so this digest is the only fence that identifies an active job
+    # still carrying refuted balances.
+    payout_artifact_sha256: str | None = None
     connection_id: int = 0
     authorization_generation: int = 0
     difficulty_generation: int = 0
@@ -5805,10 +5811,15 @@ class PrismCoordinator:
         The published artifact is otherwise immutable for its generation, but
         a confirmed drift means its bytes no longer match the durable ledger
         (a payout mutation whose response was lost). Swapping in the repaired
-        balances re-keys new work to the corrected digest; work keyed to the
-        refuted digest is superseded by the existing balance fences exactly
-        as on a generation change. Only the exact refuted snapshot is
-        replaced: any concurrent publication wins the guarded swap.
+        balances re-keys new work to the corrected digest, and every serving
+        decision for NOT-yet-stamped work re-checks that digest. Jobs already
+        stamped for miners have no such fence -- their admission compares
+        only the payout generation and append epoch, which both survive this
+        swap -- so the repair also schedules the same refresh wave a payout
+        publication schedules; digest-aware reselection then replaces exactly
+        the active jobs keyed to the refuted snapshot. Only the exact refuted
+        snapshot is replaced: any concurrent publication wins the guarded
+        swap (and drives its own wave).
         """
         self._ensure_job_cache_state()
         with self._job_cache_lock:
@@ -5844,6 +5855,13 @@ class PrismCoordinator:
             stale_prior_balances_sha256=stale_prior_balances_sha256,
             repaired_prior_balances_sha256=repaired.prior_balances_sha256,
         )
+        # Active jobs keyed to the refuted digest remain mineable until a
+        # wave replaces them -- a block solved from one would commit the
+        # stale allocation. The pending mark survives a superseded wave and
+        # the digest reselection is idempotent, so a wave that raced this
+        # repair converges on the next pass.
+        self._mark_tip_refresh_pending(int(expected_payout_state_generation))
+        self._schedule_tip_refresh_retry()
         return True
 
     def _current_payout_state_artifact(
@@ -10255,6 +10273,11 @@ class PrismCoordinator:
                 )
                 if cached.build_key is not None
                 else 0
+            ),
+            payout_artifact_sha256=(
+                cached.build_key.payout_artifact_sha256
+                if cached.build_key is not None
+                else None
             ),
             connection_id=client.connection_id,
             authorization_generation=int(
@@ -17954,12 +17977,35 @@ class PrismCoordinator:
         context_payout_generation = int(
             getattr(context, "payout_state_generation", 0)
         )
+        context_payout_artifact_sha256 = getattr(
+            context,
+            "payout_artifact_sha256",
+            None,
+        )
+        published_payout_state = getattr(self, "_published_payout_state", None)
+        published_payout_artifact = (
+            published_payout_state.artifact
+            if published_payout_state is not None
+            else None
+        )
         active_needs_refresh = (
             previousblockhash != snapshot.bestblockhash
             or previousblockhash != snapshot.previousblockhash
             or context_fingerprint != snapshot.template_fingerprint
             or context_payout_generation
             != int(getattr(self, "_payout_state_generation", 0))
+            # A self-check repair swaps the published balance snapshot in
+            # place: the generation and append epoch both survive, so only
+            # the digest identifies an active job still mining the refuted
+            # balances. Jobs stamped before the digest existed (or while no
+            # artifact is published mid-publication) defer to the generation
+            # fence above.
+            or (
+                context_payout_artifact_sha256 is not None
+                and published_payout_artifact is not None
+                and context_payout_artifact_sha256
+                != published_payout_artifact.prior_balances_sha256
+            )
         )
         if active_needs_refresh:
             return True

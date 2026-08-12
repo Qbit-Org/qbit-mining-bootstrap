@@ -1430,6 +1430,69 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
         with server._job_cache_lock:
             self.assertIsNotNone(server._payout_ledger_artifact)
 
+    def test_self_check_repair_supersedes_active_jobs(self) -> None:
+        # The in-place repair changes neither the payout generation nor the
+        # append epoch, so an already-stamped job passes every admission
+        # fence while carrying the refuted balances. The repair must
+        # schedule a refresh wave, and the wave's reselection must identify
+        # such jobs by their payout digest, or they stay mineable (and a
+        # block solve commits the stale allocation) until an unrelated
+        # generation change.
+        server, _ledger, _artifacts = self.configured_server()
+        install_fake_bundle_builder(server)
+        server._ensure_tip_refresh_state()
+        state = client(1)
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: 1_000_000,
+        ):
+            bundle = server.build_shared_job_bundle(
+                server.current_template_artifacts(),
+                worker(),
+            )
+            context = server.stamp_job_for_client(
+                state,
+                bundle,
+                clean_jobs=True,
+            )
+        state.active_job = context
+        snapshot = SimpleNamespace(
+            bestblockhash=str(bundle.template["previousblockhash"]),
+            previousblockhash=str(bundle.template["previousblockhash"]),
+            template_fingerprint=bundle.template_fingerprint,
+        )
+        with server._job_cache_lock:
+            published = server._published_payout_state.artifact
+        assert published is not None
+        self.assertEqual(
+            context.payout_artifact_sha256,
+            published.prior_balances_sha256,
+        )
+        self.assertFalse(
+            server.client_needs_tip_template_refresh(state, snapshot)
+        )
+
+        self.assertTrue(
+            server._publish_self_check_repaired_balances(
+                0,
+                stale_prior_balances_sha256=published.prior_balances_sha256,
+                balances=[
+                    {
+                        "recipient_id": "carry",
+                        "order_key": "01:carry",
+                        "p2mr_program_hex": "66" * 32,
+                        "balance_sats": 999,
+                    }
+                ],
+            )
+        )
+
+        self.assertTrue(
+            server.client_needs_tip_template_refresh(state, snapshot)
+        )
+        self.assertTrue(server._tip_refresh_pending_event.is_set())
+        self.assertTrue(server._tip_refresh_retry.is_set())
+
     def test_incremental_and_forced_full_artifacts_match_with_carry_boundaries(
         self,
     ) -> None:
