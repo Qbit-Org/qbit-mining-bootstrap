@@ -1314,16 +1314,51 @@ class JsonRpc:
                     raise last_exc
                 raise TimeoutError(f"qbit RPC {method} timed out")
             conn = self._acquire_connection(remaining)
+            # The socket timeout bounds each individual socket operation,
+            # not the call: a response body arriving one packet per
+            # interval extends the call arbitrarily past its nominal
+            # deadline. Lease authority margins are sized from this
+            # timeout as a wall-clock bound on fence-guarded effects, so
+            # enforce it end-to-end: a watchdog severs the socket at the
+            # deadline and the blocked operation surfaces as a timeout.
+            # For mutating calls that is the same uncertain outcome a
+            # socket timeout already produces, reconciled by durable
+            # replay as a new fully fenced operation.
+            watchdog_fired = threading.Event()
+
+            def _sever_connection(
+                doomed: http.client.HTTPConnection = conn,
+                fired: threading.Event = watchdog_fired,
+            ) -> None:
+                fired.set()
+                sock = getattr(doomed, "sock", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                try:
+                    doomed.close()
+                except Exception:
+                    pass
+
+            watchdog = threading.Timer(remaining + 0.1, _sever_connection)
+            watchdog.daemon = True
+            watchdog.start()
             try:
                 conn.request("POST", path, body=body, headers=headers)
                 response = conn.getresponse()
                 data = response.read()  # drain so the connection can be reused
             except (http.client.HTTPException, OSError) as exc:
-                last_exc = exc
                 self._drop_connection()
+                if watchdog_fired.is_set():
+                    raise TimeoutError(f"qbit RPC {method} timed out") from exc
+                last_exc = exc
                 if attempt + 1 < attempt_count:
                     continue
                 raise
+            finally:
+                watchdog.cancel()
             if response.status != 200:
                 # Non-200 bodies may hold a JSON-RPC error (qbitd returns the
                 # error object with a 500 for some methods); surface it as the
