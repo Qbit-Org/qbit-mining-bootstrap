@@ -2975,9 +2975,13 @@ class TipRefreshValidationTests(unittest.TestCase):
         self.assertIsNone(
             getattr(server, "template_refresh_failure_started_monotonic", None)
         )
-        self.assertEqual(
+        # blocked_at is a real monotonic reading plus an offset, large enough
+        # on a long-uptime host that (blocked_at + 5.0) - blocked_at rounds
+        # away from exactly 5.0 — the streak age is plain float subtraction.
+        self.assertAlmostEqual(
             server.coordination_blocked_streak_age_seconds(blocked_at + 5.0),
             5.0,
+            delta=1e-6,
         )
         self.assertTrue(server._tip_refresh_retry.is_set())
 
