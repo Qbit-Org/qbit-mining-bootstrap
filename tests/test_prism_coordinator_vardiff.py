@@ -657,6 +657,9 @@ def install_idle_job_cache(
         payout_state_generation=0,
         build_key=SimpleNamespace(
             payout_artifact_sha256=payout_artifact_sha256,
+            payout_append_invalidation_epoch=(
+                server._payout_ledger_append_invalidation_epoch
+            ),
         ),
     )
     with server._job_cache_lock:
@@ -4250,7 +4253,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
     def _reconcile_coordinator_with_artifact_counter(
         ledger: ReorgLedger,
         rpc: ReorgRpc,
-    ) -> tuple[PrismCoordinator, list[tuple[int, int]]]:
+    ) -> tuple[PrismCoordinator, list[tuple[int, int, bool]]]:
         """Coordinator armed so candidate preparation would build an artifact."""
         server = coordinator()
         server.reorg_reconciler_enabled = True
@@ -4262,17 +4265,22 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server._payout_artifact_executor_shutdown = True
         server._pool_ready_latched = True
         server._template_artifacts = SimpleNamespace(network_difficulty=1)
-        build_calls: list[tuple[int, int]] = []
+        build_calls: list[tuple[int, int, bool]] = []
 
         def fake_build(
             expected_payout_state_generation: int,
             artifact_payout_state_generation: int,
             network_difficulty: int,
+            force_full_rescan: bool = False,
+            bypass_build_interval: bool = False,
+            during_publication: bool = False,
         ) -> None:
+            del network_difficulty, bypass_build_interval, during_publication
             build_calls.append(
                 (
                     expected_payout_state_generation,
                     artifact_payout_state_generation,
+                    force_full_rescan,
                 )
             )
             return None
@@ -4296,6 +4304,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         first = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
         self.assertEqual(first["published_generation"], 1)
         self.assertEqual(len(build_calls), 1)
+        self.assertFalse(build_calls[0][2])
 
         second = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
 
@@ -4344,8 +4353,188 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(second["inactive_blocks"], 1)
         self.assertEqual(second["published_generation"], 2)
         self.assertEqual(len(build_calls), 2)
+        self.assertTrue(build_calls[1][2])
         self.assertEqual(ledger.rows[0]["chain_state"], "inactive")
         self.assertIn(("inactive", pool_block_hash, 10), ledger.events)
+
+    def test_lost_mutation_response_publishes_fresh_balances_with_forced_rescan(
+        self,
+    ) -> None:
+        tip = "5e" * 32
+        pool_block_hash = "af" * 32
+
+        class LostResponseLedger(ReorgLedger):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.prior_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.prior_balance_reads += 1
+                if any(row["chain_state"] == "confirmed" for row in self.rows):
+                    return [
+                        {
+                            "recipient_id": "stale-carry",
+                            "order_key": "01:stale-carry",
+                            "p2mr_program_hex": "44" * 32,
+                            "balance_sats": 546,
+                        }
+                    ]
+                return []
+
+            def mark_pool_block_inactive(
+                self,
+                *,
+                block_hash: str,
+                active_tip_height: int,
+            ) -> dict[str, object]:
+                result = super().mark_pool_block_inactive(
+                    block_hash=block_hash,
+                    active_tip_height=active_tip_height,
+                )
+                if int(result["inactive_count"]):
+                    raise ConnectionError("mutation response lost")
+                return result
+
+        ledger = LostResponseLedger()
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        forced_rescans: list[bool] = []
+        original_prepare = server._prepared_payout_state_candidate
+
+        def record_prepare(
+            captured: tuple[int, int, str | None, str, float],
+            *,
+            force_full_window_rescan: bool = False,
+            bypass_build_interval: bool = False,
+        ) -> object:
+            forced_rescans.append(force_full_window_rescan)
+            return original_prepare(
+                captured,
+                force_full_window_rescan=force_full_window_rescan,
+                bypass_build_interval=bypass_build_interval,
+            )
+
+        server._prepared_payout_state_candidate = record_prepare  # type: ignore[method-assign]
+
+        first = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+        self.assertEqual(first["published_generation"], 1)
+        with server._job_cache_lock:
+            initially_published = server._published_payout_state.artifact
+        assert initially_published is not None
+        self.assertEqual(len(initially_published.prior_balances()), 0)
+
+        ledger.rows.append(
+            {
+                "block_hash": pool_block_hash,
+                "block_height": 12,
+                "chain_state": "confirmed",
+                "maturity_state": "immature",
+            }
+        )
+        # Rebuild the current generation's immutable state so the test starts
+        # from balances that predate the lost-response mutation.
+        with server._job_cache_lock:
+            server._published_payout_state = dataclass_replace(
+                server._published_payout_state,
+                artifact=None,
+            )
+        stale_published = server._current_payout_state_artifact()
+        self.assertEqual(len(stale_published.prior_balances()), 1)
+        reads_before_error = ledger.prior_balance_reads
+        forced_rescans.clear()
+
+        with self.assertRaisesRegex(ConnectionError, "mutation response lost"):
+            server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+
+        with server._job_cache_lock:
+            healed_state = server._published_payout_state
+        assert healed_state.artifact is not None
+        self.assertEqual(healed_state.generation, 2)
+        self.assertEqual(healed_state.artifact.prior_balances(), [])
+        self.assertEqual(ledger.prior_balance_reads, reads_before_error + 1)
+        self.assertEqual(forced_rescans, [True])
+        self.assertEqual(ledger.rows[0]["chain_state"], "inactive")
+
+    def test_read_phase_reconcile_failure_does_not_force_balance_rescan(
+        self,
+    ) -> None:
+        tip = "5f" * 32
+
+        class PrefetchFailureLedger(ReorgLedger):
+            fail_prefetch = False
+
+            def __init__(self) -> None:
+                super().__init__([])
+                self.prior_balance_reads = 0
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.prior_balance_reads += 1
+                return []
+
+            def reorg_watch_blocks(
+                self,
+                *,
+                active_tip_height: int,
+            ) -> list[dict[str, object]]:
+                if self.fail_prefetch:
+                    raise TimeoutError("reconcile prefetch join exceeded 20s")
+                return super().reorg_watch_blocks(
+                    active_tip_height=active_tip_height
+                )
+
+        ledger = PrefetchFailureLedger()
+        server = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.ledger = ledger
+        server.rpc = ReorgRpc(
+            tip=tip,
+            template=gbt_template(tip, height=11),
+            height=10,
+            block_hashes={10: tip},
+        )
+        first = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+        self.assertEqual(first["published_generation"], 1)
+        reads_before_failure = ledger.prior_balance_reads
+        with server._job_cache_lock:
+            generation_before_failure = server._published_payout_state.generation
+
+        forced_rescans: list[bool] = []
+        original_prepare = server._prepared_payout_state_candidate
+
+        def record_prepare(
+            captured: tuple[int, int, str | None, str, float],
+            *,
+            force_full_window_rescan: bool = False,
+            bypass_build_interval: bool = False,
+        ) -> object:
+            forced_rescans.append(force_full_window_rescan)
+            return original_prepare(
+                captured,
+                force_full_window_rescan=force_full_window_rescan,
+                bypass_build_interval=bypass_build_interval,
+            )
+
+        server._prepared_payout_state_candidate = record_prepare  # type: ignore[method-assign]
+        ledger.fail_prefetch = True
+
+        with self.assertRaisesRegex(
+            TimeoutError,
+            "reconcile prefetch join exceeded 20s",
+        ):
+            server.reconcile_prism_pool_blocks_once(tip_hash=tip)
+
+        with server._job_cache_lock:
+            generation_after_failure = server._published_payout_state.generation
+        self.assertEqual(forced_rescans, [])
+        self.assertEqual(ledger.prior_balance_reads, reads_before_failure)
+        self.assertEqual(generation_after_failure, generation_before_failure)
 
     def test_concurrent_same_tip_reconciles_share_one_pass(self) -> None:
         tip = "5c" * 32
@@ -6925,7 +7114,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
         self.assertEqual(
             server.stale_job_abandon_counts,
-            {"tip_moved": 0, "balance_stale": 1},
+            {"tip_moved": 0, "balance_stale": 1, "append_epoch_stale": 0},
         )
         outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
         self.assertEqual(outbox_row["state"], "abandoned")
@@ -6941,6 +7130,867 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertIn(
             'qbit_prism_stale_job_abandons_total{class="balance_stale"} 1',
             metrics,
+        )
+
+    def test_block_submit_rejects_job_after_late_append_epoch_invalidation(self) -> None:
+        # A late-visible replay append advances the live epoch and schedules
+        # the refresh wave asynchronously; until that wave retires the job,
+        # membership admission still lets the pre-append job submit. Landing
+        # must fail closed instead of minting a coinbase whose payout window
+        # omitted the replayed share.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server._ensure_job_cache_state()
+        with server._job_cache_lock:
+            server._payout_ledger_append_invalidation_epoch += 1
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("audit bundle must not be built from a pre-append payout window")
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="ea" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("append-epoch-stale").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        # The share was already accepted at submit time, so a lost block is a
+        # block-abandonment, not a stale share rejection.
+        self.assertEqual(server.stale_share_count, 0)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="append_epoch_stale"} 1',
+            metrics,
+        )
+
+    def test_replayed_block_candidate_is_exempt_from_append_epoch_fence(self) -> None:
+        # Epochs are process-local: a candidate reconstructed from durable
+        # intent carries no meaningful stamp, so an epoch advanced by this
+        # process's own share replay must not abandon the recovered block.
+        # Cross-restart payout drift is governed by the durable share-window
+        # replay and prior-balance fences instead.
+        server, state, ledger = submit_coordinator()
+        server.stop_after_block = False
+        server.max_blocks = 10
+        block_hash = "cd" * 32
+        pending = self._pending_append("replayed-epoch").pending_share
+        original = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            ),
+            pending_share=pending,
+        )
+        candidate = server.block_candidate_from_intent(
+            server.block_candidate_intent(original)
+        )
+        self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
+        server._ensure_job_cache_state()
+        with server._job_cache_lock:
+            server._payout_ledger_append_invalidation_epoch += 1
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            accepted = server.submit_block_candidate(candidate)
+
+        self.assertTrue(accepted)
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
+        self.assertEqual(len(ledger.persisted), 1)
+        self.assertEqual(len(ledger.confirmed), 1)
+
+    def test_replayed_block_candidate_rejects_window_omitting_durable_append(
+        self,
+    ) -> None:
+        # Epochs are process-local, so a reconstructed candidate is exempt
+        # from the epoch fence -- but the late-visible append that fence
+        # guards against survives the restart in the durable ledger. A carry
+        # balance does not move on a share append, so the prior-balance fence
+        # cannot see it either; replaying the audit window at the intent's
+        # declared anchor must fail the landing when it surfaces a share the
+        # recorded coinbase omitted.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        ledger.durable_payout_state = True  # type: ignore[attr-defined]
+        window_calls: list[tuple[int, int]] = []
+
+        def durable_window(
+            *,
+            anchor_job_issued_at_ms: int,
+            network_difficulty: int,
+        ) -> list[dict[str, object]]:
+            window_calls.append((anchor_job_issued_at_ms, network_difficulty))
+            return [
+                {"share_id": "recorded-window-share"},
+                {"share_id": "late-appended-share"},
+            ]
+
+        ledger.audit_share_window = durable_window  # type: ignore[method-assign]
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.shares_json = [{"share_id": "recorded-window-share"}]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError(
+                "audit bundle must not be built from a payout window omitting "
+                "a durably appended share"
+            )
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="ec" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("replayed-window-omission").pending_share
+        original = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        intent = server.block_candidate_intent(original)
+        candidate = server.block_candidate_from_intent(intent)
+        self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
+        ledger.append_batch([(pending, intent)])
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        self.assertEqual(window_calls, [(12000, 1)])
+        # The share was already accepted at submit time, so a lost block is a
+        # block-abandonment, not a stale share rejection.
+        self.assertEqual(server.stale_share_count, 0)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "replayed payout window omits a durably appended share",
+        )
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="append_epoch_stale"} 1',
+            metrics,
+        )
+
+    def test_replayed_block_candidate_lands_when_durable_window_replays_intact(
+        self,
+    ) -> None:
+        # The durable revalidation is a fence against omitted appends, not a
+        # new obstacle to recovery: when the audit window at the declared
+        # anchor replays exactly the recorded shares, the reconstructed
+        # candidate still lands -- even while this process's own live epoch
+        # has advanced past the meaningless replayed stamp.
+        server, state, ledger = submit_coordinator()
+        server.stop_after_block = False
+        server.max_blocks = 10
+        ledger.durable_payout_state = True
+        ledger.audit_share_window = (  # type: ignore[attr-defined]
+            lambda *, anchor_job_issued_at_ms, network_difficulty: [
+                {"share_id": "recorded-window-share"}
+            ]
+        )
+        context = server.jobs["job-1"]
+        context.shares_json = [{"share_id": "recorded-window-share"}]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        block_hash = "cf" * 32
+        pending = self._pending_append("replayed-durable-window").pending_share
+        original = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            ),
+            pending_share=pending,
+        )
+        candidate = server.block_candidate_from_intent(
+            server.block_candidate_intent(original)
+        )
+        self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
+        server._ensure_job_cache_state()
+        with server._job_cache_lock:
+            server._payout_ledger_append_invalidation_epoch += 1
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            accepted = server.submit_block_candidate(candidate)
+
+        self.assertTrue(accepted)
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
+        self.assertEqual(len(ledger.persisted), 1)
+        self.assertEqual(len(ledger.confirmed), 1)
+
+    def test_block_submit_aborts_when_append_invalidation_races_the_landing(
+        self,
+    ) -> None:
+        # An append-side invalidation landing between the advisory epoch
+        # fence and submitblock must still abort the landing: the
+        # authoritative fence holds the same lock the bump takes, so the
+        # bump cannot slip past both. The bump here is driven through the
+        # REAL invalidation path from the getblockcount hook -- with no
+        # armed artifact or in-flight walk in the harness, it fires only
+        # because the landing exposed its own declared anchor.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError(
+                "audit bundle must not be built after a racing append "
+                "invalidated the payout window"
+            )
+        )
+        late_append = self._pending_append("late-during-landing").pending_share
+
+        class RaceRpc(TipRpc):
+            def __init__(rpc_self, tip: str) -> None:
+                super().__init__(tip)
+                rpc_self.race_fired = False
+
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    if not rpc_self.race_fired:
+                        rpc_self.race_fired = True
+                        server._invalidate_incremental_payout_window_for_append(
+                            late_append
+                        )
+                    return 9
+                if method == "submitblock":
+                    raise AssertionError(
+                        "submitblock must not run after a racing append "
+                        "invalidation"
+                    )
+                return super().call(method, params)
+
+        server.rpc = RaceRpc("00" * 32)
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="da" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("append-races-landing").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        self.assertTrue(server.rpc.race_fired)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+        self.assertEqual(server.stale_share_count, 0)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+        # The landing retires its exposed anchor on the way out.
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_window_inflight_scan_anchors, {})
+
+    def test_replayed_candidate_aborts_when_append_races_after_revalidation(
+        self,
+    ) -> None:
+        # The durable replay rebases a reconstructed candidate onto the live
+        # epoch sequence as of the revalidation read; an epoch advanced
+        # after that read must still abort the landing at the authoritative
+        # fence even though the replayed window itself matched.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        ledger.durable_payout_state = True  # type: ignore[attr-defined]
+        ledger.audit_share_window = (  # type: ignore[method-assign]
+            lambda *, anchor_job_issued_at_ms, network_difficulty: [
+                {"share_id": "recorded-window-share"}
+            ]
+        )
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.shares_json = [{"share_id": "recorded-window-share"}]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError(
+                "audit bundle must not be built after a racing append "
+                "invalidated the replayed payout window"
+            )
+        )
+
+        class RaceRpc(TipRpc):
+            def __init__(rpc_self, tip: str) -> None:
+                super().__init__(tip)
+                rpc_self.race_fired = False
+
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    if not rpc_self.race_fired:
+                        rpc_self.race_fired = True
+                        with server._job_cache_lock:
+                            server._payout_ledger_append_invalidation_epoch += 1
+                    return 9
+                if method == "submitblock":
+                    raise AssertionError(
+                        "submitblock must not run after a racing append "
+                        "invalidation"
+                    )
+                return super().call(method, params)
+
+        server.rpc = RaceRpc("00" * 32)
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="db" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("replayed-append-race").pending_share
+        original = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        intent = server.block_candidate_intent(original)
+        candidate = server.block_candidate_from_intent(intent)
+        self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
+        ledger.append_batch([(pending, intent)])
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        self.assertTrue(server.rpc.race_fired)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+
+    def test_landing_blocked_by_fenced_append_aborts_on_bumped_epoch(
+        self,
+    ) -> None:
+        # A replay-shaped append holds the landing fence across the durable
+        # commit itself, not only across its epoch bump. A landing that
+        # arrives while that commit is in flight must wait at the fence and
+        # abort on the bumped epoch -- never verify the pre-bump epoch and
+        # submit a coinbase whose window omits the row that just became
+        # durable.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError(
+                "audit bundle must not be built after a fenced append "
+                "invalidated the payout window"
+            )
+        )
+
+        submitblock_calls: list[object] = []
+
+        class RecordingSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    submitblock_calls.append(params)
+                    return None
+                return super().call(method, params)
+
+        server.rpc = RecordingSubmitRpc("00" * 32)
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="dc" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("landing-vs-fenced-append").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        # Expose a live anchor the late row predates, as an armed window
+        # would: the writer's pre-commit peek must fire before any landing
+        # is in flight to declare its own anchor.
+        anchor_token = server._expose_inflight_scan_anchor(12000)
+        self.addCleanup(server._retire_inflight_scan_anchor, anchor_token)
+
+        commit_entered = threading.Event()
+        release_commit = threading.Event()
+        self.addCleanup(release_commit.set)
+        original_append_batch = ledger.append_batch
+
+        def gated_append_batch(entries: list[object]) -> list[object]:
+            commit_entered.set()
+            release_commit.wait(timeout=10.0)
+            return original_append_batch(entries)
+
+        ledger.append_batch = gated_append_batch  # type: ignore[method-assign]
+        late_entry = self._pending_append("late-fenced-append")
+        writer = threading.Thread(
+            target=server._append_share_batch,
+            args=([late_entry],),
+            daemon=True,
+        )
+        writer.start()
+        self.assertTrue(commit_entered.wait(timeout=10.0))
+        # The fence is held while the predating row's commit is in flight.
+        self.assertTrue(server._payout_append_landing_fence_lock.locked())
+
+        landing = threading.Thread(
+            target=server.submit_next_block_candidate,
+            daemon=True,
+        )
+        landing.start()
+        # Give the landing time to run up against the fence; with the commit
+        # still gated it must not have entered submitblock.
+        time.sleep(0.05)
+        self.assertEqual(submitblock_calls, [])
+
+        release_commit.set()
+        writer.join(timeout=10.0)
+        self.assertFalse(writer.is_alive())
+        landing.join(timeout=10.0)
+        self.assertFalse(landing.is_alive())
+
+        # The bump landed together with the durable append; the landing
+        # observed it and abandoned instead of submitting.
+        self.assertEqual(submitblock_calls, [])
+        self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+            1,
+        )
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+
+    def test_predating_append_stays_undurable_while_landing_holds_submit_fence(
+        self,
+    ) -> None:
+        # The other side of the fence boundary: while a landing holds the
+        # fence across submitblock, a predating append's durable commit --
+        # not only its epoch bump -- must wait for the RPC to return. The
+        # old ordering let the row become durable mid-RPC while its bump
+        # queued behind the fence, so the authoritative epoch check could
+        # not observe the invalidation and the coinbase entered qbitd
+        # underpaying a durable share no refresh wave can unsubmit.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        # Keep an anchor the late row predates exposed for the whole test,
+        # independent of the landing's own declared-anchor lifetime.
+        anchor_token = server._expose_inflight_scan_anchor(12000)
+        self.addCleanup(server._retire_inflight_scan_anchor, anchor_token)
+
+        late_entry = self._pending_append("mid-rpc-append")
+        durable_mid_rpc: list[bool] = []
+        append_threads: list[threading.Thread] = []
+
+        class MidRpcAppendRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    thread = threading.Thread(
+                        target=server._append_share_entry,
+                        args=(late_entry,),
+                        daemon=True,
+                    )
+                    thread.start()
+                    append_threads.append(thread)
+                    deadline = time.monotonic() + 0.25
+                    became_durable = False
+                    while time.monotonic() < deadline:
+                        if late_entry.pending_share.share_id in ledger._share_ids:
+                            became_durable = True
+                            break
+                        time.sleep(0.005)
+                    durable_mid_rpc.append(became_durable)
+                    return "rejected-by-test"
+                return super().call(method, params)
+
+        server.rpc = MidRpcAppendRpc("00" * 32)
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="dd" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("landing-holds-fence").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        # The append could not make the row durable while the fence-guarded
+        # RPC was in flight; it committed and bumped only afterwards.
+        self.assertEqual(durable_mid_rpc, [False])
+        self.assertTrue(append_threads)
+        append_threads[0].join(timeout=10.0)
+        self.assertFalse(append_threads[0].is_alive())
+        self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[
+                PRISM_REJECTION_SUBMITBLOCK_REJECTED
+            ],
+            1,
+        )
+
+    def test_landing_drains_unfenced_inflight_append_before_epoch_fences(
+        self,
+    ) -> None:
+        # The unfenced classification is a one-time predicate: an append
+        # checked while no anchor is exposed commits outside the landing
+        # fence, so a landing that exposes its declared anchor afterwards
+        # could hold the fence across submitblock while the row becomes
+        # durable mid-RPC and its epoch bump queues behind that same
+        # fence -- arriving too late to reject the block. The landing must
+        # instead drain such in-flight commits right after exposing its
+        # anchor, so the bump lands before its epoch fences run.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="dc" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("landing-drains").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        late_entry = self._pending_append("unfenced-inflight")
+        commit_entered = threading.Event()
+        commit_release = threading.Event()
+        original_append_batch = ledger.append_batch
+
+        def gated_append_batch(batch: list[object]) -> list[object]:
+            commit_entered.set()
+            if not commit_release.wait(timeout=10.0):
+                raise AssertionError("gated ledger commit was never released")
+            return original_append_batch(batch)
+
+        ledger.append_batch = gated_append_batch  # type: ignore[method-assign]
+
+        # Release the gated commit exactly when the landing starts
+        # draining, so the test exercises the wait itself rather than a
+        # lucky ordering.
+        drained_anchors: list[int] = []
+        original_drain = server._await_unfenced_appends_predating_anchor
+
+        def recording_drain(anchor_ms: int) -> None:
+            drained_anchors.append(int(anchor_ms))
+            commit_release.set()
+            original_drain(anchor_ms)
+
+        server._await_unfenced_appends_predating_anchor = recording_drain  # type: ignore[method-assign]
+
+        submitblock_calls: list[object] = []
+
+        class RecordingSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    submitblock_calls.append(params)
+                    return None
+                return super().call(method, params)
+
+        server.rpc = RecordingSubmitRpc("00" * 32)
+
+        append_thread = threading.Thread(
+            target=server._append_share_entry,
+            args=(late_entry,),
+            daemon=True,
+        )
+        append_thread.start()
+        # The append was classified with no anchor exposed and is now
+        # committing outside the fence.
+        self.assertTrue(commit_entered.wait(timeout=10.0))
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        append_thread.join(timeout=10.0)
+        self.assertFalse(append_thread.is_alive())
+        self.assertEqual(drained_anchors, [12000])
+        self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+            self.assertEqual(
+                server._payout_unfenced_append_inflight_stamps, {}
+            )
+        # The drained append's bump landed before the landing's epoch
+        # fences, so the candidate was abandoned instead of entering
+        # submitblock with a coinbase omitting the durable predating share.
+        self.assertEqual(submitblock_calls, [])
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+            1,
+        )
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+
+    def test_completed_append_predating_seedless_published_window_fences(
+        self,
+    ) -> None:
+        # A build that seeds no artifact (the documented
+        # PRISM_PAYOUT_ARTIFACT_REUSE=0 rollback mode) retires its walk
+        # exposure at the publication fence, yet jobs stamped from it keep
+        # serving that window until they retire. A replay-shaped append
+        # that started AND finished in that gap used to see no live
+        # anchor: no epoch bump, and its registry entry was popped on
+        # completion -- so a later landing drained nothing, its
+        # nonnegative context epoch skipped durable revalidation, and
+        # submitblock accepted a coinbase omitting the durable share.
+        # Publication now hands the declared anchor to the
+        # published-window watermark, so the append commits under the
+        # landing fence with its epoch bump and the landing abandons.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="dd" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("seedless-window").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        # The publication fence of a seedless build hands the bundle's
+        # declared anchor to the watermark when it retires the walk
+        # exposure.
+        server._ensure_job_cache_state()
+        with server._job_cache_lock:
+            server._publish_seedless_job_window_anchor_locked(12000)
+
+        # The ordinary share hot path stays off the fence: a row stamped
+        # above the watermark commits unfenced and bumps nothing.
+        ordinary_entry = self._pending_append(
+            "ordinary-above-watermark", accepted_at_ms=13000
+        )
+        server._append_share_entry(ordinary_entry)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 0)
+            self.assertEqual(
+                server._payout_unfenced_append_inflight_stamps, {}
+            )
+
+        # The replay-shaped append starts and finishes entirely before the
+        # landing begins: nothing is in flight for the landing to drain.
+        late_entry = self._pending_append("completed-before-landing")
+        server._append_share_entry(late_entry)
+        self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+            self.assertEqual(
+                server._payout_unfenced_append_inflight_stamps, {}
+            )
+
+        submitblock_calls: list[object] = []
+
+        class RecordingSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    submitblock_calls.append(params)
+                    return None
+                return super().call(method, params)
+
+        server.rpc = RecordingSubmitRpc("00" * 32)
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        # The bump already happened at commit time, so the landing's epoch
+        # fence rejects the pre-append window instead of submitting a
+        # coinbase that omits the durable predating share.
+        self.assertEqual(submitblock_calls, [])
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+            1,
+        )
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
         )
 
     def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
@@ -7481,6 +8531,61 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertFalse(server.share_recovery_path.exists())
             self.assertEqual(server.replay_recovered_shares(), 0)
 
+    def test_replay_recovered_shares_commit_under_the_landing_fence(self) -> None:
+        # Recovered rows reconstruct pre-crash timestamps, so they predate
+        # live anchors. Each replay append must hold the landing fence across
+        # the ledger commit and its epoch bump -- never bump after the row is
+        # already durable, where a landing could verify the pre-bump epoch
+        # and submit a coinbase omitting the replayed share.
+        server, _state, ledger = submit_coordinator()
+        anchor_token = server._expose_inflight_scan_anchor(12000)
+        self.addCleanup(server._retire_inflight_scan_anchor, anchor_token)
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            server._recover_share_to_disk(self._pending_append("h1"), "test")
+
+            fence_held_during_commit: list[bool] = []
+            original_append = ledger.append
+
+            def recording_append(pending: object) -> object:
+                fence_held_during_commit.append(
+                    server._payout_append_landing_fence_lock.locked()
+                )
+                return original_append(pending)
+
+            ledger.append = recording_append  # type: ignore[method-assign]
+            replayed = server.replay_recovered_shares()
+
+        self.assertEqual(replayed, 1)
+        self.assertEqual(fence_held_during_commit, [True])
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+
+    def test_sync_append_commits_predating_row_under_the_landing_fence(
+        self,
+    ) -> None:
+        # The synchronous (no-writer) append path takes the same fence
+        # boundary as the group-commit writer for a row that predates a
+        # live anchor.
+        server, _state, ledger = submit_coordinator()
+        anchor_token = server._expose_inflight_scan_anchor(12000)
+        self.addCleanup(server._retire_inflight_scan_anchor, anchor_token)
+
+        fence_held_during_commit: list[bool] = []
+        original_append = ledger.append
+
+        def recording_append(pending: object) -> object:
+            fence_held_during_commit.append(
+                server._payout_append_landing_fence_lock.locked()
+            )
+            return original_append(pending)
+
+        ledger.append = recording_append  # type: ignore[method-assign]
+        self.assertTrue(server._append_share_entry(self._pending_append("h2")))
+        self.assertEqual(fence_held_during_commit, [True])
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+
     def test_replay_recovered_shares_orders_by_accepted_at(self) -> None:
         # A share can be recovered out of FIFO order (overflow of the newest, or
         # a ledger flap during the shutdown drain). Replay must reorder by
@@ -7833,7 +8938,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
         self.assertEqual(
             server.stale_job_abandon_counts,
-            {"tip_moved": 1, "balance_stale": 0},
+            {"tip_moved": 1, "balance_stale": 0, "append_epoch_stale": 0},
         )
         self.assertEqual(server.stale_share_count, 0)
         # The credited share survives the lost block race.
@@ -8574,7 +9679,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         self.assertEqual(
             server.stale_job_abandon_counts,
-            {"tip_moved": 1, "balance_stale": 0},
+            {"tip_moved": 1, "balance_stale": 0, "append_epoch_stale": 0},
         )
         self.assertEqual(ledger.pending_block_candidates(), [])
         outbox_row = ledger._block_candidate_outbox[
