@@ -26332,45 +26332,59 @@ class PrismCoordinator:
                 )
                 fallback_submit_under_fence = not node_submission.attempted
                 if not node_submission.attempted:
-                    try:
-                        self._require_fresh_ledger_lease_for_external_side_effect(
-                            "submitblock"
-                        )
-                    except WriterLeaseRenewalDeferred:
-                        if not transition_already_landed:
-                            # The refusal fired before submitblock, so this
-                            # attempt's outcome is not uncertain: qbitd
-                            # provably never saw the block (no fast-lane node
-                            # offer either — attempted is False). Unwind the
-                            # landed bar this attempt armed — leaving it
-                            # would bar reconciliation and payout-state
-                            # publication for as long as the writer's own
-                            # fenced write keeps the renewal deferred, though
-                            # nothing needs preserving. The begun preview
-                            # stays and the retry re-arms both. A bar landed
-                            # by an earlier attempt that did reach
-                            # submitblock keeps standing for that attempt's
-                            # uncertain outcome.
-                            self._unmark_accepted_block_payout_landed(
-                                block_hash
+
+                    def _verify_lease_before_submitblock() -> None:
+                        # Runs at the RPC boundary — after any wait on the
+                        # landing fence lock below — so the lease runway the
+                        # verification proves is still intact when the RPC
+                        # starts. A predating append_batch can hold that
+                        # lock across its ledger commit and epoch bump far
+                        # longer than any scheduling headroom, and a
+                        # verification taken before the wait would measure
+                        # runway the wait then consumes.
+                        try:
+                            self._require_fresh_ledger_lease_for_external_side_effect(
+                                "submitblock"
                             )
-                        raise
+                        except WriterLeaseRenewalDeferred:
+                            if not transition_already_landed:
+                                # The refusal fired before submitblock, so
+                                # this attempt's outcome is not uncertain:
+                                # qbitd provably never saw the block (no
+                                # fast-lane node offer either — attempted is
+                                # False). Unwind the landed bar this attempt
+                                # armed — leaving it would bar reconciliation
+                                # and payout-state publication for as long as
+                                # the writer's own fenced write keeps the
+                                # renewal deferred, though nothing needs
+                                # preserving. The begun preview stays and the
+                                # retry re-arms both. A bar landed by an
+                                # earlier attempt that did reach submitblock
+                                # keeps standing for that attempt's uncertain
+                                # outcome.
+                                self._unmark_accepted_block_payout_landed(
+                                    block_hash
+                                )
+                            raise
+
                     # The epoch fence above is advisory: it releases the lock
                     # after one read, so an append-side bump could still commit
                     # between that read and the RPC below. This one is
                     # authoritative -- the bump acquires the same fence lock, so
                     # holding it across submitblock means no late-visible append
                     # can advance the epoch between this comparison and the
-                    # block entering qbitd. The lock spans exactly one RPC and
-                    # only on this boundary; ordinary share commits never touch
-                    # it (the append side takes it only for rows that predate a
-                    # live anchor, and this landing's own declared anchor stays
-                    # exposed for the landing's duration).
+                    # block entering qbitd. The lock spans the lease
+                    # verification and one RPC, and only on this boundary;
+                    # ordinary share commits never touch it (the append side
+                    # takes it only for rows that predate a live anchor, and
+                    # this landing's own declared anchor stays exposed for
+                    # the landing's duration).
                     append_epoch_raced = False
                     if (
                         effective_append_epoch is None
                         or getattr(context, "collection_only", False)
                     ):
+                        _verify_lease_before_submitblock()
                         node_submission = self._submit_block_candidate_to_node(
                             candidate
                         )
@@ -26383,6 +26397,7 @@ class PrismCoordinator:
                             if live_append_epoch != effective_append_epoch:
                                 append_epoch_raced = True
                             else:
+                                _verify_lease_before_submitblock()
                                 node_submission = (
                                     self._submit_block_candidate_to_node(candidate)
                                 )
