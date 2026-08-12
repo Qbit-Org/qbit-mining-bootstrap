@@ -465,6 +465,11 @@ PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
 )
 DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS = 0.25
 DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
+# The primary accounting handoff queue must be bounded or the documented
+# result-preserving spillover ordering can never engage; the overflow queue
+# stays unbounded by design so an already-offered block is never converted
+# back into a raw-submit retry.
+DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH = 8
 # The node fast lane is intentionally shorter than the normal ten-second RPC
 # budget: an ambiguous timeout leaves the durable outbox pending and replay
 # safely submits the same hash again.
@@ -23939,6 +23944,26 @@ class PrismCoordinator:
             return _BlockCandidateNodeSubmission(attempted=False)
         return self._submit_block_candidate_to_node(candidate)
 
+    def _node_submission_for_candidate_or_retained(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> _BlockCandidateNodeSubmission:
+        """Reuse a retained definitive acceptance instead of re-offering.
+
+        An in-process retry of a candidate whose earlier offer already
+        returned success must not ask the node again: the re-offer answers
+        "duplicate", which downgrades the classification to the moved live
+        tip and leans on chain probes that may be unavailable under the
+        same saturation that caused the retry. The stashed result reruns
+        the landing tail as if the first pass had continued.
+        """
+        retained = self._pop_retained_block_candidate_node_submission(
+            str(candidate.submission.block_hash_hex)
+        )
+        if retained is not None:
+            return retained
+        return self._node_submission_for_candidate(candidate)
+
     def _node_submission_for_direct_candidate(
         self,
         candidate: PrismBlockCandidate,
@@ -24027,7 +24052,7 @@ class PrismCoordinator:
                     raise RuntimeError(
                         "block candidate is waiting for fast-lane capacity"
                     )
-                node_submission = self._node_submission_for_candidate(candidate)
+                node_submission = self._node_submission_for_candidate_or_retained(candidate)
                 self._mark_block_candidate_attempted(block_hash)
                 with self._block_submitter_ledger_statement_timeout_scope():
                     production_submit = (
@@ -24311,7 +24336,17 @@ class PrismCoordinator:
         if not hasattr(self, "_block_accounting_state_lock"):
             self._block_accounting_state_lock = threading.Lock()
         if not hasattr(self, "_block_accounting_queue"):
-            self._block_accounting_queue = queue.PriorityQueue()
+            depth = max(
+                1,
+                int(
+                    getattr(
+                        self,
+                        "block_accounting_queue_depth",
+                        DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH,
+                    )
+                ),
+            )
+            self._block_accounting_queue = queue.PriorityQueue(maxsize=depth)
         if not hasattr(self, "_block_accounting_overflow_queue"):
             self._block_accounting_overflow_queue = queue.PriorityQueue()
         if not hasattr(self, "_block_accounting_sequence"):
@@ -24561,6 +24596,10 @@ class PrismCoordinator:
                     flush=True,
                 )
                 traceback.print_exc()
+                self._stash_retained_block_candidate_node_submission(
+                    str(task.candidate.submission.block_hash_hex),
+                    task.node_submission,
+                )
                 self._retain_block_candidate_for_retry(task.candidate)
             finally:
                 assert source_queue is not None
@@ -24782,7 +24821,7 @@ class PrismCoordinator:
                     return True
                 else:
                     try:
-                        node_submission = self._node_submission_for_candidate(candidate)
+                        node_submission = self._node_submission_for_candidate_or_retained(candidate)
                     except BaseException:
                         try:
                             self._retain_block_candidate_for_retry(candidate)
@@ -24791,7 +24830,7 @@ class PrismCoordinator:
                         raise
             else:
                 try:
-                    node_submission = self._node_submission_for_candidate(candidate)
+                    node_submission = self._node_submission_for_candidate_or_retained(candidate)
                 except BaseException:
                     try:
                         self._retain_block_candidate_for_retry(candidate)
@@ -24881,8 +24920,10 @@ class PrismCoordinator:
                 if terminal_outcome is not None:
                     return terminal_outcome
                 if node_submission is None:
-                    node_submission = self._node_submission_for_candidate(
-                        candidate
+                    node_submission = (
+                        self._node_submission_for_candidate_or_retained(
+                            candidate
+                        )
                     )
                 return self._submit_next_block_candidate_writer(
                     candidate,
@@ -24915,7 +24956,7 @@ class PrismCoordinator:
                 outcome=outcome,
             )
         if node_submission is None:
-            node_submission = self._node_submission_for_candidate(candidate)
+            node_submission = self._node_submission_for_candidate_or_retained(candidate)
         try:
             self._mark_block_candidate_attempted(block_hash)
         except Exception:
@@ -24925,6 +24966,10 @@ class PrismCoordinator:
                 flush=True,
             )
             traceback.print_exc()
+            self._stash_retained_block_candidate_node_submission(
+                block_hash,
+                node_submission,
+            )
             self._retain_block_candidate_for_retry(candidate)
             self._pace_block_candidate_retry(block_hash)
             return True
@@ -24975,6 +25020,10 @@ class PrismCoordinator:
                 "prism coordinator: retained block candidate for retry "
                 f"hash={block_hash} reason={abandon_reason or 'exception'}",
                 flush=True,
+            )
+            self._stash_retained_block_candidate_node_submission(
+                block_hash,
+                node_submission,
             )
             self._retain_block_candidate_for_retry(candidate)
             self._pace_block_candidate_retry(block_hash)
@@ -25322,6 +25371,56 @@ class PrismCoordinator:
         not_before.pop(block_hash, None)
         return True
 
+    def _stash_retained_block_candidate_node_submission(
+        self,
+        block_hash: str,
+        node_submission: _BlockCandidateNodeSubmission | None,
+    ) -> None:
+        """Carry a definitive node acceptance across an in-process retry.
+
+        A fast-lane offer that returned success can be followed by a
+        retryable failure (for example an attempt-marker statement timeout).
+        Re-offering on the retry would come back "duplicate", which
+        classifies against the moved live tip and can only rescue the block
+        through chain probes that may be unavailable under the same
+        saturation. The acceptance is already known, so retain it with the
+        candidate; the retry reruns the landing tail exactly as if the
+        first pass had continued.
+        """
+        if node_submission is None or not node_submission.attempted:
+            return
+        if (
+            node_submission.error is not None
+            or node_submission.result is not None
+        ):
+            # Only a definitive success is safe to reuse: an ambiguous or
+            # rejected offer must be re-offered so the node can resolve it.
+            return
+        with self.lock:
+            retained = getattr(
+                self,
+                "_block_candidate_retained_node_submissions",
+                None,
+            )
+            if retained is None:
+                retained = {}
+                self._block_candidate_retained_node_submissions = retained
+            retained[str(block_hash).lower()] = node_submission
+
+    def _pop_retained_block_candidate_node_submission(
+        self,
+        block_hash: str,
+    ) -> _BlockCandidateNodeSubmission | None:
+        with self.lock:
+            retained = getattr(
+                self,
+                "_block_candidate_retained_node_submissions",
+                None,
+            )
+            if not retained:
+                return None
+            return retained.pop(str(block_hash).lower(), None)
+
     def _clear_block_candidate_retry_state(self, block_hash: str) -> None:
         with self.lock:
             delays = getattr(self, "block_candidate_retry_delays", None)
@@ -25334,6 +25433,13 @@ class PrismCoordinator:
             )
             if not_before is not None:
                 not_before.pop(block_hash, None)
+            retained = getattr(
+                self,
+                "_block_candidate_retained_node_submissions",
+                None,
+            )
+            if retained is not None:
+                retained.pop(str(block_hash).lower(), None)
 
     def _defer_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
         """Record a retryable outcome without counting a terminal abandonment."""
@@ -26692,7 +26798,10 @@ class PrismCoordinator:
         # against the candidate's stamped parent. A later getblockhash check
         # proves a successful acknowledgement, while an ambiguous transport
         # outcome stays pending for duplicate-safe replay. Duplicate replies
-        # are replay evidence and retain the live-tip classification.
+        # are replay evidence and retain the live-tip classification; the
+        # abandonment tie-breaker separately consults this process's own
+        # recorded offer evidence so an unprovable chain view cannot
+        # terminally discard a block the node already told us it has.
         fresh_or_uncertain_submit = bool(
             node_submission.attempted
             and (

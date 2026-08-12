@@ -12092,7 +12092,11 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         with patch("builtins.print"):
             handled = server._submit_next_block_candidate_writer(
                 candidate,
-                node_submission=SimpleNamespace(),
+                node_submission=SimpleNamespace(
+                    attempted=False,
+                    result=None,
+                    error=None,
+                ),
                 disposition_held=True,
             )
         elapsed = time.monotonic() - started
@@ -12133,6 +12137,141 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             self.assertTrue(
                 server.submit_next_block_candidate(defer_accounting=True)
             )
+
+    def test_live_retry_reuses_definitive_node_acceptance_without_reoffer(self) -> None:
+        parent_hash = "00" * 32
+        block_hash = "ce" * 32
+        moved_tip = "11" * 32
+        ledger = SingleWriterShareLedger()
+        server, state, _recording = submit_coordinator(tip=parent_hash)
+        server.ledger = ledger
+        server.stop_after_block = False
+        server.max_blocks = 10
+        server.block_candidate_retry_initial_seconds = 0.0
+        server.block_candidate_retry_max_seconds = 0.0
+        from lab.prism.share_ledger import PendingShare
+
+        pending = PendingShare(
+            share_id="miner-a:live-retry-duplicate",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=10,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=2,
+            ntime=1_700_000_000,
+        )
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        intent = server.block_candidate_intent(candidate)
+        ledger.append_batch([(pending, intent)])
+
+        expected_height = int(candidate.context.template["height"])
+        header_state = {"confirmations": -1}
+
+        class MovedTipRpc(FakeRpc):
+            def __init__(self) -> None:
+                self.submit_results: list[object] = []
+
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+                *,
+                timeout: float | None = None,
+            ) -> object:
+                if method == "submitblock":
+                    result = None if not self.submit_results else "duplicate"
+                    self.submit_results.append(result)
+                    return result
+                if method == "getbestblockhash":
+                    # The chain advances as soon as the first offer lands, so
+                    # the in-process retry observes a moved tip.
+                    return parent_hash if not self.submit_results else moved_tip
+                if method == "getblockhash":
+                    return block_hash
+                if method == "getblockcount":
+                    return 9
+                if method == "getblockheader":
+                    # Unprovable during the tip race (found, not yet active),
+                    # then settled and active for the final pass.
+                    return {
+                        "height": expected_height,
+                        "confirmations": header_state["confirmations"],
+                    }
+                return super().call(method, params)
+
+        rpc = MovedTipRpc()
+        server.rpc = rpc
+        original_mark = ledger.mark_block_candidate_attempted
+        mark_state = {"failed_once": False}
+
+        def flaky_mark(*, block_hash: str) -> bool:
+            # Fail exactly once, on the first attempt marker after the fresh
+            # node offer, mirroring a statement timeout under saturation.
+            if len(rpc.submit_results) == 1 and not mark_state["failed_once"]:
+                mark_state["failed_once"] = True
+                raise RuntimeError("attempt marker timed out")
+            return original_mark(block_hash=block_hash)
+
+        ledger.mark_block_candidate_attempted = flaky_mark  # type: ignore[method-assign]
+        server.enqueue_block_candidate(candidate)
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            with patch("builtins.print"):
+                # First pass: fresh accept from the node, then the attempt
+                # marker fails and the candidate is retained for an
+                # in-process retry carrying the definitive node result.
+                self.assertTrue(server.submit_next_block_candidate())
+                self.assertEqual(rpc.submit_results, [None])
+                self.assertEqual(
+                    ledger._block_candidate_outbox[block_hash]["state"],
+                    "pending",
+                )
+                # Retry: the stashed acceptance is reused, so the node is
+                # never asked again (no "duplicate" classification, no chain
+                # probe reliance) and the landing tail finalizes exactly as
+                # if the first pass had continued past the marker failure.
+                self.assertTrue(server.submit_next_block_candidate())
+        self.assertEqual(rpc.submit_results, [None])
+        self.assertEqual(
+            ledger._block_candidate_outbox[block_hash]["state"],
+            "submitted",
+        )
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            getattr(server, "block_candidate_abandoned_counts", {}),
+        )
+        self.assertEqual(server.accepted_block_count, 1)
+
+    def test_block_accounting_primary_queue_is_bounded_by_default(self) -> None:
+        server, _state, _recording = submit_coordinator()
+        server._ensure_block_accounting_state()
+        # A bounded primary is what makes the documented result-preserving
+        # spillover ordering reachable; the overflow queue stays unbounded.
+        self.assertEqual(server._block_accounting_queue.maxsize, 8)
+        self.assertEqual(server._block_accounting_overflow_queue.maxsize, 0)
 
     def test_accounting_saturation_does_not_convoy_node_offers(self) -> None:
         server, state, _recording = submit_coordinator()
