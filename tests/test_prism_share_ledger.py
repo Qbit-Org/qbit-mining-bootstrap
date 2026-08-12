@@ -1511,6 +1511,149 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(result["renewed_count"], 0)
         self.assertIs(result["renewal_deferred_to_own_write"], True)
 
+    def test_guard_verification_rechecks_when_own_commit_clears_locker_attribution(
+        self,
+    ) -> None:
+        """An own-write commit racing the locker probe must not hard-exit.
+
+        The verification statement's lease-row reads share one MVCC
+        snapshot while pg_stat_activity reports live backend state. When
+        the writer's own fenced write commits after the SKIP LOCKED renewal
+        skipped its locked row but before the probe runs, backend_xid has
+        already cleared and the snapshot still shows the old expired tuple:
+        renewal skipped, row expired, no attributable locker — the exact
+        shape of a competing claim. That commit refreshed the TTL, so a
+        fresh statement's snapshot renews normally; hard-exiting here would
+        restart-loop the coordinator on the very writes the own-lock
+        exemption exists to survive.
+        """
+
+        class CommitRacedGuard:
+            held = True
+
+            def __init__(self) -> None:
+                self.statements: list[str] = []
+                self.query_starts = 0
+
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+            ) -> dict[str, object]:
+                if on_query_start is not None:
+                    self.query_starts += 1
+                    on_query_start()
+                self.statements.append(sql)
+                if len(self.statements) == 1:
+                    # First statement: snapshot taken before the own write's
+                    # commit, probe run after it — locker unattributable.
+                    return {
+                        "backend": "postgres-psql",
+                        "guard_advisory_lock_held": True,
+                        "writer_session_token_current": True,
+                        "lease_renewed_count": 0,
+                        "lease_expired": True,
+                        "lease_locked_by_this_process": False,
+                    }
+                # Recheck: the fresh snapshot sees the committed refresh and
+                # the uncontended row renews.
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 1,
+                    "lease_expired": False,
+                }
+
+        guard = CommitRacedGuard()
+        ledger = self.guarded_verification_ledger(guard)
+        result = ledger.verify_writer_lease_guard_session(
+            on_query_start=lambda: None
+        )
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 1)
+        self.assertIs(result["renewal_deferred_to_own_write"], False)
+        self.assertEqual(len(guard.statements), 2)
+        # The recheck is the same verification's execution, not a new queue
+        # wait: callers budgeting queue wait via on_query_start must see it
+        # fire exactly once.
+        self.assertEqual(guard.query_starts, 1)
+
+    def test_guard_verification_recheck_still_fails_closed_on_real_contention(
+        self,
+    ) -> None:
+        """The recheck is bounded and never converts contention to liveness.
+
+        A different-identity expiry claim still in flight shows the same
+        expired-locked-unattributable shape on every fresh snapshot; the
+        second identical read must raise, not loop.
+        """
+
+        class ContendedGuard:
+            held = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def run_json(self, sql: str) -> dict[str, object]:
+                self.calls += 1
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": True,
+                    "lease_locked_by_this_process": False,
+                }
+
+        guard = ContendedGuard()
+        ledger = self.guarded_verification_ledger(guard)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "expired and its renewal was lock-blocked",
+        ):
+            ledger.verify_writer_lease_guard_session()
+        self.assertEqual(guard.calls, 2)
+
+    def test_guard_verification_recheck_detects_completed_takeover(self) -> None:
+        """A takeover committing mid-verification fails closed on identity.
+
+        When the ambiguous first read was a competing claim that then
+        committed, the recheck's fresh snapshot no longer matches this
+        exact session and must raise the fenced-out error rather than
+        re-reporting the stale lock-blocked one.
+        """
+
+        class TakeoverGuard:
+            held = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def run_json(self, sql: str) -> dict[str, object]:
+                self.calls += 1
+                if self.calls == 1:
+                    return {
+                        "backend": "postgres-psql",
+                        "guard_advisory_lock_held": True,
+                        "writer_session_token_current": True,
+                        "lease_renewed_count": 0,
+                        "lease_expired": True,
+                        "lease_locked_by_this_process": False,
+                    }
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": False,
+                }
+
+        guard = TakeoverGuard()
+        ledger = self.guarded_verification_ledger(guard)
+        with self.assertRaisesRegex(RuntimeError, "writer lease is not active"):
+            ledger.verify_writer_lease_guard_session()
+        self.assertEqual(guard.calls, 2)
+
     def test_guard_verification_reports_no_deferral_outside_own_lock_expiry(
         self,
     ) -> None:

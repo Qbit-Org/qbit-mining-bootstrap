@@ -7535,6 +7535,21 @@ SELECT COALESCE(
         is this writer's own fenced write. Only an expired row locked by
         anyone else raises.
 
+        That attribution can misfire in one direction: the statement's
+        lease-row reads all share one MVCC snapshot, while
+        ``pg_stat_activity`` reports live backend state. An own fenced
+        write committing between the snapshot and the probe clears its
+        backend's ``backend_xid`` while the snapshot still shows the
+        expired row that write locked, so the probe reports no own locker
+        for a renewal that in fact just landed. A would-be fail-closed is
+        therefore re-verified once on a fresh statement: its new snapshot
+        sees the committed refresh (the renewal lands normally), a
+        completed takeover (the exact-identity match fails closed), or the
+        same contended expiry (still fails closed). One recheck is enough
+        — each further miss needs another independent commit to land
+        inside the next statement's snapshot-to-probe window, and every
+        residual outcome remains fail-closed.
+
         That tolerance proves liveness only, not authority to act outside
         the database: the survival argument assumes the fenced write
         commits, and a rollback instead releases the expired row unchanged,
@@ -7547,7 +7562,9 @@ SELECT COALESCE(
 
         ``on_query_start`` fires once the guarded session's serialized query
         slot is acquired, letting callers budget queue wait separately from
-        statement execution.
+        statement execution. The attribution recheck does not re-fire it:
+        the recheck belongs to the same verification's execution, not a new
+        queue wait.
         """
         if not self.writer_lease_fast_adoption_capable:
             raise RuntimeError("writer session is not heartbeat-capable")
@@ -7629,57 +7646,71 @@ SELECT json_build_object(
     )
 );
 """
-        if on_query_start is None:
-            result = guard.run_json(sql)
-        else:
-            result = guard.run_json(sql, on_query_start=on_query_start)
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                "psql writer lease guard verification returned non-object JSON"
+        attribution_rechecks_left = 1
+        while True:
+            if on_query_start is None:
+                result = guard.run_json(sql)
+            else:
+                result = guard.run_json(sql, on_query_start=on_query_start)
+                on_query_start = None
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "psql writer lease guard verification returned non-object JSON"
+                )
+            if not result.get("guard_advisory_lock_held"):
+                raise RuntimeError(
+                    "postgres writer lease guard advisory lock is no longer held"
+                )
+            if not result.get("writer_session_token_current"):
+                raise RuntimeError("writer lease is not active")
+            try:
+                renewed_count = int(result.get("lease_renewed_count", 0))
+            except (TypeError, ValueError):
+                renewed_count = 0
+            renewal_deferred_to_own_write = bool(
+                renewed_count == 0
+                and result.get("lease_expired")
+                and result.get("lease_locked_by_this_process")
             )
-        if not result.get("guard_advisory_lock_held"):
-            raise RuntimeError(
-                "postgres writer lease guard advisory lock is no longer held"
-            )
-        if not result.get("writer_session_token_current"):
-            raise RuntimeError("writer lease is not active")
-        try:
-            renewed_count = int(result.get("lease_renewed_count", 0))
-        except (TypeError, ValueError):
-            renewed_count = 0
-        renewal_deferred_to_own_write = bool(
-            renewed_count == 0
-            and result.get("lease_expired")
-            and result.get("lease_locked_by_this_process")
-        )
-        if (
-            renewed_count == 0
-            and result.get("lease_expired")
-            and not renewal_deferred_to_own_write
-        ):
-            # The committed row still names this session but its TTL has
-            # lapsed and the tuple lock we declined to wait on may belong to
-            # a different-identity expiry claim whose commit would land right
-            # after this snapshot. A stale token read is not proof of
-            # liveness here; fail closed like the queueing renewal used to.
-            # The exemption is the writer's own fenced write outlasting the
-            # TTL: its exclusive tuple lock means no claim is in flight, and
-            # its commit refreshes the TTL before any queued claimant
-            # re-evaluates its expiry CAS, so the session provably survives.
-            # It survives as a *process*; the returned deferral flag tells
-            # external-side-effect fences the same state is not authority
-            # for a guarded RPC, because a rollback would hand the expired
-            # row to a queued claimant instead.
-            raise RuntimeError(
-                "writer lease is expired and its renewal was lock-blocked; "
-                "a competing expiry claim may be in flight"
-            )
-        return {
-            "backend": str(result["backend"]),
-            "verified_count": 1,
-            "renewed_count": renewed_count,
-            "renewal_deferred_to_own_write": renewal_deferred_to_own_write,
-        }
+            if (
+                renewed_count == 0
+                and result.get("lease_expired")
+                and not renewal_deferred_to_own_write
+            ):
+                if attribution_rechecks_left:
+                    # The locker probe reads live pg_stat_activity state
+                    # against this statement's older row snapshot, so an own
+                    # fenced write committing mid-statement leaves an expired
+                    # locked row with no attributable locker — the same shape
+                    # as a competing claim. A fresh statement's snapshot
+                    # resolves which one it was; only the ambiguous shape
+                    # earns the recheck, and every recheck outcome that is
+                    # not a landed renewal still fails closed.
+                    attribution_rechecks_left -= 1
+                    continue
+                # The committed row still names this session but its TTL has
+                # lapsed and the tuple lock we declined to wait on may belong to
+                # a different-identity expiry claim whose commit would land right
+                # after this snapshot. A stale token read is not proof of
+                # liveness here; fail closed like the queueing renewal used to.
+                # The exemption is the writer's own fenced write outlasting the
+                # TTL: its exclusive tuple lock means no claim is in flight, and
+                # its commit refreshes the TTL before any queued claimant
+                # re-evaluates its expiry CAS, so the session provably survives.
+                # It survives as a *process*; the returned deferral flag tells
+                # external-side-effect fences the same state is not authority
+                # for a guarded RPC, because a rollback would hand the expired
+                # row to a queued claimant instead.
+                raise RuntimeError(
+                    "writer lease is expired and its renewal was lock-blocked; "
+                    "a competing expiry claim may be in flight"
+                )
+            return {
+                "backend": str(result["backend"]),
+                "verified_count": 1,
+                "renewed_count": renewed_count,
+                "renewal_deferred_to_own_write": renewal_deferred_to_own_write,
+            }
 
     def _renew_writer_lease_with(
         self,
