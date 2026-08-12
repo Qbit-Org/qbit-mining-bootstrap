@@ -4751,8 +4751,28 @@ class PrismCoordinator:
             return materialized
 
         min_interval = self._payout_artifact_min_build_interval_seconds()
+        full_rescan_seconds = float(
+            getattr(
+                self,
+                "payout_artifact_full_rescan_seconds",
+                DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS,
+            )
+        )
+        # Bypass builds (accepted-block previews) refresh
+        # refreshed_monotonic on every block yet never run the periodic
+        # oracle themselves, so a sustained sub-interval block cadence
+        # would otherwise send every routine build back from this
+        # debounce and postpone the configured self-check indefinitely.
+        # An overdue self-check disarms the debounce for routine builds;
+        # the urgent preview path stays debounce-free and oracle-free
+        # either way.
+        self_check_overdue = (
+            observed - cached.full_rescan_attempt_monotonic
+            >= full_rescan_seconds
+        )
         if (
             not bypass_build_interval
+            and not self_check_overdue
             and observed - cached.refreshed_monotonic < min_interval
         ):
             return _PayoutWindowMaterialization(
@@ -4823,18 +4843,7 @@ class PrismCoordinator:
         check_reason: str | None = None
         balance_check_prior_balances: tuple[dict[str, object], ...] | None = None
         balance_check_mismatch = False
-        full_rescan_seconds = float(
-            getattr(
-                self,
-                "payout_artifact_full_rescan_seconds",
-                DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS,
-            )
-        )
-        if (
-            not bypass_build_interval
-            and observed - cached.full_rescan_attempt_monotonic
-            >= full_rescan_seconds
-        ):
+        if not bypass_build_interval and self_check_overdue:
             try:
                 full_records = list(
                     self.ledger.snapshot_at_job_issue(

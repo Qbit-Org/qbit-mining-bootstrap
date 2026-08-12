@@ -1213,6 +1213,66 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
         self.assertEqual(ledger.delta_snapshot_calls, 1)
         self.assertEqual(ledger.full_snapshot_calls, 2)
 
+    def test_routine_build_runs_overdue_self_check_despite_preview_refresh(
+        self,
+    ) -> None:
+        # Accepted-block previews bypass the build interval and refresh
+        # refreshed_monotonic on every block, yet never run the periodic
+        # oracle themselves. Under a sustained sub-interval block cadence
+        # every routine build used to return from the debounce branch
+        # before reaching the self-check condition, so the configured
+        # full-rescan window and balance oracle could be postponed
+        # indefinitely. An overdue self-check now disarms the debounce
+        # for routine builds while the urgent preview path stays
+        # debounce-free and oracle-free.
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            self.assertIsNotNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            preview = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty, False, True
+            )
+            assert preview is not None
+            self.assertEqual(preview.window_build_mode, "incremental")
+            # The next preview arrives with the self-check long overdue;
+            # the urgent path must still not pay the oracle walk.
+            server.payout_artifact_full_rescan_seconds = 0.0
+            append_incremental_share(
+                ledger,
+                share_seq=5,
+                accepted_at_ms=1_000_030,
+            )
+            clock_ms[0] = 1_000_040
+            urgent = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty, False, True
+            )
+            assert urgent is not None
+            self.assertEqual(urgent.window_build_mode, "incremental")
+            self.assertEqual(ledger.full_snapshot_calls, 1)
+            # A routine build inside the min build interval used to
+            # debounce here -- forever, while blocks kept refreshing the
+            # window above -- and the self-check never ran.
+            checked = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+
+        assert checked is not None
+        self.assertEqual(checked.window_build_mode, "self_check_match")
+        self.assertEqual(ledger.full_snapshot_calls, 2)
+
     def test_periodic_self_check_replaces_divergent_delta_with_full_bytes(
         self,
     ) -> None:
