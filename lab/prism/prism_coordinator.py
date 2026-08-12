@@ -7461,6 +7461,32 @@ class PrismCoordinator:
             )
             self._accepted_block_payout_preview_condition.notify_all()
 
+    def _unmark_accepted_block_payout_landed(self, block_hash: str) -> None:
+        """Withdraw a landed bar armed for an attempt that never reached RPC.
+
+        Only sound while the submit outcome is NOT uncertain: the caller
+        must know submitblock was never invoked under this arming (a
+        preflight refusal such as ``WriterLeaseRenewalDeferred``), so there
+        is no possibly-active coinbase for the barrier to preserve and no
+        reason to keep reconciliation and payout-state publication barred
+        while the candidate waits for its retry. The pending preview entry
+        survives — child work keeps waiting instead of snapshotting
+        pre-accept balances, matching the startup-replay state a durable
+        candidate restores — and the next attempt re-arms ``landed`` before
+        its own RPC.
+        """
+        self._ensure_job_cache_state()
+        key = block_hash.lower()
+        with self._accepted_block_payout_preview_condition:
+            existing = self._accepted_block_payout_previews.get(key)
+            if existing is None or not existing.landed:
+                return
+            self._accepted_block_payout_previews[key] = dataclass_replace(
+                existing,
+                landed=False,
+            )
+            self._accepted_block_payout_preview_condition.notify_all()
+
     def _publish_accepted_block_payout_preview(
         self,
         block_hash: str,
@@ -26228,9 +26254,29 @@ class PrismCoordinator:
                 )
                 fallback_submit_under_fence = not node_submission.attempted
                 if not node_submission.attempted:
-                    self._require_fresh_ledger_lease_for_external_side_effect(
-                        "submitblock"
-                    )
+                    try:
+                        self._require_fresh_ledger_lease_for_external_side_effect(
+                            "submitblock"
+                        )
+                    except WriterLeaseRenewalDeferred:
+                        if not transition_already_landed:
+                            # The refusal fired before submitblock, so this
+                            # attempt's outcome is not uncertain: qbitd
+                            # provably never saw the block (no fast-lane node
+                            # offer either — attempted is False). Unwind the
+                            # landed bar this attempt armed — leaving it
+                            # would bar reconciliation and payout-state
+                            # publication for as long as the writer's own
+                            # fenced write keeps the renewal deferred, though
+                            # nothing needs preserving. The begun preview
+                            # stays and the retry re-arms both. A bar landed
+                            # by an earlier attempt that did reach
+                            # submitblock keeps standing for that attempt's
+                            # uncertain outcome.
+                            self._unmark_accepted_block_payout_landed(
+                                block_hash
+                            )
+                        raise
                     # The epoch fence above is advisory: it releases the lock
                     # after one read, so an append-side bump could still commit
                     # between that read and the RPC below. This one is
