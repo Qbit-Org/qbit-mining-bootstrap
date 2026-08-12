@@ -364,7 +364,12 @@ no fenced writes and the CTV broadcaster disabled — still keeps its lease from
 expiring under a different writer identity's expiry claim. If the committed row
 is already expired and the renewal was lock-blocked, verification fails closed:
 the skipped lock may be an in-flight expiry claim, and a stale committed token
-read is not proof of liveness. A
+read is not proof of liveness. The one exemption is a lock `pg_stat_activity`
+attributes to this coordinator's own pooled backends — a fenced write
+outlasting the TTL — because its exclusive tuple lock means no claim can be in
+flight and its commit refreshes the lease before any queued claimant
+re-evaluates its expiry CAS; hard-exiting there would roll back a valid write
+and restart-loop on every similarly slow block. A
 replacement must acquire the guard and then wait one full silence interval
 measured both from the lease row's last update and from its own guard
 acquisition before its exact-session CAS, so a predecessor that just lost its

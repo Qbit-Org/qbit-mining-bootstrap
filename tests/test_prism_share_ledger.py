@@ -1216,6 +1216,7 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger._writer_id = "writer-a"
         ledger._writer_epoch = 7
         ledger._writer_session_token = session
+        ledger._pool_application_name = "qbit-prism-writer-test-pool"
         ledger._lease_interval_sql = "make_interval(secs => 60.0)"
         ledger._writer_lease_guard = guard
         return ledger
@@ -1270,6 +1271,14 @@ class PrismShareLedgerTests(unittest.TestCase):
         # The statement must also report committed-row expiry so a skipped
         # renewal over an expired lease can fail closed.
         self.assertIn("lease_expires_at <= clock_timestamp()", statement)
+        # And it must attribute the lease tuple's locker, so this process's
+        # own fenced write outlasting the TTL is not mistaken for a
+        # competing expiry claim: the committed row's xmax is the locker's
+        # transaction id, and a pg_stat_activity backend running it under
+        # the pool's unique application_name is our own write.
+        self.assertIn("pg_stat_activity", statement)
+        self.assertIn("backend_xid = qbit_ledger_writer_lease.xmax", statement)
+        self.assertIn("qbit-prism-writer-test-pool", statement)
 
     def test_guard_verification_renews_idle_lease_ttl_for_exact_identity(self) -> None:
         """An idle coordinator's heartbeat must keep lease_expires_at ahead.
@@ -1401,6 +1410,9 @@ class PrismShareLedgerTests(unittest.TestCase):
                     # A healthy heartbeat kept the TTL ~a full lease ahead
                     # before the fenced write took the tuple lock.
                     "lease_expired": False,
+                    # pg_stat_activity attributes the held tuple lock to
+                    # this process's own pooled backend.
+                    "lease_locked_by_this_process": lease_tuple_locked,
                 }
 
         guard = RowLockEnforcingGuard()
@@ -1431,10 +1443,13 @@ class PrismShareLedgerTests(unittest.TestCase):
         The tuple lock that made SKIP LOCKED skip may belong to a
         different-identity _try_acquire_writer_lease taking the expired row
         through its expiry CAS; the committed snapshot still names this
-        session until that claim commits (reachable after host suspend or a
-        write outlasting the TTL). The queueing renewal used to detect this
-        by re-evaluating after the claimant committed; the non-blocking
-        spelling must fail closed instead of trusting the stale token read.
+        session until that claim commits (reachable after host suspend,
+        where the monotonic freshness gate cannot be trusted either). The
+        queueing renewal used to detect this by re-evaluating after the
+        claimant committed; the non-blocking spelling must fail closed
+        instead of trusting the stale token read. The fake omits
+        lease_locked_by_this_process to prove an absent locker attribution
+        also defaults closed.
         """
 
         class ExpiredContendedGuard:
@@ -1455,6 +1470,39 @@ class PrismShareLedgerTests(unittest.TestCase):
             "expired and its renewal was lock-blocked",
         ):
             ledger.verify_writer_lease_guard_session()
+
+    def test_guard_verification_survives_own_fenced_write_outlasting_ttl(self) -> None:
+        """A fenced write outlasting the TTL must not hard-exit the coordinator.
+
+        persist_accepted_block holds the lease tuple lock for its whole
+        autocommit statement, so the heartbeat cannot renew the TTL while it
+        runs; a statement outlasting the remaining TTL leaves the committed
+        row expired with the renewal lock-blocked. When pg_stat_activity
+        attributes that tuple lock to one of this process's own pooled
+        backends, failing closed would roll back the valid write and
+        restart-loop on every similarly slow block — and it is unnecessary:
+        the exclusive tuple lock means no expiry claim can be in flight, and
+        the write's own commit refreshes lease_expires_at before any queued
+        claimant re-evaluates its expiry CAS.
+        """
+
+        class OwnLongFencedWriteGuard:
+            held = True
+
+            def run_json(self, sql: str) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": True,
+                    "lease_locked_by_this_process": True,
+                }
+
+        ledger = self.guarded_verification_ledger(OwnLongFencedWriteGuard())
+        result = ledger.verify_writer_lease_guard_session()
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 0)
 
     def test_guard_verification_recovers_expired_lease_when_renewal_lands(self) -> None:
         """Renewing an expired-but-uncontended row is the idle-recovery path.

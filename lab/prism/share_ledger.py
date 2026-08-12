@@ -1620,13 +1620,26 @@ class _NativePostgresClient:
     group-commit ``append_batch`` statement, whose durability comes from its
     own ``set_config('synchronous_commit', 'on', true)``), and a connection
     that raises is discarded so the next acquisition reconnects.
+
+    ``application_name`` (overriding any value in the conninfo) marks every
+    pooled backend in ``pg_stat_activity`` as belonging to this process, so
+    the lease guard can attribute an in-flight lease-tuple lock to the
+    writer's own fenced transaction rather than a competing expiry claim
+    (see ``verify_writer_lease_guard_session``).
     """
 
-    def __init__(self, conninfo: str, *, pool_size: int):
+    def __init__(
+        self,
+        conninfo: str,
+        *,
+        pool_size: int,
+        application_name: str | None = None,
+    ):
         import psycopg  # deferred: the subprocess backend must work without it
 
         self._psycopg = psycopg
         self._conninfo = conninfo
+        self._application_name = application_name
         self._pool_size = max(1, int(pool_size))
         self._slots = BoundedSemaphore(self._pool_size)
         self._idle: list[Any] = []
@@ -1644,6 +1657,8 @@ class _NativePostgresClient:
             # sub-second statement budgets valid without silently disabling
             # the connection deadline.
             kwargs["connect_timeout"] = max(1, math.ceil(timeout_seconds))
+        if self._application_name is not None:
+            kwargs["application_name"] = self._application_name
         return self._psycopg.connect(self._conninfo, **kwargs)
 
     @contextmanager
@@ -1915,6 +1930,13 @@ class PsqlShareLedger:
         self._writer_id = writer_id
         self._writer_epoch = writer_epoch
         self._writer_session_token = writer_session_token or uuid.uuid4().hex
+        # Advertised as application_name by every pooled connection so the
+        # lease guard can recognize the lease tuple's locker as one of this
+        # process's own backends (a fenced write outlasting the TTL) rather
+        # than a competing expiry claim. Unique per ledger instance: a
+        # predecessor or replacement process never shares it, so their
+        # in-flight writes still fence this session out.
+        self._pool_application_name = f"qbit-prism-writer-{uuid.uuid4().hex}"
         self._lease_ttl_seconds = lease_ttl_seconds
         # SQL fragment for the writer-lease expiry. The lease is refreshed on
         # every append (the dominant liveness signal during active mining), so a
@@ -1996,7 +2018,11 @@ class PsqlShareLedger:
         try:
             # One pooled connection per concurrent reader plus one for the
             # serialized write path (the coordinator's share writer thread).
-            return _NativePostgresClient(conninfo, pool_size=read_concurrency + 1)
+            return _NativePostgresClient(
+                conninfo,
+                pool_size=read_concurrency + 1,
+                application_name=self._pool_application_name,
+            )
         except ImportError:
             if required:
                 raise ValueError(
@@ -7496,6 +7522,19 @@ SELECT COALESCE(
         by failing closed whenever the renewal was lock-blocked and the
         committed row was already expired.
 
+        The one lock-blocked expired case that must not fail closed is this
+        coordinator's own fenced write outlasting the TTL (a slow
+        ``persist_accepted_block``): it holds the tuple's exclusive lock, so
+        no expiry claim can be in flight behind it, and its commit refreshes
+        ``lease_expires_at`` before any queued claimant re-evaluates its
+        expiry CAS — raising would roll back a valid write and restart-loop
+        on every similarly slow block. The statement therefore attributes
+        the committed row's locker through ``pg_stat_activity``: the row's
+        ``xmax`` is the locker's transaction id, and a backend running that
+        transaction under this process's unique pool ``application_name``
+        is this writer's own fenced write. Only an expired row locked by
+        anyone else raises.
+
         ``on_query_start`` fires once the guarded session's serialized query
         slot is acquired, letting callers budget queue wait separately from
         statement execution.
@@ -7509,6 +7548,7 @@ SELECT COALESCE(
             "writer_id": self._writer_id,
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
+            "pool_application_name": self._pool_application_name,
         }
         lock_key = _writer_lease_advisory_lock_key(
             self._writer_id,
@@ -7568,6 +7608,14 @@ SELECT json_build_object(
           AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
           AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
           AND qbit_ledger_writer_lease.lease_expires_at <= clock_timestamp()
+    ),
+    'lease_locked_by_this_process', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, pg_stat_activity, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND pg_stat_activity.application_name = data->>'pool_application_name'
+          AND pg_stat_activity.backend_xid IS NOT NULL
+          AND pg_stat_activity.backend_xid = qbit_ledger_writer_lease.xmax
     )
 );
 """
@@ -7589,12 +7637,20 @@ SELECT json_build_object(
             renewed_count = int(result.get("lease_renewed_count", 0))
         except (TypeError, ValueError):
             renewed_count = 0
-        if renewed_count == 0 and result.get("lease_expired"):
+        if (
+            renewed_count == 0
+            and result.get("lease_expired")
+            and not result.get("lease_locked_by_this_process")
+        ):
             # The committed row still names this session but its TTL has
             # lapsed and the tuple lock we declined to wait on may belong to
             # a different-identity expiry claim whose commit would land right
             # after this snapshot. A stale token read is not proof of
             # liveness here; fail closed like the queueing renewal used to.
+            # The exemption is the writer's own fenced write outlasting the
+            # TTL: its exclusive tuple lock means no claim is in flight, and
+            # its commit refreshes the TTL before any queued claimant
+            # re-evaluates its expiry CAS, so the session provably survives.
             raise RuntimeError(
                 "writer lease is expired and its renewal was lock-blocked; "
                 "a competing expiry claim may be in flight"
