@@ -402,7 +402,11 @@ PRISM_TIP_REFRESH_COVERAGE_TARGETS = (
     ("95", Decimal("0.95")),
     ("99", Decimal("0.99")),
 )
-PRISM_STALE_JOB_ABANDON_CLASSES = ("tip_moved", "balance_stale")
+PRISM_STALE_JOB_ABANDON_CLASSES = (
+    "tip_moved",
+    "balance_stale",
+    "append_epoch_stale",
+)
 # Never-served clients outrank the fleet's tip-refresh wave: a client with no
 # active job is producing nothing until its first notify, while a client with
 # stale-tip work keeps mining (stale-grace credits it) for the wave's duration.
@@ -21049,6 +21053,12 @@ class PrismCoordinator:
                 if isinstance(intent.get("prospective_prior_balances"), list)
                 else None
             ),
+            # Append-invalidation epochs are process-local counters, so a
+            # stamp from the process that built this candidate is meaningless
+            # after a restart. The negative sentinel tells the landing epoch
+            # fence to stand down; cross-restart payout drift stays governed
+            # by the content-based prior-balance fence.
+            payout_append_invalidation_epoch=-1,
         )
         return PrismBlockCandidate(
             context=context,
@@ -23845,6 +23855,38 @@ class PrismCoordinator:
                     worker=worker,
                 )
             ):
+                return None
+            # A late-visible append advances only the append-invalidation
+            # epoch: the tip, payout generation, and balance digest all
+            # survive, yet this candidate's coinbase pays from a window that
+            # omitted the late row. The refresh wave retires the job
+            # asynchronously; until it does, membership admission still lets
+            # the pre-append job submit, so landing fails closed here.
+            # Collection candidates settle solver-pays-all and are exempt, as
+            # at every other epoch fence. A negative stamp is a candidate
+            # reconstructed from durable intent: epochs are process-local, so
+            # cross-restart drift is governed by the content fences instead.
+            context_append_epoch = int(
+                getattr(context, "payout_append_invalidation_epoch", 0)
+            )
+            with self._job_cache_lock:
+                live_append_epoch = int(
+                    self._payout_ledger_append_invalidation_epoch
+                )
+            if (
+                not already_active
+                and not getattr(context, "collection_only", False)
+                and context_append_epoch >= 0
+                and context_append_epoch != live_append_epoch
+            ):
+                self._abandon_block_candidate(
+                    PRISM_REJECTION_STALE_JOB,
+                    "payout window was invalidated by a late-visible share append",
+                    block_hash=block_hash,
+                    worker=worker,
+                    expected_height=expected_height,
+                    stale_job_class="append_epoch_stale",
+                )
                 return None
             if (
                 durable_payout_state

@@ -7114,7 +7114,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
         self.assertEqual(
             server.stale_job_abandon_counts,
-            {"tip_moved": 0, "balance_stale": 1},
+            {"tip_moved": 0, "balance_stale": 1, "append_epoch_stale": 0},
         )
         outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
         self.assertEqual(outbox_row["state"], "abandoned")
@@ -7131,6 +7131,110 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             'qbit_prism_stale_job_abandons_total{class="balance_stale"} 1',
             metrics,
         )
+
+    def test_block_submit_rejects_job_after_late_append_epoch_invalidation(self) -> None:
+        # A late-visible replay append advances the live epoch and schedules
+        # the refresh wave asynchronously; until that wave retires the job,
+        # membership admission still lets the pre-append job submit. Landing
+        # must fail closed instead of minting a coinbase whose payout window
+        # omitted the replayed share.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server._ensure_job_cache_state()
+        with server._job_cache_lock:
+            server._payout_ledger_append_invalidation_epoch += 1
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("audit bundle must not be built from a pre-append payout window")
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="ea" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("append-epoch-stale").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        # The share was already accepted at submit time, so a lost block is a
+        # block-abandonment, not a stale share rejection.
+        self.assertEqual(server.stale_share_count, 0)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+        metrics = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_stale_job_abandons_total{class="append_epoch_stale"} 1',
+            metrics,
+        )
+
+    def test_replayed_block_candidate_is_exempt_from_append_epoch_fence(self) -> None:
+        # Epochs are process-local: a candidate reconstructed from durable
+        # intent carries no meaningful stamp, so an epoch advanced by this
+        # process's own share replay must not abandon the recovered block.
+        # Cross-restart payout drift stays governed by the content-based
+        # prior-balance fence.
+        server, state, ledger = submit_coordinator()
+        server.stop_after_block = False
+        server.max_blocks = 10
+        block_hash = "cd" * 32
+        pending = self._pending_append("replayed-epoch").pending_share
+        original = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            ),
+            pending_share=pending,
+        )
+        candidate = server.block_candidate_from_intent(
+            server.block_candidate_intent(original)
+        )
+        self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
+        server._ensure_job_cache_state()
+        with server._job_cache_lock:
+            server._payout_ledger_append_invalidation_epoch += 1
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            accepted = server.submit_block_candidate(candidate)
+
+        self.assertTrue(accepted)
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
+        self.assertEqual(len(ledger.persisted), 1)
+        self.assertEqual(len(ledger.confirmed), 1)
 
     def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
         self,
@@ -8022,7 +8126,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
         self.assertEqual(
             server.stale_job_abandon_counts,
-            {"tip_moved": 1, "balance_stale": 0},
+            {"tip_moved": 1, "balance_stale": 0, "append_epoch_stale": 0},
         )
         self.assertEqual(server.stale_share_count, 0)
         # The credited share survives the lost block race.
@@ -8763,7 +8867,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         self.assertEqual(
             server.stale_job_abandon_counts,
-            {"tip_moved": 1, "balance_stale": 0},
+            {"tip_moved": 1, "balance_stale": 0, "append_epoch_stale": 0},
         )
         self.assertEqual(ledger.pending_block_candidates(), [])
         outbox_row = ledger._block_candidate_outbox[
