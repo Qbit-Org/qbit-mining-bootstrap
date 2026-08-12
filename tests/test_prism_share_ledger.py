@@ -1234,6 +1234,7 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "guard_advisory_lock_held": True,
                     "writer_session_token_current": True,
                     "lease_renewed_count": 1,
+                    "lease_expired": False,
                 }
 
         guard = FakeGuard()
@@ -1266,6 +1267,9 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("pg_backend_pid()", statement)
         self.assertIn("qbit_ledger_writer_lease", statement)
         self.assertIn(f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}session-a", statement)
+        # The statement must also report committed-row expiry so a skipped
+        # renewal over an expired lease can fail closed.
+        self.assertIn("lease_expires_at <= clock_timestamp()", statement)
 
     def test_guard_verification_renews_idle_lease_ttl_for_exact_identity(self) -> None:
         """An idle coordinator's heartbeat must keep lease_expires_at ahead.
@@ -1394,6 +1398,9 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "guard_advisory_lock_held": True,
                     "writer_session_token_current": True,
                     "lease_renewed_count": renewed,
+                    # A healthy heartbeat kept the TTL ~a full lease ahead
+                    # before the fenced write took the tuple lock.
+                    "lease_expired": False,
                 }
 
         guard = RowLockEnforcingGuard()
@@ -1412,6 +1419,65 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         # Once the fenced transaction commits (and refreshes the TTL itself),
         # the very next heartbeat resumes renewing on the guard session.
+        result = ledger.verify_writer_lease_guard_session()
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 1)
+
+    def test_guard_verification_fails_closed_on_expired_lease_with_blocked_renewal(
+        self,
+    ) -> None:
+        """An expired row plus a lock-blocked renewal is not proof of liveness.
+
+        The tuple lock that made SKIP LOCKED skip may belong to a
+        different-identity _try_acquire_writer_lease taking the expired row
+        through its expiry CAS; the committed snapshot still names this
+        session until that claim commits (reachable after host suspend or a
+        write outlasting the TTL). The queueing renewal used to detect this
+        by re-evaluating after the claimant committed; the non-blocking
+        spelling must fail closed instead of trusting the stale token read.
+        """
+
+        class ExpiredContendedGuard:
+            held = True
+
+            def run_json(self, sql: str) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": True,
+                }
+
+        ledger = self.guarded_verification_ledger(ExpiredContendedGuard())
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "expired and its renewal was lock-blocked",
+        ):
+            ledger.verify_writer_lease_guard_session()
+
+    def test_guard_verification_recovers_expired_lease_when_renewal_lands(self) -> None:
+        """Renewing an expired-but-uncontended row is the idle-recovery path.
+
+        Taking the tuple lock for the renewal proves no expiry claim was in
+        flight, and any claimant arriving afterwards re-evaluates against the
+        refreshed row and loses its CAS. Only a renewal that could not land
+        makes an expired row disqualifying.
+        """
+
+        class ExpiredUncontendedGuard:
+            held = True
+
+            def run_json(self, sql: str) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 1,
+                    "lease_expired": True,
+                }
+
+        ledger = self.guarded_verification_ledger(ExpiredUncontendedGuard())
         result = ledger.verify_writer_lease_guard_session()
         self.assertEqual(result["verified_count"], 1)
         self.assertEqual(result["renewed_count"], 1)
