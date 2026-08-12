@@ -275,6 +275,32 @@ assert_equal(
     "audit window excludes future-accepted old-job share",
 )
 
+# Eligible shares at this anchor, newest first: share-3 (difficulty 103,
+# cumulative 103), share-2 (102, cumulative 205), share-1 (101, cumulative
+# 306). The bounded snapshot must include the share that crosses the window
+# weight and nothing past it.
+for weight, expected_ids in [
+    (1, ["share-3"]),
+    (103, ["share-3"]),
+    (104, ["share-2", "share-3"]),
+    (205, ["share-2", "share-3"]),
+    (206, ["share-1", "share-2", "share-3"]),
+]:
+    bounded = ledger.snapshot_at_job_issue(1_700_000_001_300, window_weight=weight)
+    assert_equal(
+        [share.share_id for share in bounded],
+        expected_ids,
+        f"bounded snapshot crossing behavior at window weight {weight}",
+    )
+assert_equal(
+    [
+        share.share_id
+        for share in ledger.snapshot_at_job_issue(1_700_000_001_300, window_weight=10**9)
+    ],
+    [share.share_id for share in ledger.snapshot_at_job_issue(1_700_000_001_300)],
+    "bounded snapshot with beyond-history weight matches the unbounded snapshot",
+)
+
 try:
     PsqlShareLedger(psql_command=psql, writer_id="writer-a", writer_epoch=2)
 except RuntimeError as exc:
