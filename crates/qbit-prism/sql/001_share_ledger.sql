@@ -494,6 +494,12 @@ AS $$
     -- consumed as a scalar subquery: joined in as a relation it degrades to a
     -- post-join filter over the whole pkey walk, while the scalar form
     -- becomes an InitPlan the index scan uses as its start bound.
+    --
+    -- The page-granular stop relies on share_difficulty being NOT NULL and
+    -- strictly positive (schema CHECK): positivity keeps the cumulative
+    -- weight strictly increasing, which guarantees the crossing row lies
+    -- inside the last fetched page. Relaxing that constraint requires
+    -- revisiting this walk and the matching one in lab/prism/share_ledger.py.
     WITH RECURSIVE pages AS (
         SELECT page.min_share_seq,
                page.page_weight,

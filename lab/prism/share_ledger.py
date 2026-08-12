@@ -2549,6 +2549,13 @@ WITH rows AS (
             # a filter after walking the whole pkey backwards, while a scalar
             # subquery becomes an InitPlan the index scan can use as its start
             # bound, keeping this pass O(window) too.
+            #
+            # The page-granular stop relies on share_difficulty being NOT NULL
+            # and strictly positive (schema CHECK), which keeps the cumulative
+            # weight strictly increasing so the crossing row always lies in
+            # the last fetched page. The same holds for qbit_prism_window()
+            # in the schema file; relax the constraint and both walks need
+            # revisiting.
             rows_cte = f"""
 WITH RECURSIVE pages AS (
     SELECT page.min_share_seq,

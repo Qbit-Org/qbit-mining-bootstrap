@@ -1329,6 +1329,10 @@ class PrismShareLedgerTests(unittest.TestCase):
             schema,
         )
         self.assertNotIn("CROSS JOIN page_cutoff", schema)
+        # Exactly one windowed difficulty sum may exist in the schema: the
+        # cutoff-bounded ranked pass of qbit_prism_window. Any other schema
+        # function adopting a windowed sum must justify its scan bound here.
+        self.assertEqual(schema.count("sum(ledger.share_difficulty) OVER"), 1)
         self.assertIn("ON qbit_share_ledger ((lower(right(share_id, 64))), accepted_at DESC, share_seq DESC)", schema)
         self.assertIn("ALTER COLUMN anchor_vout DROP NOT NULL", schema)
         self.assertIn("CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace'))", schema)
