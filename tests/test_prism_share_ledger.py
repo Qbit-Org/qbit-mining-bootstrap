@@ -30,6 +30,7 @@ from lab.prism.share_ledger import (
     AUDIT_BUNDLE_V2_SCHEMA,
     PendingShare,
     PsqlShareLedger,
+    LedgerOperationTimeout,
     AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
     SingleWriterShareLedger,
@@ -422,9 +423,15 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger = SingleWriterShareLedger()
         first = pending_share(1)
         duplicate = pending_share(2).__class__(**{**pending_share(2).__dict__, "share_id": first.share_id})
+        later_stamp = first.__class__(
+            **{**first.__dict__, "accepted_at_ms": first.accepted_at_ms + 42}
+        )
 
         self.assertEqual(ledger.append(first).share_seq, 1)
-        self.assertEqual(ledger.append(first).share_seq, 1)
+        replay = ledger.append(later_stamp)
+        self.assertEqual(replay.share_seq, 1)
+        self.assertFalse(replay.newly_inserted)
+        self.assertEqual(replay.accepted_at_ms, first.accepted_at_ms)
         with self.assertRaisesRegex(ValueError, "payload mismatch"):
             ledger.append(duplicate)
 
@@ -442,6 +449,8 @@ class PrismShareLedgerTests(unittest.TestCase):
         records = ledger.append_batch([(share, intent)])
 
         self.assertEqual(records[0].share_seq, 1)
+        self.assertTrue(records[0].newly_inserted)
+        self.assertEqual(records[0].candidate_outbox_state, "pending")
         self.assertEqual(ledger.pending_block_candidates(), [intent])
         self.assertEqual(
             ledger.pending_block_candidate_rows(),
@@ -449,12 +458,27 @@ class PrismShareLedgerTests(unittest.TestCase):
         )
         # Exact replay returns the original row and does not duplicate outbox
         # work. A changed intent with the same hash is rejected as corruption.
-        self.assertEqual(ledger.append_batch([(share, intent)])[0].share_seq, 1)
+        replay = ledger.append_batch([(share, intent)])[0]
+        self.assertEqual(replay.share_seq, 1)
+        self.assertFalse(replay.newly_inserted)
+        self.assertEqual(replay.candidate_outbox_state, "pending")
         with self.assertRaisesRegex(ValueError, "candidate payload mismatch"):
             ledger.append_batch([(share, {**intent, "block_hex": "01"})])
         self.assertEqual(len(ledger), 1)
         self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="ab" * 32))
         self.assertEqual(ledger.pending_block_candidates(), [])
+        later_share = share.__class__(
+            **{**share.__dict__, "accepted_at_ms": share.accepted_at_ms + 42}
+        )
+        terminal_replay = ledger.append_batch([(later_share, intent)])[0]
+        self.assertFalse(terminal_replay.newly_inserted)
+        self.assertEqual(terminal_replay.candidate_outbox_state, "submitted")
+        self.assertFalse(
+            ledger.mark_block_candidate_abandoned(
+                block_hash="ab" * 32,
+                error="must not invert terminal state",
+            )
+        )
 
     def test_pending_candidate_age_distinguishes_first_attempt(self) -> None:
         ledger = SingleWriterShareLedger()
@@ -526,8 +550,12 @@ class PrismShareLedgerTests(unittest.TestCase):
         retry_share = pending_share(1, accepted_at_ms=2_042)
         retry_intent = {**intent, "pending_share": dict(retry_share.__dict__)}
 
-        self.assertTrue(ledger.persist_block_candidate_intent(intent))
-        self.assertFalse(ledger.persist_block_candidate_intent(retry_intent))
+        first_persist = ledger.persist_block_candidate_intent(intent)
+        retry_persist = ledger.persist_block_candidate_intent(retry_intent)
+        self.assertTrue(first_persist)
+        self.assertEqual(first_persist.state, "pending")
+        self.assertFalse(retry_persist)
+        self.assertEqual(retry_persist.state, "pending")
         self.assertEqual(ledger.pending_block_candidates(), [intent])
         with self.assertRaisesRegex(ValueError, "candidate payload mismatch"):
             ledger.persist_block_candidate_intent({**retry_intent, "block_hex": "01"})
@@ -540,6 +568,10 @@ class PrismShareLedgerTests(unittest.TestCase):
             ledger.pending_block_candidate_rows(),
             [{"block_hash": "ef" * 32, "candidate": intent}],
         )
+        self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="ef" * 32))
+        terminal_persist = ledger.persist_block_candidate_intent(retry_intent)
+        self.assertFalse(terminal_persist)
+        self.assertEqual(terminal_persist.state, "submitted")
 
     def test_concurrent_append_still_has_one_canonical_sequence(self) -> None:
         ledger = SingleWriterShareLedger()
@@ -997,6 +1029,8 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("inserted_candidates AS", query)
         self.assertIn("qbit_block_candidate_outbox", query)
         self.assertIn("duplicate share_id payload mismatch", query)
+        self.assertIn("'candidate_outbox_state'", query)
+        self.assertNotIn("ledger.accepted_at IS DISTINCT", query)
         self.assertEqual(query.count("SELECT CASE"), 1)
 
     def test_postgres_candidate_only_intent_forces_durable_fenced_commit(self) -> None:
@@ -1015,6 +1049,7 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("set_config('synchronous_commit', 'on', true)", query)
         self.assertIn("qbit_ledger_writer_lease", query)
         self.assertIn("qbit_block_candidate_outbox", query)
+        self.assertIn("SELECT candidate_sha256, state", query)
 
     def test_postgres_pending_candidate_rows_keep_authoritative_outbox_key(self) -> None:
         intent = {
@@ -3827,6 +3862,192 @@ def stats_payload(
 
 
 class NativeClientSelectionTests(unittest.TestCase):
+    def test_operation_timeout_bounds_local_writer_lock_admission(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        gate = threading.Lock()
+        gate.acquire()
+        started = time.monotonic()
+        try:
+            with ledger.operation_timeout(0.02):
+                with self.assertRaisesRegex(
+                    LedgerOperationTimeout,
+                    "writer lock",
+                ):
+                    with ledger._operation_gate(gate, "writer lock"):
+                        self.fail("contended writer lock unexpectedly acquired")
+        finally:
+            gate.release()
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_statement_timeout_refreshes_for_each_database_step(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        clock = {"now": 10.0}
+
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with ledger.statement_timeout(0.5):
+                self.assertEqual(ledger._remaining_operation_timeout(), 0.5)
+                clock["now"] += 60.0
+                self.assertEqual(ledger._remaining_operation_timeout(), 0.5)
+
+    def test_subprocess_operation_timeout_sets_client_and_server_deadlines(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+        completed = unittest.mock.Mock(returncode=0, stdout="{}\n", stderr="")
+
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ) as run:
+            with ledger.operation_timeout(0.5):
+                self.assertEqual(ledger._run_sql("SELECT '{}'::json;"), "{}\n")
+
+        kwargs = run.call_args.kwargs
+        self.assertGreater(float(kwargs["timeout"]), 0.0)
+        self.assertLessEqual(float(kwargs["timeout"]), 0.5)
+        self.assertEqual(kwargs["env"]["PGCONNECT_TIMEOUT"], "1")
+        self.assertIn("statement_timeout=", kwargs["env"]["PGOPTIONS"])
+        self.assertIn("lock_timeout=", kwargs["env"]["PGOPTIONS"])
+        self.assertIn("VERBOSITY=verbose", run.call_args.args[0])
+
+    def test_subprocess_server_deadlines_raise_operation_timeout(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+        deadline_errors = (
+            "ERROR:  57014: canceling statement due to statement timeout",
+            "FEHLER:  57014: Anweisung wegen Zeitüberschreitung abgebrochen",
+            "ERROR:  55P03: canceling statement due to lock timeout",
+            "FEHLER:  55P03: Anweisung wegen Zeitüberschreitung abgebrochen",
+            "psql: error: connection to server failed: timeout expired",
+        )
+
+        for stderr in deadline_errors:
+            with self.subTest(stderr=stderr), unittest.mock.patch(
+                "lab.prism.share_ledger.subprocess.run",
+                return_value=unittest.mock.Mock(
+                    returncode=3,
+                    stdout="",
+                    stderr=stderr,
+                ),
+            ):
+                with ledger.operation_timeout(0.5):
+                    with self.assertRaises(LedgerOperationTimeout):
+                        ledger._run_sql("SELECT '{}'::json;")
+
+    def test_subprocess_hard_error_remains_runtime_error(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+        completed = unittest.mock.Mock(
+            returncode=3,
+            stdout="",
+            stderr="ERROR: permission denied for table qbit_block_candidate_outbox",
+        )
+
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ), ledger.operation_timeout(0.5):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                ledger._run_sql("SELECT '{}'::json;")
+
+    def test_native_operation_timeout_is_transaction_local(self) -> None:
+        class OperationalError(Exception):
+            pass
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+        executions: list[str] = []
+        borrowed_with: list[float | None] = []
+
+        class FakeConnection:
+            @contextlib.contextmanager
+            def transaction(self) -> Any:
+                yield
+
+            def execute(self, sql: str) -> FakeConnection:
+                executions.append(sql)
+                return self
+
+            def fetchone(self) -> tuple[object]:
+                return ({"ok": True},)
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+
+        @contextlib.contextmanager
+        def connection(*, timeout_seconds: float | None = None) -> Any:
+            borrowed_with.append(timeout_seconds)
+            yield FakeConnection()
+
+        client.connection = connection  # type: ignore[method-assign]
+
+        self.assertEqual(
+            client.run_json("SELECT json_build_object('ok', true)", timeout_seconds=0.5),
+            {"ok": True},
+        )
+        self.assertEqual(len(borrowed_with), 1)
+        self.assertIsNotNone(borrowed_with[0])
+        self.assertGreater(float(borrowed_with[0]), 0.0)
+        self.assertLessEqual(float(borrowed_with[0]), 0.5)
+        self.assertRegex(executions[0], r"^SET LOCAL statement_timeout = '\d+ms'$")
+        self.assertRegex(executions[1], r"^SET LOCAL lock_timeout = '\d+ms'$")
+        self.assertEqual(executions[2], "SELECT json_build_object('ok', true)")
+
+    def test_native_server_deadline_raises_operation_timeout(self) -> None:
+        class OperationalError(Exception):
+            pass
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+
+        class FakeConnection:
+            def __init__(self, error: OperationalError):
+                self.error = error
+
+            @contextlib.contextmanager
+            def transaction(self) -> Any:
+                yield
+
+            def execute(self, sql: str) -> FakeConnection:
+                if sql.startswith("SET LOCAL"):
+                    return self
+                raise self.error
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+
+        deadline_errors = (
+            ("57014", "canceling statement due to statement timeout"),
+            ("55P03", "Anweisung wegen Zeitüberschreitung abgebrochen"),
+        )
+        for sqlstate, message in deadline_errors:
+            with self.subTest(sqlstate=sqlstate):
+                error = OperationalError(message)
+                error.sqlstate = sqlstate  # type: ignore[attr-defined]
+
+                @contextlib.contextmanager
+                def connection(*, timeout_seconds: float | None = None) -> Any:
+                    yield FakeConnection(error)
+
+                client.connection = connection  # type: ignore[method-assign]
+                with self.assertRaises(LedgerOperationTimeout):
+                    client.run_json("SELECT '{}'::json", timeout_seconds=0.5)
+
     def test_database_url_extraction_variants(self) -> None:
         self.assertEqual(
             database_url_from_psql_command(["psql", "postgres://u:p@h:5432/db"]),

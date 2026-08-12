@@ -94,18 +94,68 @@ context, reward inputs, and extranonce fields required to finish audit and
 submission. The share and intent become visible atomically before Stratum
 success.
 
-The in-memory candidate queue is only a bounded wakeup path. Queue saturation
-coalesces wakeups; it cannot delete an outbox row. Before opening Stratum
-listeners and whenever the queue drains, the coordinator replays pending rows.
+The bounded live-candidate queue is only a wakeup path. Queue saturation
+coalesces wakeups; it cannot delete an outbox row. Recovery restores pending
+rows in batches into a separate, lower-priority replay queue, without doing
+per-row database accounting. Live discoveries therefore always outrank restart
+work, while an older replay stalled in accounting cannot hide later durable
+rows. The pre-accept startup recovery pass is best-effort under a slow ledger:
+if its database budget expires, the coordinator finishes starting and the
+block-submitter loop retries every durable pending row with ordinary backoff.
+Before qbitd can observe a candidate, the coordinator installs a short in-memory
+prospective-payout barrier; this prevents startup prewarm from issuing child
+work from the old balance base without falsely claiming that the block landed.
+
+Once a durable candidate is dequeued, its qbit `submitblock` RPC is the fast
+lane: it runs before the attempt-marker write, accepted-block writer admission,
+audit construction, or payout publication. The node result and same-hash lease
+then transfer to an independent, height-prioritized accounting lane. A full
+primary handoff spills to a result-preserving overflow queue; it never turns an
+already-offered block back into a raw-submit retry. `block_submitter` and
+`block_accounting` expose independent phase heartbeats, so slow accounting does
+not delay later node offers or disguise the phase that stopped progressing.
+
+`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` bounds the fast-lane RPC (default 1
+second). `PRISM_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS` gives each later Postgres
+statement and local ledger gate a fresh deadline (default 1 second); direct
+outbox reads and mutations additionally use a single-flight wrapper so a
+driver that ignores its deadline cannot accumulate retry threads. Timeouts
+leave the row pending and enter the ordinary candidate backoff. Contended
+submit-path locks are acquired in heartbeat slices and identify the lock in a
+periodic diagnostic controlled by `PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS`
+(default 5 seconds). At most two timeout-ignoring RPC workers and two
+timeout-ignoring ledger workers may remain detached. If either bounded worker
+pool remains exhausted for `PRISM_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS`
+(default 30 seconds), the coordinator requests shutdown and exits nonzero so
+the supervisor replaces the poisoned process; durable outbox rows remain
+pending for replay. One detached call does not interrupt the healthy raw lane
+while the other bounded slot can still make progress.
+
 Successful submissions become `submitted`; candidates that definitively lose
 their tip race or fail validation become `abandoned`. If the process exits
-after `submitblock` but before finalizing the row, restart recognizes the
-candidate as the active tip and completes the idempotent confirmation path.
+after `submitblock` but before the attempt marker or terminal outbox update,
+restart resubmits the same bytes. qbit's accepted-duplicate response is a
+successful landing signal; block-hash-keyed ledger persistence and the
+finalize-only registry keep accounting and terminal side effects exactly once.
+Restart can also recognize the candidate as the active tip and complete the
+same idempotent confirmation path. Exact miner resubmissions observe an
+existing terminal outbox state in the same durable pre-submit transaction:
+`submitted` coalesces to success and `abandoned` stays rejected before any new
+node offer. Exact share replays return the original row as not newly inserted,
+so process-local worker and vardiff counters are not credited twice.
 Transient RPC, audit, and ledger outcomes remain pending and retry with an
 exponential delay starting at 250 milliseconds and capped at 30 seconds. They
-do not increment terminal abandonment counters. Replay carries the database
-row's block hash separately from candidate JSON, so malformed payloads can be
-quarantined by their authoritative outbox key instead of replaying forever.
+do not increment terminal abandonment counters. An abandonment is counted only
+after any prepared payout state is rejected and the false disposition is fixed;
+if cleanup fails, the candidate remains pending and can still converge to
+submitted on later chain evidence. Replay carries the database row's block hash
+separately from candidate JSON, so malformed payloads can be quarantined using
+the authoritative outbox key instead of replaying forever.
+
+The block submitter heartbeat carries its current phase, including replay
+query, node RPC, lock admission, audit, persistence, and finalization. A stale
+watchdog diagnostic therefore reports a label such as
+`block_submitter:replay-outbox-query` instead of only the thread name.
 
 When a network-valid hash is below a listener's advertised share target, the
 coordinator first stores a candidate-only intent, submits it synchronously, and
