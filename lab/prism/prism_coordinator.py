@@ -23857,6 +23857,10 @@ class PrismCoordinator:
         node_submission: _BlockCandidateNodeSubmission,
     ) -> None:
         """Fence child payout work as soon as node acceptance is possible."""
+        self._stash_retained_block_candidate_node_submission(
+            str(candidate.submission.block_hash_hex),
+            node_submission,
+        )
         ambiguous_or_landed = (
             node_submission.error is not None
             or node_submission.result in (None, "duplicate")
@@ -23957,7 +23961,7 @@ class PrismCoordinator:
         same saturation that caused the retry. The stashed result reruns
         the landing tail as if the first pass had continued.
         """
-        retained = self._pop_retained_block_candidate_node_submission(
+        retained = self._retained_block_candidate_node_submission(
             str(candidate.submission.block_hash_hex)
         )
         if retained is not None:
@@ -24596,10 +24600,6 @@ class PrismCoordinator:
                     flush=True,
                 )
                 traceback.print_exc()
-                self._stash_retained_block_candidate_node_submission(
-                    str(task.candidate.submission.block_hash_hex),
-                    task.node_submission,
-                )
                 self._retain_block_candidate_for_retry(task.candidate)
             finally:
                 assert source_queue is not None
@@ -24966,10 +24966,6 @@ class PrismCoordinator:
                 flush=True,
             )
             traceback.print_exc()
-            self._stash_retained_block_candidate_node_submission(
-                block_hash,
-                node_submission,
-            )
             self._retain_block_candidate_for_retry(candidate)
             self._pace_block_candidate_retry(block_hash)
             return True
@@ -25020,10 +25016,6 @@ class PrismCoordinator:
                 "prism coordinator: retained block candidate for retry "
                 f"hash={block_hash} reason={abandon_reason or 'exception'}",
                 flush=True,
-            )
-            self._stash_retained_block_candidate_node_submission(
-                block_hash,
-                node_submission,
             )
             self._retain_block_candidate_for_retry(candidate)
             self._pace_block_candidate_retry(block_hash)
@@ -25376,16 +25368,18 @@ class PrismCoordinator:
         block_hash: str,
         node_submission: _BlockCandidateNodeSubmission | None,
     ) -> None:
-        """Carry a definitive node acceptance across an in-process retry.
+        """Record a definitive node acceptance for in-process retries.
 
-        A fast-lane offer that returned success can be followed by a
-        retryable failure (for example an attempt-marker statement timeout).
-        Re-offering on the retry would come back "duplicate", which
-        classifies against the moved live tip and can only rescue the block
-        through chain probes that may be unavailable under the same
-        saturation. The acceptance is already known, so retain it with the
-        candidate; the retry reruns the landing tail exactly as if the
-        first pass had continued.
+        Recorded at the offer itself (the universal post-offer hook) so
+        every retention path — writer failures, defer-accounting handoff
+        failures, the accounting loop — is covered without each site having
+        to remember. A retryable failure after a successful offer would
+        otherwise re-offer on retry and read "duplicate", which classifies
+        against the moved live tip and can only rescue the block through
+        chain probes that may be unavailable under the same saturation.
+        The entry is read without consuming and lives until the candidate
+        reaches a terminal outcome, so repeated retryable failures keep
+        reusing the same known acceptance.
         """
         if node_submission is None or not node_submission.attempted:
             return
@@ -25407,7 +25401,7 @@ class PrismCoordinator:
                 self._block_candidate_retained_node_submissions = retained
             retained[str(block_hash).lower()] = node_submission
 
-    def _pop_retained_block_candidate_node_submission(
+    def _retained_block_candidate_node_submission(
         self,
         block_hash: str,
     ) -> _BlockCandidateNodeSubmission | None:
@@ -25419,7 +25413,7 @@ class PrismCoordinator:
             )
             if not retained:
                 return None
-            return retained.pop(str(block_hash).lower(), None)
+            return retained.get(str(block_hash).lower())
 
     def _clear_block_candidate_retry_state(self, block_hash: str) -> None:
         with self.lock:

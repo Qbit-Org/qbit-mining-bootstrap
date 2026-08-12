@@ -12217,13 +12217,15 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         rpc = MovedTipRpc()
         server.rpc = rpc
         original_mark = ledger.mark_block_candidate_attempted
-        mark_state = {"failed_once": False}
+        mark_state = {"failures": 0}
 
         def flaky_mark(*, block_hash: str) -> bool:
-            # Fail exactly once, on the first attempt marker after the fresh
-            # node offer, mirroring a statement timeout under saturation.
-            if len(rpc.submit_results) == 1 and not mark_state["failed_once"]:
-                mark_state["failed_once"] = True
+            # Fail twice, starting at the first attempt marker after the
+            # fresh node offer, mirroring statement timeouts under sustained
+            # saturation. The retained acceptance must survive the failed
+            # retry too, not just the first failure.
+            if len(rpc.submit_results) == 1 and mark_state["failures"] < 2:
+                mark_state["failures"] += 1
                 raise RuntimeError("attempt marker timed out")
             return original_mark(block_hash=block_hash)
 
@@ -12249,10 +12251,19 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                     ledger._block_candidate_outbox[block_hash]["state"],
                     "pending",
                 )
-                # Retry: the stashed acceptance is reused, so the node is
-                # never asked again (no "duplicate" classification, no chain
-                # probe reliance) and the landing tail finalizes exactly as
-                # if the first pass had continued past the marker failure.
+                # Retry 1 fails the marker again: the retained acceptance
+                # must survive a consumed-and-failed retry, not just the
+                # first failure.
+                self.assertTrue(server.submit_next_block_candidate())
+                self.assertEqual(rpc.submit_results, [None])
+                self.assertEqual(
+                    ledger._block_candidate_outbox[block_hash]["state"],
+                    "pending",
+                )
+                # Retry 2: the stashed acceptance is still reused, so the
+                # node is never asked again (no "duplicate" classification,
+                # no chain probe reliance) and the landing tail finalizes
+                # exactly as if the first pass had continued.
                 self.assertTrue(server.submit_next_block_candidate())
         self.assertEqual(rpc.submit_results, [None])
         self.assertEqual(
