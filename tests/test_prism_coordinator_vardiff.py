@@ -7676,6 +7676,96 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "payout window was invalidated by a late-visible share append",
         )
 
+    def test_predating_append_stays_undurable_while_landing_holds_submit_fence(
+        self,
+    ) -> None:
+        # The other side of the fence boundary: while a landing holds the
+        # fence across submitblock, a predating append's durable commit --
+        # not only its epoch bump -- must wait for the RPC to return. The
+        # old ordering let the row become durable mid-RPC while its bump
+        # queued behind the fence, so the authoritative epoch check could
+        # not observe the invalidation and the coinbase entered qbitd
+        # underpaying a durable share no refresh wave can unsubmit.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        # Keep an anchor the late row predates exposed for the whole test,
+        # independent of the landing's own declared-anchor lifetime.
+        anchor_token = server._expose_inflight_scan_anchor(12000)
+        self.addCleanup(server._retire_inflight_scan_anchor, anchor_token)
+
+        late_entry = self._pending_append("mid-rpc-append")
+        durable_mid_rpc: list[bool] = []
+        append_threads: list[threading.Thread] = []
+
+        class MidRpcAppendRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    thread = threading.Thread(
+                        target=server._append_share_entry,
+                        args=(late_entry,),
+                        daemon=True,
+                    )
+                    thread.start()
+                    append_threads.append(thread)
+                    deadline = time.monotonic() + 0.25
+                    became_durable = False
+                    while time.monotonic() < deadline:
+                        if late_entry.pending_share.share_id in ledger._share_ids:
+                            became_durable = True
+                            break
+                        time.sleep(0.005)
+                    durable_mid_rpc.append(became_durable)
+                    return "rejected-by-test"
+                return super().call(method, params)
+
+        server.rpc = MidRpcAppendRpc("00" * 32)
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="dd" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("landing-holds-fence").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        # The append could not make the row durable while the fence-guarded
+        # RPC was in flight; it committed and bumped only afterwards.
+        self.assertEqual(durable_mid_rpc, [False])
+        self.assertTrue(append_threads)
+        append_threads[0].join(timeout=10.0)
+        self.assertFalse(append_threads[0].is_alive())
+        self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[
+                PRISM_REJECTION_SUBMITBLOCK_REJECTED
+            ],
+            1,
+        )
+
     def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
         self,
     ) -> None:
@@ -8213,6 +8303,61 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             # File is cleared after a clean replay so shares are not re-added.
             self.assertFalse(server.share_recovery_path.exists())
             self.assertEqual(server.replay_recovered_shares(), 0)
+
+    def test_replay_recovered_shares_commit_under_the_landing_fence(self) -> None:
+        # Recovered rows reconstruct pre-crash timestamps, so they predate
+        # live anchors. Each replay append must hold the landing fence across
+        # the ledger commit and its epoch bump -- never bump after the row is
+        # already durable, where a landing could verify the pre-bump epoch
+        # and submit a coinbase omitting the replayed share.
+        server, _state, ledger = submit_coordinator()
+        anchor_token = server._expose_inflight_scan_anchor(12000)
+        self.addCleanup(server._retire_inflight_scan_anchor, anchor_token)
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            server._recover_share_to_disk(self._pending_append("h1"), "test")
+
+            fence_held_during_commit: list[bool] = []
+            original_append = ledger.append
+
+            def recording_append(pending: object) -> object:
+                fence_held_during_commit.append(
+                    server._payout_append_landing_fence_lock.locked()
+                )
+                return original_append(pending)
+
+            ledger.append = recording_append  # type: ignore[method-assign]
+            replayed = server.replay_recovered_shares()
+
+        self.assertEqual(replayed, 1)
+        self.assertEqual(fence_held_during_commit, [True])
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+
+    def test_sync_append_commits_predating_row_under_the_landing_fence(
+        self,
+    ) -> None:
+        # The synchronous (no-writer) append path takes the same fence
+        # boundary as the group-commit writer for a row that predates a
+        # live anchor.
+        server, _state, ledger = submit_coordinator()
+        anchor_token = server._expose_inflight_scan_anchor(12000)
+        self.addCleanup(server._retire_inflight_scan_anchor, anchor_token)
+
+        fence_held_during_commit: list[bool] = []
+        original_append = ledger.append
+
+        def recording_append(pending: object) -> object:
+            fence_held_during_commit.append(
+                server._payout_append_landing_fence_lock.locked()
+            )
+            return original_append(pending)
+
+        ledger.append = recording_append  # type: ignore[method-assign]
+        self.assertTrue(server._append_share_entry(self._pending_append("h2")))
+        self.assertEqual(fence_held_during_commit, [True])
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
 
     def test_replay_recovered_shares_orders_by_accepted_at(self) -> None:
         # A share can be recovered out of FIFO order (overflow of the newest, or

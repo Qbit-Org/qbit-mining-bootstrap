@@ -21706,8 +21706,26 @@ class PrismCoordinator:
         skipped_duplicates = 0
         for pending in pendings:
             try:
-                self.ledger.append(pending)
-                self._invalidate_incremental_payout_window_for_append(pending)
+                # A recovered row reconstructs its pre-crash timestamps, so
+                # it routinely predates a live anchor; each row commits under
+                # the landing fence with its epoch bump so a concurrent
+                # landing can never verify a pre-bump epoch against an
+                # already-durable replayed share. The window retirement runs
+                # after the fence releases, per row, so replay never holds
+                # the fence across the prepare-lock wait.
+                invalidation_epoch: int | None = None
+                with self._landing_fence_for_predating_append(
+                    [pending]
+                ) as fence_owned:
+                    self.ledger.append(pending)
+                    invalidation_epoch = self._record_late_visible_payout_append(
+                        pending,
+                        landing_fence_owned=fence_owned,
+                    )
+                if invalidation_epoch is not None:
+                    self._retire_payout_windows_for_late_append(
+                        pending, invalidation_epoch
+                    )
                 replayed += 1
             except Exception as exc:
                 if "duplicate share_id" in str(exc):
@@ -21758,16 +21776,29 @@ class PrismCoordinator:
         caller uses that to keep the shutdown drain in order.
         """
         backoff_seconds = 0.5
+        invalidation_epoch: int | None = None
         while True:
             try:
-                append_batch = getattr(self.ledger, "append_batch", None)
-                if callable(append_batch):
-                    record = append_batch(
-                        [(entry.pending_share, entry.candidate_intent)]
-                    )[0]
-                else:
-                    record = self.ledger.append(entry.pending_share)
-                entry.record = record
+                # A replay-shaped row commits under the landing fence with
+                # its epoch bump (see _landing_fence_for_predating_append).
+                # The fence wraps one attempt only: the backoff sleep below
+                # runs outside it, so a retrying ledger outage never holds
+                # up a landing.
+                with self._landing_fence_for_predating_append(
+                    [entry.pending_share]
+                ) as fence_owned:
+                    append_batch = getattr(self.ledger, "append_batch", None)
+                    if callable(append_batch):
+                        record = append_batch(
+                            [(entry.pending_share, entry.candidate_intent)]
+                        )[0]
+                    else:
+                        record = self.ledger.append(entry.pending_share)
+                    entry.record = record
+                    invalidation_epoch = self._record_late_visible_payout_append(
+                        entry.pending_share,
+                        landing_fence_owned=fence_owned,
+                    )
                 break
             except Exception:
                 if not retry_until_stopped:
@@ -21791,9 +21822,10 @@ class PrismCoordinator:
                     return False
                 backoff_seconds = min(backoff_seconds * 2, 5.0)
                 self._record_heartbeat("share_writer")
-        self._invalidate_incremental_payout_window_for_append(
-            entry.pending_share
-        )
+        if invalidation_epoch is not None:
+            self._retire_payout_windows_for_late_append(
+                entry.pending_share, invalidation_epoch
+            )
         if getattr(self, "hot_path_log_enabled", False):
             print(
                 "prism coordinator: accepted share "
