@@ -7381,6 +7381,179 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.persisted), 1)
         self.assertEqual(len(ledger.confirmed), 1)
 
+    def test_block_submit_aborts_when_append_invalidation_races_the_landing(
+        self,
+    ) -> None:
+        # An append-side invalidation landing between the advisory epoch
+        # fence and submitblock must still abort the landing: the
+        # authoritative fence holds the same lock the bump takes, so the
+        # bump cannot slip past both. The bump here is driven through the
+        # REAL invalidation path from the getblockcount hook -- with no
+        # armed artifact or in-flight walk in the harness, it fires only
+        # because the landing exposed its own declared anchor.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError(
+                "audit bundle must not be built after a racing append "
+                "invalidated the payout window"
+            )
+        )
+        late_append = self._pending_append("late-during-landing").pending_share
+
+        class RaceRpc(TipRpc):
+            def __init__(rpc_self, tip: str) -> None:
+                super().__init__(tip)
+                rpc_self.race_fired = False
+
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    if not rpc_self.race_fired:
+                        rpc_self.race_fired = True
+                        server._invalidate_incremental_payout_window_for_append(
+                            late_append
+                        )
+                    return 9
+                if method == "submitblock":
+                    raise AssertionError(
+                        "submitblock must not run after a racing append "
+                        "invalidation"
+                    )
+                return super().call(method, params)
+
+        server.rpc = RaceRpc("00" * 32)
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="da" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("append-races-landing").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        self.assertTrue(server.rpc.race_fired)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+        self.assertEqual(server.stale_share_count, 0)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+        # The landing retires its exposed anchor on the way out.
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_window_inflight_scan_anchors, {})
+
+    def test_replayed_candidate_aborts_when_append_races_after_revalidation(
+        self,
+    ) -> None:
+        # The durable replay rebases a reconstructed candidate onto the live
+        # epoch sequence as of the revalidation read; an epoch advanced
+        # after that read must still abort the landing at the authoritative
+        # fence even though the replayed window itself matched.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        ledger.durable_payout_state = True  # type: ignore[attr-defined]
+        ledger.audit_share_window = (  # type: ignore[method-assign]
+            lambda *, anchor_job_issued_at_ms, network_difficulty: [
+                {"share_id": "recorded-window-share"}
+            ]
+        )
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.shares_json = [{"share_id": "recorded-window-share"}]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError(
+                "audit bundle must not be built after a racing append "
+                "invalidated the replayed payout window"
+            )
+        )
+
+        class RaceRpc(TipRpc):
+            def __init__(rpc_self, tip: str) -> None:
+                super().__init__(tip)
+                rpc_self.race_fired = False
+
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    if not rpc_self.race_fired:
+                        rpc_self.race_fired = True
+                        with server._job_cache_lock:
+                            server._payout_ledger_append_invalidation_epoch += 1
+                    return 9
+                if method == "submitblock":
+                    raise AssertionError(
+                        "submitblock must not run after a racing append "
+                        "invalidation"
+                    )
+                return super().call(method, params)
+
+        server.rpc = RaceRpc("00" * 32)
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="db" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("replayed-append-race").pending_share
+        original = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        intent = server.block_candidate_intent(original)
+        candidate = server.block_candidate_from_intent(intent)
+        self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
+        ledger.append_batch([(pending, intent)])
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        self.assertTrue(server.rpc.race_fired)
+        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+
     def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
         self,
     ) -> None:

@@ -4097,6 +4097,16 @@ class PrismCoordinator:
             # advances only when a newly visible row predates an anchored
             # share window and makes pre-append work unsafe to publish.
             self._payout_ledger_append_invalidation_epoch = 0
+        if not hasattr(self, "_payout_append_landing_fence_lock"):
+            # Serializes the append-side epoch bump against the landing's
+            # final epoch-check-and-submitblock boundary. Ordinary share
+            # commits never touch it: the append side acquires it only for
+            # rows that predate a live anchor (the rare replay-shaped
+            # append), and the landing holds it across exactly one RPC, so
+            # an epoch advance can never slip between the landing's last
+            # epoch read and the block entering qbitd. Ordered strictly
+            # outside _job_cache_lock.
+            self._payout_append_landing_fence_lock = threading.Lock()
         if not hasattr(self, "_payout_window_inflight_scan_anchors"):
             # Guarded by _job_cache_lock. The anchors of ledger window walks
             # whose results are not yet visible anywhere else, published
@@ -21239,16 +21249,18 @@ class PrismCoordinator:
                 and int(pending_share.accepted_at_ms) <= anchor_ms
             )
 
-        # The incremental pointer is immutable and replaced atomically. Its
-        # owning lock is deliberately not acquired here: an urgent append
-        # must disarm the separately guarded artifact even while a long oracle
-        # build owns _payout_state_prepare_lock. Reading it under
-        # _job_cache_lock orders the read against the in-flight scan anchors:
-        # a window walk makes its result visible (the incremental pointer,
-        # or the armed artifact's install fence) before retiring its exposed
-        # anchor under this lock, so a walk that could have missed this row
-        # always exposes an anchor to the predates() checks below.
-        with self._job_cache_lock:
+        def predates_live_anchor_locked() -> bool:
+            # Caller holds _job_cache_lock. The incremental pointer is
+            # immutable and replaced atomically; its owning lock is
+            # deliberately not acquired here, because an urgent append must
+            # disarm the separately guarded artifact even while a long
+            # oracle build owns _payout_state_prepare_lock. Reading it under
+            # _job_cache_lock orders the read against the in-flight scan
+            # anchors: a window walk makes its result visible (the
+            # incremental pointer, or the armed artifact's install fence)
+            # before retiring its exposed anchor under this lock, so a walk
+            # that could have missed this row always exposes an anchor to
+            # the predates() checks below.
             cached = getattr(self, "_incremental_payout_artifact_window", None)
             artifact = self._payout_ledger_artifact
             inflight_anchors_ms = tuple(
@@ -21264,19 +21276,35 @@ class PrismCoordinator:
                 if artifact is None or artifact.snapshot_anchor_ms is None
                 else int(artifact.snapshot_anchor_ms)
             )
-            if not (
+            return bool(
                 predates(cached_anchor_ms)
                 or predates(artifact_anchor_ms)
                 or any(
                     predates(anchor_ms) for anchor_ms in inflight_anchors_ms
                 )
-            ):
-                return
-            self._payout_ledger_append_invalidation_epoch += 1
-            invalidation_epoch = int(
-                self._payout_ledger_append_invalidation_epoch
             )
-            self._payout_ledger_artifact = None
+
+        # Two-phase bump. The unfenced peek keeps ordinary share commits off
+        # the landing fence lock entirely; only a row that predates a live
+        # anchor re-checks and bumps under it. Holding that lock for the bump
+        # is what makes the landing's final epoch fence authoritative: a bump
+        # cannot commit while a landing sits between its last epoch read and
+        # submitblock, so the invalidation lands either before that read
+        # (candidate abandoned) or after the RPC returns (the refresh wave
+        # retires the job). The predicate re-runs under the lock because the
+        # anchor set may have moved during the unfenced gap.
+        with self._job_cache_lock:
+            if not predates_live_anchor_locked():
+                return
+        with self._payout_append_landing_fence_lock:
+            with self._job_cache_lock:
+                if not predates_live_anchor_locked():
+                    return
+                self._payout_ledger_append_invalidation_epoch += 1
+                invalidation_epoch = int(
+                    self._payout_ledger_append_invalidation_epoch
+                )
+                self._payout_ledger_artifact = None
 
         # Active jobs stamped against the pre-append window still pass the
         # generation and digest fences; only epoch-aware reselection replaces
@@ -23783,6 +23811,7 @@ class PrismCoordinator:
         current_tip: str,
         already_active: bool,
         worker: str | None,
+        revalidated_append_epoch: int | None = None,
     ) -> tuple[
         dict[str, Any],
         dict[str, Any],
@@ -23921,10 +23950,19 @@ class PrismCoordinator:
             # the pre-append job submit, so landing fails closed here.
             # Collection candidates settle solver-pays-all and are exempt, as
             # at every other epoch fence. A negative stamp is a candidate
-            # reconstructed from durable intent: epochs are process-local, so
-            # cross-restart drift is governed by the content fences instead.
+            # reconstructed from durable intent: the caller revalidated its
+            # recorded window against the durable ledger before this landing
+            # and rebased it onto the live epoch sequence at that read, so
+            # from here both kinds of candidate share one epoch fence. A
+            # reconstructed candidate on a backend that cannot revalidate
+            # carries no epoch and the fence stands down.
             context_append_epoch = int(
                 getattr(context, "payout_append_invalidation_epoch", 0)
+            )
+            effective_append_epoch = (
+                context_append_epoch
+                if context_append_epoch >= 0
+                else revalidated_append_epoch
             )
             with self._job_cache_lock:
                 live_append_epoch = int(
@@ -23933,8 +23971,8 @@ class PrismCoordinator:
             if (
                 not already_active
                 and not getattr(context, "collection_only", False)
-                and context_append_epoch >= 0
-                and context_append_epoch != live_append_epoch
+                and effective_append_epoch is not None
+                and effective_append_epoch != live_append_epoch
             ):
                 self._abandon_block_candidate(
                     PRISM_REJECTION_STALE_JOB,
@@ -23945,46 +23983,6 @@ class PrismCoordinator:
                     stale_job_class="append_epoch_stale",
                 )
                 return None
-            # A negative stamp is a candidate reconstructed from durable
-            # intent: the epoch fence above stood down because its comparison
-            # is process-local, but the hazard it guards against survives the
-            # restart -- a share append that became durably visible after the
-            # recorded window walk leaves the tip, height, and carry balances
-            # (every fence below) untouched while the recorded coinbase
-            # underpays the appended share. Replay the audit window at the
-            # intent's declared anchor and fail closed when it surfaces a
-            # share the recorded window omitted. A failed replay read defers
-            # the candidate for retry instead of abandoning it terminally.
-            if (
-                durable_payout_state
-                and not already_active
-                and not getattr(context, "collection_only", False)
-                and context_append_epoch < 0
-            ):
-                try:
-                    window_reproducible = (
-                        self._replayed_payout_window_reproducible(context)
-                    )
-                except Exception:
-                    traceback.print_exc()
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
-                        "durable share-window replay failed for the "
-                        "reconstructed candidate",
-                        block_hash=block_hash,
-                        worker=worker,
-                    )
-                    return None
-                if not window_reproducible:
-                    self._abandon_block_candidate(
-                        PRISM_REJECTION_STALE_JOB,
-                        "replayed payout window omits a durably appended share",
-                        block_hash=block_hash,
-                        worker=worker,
-                        expected_height=expected_height,
-                        stale_job_class="append_epoch_stale",
-                    )
-                    return None
             if (
                 durable_payout_state
                 and not already_active
@@ -24028,7 +24026,48 @@ class PrismCoordinator:
                 self._require_fresh_ledger_lease_for_external_side_effect(
                     "submitblock"
                 )
-                result = self.rpc.call("submitblock", [submission.block_hex])
+                # The epoch fence above is advisory: it releases the lock
+                # after one read, so an append-side bump could still commit
+                # between that read and the RPC below. This one is
+                # authoritative -- the bump acquires the same fence lock, so
+                # holding it across submitblock means no late-visible append
+                # can advance the epoch between this comparison and the
+                # block entering qbitd. The lock spans exactly one RPC and
+                # only on this boundary; ordinary share commits never touch
+                # it (the append side takes it only for rows that predate a
+                # live anchor, and this landing's own declared anchor stays
+                # exposed for the landing's duration).
+                result: object = None
+                append_epoch_raced = False
+                if (
+                    effective_append_epoch is None
+                    or getattr(context, "collection_only", False)
+                ):
+                    result = self.rpc.call(
+                        "submitblock", [submission.block_hex]
+                    )
+                else:
+                    with self._payout_append_landing_fence_lock:
+                        with self._job_cache_lock:
+                            live_append_epoch = int(
+                                self._payout_ledger_append_invalidation_epoch
+                            )
+                        if live_append_epoch != effective_append_epoch:
+                            append_epoch_raced = True
+                        else:
+                            result = self.rpc.call(
+                                "submitblock", [submission.block_hex]
+                            )
+                if append_epoch_raced:
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_STALE_JOB,
+                        "payout window was invalidated by a late-visible share append",
+                        block_hash=block_hash,
+                        worker=worker,
+                        expected_height=expected_height,
+                        stale_job_class="append_epoch_stale",
+                    )
+                    return None
                 self._record_heartbeat("block_submitter")
                 landed_monotonic = getattr(candidate, "landed_monotonic", None)
                 if landed_monotonic is not None:
@@ -24570,12 +24609,83 @@ class PrismCoordinator:
                 stale_job_class="tip_moved",
             )
             return accepted_race_won
-        landed = self._land_and_confirm_block_candidate(
-            candidate,
-            current_tip=current_tip,
-            already_active=already_active,
-            worker=worker,
+        # A reconstructed candidate revalidates BEFORE the balance
+        # serializer: the audit share-window replay is the slow oracle walk
+        # and takes the ledger writer lock, so running it inside
+        # _payout_balance_mutation_lock would stall share persistence and
+        # every other landing for the walk's duration. The read is safe out
+        # here because the window is append-only content -- a pass can only
+        # be invalidated by a later append, and any such append after the
+        # baseline epoch captured below advances the live epoch (this
+        # landing's declared anchor stays exposed to the append-side
+        # predates() checks), which the landing's fences compare against.
+        collection_only = bool(getattr(context, "collection_only", False))
+        context_append_epoch = int(
+            getattr(context, "payout_append_invalidation_epoch", 0)
         )
+        revalidated_append_epoch: int | None = None
+        landing_anchor_token: int | None = None
+        if not already_active and not collection_only:
+            found_block = getattr(context, "found_block", None)
+            declared_anchor_ms = (
+                found_block.get("anchor_job_issued_at_ms")
+                if isinstance(found_block, dict)
+                else None
+            )
+            if declared_anchor_ms is not None:
+                # With no armed artifact and no in-flight walk (an outbox
+                # replay at startup, or a landing after the artifact was
+                # disarmed), a replay-shaped append would skip the epoch
+                # bump entirely; exposing the landing window's own anchor
+                # guarantees the bump the fences below check for.
+                landing_anchor_token = self._expose_inflight_scan_anchor(
+                    int(declared_anchor_ms)
+                )
+        try:
+            if (
+                not already_active
+                and not collection_only
+                and context_append_epoch < 0
+                and bool(getattr(self.ledger, "durable_payout_state", False))
+            ):
+                with self._job_cache_lock:
+                    revalidation_base_epoch = int(
+                        self._payout_ledger_append_invalidation_epoch
+                    )
+                try:
+                    window_reproducible = (
+                        self._replayed_payout_window_reproducible(context)
+                    )
+                except Exception:
+                    traceback.print_exc()
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
+                        "durable share-window replay failed for the "
+                        "reconstructed candidate",
+                        block_hash=block_hash,
+                        worker=worker,
+                    )
+                    return False
+                if not window_reproducible:
+                    self._abandon_block_candidate(
+                        PRISM_REJECTION_STALE_JOB,
+                        "replayed payout window omits a durably appended share",
+                        block_hash=block_hash,
+                        worker=worker,
+                        expected_height=expected_height,
+                        stale_job_class="append_epoch_stale",
+                    )
+                    return False
+                revalidated_append_epoch = revalidation_base_epoch
+            landed = self._land_and_confirm_block_candidate(
+                candidate,
+                current_tip=current_tip,
+                already_active=already_active,
+                worker=worker,
+                revalidated_append_epoch=revalidated_append_epoch,
+            )
+        finally:
+            self._retire_inflight_scan_anchor(landing_anchor_token)
         if landed is None:
             return False
         final_bundle, report, persistence, confirmation = landed
