@@ -38,6 +38,13 @@ DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE = 512
 # psql-only deployments retain ordinary TTL fencing and are never treated as
 # fast-adoptable merely because they share an identity with a replacement.
 WRITER_LEASE_HEARTBEAT_SESSION_PREFIX = "heartbeat-v1:"
+# Statements verify_writer_lease_guard_session may lawfully run inside one
+# guarded slot: the verification statement plus its single attribution
+# recheck. Callers that budget the verification's execution wall-clock must
+# cover this many server-side statement timeouts, or a lawful recheck under
+# moderate database latency is killed by the caller's deadline instead of
+# rescuing the coordinator.
+WRITER_LEASE_VERIFICATION_MAX_STATEMENTS = 2
 DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS = 1.0
 VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
 
@@ -7735,7 +7742,7 @@ SELECT json_build_object(
     )
 );
 """
-        attribution_rechecks_left = 1
+        attribution_rechecks_left = WRITER_LEASE_VERIFICATION_MAX_STATEMENTS - 1
 
         def attribution_recheck(result: Any) -> str | None:
             # Runs inside the guard's held query slot, between statements.

@@ -76,6 +76,7 @@ from lab.prism.share_ledger import (
     PsqlShareLedger,
     SingleWriterShareLedger,
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
+    WRITER_LEASE_VERIFICATION_MAX_STATEMENTS,
     sha256_json_hex,
 )
 
@@ -12927,7 +12928,13 @@ class PrismCoordinator:
                 f"writer lease guard verification is unavailable before {component}"
             )
 
-        timeout_seconds = max(
+        # The configured fence timeout budgets one statement; the
+        # verification may lawfully run a second inside the same guarded
+        # slot (the attribution recheck), and killing that recheck at the
+        # single-statement deadline would hard-exit a coordinator the
+        # recheck was about to prove healthy. Two moderately slow but
+        # in-deadline statements must both fit.
+        timeout_seconds = WRITER_LEASE_VERIFICATION_MAX_STATEMENTS * max(
             0.0,
             float(
                 getattr(
