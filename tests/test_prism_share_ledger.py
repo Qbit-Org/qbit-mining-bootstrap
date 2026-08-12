@@ -1221,6 +1221,47 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger._writer_lease_guard = guard
         return ledger
 
+    class InSlotFakeGuard:
+        """Mimic the native guard's run_json slot semantics for fakes.
+
+        One serialized-slot acquisition per run_json call, with followup
+        statements executed inside that same acquisition — the property
+        the attribution recheck relies on so its extra statement can never
+        queue behind other guard callers. Subclasses supply the per-
+        statement result via result_for(statement_index).
+        """
+
+        held = True
+
+        def __init__(self) -> None:
+            self.slot_acquisitions = 0
+            self.query_starts = 0
+            self.statements: list[str] = []
+
+        def result_for(self, index: int) -> dict[str, object]:
+            raise NotImplementedError
+
+        def run_json(
+            self,
+            sql: str,
+            *,
+            on_query_start: Any = None,
+            followup: Any = None,
+        ) -> dict[str, object]:
+            self.slot_acquisitions += 1
+            if on_query_start is not None:
+                self.query_starts += 1
+                on_query_start()
+            self.statements.append(sql)
+            result = self.result_for(len(self.statements) - 1)
+            while followup is not None:
+                next_sql = followup(result)
+                if next_sql is None:
+                    break
+                self.statements.append(next_sql)
+                result = self.result_for(len(self.statements) - 1)
+            return result
+
     def test_guard_session_verification_is_non_blocking_and_exact_session(self) -> None:
         class FakeGuard:
             held = True
@@ -1228,7 +1269,13 @@ class PrismShareLedgerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.statements: list[str] = []
 
-            def run_json(self, sql: str) -> dict[str, object]:
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
                 self.statements.append(sql)
                 return {
                     "backend": "postgres-psql",
@@ -1298,7 +1345,13 @@ class PrismShareLedgerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.statements: list[str] = []
 
-            def run_json(self, sql: str) -> dict[str, object]:
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
                 self.statements.append(sql)
                 return {
                     "backend": "postgres-psql",
@@ -1337,7 +1390,13 @@ class PrismShareLedgerTests(unittest.TestCase):
                 class FakeGuard:
                     held = True
 
-                    def run_json(self, sql: str) -> dict[str, object]:
+                    def run_json(
+                        self,
+                        sql: str,
+                        *,
+                        on_query_start: Any = None,
+                        followup: Any = None,
+                    ) -> dict[str, object]:
                         return {
                             "backend": "postgres-psql",
                             "guard_advisory_lock_held": True,
@@ -1383,6 +1442,7 @@ class PrismShareLedgerTests(unittest.TestCase):
                 sql: str,
                 *,
                 on_query_start: Any = None,
+                followup: Any = None,
             ) -> dict[str, object]:
                 if on_query_start is not None:
                     on_query_start()
@@ -1453,10 +1513,8 @@ class PrismShareLedgerTests(unittest.TestCase):
         also defaults closed.
         """
 
-        class ExpiredContendedGuard:
-            held = True
-
-            def run_json(self, sql: str) -> dict[str, object]:
+        class ExpiredContendedGuard(self.InSlotFakeGuard):
+            def result_for(self, index: int) -> dict[str, object]:
                 return {
                     "backend": "postgres-psql",
                     "guard_advisory_lock_held": True,
@@ -1465,12 +1523,17 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "lease_expired": True,
                 }
 
-        ledger = self.guarded_verification_ledger(ExpiredContendedGuard())
+        guard = ExpiredContendedGuard()
+        ledger = self.guarded_verification_ledger(guard)
         with self.assertRaisesRegex(
             RuntimeError,
             "expired and its renewal was lock-blocked",
         ):
             ledger.verify_writer_lease_guard_session()
+        # The ambiguous shape earns exactly one in-slot attribution recheck
+        # before the fail-closed stands.
+        self.assertEqual(len(guard.statements), 2)
+        self.assertEqual(guard.slot_acquisitions, 1)
 
     def test_guard_verification_survives_own_fenced_write_outlasting_ttl(self) -> None:
         """A fenced write outlasting the TTL must not hard-exit the coordinator.
@@ -1495,7 +1558,13 @@ class PrismShareLedgerTests(unittest.TestCase):
         class OwnLongFencedWriteGuard:
             held = True
 
-            def run_json(self, sql: str) -> dict[str, object]:
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
                 return {
                     "backend": "postgres-psql",
                     "guard_advisory_lock_held": True,
@@ -1528,24 +1597,9 @@ class PrismShareLedgerTests(unittest.TestCase):
         exemption exists to survive.
         """
 
-        class CommitRacedGuard:
-            held = True
-
-            def __init__(self) -> None:
-                self.statements: list[str] = []
-                self.query_starts = 0
-
-            def run_json(
-                self,
-                sql: str,
-                *,
-                on_query_start: Any = None,
-            ) -> dict[str, object]:
-                if on_query_start is not None:
-                    self.query_starts += 1
-                    on_query_start()
-                self.statements.append(sql)
-                if len(self.statements) == 1:
+        class CommitRacedGuard(self.InSlotFakeGuard):
+            def result_for(self, index: int) -> dict[str, object]:
+                if index == 0:
                     # First statement: snapshot taken before the own write's
                     # commit, probe run after it — locker unattributable.
                     return {
@@ -1575,9 +1629,12 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(result["renewed_count"], 1)
         self.assertIs(result["renewal_deferred_to_own_write"], False)
         self.assertEqual(len(guard.statements), 2)
-        # The recheck is the same verification's execution, not a new queue
-        # wait: callers budgeting queue wait via on_query_start must see it
-        # fire exactly once.
+        # The recheck runs inside the same serialized slot acquisition: it
+        # can never queue behind other guard callers, so the only cost
+        # charged to the caller's execution budget is one more statement,
+        # and callers budgeting queue wait via on_query_start see it fire
+        # exactly once.
+        self.assertEqual(guard.slot_acquisitions, 1)
         self.assertEqual(guard.query_starts, 1)
 
     def test_guard_verification_recheck_still_fails_closed_on_real_contention(
@@ -1590,14 +1647,8 @@ class PrismShareLedgerTests(unittest.TestCase):
         second identical read must raise, not loop.
         """
 
-        class ContendedGuard:
-            held = True
-
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def run_json(self, sql: str) -> dict[str, object]:
-                self.calls += 1
+        class ContendedGuard(self.InSlotFakeGuard):
+            def result_for(self, index: int) -> dict[str, object]:
                 return {
                     "backend": "postgres-psql",
                     "guard_advisory_lock_held": True,
@@ -1614,7 +1665,8 @@ class PrismShareLedgerTests(unittest.TestCase):
             "expired and its renewal was lock-blocked",
         ):
             ledger.verify_writer_lease_guard_session()
-        self.assertEqual(guard.calls, 2)
+        self.assertEqual(len(guard.statements), 2)
+        self.assertEqual(guard.slot_acquisitions, 1)
 
     def test_guard_verification_recheck_detects_completed_takeover(self) -> None:
         """A takeover committing mid-verification fails closed on identity.
@@ -1625,15 +1677,9 @@ class PrismShareLedgerTests(unittest.TestCase):
         re-reporting the stale lock-blocked one.
         """
 
-        class TakeoverGuard:
-            held = True
-
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def run_json(self, sql: str) -> dict[str, object]:
-                self.calls += 1
-                if self.calls == 1:
+        class TakeoverGuard(self.InSlotFakeGuard):
+            def result_for(self, index: int) -> dict[str, object]:
+                if index == 0:
                     return {
                         "backend": "postgres-psql",
                         "guard_advisory_lock_held": True,
@@ -1652,7 +1698,8 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger = self.guarded_verification_ledger(guard)
         with self.assertRaisesRegex(RuntimeError, "writer lease is not active"):
             ledger.verify_writer_lease_guard_session()
-        self.assertEqual(guard.calls, 2)
+        self.assertEqual(len(guard.statements), 2)
+        self.assertEqual(guard.slot_acquisitions, 1)
 
     def test_guard_verification_reports_no_deferral_outside_own_lock_expiry(
         self,
@@ -1670,7 +1717,13 @@ class PrismShareLedgerTests(unittest.TestCase):
                 class Guard:
                     held = True
 
-                    def run_json(self, sql: str) -> dict[str, object]:
+                    def run_json(
+                        self,
+                        sql: str,
+                        *,
+                        on_query_start: Any = None,
+                        followup: Any = None,
+                    ) -> dict[str, object]:
                         return {
                             "backend": "postgres-psql",
                             "guard_advisory_lock_held": True,
@@ -1696,7 +1749,13 @@ class PrismShareLedgerTests(unittest.TestCase):
         class ExpiredUncontendedGuard:
             held = True
 
-            def run_json(self, sql: str) -> dict[str, object]:
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
                 return {
                     "backend": "postgres-psql",
                     "guard_advisory_lock_held": True,
