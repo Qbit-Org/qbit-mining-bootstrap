@@ -7572,10 +7572,24 @@ SELECT COALESCE(
         commits, and a rollback instead releases the expired row unchanged,
         letting a queued different-identity claimant take it immediately.
         The result therefore reports ``renewal_deferred_to_own_write`` for
-        exactly this state, and external-side-effect fences must withhold
-        the guarded RPC while it is set, retrying on their own cadence until
-        a verification lands a renewal (the write committed, refreshing the
+        this state, and external-side-effect fences must withhold the
+        guarded RPC while it is set, retrying on their own cadence until a
+        verification lands a renewal (the write committed, refreshing the
         TTL) or fails closed. The heartbeat may keep treating it as live.
+
+        The deferral engages before expiry as well: an own-write skip over
+        a committed row with less than half the lease TTL remaining also
+        defers. An RPC authorized on a nearly-lapsed row can outlive it,
+        and from expiry onward its authority degenerates into the same
+        rollback-dependent argument — the TTL erodes exactly while a long
+        own write withholds renewals, so the margin shrinks precisely when
+        the write's fate is least certain. Skips over a row with at least
+        half the TTL remaining keep authorizing on the committed row's own
+        standalone validity: every fenced commit refreshes the TTL, so
+        steady write traffic never erodes the margin, and deferring every
+        own-write skip would withhold submitblock and broadcasts behind
+        saturated append traffic — the submitter liveness the fast-lane
+        submit path exists to protect.
 
         ``on_query_start`` fires once the guarded session's serialized query
         slot is acquired, letting callers budget queue wait separately from
@@ -7653,6 +7667,16 @@ SELECT json_build_object(
           AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
           AND qbit_ledger_writer_lease.lease_expires_at <= clock_timestamp()
     ),
+    'lease_expiring_within_authority_margin', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+          AND qbit_ledger_writer_lease.lease_expires_at
+              <= clock_timestamp() + ({self._lease_interval_sql}) / 2.0
+    ),
     'lease_locked_by_this_process', EXISTS (
         SELECT 1
         FROM qbit_ledger_writer_lease, pg_stat_activity, payload
@@ -7707,8 +7731,11 @@ SELECT json_build_object(
             renewed_count = 0
         renewal_deferred_to_own_write = bool(
             renewed_count == 0
-            and result.get("lease_expired")
             and result.get("lease_locked_by_this_process")
+            and (
+                result.get("lease_expired")
+                or result.get("lease_expiring_within_authority_margin")
+            )
         )
         if (
             renewed_count == 0

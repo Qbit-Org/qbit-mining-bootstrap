@@ -1319,6 +1319,13 @@ class PrismShareLedgerTests(unittest.TestCase):
         # The statement must also report committed-row expiry so a skipped
         # renewal over an expired lease can fail closed.
         self.assertIn("lease_expires_at <= clock_timestamp()", statement)
+        # And the remaining-TTL authority margin, so an own-write skip over
+        # a nearly-lapsed row defers external side effects before its
+        # authority degenerates into a rollback-dependent argument.
+        self.assertIn(
+            "<= clock_timestamp() + (make_interval(secs => 60.0)) / 2.0",
+            statement,
+        )
         # And it must attribute the lease tuple's locker, so this process's
         # own fenced write outlasting the TTL is not mistaken for a
         # competing expiry claim: the committed row's xmax is the locker's
@@ -1579,6 +1586,86 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(result["verified_count"], 1)
         self.assertEqual(result["renewed_count"], 0)
         self.assertIs(result["renewal_deferred_to_own_write"], True)
+
+    def test_guard_verification_defers_own_write_skip_inside_authority_margin(
+        self,
+    ) -> None:
+        """An own-write skip with a thin remaining TTL defers before expiry.
+
+        The TTL erodes exactly while a long own fenced write withholds
+        renewals, so an external side effect authorized on a nearly-lapsed
+        committed row can outlive it mid-RPC — from expiry onward its
+        authority is the same rollback-dependent argument the expired-case
+        deferral rejects. The margin probe engages the deferral once less
+        than half the lease TTL remains, while the row is still unexpired
+        and the heartbeat keeps treating the session as live.
+        """
+
+        class ErodedMarginGuard:
+            held = True
+
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": False,
+                    "lease_expiring_within_authority_margin": True,
+                    "lease_locked_by_this_process": True,
+                }
+
+        ledger = self.guarded_verification_ledger(ErodedMarginGuard())
+        result = ledger.verify_writer_lease_guard_session()
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 0)
+        self.assertIs(result["renewal_deferred_to_own_write"], True)
+
+    def test_guard_verification_authorizes_own_write_skip_with_healthy_margin(
+        self,
+    ) -> None:
+        """A fresh-TTL own-write skip keeps authorizing external effects.
+
+        Every fenced commit refreshes the TTL, so under steady append
+        traffic the lease tuple is frequently locked by this process while
+        the committed row still has most of a lease ahead. Deferring those
+        skips would withhold submitblock and broadcasts behind saturated
+        append traffic; the committed row's own unexpired validity — with
+        at least half the TTL of runway — is standalone authority that
+        needs no assumption about the in-flight write's fate.
+        """
+
+        class FreshTtlOwnWriteGuard:
+            held = True
+
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": False,
+                    "lease_expiring_within_authority_margin": False,
+                    "lease_locked_by_this_process": True,
+                }
+
+        ledger = self.guarded_verification_ledger(FreshTtlOwnWriteGuard())
+        result = ledger.verify_writer_lease_guard_session()
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 0)
+        self.assertIs(result["renewal_deferred_to_own_write"], False)
 
     def test_guard_verification_rechecks_when_own_commit_clears_locker_attribution(
         self,
