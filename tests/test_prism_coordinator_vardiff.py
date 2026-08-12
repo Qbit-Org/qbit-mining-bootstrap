@@ -805,6 +805,15 @@ def coordinator() -> PrismCoordinator:
 
 def submit_coordinator(tip: str = "00" * 32) -> tuple[PrismCoordinator, ClientState, RecordingLedger]:
     server = coordinator()
+    # This suite runs on a synthetic millisecond timeline (declared anchors
+    # like 12000, share stamps of 1-2) while _expose_inflight_scan_anchor
+    # prunes exposures older than a real-wall-clock ceiling. Every synthetic
+    # anchor is decades past that ceiling, so the next exposure (a landing
+    # publishing its declared anchor) silently pruned a test's standing
+    # anchor and turned epoch-bump assertions into thread races against the
+    # landing's own anchor retirement. Pin the ceiling out of reach so
+    # exposed anchors live exactly as long as each test intends.
+    server.payout_artifact_max_anchor_age_seconds = float("inf")
     server.vardiff_config = SimpleNamespace(enabled=False)
     server.rpc = TipRpc(tip)
     server.jobs = {}
