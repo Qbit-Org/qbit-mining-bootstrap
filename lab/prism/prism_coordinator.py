@@ -4120,6 +4120,21 @@ class PrismCoordinator:
             # exposes that window's anchor in the meantime.
             self._payout_window_inflight_scan_anchors: dict[int, int] = {}
             self._payout_window_inflight_scan_anchor_token = 0
+        if not hasattr(self, "_payout_unfenced_append_inflight_stamps"):
+            # Guarded by _job_cache_lock. One entry per durable append
+            # currently committing OUTSIDE the landing fence, holding the
+            # batch's most predating row stamp (min over rows of
+            # max(job_issued_at_ms, accepted_at_ms)). The unfenced
+            # classification is a one-time predicate: an anchor exposed
+            # after it cannot retroactively fence the in-flight commit, so
+            # a landing that just exposed its declared anchor drains
+            # matching entries before its epoch fences arm. The condition
+            # shares _job_cache_lock and signals every deregistration.
+            self._payout_unfenced_append_inflight_stamps: dict[int, int] = {}
+            self._payout_unfenced_append_inflight_token = 0
+            self._payout_unfenced_append_drained = threading.Condition(
+                self._job_cache_lock
+            )
         if not hasattr(self, "_incremental_payout_artifact_window"):
             # Guarded by _payout_state_prepare_lock. It is independent of the
             # published artifact generation: normal generation bumps retag
@@ -21294,18 +21309,77 @@ class PrismCoordinator:
         peek here fires only for the rare replay-shaped append. Yields
         whether the fence is held so the caller can thread it into
         _record_late_visible_payout_append.
+
+        The unfenced classification is a one-time predicate, so an anchor
+        exposed after it (a landing publishing its declared anchor) cannot
+        retroactively fence this commit. An unfenced batch therefore
+        registers itself, atomically with the classification, in
+        _payout_unfenced_append_inflight_stamps and deregisters only after
+        the caller's post-commit epoch-bump attempt ran inside this block;
+        _await_unfenced_appends_predating_anchor lets a landing wait those
+        commits out before its epoch fences arm.
         """
         self._ensure_job_cache_state()
+        unfenced_token: int | None = None
         with self._job_cache_lock:
             fence_needed = any(
                 self._pending_share_predates_live_anchor_locked(pending)
                 for pending in pending_shares
             )
+            if not fence_needed and pending_shares:
+                self._payout_unfenced_append_inflight_token += 1
+                unfenced_token = self._payout_unfenced_append_inflight_token
+                self._payout_unfenced_append_inflight_stamps[
+                    unfenced_token
+                ] = min(
+                    max(
+                        int(pending.job_issued_at_ms),
+                        int(pending.accepted_at_ms),
+                    )
+                    for pending in pending_shares
+                )
         if not fence_needed:
-            yield False
+            try:
+                yield False
+            finally:
+                if unfenced_token is not None:
+                    with self._payout_unfenced_append_drained:
+                        self._payout_unfenced_append_inflight_stamps.pop(
+                            unfenced_token, None
+                        )
+                        self._payout_unfenced_append_drained.notify_all()
             return
         with self._payout_append_landing_fence_lock:
             yield True
+
+    def _await_unfenced_appends_predating_anchor(self, anchor_ms: int) -> None:
+        """Wait until no unfenced in-flight append can predate ``anchor_ms``.
+
+        Called by a landing right after exposing its declared anchor. An
+        append classified as unfenced before that exposure commits outside
+        the landing fence, so holding the fence across submitblock would
+        not exclude its durable commit -- and its post-commit epoch bump
+        would queue behind the very fence the landing holds, arriving only
+        after the block entered qbitd. Draining here restores the fence
+        contract: each matching append finishes its commit and its bump
+        attempt against the now-exposed anchor before this returns, so a
+        predating row advances the epoch the landing's fences check, and
+        every append classified after the exposure sees the anchor and
+        takes the fence itself. Appends whose rows cannot predate the
+        anchor never block this wait, and the registry holds entries only
+        for the duration of a ledger commit, so the common path is one
+        locked emptiness check.
+        """
+        self._ensure_job_cache_state()
+        anchor = int(anchor_ms)
+        with self._payout_unfenced_append_drained:
+            while any(
+                stamp_ms <= anchor
+                for stamp_ms in (
+                    self._payout_unfenced_append_inflight_stamps.values()
+                )
+            ):
+                self._payout_unfenced_append_drained.wait()
 
     def _record_late_visible_payout_append(
         self,
@@ -24783,6 +24857,17 @@ class PrismCoordinator:
                 # bump entirely; exposing the landing window's own anchor
                 # guarantees the bump the fences below check for.
                 landing_anchor_token = self._expose_inflight_scan_anchor(
+                    int(declared_anchor_ms)
+                )
+                # An append classified as unfenced before that exposure
+                # commits outside the landing fence, so its row could
+                # become durable mid-submitblock while its epoch bump
+                # queues behind the fence this landing holds across the
+                # RPC. Wait those commits (and their bump attempts
+                # against the now-exposed anchor) out before any window
+                # revalidation or epoch fence runs; no fence is held
+                # here, so the bump can always proceed.
+                self._await_unfenced_appends_predating_anchor(
                     int(declared_anchor_ms)
                 )
         try:

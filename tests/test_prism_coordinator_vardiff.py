@@ -7766,6 +7766,125 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             1,
         )
 
+    def test_landing_drains_unfenced_inflight_append_before_epoch_fences(
+        self,
+    ) -> None:
+        # The unfenced classification is a one-time predicate: an append
+        # checked while no anchor is exposed commits outside the landing
+        # fence, so a landing that exposes its declared anchor afterwards
+        # could hold the fence across submitblock while the row becomes
+        # durable mid-RPC and its epoch bump queues behind that same
+        # fence -- arriving too late to reject the block. The landing must
+        # instead drain such in-flight commits right after exposing its
+        # anchor, so the bump lands before its epoch fences run.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="dc" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("landing-drains").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        late_entry = self._pending_append("unfenced-inflight")
+        commit_entered = threading.Event()
+        commit_release = threading.Event()
+        original_append_batch = ledger.append_batch
+
+        def gated_append_batch(batch: list[object]) -> list[object]:
+            commit_entered.set()
+            if not commit_release.wait(timeout=10.0):
+                raise AssertionError("gated ledger commit was never released")
+            return original_append_batch(batch)
+
+        ledger.append_batch = gated_append_batch  # type: ignore[method-assign]
+
+        # Release the gated commit exactly when the landing starts
+        # draining, so the test exercises the wait itself rather than a
+        # lucky ordering.
+        drained_anchors: list[int] = []
+        original_drain = server._await_unfenced_appends_predating_anchor
+
+        def recording_drain(anchor_ms: int) -> None:
+            drained_anchors.append(int(anchor_ms))
+            commit_release.set()
+            original_drain(anchor_ms)
+
+        server._await_unfenced_appends_predating_anchor = recording_drain  # type: ignore[method-assign]
+
+        submitblock_calls: list[object] = []
+
+        class RecordingSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    submitblock_calls.append(params)
+                    return None
+                return super().call(method, params)
+
+        server.rpc = RecordingSubmitRpc("00" * 32)
+
+        append_thread = threading.Thread(
+            target=server._append_share_entry,
+            args=(late_entry,),
+            daemon=True,
+        )
+        append_thread.start()
+        # The append was classified with no anchor exposed and is now
+        # committing outside the fence.
+        self.assertTrue(commit_entered.wait(timeout=10.0))
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        append_thread.join(timeout=10.0)
+        self.assertFalse(append_thread.is_alive())
+        self.assertEqual(drained_anchors, [12000])
+        self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+            self.assertEqual(
+                server._payout_unfenced_append_inflight_stamps, {}
+            )
+        # The drained append's bump landed before the landing's epoch
+        # fences, so the candidate was abandoned instead of entering
+        # submitblock with a coinbase omitting the durable predating share.
+        self.assertEqual(submitblock_calls, [])
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+            1,
+        )
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+
     def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
         self,
     ) -> None:
