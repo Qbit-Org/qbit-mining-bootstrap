@@ -354,11 +354,14 @@ delivery coverage during rollout, and return the setting to `0` to roll back.
 PRISM's fast same-identity restart path requires the default native PostgreSQL
 client (`PRISM_POSTGRES_NATIVE_CLIENT=auto` or `1`). Each coordinator holds a
 dedicated PostgreSQL advisory guard for its writer ID and epoch and
-periodically proves that isolated session live with a non-locking check (the
+periodically proves that isolated session live with a non-blocking check (the
 session answers, still holds the advisory lock, and the committed lease row
-still names it). The heartbeat never updates the lease row itself: fenced
-writes hold that tuple's row lock for entire transactions, and accepted-block
-persistence can legitimately exceed the guard's statement timeout. A
+still names it). The heartbeat never waits on the lease tuple's row lock:
+fenced writes hold it for entire transactions, and accepted-block persistence
+can legitimately exceed the guard's statement timeout. It renews the lease TTL
+only while that tuple is uncontended (`SKIP LOCKED`), so an idle coordinator —
+no fenced writes and the CTV broadcaster disabled — still keeps its lease from
+expiring under a different writer identity's expiry claim. A
 replacement must acquire the guard and then wait one full silence interval
 measured both from the lease row's last update and from its own guard
 acquisition before its exact-session CAS, so a predecessor that just lost its
@@ -370,7 +373,7 @@ the configured lease TTL. Keep generated session tokens in production; fixed
 tokens remain a local test-only facility.
 
 Before each mutating qbitd or wallet RPC, the coordinator performs the same
-bounded non-locking exact-session verification on that advisory-guard
+bounded non-blocking exact-session verification on that advisory-guard
 connection, so the fence never contends with an in-flight accepted-block
 transaction on the lease tuple. This makes a lost
 session or a host suspend/resume fail closed before the usual RPC path. It is a

@@ -1185,7 +1185,7 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger._writer_lease_guard = guard
         return ledger
 
-    def test_guard_session_verification_is_non_locking_and_exact_session(self) -> None:
+    def test_guard_session_verification_is_non_blocking_and_exact_session(self) -> None:
         class FakeGuard:
             held = True
 
@@ -1198,6 +1198,7 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "backend": "postgres-psql",
                     "guard_advisory_lock_held": True,
                     "writer_session_token_current": True,
+                    "lease_renewed_count": 1,
                 }
 
         guard = FakeGuard()
@@ -1210,20 +1211,73 @@ class PrismShareLedgerTests(unittest.TestCase):
         ) as fenced:
             self.assertEqual(
                 ledger.verify_writer_lease_guard_session(),
-                {"backend": "postgres-psql", "verified_count": 1},
+                {
+                    "backend": "postgres-psql",
+                    "verified_count": 1,
+                    "renewed_count": 1,
+                },
             )
 
         fenced.assert_not_called()
         self.assertEqual(len(guard.statements), 1)
         statement = guard.statements[0]
-        # The whole point: liveness must never take the lease tuple's row
-        # lock, which fenced writes hold for entire transactions.
-        self.assertNotIn("UPDATE", statement)
+        # The whole point: liveness must never wait on the lease tuple's row
+        # lock, which fenced writes hold for entire transactions. The only
+        # tuple-lock acquisition is the opportunistic TTL renewal, and it must
+        # skip an already-locked row instead of queueing behind it.
+        self.assertIn("FOR NO KEY UPDATE SKIP LOCKED", statement)
         self.assertNotIn("FOR UPDATE", statement)
         self.assertIn("pg_locks", statement)
         self.assertIn("pg_backend_pid()", statement)
         self.assertIn("qbit_ledger_writer_lease", statement)
         self.assertIn(f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}session-a", statement)
+
+    def test_guard_verification_renews_idle_lease_ttl_for_exact_identity(self) -> None:
+        """An idle coordinator's heartbeat must keep lease_expires_at ahead.
+
+        With the CTV broadcaster disabled and no fenced writes for a full
+        lease TTL, this heartbeat is the only writer-side refresh left. If it
+        only read, the singleton row would expire while the coordinator is
+        alive and any different-identity claimant could seize it through the
+        expiry CAS — that identity's advisory-lock key differs, so the live
+        guard would not block it.
+        """
+
+        class FakeGuard:
+            held = True
+
+            def __init__(self) -> None:
+                self.statements: list[str] = []
+
+            def run_json(self, sql: str) -> dict[str, object]:
+                self.statements.append(sql)
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 1,
+                }
+
+        guard = FakeGuard()
+        ledger = self.guarded_verification_ledger(guard)
+
+        result = ledger.verify_writer_lease_guard_session()
+
+        self.assertEqual(result["renewed_count"], 1)
+        statement = guard.statements[0]
+        self.assertIn(
+            "lease_expires_at = clock_timestamp() + make_interval(secs => 60.0)",
+            statement,
+        )
+        self.assertIn("updated_at = clock_timestamp()", statement)
+        # Renewal is fenced to this exact identity; it can never extend a
+        # lease row another writer already took over.
+        self.assertIn("writer_id = data->>'writer_id'", statement)
+        self.assertIn("writer_epoch = (data->>'writer_epoch')::bigint", statement)
+        self.assertIn(
+            "writer_session_token = data->>'writer_session_token'",
+            statement,
+        )
 
     def test_guard_session_verification_fails_closed_on_lost_lock_or_token(self) -> None:
         for missing_field, message in (
@@ -1261,10 +1315,11 @@ class PrismShareLedgerTests(unittest.TestCase):
         """A fenced write holds the lease tuple past the guard statement timeout.
 
         Simulates the production PostgreSQL behavior behind block 39416: any
-        guarded statement that needs the qbit_ledger_writer_lease tuple lock
-        while persist_accepted_block's transaction holds it dies with SQLSTATE
-        57014. The old heartbeat renewal did exactly that; the non-locking
-        verification must keep succeeding for the whole transaction.
+        guarded statement that waits on the qbit_ledger_writer_lease tuple
+        lock while persist_accepted_block's transaction holds it dies with
+        SQLSTATE 57014. The old heartbeat renewal did exactly that; the
+        SKIP LOCKED verification must keep succeeding for the whole
+        transaction, skipping the TTL renewal instead of queueing for it.
         """
         accepted_block_row_lock = threading.Lock()
 
@@ -1283,19 +1338,27 @@ class PrismShareLedgerTests(unittest.TestCase):
                 if on_query_start is not None:
                     on_query_start()
                 self.statements.append(sql)
-                needs_lease_tuple_lock = "qbit_ledger_writer_lease" in sql and (
+                takes_lease_tuple_lock = "qbit_ledger_writer_lease" in sql and (
                     "UPDATE" in sql or "DELETE" in sql or "FOR UPDATE" in sql
                 )
-                if needs_lease_tuple_lock and accepted_block_row_lock.locked():
-                    raise RuntimeError(
-                        "canceling statement due to statement timeout\n"
-                        'CONTEXT:  while updating tuple (0,1) in relation '
-                        '"qbit_ledger_writer_lease"'
-                    )
+                lease_tuple_locked = accepted_block_row_lock.locked()
+                if takes_lease_tuple_lock and lease_tuple_locked:
+                    if "SKIP LOCKED" not in sql:
+                        raise RuntimeError(
+                            "canceling statement due to statement timeout\n"
+                            'CONTEXT:  while updating tuple (0,1) in relation '
+                            '"qbit_ledger_writer_lease"'
+                        )
+                    # SKIP LOCKED sees the held tuple lock and moves on
+                    # without waiting: the renewal simply does not happen.
+                    renewed = 0
+                else:
+                    renewed = 1 if takes_lease_tuple_lock else 0
                 return {
                     "backend": "postgres-psql",
                     "guard_advisory_lock_held": True,
                     "writer_session_token_current": True,
+                    "lease_renewed_count": renewed,
                 }
 
         guard = RowLockEnforcingGuard()
@@ -1305,12 +1368,18 @@ class PrismShareLedgerTests(unittest.TestCase):
             # Control: the pre-fix lease-row renewal dies on the tuple lock.
             with self.assertRaisesRegex(RuntimeError, "statement timeout"):
                 ledger._renew_writer_lease_with(guard.run_json)
-            # The corrected heartbeat keeps proving liveness throughout.
+            # The corrected heartbeat keeps proving liveness throughout,
+            # skipping the TTL renewal while the fenced write holds the row.
             for _ in range(3):
-                self.assertEqual(
-                    ledger.verify_writer_lease_guard_session()["verified_count"],
-                    1,
-                )
+                result = ledger.verify_writer_lease_guard_session()
+                self.assertEqual(result["verified_count"], 1)
+                self.assertEqual(result["renewed_count"], 0)
+
+        # Once the fenced transaction commits (and refreshes the TTL itself),
+        # the very next heartbeat resumes renewing on the guard session.
+        result = ledger.verify_writer_lease_guard_session()
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 1)
 
     def test_block_state_functions_refresh_configured_lease_after_sql_function(self) -> None:
         cases = (

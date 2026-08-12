@@ -282,9 +282,11 @@ DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS = 5.0
 # A fast-adoptable coordinator proves its guarded session live four times
 # inside the one-second silence proof required by PsqlShareLedger. This runs
 # through a dedicated connection, not the ordinary ledger lock or shared
-# native pool, and must never touch the lease row itself: fenced writes hold
-# that tuple's row lock for whole transactions (persist_accepted_block can
-# exceed the guard's statement timeout many times over).
+# native pool, and must never wait on the lease tuple's row lock: fenced
+# writes hold it for whole transactions (persist_accepted_block can exceed
+# the guard's statement timeout many times over). The lease TTL is renewed
+# only when that tuple is uncontended (SKIP LOCKED), so an idle coordinator
+# still keeps lease_expires_at ahead of different-identity expiry claims.
 DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_SECONDS = (
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS / 4
 )
@@ -12212,12 +12214,14 @@ class PrismCoordinator:
         """Return the guarded-session liveness check for ``ledger``.
 
         Prefer ``verify_writer_lease_guard_session``: it proves the dedicated
-        guard session is live without updating ``qbit_ledger_writer_lease``,
+        guard session is live and renews the lease TTL only via SKIP LOCKED,
         so it can never queue behind the row lock a long fenced transaction
         (``persist_accepted_block``) holds until commit and then die on the
-        guard's statement timeout. ``renew_writer_lease_heartbeat`` is the
-        legacy embedder spelling and does lock the lease tuple; it is only a
-        fallback for ledgers that predate the non-locking verification.
+        guard's statement timeout, yet an idle coordinator still keeps its
+        lease from expiring under different-identity claimants.
+        ``renew_writer_lease_heartbeat`` is the legacy embedder spelling and
+        does wait on the lease tuple; it is only a fallback for ledgers that
+        predate the non-blocking verification.
         """
         verify = getattr(ledger, "verify_writer_lease_guard_session", None)
         if verify is not None:
@@ -12348,10 +12352,13 @@ class PrismCoordinator:
     def ledger_lease_heartbeat_loop(self) -> None:
         """Keep proving the guarded session live on an isolated DB path.
 
-        This is a liveness check, not a lease renewal: it must never lock the
-        lease tuple that fenced writes hold for whole transactions, or a long
-        ``persist_accepted_block`` would time out the heartbeat statement and
-        hard-exit a healthy coordinator (the block-39416 restart loop).
+        The heartbeat must never wait on the lease tuple that fenced writes
+        hold for whole transactions, or a long ``persist_accepted_block``
+        would time out the heartbeat statement and hard-exit a healthy
+        coordinator (the block-39416 restart loop). It still renews the
+        lease TTL whenever that tuple is uncontended, so an idle coordinator
+        (no fenced writes, CTV broadcaster disabled) does not let
+        ``lease_expires_at`` lapse into different-identity expiry claims.
         """
         ledger = getattr(self, "ledger", None)
         verify = self._ledger_lease_guard_session_verifier(ledger)
@@ -12495,12 +12502,13 @@ class PrismCoordinator:
         authorization oracle: CLOCK_MONOTONIC may not advance across host
         suspend, and a PostgreSQL connection object does not necessarily know
         its server session died until the next I/O. Every external mutation
-        therefore performs a bounded non-locking verification on the session
-        holding the advisory guard. It must not update the lease row: a long
+        therefore performs a bounded non-blocking verification on the session
+        holding the advisory guard. It must not wait on the lease row: a long
         fenced transaction (``persist_accepted_block``) holds that tuple's
         row lock until commit, and queueing behind it would time out and
-        fence a healthy coordinator. A daemon worker bounds a dead network
-        path even when the driver's server-side statement timeout cannot.
+        fence a healthy coordinator (the TTL is renewed opportunistically via
+        SKIP LOCKED instead). A daemon worker bounds a dead network path even
+        when the driver's server-side statement timeout cannot.
 
         PostgreSQL and qbitd are independent systems, so this remains a
         preflight fence rather than an atomic transaction with the subsequent

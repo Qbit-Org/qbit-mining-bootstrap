@@ -7170,19 +7170,31 @@ SELECT COALESCE(
         *,
         on_query_start: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
-        """Prove the advisory-guard session is live without locking any row.
+        """Prove the guard session live; renew the TTL only without waiting.
 
         The coordinator's periodic heartbeat and its external-side-effect
         fence both run this on the dedicated guard connection. It must never
-        update ``qbit_ledger_writer_lease``: every fenced write (share
-        appends, ``persist_accepted_block``) row-locks that tuple for its
-        whole transaction, and a guarded statement queued behind it hits the
-        guard's statement timeout and hard-exits a healthy coordinator.
-        Liveness is instead proven by non-blocking reads: the session
-        answers, PostgreSQL still shows this backend holding the writer
-        advisory lock, and the last committed lease row still names this
-        exact session. Guard-connection loss or a fenced-out session raises,
-        which callers treat as loss of the guarded session.
+        wait on the ``qbit_ledger_writer_lease`` tuple lock: every fenced
+        write (share appends, ``persist_accepted_block``) row-locks that
+        tuple for its whole transaction, and a guarded statement queued
+        behind it hits the guard's statement timeout and hard-exits a
+        healthy coordinator. Liveness is therefore proven by non-blocking
+        reads: the session answers, PostgreSQL still shows this backend
+        holding the writer advisory lock, and the last committed lease row
+        still names this exact session. Guard-connection loss or a
+        fenced-out session raises, which callers treat as loss of the
+        guarded session.
+
+        The lease TTL still needs a writer-side refresh, or an idle
+        coordinator (no fenced writes, CTV broadcaster disabled) would let
+        ``lease_expires_at`` lapse and any different-identity claimant could
+        seize the singleton row through its expiry CAS — that identity uses
+        a different advisory-lock key, so this process's guard would not
+        block it. The same statement therefore renews the exact-identity
+        lease row with ``FOR NO KEY UPDATE SKIP LOCKED``: renewal happens on
+        every heartbeat while the tuple is uncontended and is skipped
+        without queueing while a fenced transaction holds it (that
+        transaction refreshes the TTL itself when it commits).
 
         ``on_query_start`` fires once the guarded session's serialized query
         slot is acquired, letting callers budget queue wait separately from
@@ -7209,6 +7221,23 @@ SELECT COALESCE(
         sql = f"""
 WITH payload AS (
     SELECT {self._jsonb_literal(payload)} AS data
+),
+renewable AS (
+    SELECT qbit_ledger_writer_lease.singleton
+    FROM qbit_ledger_writer_lease, payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    FOR NO KEY UPDATE SKIP LOCKED
+),
+renewed AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM renewable
+    WHERE qbit_ledger_writer_lease.singleton = renewable.singleton
+    RETURNING qbit_ledger_writer_lease.writer_id
 )
 SELECT json_build_object(
     'backend', 'postgres-psql',
@@ -7229,7 +7258,8 @@ SELECT json_build_object(
           AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
           AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
           AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
-    )
+    ),
+    'lease_renewed_count', (SELECT count(*) FROM renewed)
 );
 """
         if on_query_start is None:
@@ -7246,7 +7276,15 @@ SELECT json_build_object(
             )
         if not result.get("writer_session_token_current"):
             raise RuntimeError("writer lease is not active")
-        return {"backend": str(result["backend"]), "verified_count": 1}
+        try:
+            renewed_count = int(result.get("lease_renewed_count", 0))
+        except (TypeError, ValueError):
+            renewed_count = 0
+        return {
+            "backend": str(result["backend"]),
+            "verified_count": 1,
+            "renewed_count": renewed_count,
+        }
 
     def _renew_writer_lease_with(
         self,
