@@ -12064,6 +12064,76 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                 release_mark.set()
         self.assertFalse(submitter.is_alive())
 
+    def test_accounting_retry_backoff_defers_instead_of_sleeping_under_admission(self) -> None:
+        server, state, _recording = submit_coordinator()
+        server.block_candidate_retry_initial_seconds = 30.0
+        server.block_candidate_retry_max_seconds = 30.0
+
+        class FailingMarkLedger(RecordingLedger):
+            def mark_block_candidate_attempted(self, *, block_hash: str) -> bool:
+                raise RuntimeError("attempt marker unavailable")
+
+        server.ledger = FailingMarkLedger()
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="ab" * 32,
+                block_hex="ab",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        block_hash = "ab" * 32
+        server._block_accounting_thread_ident = threading.get_ident()
+        server._block_accounting_holds_disposition = True
+        started = time.monotonic()
+        with patch("builtins.print"):
+            handled = server._submit_next_block_candidate_writer(
+                candidate,
+                node_submission=SimpleNamespace(),
+                disposition_held=True,
+            )
+        elapsed = time.monotonic() - started
+        self.assertTrue(handled)
+        # The 30s backoff must be recorded as a deadline, never slept while
+        # the accounting thread holds admission and the disposition lease.
+        self.assertLess(elapsed, 10.0)
+        self.assertIs(
+            getattr(server, "_block_accounting_deferred_retry_candidate", None),
+            candidate,
+        )
+        with server.lock:
+            deadline = server._block_candidate_retry_not_before.get(block_hash)
+        self.assertIsNotNone(deadline)
+        self.assertGreater(deadline, time.monotonic())
+
+        # After the lease releases, the deferred candidate parks in the retry
+        # slot and the dequeue honors the backoff deadline.
+        server._block_accounting_holds_disposition = False
+        with server.lock:
+            server._block_accounting_deferred_retry_candidate = None
+            server._merge_block_candidate_retry_locked(
+                "_retry_block_candidate",
+                candidate,
+            )
+        with patch("builtins.print"):
+            self.assertFalse(
+                server.submit_next_block_candidate(defer_accounting=True)
+            )
+        self.assertIs(getattr(server, "_retry_block_candidate", None), candidate)
+
+        # Once the deadline passes the same candidate dequeues again.
+        with server.lock:
+            server._block_candidate_retry_not_before[block_hash] = (
+                time.monotonic() - 1.0
+            )
+        with patch("builtins.print"):
+            self.assertTrue(
+                server.submit_next_block_candidate(defer_accounting=True)
+            )
+
     def test_accounting_saturation_does_not_convoy_node_offers(self) -> None:
         server, state, _recording = submit_coordinator()
         server.max_blocks = 10

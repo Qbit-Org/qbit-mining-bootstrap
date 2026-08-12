@@ -24637,6 +24637,13 @@ class PrismCoordinator:
         self._record_block_submitter_phase("dequeue-retry")
         with self.lock:
             candidate = getattr(self, "_retry_block_candidate", None)
+            if candidate is not None and not self._block_candidate_retry_ready_locked(
+                candidate
+            ):
+                # Parked by _pace_block_candidate_retry: honor the backoff
+                # deadline without sleeping on the submitter or accounting
+                # lane.
+                candidate = None
             if candidate is not None:
                 self._retry_block_candidate = None
         if candidate is None:
@@ -24665,9 +24672,16 @@ class PrismCoordinator:
                     self._ensure_block_candidate_disposition_state()
                     with self.lock:
                         waiting = self._block_disposition_waiting_retries
-                        if waiting:
+                        ready_hashes = [
+                            key
+                            for key in waiting
+                            if self._block_candidate_retry_ready_locked(
+                                waiting[key]
+                            )
+                        ]
+                        if ready_hashes:
                             waiting_hash = min(
-                                waiting,
+                                ready_hashes,
                                 key=lambda key: int(
                                     waiting[key].context.template["height"]
                                 ),
@@ -24912,9 +24926,7 @@ class PrismCoordinator:
             )
             traceback.print_exc()
             self._retain_block_candidate_for_retry(candidate)
-            self._wait_for_block_candidate_retry(
-                self._next_block_candidate_retry_delay(block_hash)
-            )
+            self._pace_block_candidate_retry(block_hash)
             return True
         accepted = False
         error = "candidate became stale or submission failed"
@@ -24965,9 +24977,7 @@ class PrismCoordinator:
                 flush=True,
             )
             self._retain_block_candidate_for_retry(candidate)
-            self._wait_for_block_candidate_retry(
-                self._next_block_candidate_retry_delay(block_hash)
-            )
+            self._pace_block_candidate_retry(block_hash)
             return True
         if not accepted:
             try:
@@ -25252,11 +25262,78 @@ class PrismCoordinator:
             delays[block_hash] = min(maximum, max(initial, delay * 2))
         return min(delay, maximum)
 
+    def _pace_block_candidate_retry(self, block_hash: str) -> None:
+        """Apply per-candidate retry backoff without convoying accounting.
+
+        On the block_accounting thread the disposition lease and writer
+        admission stay held until the accounting task's finally clause, so
+        sleeping here would stall every queued accounting task and keep an
+        armed payout barrier blocking balance mutation for the whole backoff
+        window. Record a not-before deadline instead; the dequeue path honors
+        it, and replay_pending_block_candidates already short-circuits while
+        the retained candidate occupies the retry slot.
+        """
+        delay_seconds = self._next_block_candidate_retry_delay(block_hash)
+        accounting_owner = (
+            threading.get_ident()
+            == getattr(self, "_block_accounting_thread_ident", None)
+            and bool(
+                getattr(
+                    self,
+                    "_block_accounting_holds_disposition",
+                    False,
+                )
+            )
+        )
+        if not accounting_owner:
+            self._wait_for_block_candidate_retry(delay_seconds)
+            return
+        with self.lock:
+            not_before = getattr(
+                self,
+                "_block_candidate_retry_not_before",
+                None,
+            )
+            if not_before is None:
+                not_before = {}
+                self._block_candidate_retry_not_before = not_before
+            not_before[str(block_hash).lower()] = (
+                time.monotonic() + delay_seconds
+            )
+
+    def _block_candidate_retry_ready_locked(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> bool:
+        """Return whether a parked retry's backoff deadline has passed.
+
+        Caller holds self.lock. A ready entry is dropped so a candidate that
+        later lands terminally leaves no stale pacing behind.
+        """
+        not_before = getattr(self, "_block_candidate_retry_not_before", None)
+        if not not_before:
+            return True
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        deadline = not_before.get(block_hash)
+        if deadline is None:
+            return True
+        if time.monotonic() < deadline:
+            return False
+        not_before.pop(block_hash, None)
+        return True
+
     def _clear_block_candidate_retry_state(self, block_hash: str) -> None:
         with self.lock:
             delays = getattr(self, "block_candidate_retry_delays", None)
             if delays is not None:
                 delays.pop(block_hash, None)
+            not_before = getattr(
+                self,
+                "_block_candidate_retry_not_before",
+                None,
+            )
+            if not_before is not None:
+                not_before.pop(block_hash, None)
 
     def _defer_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
         """Record a retryable outcome without counting a terminal abandonment."""
