@@ -1352,6 +1352,138 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
         ]
         self.assertEqual(len(repair_logs), 1)
 
+    def test_balance_backstop_failure_retains_oracle_repaired_window(
+        self,
+    ) -> None:
+        # The share-window oracle and the carry-balance backstop are
+        # independent reads. A backstop failure after a successful oracle
+        # must not resurrect the delta window the oracle just refuted.
+        class FailingCarryOmittingDeltaLedger(IncrementalRecordingLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_balance_read = False
+                self.balance_read_attempts = 0
+
+            def snapshot_between_job_issues(
+                self,
+                previous_anchor_job_issued_at_ms: int,
+                anchor_job_issued_at_ms: int,
+            ) -> list[object]:
+                del previous_anchor_job_issued_at_ms, anchor_job_issued_at_ms
+                self.delta_snapshot_calls += 1
+                return []
+
+            def current_prior_balances(self) -> list[dict[str, object]]:
+                self.balance_read_attempts += 1
+                if self.fail_balance_read:
+                    raise RuntimeError("carry aggregate unavailable")
+                return [
+                    {
+                        "recipient_id": "carry",
+                        "order_key": "01:carry",
+                        "p2mr_program_hex": "66" * 32,
+                        "balance_sats": 546,
+                    }
+                ]
+
+        ledger = FailingCarryOmittingDeltaLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        server.payout_artifact_full_rescan_seconds = 3_600.0
+        clock_ms = [1_000_000]
+        monotonic_seconds = [100.0]
+        with (
+            patch(
+                "lab.prism.prism_coordinator.now_ms",
+                side_effect=lambda: clock_ms[0],
+            ),
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: monotonic_seconds[0],
+            ),
+        ):
+            server._current_payout_state_artifact()
+            initial = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+            )
+            assert initial is not None
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+
+            ledger.fail_balance_read = True
+            append_incremental_share(
+                ledger,
+                share_seq=4,
+                accepted_at_ms=1_000_010,
+            )
+            clock_ms[0] = 1_000_020
+            monotonic_seconds[0] = 3_701.0
+            checked = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+            )
+
+            append_incremental_share(
+                ledger,
+                share_seq=5,
+                accepted_at_ms=1_000_021,
+            )
+            clock_ms[0] = 1_000_030
+            monotonic_seconds[0] = 3_702.0
+            following = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+            )
+
+        assert checked is not None and following is not None
+        self.assertEqual(checked.window_build_mode, "self_check_mismatch")
+        self.assertEqual(
+            checked.window_full_rescan_reason,
+            "periodic_self_check_balance_check_failed",
+        )
+        # The omitting delta produced three retained shares; the oracle's
+        # four-share window must be the one served and cached.
+        self.assertEqual(len(checked.shares_json), 4)
+        # One read published the priming state; the only other attempt is
+        # the backstop that failed.
+        self.assertEqual(ledger.balance_read_attempts, 2)
+        # The unverified balances keep reusing the published snapshot.
+        self.assertEqual(
+            checked.prior_balances_sha256,
+            initial.prior_balances_sha256,
+        )
+        self.assertIsNone(
+            server._payout_prior_balances_reuse_invalidated_sha256
+        )
+        self.assertEqual(
+            server.payout_artifact_event_counts["self_check_mismatch"],
+            1,
+        )
+        self.assertEqual(
+            server.payout_artifact_event_counts["self_check_failed"],
+            0,
+        )
+        self.assertEqual(
+            server.payout_artifact_event_counts["balance_check_mismatch"],
+            0,
+        )
+        # The failed backstop still stamps the attempt: the next build stays
+        # on the delta path instead of retrying the oracle immediately.
+        self.assertEqual(following.window_build_mode, "incremental")
+        self.assertEqual(ledger.full_snapshot_calls, 2)
+
     def test_periodic_self_check_repair_arms_and_serves(self) -> None:
         # The repaired publication is what lets the mismatch build's fresh
         # balances actually reach miners: its artifact must arm against the

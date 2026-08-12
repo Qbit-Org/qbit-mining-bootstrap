@@ -4808,51 +4808,6 @@ class PrismCoordinator:
                 matched = full_retained == advanced_window.records()
                 shares_json = full_window.json_records()
                 digest = canonical_json_sha256(shares_json)
-                if reused_prior_balances_sha256 is not None:
-                    checked_balances = tuple(
-                        self.ledger.current_prior_balances()
-                    )
-                    checked_balances_sha256 = canonical_json_sha256(
-                        checked_balances
-                    )
-                    if (
-                        checked_balances_sha256
-                        != reused_prior_balances_sha256
-                    ):
-                        balance_check_prior_balances = checked_balances
-                        balance_check_mismatch = True
-                        self._payout_prior_balances_reuse_invalidated_sha256 = (
-                            reused_prior_balances_sha256
-                        )
-                        # Equal-window refreshes intentionally retain their
-                        # armed balances. Drop the stale artifact so the fresh
-                        # balance read cannot be discarded as a window-only
-                        # no-op when this build is installed.
-                        with self._job_cache_lock:
-                            armed = self._payout_ledger_artifact
-                            if armed is not None:
-                                armed_balances_sha256 = (
-                                    armed.prior_balances_sha256
-                                    or canonical_json_sha256(
-                                        armed.prior_balances
-                                    )
-                                )
-                                if (
-                                    armed_balances_sha256
-                                    == reused_prior_balances_sha256
-                                ):
-                                    self._payout_ledger_artifact = None
-                advanced = _IncrementalPayoutArtifactWindow(
-                    window=full_window,
-                    shares_json=shares_json,
-                    share_snapshot_sha256=digest,
-                    refreshed_monotonic=observed,
-                    full_rescan_monotonic=observed,
-                    full_rescan_attempt_monotonic=observed,
-                    append_invalidation_epoch=append_invalidation_epoch,
-                )
-                mode = "self_check_match" if matched else "self_check_mismatch"
-                check_reason = "periodic_self_check"
             except Exception:
                 # The already-validated delta remains usable. Space failed
                 # oracle attempts by the configured self-check interval so a
@@ -4864,6 +4819,63 @@ class PrismCoordinator:
                 )
                 mode = "incremental_self_check_failed"
                 check_reason = "periodic_self_check_failed"
+            else:
+                advanced = _IncrementalPayoutArtifactWindow(
+                    window=full_window,
+                    shares_json=shares_json,
+                    share_snapshot_sha256=digest,
+                    refreshed_monotonic=observed,
+                    full_rescan_monotonic=observed,
+                    full_rescan_attempt_monotonic=observed,
+                    append_invalidation_epoch=append_invalidation_epoch,
+                )
+                mode = "self_check_match" if matched else "self_check_mismatch"
+                check_reason = "periodic_self_check"
+                if reused_prior_balances_sha256 is not None:
+                    try:
+                        checked_balances = tuple(
+                            self.ledger.current_prior_balances()
+                        )
+                        checked_balances_sha256 = canonical_json_sha256(
+                            checked_balances
+                        )
+                        if (
+                            checked_balances_sha256
+                            != reused_prior_balances_sha256
+                        ):
+                            balance_check_prior_balances = checked_balances
+                            balance_check_mismatch = True
+                            self._payout_prior_balances_reuse_invalidated_sha256 = (
+                                reused_prior_balances_sha256
+                            )
+                            # Equal-window refreshes intentionally retain
+                            # their armed balances. Drop the stale artifact so
+                            # the fresh balance read cannot be discarded as a
+                            # window-only no-op when this build is installed.
+                            with self._job_cache_lock:
+                                armed = self._payout_ledger_artifact
+                                if armed is not None:
+                                    armed_balances_sha256 = (
+                                        armed.prior_balances_sha256
+                                        or canonical_json_sha256(
+                                            armed.prior_balances
+                                        )
+                                    )
+                                    if (
+                                        armed_balances_sha256
+                                        == reused_prior_balances_sha256
+                                    ):
+                                        self._payout_ledger_artifact = None
+                    except Exception:
+                        # The carry backstop is independent of the window
+                        # oracle that just succeeded. Reverting here would
+                        # serve a window the oracle may have refuted for a
+                        # whole rescan interval, so keep the full window and
+                        # leave the reused balances unverified until the next
+                        # self-check.
+                        check_reason = (
+                            "periodic_self_check_balance_check_failed"
+                        )
 
         self._incremental_payout_artifact_window = advanced
         return _PayoutWindowMaterialization(
