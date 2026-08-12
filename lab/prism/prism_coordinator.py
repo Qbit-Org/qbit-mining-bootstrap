@@ -1360,6 +1360,19 @@ class JsonRpc:
             )
             watchdog.start()
             try:
+                # Establish the connection (name resolution + TCP) under
+                # the watchdog and re-check the deadline before any request
+                # byte is sent. Left to conn.request(), a name resolution
+                # returning after the deadline resumes straight into
+                # sendall(), and a short mutating POST can reach qbitd
+                # between the watchdog's periodic sweeps; the explicit
+                # check makes the late-connect case lose deterministically.
+                if getattr(conn, "sock", None) is None:
+                    conn_connect = getattr(conn, "connect", None)
+                    if conn_connect is not None:
+                        conn_connect()
+                if watchdog_fired.is_set():
+                    raise TimeoutError(f"qbit RPC {method} timed out")
                 conn.request("POST", path, body=body, headers=headers)
                 response = conn.getresponse()
                 data = response.read()  # drain so the connection can be reused

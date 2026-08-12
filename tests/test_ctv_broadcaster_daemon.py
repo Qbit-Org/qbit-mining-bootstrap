@@ -966,54 +966,46 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
             with self.assertRaisesRegex(TimeoutError, "timed out"):
                 rpc.call("getbestblockhash", timeout=0.2)
 
-    def test_json_rpc_deadline_covers_socket_created_after_stall(self) -> None:
-        # A stalled name resolution has no socket for the watchdog to sever;
-        # the socket connect() creates afterwards must not carry the RPC past
-        # its deadline. The watchdog keeps severing until the attempt
-        # observes the abort, so the late-created socket dies too.
-        close_calls: list[float] = []
+    def test_json_rpc_deadline_stops_late_name_resolution_before_send(self) -> None:
+        # A stalled name resolution has no socket for the watchdog to sever,
+        # and once resolution returns the caller thread would resume straight
+        # into sendall() — a short mutating POST could reach qbitd between
+        # watchdog sweeps. The explicit connect-then-recheck must make the
+        # late connect lose deterministically: the request is never sent.
+        constructed: list[object] = []
 
         class FakeSock:
-            def __init__(self) -> None:
-                self.shutdown_calls = 0
-
             def shutdown(self, how: int) -> None:
-                self.shutdown_calls += 1
+                return None
 
         class FakeConnection:
             def __init__(self, host: str, port: int, timeout: float) -> None:
                 self.sock: FakeSock | None = None
+                self.request_calls = 0
+                constructed.append(self)
+
+            def connect(self) -> None:
+                # Name resolution stalls past the deadline, then the
+                # connection comes up as if DNS finally answered.
+                threading.Event().wait(0.45)
+                self.sock = FakeSock()
 
             def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
-                # Stall past the deadline with no socket published (DNS),
-                # then publish the socket connect() would create and block
-                # like an in-flight send until the watchdog severs it.
-                threading.Event().wait(0.45)
-                sock = FakeSock()
-                self.sock = sock
-                pacing = threading.Event()
-                for _ in range(100):
-                    if sock.shutdown_calls:
-                        return
-                    pacing.wait(0.05)
+                self.request_calls += 1
 
             def getresponse(self) -> object:
-                # The next socket operation observes the late sever.
-                sock = self.sock
-                if close_calls and sock is not None and sock.shutdown_calls:
-                    raise ConnectionResetError("connection severed")
-                raise AssertionError("late-created socket was never severed")
+                raise AssertionError("request must never be sent past the deadline")
 
             def close(self) -> None:
-                close_calls.append(1.0)
+                return None
 
         rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
         with patch("http.client.HTTPConnection", FakeConnection):
             with self.assertRaisesRegex(TimeoutError, "timed out"):
-                rpc.call("getbestblockhash", timeout=0.2)
-        # The watchdog severed at least once before the socket existed and
-        # again after it appeared.
-        self.assertGreaterEqual(len(close_calls), 2)
+                rpc.call("submitblock", timeout=0.2)
+        # The deadline check fired after the late connect and before any
+        # request byte went out.
+        self.assertEqual(constructed[0].request_calls, 0)
 
 
 if __name__ == "__main__":
