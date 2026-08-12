@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 import threading
+import time
 import urllib.request
 import unittest
 from unittest.mock import patch
@@ -944,13 +945,19 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
 
             def read(self) -> bytes:
                 # Blocks like a slow-dripping body until the watchdog severs
-                # the connection, then fails like a closed socket would.
+                # the connection, then fails like a closed socket would. The
+                # wait is a backstop only; the assertion below proves the
+                # watchdog actually severed within its deadline.
                 severed.wait(5)
                 raise ConnectionResetError("connection severed")
 
+        class FakeSock:
+            def shutdown(self, how: int) -> None:
+                severed.set()
+
         class FakeConnection:
             def __init__(self, host: str, port: int, timeout: float) -> None:
-                self.sock = object()
+                self.sock = FakeSock()
 
             def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
                 return None
@@ -962,9 +969,14 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
                 severed.set()
 
         rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
+        begun = time.monotonic()
         with patch("http.client.HTTPConnection", FakeConnection):
             with self.assertRaisesRegex(TimeoutError, "timed out"):
                 rpc.call("getbestblockhash", timeout=0.2)
+        # The watchdog severed at its ~0.3s allowance, not the 5s backstop:
+        # anything near the backstop means the sever never reached the sock.
+        self.assertLess(time.monotonic() - begun, 2.0)
+        self.assertTrue(severed.is_set())
 
     def test_json_rpc_deadline_stops_late_name_resolution_before_send(self) -> None:
         # A stalled name resolution has no socket for the watchdog to sever,
