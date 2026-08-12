@@ -18098,11 +18098,33 @@ class PrismCoordinator:
         if context is None:
             return True
         previousblockhash = str(context.template.get("previousblockhash", ""))
+        context_payout_artifact_sha256 = getattr(
+            context,
+            "payout_artifact_sha256",
+            None,
+        )
+        published_payout_state = getattr(self, "_published_payout_state", None)
+        published_payout_artifact = (
+            published_payout_state.artifact
+            if published_payout_state is not None
+            else None
+        )
         return (
             previousblockhash != snapshot.bestblockhash
             or previousblockhash != snapshot.previousblockhash
             or int(getattr(context, "payout_state_generation", 0))
             != int(getattr(self, "_payout_state_generation", 0))
+            # A refresh selected because a self-check repair replaced the
+            # published balance digest must also retire the refuted job: a
+            # clean_jobs=False replacement leaves the old job ID admissible,
+            # so a late block submission could still commit the refuted
+            # allocation. Same None guards as the reselection predicate.
+            or (
+                context_payout_artifact_sha256 is not None
+                and published_payout_artifact is not None
+                and context_payout_artifact_sha256
+                != published_payout_artifact.prior_balances_sha256
+            )
         )
 
     def handle_client(self, client: ClientState) -> None:
