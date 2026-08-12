@@ -2615,6 +2615,19 @@ class ShutdownInProgress(RuntimeError):
     """Raised when work that could mutate the ledger arrives after shutdown."""
 
 
+class WriterLeaseRenewalDeferred(RuntimeError):
+    """An external side effect was withheld while the lease renewal is deferred.
+
+    The guarded session is live, but its lease TTL renewal is blocked behind
+    this coordinator's own fenced write that has outlasted the TTL. Liveness
+    there assumes the write commits; a rollback would instead hand the
+    expired row to a queued different-identity claimant, so the fence
+    refuses the RPC without fencing the process. Callers retry on their own
+    cadence (broadcast pass interval, block-candidate outbox replay) and
+    succeed once a verification lands a renewal.
+    """
+
+
 class _WriterOperationToken:
     """One transferable writer admission held until durable work completes."""
 
@@ -12825,6 +12838,16 @@ class PrismCoordinator:
         preflight fence rather than an atomic transaction with the subsequent
         RPC. The advisory session remains held across the RPC in the ordinary
         case; see the deployment guide for the residual post-check pause risk.
+
+        A verification that reports ``renewal_deferred_to_own_write`` proves
+        liveness but not authority: the writer's own fenced write holds the
+        expired lease row, and only its commit guarantees the lease survives.
+        That is enough for the heartbeat, which merely keeps a healthy
+        process from self-fencing, but not for an RPC — a rollback would let
+        a queued claimant take the lease while the effect is in flight. This
+        fence then raises :class:`WriterLeaseRenewalDeferred` without arming
+        the hard exit; callers already retry deferred work on their own
+        cadence.
         """
         ledger = getattr(self, "ledger", None)
         if not bool(
@@ -12884,17 +12907,19 @@ class PrismCoordinator:
             query_started.set()
 
         outcome: queue.Queue[BaseException | None] = queue.Queue(maxsize=1)
+        verification_result: list[object] = []
         verification_started_monotonic = time.monotonic()
 
         def verify_exact_session() -> None:
             try:
                 if verify_reports_query_start:
-                    verify(on_query_start=query_started.set)
+                    result = verify(on_query_start=query_started.set)
                 else:
-                    verify()
+                    result = verify()
             except BaseException as exc:
                 outcome.put(exc)
             else:
+                verification_result.append(result)
                 outcome.put(None)
 
         try:
@@ -12966,6 +12991,24 @@ class PrismCoordinator:
         self._record_ledger_lease_heartbeat_success(
             verification_started_monotonic
         )
+
+        # A verification that proved liveness only because the writer's own
+        # fenced write holds the expired lease row is not authority for an
+        # external side effect: that survival argument assumes the write
+        # commits, and a rollback would hand the row to a queued
+        # different-identity claimant while the RPC is in flight. Refuse the
+        # side effect without fencing the process — the session is healthy
+        # and the write's commit will land the next renewal; callers retry
+        # on their own cadence (broadcast interval, candidate outbox replay).
+        result = verification_result[0] if verification_result else None
+        if isinstance(result, dict) and result.get(
+            "renewal_deferred_to_own_write"
+        ):
+            raise WriterLeaseRenewalDeferred(
+                f"withholding {component}: writer lease renewal is deferred "
+                "behind this coordinator's own in-flight fenced write; "
+                "retry after that transaction commits and a renewal lands"
+            )
 
     @contextmanager
     def _watchdog_paused(self, *names: str) -> Iterator[None]:

@@ -1252,6 +1252,7 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "backend": "postgres-psql",
                     "verified_count": 1,
                     "renewed_count": 1,
+                    "renewal_deferred_to_own_write": False,
                 },
             )
 
@@ -1484,6 +1485,11 @@ class PrismShareLedgerTests(unittest.TestCase):
         the exclusive tuple lock means no expiry claim can be in flight, and
         the write's own commit refreshes lease_expires_at before any queued
         claimant re-evaluates its expiry CAS.
+
+        Liveness is all the exemption grants. The survival argument assumes
+        the write commits — a rollback hands the expired row to a queued
+        claimant — so the result must flag the deferral for external
+        side-effect fences to withhold guarded RPCs until a renewal lands.
         """
 
         class OwnLongFencedWriteGuard:
@@ -1503,6 +1509,37 @@ class PrismShareLedgerTests(unittest.TestCase):
         result = ledger.verify_writer_lease_guard_session()
         self.assertEqual(result["verified_count"], 1)
         self.assertEqual(result["renewed_count"], 0)
+        self.assertIs(result["renewal_deferred_to_own_write"], True)
+
+    def test_guard_verification_reports_no_deferral_outside_own_lock_expiry(
+        self,
+    ) -> None:
+        """The deferral flag is scoped to exactly the own-lock expired skip.
+
+        A landed renewal (idle recovery included) restores full authority:
+        the TTL is a lease ahead again, so external side effects need no
+        deferral. A healthy skipped renewal over an unexpired row keeps the
+        pre-existing contract as well.
+        """
+        for renewed, expired in ((1, True), (1, False), (0, False)):
+            with self.subTest(renewed=renewed, expired=expired):
+
+                class Guard:
+                    held = True
+
+                    def run_json(self, sql: str) -> dict[str, object]:
+                        return {
+                            "backend": "postgres-psql",
+                            "guard_advisory_lock_held": True,
+                            "writer_session_token_current": True,
+                            "lease_renewed_count": renewed,
+                            "lease_expired": expired,
+                            "lease_locked_by_this_process": True,
+                        }
+
+                ledger = self.guarded_verification_ledger(Guard())
+                result = ledger.verify_writer_lease_guard_session()
+                self.assertIs(result["renewal_deferred_to_own_write"], False)
 
     def test_guard_verification_recovers_expired_lease_when_renewal_lands(self) -> None:
         """Renewing an expired-but-uncontended row is the idle-recovery path.

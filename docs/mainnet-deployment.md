@@ -369,7 +369,12 @@ attributes to this coordinator's own pooled backends — a fenced write
 outlasting the TTL — because its exclusive tuple lock means no claim can be in
 flight and its commit refreshes the lease before any queued claimant
 re-evaluates its expiry CAS; hard-exiting there would roll back a valid write
-and restart-loop on every similarly slow block. A
+and restart-loop on every similarly slow block. That exemption keeps only the
+heartbeat alive: it assumes the write commits, so the external-side-effect
+fence refuses guarded RPCs (without fencing the process) while renewal is
+deferred behind the writer's own write — a rollback would hand the expired row
+to a queued claimant — and broadcast passes or candidate-outbox replays simply
+retry once the commit lands a renewal. A
 replacement must acquire the guard and then wait one full silence interval
 measured both from the lease row's last update and from its own guard
 acquisition before its exact-session CAS, so a predecessor that just lost its

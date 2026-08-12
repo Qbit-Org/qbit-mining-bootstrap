@@ -7535,6 +7535,16 @@ SELECT COALESCE(
         is this writer's own fenced write. Only an expired row locked by
         anyone else raises.
 
+        That tolerance proves liveness only, not authority to act outside
+        the database: the survival argument assumes the fenced write
+        commits, and a rollback instead releases the expired row unchanged,
+        letting a queued different-identity claimant take it immediately.
+        The result therefore reports ``renewal_deferred_to_own_write`` for
+        exactly this state, and external-side-effect fences must withhold
+        the guarded RPC while it is set, retrying on their own cadence until
+        a verification lands a renewal (the write committed, refreshing the
+        TTL) or fails closed. The heartbeat may keep treating it as live.
+
         ``on_query_start`` fires once the guarded session's serialized query
         slot is acquired, letting callers budget queue wait separately from
         statement execution.
@@ -7637,10 +7647,15 @@ SELECT json_build_object(
             renewed_count = int(result.get("lease_renewed_count", 0))
         except (TypeError, ValueError):
             renewed_count = 0
+        renewal_deferred_to_own_write = bool(
+            renewed_count == 0
+            and result.get("lease_expired")
+            and result.get("lease_locked_by_this_process")
+        )
         if (
             renewed_count == 0
             and result.get("lease_expired")
-            and not result.get("lease_locked_by_this_process")
+            and not renewal_deferred_to_own_write
         ):
             # The committed row still names this session but its TTL has
             # lapsed and the tuple lock we declined to wait on may belong to
@@ -7651,6 +7666,10 @@ SELECT json_build_object(
             # TTL: its exclusive tuple lock means no claim is in flight, and
             # its commit refreshes the TTL before any queued claimant
             # re-evaluates its expiry CAS, so the session provably survives.
+            # It survives as a *process*; the returned deferral flag tells
+            # external-side-effect fences the same state is not authority
+            # for a guarded RPC, because a rollback would hand the expired
+            # row to a queued claimant instead.
             raise RuntimeError(
                 "writer lease is expired and its renewal was lock-blocked; "
                 "a competing expiry claim may be in flight"
@@ -7659,6 +7678,7 @@ SELECT json_build_object(
             "backend": str(result["backend"]),
             "verified_count": 1,
             "renewed_count": renewed_count,
+            "renewal_deferred_to_own_write": renewal_deferred_to_own_write,
         }
 
     def _renew_writer_lease_with(
