@@ -2550,6 +2550,19 @@ WITH rows AS (
             # window sizes that meant 100k+ lateral index probes. Paging keeps
             # the scan O(window), not O(history), while returning the identical
             # final crossing row and therefore byte-identical audit input.
+            #
+            # The final pass must consume the cutoff as a scalar subquery, not
+            # a joined relation: a join makes the planner apply the cutoff as
+            # a filter after walking the whole pkey backwards, while a scalar
+            # subquery becomes an InitPlan the index scan can use as its start
+            # bound, keeping this pass O(window) too.
+            #
+            # The page-granular stop relies on share_difficulty being NOT NULL
+            # and strictly positive (schema CHECK), which keeps the cumulative
+            # weight strictly increasing so the crossing row always lies in
+            # the last fetched page. The same holds for qbit_prism_window()
+            # in the schema file; relax the constraint and both walks need
+            # revisiting.
             rows_cte = f"""
 WITH RECURSIVE pages AS (
     SELECT page.min_share_seq,
@@ -2602,11 +2615,10 @@ ranked AS (
                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
            )::numeric AS cumulative_difficulty
     FROM qbit_share_ledger ledger
-    CROSS JOIN page_cutoff
     WHERE ledger.accepted
       AND ledger.job_issued_at <= {anchor}
       AND ledger.accepted_at <= {anchor}
-      AND ledger.share_seq >= page_cutoff.min_share_seq
+      AND ledger.share_seq >= (SELECT min_share_seq FROM page_cutoff)
 ),
 rows AS (
     SELECT *

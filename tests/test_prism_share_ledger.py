@@ -1479,6 +1479,11 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(snapshots, [[]])
         self.assertIn("WITH RECURSIVE pages", ledger.queries[0])
+        self.assertIn(
+            "share_seq >= (SELECT min_share_seq FROM page_cutoff)",
+            ledger.queries[0],
+        )
+        self.assertNotIn("CROSS JOIN page_cutoff", ledger.queries[0])
 
     def test_postgres_job_snapshot_delta_uses_disjoint_timestamp_ranges(self) -> None:
         ledger = QueryCapturePsqlShareLedger()
@@ -1511,8 +1516,17 @@ class PrismShareLedgerTests(unittest.TestCase):
         ):
             self.assertIn(name, schema)
 
-        self.assertIn("WITH RECURSIVE eligible AS", schema)
-        self.assertIn("AND ledger.share_seq < eligible.share_seq", schema)
+        self.assertIn("WITH RECURSIVE pages AS", schema)
+        self.assertIn("AND ledger.share_seq < pages.min_share_seq", schema)
+        self.assertIn(
+            "ledger.share_seq >= (SELECT min_share_seq FROM page_cutoff)",
+            schema,
+        )
+        self.assertNotIn("CROSS JOIN page_cutoff", schema)
+        # Exactly one windowed difficulty sum may exist in the schema: the
+        # cutoff-bounded ranked pass of qbit_prism_window. Any other schema
+        # function adopting a windowed sum must justify its scan bound here.
+        self.assertEqual(schema.count("sum(ledger.share_difficulty) OVER"), 1)
         self.assertIn("ON qbit_share_ledger ((lower(right(share_id, 64))), accepted_at DESC, share_seq DESC)", schema)
         self.assertIn("ALTER COLUMN anchor_vout DROP NOT NULL", schema)
         self.assertIn("CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace'))", schema)
@@ -1520,7 +1534,6 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertNotIn("DROP CONSTRAINT IF EXISTS qbit_share_ledger_credit_policy_check", schema)
         self.assertLess(schema.index("writer_epoch bigint"), schema.index("credit_policy text"))
         self.assertLess(schema.index("credit_policy text"), schema.index("CHECK (accepted OR reject_reason IS NOT NULL)"))
-        self.assertNotIn("sum(ledger.share_difficulty) OVER", schema)
 
     def test_memory_pool_snapshot_reward_window_uses_anchor_eligible_shares(self) -> None:
         ledger = SingleWriterShareLedger()
