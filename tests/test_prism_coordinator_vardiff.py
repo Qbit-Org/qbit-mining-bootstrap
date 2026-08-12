@@ -7885,6 +7885,114 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "payout window was invalidated by a late-visible share append",
         )
 
+    def test_completed_append_predating_seedless_published_window_fences(
+        self,
+    ) -> None:
+        # A build that seeds no artifact (the documented
+        # PRISM_PAYOUT_ARTIFACT_REUSE=0 rollback mode) retires its walk
+        # exposure at the publication fence, yet jobs stamped from it keep
+        # serving that window until they retire. A replay-shaped append
+        # that started AND finished in that gap used to see no live
+        # anchor: no epoch bump, and its registry entry was popped on
+        # completion -- so a later landing drained nothing, its
+        # nonnegative context epoch skipped durable revalidation, and
+        # submitblock accepted a coinbase omitting the durable share.
+        # Publication now hands the declared anchor to the
+        # published-window watermark, so the append commits under the
+        # landing fence with its epoch bump and the landing abandons.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="dd" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("seedless-window").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        # The publication fence of a seedless build hands the bundle's
+        # declared anchor to the watermark when it retires the walk
+        # exposure.
+        server._ensure_job_cache_state()
+        with server._job_cache_lock:
+            server._publish_seedless_job_window_anchor_locked(12000)
+
+        # The ordinary share hot path stays off the fence: a row stamped
+        # above the watermark commits unfenced and bumps nothing.
+        ordinary_entry = self._pending_append(
+            "ordinary-above-watermark", accepted_at_ms=13000
+        )
+        server._append_share_entry(ordinary_entry)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 0)
+            self.assertEqual(
+                server._payout_unfenced_append_inflight_stamps, {}
+            )
+
+        # The replay-shaped append starts and finishes entirely before the
+        # landing begins: nothing is in flight for the landing to drain.
+        late_entry = self._pending_append("completed-before-landing")
+        server._append_share_entry(late_entry)
+        self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
+        with server._job_cache_lock:
+            self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+            self.assertEqual(
+                server._payout_unfenced_append_inflight_stamps, {}
+            )
+
+        submitblock_calls: list[object] = []
+
+        class RecordingSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    submitblock_calls.append(params)
+                    return None
+                return super().call(method, params)
+
+        server.rpc = RecordingSubmitRpc("00" * 32)
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        # The bump already happened at commit time, so the landing's epoch
+        # fence rejects the pre-append window instead of submitting a
+        # coinbase that omits the durable predating share.
+        self.assertEqual(submitblock_calls, [])
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+            1,
+        )
+        self.assertEqual(
+            server.stale_job_abandon_counts,
+            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "abandoned")
+        self.assertEqual(
+            outbox_row["last_error"],
+            "payout window was invalidated by a late-visible share append",
+        )
+
     def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
         self,
     ) -> None:

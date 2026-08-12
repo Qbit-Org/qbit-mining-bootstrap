@@ -4135,6 +4135,20 @@ class PrismCoordinator:
             self._payout_unfenced_append_drained = threading.Condition(
                 self._job_cache_lock
             )
+        if not hasattr(self, "_payout_published_job_window_anchor_ms"):
+            # Guarded by _job_cache_lock. The highest declared anchor among
+            # published job windows whose walk exposure retired without a
+            # seeded artifact to carry it (a build under the reuse
+            # kill-switch, or one with nothing to seed). Jobs stamped from
+            # such a bundle keep serving the window until they retire, and
+            # nothing else exposes its anchor between publication and the
+            # landing's own exposure -- so the anchor must stay visible to
+            # the append-side predates() checks: a replay-shaped append
+            # committing in that gap has to advance the epoch those jobs'
+            # landing fences compare against. Monotonic and never retired;
+            # ordinary share commits can never match it because every job
+            # anchor is clamped below the pending-commit floor.
+            self._payout_published_job_window_anchor_ms: int | None = None
         if not hasattr(self, "_incremental_payout_artifact_window"):
             # Guarded by _payout_state_prepare_lock. It is independent of the
             # published artifact generation: normal generation bumps retag
@@ -10211,11 +10225,19 @@ class PrismCoordinator:
                     and prepared_ledger_artifact is None
                 ):
                     # The fence above just proved, under this same lock hold,
-                    # that no append predated this build's window, and no
-                    # seed carries the window past this return: every later
-                    # serving decision re-fences through the recorded epoch.
-                    # Seeded builds instead keep their exposure until the
-                    # artifact's install fence settles.
+                    # that no append predated this build's window. Seeded
+                    # builds keep their exposure until the artifact's
+                    # install fence settles; with no seed, nothing else
+                    # exposes this window's anchor once the walk exposure
+                    # retires, yet jobs stamped from this bundle keep
+                    # serving the window until they retire. Hand the anchor
+                    # to the published-window watermark under this same lock
+                    # hold, so a replay-shaped append committing after this
+                    # return still predates a live anchor and advances the
+                    # epoch those jobs' landing fences check.
+                    self._publish_seedless_job_window_anchor_locked(
+                        issued_at_ms
+                    )
                     self._payout_window_inflight_scan_anchors.pop(
                         inflight_scan_anchor_token,
                         None,
@@ -21239,6 +21261,26 @@ class PrismCoordinator:
         with self._job_cache_lock:
             self._payout_window_inflight_scan_anchors.pop(int(token), None)
 
+    def _publish_seedless_job_window_anchor_locked(self, anchor_ms: int) -> None:
+        """Keep a seedless published window's anchor visible to appends.
+
+        Caller holds _job_cache_lock, at the bundle publication fence of a
+        build whose walk exposure retires with no seeded artifact to carry
+        it (the reuse kill-switch, or nothing to seed). Jobs stamped from
+        that bundle keep serving the window until they retire, so the
+        declared anchor must stay in the predates() anchor set past the
+        exposure: a replay-shaped append that starts and finishes entirely
+        between publication and a landing's own anchor exposure would
+        otherwise see no live anchor, skip its epoch bump, and leave no
+        registry entry for the landing's drain to find. Monotonic and never
+        retired; the pending-commit floor keeps every ordinary share commit
+        above it.
+        """
+        self._payout_published_job_window_anchor_ms = max(
+            int(anchor_ms),
+            self._payout_published_job_window_anchor_ms or 0,
+        )
+
     @staticmethod
     def _pending_share_predates_anchor(
         pending_share: PendingShare,
@@ -21281,9 +21323,13 @@ class PrismCoordinator:
             if artifact is None or artifact.snapshot_anchor_ms is None
             else int(artifact.snapshot_anchor_ms)
         )
+        published_job_anchor_ms = getattr(
+            self, "_payout_published_job_window_anchor_ms", None
+        )
         return bool(
             predates(pending_share, cached_anchor_ms)
             or predates(pending_share, artifact_anchor_ms)
+            or predates(pending_share, published_job_anchor_ms)
             or any(
                 predates(pending_share, anchor_ms)
                 for anchor_ms in inflight_anchors_ms
@@ -21368,7 +21414,13 @@ class PrismCoordinator:
         takes the fence itself. Appends whose rows cannot predate the
         anchor never block this wait, and the registry holds entries only
         for the duration of a ledger commit, so the common path is one
-        locked emptiness check.
+        locked emptiness check. Commit-scoped retention is sound because an
+        append that completed before this drain cannot have predated
+        ``anchor_ms`` silently: every landable declared anchor is exposed
+        from publication onward (the armed artifact's anchor, or the
+        published-window watermark a seedless build hands its anchor to at
+        the publication fence), so such an append classified as fenced and
+        advanced the epoch this landing's fences compare against.
         """
         self._ensure_job_cache_state()
         anchor = int(anchor_ms)
