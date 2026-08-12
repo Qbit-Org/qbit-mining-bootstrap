@@ -279,9 +279,14 @@ DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS = 15.0
 # The release worker is daemonized and the watchdog hard-exits at this total
 # wall-clock deadline whether quiescence or the fresh DB connection completes.
 DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS = 5.0
-# A fast-adoptable coordinator renews four times inside the one-second silence
-# proof required by PsqlShareLedger. This runs through a dedicated connection,
-# not the ordinary ledger lock or shared native pool.
+# A fast-adoptable coordinator proves its guarded session live four times
+# inside the one-second silence proof required by PsqlShareLedger. This runs
+# through a dedicated connection, not the ordinary ledger lock or shared
+# native pool, and must never wait on the lease tuple's row lock: fenced
+# writes hold it for whole transactions (persist_accepted_block can exceed
+# the guard's statement timeout many times over). The lease TTL is renewed
+# only when that tuple is uncontended (SKIP LOCKED), so an idle coordinator
+# still keeps lease_expires_at ahead of different-identity expiry claims.
 DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_SECONDS = (
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS / 4
 )
@@ -12202,6 +12207,27 @@ class PrismCoordinator:
                     renewal_started_monotonic
                 )
 
+    @staticmethod
+    def _ledger_lease_guard_session_verifier(
+        ledger: object,
+    ) -> Callable[..., object] | None:
+        """Return the guarded-session liveness check for ``ledger``.
+
+        Prefer ``verify_writer_lease_guard_session``: it proves the dedicated
+        guard session is live and renews the lease TTL only via SKIP LOCKED,
+        so it can never queue behind the row lock a long fenced transaction
+        (``persist_accepted_block``) holds until commit and then die on the
+        guard's statement timeout, yet an idle coordinator still keeps its
+        lease from expiring under different-identity claimants.
+        ``renew_writer_lease_heartbeat`` is the legacy embedder spelling and
+        does wait on the lease tuple; it is only a fallback for ledgers that
+        predate the non-blocking verification.
+        """
+        verify = getattr(ledger, "verify_writer_lease_guard_session", None)
+        if verify is not None:
+            return verify
+        return getattr(ledger, "renew_writer_lease_heartbeat", None)
+
     def _start_ledger_lease_heartbeat(self) -> threading.Thread | None:
         existing = getattr(self, "_ledger_lease_heartbeat_thread", None)
         if existing is not None and existing.is_alive():
@@ -12227,12 +12253,12 @@ class PrismCoordinator:
                     include_traceback=False,
                 )
             return None
-        renew = getattr(ledger, "renew_writer_lease_heartbeat", None)
-        if renew is None:
+        verify = self._ledger_lease_guard_session_verifier(ledger)
+        if verify is None:
             if guard_required:
                 self._ledger_lease_heartbeat_hard_exit(
                     "prism coordinator: writer lease guard requires a "
-                    "heartbeat but the ledger cannot renew on the guarded "
+                    "heartbeat but the ledger cannot verify the guarded "
                     "session; hard-exiting instead of running unguarded",
                     include_traceback=False,
                 )
@@ -12324,10 +12350,19 @@ class PrismCoordinator:
         )
 
     def ledger_lease_heartbeat_loop(self) -> None:
-        """Keep fast-adoptable sessions visibly live on an isolated DB path."""
+        """Keep proving the guarded session live on an isolated DB path.
+
+        The heartbeat must never wait on the lease tuple that fenced writes
+        hold for whole transactions, or a long ``persist_accepted_block``
+        would time out the heartbeat statement and hard-exit a healthy
+        coordinator (the block-39416 restart loop). It still renews the
+        lease TTL whenever that tuple is uncontended, so an idle coordinator
+        (no fenced writes, CTV broadcaster disabled) does not let
+        ``lease_expires_at`` lapse into different-identity expiry claims.
+        """
         ledger = getattr(self, "ledger", None)
-        renew = getattr(ledger, "renew_writer_lease_heartbeat", None)
-        if renew is None:
+        verify = self._ledger_lease_guard_session_verifier(ledger)
+        if verify is None:
             return
         interval_seconds = float(
             getattr(
@@ -12345,9 +12380,9 @@ class PrismCoordinator:
             heartbeat_stop = threading.Event()
             self._ledger_lease_heartbeat_stop_event = heartbeat_stop
         while not heartbeat_stop.is_set():
-            renew_started_monotonic = time.monotonic()
+            verify_started_monotonic = time.monotonic()
             try:
-                renew()
+                verify()
             except Exception:
                 self._ledger_lease_heartbeat_hard_exit(
                     "prism coordinator: ledger lease heartbeat failed; "
@@ -12356,11 +12391,11 @@ class PrismCoordinator:
                     include_traceback=True,
                 )
                 return
-            # The database row was refreshed no earlier than call start. Using
+            # The session was proven live no earlier than call start. Using
             # that conservative edge prevents a delayed response from making
-            # local freshness look newer than PostgreSQL's updated_at.
+            # local freshness look newer than what PostgreSQL actually proved.
             self._record_ledger_lease_heartbeat_success(
-                renew_started_monotonic
+                verify_started_monotonic
             )
             ready = getattr(self, "_ledger_lease_heartbeat_ready", None)
             if ready is not None:
@@ -12467,9 +12502,13 @@ class PrismCoordinator:
         authorization oracle: CLOCK_MONOTONIC may not advance across host
         suspend, and a PostgreSQL connection object does not necessarily know
         its server session died until the next I/O. Every external mutation
-        therefore performs a bounded renewal on the session holding the
-        advisory guard. A daemon worker bounds a dead network path even when
-        the driver's server-side statement timeout cannot.
+        therefore performs a bounded non-blocking verification on the session
+        holding the advisory guard. It must not wait on the lease row: a long
+        fenced transaction (``persist_accepted_block``) holds that tuple's
+        row lock until commit, and queueing behind it would time out and
+        fence a healthy coordinator (the TTL is renewed opportunistically via
+        SKIP LOCKED instead). A daemon worker bounds a dead network path even
+        when the driver's server-side statement timeout cannot.
 
         PostgreSQL and qbitd are independent systems, so this remains a
         preflight fence rather than an atomic transaction with the subsequent
@@ -12481,8 +12520,8 @@ class PrismCoordinator:
             getattr(ledger, "writer_lease_guard_required", False)
         ):
             return
-        renew = getattr(ledger, "renew_writer_lease_heartbeat", None)
-        if renew is None:
+        verify = self._ledger_lease_guard_session_verifier(ledger)
+        if verify is None:
             self._ledger_lease_heartbeat_hard_exit(
                 "prism coordinator: refusing external side effect from "
                 f"{component}; exact-session verification is unavailable",
@@ -12522,14 +12561,15 @@ class PrismCoordinator:
         )
         query_started = threading.Event()
         try:
-            renew_reports_query_start = (
-                "on_query_start" in inspect.signature(renew).parameters
+            verify_reports_query_start = (
+                "on_query_start" in inspect.signature(verify).parameters
             )
         except (TypeError, ValueError):
-            renew_reports_query_start = False
-        if not renew_reports_query_start:
-            # A renewal that cannot report when its query slot was acquired
-            # keeps the previous behavior: the whole budget covers both.
+            verify_reports_query_start = False
+        if not verify_reports_query_start:
+            # A verification that cannot report when its query slot was
+            # acquired keeps the previous behavior: the whole budget covers
+            # both.
             query_started.set()
 
         outcome: queue.Queue[BaseException | None] = queue.Queue(maxsize=1)
@@ -12537,10 +12577,10 @@ class PrismCoordinator:
 
         def verify_exact_session() -> None:
             try:
-                if renew_reports_query_start:
-                    renew(on_query_start=query_started.set)
+                if verify_reports_query_start:
+                    verify(on_query_start=query_started.set)
                 else:
-                    renew()
+                    verify()
             except BaseException as exc:
                 outcome.put(exc)
             else:

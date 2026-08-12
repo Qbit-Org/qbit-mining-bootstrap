@@ -1908,6 +1908,13 @@ class PsqlShareLedger:
                 raise
             if acquired:
                 self._writer_lease_guard = guard
+                # Adoption silence is measured from this moment as well as
+                # from the lease row's updated_at. The predecessor that just
+                # lost this advisory lock self-fences within its heartbeat
+                # failure budget; counting from acquisition guarantees it
+                # that time even when its lease row is already stale because
+                # a long fenced transaction withheld updated_at refreshes.
+                self._writer_lease_guard_acquired_monotonic = time.monotonic()
                 return
             guard.close()
             if not warned:
@@ -7022,9 +7029,19 @@ SELECT COALESCE(
         restricted to coordinator sessions guarded by the same writer/epoch
         PostgreSQL advisory lock. This process cannot reach this method until
         that predecessor's guard session is gone. PostgreSQL must additionally
-        report the exact session unchanged for several heartbeat periods before
+        report the exact session unchanged for a full silence interval before
         the CAS, giving a holder whose guard connection failed time to self-exit.
         A renewing live twin retains the guard and cannot reach lease polling.
+
+        The silence interval is measured from two independent edges and the
+        later one wins. The row edge (``updated_at`` age) alone is unsafe: a
+        long fenced transaction such as ``persist_accepted_block`` withholds
+        the predecessor's ``updated_at`` refresh until commit, so the row can
+        already look minutes silent the instant the predecessor dies. The
+        guard edge therefore requires a full interval to elapse after *this*
+        process acquired the advisory guard, guaranteeing the predecessor its
+        whole heartbeat failure budget to self-fence after losing the guard,
+        no matter how stale the row already is.
         """
         observed_session = result.get("writer_session_token")
         if not (
@@ -7036,13 +7053,32 @@ SELECT COALESCE(
             and result.get("lease_updated_at") is not None
         ):
             return None
+        guard_acquired_monotonic = getattr(
+            self,
+            "_writer_lease_guard_acquired_monotonic",
+            None,
+        )
+        if guard_acquired_monotonic is None:
+            return None
         try:
             age_seconds = float(result.get("lease_age_seconds"))
         except (TypeError, ValueError):
             return None
         if not math.isfinite(age_seconds) or age_seconds < 0:
             return None
-        return max(0.0, self._lease_adoption_silence_seconds - age_seconds)
+        row_wait_seconds = max(
+            0.0,
+            self._lease_adoption_silence_seconds - age_seconds,
+        )
+        guard_held_seconds = max(
+            0.0,
+            time.monotonic() - guard_acquired_monotonic,
+        )
+        guard_wait_seconds = max(
+            0.0,
+            self._lease_adoption_silence_seconds - guard_held_seconds,
+        )
+        return max(row_wait_seconds, guard_wait_seconds)
 
     def _try_adopt_writer_lease(self, observed: dict[str, Any]) -> dict[str, Any]:
         """Fence and replace one observed same-identity predecessor session.
@@ -7141,12 +7177,36 @@ SELECT COALESCE(
         """
         return self._renew_writer_lease_with(self._run_fenced_json)
 
-    def renew_writer_lease_heartbeat(
+    def verify_writer_lease_guard_session(
         self,
         *,
         on_query_start: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
-        """Refresh on the session that holds the writer advisory guard.
+        """Prove the guard session live; renew the TTL only without waiting.
+
+        The coordinator's periodic heartbeat and its external-side-effect
+        fence both run this on the dedicated guard connection. It must never
+        wait on the ``qbit_ledger_writer_lease`` tuple lock: every fenced
+        write (share appends, ``persist_accepted_block``) row-locks that
+        tuple for its whole transaction, and a guarded statement queued
+        behind it hits the guard's statement timeout and hard-exits a
+        healthy coordinator. Liveness is therefore proven by non-blocking
+        reads: the session answers, PostgreSQL still shows this backend
+        holding the writer advisory lock, and the last committed lease row
+        still names this exact session. Guard-connection loss or a
+        fenced-out session raises, which callers treat as loss of the
+        guarded session.
+
+        The lease TTL still needs a writer-side refresh, or an idle
+        coordinator (no fenced writes, CTV broadcaster disabled) would let
+        ``lease_expires_at`` lapse and any different-identity claimant could
+        seize the singleton row through its expiry CAS — that identity uses
+        a different advisory-lock key, so this process's guard would not
+        block it. The same statement therefore renews the exact-identity
+        lease row with ``FOR NO KEY UPDATE SKIP LOCKED``: renewal happens on
+        every heartbeat while the tuple is uncontended and is skipped
+        without queueing while a fenced transaction holds it (that
+        transaction refreshes the TTL itself when it commits).
 
         ``on_query_start`` fires once the guarded session's serialized query
         slot is acquired, letting callers budget queue wait separately from
@@ -7157,11 +7217,86 @@ SELECT COALESCE(
         guard = self._writer_lease_guard
         if guard is None:
             raise RuntimeError("postgres writer lease guard is not held")
-        if on_query_start is None:
-            return self._renew_writer_lease_with(guard.run_json)
-        return self._renew_writer_lease_with(
-            lambda sql: guard.run_json(sql, on_query_start=on_query_start)
+        payload = {
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        lock_key = _writer_lease_advisory_lock_key(
+            self._writer_id,
+            self._writer_epoch,
         )
+        # pg_locks splits a 64-bit advisory key into classid (high word) and
+        # objid (low word) with objsubid = 1.
+        lock_classid = (lock_key >> 32) & 0xFFFFFFFF
+        lock_objid = lock_key & 0xFFFFFFFF
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+renewable AS (
+    SELECT qbit_ledger_writer_lease.singleton
+    FROM qbit_ledger_writer_lease, payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    FOR NO KEY UPDATE SKIP LOCKED
+),
+renewed AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM renewable
+    WHERE qbit_ledger_writer_lease.singleton = renewable.singleton
+    RETURNING qbit_ledger_writer_lease.writer_id
+)
+SELECT json_build_object(
+    'backend', 'postgres-psql',
+    'guard_advisory_lock_held', EXISTS (
+        SELECT 1
+        FROM pg_locks
+        WHERE locktype = 'advisory'
+          AND granted
+          AND pid = pg_backend_pid()
+          AND classid = {lock_classid}::oid
+          AND objid = {lock_objid}::oid
+          AND objsubid = 1
+    ),
+    'writer_session_token_current', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    ),
+    'lease_renewed_count', (SELECT count(*) FROM renewed)
+);
+"""
+        if on_query_start is None:
+            result = guard.run_json(sql)
+        else:
+            result = guard.run_json(sql, on_query_start=on_query_start)
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "psql writer lease guard verification returned non-object JSON"
+            )
+        if not result.get("guard_advisory_lock_held"):
+            raise RuntimeError(
+                "postgres writer lease guard advisory lock is no longer held"
+            )
+        if not result.get("writer_session_token_current"):
+            raise RuntimeError("writer lease is not active")
+        try:
+            renewed_count = int(result.get("lease_renewed_count", 0))
+        except (TypeError, ValueError):
+            renewed_count = 0
+        return {
+            "backend": str(result["backend"]),
+            "verified_count": 1,
+            "renewed_count": renewed_count,
+        }
 
     def _renew_writer_lease_with(
         self,

@@ -850,7 +850,11 @@ def block_candidate(
         extranonce1_hex=state.extranonce1_hex,
         extranonce2_hex="00" * 8,
         pending_share=pending_share
-        or SimpleNamespace(share_id="miner-a:" + submission.block_hash_hex),
+        or SimpleNamespace(
+            share_id="miner-a:" + submission.block_hash_hex,
+            job_issued_at_ms=0,
+            accepted_at_ms=0,
+        ),
         client=state,
         credit_share_on_accept=credit_share_on_accept,
     )
@@ -8435,7 +8439,11 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         flaky = FlakyLedger()
         server.ledger = flaky
         entry = PendingShareAppend(
-            pending_share=SimpleNamespace(share_id="miner-a:" + "ee" * 32),
+            pending_share=SimpleNamespace(
+                share_id="miner-a:" + "ee" * 32,
+                job_issued_at_ms=0,
+                accepted_at_ms=0,
+            ),
             username="miner-a",
             job_id="job-1",
             block_hash_hex="ee" * 32,
