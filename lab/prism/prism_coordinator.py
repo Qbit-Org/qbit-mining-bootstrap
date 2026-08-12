@@ -11788,21 +11788,31 @@ class PrismCoordinator:
             # Unlocked at the gate (a cancellation hint, exactly like direct
             # delivery's callback); authoritative only when re-read under
             # _job_cache_lock at the commit boundary below.
+            published_artifact = self._published_payout_state.artifact
             return (
                 bundle.payout_state_generation != self._payout_state_generation
+                or bundle.build_key is None
+                # A periodic self-check repair replaces the published balance
+                # snapshot in place: the generation and append epoch both
+                # survive the swap, so only the digest identifies work keyed
+                # to the refuted balances. Every other serving decision
+                # (cache usability, idle issuance, cache publication) already
+                # applies this fence; the initial-delivery commit must too,
+                # or a bundle probed before the repair becomes the miner's
+                # active job with the refuted balances.
+                or published_artifact is None
+                or bundle.build_key.payout_artifact_sha256
+                != published_artifact.prior_balances_sha256
                 or (
                     not bundle.collection_only
-                    and (
-                        bundle.build_key is None
-                        or int(
-                            getattr(
-                                bundle.build_key,
-                                "payout_append_invalidation_epoch",
-                                0,
-                            )
+                    and int(
+                        getattr(
+                            bundle.build_key,
+                            "payout_append_invalidation_epoch",
+                            0,
                         )
-                        != self._payout_ledger_append_invalidation_epoch
                     )
+                    != self._payout_ledger_append_invalidation_epoch
                 )
             )
 

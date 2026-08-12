@@ -180,6 +180,79 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertIsNone(state.active_job)
         self.assertEqual(state.active_job_ids, set())
 
+    def test_initial_delivery_rechecks_published_digest_after_vardiff_wait(
+        self,
+    ) -> None:
+        # A periodic self-check repair swaps the published balance snapshot
+        # in place: neither the payout generation nor the append epoch moves,
+        # so only the digest identifies work keyed to the refuted balances.
+        # The commit boundary must re-check it or a bundle probed before the
+        # repair becomes the miner's active job with the refuted balances.
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        bundle = server.prewarm_current_tip_ready_bundle()
+        assert bundle is not None
+        artifacts = server.current_template_artifacts()
+        state = client(1)
+        state.authorization_generation = 1
+        state.difficulty_generation = 0
+        state.authorized_monotonic = time.monotonic()
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        vardiff_lock = ObservedRLock()
+        state.vardiff_lock = vardiff_lock  # type: ignore[assignment]
+        server.clients = {state}
+        server._ensure_initial_job_state()
+        request = PendingInitialJob(
+            client=state,
+            authorization_generation=1,
+            worker=state.worker,
+            requested_monotonic=time.monotonic(),
+            deadline_monotonic=None,
+            connection_id=state.connection_id,
+            difficulty_generation=0,
+        )
+        server.pending_initial_jobs[state] = request
+        results: list[bool | None] = []
+
+        with vardiff_lock:
+            vardiff_lock.acquire_attempted.clear()
+            vardiff_lock.observe_acquires = True
+            delivery = threading.Thread(
+                target=lambda: results.append(
+                    server._deliver_initial_bundle(request, artifacts, bundle)
+                )
+            )
+            delivery.start()
+            self.assertTrue(vardiff_lock.acquire_attempted.wait(2))
+            # The delivery passed its pre-wait payout check and is blocked on
+            # the Vardiff lock; the periodic self-check now refutes and
+            # repairs the published balances the bundle was keyed to.
+            with server._job_cache_lock:
+                published = server._published_payout_state.artifact
+            assert published is not None
+            self.assertTrue(
+                server._publish_self_check_repaired_balances(
+                    0,
+                    stale_prior_balances_sha256=(
+                        published.prior_balances_sha256
+                    ),
+                    balances=[
+                        {
+                            "recipient_id": "carry",
+                            "order_key": "01:carry",
+                            "p2mr_program_hex": "66" * 32,
+                            "balance_sats": 999,
+                        }
+                    ],
+                )
+            )
+
+        delivery.join(2)
+        self.assertFalse(delivery.is_alive())
+        self.assertEqual(results, [None])
+        self.assertIsNone(state.active_job)
+        self.assertEqual(state.active_job_ids, set())
+
     def test_initial_delivery_retries_transient_reorg_and_build_failures(self) -> None:
         server, _rpc = coordinator()
         install_fake_bundle_builder(server)
