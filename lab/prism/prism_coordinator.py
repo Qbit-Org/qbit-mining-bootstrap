@@ -1658,6 +1658,16 @@ class PayoutLedgerArtifact:
         compare=False,
         repr=False,
     )
+    # Exposed in-flight scan anchor carried from the synchronous bundle
+    # build that seeded this artifact (see _expose_inflight_scan_anchor).
+    # Nothing else exposes this window's anchor between the ledger read and
+    # the install fence, so the exposure rides here and the install retires
+    # it once the fence settles either way.
+    inflight_scan_anchor_token: int | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     # Build-path diagnostics only. They do not participate in artifact
     # equality or any signed/wire representation.
     window_build_mode: str | None = field(default=None, compare=False, repr=False)
@@ -2840,6 +2850,11 @@ class _JobBuildRequest:
     promise: Future[CachedJobBundle] = field(default_factory=Future)
     requested_monotonic: float = field(default_factory=time.monotonic)
     superseded_monotonic: float | None = None
+    # Exposed in-flight scan anchor owned by this build (see
+    # _expose_inflight_scan_anchor). Set by the synchronous ledger read so
+    # the executor wrapper can retire the exposure when the build dies
+    # before handing the token to its seeded artifact.
+    inflight_scan_anchor_token: int | None = None
 
 
 @dataclass(eq=False)
@@ -4072,15 +4087,19 @@ class PrismCoordinator:
             # advances only when a newly visible row predates an anchored
             # share window and makes pre-append work unsafe to publish.
             self._payout_ledger_append_invalidation_epoch = 0
-        if not hasattr(self, "_payout_window_inflight_scan_anchor_ms"):
-            # Guarded by _job_cache_lock. The anchor of the ledger window
-            # walk currently in flight, published before the read begins.
-            # A late-visible append can predate this anchor while no
-            # completed window or armed artifact exposes one, and the
-            # walk's database snapshot may already exclude the row; the
-            # append-side invalidation must still advance the epoch so the
-            # walk's result cannot arm or serve.
-            self._payout_window_inflight_scan_anchor_ms: int | None = None
+        if not hasattr(self, "_payout_window_inflight_scan_anchors"):
+            # Guarded by _job_cache_lock. The anchors of ledger window walks
+            # whose results are not yet visible anywhere else, published
+            # before each read begins. A late-visible append can predate such
+            # an anchor while no completed window or armed artifact exposes
+            # one, and the walk's database snapshot may already exclude the
+            # row; the append-side invalidation must still advance the epoch
+            # so the walk's result cannot arm or serve. A synchronous bundle
+            # build keeps its entry exposed past its own return -- until the
+            # seeded artifact's install fence settles -- because nothing else
+            # exposes that window's anchor in the meantime.
+            self._payout_window_inflight_scan_anchors: dict[int, int] = {}
+            self._payout_window_inflight_scan_anchor_token = 0
         if not hasattr(self, "_incremental_payout_artifact_window"):
             # Guarded by _payout_state_prepare_lock. It is independent of the
             # published artifact generation: normal generation bumps retag
@@ -4930,15 +4949,17 @@ class PrismCoordinator:
                     # share-commit liveness watchdog owns recovery.
                     return None
                 window_started = time.monotonic()
-                with self._job_cache_lock:
-                    # Publish the walk's anchor before the ledger read: a
-                    # late-visible append committing mid-walk can predate it
-                    # while a cold or forcibly cleared cache exposes no other
-                    # anchor, and the walk's database snapshot may already
-                    # exclude the row.
-                    self._payout_window_inflight_scan_anchor_ms = int(
-                        snapshot_anchor_ms
-                    )
+                # Publish the walk's anchor before the ledger read: a
+                # late-visible append committing mid-walk can predate it
+                # while a cold or forcibly cleared cache exposes no other
+                # anchor, and the walk's database snapshot may already
+                # exclude the row. Retiring in the finally is safe here
+                # because the materialization installs its incremental
+                # pointer -- the walk's durable visibility -- before this
+                # exposure is withdrawn.
+                inflight_anchor_token = self._expose_inflight_scan_anchor(
+                    snapshot_anchor_ms
+                )
                 try:
                     materialized = self._incremental_payout_window_materialization(
                         snapshot_anchor_ms=snapshot_anchor_ms,
@@ -4954,8 +4975,7 @@ class PrismCoordinator:
                         ),
                     )
                 finally:
-                    with self._job_cache_lock:
-                        self._payout_window_inflight_scan_anchor_ms = None
+                    self._retire_inflight_scan_anchor(inflight_anchor_token)
                 if materialized.balance_check_mismatch:
                     # Emit at detection time: a later, unrelated artifact
                     # serialization or stats failure must not hide the oracle
@@ -5178,6 +5198,23 @@ class PrismCoordinator:
         rewalk the reward window continuously: the livelock behind the
         2026-07-29 rollback.
         """
+        try:
+            return self._install_payout_ledger_artifact_outcome(artifact)
+        finally:
+            # A seeded artifact carries the exposed scan anchor of the
+            # synchronous read that produced it. The install decision above
+            # is atomic under _job_cache_lock: either the window armed (its
+            # own anchor is now visible to append invalidation) or it was
+            # discarded and can never serve, so the exposure has done its
+            # job either way.
+            self._retire_inflight_scan_anchor(
+                artifact.inflight_scan_anchor_token
+            )
+
+    def _install_payout_ledger_artifact_outcome(
+        self,
+        artifact: PayoutLedgerArtifact,
+    ) -> bool:
         if not self._payout_artifact_reuse_active():
             # Kill-switch: never arm. An armed artifact would churn install
             # events while disabled and re-key the idle-bundle fast path to
@@ -5932,6 +5969,17 @@ class PrismCoordinator:
                     key=request.cache_key,
                     build_request=request,
                 )
+        except BaseException:
+            # A build that died past its synchronous ledger read can no
+            # longer hand its exposed scan anchor to a seeded artifact;
+            # retire it here so a dead walk does not keep advancing the
+            # append-invalidation epoch. Successful builds either retired
+            # the token at the publication fence or handed it to the seed,
+            # whose install fence retires it.
+            self._retire_inflight_scan_anchor(
+                request.inflight_scan_anchor_token
+            )
+            raise
         finally:
             self._flush_job_build_phases(phases)
             self._job_build_phase_local.bundle_build_control = previous_control
@@ -9771,6 +9819,7 @@ class PrismCoordinator:
         )
         prepared_ledger_artifact: PayoutLedgerArtifact | None = None
         snapshot_accepted_count: int | None = None
+        inflight_scan_anchor_token: int | None = None
         if payout_artifact is not None:
             # The reuse decision was made at request preparation. Nothing
             # that happens to the ARMED slot afterwards -- a fresher window
@@ -9869,24 +9918,41 @@ class PrismCoordinator:
                         # no bracket around the read is needed.
                         snapshot_accepted_count = int(accepted_now)
                 if resolved_mode == "ready":
-                    with self._job_cache_lock:
-                        # Publish the read's frozen anchor: a late-visible
-                        # append committing mid-read predates it without
-                        # holding the pending floor, and this read's database
-                        # snapshot may already exclude the row. The recorded
-                        # invalidation epoch keeps the resulting bundle and
-                        # its seeded artifact from arming or serving.
-                        self._payout_window_inflight_scan_anchor_ms = int(
-                            issued_at_ms
-                        )
+                    # Publish the read's frozen anchor: a late-visible
+                    # append committing mid-read predates it without
+                    # holding the pending floor, and this read's database
+                    # snapshot may already exclude the row. The recorded
+                    # invalidation epoch keeps the resulting bundle and
+                    # its seeded artifact from arming or serving. The
+                    # exposure must outlive this read: nothing else exposes
+                    # this window's anchor until the seeded artifact passes
+                    # its install fence, so an append committing during
+                    # bundle construction or cache publication would
+                    # otherwise advance no epoch and the seed would arm a
+                    # window that delta reads can never rediscover the row
+                    # from. The token therefore rides the seeded artifact
+                    # (retired by its install fence); a build that raises,
+                    # or seeds nothing, retires it on the spot.
+                    inflight_scan_anchor_token = (
+                        self._expose_inflight_scan_anchor(issued_at_ms)
+                    )
+                    # Mirrored onto the request so the executor wrapper can
+                    # retire the exposure when this build dies anywhere past
+                    # the read (checkpoint cancellation, manifest assembly,
+                    # the publication fence).
+                    build_request.inflight_scan_anchor_token = (
+                        inflight_scan_anchor_token
+                    )
                     try:
                         records = self.ledger.snapshot_at_job_issue(
                             issued_at_ms,
                             window_weight=snapshot_window_weight,
                         )
-                    finally:
-                        with self._job_cache_lock:
-                            self._payout_window_inflight_scan_anchor_ms = None
+                    except BaseException:
+                        self._retire_inflight_scan_anchor(
+                            inflight_scan_anchor_token
+                        )
+                        raise
                 else:
                     records = []
                 # An accepted parent's prospective carry state supersedes the
@@ -9968,6 +10034,7 @@ class PrismCoordinator:
                 append_invalidation_epoch=(
                     build_request.key.payout_append_invalidation_epoch
                 ),
+                inflight_scan_anchor_token=inflight_scan_anchor_token,
             )
         final_build_key = dataclass_replace(
             build_request.key,
@@ -10080,6 +10147,22 @@ class PrismCoordinator:
                     raise JobBuildSuperseded(
                         "payout window invalidated before bundle publication"
                     )
+                if (
+                    inflight_scan_anchor_token is not None
+                    and prepared_ledger_artifact is None
+                ):
+                    # The fence above just proved, under this same lock hold,
+                    # that no append predated this build's window, and no
+                    # seed carries the window past this return: every later
+                    # serving decision re-fences through the recorded epoch.
+                    # Seeded builds instead keep their exposure until the
+                    # artifact's install fence settles.
+                    self._payout_window_inflight_scan_anchors.pop(
+                        inflight_scan_anchor_token,
+                        None,
+                    )
+                    inflight_scan_anchor_token = None
+                    build_request.inflight_scan_anchor_token = None
         phases["bundle"] = phases.get("bundle", 0.0) + (time.monotonic() - started)
         return CachedJobBundle(
             key=key,
@@ -20945,6 +21028,43 @@ class PrismCoordinator:
             ]
         return pending
 
+    def _expose_inflight_scan_anchor(self, anchor_ms: int) -> int:
+        """Publish a ledger walk's anchor to the append-side invalidation.
+
+        The entry must stay exposed for as long as the walk's result is
+        invisible to ``_invalidate_incremental_payout_window_for_append``:
+        from before the database read (whose snapshot may already exclude a
+        row committing mid-read) until either the result is discarded or its
+        window becomes visible through the incremental cache or the armed
+        artifact's own anchor. Entries older than the audit ceiling are
+        pruned lazily here: ``_install_payout_ledger_artifact`` rejects any
+        artifact whose anchor aged past that same ceiling as born-expired,
+        so a leaked exposure (a built bundle every waiter abandoned) can
+        never outlive the last install that could have used it.
+        """
+        self._ensure_job_cache_state()
+        max_age_ms = self._payout_artifact_max_anchor_age_ms()
+        stale_before_ms = now_ms() - max_age_ms
+        with self._job_cache_lock:
+            for token, exposed_anchor_ms in tuple(
+                self._payout_window_inflight_scan_anchors.items()
+            ):
+                if exposed_anchor_ms < stale_before_ms:
+                    self._payout_window_inflight_scan_anchors.pop(token, None)
+            self._payout_window_inflight_scan_anchor_token += 1
+            token = self._payout_window_inflight_scan_anchor_token
+            self._payout_window_inflight_scan_anchors[token] = int(anchor_ms)
+            return token
+
+    def _retire_inflight_scan_anchor(self, token: int | None) -> None:
+        """Withdraw an exposed walk anchor once its result became visible
+        (or provably never will). Idempotent; ``None`` is a no-op."""
+        if token is None:
+            return
+        self._ensure_job_cache_state()
+        with self._job_cache_lock:
+            self._payout_window_inflight_scan_anchors.pop(int(token), None)
+
     def _invalidate_incremental_payout_window_for_append(
         self,
         pending_share: PendingShare,
@@ -20974,14 +21094,17 @@ class PrismCoordinator:
         # owning lock is deliberately not acquired here: an urgent append
         # must disarm the separately guarded artifact even while a long oracle
         # build owns _payout_state_prepare_lock. Reading it under
-        # _job_cache_lock orders the read against the in-flight scan anchor:
-        # a window walk installs its incremental pointer before clearing the
-        # published anchor under this lock, so a walk that could have missed
-        # this row always exposes its anchor to the predates() checks below.
+        # _job_cache_lock orders the read against the in-flight scan anchors:
+        # a window walk makes its result visible (the incremental pointer,
+        # or the armed artifact's install fence) before retiring its exposed
+        # anchor under this lock, so a walk that could have missed this row
+        # always exposes an anchor to the predates() checks below.
         with self._job_cache_lock:
             cached = getattr(self, "_incremental_payout_artifact_window", None)
             artifact = self._payout_ledger_artifact
-            inflight_anchor_ms = self._payout_window_inflight_scan_anchor_ms
+            inflight_anchors_ms = tuple(
+                self._payout_window_inflight_scan_anchors.values()
+            )
             cached_anchor_ms = (
                 None
                 if cached is None
@@ -20995,7 +21118,9 @@ class PrismCoordinator:
             if not (
                 predates(cached_anchor_ms)
                 or predates(artifact_anchor_ms)
-                or predates(inflight_anchor_ms)
+                or any(
+                    predates(anchor_ms) for anchor_ms in inflight_anchors_ms
+                )
             ):
                 return
             self._payout_ledger_append_invalidation_epoch += 1

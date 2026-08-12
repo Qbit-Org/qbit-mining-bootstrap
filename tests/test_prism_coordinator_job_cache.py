@@ -772,8 +772,11 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
         with server._job_cache_lock:
             self.assertEqual(server._payout_ledger_append_invalidation_epoch, 0)
 
-        with server._job_cache_lock:
-            server._payout_window_inflight_scan_anchor_ms = 999_999
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: 1_000_000,
+        ):
+            token = server._expose_inflight_scan_anchor(999_999)
         try:
             server._invalidate_incremental_payout_window_for_append(fresh)
             with server._job_cache_lock:
@@ -782,14 +785,109 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
                 )
             server._invalidate_incremental_payout_window_for_append(predating)
         finally:
-            with server._job_cache_lock:
-                server._payout_window_inflight_scan_anchor_ms = None
+            server._retire_inflight_scan_anchor(token)
         with server._job_cache_lock:
             self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
+            self.assertEqual(server._payout_window_inflight_scan_anchors, {})
         self.assertEqual(
             server._incremental_payout_artifact_window_invalidation_reason,
             "late_visible_append",
         )
+
+    def test_replay_append_during_bundle_construction_invalidates_build(
+        self,
+    ) -> None:
+        # A cold synchronous ready build exposes no cached window or armed
+        # artifact once its ledger read returns, while manifest construction
+        # and cache publication still lie ahead. A replayed row committing in
+        # that gap with timestamps below the read's anchor must still advance
+        # the epoch -- the exposure outlives the read -- so the publication
+        # fence supersedes the bundle instead of seeding a window that delta
+        # reads can never rediscover the row from.
+        server, _ledger, _artifacts = self.configured_server()
+        install_fake_bundle_builder(server)
+        clock_ms = [1_000_000]
+        entry = self.replay_shaped_append_entry(
+            accepted_at_ms=999_950,
+            block_hash_hex="66" * 32,
+        )
+        raced = threading.Event()
+        original_build = server.build_audit_bundle
+
+        def racing_build(**kwargs: object) -> dict[str, object]:
+            # The ledger read has already returned; the replayed row commits
+            # while the coinbase manifest is being constructed.
+            if not raced.is_set():
+                raced.set()
+                server._append_share_batch([entry])
+            return original_build(**kwargs)
+
+        server.build_audit_bundle = racing_build  # type: ignore[method-assign]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            with self.assertRaises(JobBuildSuperseded):
+                server.build_shared_job_bundle(
+                    server.current_template_artifacts(),
+                    worker(),
+                )
+            with server._job_cache_lock:
+                self.assertEqual(
+                    server._payout_ledger_append_invalidation_epoch, 1
+                )
+                self.assertIsNone(server._payout_ledger_artifact)
+
+            # A fresh build keyed to the advanced epoch re-reads the ledger
+            # and rediscovers the replayed row.
+            with server._job_cache_lock:
+                server._job_build_issued_at_ms.clear()
+            clock_ms[0] = 1_000_040
+            rebuilt = server.build_shared_job_bundle(
+                server.current_template_artifacts(),
+                worker(),
+            )
+        self.assertIn(
+            entry.pending_share.share_id,
+            {str(share["share_id"]) for share in rebuilt.shares_json},
+        )
+
+    def test_seeded_artifact_exposure_survives_until_install_fence(
+        self,
+    ) -> None:
+        # The synchronous build's exposed scan anchor rides its seeded
+        # artifact: a replayed row committing after the bundle returned but
+        # before cache publication installs the seed must advance the epoch,
+        # and the doomed seed's install fence must discard it (retiring the
+        # exposure) instead of arming the pre-append window.
+        server, _ledger, _artifacts = self.configured_server()
+        install_fake_bundle_builder(server)
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: 1_000_000,
+        ):
+            bundle = server.build_shared_job_bundle(
+                server.current_template_artifacts(),
+                worker(),
+            )
+            seed = bundle.prepared_ledger_artifact
+            assert seed is not None
+            self.assertIsNotNone(seed.inflight_scan_anchor_token)
+
+            entry = self.replay_shaped_append_entry(
+                accepted_at_ms=999_950,
+                block_hash_hex="77" * 32,
+            )
+            self.assertTrue(server._append_share_batch([entry]))
+            with server._job_cache_lock:
+                self.assertEqual(
+                    server._payout_ledger_append_invalidation_epoch, 1
+                )
+
+            self.assertFalse(server._install_payout_ledger_artifact(seed))
+        with server._job_cache_lock:
+            self.assertIsNone(server._payout_ledger_artifact)
+            self.assertEqual(server._payout_window_inflight_scan_anchors, {})
 
     def test_late_append_disarms_before_prepare_lock_is_available(self) -> None:
         server, _ledger, artifacts = self.configured_server()
