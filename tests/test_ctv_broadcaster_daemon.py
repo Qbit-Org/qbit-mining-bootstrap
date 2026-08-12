@@ -931,6 +931,90 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
                 self.assertEqual(constructed[0].requests, 1)
                 self.assertTrue(constructed[0].closed)
 
+    def test_json_rpc_enforces_wall_clock_deadline_on_slow_body(self) -> None:
+        # The socket timeout bounds each recv, not the call: a body dripping
+        # one packet per interval keeps every recv in-timeout while the call
+        # runs unbounded. Lease authority margins treat the timeout as a
+        # wall-clock cap on fence-guarded effects, so the deadline watchdog
+        # must sever the connection and surface a TimeoutError instead.
+        severed = threading.Event()
+
+        class DrippingResponse:
+            status = 200
+
+            def read(self) -> bytes:
+                # Blocks like a slow-dripping body until the watchdog severs
+                # the connection, then fails like a closed socket would.
+                severed.wait(5)
+                raise ConnectionResetError("connection severed")
+
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.sock = object()
+
+            def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
+                return None
+
+            def getresponse(self) -> DrippingResponse:
+                return DrippingResponse()
+
+            def close(self) -> None:
+                severed.set()
+
+        rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
+        with patch("http.client.HTTPConnection", FakeConnection):
+            with self.assertRaisesRegex(TimeoutError, "timed out"):
+                rpc.call("getbestblockhash", timeout=0.2)
+
+    def test_json_rpc_deadline_covers_socket_created_after_stall(self) -> None:
+        # A stalled name resolution has no socket for the watchdog to sever;
+        # the socket connect() creates afterwards must not carry the RPC past
+        # its deadline. The watchdog keeps severing until the attempt
+        # observes the abort, so the late-created socket dies too.
+        close_calls: list[float] = []
+
+        class FakeSock:
+            def __init__(self) -> None:
+                self.shutdown_calls = 0
+
+            def shutdown(self, how: int) -> None:
+                self.shutdown_calls += 1
+
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.sock: FakeSock | None = None
+
+            def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
+                # Stall past the deadline with no socket published (DNS),
+                # then publish the socket connect() would create and block
+                # like an in-flight send until the watchdog severs it.
+                threading.Event().wait(0.45)
+                sock = FakeSock()
+                self.sock = sock
+                pacing = threading.Event()
+                for _ in range(100):
+                    if sock.shutdown_calls:
+                        return
+                    pacing.wait(0.05)
+
+            def getresponse(self) -> object:
+                # The next socket operation observes the late sever.
+                sock = self.sock
+                if close_calls and sock is not None and sock.shutdown_calls:
+                    raise ConnectionResetError("connection severed")
+                raise AssertionError("late-created socket was never severed")
+
+            def close(self) -> None:
+                close_calls.append(1.0)
+
+        rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
+        with patch("http.client.HTTPConnection", FakeConnection):
+            with self.assertRaisesRegex(TimeoutError, "timed out"):
+                rpc.call("getbestblockhash", timeout=0.2)
+        # The watchdog severed at least once before the socket existed and
+        # again after it appeared.
+        self.assertGreaterEqual(len(close_calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

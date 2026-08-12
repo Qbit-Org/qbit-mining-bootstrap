@@ -1319,31 +1319,45 @@ class JsonRpc:
             # interval extends the call arbitrarily past its nominal
             # deadline. Lease authority margins are sized from this
             # timeout as a wall-clock bound on fence-guarded effects, so
-            # enforce it end-to-end: a watchdog severs the socket at the
-            # deadline and the blocked operation surfaces as a timeout.
-            # For mutating calls that is the same uncertain outcome a
-            # socket timeout already produces, reconciled by durable
-            # replay as a new fully fenced operation.
+            # enforce it end-to-end: past the deadline a watchdog severs
+            # the connection's socket — repeatedly, because a stalled name
+            # resolution has no socket yet and the one connect() creates
+            # afterwards must not carry the RPC onward — until the attempt
+            # observes the abort as a transport error. For mutating calls
+            # that is the same uncertain outcome a socket timeout already
+            # produces, reconciled by durable replay as a new fully fenced
+            # operation.
             watchdog_fired = threading.Event()
+            attempt_finished = threading.Event()
 
-            def _sever_connection(
+            def _enforce_deadline(
                 doomed: http.client.HTTPConnection = conn,
                 fired: threading.Event = watchdog_fired,
+                finished: threading.Event = attempt_finished,
+                allowance: float = remaining + 0.1,
             ) -> None:
+                if finished.wait(allowance):
+                    return
                 fired.set()
-                sock = getattr(doomed, "sock", None)
-                if sock is not None:
+                while True:
+                    sock = getattr(doomed, "sock", None)
+                    if sock is not None:
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
                     try:
-                        sock.shutdown(socket.SHUT_RDWR)
-                    except OSError:
+                        doomed.close()
+                    except Exception:
                         pass
-                try:
-                    doomed.close()
-                except Exception:
-                    pass
+                    if finished.wait(0.1):
+                        return
 
-            watchdog = threading.Timer(remaining + 0.1, _sever_connection)
-            watchdog.daemon = True
+            watchdog = threading.Thread(
+                target=_enforce_deadline,
+                name="qbit-rpc-deadline",
+                daemon=True,
+            )
             watchdog.start()
             try:
                 conn.request("POST", path, body=body, headers=headers)
@@ -1358,7 +1372,7 @@ class JsonRpc:
                     continue
                 raise
             finally:
-                watchdog.cancel()
+                attempt_finished.set()
             if response.status != 200:
                 # Non-200 bodies may hold a JSON-RPC error (qbitd returns the
                 # error object with a 500 for some methods); surface it as the
