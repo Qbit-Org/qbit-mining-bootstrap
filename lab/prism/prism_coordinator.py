@@ -470,6 +470,11 @@ DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 # stays unbounded by design so an already-offered block is never converted
 # back into a raw-submit retry.
 DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH = 8
+# The default deadline for every JsonRpc.call without an explicit timeout,
+# including the fence-guarded CTV broadcast RPCs. The ledger's own-write
+# deferral margin is derived from the guarded deadlines, so route changes
+# through this constant rather than the call signature's literal.
+DEFAULT_QBIT_RPC_CALL_TIMEOUT_SECONDS = 10.0
 # The node fast lane is intentionally shorter than the normal ten-second RPC
 # budget: an ambiguous timeout leaves the durable outbox pending and replay
 # safely submits the same hash again.
@@ -1263,7 +1268,7 @@ class JsonRpc:
         params: list[object] | None = None,
         *,
         wallet: str | None = None,
-        timeout: float = 10,
+        timeout: float = DEFAULT_QBIT_RPC_CALL_TIMEOUT_SECONDS,
     ) -> Any:
         body = json.dumps(
             {
@@ -4008,6 +4013,23 @@ class PrismCoordinator:
             writer_session_token=writer_session_token,
             initialize_schema=env("PRISM_POSTGRES_INIT_SCHEMA", "0") in {"1", "true", "yes"},
             lease_ttl_seconds=env_positive_float("PRISM_LEDGER_LEASE_TTL_SECONDS", 60.0),
+            # The own-write deferral margin must cover the longest RPC the
+            # lease fence can authorize — submitblock's dedicated deadline
+            # and the CTV broadcast RPCs riding JsonRpc.call's default —
+            # doubled for transport-retry and scheduling slop. The ledger
+            # floors this at half the TTL, so short deadlines keep today's
+            # behavior and only an operator raising a guarded deadline
+            # widens the deferral window with it.
+            lease_authority_margin_seconds=2.0 * max(
+                float(
+                    getattr(
+                        self,
+                        "block_submit_rpc_timeout_seconds",
+                        DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS,
+                    )
+                ),
+                DEFAULT_QBIT_RPC_CALL_TIMEOUT_SECONDS,
+            ),
             read_concurrency=env_positive_int("PRISM_POSTGRES_READ_CONCURRENCY", 4),
             accepted_stats_cache_seconds=env_nonnegative_float("PRISM_ACCEPTED_STATS_CACHE_SECONDS", 60.0),
             reward_window_cache_seconds=env_nonnegative_float("PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS", 30.0),

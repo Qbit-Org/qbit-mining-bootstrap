@@ -1218,6 +1218,7 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger._writer_session_token = session
         ledger._pool_application_name = "qbit-prism-writer-test-pool"
         ledger._lease_interval_sql = "make_interval(secs => 60.0)"
+        ledger._lease_authority_margin_sql = "make_interval(secs => 30.0)"
         ledger._writer_lease_guard = guard
         return ledger
 
@@ -1323,7 +1324,7 @@ class PrismShareLedgerTests(unittest.TestCase):
         # a nearly-lapsed row defers external side effects before its
         # authority degenerates into a rollback-dependent argument.
         self.assertIn(
-            "<= clock_timestamp() + (make_interval(secs => 60.0)) / 2.0",
+            "<= clock_timestamp() + make_interval(secs => 30.0)",
             statement,
         )
         # And it must attribute the lease tuple's locker, so this process's
@@ -1666,6 +1667,26 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(result["verified_count"], 1)
         self.assertEqual(result["renewed_count"], 0)
         self.assertIs(result["renewal_deferred_to_own_write"], False)
+
+    def test_lease_authority_margin_covers_guarded_rpc_deadlines(self) -> None:
+        """The deferral margin floors at TTL/2 and rises with RPC deadlines.
+
+        The margin must cover the longest RPC the lease fence can
+        authorize, or an effect authorized just above the margin outlives
+        its runway and degenerates into rollback-dependent authority. The
+        floor keeps the deferral engaged through the eroded tail of a long
+        own write even when configured deadlines are short; a margin at or
+        above the TTL defers every own-write skip — the honest consequence
+        of a guarded effect that can outlast the whole lease.
+        """
+        resolve = PsqlShareLedger._resolve_lease_authority_margin_seconds
+        self.assertEqual(resolve(60.0, None), 30.0)
+        self.assertEqual(resolve(60.0, 20.0), 30.0)
+        self.assertEqual(resolve(60.0, 90.0), 90.0)
+        with self.assertRaises(ValueError):
+            resolve(60.0, float("nan"))
+        with self.assertRaises(ValueError):
+            resolve(60.0, -1.0)
 
     def test_guard_verification_rechecks_when_own_commit_clears_locker_attribution(
         self,

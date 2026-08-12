@@ -1891,6 +1891,34 @@ class PsqlShareLedger:
 
     durable_payout_state = True
 
+    @staticmethod
+    def _resolve_lease_authority_margin_seconds(
+        lease_ttl_seconds: float,
+        lease_authority_margin_seconds: float | None,
+    ) -> float:
+        """Resolve the own-write deferral margin for external side effects.
+
+        Never below half the lease TTL: that floor keeps the deferral
+        engaged through the eroded tail of a long own fenced write even
+        when the configured guarded-RPC deadlines are short. A caller
+        supplies a larger margin when its longest fence-guarded RPC could
+        outlast the floor — the margin must cover the longest effect the
+        fence can authorize, or the effect outlives its runway and
+        degenerates into rollback-dependent authority. A margin at or
+        above the TTL makes every own-write skip defer, which is the
+        honest consequence of a guarded effect that can outlast the whole
+        lease.
+        """
+        floor = lease_ttl_seconds / 2.0
+        if lease_authority_margin_seconds is None:
+            return floor
+        margin = float(lease_authority_margin_seconds)
+        if not math.isfinite(margin) or margin < 0:
+            raise ValueError(
+                "lease_authority_margin_seconds must be finite and non-negative"
+            )
+        return max(floor, margin)
+
     def __init__(
         self,
         *,
@@ -1905,6 +1933,7 @@ class PsqlShareLedger:
         lease_retry_sleep: Callable[[float], None] | None = None,
         lease_retry_max_sleep_seconds: float = 15.0,
         lease_ttl_seconds: float = 60.0,
+        lease_authority_margin_seconds: float | None = None,
         lease_adoption_silence_seconds: float = DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
         read_concurrency: int = 4,
         accepted_stats_cache_seconds: float = 60.0,
@@ -1929,6 +1958,12 @@ class PsqlShareLedger:
         lease_ttl_seconds = float(lease_ttl_seconds)
         if not math.isfinite(lease_ttl_seconds) or lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be finite and positive")
+        lease_authority_margin_seconds = (
+            self._resolve_lease_authority_margin_seconds(
+                lease_ttl_seconds,
+                lease_authority_margin_seconds,
+            )
+        )
         lease_adoption_silence_seconds = float(lease_adoption_silence_seconds)
         if (
             not math.isfinite(lease_adoption_silence_seconds)
@@ -1958,6 +1993,14 @@ class PsqlShareLedger:
         # after an *ungraceful* crash. Graceful shutdown releases the lease
         # outright (see release_writer_lease), making restarts near-instant.
         self._lease_interval_sql = f"make_interval(secs => {lease_ttl_seconds})"
+        self._lease_authority_margin_seconds = lease_authority_margin_seconds
+        # SQL fragment for the own-write deferral margin (see
+        # verify_writer_lease_guard_session): an own-write renewal skip over
+        # a committed row with less than this much TTL remaining defers
+        # external side effects instead of authorizing them.
+        self._lease_authority_margin_sql = (
+            f"make_interval(secs => {lease_authority_margin_seconds})"
+        )
         self._lease_retry_sleep = lease_retry_sleep or time.sleep
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
@@ -7578,18 +7621,23 @@ SELECT COALESCE(
         TTL) or fails closed. The heartbeat may keep treating it as live.
 
         The deferral engages before expiry as well: an own-write skip over
-        a committed row with less than half the lease TTL remaining also
+        a committed row with less than the authority margin remaining also
         defers. An RPC authorized on a nearly-lapsed row can outlive it,
         and from expiry onward its authority degenerates into the same
         rollback-dependent argument — the TTL erodes exactly while a long
-        own write withholds renewals, so the margin shrinks precisely when
-        the write's fate is least certain. Skips over a row with at least
-        half the TTL remaining keep authorizing on the committed row's own
-        standalone validity: every fenced commit refreshes the TTL, so
-        steady write traffic never erodes the margin, and deferring every
-        own-write skip would withhold submitblock and broadcasts behind
-        saturated append traffic — the submitter liveness the fast-lane
-        submit path exists to protect.
+        own write withholds renewals, so the runway shrinks precisely when
+        the write's fate is least certain. The margin is never below half
+        the lease TTL and is raised by the coordinator to cover its
+        longest fence-guarded RPC deadline (see
+        ``_resolve_lease_authority_margin_seconds``), so every authorized
+        effect completes within the committed row's remaining validity.
+        Skips over a row with at least the margin remaining keep
+        authorizing on the committed row's own standalone validity: every
+        fenced commit refreshes the TTL, so steady write traffic never
+        erodes the runway, and deferring every own-write skip would
+        withhold submitblock and broadcasts behind saturated append
+        traffic — the submitter liveness the fast-lane submit path exists
+        to protect.
 
         ``on_query_start`` fires once the guarded session's serialized query
         slot is acquired, letting callers budget queue wait separately from
@@ -7675,7 +7723,7 @@ SELECT json_build_object(
           AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
           AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
           AND qbit_ledger_writer_lease.lease_expires_at
-              <= clock_timestamp() + ({self._lease_interval_sql}) / 2.0
+              <= clock_timestamp() + {self._lease_authority_margin_sql}
     ),
     'lease_locked_by_this_process', EXISTS (
         SELECT 1
