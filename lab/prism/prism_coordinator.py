@@ -12688,6 +12688,72 @@ class PrismCoordinator:
         """
         self._ledger_lease_heartbeat_last_progress_monotonic = time.monotonic()
 
+    def _record_ledger_lease_heartbeat_server_proven(self) -> None:
+        """Stamp a completed server round trip: progress plus the envelope edge.
+
+        Client-side progress marks (attempt start, query-slot acquisition)
+        keep a lawfully slow verification alive under the monitor, but they
+        can postdate a silent guard-session death by up to one idle
+        interval, so they cannot carry the adoption-envelope guarantee
+        (hard exit completes before a replacement's silence window can
+        elapse). Only a response actually received from PostgreSQL — a
+        completed statement round trip or a whole verification — proves
+        the session was alive approximately now, so only these sites stamp
+        the server-proven edge the monitor's envelope cap measures from.
+        """
+        now = time.monotonic()
+        self._ledger_lease_heartbeat_last_progress_monotonic = now
+        self._ledger_lease_heartbeat_last_server_proven_monotonic = now
+
+    def _ledger_lease_adoption_silence_seconds(self) -> float:
+        """Resolve the ledger's adoption-silence window for timing checks.
+
+        PsqlShareLedger keeps the value on a private attribute with no
+        public alias; read both spellings so operator overrides actually
+        reach the misconfiguration warning and the monitor's envelope cap
+        instead of silently comparing against the compiled default.
+        """
+        ledger = getattr(self, "ledger", None)
+        for name in (
+            "lease_adoption_silence_seconds",
+            "_lease_adoption_silence_seconds",
+        ):
+            value = getattr(ledger, name, None)
+            if value:
+                return float(value)
+        return float(DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS)
+
+    def _ledger_lease_heartbeat_activity_age_seconds(self) -> float:
+        """Age of the newest monitor-visible heartbeat activity mark.
+
+        The success timestamp is deliberately the call-start edge (authority
+        freshness must never look newer than what PostgreSQL proved), so it
+        alone cannot answer "is the heartbeat advancing?": back-to-back
+        verifications that each lawfully approach the statement budget age
+        the freshest success edge by two call durations plus the idle
+        interval, and a budget sized for one statement would hard-exit a
+        healthy sole writer. Staleness enforcers therefore measure silence
+        from the newest of the success edge and the progress mark, which
+        carries attempt starts, query-slot acquisition, statement round
+        trips, and completions. A verification that stops advancing stops
+        stamping, so a wedged statement still ages out on the same budget.
+        """
+        last_success = float(
+            getattr(
+                self,
+                "_ledger_lease_heartbeat_last_success_monotonic",
+                time.monotonic(),
+            )
+        )
+        last_progress = float(
+            getattr(
+                self,
+                "_ledger_lease_heartbeat_last_progress_monotonic",
+                last_success,
+            )
+        )
+        return max(0.0, time.monotonic() - max(last_success, last_progress))
+
     @staticmethod
     def _ledger_lease_guard_session_verifier(
         ledger: object,
@@ -12748,6 +12814,9 @@ class PrismCoordinator:
         self._ledger_lease_heartbeat_last_success_monotonic = (
             armed_started_monotonic
         )
+        self._ledger_lease_heartbeat_last_server_proven_monotonic = (
+            armed_started_monotonic
+        )
         self._ledger_lease_heartbeat_failed = threading.Event()
         self._ledger_lease_heartbeat_failure_lock = threading.Lock()
         self._ledger_lease_heartbeat_ready = threading.Event()
@@ -12773,10 +12842,64 @@ class PrismCoordinator:
                 DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_FAILURE_SECONDS,
             )
         )
+        interval_seconds = float(
+            getattr(
+                self,
+                "ledger_lease_heartbeat_seconds",
+                DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_SECONDS,
+            )
+        )
+        silence_seconds = self._ledger_lease_adoption_silence_seconds()
+        monitor_seconds = float(
+            getattr(
+                self,
+                "ledger_lease_heartbeat_monitor_seconds",
+                DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_MONITOR_SECONDS,
+            )
+        )
+        exit_seconds = float(
+            getattr(
+                self,
+                "ledger_lease_heartbeat_exit_timeout_seconds",
+                DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_EXIT_TIMEOUT_SECONDS,
+            )
+        )
+        if (
+            failure_seconds <= interval_seconds
+            or silence_seconds
+            <= failure_seconds + exit_seconds + 2.0 * monitor_seconds
+        ):
+            # The hard-exit ordering argument needs interval < budget (one
+            # idle wait must not exhaust the budget) and enough headroom
+            # between the budget and the adoption silence for the monitor's
+            # server-proven envelope cap to fit its poll and exit costs
+            # (this process must be gone before a replacement may CAS).
+            # The derived defaults satisfy both; only operator overrides
+            # can break them, so warn rather than refuse.
+            print(
+                "prism coordinator: ledger lease heartbeat timing is "
+                f"misconfigured: failure budget {failure_seconds:g}s must "
+                f"exceed the heartbeat interval {interval_seconds:g}s and "
+                f"leave the adoption silence {silence_seconds:g}s at least "
+                f"{exit_seconds + 2.0 * monitor_seconds:g}s of envelope "
+                "headroom; continuing, but hard-exit is no longer "
+                "guaranteed to precede replacement adoption",
+                flush=True,
+            )
+        # The startup fencing deadline measures silence from the newest
+        # monitor-visible activity, not from arming: a first verification
+        # that is legally slower than the whole budget end-to-end but
+        # demonstrably advancing (queue wait, then a statement round trip
+        # near the guard's statement timeout) is not a wedged first beat.
+        # A genuinely stuck first statement stamps nothing and ages out on
+        # the same budget the monitor enforces.
         while not self._ledger_lease_heartbeat_ready.wait(0.01):
             if self._ledger_lease_heartbeat_failed.is_set():
                 return None
-            if time.monotonic() - armed_started_monotonic < failure_seconds:
+            if (
+                self._ledger_lease_heartbeat_activity_age_seconds()
+                < failure_seconds
+            ):
                 continue
             self._ledger_lease_heartbeat_hard_exit(
                 "prism coordinator: initial ledger lease heartbeat did not "
@@ -12868,22 +12991,47 @@ class PrismCoordinator:
         # round trip instead of hard-exiting a healthy coordinator mid-way
         # through a lawful recheck.
         try:
-            verify_reports_statement_progress = (
-                "on_statement_progress" in inspect.signature(verify).parameters
-            )
+            verify_parameters = inspect.signature(verify).parameters
         except (TypeError, ValueError):
-            verify_reports_statement_progress = False
+            verify_parameters = {}
+        verify_reports_query_start = "on_query_start" in verify_parameters
+        verify_reports_statement_progress = (
+            "on_statement_progress" in verify_parameters
+        )
         while not heartbeat_stop.is_set():
             verify_started_monotonic = time.monotonic()
+            # An advancing verification is monitor-visible activity. The
+            # failure budget is sized for one statement round trip, so the
+            # monitor must measure silence between demonstrable steps of a
+            # verification (attempt start, query-slot acquisition, statement
+            # progress, completion), never between success edges: those are
+            # call-start times, so back-to-back verifications that each
+            # lawfully approach the statement budget age the freshest edge
+            # by two call durations plus the idle interval and the monitor
+            # would hard-exit a healthy sole writer. Progress marks feed
+            # only the staleness monitor — authority freshness still moves
+            # exclusively on the conservative success edge below. The
+            # attempt-start and slot-acquisition marks are client-side and
+            # can postdate a silent guard-session death by at most one idle
+            # interval, so they carry only the liveness budget; the
+            # adoption envelope (hard exit before a replacement's silence
+            # window elapses) is enforced separately by the monitor's
+            # server-proven cap, which measures from completed round trips
+            # alone. During any such hang the external-effect fence also
+            # queues behind the hung statement and fails closed, so no new
+            # external effect authorizes while the monitor ages out.
+            self._record_ledger_lease_heartbeat_progress()
+            verify_kwargs: dict[str, Callable[[], None]] = {}
+            if verify_reports_query_start:
+                verify_kwargs["on_query_start"] = (
+                    self._record_ledger_lease_heartbeat_progress
+                )
+            if verify_reports_statement_progress:
+                verify_kwargs["on_statement_progress"] = (
+                    self._record_ledger_lease_heartbeat_server_proven
+                )
             try:
-                if verify_reports_statement_progress:
-                    verify(
-                        on_statement_progress=(
-                            self._record_ledger_lease_heartbeat_progress
-                        )
-                    )
-                else:
-                    verify()
+                verify(**verify_kwargs)
             except Exception:
                 self._ledger_lease_heartbeat_hard_exit(
                     "prism coordinator: ledger lease heartbeat failed; "
@@ -12898,6 +13046,11 @@ class PrismCoordinator:
             self._record_ledger_lease_heartbeat_success(
                 verify_started_monotonic
             )
+            # Completion is the newest demonstrable activity and a real
+            # server response; the monitor may observe it even though
+            # authority freshness stays pinned to the call-start edge
+            # recorded above.
+            self._record_ledger_lease_heartbeat_server_proven()
             ready = getattr(self, "_ledger_lease_heartbeat_ready", None)
             if ready is not None:
                 ready.set()
@@ -12927,37 +13080,61 @@ class PrismCoordinator:
         if heartbeat_stop is None:
             heartbeat_stop = threading.Event()
             self._ledger_lease_heartbeat_stop_event = heartbeat_stop
+        # The adoption-envelope cap: the client-side progress marks that
+        # keep a lawfully slow verification alive can postdate a silent
+        # guard-session death by up to one idle interval, which with the
+        # derived defaults (interval + budget = silence) would let the
+        # hard exit land at or after a replacement's CAS eligibility.
+        # Server-proven marks cannot postdate the death, so a second bound
+        # measured from them — sized to leave room for one monitor poll on
+        # each side plus the hard-exit budget inside the silence window —
+        # restores exit-before-adoption regardless of client marks. It is
+        # floored at the failure budget so a misconfigured (warned) tiny
+        # silence degrades to the plain liveness bound instead of killing
+        # lawful single-statement verifications.
+        exit_seconds = float(
+            getattr(
+                self,
+                "ledger_lease_heartbeat_exit_timeout_seconds",
+                DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_EXIT_TIMEOUT_SECONDS,
+            )
+        )
+        server_cap_seconds = max(
+            failure_seconds,
+            self._ledger_lease_adoption_silence_seconds()
+            - exit_seconds
+            - 2.0 * monitor_seconds,
+        )
         while not heartbeat_stop.wait(monitor_seconds):
-            last_success = float(
+            # Mid-verification progress counts: the budget — sized for one
+            # statement so it stays under the adoption silence — cannot
+            # absorb a whole multi-step verification, and each demonstrable
+            # step (attempt start, slot acquisition, statement round trip,
+            # completion) is the advancing-heartbeat evidence this monitor
+            # watches for. A wedged statement records nothing and still
+            # ages out.
+            age_seconds = self._ledger_lease_heartbeat_activity_age_seconds()
+            last_server_proven = float(
                 getattr(
                     self,
-                    "_ledger_lease_heartbeat_last_success_monotonic",
+                    "_ledger_lease_heartbeat_last_server_proven_monotonic",
                     time.monotonic(),
                 )
             )
-            # Mid-verification progress counts: a lawful attribution
-            # recheck runs a second statement whose duration this budget —
-            # sized for one statement so it stays under the adoption
-            # silence — cannot absorb, and the completed first round trip
-            # is the same session-answers evidence a success proves. A
-            # wedged statement records neither and still ages out.
-            last_progress = float(
-                getattr(
-                    self,
-                    "_ledger_lease_heartbeat_last_progress_monotonic",
-                    last_success,
-                )
-            )
-            age_seconds = max(
+            server_age_seconds = max(
                 0.0,
-                time.monotonic() - max(last_success, last_progress),
+                time.monotonic() - last_server_proven,
             )
-            if age_seconds < failure_seconds:
+            if (
+                age_seconds < failure_seconds
+                and server_age_seconds < server_cap_seconds
+            ):
                 continue
             self._ledger_lease_heartbeat_hard_exit(
                 "prism coordinator: ledger lease heartbeat stopped making "
-                f"progress for {age_seconds:.3f}s; hard-exiting before its "
-                "session becomes fast-adoptable",
+                f"progress for {age_seconds:.3f}s "
+                f"(server-proven {server_age_seconds:.3f}s); hard-exiting "
+                "before its session becomes fast-adoptable",
                 include_traceback=False,
             )
             return
@@ -13125,7 +13302,7 @@ class PrismCoordinator:
                     verify_kwargs["on_query_start"] = query_started.set
                 if verify_reports_statement_progress:
                     verify_kwargs["on_statement_progress"] = (
-                        self._record_ledger_lease_heartbeat_progress
+                        self._record_ledger_lease_heartbeat_server_proven
                     )
                 result = verify(**verify_kwargs)
             except BaseException as exc:
@@ -13199,10 +13376,13 @@ class PrismCoordinator:
             ) from error
 
         # Use the call-start time so scheduler delay never makes this success
-        # appear fresher than the database response actually proves.
+        # appear fresher than the database response actually proves. The
+        # response itself is a fresh server round trip, so the monitor's
+        # envelope cap may take it at receipt time.
         self._record_ledger_lease_heartbeat_success(
             verification_started_monotonic
         )
+        self._record_ledger_lease_heartbeat_server_proven()
 
         # A verification that proved liveness only because the writer's own
         # fenced write holds the expired lease row is not authority for an

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import signal
 import threading
 import time
@@ -762,6 +763,267 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
                 heartbeat_stop.set()
             if thread is not None:
                 thread.join(0.2)
+
+    def test_heartbeat_survives_steady_slow_but_successful_verifications(
+        self,
+    ) -> None:
+        """Regression: healthy-writer hard exit at legal verification latency.
+
+        The success timestamp is the call-start edge, so with steady
+        verification duration D the freshest edge reaches age 2D plus the
+        idle interval just before the next success lands. Keyed on success
+        edges alone (D=0.15, interval=0.05, budget=0.25 here), the monitor
+        fires ~0.35s into a run in which every verification succeeds. The
+        attempt-start and completion progress marks keep the observable
+        silence at D, so a sole writer whose statements stay inside their
+        legal budgets is never hard-exited.
+        """
+
+        class SlowVerifyLedger(RecordingLeaseLedger):
+            writer_lease_fast_adoption_capable = True
+            writer_lease_guard_required = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.verify_calls = 0
+
+            def verify_writer_lease_guard_session(
+                self,
+            ) -> dict[str, int | str]:
+                time.sleep(0.15)
+                self.verify_calls += 1
+                return {"backend": "recording", "verified_count": 1}
+
+        ledger = SlowVerifyLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.05
+        server.ledger_lease_heartbeat_failure_seconds = 0.25
+        server.ledger_lease_heartbeat_monitor_seconds = 0.01
+
+        with patch(
+            "lab.prism.prism_coordinator.os._exit",
+            side_effect=AssertionError("unexpected hard exit"),
+        ) as process_exit, patch.object(
+            server,
+            "_watchdog_hard_exit",
+        ) as hard_exit:
+            thread = server._start_ledger_lease_heartbeat()
+            self.assertIsNotNone(thread)
+            deadline = time.monotonic() + 2.0
+            while ledger.verify_calls < 4 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(ledger.verify_calls, 4)
+            assert thread is not None
+            self.assertTrue(thread.is_alive())
+            self.assertTrue(server._stop_ledger_lease_heartbeat())
+            thread.join(0.5)
+
+        process_exit.assert_not_called()
+        hard_exit.assert_not_called()
+
+    def test_slow_but_advancing_first_heartbeat_does_not_startup_exit(
+        self,
+    ) -> None:
+        """The startup fencing deadline keys on activity, not arming age.
+
+        A first verification whose end-to-end duration exceeds the whole
+        failure budget while every observable segment stays inside it
+        (queue wait, then a statement round trip) must arm the heartbeat
+        rather than hard-exit at startup. A genuinely wedged first beat
+        still ages out because it stamps nothing.
+        """
+
+        class AdvancingFirstBeatLedger(RecordingLeaseLedger):
+            writer_lease_fast_adoption_capable = True
+            writer_lease_guard_required = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.saw_query_start = threading.Event()
+
+            def verify_writer_lease_guard_session(
+                self,
+                *,
+                on_query_start=None,
+            ) -> dict[str, int | str]:
+                time.sleep(0.10)
+                if on_query_start is not None:
+                    on_query_start()
+                    self.saw_query_start.set()
+                time.sleep(0.10)
+                return {"backend": "recording", "verified_count": 1}
+
+        ledger = AdvancingFirstBeatLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.05
+        server.ledger_lease_heartbeat_failure_seconds = 0.16
+        server.ledger_lease_heartbeat_monitor_seconds = 0.01
+
+        with patch(
+            "lab.prism.prism_coordinator.os._exit",
+            side_effect=AssertionError("unexpected hard exit"),
+        ) as process_exit, patch.object(
+            server,
+            "_watchdog_hard_exit",
+        ) as hard_exit:
+            thread = server._start_ledger_lease_heartbeat()
+            self.assertIsNotNone(thread)
+            self.assertTrue(ledger.saw_query_start.is_set())
+            assert thread is not None
+            self.assertTrue(server._stop_ledger_lease_heartbeat())
+            thread.join(0.5)
+
+        process_exit.assert_not_called()
+        hard_exit.assert_not_called()
+
+    def test_server_proven_cap_preserves_adoption_envelope_after_death(
+        self,
+    ) -> None:
+        """Client-side marks must not stretch hard exit past adoption.
+
+        A silent guard-session death leaves one attempt-start and one
+        query-slot mark up to an idle interval after the death, so the
+        plain activity budget alone would fire only at
+        death + interval + budget — past a replacement's CAS eligibility
+        when interval + budget reaches the adoption silence. The
+        server-proven cap measures from completed round trips, which
+        cannot postdate the death, and must fire first (cap 0.265s here
+        versus interval + budget = 0.30s).
+        """
+        first_done = threading.Event()
+        release_hang = threading.Event()
+        calls: list[int] = []
+
+        class DyingSessionLedger(RecordingLeaseLedger):
+            writer_lease_fast_adoption_capable = True
+            writer_lease_guard_required = True
+            _lease_adoption_silence_seconds = 0.28
+
+            def verify_writer_lease_guard_session(
+                self,
+                *,
+                on_query_start=None,
+            ) -> dict[str, int | str]:
+                calls.append(len(calls))
+                if on_query_start is not None:
+                    on_query_start()
+                if len(calls) == 1:
+                    first_done.set()
+                    return {"backend": "recording", "verified_count": 1}
+                # The guard session died silently between beats: this
+                # statement black-holes with no error and no response.
+                release_hang.wait(5.0)
+                return {"backend": "recording", "verified_count": 1}
+
+        ledger = DyingSessionLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.05
+        server.ledger_lease_heartbeat_failure_seconds = 0.25
+        server.ledger_lease_heartbeat_monitor_seconds = 0.005
+        server.ledger_lease_heartbeat_exit_timeout_seconds = 0.005
+        thread: threading.Thread | None = None
+
+        try:
+            with patch("builtins.print"), patch.object(
+                server,
+                "_watchdog_hard_exit",
+            ) as hard_exit:
+                thread = server._start_ledger_lease_heartbeat()
+                self.assertIsNotNone(thread)
+                self.assertTrue(first_done.wait(0.5))
+                deadline = time.monotonic() + 1.0
+                while not hard_exit.called and time.monotonic() < deadline:
+                    time.sleep(0.002)
+                self.assertTrue(hard_exit.called)
+            reason = str(
+                getattr(server, "_ledger_lease_heartbeat_failure_reason", "")
+            )
+            match = re.search(
+                r"progress for ([0-9.]+)s \(server-proven ([0-9.]+)s\)",
+                reason,
+            )
+            self.assertIsNotNone(match, reason)
+            assert match is not None
+            activity_age = float(match.group(1))
+            server_age = float(match.group(2))
+            # The cap fired on stale server evidence while the client
+            # marks were still inside the plain activity budget.
+            self.assertLess(activity_age, 0.25)
+            self.assertGreaterEqual(server_age, 0.26)
+        finally:
+            release_hang.set()
+            heartbeat_stop = getattr(
+                server,
+                "_ledger_lease_heartbeat_stop_event",
+                None,
+            )
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if thread is not None:
+                thread.join(0.5)
+
+    def test_heartbeat_warning_honors_private_silence_attribute(self) -> None:
+        class ShortSilenceLedger(GuardVerifyLeaseLedger):
+            _lease_adoption_silence_seconds = 0.5
+
+        ledger = ShortSilenceLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+
+        with patch("builtins.print") as printed:
+            thread = server._start_ledger_lease_heartbeat()
+            self.assertIsNotNone(thread)
+            self.assertTrue(server._stop_ledger_lease_heartbeat())
+        assert thread is not None
+        thread.join(0.2)
+        warnings = [
+            call.args[0]
+            for call in printed.call_args_list
+            if call.args
+            and "heartbeat timing is misconfigured" in str(call.args[0])
+        ]
+        # The default 0.75s budget leaves no envelope headroom under a
+        # 0.5s operator silence override stored on the ledger's private
+        # attribute; the warning must see it rather than the 1.0s default.
+        self.assertEqual(len(warnings), 1)
+
+    def test_heartbeat_timing_misconfiguration_warns_at_start(self) -> None:
+        ledger = GuardVerifyLeaseLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+        server.ledger_lease_heartbeat_failure_seconds = 1.5
+
+        with patch("builtins.print") as printed:
+            thread = server._start_ledger_lease_heartbeat()
+            self.assertIsNotNone(thread)
+            self.assertTrue(server._stop_ledger_lease_heartbeat())
+        assert thread is not None
+        thread.join(0.2)
+        warnings = [
+            call.args[0]
+            for call in printed.call_args_list
+            if call.args
+            and "heartbeat timing is misconfigured" in str(call.args[0])
+        ]
+        self.assertEqual(len(warnings), 1)
+
+    def test_heartbeat_default_timing_does_not_warn(self) -> None:
+        ledger = GuardVerifyLeaseLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+
+        with patch("builtins.print") as printed:
+            thread = server._start_ledger_lease_heartbeat()
+            self.assertIsNotNone(thread)
+            self.assertTrue(server._stop_ledger_lease_heartbeat())
+        assert thread is not None
+        thread.join(0.2)
+        for call in printed.call_args_list:
+            if call.args:
+                self.assertNotIn(
+                    "heartbeat timing is misconfigured",
+                    str(call.args[0]),
+                )
 
     def test_external_fence_reports_recheck_progress_to_the_monitor(
         self,
