@@ -25666,6 +25666,15 @@ class PrismCoordinator:
                 retained = {}
                 self._block_candidate_retained_node_submissions = retained
             retained[str(block_hash).lower()] = node_submission
+            stamped = getattr(
+                self,
+                "_block_candidate_retained_submission_monotonic",
+                None,
+            )
+            if stamped is None:
+                stamped = {}
+                self._block_candidate_retained_submission_monotonic = stamped
+            stamped[str(block_hash).lower()] = time.monotonic()
 
     def _retained_block_candidate_node_submission(
         self,
@@ -25680,6 +25689,43 @@ class PrismCoordinator:
             if not retained:
                 return None
             return retained.get(str(block_hash).lower())
+
+    def _block_candidate_acceptance_retained(self, block_hash: str) -> bool:
+        """Whether this process holds fresh first-party acceptance evidence.
+
+        The retained stash records only definitive submitblock successes,
+        so its presence proves qbitd accepted this candidate — evidence of
+        the same strength as a recent own-hash tip observation, and
+        available precisely when saturation makes the chain probes answer
+        "unknown" (the observation registry can be empty after a definitive
+        ack: blockwait only reports the newest of rapid connects). It ages
+        on the same window as tip observations: acceptance at offer time
+        does not prove the block stayed canonical, and an orphaned block
+        never probes False — it is merely absent — so a candidate whose
+        probes stay inconclusive past the window must regain
+        abandonability instead of deferring forever behind a stale ack.
+        """
+        with self.lock:
+            stamped = getattr(
+                self,
+                "_block_candidate_retained_submission_monotonic",
+                None,
+            )
+            if not stamped:
+                return False
+            recorded = stamped.get(str(block_hash).lower())
+        if recorded is None:
+            return False
+        window = float(
+            getattr(
+                self,
+                "observed_tip_accept_window_seconds",
+                DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,
+            )
+        )
+        if window <= 0:
+            return True
+        return (time.monotonic() - recorded) <= window
 
     def _clear_block_candidate_retry_state(self, block_hash: str) -> None:
         with self.lock:
@@ -25700,6 +25746,13 @@ class PrismCoordinator:
             )
             if retained is not None:
                 retained.pop(str(block_hash).lower(), None)
+            stamped = getattr(
+                self,
+                "_block_candidate_retained_submission_monotonic",
+                None,
+            )
+            if stamped is not None:
+                stamped.pop(str(block_hash).lower(), None)
 
     def _defer_block_candidate(self, reason: str, message: str, *, worker: str | None) -> None:
         """Record a retryable outcome without counting a terminal abandonment."""
@@ -25888,13 +25941,16 @@ class PrismCoordinator:
 
         Independent of that completed-tail record, a candidate whose own
         block hash is the fresh best tip, an active chain header at its
-        expected height, or a recent own-hash tip observation is an ACCEPTED
-        block whose finalization is still pending (for example after a lost
-        submitblock ack). Terminal abandonment would discard its payout
+        expected height, a recent own-hash tip observation, or a fresh
+        retained definitive submitblock success is an ACCEPTED block whose
+        finalization is still pending (for example after a lost submitblock
+        ack, or when saturation makes both probes answer "unknown" at this
+        instant). Terminal abandonment would discard its payout
         accounting and withdraw its landed preview -- fencing payout
         publication for work qbitd already accepted -- so such candidates
         defer for retry instead; only hashes provably absent from the active
-        chain (past the observation window) abandon terminally. The terminal
+        chain (past the observation and retained-acceptance windows)
+        abandon terminally. The terminal
         seal re-reads observation evidence atomically, so callers can order
         follow-up durable work (rejecting prepared payout rows) strictly
         afterward. Abandonment metrics commit only once that cleanup succeeds
@@ -25931,14 +25987,17 @@ class PrismCoordinator:
         )
         if chain_probe is True or (
             chain_probe is None
-            and self._block_candidate_acceptance_observed(block_hash)
+            and (
+                self._block_candidate_acceptance_observed(block_hash)
+                or self._block_candidate_acceptance_retained(block_hash)
+            )
         ):
             self._count_accept_pending_defer()
             self._defer_block_candidate(
                 PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
-                "candidate is on (or was recently observed as) the active "
-                f"chain; refusing terminal abandonment (was {reason}: "
-                f"{message})",
+                "candidate is on (or was recently observed or definitively "
+                "accepted as) the active chain; refusing terminal "
+                f"abandonment (was {reason}: {message})",
                 worker=worker,
             )
             return False
@@ -25987,8 +26046,13 @@ class PrismCoordinator:
                     late_probe is True
                     or (
                         late_probe is not False
-                        and self._block_candidate_acceptance_observed(
-                            block_hash
+                        and (
+                            self._block_candidate_acceptance_observed(
+                                block_hash
+                            )
+                            or self._block_candidate_acceptance_retained(
+                                block_hash
+                            )
                         )
                     )
                 )
@@ -26397,9 +26461,18 @@ class PrismCoordinator:
             if (
                 not already_active
                 and not getattr(context, "collection_only", False)
+                and not node_submission.attempted
                 and effective_append_epoch is not None
                 and effective_append_epoch != live_append_epoch
             ):
+                # Fail closed only while nothing has been offered: a
+                # fast-lane candidate already reached qbitd, so a moved
+                # epoch can no longer withhold its coinbase — the offer's
+                # own classification below decides (an error retries
+                # duplicate-safe, a rejection stays terminal, and an
+                # accepted or duplicate result proceeds to the post-offer
+                # fence, which keeps the as-issued snapshot for
+                # accounting).
                 self._abandon_block_candidate(
                     PRISM_REJECTION_STALE_JOB,
                     "payout window was invalidated by a late-visible share append",
@@ -26549,27 +26622,38 @@ class PrismCoordinator:
                 ):
                     # The fast lane offered this block to qbitd without any
                     # ledger synchronization, so the landing fence can no
-                    # longer gate submitblock itself. It still gates the
+                    # longer gate submitblock itself. It still orders the
                     # accounting decision: wait out any fenced predating
                     # append whose durable commit is in flight (the commit
-                    # holds this lock across its epoch bump) and fail closed
-                    # if the live epoch moved past the window this
-                    # candidate's coinbase paid.
+                    # holds this lock across its epoch bump). A moved epoch
+                    # is no longer terminal here, though: every candidate
+                    # reaching this point was accepted or already known by
+                    # the node (rejections returned above), so its coinbase
+                    # paid the as-issued window the moment it landed and no
+                    # rebuild can change it. Abandoning would permanently
+                    # discard payout accounting for a live block — the
+                    # ledger would then re-pay the same carried balances in
+                    # a later block — so the as-issued snapshot is kept for
+                    # accounting and the predating share simply rides the
+                    # next window (its ledger credit is untouched). The
+                    # active-height check below still owns the
+                    # did-it-actually-land verdict, and the pre-offer fence
+                    # above still fails closed while nothing has been
+                    # submitted.
                     with self._payout_append_landing_fence_lock:
                         with self._job_cache_lock:
                             live_append_epoch = int(
                                 self._payout_ledger_append_invalidation_epoch
                             )
                     if live_append_epoch != effective_append_epoch:
-                        self._abandon_block_candidate(
-                            PRISM_REJECTION_STALE_JOB,
-                            "payout window was invalidated by a late-visible share append",
-                            block_hash=block_hash,
-                            worker=worker,
-                            expected_height=expected_height,
-                            stale_job_class="append_epoch_stale",
+                        print(
+                            "prism coordinator: payout window was "
+                            "invalidated by a late-visible share append "
+                            f"after the node offer hash={block_hash}; "
+                            "keeping the as-issued payout snapshot for "
+                            "accounting",
+                            flush=True,
                         )
-                        return None
                 active_hash = str(
                     self.rpc.call("getblockhash", [expected_height])
                 ).lower()
