@@ -1331,11 +1331,17 @@ class JsonRpc:
             watchdog_fired = threading.Event()
             attempt_finished = threading.Event()
 
+            # The allowance is the attempt's exact remaining wall clock, no
+            # grace: callers like the submitblock hard-deadline wrapper
+            # abandon the call and release ordering locks (the payout
+            # landing fence) the instant their deadline passes, so a byte
+            # transmitted in any grace window would race work those callers
+            # already unblocked.
             def _enforce_deadline(
                 doomed: http.client.HTTPConnection = conn,
                 fired: threading.Event = watchdog_fired,
                 finished: threading.Event = attempt_finished,
-                allowance: float = remaining + 0.1,
+                allowance: float = remaining,
             ) -> None:
                 if finished.wait(allowance):
                     return
@@ -1368,11 +1374,16 @@ class JsonRpc:
                 # sendall(), and a short mutating POST can reach qbitd
                 # between the watchdog's periodic sweeps; the explicit
                 # check makes the late-connect case lose deterministically.
+                # The check is against the wall clock, not just the
+                # watchdog flag: the flag lags the deadline by thread
+                # scheduling, and a caller that abandoned this call at its
+                # deadline may already have released ordering locks that
+                # a post-deadline send would race.
                 if getattr(conn, "sock", None) is None:
                     conn_connect = getattr(conn, "connect", None)
                     if conn_connect is not None:
                         conn_connect()
-                if watchdog_fired.is_set():
+                if watchdog_fired.is_set() or time.monotonic() >= deadline:
                     raise TimeoutError(f"qbit RPC {method} timed out")
                 conn.request("POST", path, body=body, headers=headers)
                 response = conn.getresponse()
