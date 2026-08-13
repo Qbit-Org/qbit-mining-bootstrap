@@ -7672,9 +7672,15 @@ SELECT COALESCE(
         own write withholds renewals, so the runway shrinks precisely when
         the write's fate is least certain. The margin is never below half
         the lease TTL and is raised by the coordinator to cover its
-        longest fence-guarded RPC deadline (see
+        longest fence-guarded RPC deadline plus fixed headroom (see
         ``_resolve_lease_authority_margin_seconds``), so every authorized
-        effect completes within the committed row's remaining validity.
+        effect's transmission deadline — and, within the headroom, the
+        node's application of a fully received request — lands inside the
+        committed row's remaining validity. A node that stalls longer
+        than the headroom after complete receipt is the documented
+        residual of preflight fencing between independent systems; no
+        client-side deadline can cancel a handler the node already
+        received.
         Skips over a row with at least the margin remaining keep
         authorizing on the committed row's own standalone validity: every
         fenced commit refreshes the TTL, so steady write traffic never

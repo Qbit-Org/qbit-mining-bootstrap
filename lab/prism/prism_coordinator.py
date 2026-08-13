@@ -478,13 +478,21 @@ DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH = 8
 # through this constant rather than the call signature's literal.
 DEFAULT_QBIT_RPC_CALL_TIMEOUT_SECONDS = 10.0
 # Headroom added on top of the longest guarded RPC deadline when sizing the
-# ledger's own-write deferral margin: the scheduling gap between the fence
-# verification returning and the RPC's first byte, plus coordinator-vs-DB
-# clock drift (the lease runway is measured by clock_timestamp()). The RPC
-# itself can never exceed its own wall-clock deadline — mutating methods are
-# in _QBIT_RPC_NO_TRANSPORT_RETRY_METHODS and never retry, and retried read
-# paths share one deadline across attempts — so a multiplicative factor here
-# would only make the deferral needlessly eager as operators raise deadlines.
+# ledger's own-write deferral margin. It absorbs what the deadline itself
+# cannot: the scheduling gap between the fence verification returning and
+# the RPC's first byte, coordinator-vs-DB clock drift (the lease runway is
+# measured by clock_timestamp()), and the node's application tail — the
+# client-side deadline severs the socket, which bounds transmission but
+# cannot cancel a handler qbitd already received in full, and these RPC
+# handlers apply within milliseconds of complete receipt. The client side
+# of the RPC can never exceed its wall-clock deadline (mutating methods are
+# in _QBIT_RPC_NO_TRANSPORT_RETRY_METHODS and never retry; retried read
+# paths share one deadline across attempts), so a multiplicative factor
+# here would only make the deferral needlessly eager as operators raise
+# deadlines. A node that stalls longer than this headroom after fully
+# receiving a mutating request is the documented residual of preflight
+# fencing between independent systems (see the external-side-effect fence
+# docstring); no client-side teardown can bound it.
 LEASE_AUTHORITY_MARGIN_HEADROOM_SECONDS = 5.0
 # The node fast lane is intentionally shorter than the normal ten-second RPC
 # budget: an ambiguous timeout leaves the durable outbox pending and replay
