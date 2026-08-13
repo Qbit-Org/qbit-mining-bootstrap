@@ -1663,10 +1663,15 @@ class PrismShareLedgerTests(unittest.TestCase):
                 }
 
         ledger = self.guarded_verification_ledger(FreshTtlOwnWriteGuard())
-        result = ledger.verify_writer_lease_guard_session()
+        progress_marks: list[int] = []
+        result = ledger.verify_writer_lease_guard_session(
+            on_statement_progress=lambda: progress_marks.append(1),
+        )
         self.assertEqual(result["verified_count"], 1)
         self.assertEqual(result["renewed_count"], 0)
         self.assertIs(result["renewal_deferred_to_own_write"], False)
+        # A single-statement verification never reports statement progress.
+        self.assertEqual(progress_marks, [])
 
     def test_lease_authority_margin_covers_guarded_rpc_deadlines(self) -> None:
         """The deferral margin floors at TTL/2 and rises with RPC deadlines.
@@ -1749,13 +1754,18 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         guard = CommitRacedGuard()
         ledger = self.guarded_verification_ledger(guard)
+        progress_marks: list[int] = []
         result = ledger.verify_writer_lease_guard_session(
-            on_query_start=lambda: None
+            on_query_start=lambda: None,
+            on_statement_progress=lambda: progress_marks.append(1),
         )
         self.assertEqual(result["verified_count"], 1)
         self.assertEqual(result["renewed_count"], 1)
         self.assertIs(result["renewal_deferred_to_own_write"], False)
         self.assertEqual(len(guard.statements), 2)
+        # The recheck reported the completed first round trip, so liveness
+        # monitors sized for one statement can count it as progress.
+        self.assertEqual(progress_marks, [1])
         # The recheck runs inside the same serialized slot acquisition: it
         # can never queue behind other guard callers, so the only cost
         # charged to the caller's execution budget is one more statement,

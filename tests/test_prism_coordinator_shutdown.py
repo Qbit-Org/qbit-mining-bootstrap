@@ -763,6 +763,82 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             if thread is not None:
                 thread.join(0.2)
 
+    def test_recheck_statement_progress_keeps_monitor_from_hard_exiting(
+        self,
+    ) -> None:
+        """A lawful two-statement verification outlasts the failure budget.
+
+        The monitor's budget must stay under the adoption silence, so it is
+        sized for one statement; the attribution recheck's second statement
+        would age the last success past it (two in-deadline statements plus
+        the heartbeat interval exceed the budget below). The completed
+        first round trip is the same session-answers evidence a success
+        proves, so its progress mark must keep the monitor from restarting
+        a healthy coordinator, while a wedged statement — which reports no
+        progress — still ages out (previous test).
+        """
+        first_statement_seconds = 0.2
+        second_statement_seconds = 0.2
+
+        class RecheckingLedger(HeartbeatLeaseLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.verify_calls = 0
+                self.recheck_completed = threading.Event()
+
+            def verify_writer_lease_guard_session(
+                self,
+                *,
+                on_query_start=None,
+                on_statement_progress=None,
+            ) -> dict[str, int | str]:
+                if on_query_start is not None:
+                    on_query_start()
+                self.verify_calls += 1
+                if self.verify_calls == 1:
+                    # Seed the success stamp with a fast verification.
+                    return {"backend": "recording", "renewed_count": 1}
+                # The ambiguous shape: both statements individually within
+                # the guard's statement deadline, together past the
+                # monitor's failure budget.
+                time.sleep(first_statement_seconds)
+                if on_statement_progress is not None:
+                    on_statement_progress()
+                time.sleep(second_statement_seconds)
+                self.recheck_completed.set()
+                return {"backend": "recording", "renewed_count": 1}
+
+        ledger = RecheckingLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+        server.ledger_lease_heartbeat_failure_seconds = 0.3
+        server.ledger_lease_heartbeat_monitor_seconds = 0.005
+        thread: threading.Thread | None = None
+
+        try:
+            with patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=AssertionError("unexpected hard exit"),
+            ) as process_exit, patch.object(
+                server,
+                "_watchdog_hard_exit",
+            ) as hard_exit:
+                thread = server._start_ledger_lease_heartbeat()
+                self.assertIsNotNone(thread)
+                self.assertTrue(ledger.recheck_completed.wait(2))
+                process_exit.assert_not_called()
+                hard_exit.assert_not_called()
+        finally:
+            heartbeat_stop = getattr(
+                server,
+                "_ledger_lease_heartbeat_stop_event",
+                None,
+            )
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if thread is not None:
+                thread.join(1)
+
     def test_watchdog_exit_releases_on_fresh_thread_within_deadline(self) -> None:
         ledger = WatchdogLeaseLedger()
         server = coordinator(ledger)

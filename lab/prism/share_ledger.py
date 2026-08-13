@@ -7585,6 +7585,7 @@ SELECT COALESCE(
         self,
         *,
         on_query_start: Callable[[], None] | None = None,
+        on_statement_progress: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
         """Prove the guard session live; renew the TTL only without waiting.
 
@@ -7687,6 +7688,15 @@ SELECT COALESCE(
         statement execution. The attribution recheck happens within that
         one slot acquisition, so it neither re-fires the callback nor adds
         a queue wait to the caller's execution budget.
+
+        ``on_statement_progress`` fires when the recheck decides to run a
+        second statement: the first statement's full round trip has
+        completed, which is exactly the session-answers evidence a
+        liveness monitor watches for. Callers whose staleness budgets are
+        sized for one statement (the heartbeat monitor's failure window)
+        stamp progress here so a lawful two-statement verification is not
+        mistaken for a wedged heartbeat, while a genuinely stuck statement
+        still produces no progress at all.
         """
         if not self.writer_lease_fast_adoption_capable:
             raise RuntimeError("writer session is not heartbeat-capable")
@@ -7795,6 +7805,11 @@ SELECT json_build_object(
                 self._lease_renewal_ambiguously_lock_blocked(result)
             ):
                 attribution_rechecks_left -= 1
+                if on_statement_progress is not None:
+                    # The first statement's round trip just completed;
+                    # liveness monitors must count it before the second
+                    # statement's execution starts consuming their budget.
+                    on_statement_progress()
                 return sql
             return None
 

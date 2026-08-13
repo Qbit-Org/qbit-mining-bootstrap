@@ -12644,6 +12644,21 @@ class PrismCoordinator:
                     renewal_started_monotonic
                 )
 
+    def _record_ledger_lease_heartbeat_progress(self) -> None:
+        """Stamp mid-verification progress for the staleness monitor only.
+
+        Fires from inside verify_writer_lease_guard_session when its
+        attribution recheck runs a second statement: the first statement's
+        round trip completed, proving the heartbeat machinery is making
+        progress. Deliberately separate from the success timestamp — the
+        verification has not yet reached a verdict, so nothing that treats
+        success as authorization freshness may observe this mark. Only the
+        heartbeat monitor reads it, so a lawful two-statement verification
+        is not mistaken for a wedged heartbeat while a genuinely stuck
+        statement still ages toward the failure budget unimpeded.
+        """
+        self._ledger_lease_heartbeat_last_progress_monotonic = time.monotonic()
+
     @staticmethod
     def _ledger_lease_guard_session_verifier(
         ledger: object,
@@ -12816,10 +12831,30 @@ class PrismCoordinator:
         if heartbeat_stop is None:
             heartbeat_stop = threading.Event()
             self._ledger_lease_heartbeat_stop_event = heartbeat_stop
+        # The verification may lawfully run a second statement (the
+        # attribution recheck) whose duration the monitor's failure budget
+        # cannot absorb — that budget must stay under the adoption silence,
+        # so it is sized for one statement. A verification that reports
+        # per-statement progress lets the monitor count the completed first
+        # round trip instead of hard-exiting a healthy coordinator mid-way
+        # through a lawful recheck.
+        try:
+            verify_reports_statement_progress = (
+                "on_statement_progress" in inspect.signature(verify).parameters
+            )
+        except (TypeError, ValueError):
+            verify_reports_statement_progress = False
         while not heartbeat_stop.is_set():
             verify_started_monotonic = time.monotonic()
             try:
-                verify()
+                if verify_reports_statement_progress:
+                    verify(
+                        on_statement_progress=(
+                            self._record_ledger_lease_heartbeat_progress
+                        )
+                    )
+                else:
+                    verify()
             except Exception:
                 self._ledger_lease_heartbeat_hard_exit(
                     "prism coordinator: ledger lease heartbeat failed; "
@@ -12871,7 +12906,23 @@ class PrismCoordinator:
                     time.monotonic(),
                 )
             )
-            age_seconds = max(0.0, time.monotonic() - last_success)
+            # Mid-verification progress counts: a lawful attribution
+            # recheck runs a second statement whose duration this budget —
+            # sized for one statement so it stays under the adoption
+            # silence — cannot absorb, and the completed first round trip
+            # is the same session-answers evidence a success proves. A
+            # wedged statement records neither and still ages out.
+            last_progress = float(
+                getattr(
+                    self,
+                    "_ledger_lease_heartbeat_last_progress_monotonic",
+                    last_success,
+                )
+            )
+            age_seconds = max(
+                0.0,
+                time.monotonic() - max(last_success, last_progress),
+            )
             if age_seconds < failure_seconds:
                 continue
             self._ledger_lease_heartbeat_hard_exit(
