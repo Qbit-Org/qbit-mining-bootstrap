@@ -27480,11 +27480,36 @@ class PrismCoordinator:
                     int(declared_anchor_ms)
                 )
         try:
-            if (
+            reconstructed_needs_revalidation = (
                 not already_active
                 and not collection_only
                 and context_append_epoch < 0
                 and bool(getattr(self.ledger, "durable_payout_state", False))
+            )
+            if reconstructed_needs_revalidation and node_submission.attempted:
+                # Revalidation guards an offer the node has not yet seen: a
+                # reconstructed window that omits a durably appended share
+                # must not mint a coinbase. Once the fast lane has offered
+                # the durable bytes, the coinbase is the node's to judge —
+                # an accepted or duplicate result proceeds with the
+                # as-issued snapshot (the post-offer epoch fences log
+                # rather than abandon), a rejection stayed terminal above,
+                # and an ambiguous transport error re-offers duplicate-
+                # safely on retry. Abandoning an already-offered candidate
+                # here would permanently discard payout accounting for a
+                # block qbitd may have accepted, and the audit walk is the
+                # slow oracle whose deadline under saturation would
+                # otherwise defer-loop an accepted block forever.
+                print(
+                    "prism coordinator: reconstructed candidate was already "
+                    f"offered to the node hash={block_hash}; keeping the "
+                    "as-issued payout snapshot (window revalidation "
+                    "skipped)",
+                    flush=True,
+                )
+            if (
+                reconstructed_needs_revalidation
+                and not node_submission.attempted
             ):
                 with self._job_cache_lock:
                     revalidation_base_epoch = int(

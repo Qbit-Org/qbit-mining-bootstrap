@@ -7300,16 +7300,115 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.persisted), 1)
         self.assertEqual(len(ledger.confirmed), 1)
 
-    def test_replayed_block_candidate_rejects_window_omitting_durable_append(
+    def test_offered_replay_keeps_as_issued_snapshot_despite_window_omission(
         self,
     ) -> None:
-        # Epochs are process-local, so a reconstructed candidate is exempt
-        # from the epoch fence -- but the late-visible append that fence
-        # guards against survives the restart in the durable ledger. A carry
-        # balance does not move on a share append, so the prior-balance fence
-        # cannot see it either; replaying the audit window at the intent's
-        # declared anchor must fail the landing when it surfaces a share the
-        # recorded coinbase omitted.
+        # Revalidation guards an offer the node has not yet seen. The
+        # dedicated submitter's fast lane offers the durable bytes before
+        # the landing runs, so once the node accepts, the recorded coinbase
+        # is settled reality: the landing must keep the as-issued snapshot
+        # and skip the audit-window walk entirely instead of terminally
+        # abandoning payout accounting for an accepted block (or defer-
+        # looping behind the walk's deadline under saturation).
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        ledger.durable_payout_state = True  # type: ignore[attr-defined]
+        window_calls: list[tuple[int, int]] = []
+
+        def durable_window(
+            *,
+            anchor_job_issued_at_ms: int,
+            network_difficulty: int,
+        ) -> list[dict[str, object]]:
+            window_calls.append((anchor_job_issued_at_ms, network_difficulty))
+            return [
+                {"share_id": "recorded-window-share"},
+                {"share_id": "late-appended-share"},
+            ]
+
+        ledger.audit_share_window = durable_window  # type: ignore[method-assign]
+        server.ledger = ledger
+        context = server.jobs["job-1"]
+        context.shares_json = [{"share_id": "recorded-window-share"}]
+        context.found_block = {
+            "network_difficulty": 1,
+            "anchor_job_issued_at_ms": 12000,
+        }
+        bundle_builds: list[dict[str, object]] = []
+
+        def recording_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+            bundle_builds.append(dict(kwargs))
+            return verified_block_bundle()
+
+        server.build_audit_bundle = recording_build_audit_bundle  # type: ignore[method-assign]
+        server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
+        tail_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tail_dir.cleanup)
+        server.audit_dir = Path(tail_dir.name)
+        server.evidence_path = Path(tail_dir.name) / "evidence.json"
+        server.ledger_writer_public_key_hex = "aa" * 32
+
+        submitblock_calls: list[object] = []
+
+        class RecordingSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    submitblock_calls.append(params)
+                    return None
+                if method == "getblockhash":
+                    return "ec" * 32
+                return super().call(method, params)
+
+        server.rpc = RecordingSubmitRpc("00" * 32)
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="ec" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("replayed-window-omission").pending_share
+        original = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        intent = server.block_candidate_intent(original)
+        candidate = server.block_candidate_from_intent(intent)
+        self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
+        ledger.append_batch([(pending, intent)])
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+        # The fast lane offered first, so the walk never runs and the
+        # as-issued snapshot is accounted.
+        self.assertEqual(submitblock_calls, [["00"]])
+        self.assertEqual(window_calls, [])
+        self.assertEqual(len(bundle_builds), 1)
+        self.assertEqual(server.stale_share_count, 0)
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
+        )
+        outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
+        self.assertEqual(outbox_row["state"], "submitted")
+        self.assertIsNone(outbox_row["last_error"])
+        self.assertEqual(server.accepted_block_count, 1)
+
+    def test_unoffered_replay_still_rejects_window_omitting_durable_append(
+        self,
+    ) -> None:
+        # The pre-offer half of the same fence: a direct embedder resumes a
+        # reconstructed candidate with no node offer made (attempted=False,
+        # as the compatibility probe reports when block bytes are not
+        # retained), and the durable window surfaces a share the recorded
+        # coinbase omitted — the landing must still refuse to mint that
+        # coinbase, and the revalidation walk must run before any offer.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         ledger.durable_payout_state = True  # type: ignore[attr-defined]
@@ -7342,10 +7441,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         submission = SimpleNamespace(
             coinbase_tx_hex="c0ffee",
-            block_hash_hex="ec" * 32,
+            block_hash_hex="ed" * 32,
             block_hex="00",
         )
-        pending = self._pending_append("replayed-window-omission").pending_share
+        pending = self._pending_append("unoffered-window-omission").pending_share
         original = block_candidate(
             server,
             state,
@@ -7356,29 +7455,32 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         candidate = server.block_candidate_from_intent(intent)
         self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
         ledger.append_batch([(pending, intent)])
-        server.enqueue_block_candidate(candidate)
 
-        self.assertTrue(server.submit_next_block_candidate())
+        self.assertFalse(
+            server.submit_block_candidate(
+                candidate,
+                node_submission=SimpleNamespace(
+                    attempted=False,
+                    error=None,
+                    result=None,
+                ),
+            )
+        )
+
         self.assertEqual(window_calls, [(12000, 1)])
-        # The share was already accepted at submit time, so a lost block is a
-        # block-abandonment, not a stale share rejection.
-        self.assertEqual(server.stale_share_count, 0)
-        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        self.assertEqual(
+            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
+            1,
+        )
         self.assertEqual(
             server.stale_job_abandon_counts,
             {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
         )
+        # Direct embedders do not use the outbox-finalization wrapper:
+        # the terminal outcome is recorded and counted, while the durable
+        # row stays pending for queue-driven replay to finalize.
         outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
-        self.assertEqual(outbox_row["state"], "abandoned")
-        self.assertEqual(
-            outbox_row["last_error"],
-            "replayed payout window omits a durably appended share",
-        )
-        metrics = server.metrics_payload()
-        self.assertIn(
-            'qbit_prism_stale_job_abandons_total{class="append_epoch_stale"} 1',
-            metrics,
-        )
+        self.assertEqual(outbox_row["state"], "pending")
 
     def test_replayed_block_candidate_lands_when_durable_window_replays_intact(
         self,
@@ -7559,32 +7661,27 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with server._job_cache_lock:
             self.assertEqual(server._payout_window_inflight_scan_anchors, {})
 
-    def test_replayed_candidate_keeps_as_issued_accounting_when_append_races(
+    def test_offered_replay_lands_as_issued_without_revalidation_walk(
         self,
     ) -> None:
-        # The durable replay rebases a reconstructed candidate onto the live
-        # epoch sequence as of the revalidation read; an epoch advanced
-        # after that read is still observed at the epoch fence, but the
-        # offer already reached qbitd: accounting keeps the as-issued
-        # snapshot rather than abandoning an accepted block.
+        # The fast lane offers a reconstructed candidate's durable bytes
+        # before the landing runs, so the slow audit-window walk is skipped
+        # outright — even while this process's live epoch advances mid-
+        # flight — and accounting keeps the as-issued snapshot rather than
+        # abandoning (or re-walking) an accepted block.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         ledger.durable_payout_state = True  # type: ignore[attr-defined]
 
-        race_fired: list[bool] = []
+        window_calls: list[tuple[int, int]] = []
 
-        def racing_audit_share_window(
+        def recording_audit_share_window(
             *, anchor_job_issued_at_ms: int, network_difficulty: int
         ) -> list[dict[str, object]]:
-            # The epoch advances only after the revalidation base read,
-            # i.e. while the replayed-window walk itself is in flight.
-            if not race_fired:
-                race_fired.append(True)
-                with server._job_cache_lock:
-                    server._payout_ledger_append_invalidation_epoch += 1
+            window_calls.append((anchor_job_issued_at_ms, network_difficulty))
             return [{"share_id": "recorded-window-share"}]
 
-        ledger.audit_share_window = racing_audit_share_window  # type: ignore[method-assign]
+        ledger.audit_share_window = recording_audit_share_window  # type: ignore[method-assign]
         server.ledger = ledger
         context = server.jobs["job-1"]
         context.shares_json = [{"share_id": "recorded-window-share"}]
@@ -7641,11 +7738,17 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(candidate.context.payout_append_invalidation_epoch, -1)
         ledger.append_batch([(pending, intent)])
         server.enqueue_block_candidate(candidate)
+        # A live epoch bump mid-flight is irrelevant to a reconstructed
+        # candidate whose offer is already out: no revalidation rebases it
+        # and the epoch fences stand down (no effective epoch).
+        server._ensure_job_cache_state()
+        with server._job_cache_lock:
+            server._payout_ledger_append_invalidation_epoch += 1
 
         self.assertTrue(server.submit_next_block_candidate())
-        self.assertEqual(race_fired, [True])
-        # The fast lane offered the replayed block before revalidation ran.
+        # The fast lane offered the replayed block; the walk never ran.
         self.assertEqual(submitblock_calls, [["00"]])
+        self.assertEqual(window_calls, [])
         # The landing observed the bump but the node already accepted
         # the block: accounting keeps the as-issued snapshot instead of
         # terminally abandoning a live block's payouts.
