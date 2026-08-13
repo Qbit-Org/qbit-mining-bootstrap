@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Optional
 
+from lab.prism.share_ledger import WriterLeaseRenewalDeferred
+
 # qbit coinbase maturity (consensus): a coinbase output is spendable once the
 # active tip is at least this many blocks above the coinbase height.
 COINBASE_MATURITY = 1000
@@ -489,6 +491,13 @@ class CtvFanoutBroadcaster:
                 )
             signed_child_hex, _unsigned = self._build_signed_child(artifact, fee_sats)
             result = self._submit_package(artifact, signed_child_hex)
+        except WriterLeaseRenewalDeferred:
+            # The lease fence withheld the RPC before it ran: not a
+            # broadcast outcome. Converting it into an error attempt would
+            # journal a failure and push the payout behind the persistent
+            # retry backoff; propagating lets the daemon's caller retry on
+            # its ordinary pass interval once the deferring write commits.
+            raise
         except Exception as exc:
             return BroadcastAttempt(
                 fanout_txid=artifact.fanout_txid,

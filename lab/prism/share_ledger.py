@@ -38,6 +38,25 @@ DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE = 512
 # psql-only deployments retain ordinary TTL fencing and are never treated as
 # fast-adoptable merely because they share an identity with a replacement.
 WRITER_LEASE_HEARTBEAT_SESSION_PREFIX = "heartbeat-v1:"
+
+
+class WriterLeaseRenewalDeferred(RuntimeError):
+    """An external side effect was withheld while the lease renewal is deferred.
+
+    The guarded session is live, but its lease TTL renewal is blocked behind
+    this coordinator's own fenced write that has outlasted the TTL. Liveness
+    there assumes the write commits; a rollback would instead hand the
+    expired row to a queued different-identity claimant, so the fence
+    refuses the RPC without fencing the process. Callers retry on their own
+    cadence (broadcast pass interval, block-candidate outbox replay) and
+    succeed once a verification lands a renewal.
+
+    Defined here, with the lease machinery, so side-effect executors like
+    the CTV broadcaster can pass the refusal through to their retrying
+    caller instead of misclassifying it as a failed attempt.
+    """
+
+
 # Statements verify_writer_lease_guard_session may lawfully run inside one
 # guarded slot: the verification statement plus its single attribution
 # recheck. Callers that budget the verification's execution wall-clock must

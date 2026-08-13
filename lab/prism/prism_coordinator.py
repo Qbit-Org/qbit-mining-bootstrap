@@ -77,6 +77,7 @@ from lab.prism.share_ledger import (
     SingleWriterShareLedger,
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
     WRITER_LEASE_VERIFICATION_MAX_STATEMENTS,
+    WriterLeaseRenewalDeferred,
     sha256_json_hex,
 )
 
@@ -2690,19 +2691,6 @@ class StratumError(RuntimeError):
 
 class ShutdownInProgress(RuntimeError):
     """Raised when work that could mutate the ledger arrives after shutdown."""
-
-
-class WriterLeaseRenewalDeferred(RuntimeError):
-    """An external side effect was withheld while the lease renewal is deferred.
-
-    The guarded session is live, but its lease TTL renewal is blocked behind
-    this coordinator's own fenced write that has outlasted the TTL. Liveness
-    there assumes the write commits; a rollback would instead hand the
-    expired row to a queued different-identity claimant, so the fence
-    refuses the RPC without fencing the process. Callers retry on their own
-    cadence (broadcast pass interval, block-candidate outbox replay) and
-    succeed once a verification lands a renewal.
-    """
 
 
 class _WriterOperationToken:
@@ -14479,6 +14467,17 @@ class PrismCoordinator:
                         self.observe_ctv_fanout_broadcaster_pass(
                             max(0.0, time.monotonic() - started)
                         )
+            except WriterLeaseRenewalDeferred as exc:
+                # A preflight refusal, not a failure: the writer's own
+                # fenced write is holding the lease renewal, and the fence
+                # withheld the guarded RPC before it ran. The next pass on
+                # the ordinary interval retries once the write commits and
+                # a renewal lands.
+                print(
+                    "prism coordinator: CTV fanout broadcaster pass "
+                    f"withheld: {exc}",
+                    flush=True,
+                )
             except Exception:
                 print("prism coordinator: CTV fanout broadcaster pass failed", flush=True)
                 traceback.print_exc()
