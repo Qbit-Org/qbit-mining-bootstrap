@@ -7157,21 +7157,53 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             metrics,
         )
 
-    def test_block_submit_rejects_job_after_late_append_epoch_invalidation(self) -> None:
+    def test_block_submit_lands_as_issued_after_late_append_epoch_invalidation(self) -> None:
         # A late-visible replay append advances the live epoch and schedules
         # the refresh wave asynchronously; until that wave retires the job,
-        # membership admission still lets the pre-append job submit. Landing
-        # must fail closed instead of minting a coinbase whose payout window
-        # omitted the replayed share.
+        # membership admission still lets the pre-append job submit. The
+        # fast lane offers the solve to qbitd without ledger
+        # synchronization, so once the node accepts it the landing keeps
+        # the as-issued payout snapshot for accounting (the replayed share
+        # rides the next window) instead of terminally abandoning an
+        # accepted block.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         server.ledger = ledger
         server._ensure_job_cache_state()
         with server._job_cache_lock:
             server._payout_ledger_append_invalidation_epoch += 1
-        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
-            AssertionError("audit bundle must not be built from a pre-append payout window")
-        )
+        bundle_builds: list[dict[str, object]] = []
+
+        def recording_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+            bundle_builds.append(dict(kwargs))
+            return verified_block_bundle()
+
+        server.build_audit_bundle = recording_build_audit_bundle  # type: ignore[method-assign]
+        server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
+        tail_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tail_dir.cleanup)
+        server.audit_dir = Path(tail_dir.name)
+        server.evidence_path = Path(tail_dir.name) / "evidence.json"
+        server.ledger_writer_public_key_hex = "aa" * 32
+
+        submitblock_calls: list[object] = []
+
+        class RecordingSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    submitblock_calls.append(params)
+                    return None
+                if method == "getblockhash":
+                    return "ea" * 32
+                return super().call(method, params)
+
+        server.rpc = RecordingSubmitRpc("00" * 32)
         submission = SimpleNamespace(
             coinbase_tx_hex="c0ffee",
             block_hash_hex="ea" * 32,
@@ -7193,20 +7225,27 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         # The share was already accepted at submit time, so a lost block is a
         # block-abandonment, not a stale share rejection.
         self.assertEqual(server.stale_share_count, 0)
-        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        # The node accepted the pre-append solve: accounting keeps the
+        # as-issued snapshot instead of terminally abandoning it.
+        self.assertEqual(submitblock_calls, [["00"]])
+        self.assertEqual(len(bundle_builds), 1)
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
+        )
         self.assertEqual(
-            server.stale_job_abandon_counts,
-            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+            getattr(server, "stale_job_abandon_counts", {}).get(
+                "append_epoch_stale", 0
+            ),
+            0,
         )
         outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
-        self.assertEqual(outbox_row["state"], "abandoned")
-        self.assertEqual(
-            outbox_row["last_error"],
-            "payout window was invalidated by a late-visible share append",
-        )
+        self.assertEqual(outbox_row["state"], "submitted")
+        self.assertIsNone(outbox_row["last_error"])
+        self.assertEqual(server.accepted_block_count, 1)
         metrics = server.metrics_payload()
         self.assertIn(
-            'qbit_prism_stale_job_abandons_total{class="append_epoch_stale"} 1',
+            'qbit_prism_stale_job_abandons_total{class="append_epoch_stale"} 0',
             metrics,
         )
 
@@ -7406,14 +7445,16 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(len(ledger.persisted), 1)
         self.assertEqual(len(ledger.confirmed), 1)
 
-    def test_block_submit_aborts_when_append_invalidation_races_the_landing(
+    def test_block_submit_keeps_as_issued_accounting_when_append_races_the_landing(
         self,
     ) -> None:
         # Node propagation is the fast lane: the block is offered to qbitd
         # before payout accounting notices anything, so an append-side
         # invalidation racing the landing can no longer block submitblock.
-        # It must still abort the ACCOUNTING: the landing's epoch fences
-        # fail closed before the audit bundle or any payout persistence.
+        # The landing still observes the bump at its epoch fence, but the
+        # node already accepted the block, so accounting proceeds with the
+        # as-issued snapshot instead of terminally abandoning a live
+        # block's payouts.
         # The bump here is driven through the REAL invalidation path from
         # the drain hook -- with no armed artifact or in-flight walk in the
         # harness, it fires only because the landing exposed its own
@@ -7426,12 +7467,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "network_difficulty": 1,
             "anchor_job_issued_at_ms": 12000,
         }
-        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
-            AssertionError(
-                "audit bundle must not be built after a racing append "
-                "invalidated the payout window"
-            )
-        )
+        bundle_builds: list[dict[str, object]] = []
+
+        def recording_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+            bundle_builds.append(dict(kwargs))
+            return verified_block_bundle()
+
+        server.build_audit_bundle = recording_build_audit_bundle  # type: ignore[method-assign]
+        server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
+        tail_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tail_dir.cleanup)
+        server.audit_dir = Path(tail_dir.name)
+        server.evidence_path = Path(tail_dir.name) / "evidence.json"
+        server.ledger_writer_public_key_hex = "aa" * 32
         late_append = self._pending_append("late-during-landing").pending_share
 
         race_fired: list[bool] = []
@@ -7460,6 +7508,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 if method == "submitblock":
                     submitblock_calls.append(params)
                     return None
+                if method == "getblockhash":
+                    return "da" * 32
                 return super().call(method, params)
 
         server.rpc = RecordingSubmitRpc("00" * 32)
@@ -7487,30 +7537,36 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         with server._job_cache_lock:
             self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
         self.assertEqual(server.stale_share_count, 0)
-        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        # The landing observed the bump but the node already accepted
+        # the block: accounting keeps the as-issued snapshot instead of
+        # terminally abandoning a live block's payouts.
+        self.assertEqual(len(bundle_builds), 1)
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
+        )
         self.assertEqual(
-            server.stale_job_abandon_counts,
-            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+            getattr(server, "stale_job_abandon_counts", {}).get(
+                "append_epoch_stale", 0
+            ),
+            0,
         )
         outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
-        self.assertEqual(outbox_row["state"], "abandoned")
-        self.assertEqual(
-            outbox_row["last_error"],
-            "payout window was invalidated by a late-visible share append",
-        )
+        self.assertEqual(outbox_row["state"], "submitted")
+        self.assertIsNone(outbox_row["last_error"])
+        self.assertEqual(server.accepted_block_count, 1)
         # The landing retires its exposed anchor on the way out.
         with server._job_cache_lock:
             self.assertEqual(server._payout_window_inflight_scan_anchors, {})
 
-    def test_replayed_candidate_aborts_when_append_races_after_revalidation(
+    def test_replayed_candidate_keeps_as_issued_accounting_when_append_races(
         self,
     ) -> None:
         # The durable replay rebases a reconstructed candidate onto the live
         # epoch sequence as of the revalidation read; an epoch advanced
-        # after that read must still abort the landing's ACCOUNTING at the
-        # epoch fence even though the replayed window itself matched. The
-        # node offer itself is the fast lane and is not gated: the block
-        # reaches qbitd, but no audit bundle or payout persistence follows.
+        # after that read is still observed at the epoch fence, but the
+        # offer already reached qbitd: accounting keeps the as-issued
+        # snapshot rather than abandoning an accepted block.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         ledger.durable_payout_state = True  # type: ignore[attr-defined]
@@ -7536,12 +7592,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "network_difficulty": 1,
             "anchor_job_issued_at_ms": 12000,
         }
-        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
-            AssertionError(
-                "audit bundle must not be built after a racing append "
-                "invalidated the replayed payout window"
-            )
-        )
+        bundle_builds: list[dict[str, object]] = []
+
+        def recording_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+            bundle_builds.append(dict(kwargs))
+            return verified_block_bundle()
+
+        server.build_audit_bundle = recording_build_audit_bundle  # type: ignore[method-assign]
+        server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
+        tail_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tail_dir.cleanup)
+        server.audit_dir = Path(tail_dir.name)
+        server.evidence_path = Path(tail_dir.name) / "evidence.json"
+        server.ledger_writer_public_key_hex = "aa" * 32
 
         submitblock_calls: list[object] = []
 
@@ -7556,6 +7619,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 if method == "submitblock":
                     submitblock_calls.append(params)
                     return None
+                if method == "getblockhash":
+                    return "db" * 32
                 return super().call(method, params)
 
         server.rpc = RecordingSubmitRpc("00" * 32)
@@ -7581,28 +7646,36 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(race_fired, [True])
         # The fast lane offered the replayed block before revalidation ran.
         self.assertEqual(submitblock_calls, [["00"]])
-        self.assertEqual(server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB], 1)
+        # The landing observed the bump but the node already accepted
+        # the block: accounting keeps the as-issued snapshot instead of
+        # terminally abandoning a live block's payouts.
+        self.assertEqual(len(bundle_builds), 1)
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
+        )
         self.assertEqual(
-            server.stale_job_abandon_counts,
-            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+            getattr(server, "stale_job_abandon_counts", {}).get(
+                "append_epoch_stale", 0
+            ),
+            0,
         )
         outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
-        self.assertEqual(outbox_row["state"], "abandoned")
-        self.assertEqual(
-            outbox_row["last_error"],
-            "payout window was invalidated by a late-visible share append",
-        )
+        self.assertEqual(outbox_row["state"], "submitted")
+        self.assertIsNone(outbox_row["last_error"])
+        self.assertEqual(server.accepted_block_count, 1)
 
-    def test_landing_blocked_by_fenced_append_aborts_on_bumped_epoch(
+    def test_landing_blocked_by_fenced_append_lands_as_issued_on_bumped_epoch(
         self,
     ) -> None:
         # A replay-shaped append holds the landing fence across the durable
         # commit itself, not only across its epoch bump. The node offer is
         # the fast lane and does not wait, but a landing whose offer is
-        # already in must still wait at the fence before ACCOUNTING and
-        # abort on the bumped epoch -- never verify the pre-bump epoch and
-        # account a coinbase whose window omits the row that just became
-        # durable.
+        # already in must still wait at the fence before ACCOUNTING; with
+        # the offer already accepted, the bumped epoch is recorded and
+        # accounting proceeds with the as-issued coinbase (the durable
+        # predating share rides the next window) instead of abandoning the
+        # accepted block.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         server.ledger = ledger
@@ -7611,12 +7684,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "network_difficulty": 1,
             "anchor_job_issued_at_ms": 12000,
         }
-        server.build_audit_bundle = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
-            AssertionError(
-                "audit bundle must not be built after a fenced append "
-                "invalidated the payout window"
-            )
-        )
+        bundle_builds: list[dict[str, object]] = []
+
+        def recording_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+            bundle_builds.append(dict(kwargs))
+            return verified_block_bundle()
+
+        server.build_audit_bundle = recording_build_audit_bundle  # type: ignore[method-assign]
+        server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
+        tail_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tail_dir.cleanup)
+        server.audit_dir = Path(tail_dir.name)
+        server.evidence_path = Path(tail_dir.name) / "evidence.json"
+        server.ledger_writer_public_key_hex = "aa" * 32
 
         submitblock_calls: list[object] = []
 
@@ -7631,6 +7711,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 if method == "submitblock":
                     submitblock_calls.append(params)
                     return None
+                if method == "getblockhash":
+                    return "dc" * 32
                 return super().call(method, params)
 
         server.rpc = RecordingSubmitRpc("00" * 32)
@@ -7698,26 +7780,30 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(landing.is_alive())
 
         # The bump landed together with the durable append; the landing
-        # observed it and abandoned its accounting instead of persisting a
-        # payout window that omits the durable predating share.
+        # observed it, and with the offer already accepted it kept the
+        # as-issued snapshot for accounting.
         self.assertEqual(submitblock_calls, [["00"]])
         self.assertIn(late_entry.pending_share.share_id, ledger._share_ids)
         with server._job_cache_lock:
             self.assertEqual(server._payout_ledger_append_invalidation_epoch, 1)
-        self.assertEqual(
-            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
-            1,
+        # The landing observed the bump but the node already accepted
+        # the block: accounting keeps the as-issued snapshot instead of
+        # terminally abandoning a live block's payouts.
+        self.assertEqual(len(bundle_builds), 1)
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
         )
         self.assertEqual(
-            server.stale_job_abandon_counts,
-            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+            getattr(server, "stale_job_abandon_counts", {}).get(
+                "append_epoch_stale", 0
+            ),
+            0,
         )
         outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
-        self.assertEqual(outbox_row["state"], "abandoned")
-        self.assertEqual(
-            outbox_row["last_error"],
-            "payout window was invalidated by a late-visible share append",
-        )
+        self.assertEqual(outbox_row["state"], "submitted")
+        self.assertIsNone(outbox_row["last_error"])
+        self.assertEqual(server.accepted_block_count, 1)
 
     def test_predating_append_commits_while_fast_lane_offer_is_in_flight(
         self,
@@ -7962,6 +8048,19 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         server.ledger = ledger
+        bundle_builds: list[dict[str, object]] = []
+
+        def recording_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+            bundle_builds.append(dict(kwargs))
+            return verified_block_bundle()
+
+        server.build_audit_bundle = recording_build_audit_bundle  # type: ignore[method-assign]
+        server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
+        tail_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tail_dir.cleanup)
+        server.audit_dir = Path(tail_dir.name)
+        server.evidence_path = Path(tail_dir.name) / "evidence.json"
+        server.ledger_writer_public_key_hex = "aa" * 32
         context = server.jobs["job-1"]
         context.found_block = {
             "network_difficulty": 1,
@@ -8023,6 +8122,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 if method == "submitblock":
                     submitblock_calls.append(params)
                     return None
+                if method == "getblockhash":
+                    return "dc" * 32
                 return super().call(method, params)
 
         server.rpc = RecordingSubmitRpc("00" * 32)
@@ -8049,24 +8150,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 server._payout_unfenced_append_inflight_stamps, {}
             )
         # The drained append's bump landed before the landing's epoch
-        # fences, so the accounting was abandoned instead of persisting a
-        # payout window omitting the durable predating share. The node
-        # offer itself is the fast lane and had already gone out.
+        # fences; the landing observed it and, with the node offer already
+        # accepted, accounted the as-issued window (the durable predating
+        # share rides the next window).
         self.assertEqual(submitblock_calls, [["00"]])
-        self.assertEqual(
-            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
-            1,
+        # The landing observed the bump but the node already accepted
+        # the block: accounting keeps the as-issued snapshot instead of
+        # terminally abandoning a live block's payouts.
+        self.assertEqual(len(bundle_builds), 1)
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
         )
         self.assertEqual(
-            server.stale_job_abandon_counts,
-            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+            getattr(server, "stale_job_abandon_counts", {}).get(
+                "append_epoch_stale", 0
+            ),
+            0,
         )
         outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
-        self.assertEqual(outbox_row["state"], "abandoned")
-        self.assertEqual(
-            outbox_row["last_error"],
-            "payout window was invalidated by a late-visible share append",
-        )
+        self.assertEqual(outbox_row["state"], "submitted")
+        self.assertIsNone(outbox_row["last_error"])
+        self.assertEqual(server.accepted_block_count, 1)
 
     def test_completed_append_predating_seedless_published_window_fences(
         self,
@@ -8082,10 +8187,25 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         # submitblock accepted a coinbase omitting the durable share.
         # Publication now hands the declared anchor to the
         # published-window watermark, so the append commits under the
-        # landing fence with its epoch bump and the landing abandons.
+        # landing fence with its epoch bump -- and the landing, whose
+        # offer already landed, keeps the as-issued snapshot for
+        # accounting.
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
         server.ledger = ledger
+        bundle_builds: list[dict[str, object]] = []
+
+        def recording_build_audit_bundle(**kwargs: object) -> dict[str, object]:
+            bundle_builds.append(dict(kwargs))
+            return verified_block_bundle()
+
+        server.build_audit_bundle = recording_build_audit_bundle  # type: ignore[method-assign]
+        server.verify_bundle = lambda *_args, **_kwargs: verified_audit_report()  # type: ignore[method-assign]
+        tail_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tail_dir.cleanup)
+        server.audit_dir = Path(tail_dir.name)
+        server.evidence_path = Path(tail_dir.name) / "evidence.json"
+        server.ledger_writer_public_key_hex = "aa" * 32
         context = server.jobs["job-1"]
         context.found_block = {
             "network_difficulty": 1,
@@ -8151,31 +8271,37 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 if method == "submitblock":
                     submitblock_calls.append(params)
                     return None
+                if method == "getblockhash":
+                    return "dd" * 32
                 return super().call(method, params)
 
         server.rpc = RecordingSubmitRpc("00" * 32)
 
         self.assertTrue(server.submit_next_block_candidate())
 
-        # The bump already happened at commit time, so the landing's epoch
-        # fence rejects the pre-append window instead of accounting a
-        # coinbase that omits the durable predating share. The node offer
-        # itself is the fast lane and had already gone out.
+        # The bump already happened at commit time; the landing's epoch
+        # fence observes it and, with the node offer already accepted,
+        # accounts the as-issued coinbase (the durable predating share
+        # rides the next window).
         self.assertEqual(submitblock_calls, [["00"]])
-        self.assertEqual(
-            server.block_candidate_abandoned_counts[PRISM_REJECTION_STALE_JOB],
-            1,
+        # The landing observed the bump but the node already accepted
+        # the block: accounting keeps the as-issued snapshot instead of
+        # terminally abandoning a live block's payouts.
+        self.assertEqual(len(bundle_builds), 1)
+        self.assertNotIn(
+            PRISM_REJECTION_STALE_JOB,
+            server.block_candidate_abandoned_counts,
         )
         self.assertEqual(
-            server.stale_job_abandon_counts,
-            {"tip_moved": 0, "balance_stale": 0, "append_epoch_stale": 1},
+            getattr(server, "stale_job_abandon_counts", {}).get(
+                "append_epoch_stale", 0
+            ),
+            0,
         )
         outbox_row = ledger._block_candidate_outbox[submission.block_hash_hex]
-        self.assertEqual(outbox_row["state"], "abandoned")
-        self.assertEqual(
-            outbox_row["last_error"],
-            "payout window was invalidated by a late-visible share append",
-        )
+        self.assertEqual(outbox_row["state"], "submitted")
+        self.assertIsNone(outbox_row["last_error"])
+        self.assertEqual(server.accepted_block_count, 1)
 
     def test_block_submit_defers_descendant_until_active_ancestor_is_durable(
         self,
@@ -15673,6 +15799,31 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         )
         return submitted, abandoned
 
+    def _age_retained_acceptance_past_window(
+        self, server: PrismCoordinator
+    ) -> None:
+        """Backdate any stashed definitive ack past the acceptance window.
+
+        These interleavings pin the terminal machinery that runs once
+        first-party acceptance evidence has gone stale; a fresh stash
+        correctly vetoes the terminal decision and defers instead (see
+        test_definitive_ack_with_unprovable_chain_view_defers_not_abandons).
+        """
+        real_stash = server._stash_retained_block_candidate_node_submission
+
+        def stash_then_age(block_hash: str, node_submission: object) -> None:
+            real_stash(block_hash, node_submission)
+            with server.lock:
+                stamped = getattr(
+                    server,
+                    "_block_candidate_retained_submission_monotonic",
+                    None,
+                )
+                if stamped and block_hash.lower() in stamped:
+                    stamped[block_hash.lower()] -= 400.0
+
+        server._stash_retained_block_candidate_node_submission = stash_then_age  # type: ignore[method-assign]
+
     def _retained_candidate(self, server: PrismCoordinator) -> PrismBlockCandidate:
         with server.lock:
             candidate = server._retry_block_candidate
@@ -16133,7 +16284,8 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
     def test_post_persist_stale_view_still_rejects_without_acceptance_evidence(self) -> None:
         # The terminal half of the same site: submitblock succeeds but a
         # sibling steals the height right after persistence and the pool's
-        # block was never observed as the tip. With no acceptance evidence,
+        # block was never observed as the tip. With no FRESH acceptance
+        # evidence (the retained ack has aged past the acceptance window),
         # the terminal decision seals first and only then are the prepared
         # rows rejected, exactly once.
         parent = "00" * 32
@@ -16150,6 +16302,10 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             )
             rpc.lose_acks = False
             server.rpc = rpc
+            # The definitive ack retained at the offer would veto the
+            # terminal decision while fresh; these tests pin the sealed
+            # terminal machinery, so age it past the acceptance window.
+            self._age_retained_acceptance_past_window(server)
             candidate = block_candidate(
                 server,
                 state,
@@ -16575,6 +16731,10 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             )
             rpc.lose_acks = False
             server.rpc = rpc
+            # The definitive ack retained at the offer would veto the
+            # terminal decision while fresh; these tests pin the sealed
+            # terminal machinery, so age it past the acceptance window.
+            self._age_retained_acceptance_past_window(server)
             candidate = block_candidate(
                 server,
                 state,
@@ -16651,6 +16811,10 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             )
             rpc.lose_acks = False
             server.rpc = rpc
+            # The definitive ack retained at the offer would veto the
+            # terminal decision while fresh; these tests pin the sealed
+            # terminal machinery, so age it past the acceptance window.
+            self._age_retained_acceptance_past_window(server)
             candidate = block_candidate(
                 server,
                 state,
@@ -16727,6 +16891,97 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
                 "block-stale",
                 server.block_candidate_abandoned_counts,
             )
+
+    def test_definitive_ack_with_unprovable_chain_view_defers_not_abandons(
+        self,
+    ) -> None:
+        # Release-review finding: a definitive submitblock success followed
+        # by a chain view that cannot prove the block landed (foreign tip,
+        # header unknown, height taken by a sibling in that instant's view)
+        # must defer as accept-pending on the strength of the retained ack
+        # -- never terminally abandon accounting for a block the node
+        # accepted. The stash ages on the observation window, so a real
+        # orphan still terminalizes once the ack is stale (the sealed
+        # rejection tests above).
+        parent = "00" * 32
+        block_hash = "ce" * 32
+        racing_winner = "77" * 32
+        server, state, ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 2
+        server.stop_after_block = False
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+            rpc = LostAckSubmitRpc(
+                start_tip=parent,
+                hash_by_hex={"00": block_hash},
+            )
+            rpc.lose_acks = False
+            server.rpc = rpc
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+            real_persist = ledger.persist_accepted_block
+
+            def persist_then_lose_race(**kwargs: object) -> dict[str, object]:
+                result = real_persist(**kwargs)
+                rpc.tip = racing_winner
+                rpc.active.pop(block_hash, None)
+                rpc.getblockhash_override = racing_winner
+                return result
+
+            ledger.persist_accepted_block = persist_then_lose_race  # type: ignore[method-assign]
+
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+
+            # Deferred, not terminal: prepared rows untouched, candidate
+            # retained for retry, observation matching still open.
+            self.assertEqual(ledger.rejected, [])
+            self.assertEqual(abandoned, [])
+            self.assertEqual(submitted, [])
+            self.assertGreaterEqual(
+                getattr(server, "block_candidate_accept_pending_defer_count", 0),
+                1,
+            )
+            self.assertIsNotNone(getattr(server, "_retry_block_candidate", None))
+            self.assertNotIn(
+                "block-stale",
+                server.block_candidate_abandoned_counts,
+            )
+            self.assertIn(
+                block_hash, server._outstanding_block_candidate_hashes
+            )
+
+    def test_retained_acceptance_evidence_ages_on_observation_window(
+        self,
+    ) -> None:
+        # The stash is acceptance evidence only while fresh: past the
+        # observation window it stands down so a genuinely orphaned block
+        # (whose probes never prove anything either way) regains
+        # abandonability instead of deferring forever.
+        server, _state, _ledger = submit_coordinator()
+        block_hash = "cf" * 32
+        server._stash_retained_block_candidate_node_submission(
+            block_hash,
+            SimpleNamespace(attempted=True, error=None, result=None),
+        )
+        self.assertTrue(server._block_candidate_acceptance_retained(block_hash))
+        with server.lock:
+            server._block_candidate_retained_submission_monotonic[
+                block_hash
+            ] -= 400.0
+        self.assertFalse(server._block_candidate_acceptance_retained(block_hash))
+        # A non-positive window means evidence never expires, mirroring the
+        # tip-observation semantics.
+        server.observed_tip_accept_window_seconds = 0.0
+        self.assertTrue(server._block_candidate_acceptance_retained(block_hash))
 
     def test_pool_closed_gate_requires_probe_proven_acceptance(self) -> None:
         # Bugbot: observation evidence alone must not open the pool-closed
