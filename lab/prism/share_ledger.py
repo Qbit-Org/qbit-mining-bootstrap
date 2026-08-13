@@ -1911,10 +1911,18 @@ class PsqlShareLedger:
         supplies a larger margin when its longest fence-guarded RPC could
         outlast the floor — the margin must cover the longest effect the
         fence can authorize, or the effect outlives its runway and
-        degenerates into rollback-dependent authority. A margin at or
-        above the TTL makes every own-write skip defer, which is the
-        honest consequence of a guarded effect that can outlast the whole
-        lease.
+        degenerates into rollback-dependent authority.
+
+        A margin that reaches the TTL is rejected outright rather than
+        accepted as defer-every-skip: the deferral only gates renewal
+        *skips*, while a verification over an uncontended row renews and
+        authorizes unconditionally — and a landed renewal's runway is
+        exactly one TTL. When the guarded effect's deadline can reach the
+        TTL, even a freshly renewed lease cannot outlast the effect, so
+        no deferral policy closes the authorize-then-expire window and
+        the configuration itself is unsafe. Failing construction turns a
+        silent split-brain hazard into a startup error: raise the lease
+        TTL or lower the guarded RPC deadlines.
         """
         floor = lease_ttl_seconds / 2.0
         if lease_authority_margin_seconds is None:
@@ -1923,6 +1931,15 @@ class PsqlShareLedger:
         if not math.isfinite(margin) or margin < 0:
             raise ValueError(
                 "lease_authority_margin_seconds must be finite and non-negative"
+            )
+        if margin >= lease_ttl_seconds:
+            raise ValueError(
+                "lease_authority_margin_seconds "
+                f"({margin}) must stay below lease_ttl_seconds "
+                f"({lease_ttl_seconds}): a fence-guarded RPC whose deadline "
+                "can reach the lease TTL can outlive even a freshly renewed "
+                "lease, and renewals bypass the own-write deferral entirely; "
+                "raise the lease TTL or lower the guarded RPC deadlines"
             )
         return max(floor, margin)
 

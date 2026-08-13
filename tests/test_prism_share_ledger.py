@@ -1675,18 +1675,37 @@ class PrismShareLedgerTests(unittest.TestCase):
         authorize, or an effect authorized just above the margin outlives
         its runway and degenerates into rollback-dependent authority. The
         floor keeps the deferral engaged through the eroded tail of a long
-        own write even when configured deadlines are short; a margin at or
-        above the TTL defers every own-write skip — the honest consequence
-        of a guarded effect that can outlast the whole lease.
+        own write even when configured deadlines are short.
         """
         resolve = PsqlShareLedger._resolve_lease_authority_margin_seconds
         self.assertEqual(resolve(60.0, None), 30.0)
         self.assertEqual(resolve(60.0, 20.0), 30.0)
-        self.assertEqual(resolve(60.0, 90.0), 90.0)
+        self.assertEqual(resolve(60.0, 45.0), 45.0)
         with self.assertRaises(ValueError):
             resolve(60.0, float("nan"))
         with self.assertRaises(ValueError):
             resolve(60.0, -1.0)
+
+    def test_lease_authority_margin_reaching_the_ttl_is_rejected(self) -> None:
+        """A margin at or above the TTL is a startup error, not a policy.
+
+        The deferral only gates renewal skips; a verification over an
+        uncontended row renews and authorizes unconditionally, and a
+        landed renewal's runway is exactly one TTL. When the guarded
+        effect's deadline can reach the TTL, even a freshly renewed lease
+        cannot outlast the effect, so defer-every-skip would narrow but
+        never close the authorize-then-expire window. Construction must
+        refuse the configuration instead of running with a silent
+        split-brain hazard.
+        """
+        resolve = PsqlShareLedger._resolve_lease_authority_margin_seconds
+        for margin in (60.0, 90.0):
+            with self.subTest(margin=margin):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "must stay below lease_ttl_seconds",
+                ):
+                    resolve(60.0, margin)
 
     def test_guard_verification_rechecks_when_own_commit_clears_locker_attribution(
         self,
