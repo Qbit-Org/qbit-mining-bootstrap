@@ -763,6 +763,62 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             if thread is not None:
                 thread.join(0.2)
 
+    def test_external_fence_reports_recheck_progress_to_the_monitor(
+        self,
+    ) -> None:
+        """The fence's verification feeds the monitor's progress mark too.
+
+        The verification holds the guard's serialized slot for its whole
+        statement sequence, so the periodic heartbeat queues behind it and
+        records nothing meanwhile. Without this caller passing the
+        progress callback, a fence verification's lawful second statement
+        ages the heartbeat's last success past the single-statement
+        failure budget and the monitor hard-exits a healthy coordinator —
+        the hazard already closed for the heartbeat loop's own recheck.
+        """
+
+        class RecheckFenceLedger(RecordingLeaseLedger):
+            writer_lease_fast_adoption_capable = True
+            writer_lease_guard_required = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.saw_progress_callback = threading.Event()
+
+            def verify_writer_lease_guard_session(
+                self,
+                *,
+                on_query_start=None,
+                on_statement_progress=None,
+            ) -> dict[str, int | str]:
+                if on_query_start is not None:
+                    on_query_start()
+                if on_statement_progress is not None:
+                    # The attribution recheck's first statement completed.
+                    on_statement_progress()
+                    self.saw_progress_callback.set()
+                return {
+                    "backend": "recording",
+                    "verified_count": 1,
+                    "renewed_count": 1,
+                }
+
+        ledger = RecheckFenceLedger()
+        server = coordinator(ledger)
+
+        server._require_fresh_ledger_lease_for_external_side_effect(
+            "submitblock"
+        )
+
+        self.assertTrue(ledger.saw_progress_callback.is_set())
+        self.assertIsNotNone(
+            getattr(
+                server,
+                "_ledger_lease_heartbeat_last_progress_monotonic",
+                None,
+            )
+        )
+
     def test_recheck_statement_progress_keeps_monitor_from_hard_exiting(
         self,
     ) -> None:

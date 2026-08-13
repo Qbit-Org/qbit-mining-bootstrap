@@ -13094,11 +13094,20 @@ class PrismCoordinator:
         )
         query_started = threading.Event()
         try:
-            verify_reports_query_start = (
-                "on_query_start" in inspect.signature(verify).parameters
-            )
+            verify_parameters = inspect.signature(verify).parameters
         except (TypeError, ValueError):
-            verify_reports_query_start = False
+            verify_parameters = {}
+        verify_reports_query_start = "on_query_start" in verify_parameters
+        # This verification holds the guard's serialized slot for its whole
+        # statement sequence, so the periodic heartbeat queues behind it
+        # and records nothing meanwhile. Its lawful second statement (the
+        # attribution recheck) can therefore age the heartbeat's last
+        # success past the monitor's single-statement failure budget — the
+        # same hazard the heartbeat loop's own recheck had — so this
+        # caller must feed the monitor the completed first round trip too.
+        verify_reports_statement_progress = (
+            "on_statement_progress" in verify_parameters
+        )
         if not verify_reports_query_start:
             # A verification that cannot report when its query slot was
             # acquired keeps the previous behavior: the whole budget covers
@@ -13111,10 +13120,14 @@ class PrismCoordinator:
 
         def verify_exact_session() -> None:
             try:
+                verify_kwargs: dict[str, Callable[[], None]] = {}
                 if verify_reports_query_start:
-                    result = verify(on_query_start=query_started.set)
-                else:
-                    result = verify()
+                    verify_kwargs["on_query_start"] = query_started.set
+                if verify_reports_statement_progress:
+                    verify_kwargs["on_statement_progress"] = (
+                        self._record_ledger_lease_heartbeat_progress
+                    )
+                result = verify(**verify_kwargs)
             except BaseException as exc:
                 outcome.put(exc)
             else:
