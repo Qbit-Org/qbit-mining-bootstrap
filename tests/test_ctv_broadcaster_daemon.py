@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 from datetime import datetime, timedelta, timezone
 import threading
@@ -977,6 +978,22 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
         # anything near the backstop means the sever never reached the sock.
         self.assertLess(time.monotonic() - begun, 2.0)
         self.assertTrue(severed.is_set())
+
+    def test_json_rpc_connections_never_auto_reconnect(self) -> None:
+        # http.client's auto_open lets request() silently re-open a
+        # connection whose socket was cleared — exactly what the deadline
+        # watchdog's close() does when it lands between the pre-send check
+        # and the send. That implicit fresh socket would live until the
+        # next watchdog sweep, long enough for a short mutating POST to
+        # reach qbitd after the caller released its ordering locks. The
+        # connection must refuse to resurrect itself: a severed socket
+        # makes the send fail, and only call()'s explicit, deadline-checked
+        # connect may open one.
+        rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
+        conn = rpc._acquire_connection(1.0)
+        self.assertEqual(conn.auto_open, 0)
+        with self.assertRaises(http.client.NotConnected):
+            conn.send(b"post-deadline byte")
 
     def test_json_rpc_deadline_stops_late_name_resolution_before_send(self) -> None:
         # A stalled name resolution has no socket for the watchdog to sever,

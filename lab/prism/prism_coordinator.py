@@ -1264,6 +1264,16 @@ class JsonRpc:
         conn = getattr(self._connections, "conn", None)
         if conn is None:
             conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+            # Never let http.client resurrect a severed connection: with
+            # auto_open, request() silently reconnects when the deadline
+            # watchdog's close() lands between the pre-send check and the
+            # send, and that implicit fresh socket lives until the next
+            # watchdog sweep — long enough for a short mutating POST to
+            # reach qbitd after a caller released its ordering locks. With
+            # auto_open off a cleared socket makes send() raise
+            # NotConnected instead; call() connects explicitly under the
+            # watchdog and rechecks the deadline before any byte goes out.
+            conn.auto_open = 0
             self._connections.conn = conn
         else:
             # Reuse: refresh the deadline for this call on the live socket.
