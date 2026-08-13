@@ -64,6 +64,7 @@ from lab.prism.prism_coordinator import (
     PrismCoordinator,
     ShutdownInProgress,
     WorkerIdentity,
+    WriterLeaseRenewalDeferred,
     _FanoutCancellation,
     _ObservedRLock,
     _PayoutStatePublicationBlocked,
@@ -805,6 +806,15 @@ def coordinator() -> PrismCoordinator:
 
 def submit_coordinator(tip: str = "00" * 32) -> tuple[PrismCoordinator, ClientState, RecordingLedger]:
     server = coordinator()
+    # This suite runs on a synthetic millisecond timeline (declared anchors
+    # like 12000, share stamps of 1-2) while _expose_inflight_scan_anchor
+    # prunes exposures older than a real-wall-clock ceiling. Every synthetic
+    # anchor is decades past that ceiling, so the next exposure (a landing
+    # publishing its declared anchor) silently pruned a test's standing
+    # anchor and turned epoch-bump assertions into thread races against the
+    # landing's own anchor retirement. Pin the ceiling out of reach so
+    # exposed anchors live exactly as long as each test intends.
+    server.payout_artifact_max_anchor_age_seconds = float("inf")
     server.vardiff_config = SimpleNamespace(enabled=False)
     server.rpc = TipRpc(tip)
     server.jobs = {}
@@ -7798,6 +7808,144 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 PRISM_REJECTION_SUBMITBLOCK_REJECTED
             ],
             1,
+        )
+
+    def test_lease_deferral_unwinds_landed_bar_before_submitblock(self) -> None:
+        # The landed bar is armed before the lease fence to keep a transport
+        # failure's uncertain submitblock outcome conservative. A
+        # WriterLeaseRenewalDeferred refusal fires before the RPC, so the
+        # outcome is not uncertain: qbitd provably never saw the block, and
+        # leaving the bar armed in the (now surviving) process would bar
+        # reconciliation and payout-state publication for as long as the
+        # writer's own fenced write keeps the renewal deferred. The pending
+        # preview must survive, though: child work keeps waiting for the
+        # retry instead of snapshotting pre-accept balances.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server.block_candidate_retry_initial_seconds = 0.0
+
+        class NoSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    raise AssertionError(
+                        "submitblock must not run after a deferral refusal"
+                    )
+                return super().call(method, params)
+
+        server.rpc = NoSubmitRpc("00" * 32)
+        # Force the fenced fallback lane: with no fast-lane node offer
+        # (attempted=False), the disposition itself must clear the lease
+        # fence before submitblock — the branch the deferral exits from.
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: SimpleNamespace(
+                attempted=False,
+                result=None,
+                error=None,
+            )
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="de" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("deferral-unwind").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        server.enqueue_block_candidate(candidate)
+
+        with patch.object(
+            server,
+            "_require_fresh_ledger_lease_for_external_side_effect",
+            side_effect=WriterLeaseRenewalDeferred("renewal is deferred"),
+        ) as fence:
+            self.assertTrue(server.submit_next_block_candidate())
+
+        fence.assert_called_once_with("submitblock")
+        block_hash = str(submission.block_hash_hex).lower()
+        self.assertFalse(
+            server._accepted_block_payout_transition_landed(block_hash)
+        )
+        with server._accepted_block_payout_preview_condition:
+            self.assertIn(block_hash, server._accepted_block_payout_previews)
+
+    def test_lease_deferral_keeps_prior_attempts_landed_bar(self) -> None:
+        # A transition landed by an earlier attempt that DID reach
+        # submitblock records a genuinely uncertain outcome (a lost RPC
+        # ack); a later attempt's pre-RPC deferral must not withdraw that
+        # bar, or payout state could publish without the possibly-active
+        # coinbase's base preserved.
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server.block_candidate_retry_initial_seconds = 0.0
+
+        class NoSubmitRpc(TipRpc):
+            def call(
+                rpc_self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 9
+                if method == "submitblock":
+                    raise AssertionError(
+                        "submitblock must not run after a deferral refusal"
+                    )
+                return super().call(method, params)
+
+        server.rpc = NoSubmitRpc("00" * 32)
+        # Force the fenced fallback lane, as above.
+        server._node_submission_for_candidate = (  # type: ignore[method-assign]
+            lambda _candidate: SimpleNamespace(
+                attempted=False,
+                result=None,
+                error=None,
+            )
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex="df" * 32,
+            block_hex="00",
+        )
+        pending = self._pending_append("deferral-keeps-bar").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            submission,
+            pending_share=pending,
+        )
+        ledger.append_batch(
+            [(pending, server.block_candidate_intent(candidate))]
+        )
+        block_hash = str(submission.block_hash_hex).lower()
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        server.enqueue_block_candidate(candidate)
+
+        with patch.object(
+            server,
+            "_require_fresh_ledger_lease_for_external_side_effect",
+            side_effect=WriterLeaseRenewalDeferred("renewal is deferred"),
+        ) as fence:
+            self.assertTrue(server.submit_next_block_candidate())
+
+        fence.assert_called_once_with("submitblock")
+        self.assertTrue(
+            server._accepted_block_payout_transition_landed(block_hash)
         )
 
     def test_landing_drains_unfenced_inflight_append_before_epoch_fences(

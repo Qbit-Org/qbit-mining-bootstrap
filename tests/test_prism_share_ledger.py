@@ -1216,9 +1216,52 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger._writer_id = "writer-a"
         ledger._writer_epoch = 7
         ledger._writer_session_token = session
+        ledger._pool_application_name = "qbit-prism-writer-test-pool"
         ledger._lease_interval_sql = "make_interval(secs => 60.0)"
+        ledger._lease_authority_margin_sql = "make_interval(secs => 30.0)"
         ledger._writer_lease_guard = guard
         return ledger
+
+    class InSlotFakeGuard:
+        """Mimic the native guard's run_json slot semantics for fakes.
+
+        One serialized-slot acquisition per run_json call, with followup
+        statements executed inside that same acquisition — the property
+        the attribution recheck relies on so its extra statement can never
+        queue behind other guard callers. Subclasses supply the per-
+        statement result via result_for(statement_index).
+        """
+
+        held = True
+
+        def __init__(self) -> None:
+            self.slot_acquisitions = 0
+            self.query_starts = 0
+            self.statements: list[str] = []
+
+        def result_for(self, index: int) -> dict[str, object]:
+            raise NotImplementedError
+
+        def run_json(
+            self,
+            sql: str,
+            *,
+            on_query_start: Any = None,
+            followup: Any = None,
+        ) -> dict[str, object]:
+            self.slot_acquisitions += 1
+            if on_query_start is not None:
+                self.query_starts += 1
+                on_query_start()
+            self.statements.append(sql)
+            result = self.result_for(len(self.statements) - 1)
+            while followup is not None:
+                next_sql = followup(result)
+                if next_sql is None:
+                    break
+                self.statements.append(next_sql)
+                result = self.result_for(len(self.statements) - 1)
+            return result
 
     def test_guard_session_verification_is_non_blocking_and_exact_session(self) -> None:
         class FakeGuard:
@@ -1227,13 +1270,20 @@ class PrismShareLedgerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.statements: list[str] = []
 
-            def run_json(self, sql: str) -> dict[str, object]:
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
                 self.statements.append(sql)
                 return {
                     "backend": "postgres-psql",
                     "guard_advisory_lock_held": True,
                     "writer_session_token_current": True,
                     "lease_renewed_count": 1,
+                    "lease_expired": False,
                 }
 
         guard = FakeGuard()
@@ -1250,6 +1300,7 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "backend": "postgres-psql",
                     "verified_count": 1,
                     "renewed_count": 1,
+                    "renewal_deferred_to_own_write": False,
                 },
             )
 
@@ -1266,6 +1317,24 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("pg_backend_pid()", statement)
         self.assertIn("qbit_ledger_writer_lease", statement)
         self.assertIn(f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}session-a", statement)
+        # The statement must also report committed-row expiry so a skipped
+        # renewal over an expired lease can fail closed.
+        self.assertIn("lease_expires_at <= clock_timestamp()", statement)
+        # And the remaining-TTL authority margin, so an own-write skip over
+        # a nearly-lapsed row defers external side effects before its
+        # authority degenerates into a rollback-dependent argument.
+        self.assertIn(
+            "<= clock_timestamp() + make_interval(secs => 30.0)",
+            statement,
+        )
+        # And it must attribute the lease tuple's locker, so this process's
+        # own fenced write outlasting the TTL is not mistaken for a
+        # competing expiry claim: the committed row's xmax is the locker's
+        # transaction id, and a pg_stat_activity backend running it under
+        # the pool's unique application_name is our own write.
+        self.assertIn("pg_stat_activity", statement)
+        self.assertIn("backend_xid = qbit_ledger_writer_lease.xmax", statement)
+        self.assertIn("qbit-prism-writer-test-pool", statement)
 
     def test_guard_verification_renews_idle_lease_ttl_for_exact_identity(self) -> None:
         """An idle coordinator's heartbeat must keep lease_expires_at ahead.
@@ -1284,7 +1353,13 @@ class PrismShareLedgerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.statements: list[str] = []
 
-            def run_json(self, sql: str) -> dict[str, object]:
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
                 self.statements.append(sql)
                 return {
                     "backend": "postgres-psql",
@@ -1323,7 +1398,13 @@ class PrismShareLedgerTests(unittest.TestCase):
                 class FakeGuard:
                     held = True
 
-                    def run_json(self, sql: str) -> dict[str, object]:
+                    def run_json(
+                        self,
+                        sql: str,
+                        *,
+                        on_query_start: Any = None,
+                        followup: Any = None,
+                    ) -> dict[str, object]:
                         return {
                             "backend": "postgres-psql",
                             "guard_advisory_lock_held": True,
@@ -1369,6 +1450,7 @@ class PrismShareLedgerTests(unittest.TestCase):
                 sql: str,
                 *,
                 on_query_start: Any = None,
+                followup: Any = None,
             ) -> dict[str, object]:
                 if on_query_start is not None:
                     on_query_start()
@@ -1394,6 +1476,12 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "guard_advisory_lock_held": True,
                     "writer_session_token_current": True,
                     "lease_renewed_count": renewed,
+                    # A healthy heartbeat kept the TTL ~a full lease ahead
+                    # before the fenced write took the tuple lock.
+                    "lease_expired": False,
+                    # pg_stat_activity attributes the held tuple lock to
+                    # this process's own pooled backend.
+                    "lease_locked_by_this_process": lease_tuple_locked,
                 }
 
         guard = RowLockEnforcingGuard()
@@ -1412,6 +1500,408 @@ class PrismShareLedgerTests(unittest.TestCase):
 
         # Once the fenced transaction commits (and refreshes the TTL itself),
         # the very next heartbeat resumes renewing on the guard session.
+        result = ledger.verify_writer_lease_guard_session()
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 1)
+
+    def test_guard_verification_fails_closed_on_expired_lease_with_blocked_renewal(
+        self,
+    ) -> None:
+        """An expired row plus a lock-blocked renewal is not proof of liveness.
+
+        The tuple lock that made SKIP LOCKED skip may belong to a
+        different-identity _try_acquire_writer_lease taking the expired row
+        through its expiry CAS; the committed snapshot still names this
+        session until that claim commits (reachable after host suspend,
+        where the monotonic freshness gate cannot be trusted either). The
+        queueing renewal used to detect this by re-evaluating after the
+        claimant committed; the non-blocking spelling must fail closed
+        instead of trusting the stale token read. The fake omits
+        lease_locked_by_this_process to prove an absent locker attribution
+        also defaults closed.
+        """
+
+        class ExpiredContendedGuard(self.InSlotFakeGuard):
+            def result_for(self, index: int) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": True,
+                }
+
+        guard = ExpiredContendedGuard()
+        ledger = self.guarded_verification_ledger(guard)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "expired and its renewal was lock-blocked",
+        ):
+            ledger.verify_writer_lease_guard_session()
+        # The ambiguous shape earns exactly one in-slot attribution recheck
+        # before the fail-closed stands.
+        self.assertEqual(len(guard.statements), 2)
+        self.assertEqual(guard.slot_acquisitions, 1)
+
+    def test_guard_verification_survives_own_fenced_write_outlasting_ttl(self) -> None:
+        """A fenced write outlasting the TTL must not hard-exit the coordinator.
+
+        persist_accepted_block holds the lease tuple lock for its whole
+        autocommit statement, so the heartbeat cannot renew the TTL while it
+        runs; a statement outlasting the remaining TTL leaves the committed
+        row expired with the renewal lock-blocked. When pg_stat_activity
+        attributes that tuple lock to one of this process's own pooled
+        backends, failing closed would roll back the valid write and
+        restart-loop on every similarly slow block — and it is unnecessary:
+        the exclusive tuple lock means no expiry claim can be in flight, and
+        the write's own commit refreshes lease_expires_at before any queued
+        claimant re-evaluates its expiry CAS.
+
+        Liveness is all the exemption grants. The survival argument assumes
+        the write commits — a rollback hands the expired row to a queued
+        claimant — so the result must flag the deferral for external
+        side-effect fences to withhold guarded RPCs until a renewal lands.
+        """
+
+        class OwnLongFencedWriteGuard:
+            held = True
+
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": True,
+                    "lease_locked_by_this_process": True,
+                }
+
+        ledger = self.guarded_verification_ledger(OwnLongFencedWriteGuard())
+        result = ledger.verify_writer_lease_guard_session()
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 0)
+        self.assertIs(result["renewal_deferred_to_own_write"], True)
+
+    def test_guard_verification_defers_own_write_skip_inside_authority_margin(
+        self,
+    ) -> None:
+        """An own-write skip with a thin remaining TTL defers before expiry.
+
+        The TTL erodes exactly while a long own fenced write withholds
+        renewals, so an external side effect authorized on a nearly-lapsed
+        committed row can outlive it mid-RPC — from expiry onward its
+        authority is the same rollback-dependent argument the expired-case
+        deferral rejects. The margin probe engages the deferral once less
+        than half the lease TTL remains, while the row is still unexpired
+        and the heartbeat keeps treating the session as live.
+        """
+
+        class ErodedMarginGuard:
+            held = True
+
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": False,
+                    "lease_expiring_within_authority_margin": True,
+                    "lease_locked_by_this_process": True,
+                }
+
+        ledger = self.guarded_verification_ledger(ErodedMarginGuard())
+        result = ledger.verify_writer_lease_guard_session()
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 0)
+        self.assertIs(result["renewal_deferred_to_own_write"], True)
+
+    def test_guard_verification_authorizes_own_write_skip_with_healthy_margin(
+        self,
+    ) -> None:
+        """A fresh-TTL own-write skip keeps authorizing external effects.
+
+        Every fenced commit refreshes the TTL, so under steady append
+        traffic the lease tuple is frequently locked by this process while
+        the committed row still has most of a lease ahead. Deferring those
+        skips would withhold submitblock and broadcasts behind saturated
+        append traffic; the committed row's own unexpired validity — with
+        at least half the TTL of runway — is standalone authority that
+        needs no assumption about the in-flight write's fate.
+        """
+
+        class FreshTtlOwnWriteGuard:
+            held = True
+
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": False,
+                    "lease_expiring_within_authority_margin": False,
+                    "lease_locked_by_this_process": True,
+                }
+
+        ledger = self.guarded_verification_ledger(FreshTtlOwnWriteGuard())
+        progress_marks: list[int] = []
+        result = ledger.verify_writer_lease_guard_session(
+            on_statement_progress=lambda: progress_marks.append(1),
+        )
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 0)
+        self.assertIs(result["renewal_deferred_to_own_write"], False)
+        # A single-statement verification never reports statement progress.
+        self.assertEqual(progress_marks, [])
+
+    def test_lease_authority_margin_covers_guarded_rpc_deadlines(self) -> None:
+        """The deferral margin floors at TTL/2 and rises with RPC deadlines.
+
+        The margin must cover the longest RPC the lease fence can
+        authorize, or an effect authorized just above the margin outlives
+        its runway and degenerates into rollback-dependent authority. The
+        floor keeps the deferral engaged through the eroded tail of a long
+        own write even when configured deadlines are short.
+        """
+        resolve = PsqlShareLedger._resolve_lease_authority_margin_seconds
+        self.assertEqual(resolve(60.0, None), 30.0)
+        self.assertEqual(resolve(60.0, 20.0), 30.0)
+        self.assertEqual(resolve(60.0, 45.0), 45.0)
+        with self.assertRaises(ValueError):
+            resolve(60.0, float("nan"))
+        with self.assertRaises(ValueError):
+            resolve(60.0, -1.0)
+
+    def test_lease_authority_margin_reaching_the_ttl_is_rejected(self) -> None:
+        """A margin at or above the TTL is a startup error, not a policy.
+
+        The deferral only gates renewal skips; a verification over an
+        uncontended row renews and authorizes unconditionally, and a
+        landed renewal's runway is exactly one TTL. When the guarded
+        effect's deadline can reach the TTL, even a freshly renewed lease
+        cannot outlast the effect, so defer-every-skip would narrow but
+        never close the authorize-then-expire window. Construction must
+        refuse the configuration instead of running with a silent
+        split-brain hazard.
+        """
+        resolve = PsqlShareLedger._resolve_lease_authority_margin_seconds
+        for margin in (60.0, 90.0):
+            with self.subTest(margin=margin):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "must stay below lease_ttl_seconds",
+                ):
+                    resolve(60.0, margin)
+
+    def test_guard_verification_rechecks_when_own_commit_clears_locker_attribution(
+        self,
+    ) -> None:
+        """An own-write commit racing the locker probe must not hard-exit.
+
+        The verification statement's lease-row reads share one MVCC
+        snapshot while pg_stat_activity reports live backend state. When
+        the writer's own fenced write commits after the SKIP LOCKED renewal
+        skipped its locked row but before the probe runs, backend_xid has
+        already cleared and the snapshot still shows the old expired tuple:
+        renewal skipped, row expired, no attributable locker — the exact
+        shape of a competing claim. That commit refreshed the TTL, so a
+        fresh statement's snapshot renews normally; hard-exiting here would
+        restart-loop the coordinator on the very writes the own-lock
+        exemption exists to survive.
+        """
+
+        class CommitRacedGuard(self.InSlotFakeGuard):
+            def result_for(self, index: int) -> dict[str, object]:
+                if index == 0:
+                    # First statement: snapshot taken before the own write's
+                    # commit, probe run after it — locker unattributable.
+                    return {
+                        "backend": "postgres-psql",
+                        "guard_advisory_lock_held": True,
+                        "writer_session_token_current": True,
+                        "lease_renewed_count": 0,
+                        "lease_expired": True,
+                        "lease_locked_by_this_process": False,
+                    }
+                # Recheck: the fresh snapshot sees the committed refresh and
+                # the uncontended row renews.
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 1,
+                    "lease_expired": False,
+                }
+
+        guard = CommitRacedGuard()
+        ledger = self.guarded_verification_ledger(guard)
+        progress_marks: list[int] = []
+        result = ledger.verify_writer_lease_guard_session(
+            on_query_start=lambda: None,
+            on_statement_progress=lambda: progress_marks.append(1),
+        )
+        self.assertEqual(result["verified_count"], 1)
+        self.assertEqual(result["renewed_count"], 1)
+        self.assertIs(result["renewal_deferred_to_own_write"], False)
+        self.assertEqual(len(guard.statements), 2)
+        # The recheck reported the completed first round trip, so liveness
+        # monitors sized for one statement can count it as progress.
+        self.assertEqual(progress_marks, [1])
+        # The recheck runs inside the same serialized slot acquisition: it
+        # can never queue behind other guard callers, so the only cost
+        # charged to the caller's execution budget is one more statement,
+        # and callers budgeting queue wait via on_query_start see it fire
+        # exactly once.
+        self.assertEqual(guard.slot_acquisitions, 1)
+        self.assertEqual(guard.query_starts, 1)
+
+    def test_guard_verification_recheck_still_fails_closed_on_real_contention(
+        self,
+    ) -> None:
+        """The recheck is bounded and never converts contention to liveness.
+
+        A different-identity expiry claim still in flight shows the same
+        expired-locked-unattributable shape on every fresh snapshot; the
+        second identical read must raise, not loop.
+        """
+
+        class ContendedGuard(self.InSlotFakeGuard):
+            def result_for(self, index: int) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 0,
+                    "lease_expired": True,
+                    "lease_locked_by_this_process": False,
+                }
+
+        guard = ContendedGuard()
+        ledger = self.guarded_verification_ledger(guard)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "expired and its renewal was lock-blocked",
+        ):
+            ledger.verify_writer_lease_guard_session()
+        self.assertEqual(len(guard.statements), 2)
+        self.assertEqual(guard.slot_acquisitions, 1)
+
+    def test_guard_verification_recheck_detects_completed_takeover(self) -> None:
+        """A takeover committing mid-verification fails closed on identity.
+
+        When the ambiguous first read was a competing claim that then
+        committed, the recheck's fresh snapshot no longer matches this
+        exact session and must raise the fenced-out error rather than
+        re-reporting the stale lock-blocked one.
+        """
+
+        class TakeoverGuard(self.InSlotFakeGuard):
+            def result_for(self, index: int) -> dict[str, object]:
+                if index == 0:
+                    return {
+                        "backend": "postgres-psql",
+                        "guard_advisory_lock_held": True,
+                        "writer_session_token_current": True,
+                        "lease_renewed_count": 0,
+                        "lease_expired": True,
+                        "lease_locked_by_this_process": False,
+                    }
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": False,
+                }
+
+        guard = TakeoverGuard()
+        ledger = self.guarded_verification_ledger(guard)
+        with self.assertRaisesRegex(RuntimeError, "writer lease is not active"):
+            ledger.verify_writer_lease_guard_session()
+        self.assertEqual(len(guard.statements), 2)
+        self.assertEqual(guard.slot_acquisitions, 1)
+
+    def test_guard_verification_reports_no_deferral_outside_own_lock_expiry(
+        self,
+    ) -> None:
+        """The deferral flag is scoped to exactly the own-lock expired skip.
+
+        A landed renewal (idle recovery included) restores full authority:
+        the TTL is a lease ahead again, so external side effects need no
+        deferral. A healthy skipped renewal over an unexpired row keeps the
+        pre-existing contract as well.
+        """
+        for renewed, expired in ((1, True), (1, False), (0, False)):
+            with self.subTest(renewed=renewed, expired=expired):
+
+                class Guard:
+                    held = True
+
+                    def run_json(
+                        self,
+                        sql: str,
+                        *,
+                        on_query_start: Any = None,
+                        followup: Any = None,
+                    ) -> dict[str, object]:
+                        return {
+                            "backend": "postgres-psql",
+                            "guard_advisory_lock_held": True,
+                            "writer_session_token_current": True,
+                            "lease_renewed_count": renewed,
+                            "lease_expired": expired,
+                            "lease_locked_by_this_process": True,
+                        }
+
+                ledger = self.guarded_verification_ledger(Guard())
+                result = ledger.verify_writer_lease_guard_session()
+                self.assertIs(result["renewal_deferred_to_own_write"], False)
+
+    def test_guard_verification_recovers_expired_lease_when_renewal_lands(self) -> None:
+        """Renewing an expired-but-uncontended row is the idle-recovery path.
+
+        Taking the tuple lock for the renewal proves no expiry claim was in
+        flight, and any claimant arriving afterwards re-evaluates against the
+        refreshed row and loses its CAS. Only a renewal that could not land
+        makes an expired row disqualifying.
+        """
+
+        class ExpiredUncontendedGuard:
+            held = True
+
+            def run_json(
+                self,
+                sql: str,
+                *,
+                on_query_start: Any = None,
+                followup: Any = None,
+            ) -> dict[str, object]:
+                return {
+                    "backend": "postgres-psql",
+                    "guard_advisory_lock_held": True,
+                    "writer_session_token_current": True,
+                    "lease_renewed_count": 1,
+                    "lease_expired": True,
+                }
+
+        ledger = self.guarded_verification_ledger(ExpiredUncontendedGuard())
         result = ledger.verify_writer_lease_guard_session()
         self.assertEqual(result["verified_count"], 1)
         self.assertEqual(result["renewed_count"], 1)

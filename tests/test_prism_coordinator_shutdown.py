@@ -18,6 +18,7 @@ from lab.prism.prism_coordinator import (
     PrismCoordinator,
     ShutdownInProgress,
     StratumError,
+    WriterLeaseRenewalDeferred,
 )
 
 
@@ -65,6 +66,40 @@ class HeartbeatLeaseLedger(RecordingLeaseLedger):
         self.renew_thread = threading.current_thread()
         self.renewed.set()
         return {"backend": "recording", "renewed_count": 1}
+
+
+class DeferredRenewalLeaseLedger(RecordingLeaseLedger):
+    """Verification proves liveness with renewal deferred to an own write.
+
+    Models a fenced write that outlasted the lease TTL: the committed row is
+    expired, the SKIP LOCKED renewal skipped the tuple lock, and PostgreSQL
+    attributes that lock to this process's own pooled backend. The session
+    is live only as long as that write eventually commits.
+    """
+
+    writer_lease_fast_adoption_capable = True
+    writer_lease_guard_required = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.verify_calls = 0
+        self.verified = threading.Event()
+
+    def verify_writer_lease_guard_session(
+        self,
+        *,
+        on_query_start=None,
+    ) -> dict[str, int | str | bool]:
+        if on_query_start is not None:
+            on_query_start()
+        self.verify_calls += 1
+        self.verified.set()
+        return {
+            "backend": "recording",
+            "verified_count": 1,
+            "renewed_count": 0,
+            "renewal_deferred_to_own_write": True,
+        }
 
 
 class GuardVerifyLeaseLedger(RecordingLeaseLedger):
@@ -254,6 +289,72 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         )
         process_exit.assert_not_called()
         watchdog_hard_exit.assert_not_called()
+
+    def test_external_side_effect_gate_defers_renewal_blocked_by_own_write(
+        self,
+    ) -> None:
+        """Own-write lease deferral withholds the RPC without fencing the process.
+
+        The guarded session is live — the heartbeat exemption keeps a slow
+        fenced write from restart-looping the coordinator — but that
+        survival argument assumes the write commits. A rollback would hand
+        the expired row to a queued different-identity claimant while the
+        external effect is in flight, so the fence must refuse the RPC. It
+        must refuse without the hard exit: the process is healthy, and
+        callers retry deferred work on their own cadence (broadcast pass
+        interval, block-candidate outbox replay), succeeding once the
+        commit lands a renewal.
+        """
+        ledger = DeferredRenewalLeaseLedger()
+        server = coordinator(ledger)
+
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit, self.assertRaisesRegex(
+            WriterLeaseRenewalDeferred,
+            "renewal is deferred",
+        ):
+            server._require_fresh_ledger_lease_for_external_side_effect(
+                "submitblock"
+            )
+
+        hard_exit.assert_not_called()
+        self.assertEqual(ledger.verify_calls, 1)
+        # The verification still proved the session live; the freshness
+        # stamp must advance so the heartbeat monitor sees progress.
+        self.assertIsNotNone(
+            getattr(
+                server,
+                "_ledger_lease_heartbeat_last_success_monotonic",
+                None,
+            )
+        )
+
+    def test_lease_heartbeat_tolerates_renewal_deferred_to_own_write(self) -> None:
+        """The heartbeat keeps running while renewal defers to an own write.
+
+        Hard-exiting here would roll back the very write the lease defers
+        to and restart-loop on every similarly slow block; only the
+        external-side-effect fence treats the deferral as disqualifying.
+        """
+        ledger = DeferredRenewalLeaseLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
+            thread = server._start_ledger_lease_heartbeat()
+            self.assertIsNotNone(thread)
+            self.assertTrue(ledger.verified.wait(0.2))
+            server._ledger_lease_heartbeat_stop_event.set()
+            assert thread is not None
+            thread.join(1.0)
+
+        hard_exit.assert_not_called()
+        self.assertGreaterEqual(ledger.verify_calls, 1)
 
     def test_external_side_effect_gate_bounds_blocked_guard_verification(self) -> None:
         verification_started = threading.Event()
@@ -661,6 +762,138 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
                 heartbeat_stop.set()
             if thread is not None:
                 thread.join(0.2)
+
+    def test_external_fence_reports_recheck_progress_to_the_monitor(
+        self,
+    ) -> None:
+        """The fence's verification feeds the monitor's progress mark too.
+
+        The verification holds the guard's serialized slot for its whole
+        statement sequence, so the periodic heartbeat queues behind it and
+        records nothing meanwhile. Without this caller passing the
+        progress callback, a fence verification's lawful second statement
+        ages the heartbeat's last success past the single-statement
+        failure budget and the monitor hard-exits a healthy coordinator —
+        the hazard already closed for the heartbeat loop's own recheck.
+        """
+
+        class RecheckFenceLedger(RecordingLeaseLedger):
+            writer_lease_fast_adoption_capable = True
+            writer_lease_guard_required = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.saw_progress_callback = threading.Event()
+
+            def verify_writer_lease_guard_session(
+                self,
+                *,
+                on_query_start=None,
+                on_statement_progress=None,
+            ) -> dict[str, int | str]:
+                if on_query_start is not None:
+                    on_query_start()
+                if on_statement_progress is not None:
+                    # The attribution recheck's first statement completed.
+                    on_statement_progress()
+                    self.saw_progress_callback.set()
+                return {
+                    "backend": "recording",
+                    "verified_count": 1,
+                    "renewed_count": 1,
+                }
+
+        ledger = RecheckFenceLedger()
+        server = coordinator(ledger)
+
+        server._require_fresh_ledger_lease_for_external_side_effect(
+            "submitblock"
+        )
+
+        self.assertTrue(ledger.saw_progress_callback.is_set())
+        self.assertIsNotNone(
+            getattr(
+                server,
+                "_ledger_lease_heartbeat_last_progress_monotonic",
+                None,
+            )
+        )
+
+    def test_recheck_statement_progress_keeps_monitor_from_hard_exiting(
+        self,
+    ) -> None:
+        """A lawful two-statement verification outlasts the failure budget.
+
+        The monitor's budget must stay under the adoption silence, so it is
+        sized for one statement; the attribution recheck's second statement
+        would age the last success past it (two in-deadline statements plus
+        the heartbeat interval exceed the budget below). The completed
+        first round trip is the same session-answers evidence a success
+        proves, so its progress mark must keep the monitor from restarting
+        a healthy coordinator, while a wedged statement — which reports no
+        progress — still ages out (previous test).
+        """
+        first_statement_seconds = 0.2
+        second_statement_seconds = 0.2
+
+        class RecheckingLedger(HeartbeatLeaseLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.verify_calls = 0
+                self.recheck_completed = threading.Event()
+
+            def verify_writer_lease_guard_session(
+                self,
+                *,
+                on_query_start=None,
+                on_statement_progress=None,
+            ) -> dict[str, int | str]:
+                if on_query_start is not None:
+                    on_query_start()
+                self.verify_calls += 1
+                if self.verify_calls == 1:
+                    # Seed the success stamp with a fast verification.
+                    return {"backend": "recording", "renewed_count": 1}
+                # The ambiguous shape: both statements individually within
+                # the guard's statement deadline, together past the
+                # monitor's failure budget.
+                time.sleep(first_statement_seconds)
+                if on_statement_progress is not None:
+                    on_statement_progress()
+                time.sleep(second_statement_seconds)
+                self.recheck_completed.set()
+                return {"backend": "recording", "renewed_count": 1}
+
+        ledger = RecheckingLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+        server.ledger_lease_heartbeat_failure_seconds = 0.3
+        server.ledger_lease_heartbeat_monitor_seconds = 0.005
+        thread: threading.Thread | None = None
+
+        try:
+            with patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=AssertionError("unexpected hard exit"),
+            ) as process_exit, patch.object(
+                server,
+                "_watchdog_hard_exit",
+            ) as hard_exit:
+                thread = server._start_ledger_lease_heartbeat()
+                self.assertIsNotNone(thread)
+                self.assertTrue(ledger.recheck_completed.wait(2))
+                process_exit.assert_not_called()
+                hard_exit.assert_not_called()
+        finally:
+            heartbeat_stop = getattr(
+                server,
+                "_ledger_lease_heartbeat_stop_event",
+                None,
+            )
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if thread is not None:
+                thread.join(1)
 
     def test_watchdog_exit_releases_on_fresh_thread_within_deadline(self) -> None:
         ledger = WatchdogLeaseLedger()

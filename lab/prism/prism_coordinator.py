@@ -76,6 +76,8 @@ from lab.prism.share_ledger import (
     PsqlShareLedger,
     SingleWriterShareLedger,
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
+    WRITER_LEASE_VERIFICATION_MAX_STATEMENTS,
+    WriterLeaseRenewalDeferred,
     sha256_json_hex,
 )
 
@@ -470,6 +472,28 @@ DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 # stays unbounded by design so an already-offered block is never converted
 # back into a raw-submit retry.
 DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH = 8
+# The default deadline for every JsonRpc.call without an explicit timeout,
+# including the fence-guarded CTV broadcast RPCs. The ledger's own-write
+# deferral margin is derived from the guarded deadlines, so route changes
+# through this constant rather than the call signature's literal.
+DEFAULT_QBIT_RPC_CALL_TIMEOUT_SECONDS = 10.0
+# Headroom added on top of the longest guarded RPC deadline when sizing the
+# ledger's own-write deferral margin. It absorbs what the deadline itself
+# cannot: the scheduling gap between the fence verification returning and
+# the RPC's first byte, coordinator-vs-DB clock drift (the lease runway is
+# measured by clock_timestamp()), and the node's application tail — the
+# client-side deadline severs the socket, which bounds transmission but
+# cannot cancel a handler qbitd already received in full, and these RPC
+# handlers apply within milliseconds of complete receipt. The client side
+# of the RPC can never exceed its wall-clock deadline (mutating methods are
+# in _QBIT_RPC_NO_TRANSPORT_RETRY_METHODS and never retry; retried read
+# paths share one deadline across attempts), so a multiplicative factor
+# here would only make the deferral needlessly eager as operators raise
+# deadlines. A node that stalls longer than this headroom after fully
+# receiving a mutating request is the documented residual of preflight
+# fencing between independent systems (see the external-side-effect fence
+# docstring); no client-side teardown can bound it.
+LEASE_AUTHORITY_MARGIN_HEADROOM_SECONDS = 5.0
 # The node fast lane is intentionally shorter than the normal ten-second RPC
 # budget: an ambiguous timeout leaves the durable outbox pending and replay
 # safely submits the same hash again.
@@ -1240,6 +1264,16 @@ class JsonRpc:
         conn = getattr(self._connections, "conn", None)
         if conn is None:
             conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+            # Never let http.client resurrect a severed connection: with
+            # auto_open, request() silently reconnects when the deadline
+            # watchdog's close() lands between the pre-send check and the
+            # send, and that implicit fresh socket lives until the next
+            # watchdog sweep — long enough for a short mutating POST to
+            # reach qbitd after a caller released its ordering locks. With
+            # auto_open off a cleared socket makes send() raise
+            # NotConnected instead; call() connects explicitly under the
+            # watchdog and rechecks the deadline before any byte goes out.
+            conn.auto_open = 0
             self._connections.conn = conn
         else:
             # Reuse: refresh the deadline for this call on the live socket.
@@ -1263,7 +1297,7 @@ class JsonRpc:
         params: list[object] | None = None,
         *,
         wallet: str | None = None,
-        timeout: float = 10,
+        timeout: float = DEFAULT_QBIT_RPC_CALL_TIMEOUT_SECONDS,
     ) -> Any:
         body = json.dumps(
             {
@@ -1299,16 +1333,89 @@ class JsonRpc:
                     raise last_exc
                 raise TimeoutError(f"qbit RPC {method} timed out")
             conn = self._acquire_connection(remaining)
+            # The socket timeout bounds each individual socket operation,
+            # not the call: a response body arriving one packet per
+            # interval extends the call arbitrarily past its nominal
+            # deadline. Lease authority margins are sized from this
+            # timeout as a wall-clock bound on fence-guarded effects, so
+            # enforce it end-to-end: past the deadline a watchdog severs
+            # the connection's socket — repeatedly, because a stalled name
+            # resolution has no socket yet and the one connect() creates
+            # afterwards must not carry the RPC onward — until the attempt
+            # observes the abort as a transport error. For mutating calls
+            # that is the same uncertain outcome a socket timeout already
+            # produces, reconciled by durable replay as a new fully fenced
+            # operation.
+            watchdog_fired = threading.Event()
+            attempt_finished = threading.Event()
+
+            # The allowance is the attempt's exact remaining wall clock, no
+            # grace: callers like the submitblock hard-deadline wrapper
+            # abandon the call and release ordering locks (the payout
+            # landing fence) the instant their deadline passes, so a byte
+            # transmitted in any grace window would race work those callers
+            # already unblocked.
+            def _enforce_deadline(
+                doomed: http.client.HTTPConnection = conn,
+                fired: threading.Event = watchdog_fired,
+                finished: threading.Event = attempt_finished,
+                allowance: float = remaining,
+            ) -> None:
+                if finished.wait(allowance):
+                    return
+                fired.set()
+                while True:
+                    sock = getattr(doomed, "sock", None)
+                    if sock is not None:
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                    try:
+                        doomed.close()
+                    except Exception:
+                        pass
+                    if finished.wait(0.1):
+                        return
+
+            watchdog = threading.Thread(
+                target=_enforce_deadline,
+                name="qbit-rpc-deadline",
+                daemon=True,
+            )
+            watchdog.start()
             try:
+                # Establish the connection (name resolution + TCP) under
+                # the watchdog and re-check the deadline before any request
+                # byte is sent. Left to conn.request(), a name resolution
+                # returning after the deadline resumes straight into
+                # sendall(), and a short mutating POST can reach qbitd
+                # between the watchdog's periodic sweeps; the explicit
+                # check makes the late-connect case lose deterministically.
+                # The check is against the wall clock, not just the
+                # watchdog flag: the flag lags the deadline by thread
+                # scheduling, and a caller that abandoned this call at its
+                # deadline may already have released ordering locks that
+                # a post-deadline send would race.
+                if getattr(conn, "sock", None) is None:
+                    conn_connect = getattr(conn, "connect", None)
+                    if conn_connect is not None:
+                        conn_connect()
+                if watchdog_fired.is_set() or time.monotonic() >= deadline:
+                    raise TimeoutError(f"qbit RPC {method} timed out")
                 conn.request("POST", path, body=body, headers=headers)
                 response = conn.getresponse()
                 data = response.read()  # drain so the connection can be reused
             except (http.client.HTTPException, OSError) as exc:
-                last_exc = exc
                 self._drop_connection()
+                if watchdog_fired.is_set():
+                    raise TimeoutError(f"qbit RPC {method} timed out") from exc
+                last_exc = exc
                 if attempt + 1 < attempt_count:
                     continue
                 raise
+            finally:
+                attempt_finished.set()
             if response.status != 200:
                 # Non-200 bodies may hold a JSON-RPC error (qbitd returns the
                 # error object with a 500 for some methods); surface it as the
@@ -3995,6 +4102,28 @@ class PrismCoordinator:
             writer_session_token=writer_session_token,
             initialize_schema=env("PRISM_POSTGRES_INIT_SCHEMA", "0") in {"1", "true", "yes"},
             lease_ttl_seconds=env_positive_float("PRISM_LEDGER_LEASE_TTL_SECONDS", 60.0),
+            # The own-write deferral margin must cover the longest RPC the
+            # lease fence can authorize — submitblock's dedicated deadline
+            # and the CTV broadcast RPCs riding JsonRpc.call's default —
+            # plus fixed headroom for fence-to-RPC scheduling and clock
+            # drift (see LEASE_AUTHORITY_MARGIN_HEADROOM_SECONDS; the RPCs
+            # themselves cannot outlive their wall-clock deadlines). The
+            # ledger floors this at half the TTL, so short deadlines keep
+            # today's behavior and only an operator raising a guarded
+            # deadline widens the deferral window with it.
+            lease_authority_margin_seconds=(
+                LEASE_AUTHORITY_MARGIN_HEADROOM_SECONDS
+                + max(
+                    float(
+                        getattr(
+                            self,
+                            "block_submit_rpc_timeout_seconds",
+                            DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS,
+                        )
+                    ),
+                    DEFAULT_QBIT_RPC_CALL_TIMEOUT_SECONDS,
+                )
+            ),
             read_concurrency=env_positive_int("PRISM_POSTGRES_READ_CONCURRENCY", 4),
             accepted_stats_cache_seconds=env_nonnegative_float("PRISM_ACCEPTED_STATS_CACHE_SECONDS", 60.0),
             reward_window_cache_seconds=env_nonnegative_float("PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS", 30.0),
@@ -7445,6 +7574,32 @@ class PrismCoordinator:
                 existing,
                 block_height=block_height,
                 landed=True,
+            )
+            self._accepted_block_payout_preview_condition.notify_all()
+
+    def _unmark_accepted_block_payout_landed(self, block_hash: str) -> None:
+        """Withdraw a landed bar armed for an attempt that never reached RPC.
+
+        Only sound while the submit outcome is NOT uncertain: the caller
+        must know submitblock was never invoked under this arming (a
+        preflight refusal such as ``WriterLeaseRenewalDeferred``), so there
+        is no possibly-active coinbase for the barrier to preserve and no
+        reason to keep reconciliation and payout-state publication barred
+        while the candidate waits for its retry. The pending preview entry
+        survives — child work keeps waiting instead of snapshotting
+        pre-accept balances, matching the startup-replay state a durable
+        candidate restores — and the next attempt re-arms ``landed`` before
+        its own RPC.
+        """
+        self._ensure_job_cache_state()
+        key = block_hash.lower()
+        with self._accepted_block_payout_preview_condition:
+            existing = self._accepted_block_payout_previews.get(key)
+            if existing is None or not existing.landed:
+                return
+            self._accepted_block_payout_previews[key] = dataclass_replace(
+                existing,
+                landed=False,
             )
             self._accepted_block_payout_preview_condition.notify_all()
 
@@ -12518,6 +12673,21 @@ class PrismCoordinator:
                     renewal_started_monotonic
                 )
 
+    def _record_ledger_lease_heartbeat_progress(self) -> None:
+        """Stamp mid-verification progress for the staleness monitor only.
+
+        Fires from inside verify_writer_lease_guard_session when its
+        attribution recheck runs a second statement: the first statement's
+        round trip completed, proving the heartbeat machinery is making
+        progress. Deliberately separate from the success timestamp — the
+        verification has not yet reached a verdict, so nothing that treats
+        success as authorization freshness may observe this mark. Only the
+        heartbeat monitor reads it, so a lawful two-statement verification
+        is not mistaken for a wedged heartbeat while a genuinely stuck
+        statement still ages toward the failure budget unimpeded.
+        """
+        self._ledger_lease_heartbeat_last_progress_monotonic = time.monotonic()
+
     @staticmethod
     def _ledger_lease_guard_session_verifier(
         ledger: object,
@@ -12690,10 +12860,30 @@ class PrismCoordinator:
         if heartbeat_stop is None:
             heartbeat_stop = threading.Event()
             self._ledger_lease_heartbeat_stop_event = heartbeat_stop
+        # The verification may lawfully run a second statement (the
+        # attribution recheck) whose duration the monitor's failure budget
+        # cannot absorb — that budget must stay under the adoption silence,
+        # so it is sized for one statement. A verification that reports
+        # per-statement progress lets the monitor count the completed first
+        # round trip instead of hard-exiting a healthy coordinator mid-way
+        # through a lawful recheck.
+        try:
+            verify_reports_statement_progress = (
+                "on_statement_progress" in inspect.signature(verify).parameters
+            )
+        except (TypeError, ValueError):
+            verify_reports_statement_progress = False
         while not heartbeat_stop.is_set():
             verify_started_monotonic = time.monotonic()
             try:
-                verify()
+                if verify_reports_statement_progress:
+                    verify(
+                        on_statement_progress=(
+                            self._record_ledger_lease_heartbeat_progress
+                        )
+                    )
+                else:
+                    verify()
             except Exception:
                 self._ledger_lease_heartbeat_hard_exit(
                     "prism coordinator: ledger lease heartbeat failed; "
@@ -12745,7 +12935,23 @@ class PrismCoordinator:
                     time.monotonic(),
                 )
             )
-            age_seconds = max(0.0, time.monotonic() - last_success)
+            # Mid-verification progress counts: a lawful attribution
+            # recheck runs a second statement whose duration this budget —
+            # sized for one statement so it stays under the adoption
+            # silence — cannot absorb, and the completed first round trip
+            # is the same session-answers evidence a success proves. A
+            # wedged statement records neither and still ages out.
+            last_progress = float(
+                getattr(
+                    self,
+                    "_ledger_lease_heartbeat_last_progress_monotonic",
+                    last_success,
+                )
+            )
+            age_seconds = max(
+                0.0,
+                time.monotonic() - max(last_success, last_progress),
+            )
             if age_seconds < failure_seconds:
                 continue
             self._ledger_lease_heartbeat_hard_exit(
@@ -12825,6 +13031,16 @@ class PrismCoordinator:
         preflight fence rather than an atomic transaction with the subsequent
         RPC. The advisory session remains held across the RPC in the ordinary
         case; see the deployment guide for the residual post-check pause risk.
+
+        A verification that reports ``renewal_deferred_to_own_write`` proves
+        liveness but not authority: the writer's own fenced write holds the
+        expired lease row, and only its commit guarantees the lease survives.
+        That is enough for the heartbeat, which merely keeps a healthy
+        process from self-fencing, but not for an RPC — a rollback would let
+        a queued claimant take the lease while the effect is in flight. This
+        fence then raises :class:`WriterLeaseRenewalDeferred` without arming
+        the hard exit; callers already retry deferred work on their own
+        cadence.
         """
         ledger = getattr(self, "ledger", None)
         if not bool(
@@ -12842,7 +13058,13 @@ class PrismCoordinator:
                 f"writer lease guard verification is unavailable before {component}"
             )
 
-        timeout_seconds = max(
+        # The configured fence timeout budgets one statement; the
+        # verification may lawfully run a second inside the same guarded
+        # slot (the attribution recheck), and killing that recheck at the
+        # single-statement deadline would hard-exit a coordinator the
+        # recheck was about to prove healthy. Two moderately slow but
+        # in-deadline statements must both fit.
+        timeout_seconds = WRITER_LEASE_VERIFICATION_MAX_STATEMENTS * max(
             0.0,
             float(
                 getattr(
@@ -12872,11 +13094,20 @@ class PrismCoordinator:
         )
         query_started = threading.Event()
         try:
-            verify_reports_query_start = (
-                "on_query_start" in inspect.signature(verify).parameters
-            )
+            verify_parameters = inspect.signature(verify).parameters
         except (TypeError, ValueError):
-            verify_reports_query_start = False
+            verify_parameters = {}
+        verify_reports_query_start = "on_query_start" in verify_parameters
+        # This verification holds the guard's serialized slot for its whole
+        # statement sequence, so the periodic heartbeat queues behind it
+        # and records nothing meanwhile. Its lawful second statement (the
+        # attribution recheck) can therefore age the heartbeat's last
+        # success past the monitor's single-statement failure budget — the
+        # same hazard the heartbeat loop's own recheck had — so this
+        # caller must feed the monitor the completed first round trip too.
+        verify_reports_statement_progress = (
+            "on_statement_progress" in verify_parameters
+        )
         if not verify_reports_query_start:
             # A verification that cannot report when its query slot was
             # acquired keeps the previous behavior: the whole budget covers
@@ -12884,17 +13115,23 @@ class PrismCoordinator:
             query_started.set()
 
         outcome: queue.Queue[BaseException | None] = queue.Queue(maxsize=1)
+        verification_result: list[object] = []
         verification_started_monotonic = time.monotonic()
 
         def verify_exact_session() -> None:
             try:
+                verify_kwargs: dict[str, Callable[[], None]] = {}
                 if verify_reports_query_start:
-                    verify(on_query_start=query_started.set)
-                else:
-                    verify()
+                    verify_kwargs["on_query_start"] = query_started.set
+                if verify_reports_statement_progress:
+                    verify_kwargs["on_statement_progress"] = (
+                        self._record_ledger_lease_heartbeat_progress
+                    )
+                result = verify(**verify_kwargs)
             except BaseException as exc:
                 outcome.put(exc)
             else:
+                verification_result.append(result)
                 outcome.put(None)
 
         try:
@@ -12966,6 +13203,24 @@ class PrismCoordinator:
         self._record_ledger_lease_heartbeat_success(
             verification_started_monotonic
         )
+
+        # A verification that proved liveness only because the writer's own
+        # fenced write holds the expired lease row is not authority for an
+        # external side effect: that survival argument assumes the write
+        # commits, and a rollback would hand the row to a queued
+        # different-identity claimant while the RPC is in flight. Refuse the
+        # side effect without fencing the process — the session is healthy
+        # and the write's commit will land the next renewal; callers retry
+        # on their own cadence (broadcast interval, candidate outbox replay).
+        result = verification_result[0] if verification_result else None
+        if isinstance(result, dict) and result.get(
+            "renewal_deferred_to_own_write"
+        ):
+            raise WriterLeaseRenewalDeferred(
+                f"withholding {component}: writer lease renewal is deferred "
+                "behind this coordinator's own in-flight fenced write; "
+                "retry after that transaction commits and a renewal lands"
+            )
 
     @contextmanager
     def _watchdog_paused(self, *names: str) -> Iterator[None]:
@@ -14305,6 +14560,17 @@ class PrismCoordinator:
                         self.observe_ctv_fanout_broadcaster_pass(
                             max(0.0, time.monotonic() - started)
                         )
+            except WriterLeaseRenewalDeferred as exc:
+                # A preflight refusal, not a failure: the writer's own
+                # fenced write is holding the lease renewal, and the fence
+                # withheld the guarded RPC before it ran. The next pass on
+                # the ordinary interval retries once the write commits and
+                # a renewal lands.
+                print(
+                    "prism coordinator: CTV fanout broadcaster pass "
+                    f"withheld: {exc}",
+                    flush=True,
+                )
             except Exception:
                 print("prism coordinator: CTV fanout broadcaster pass failed", flush=True)
                 traceback.print_exc()
@@ -26185,25 +26451,59 @@ class PrismCoordinator:
                 )
                 fallback_submit_under_fence = not node_submission.attempted
                 if not node_submission.attempted:
-                    self._require_fresh_ledger_lease_for_external_side_effect(
-                        "submitblock"
-                    )
+
+                    def _verify_lease_before_submitblock() -> None:
+                        # Runs at the RPC boundary — after any wait on the
+                        # landing fence lock below — so the lease runway the
+                        # verification proves is still intact when the RPC
+                        # starts. A predating append_batch can hold that
+                        # lock across its ledger commit and epoch bump far
+                        # longer than any scheduling headroom, and a
+                        # verification taken before the wait would measure
+                        # runway the wait then consumes.
+                        try:
+                            self._require_fresh_ledger_lease_for_external_side_effect(
+                                "submitblock"
+                            )
+                        except WriterLeaseRenewalDeferred:
+                            if not transition_already_landed:
+                                # The refusal fired before submitblock, so
+                                # this attempt's outcome is not uncertain:
+                                # qbitd provably never saw the block (no
+                                # fast-lane node offer either — attempted is
+                                # False). Unwind the landed bar this attempt
+                                # armed — leaving it would bar reconciliation
+                                # and payout-state publication for as long as
+                                # the writer's own fenced write keeps the
+                                # renewal deferred, though nothing needs
+                                # preserving. The begun preview stays and the
+                                # retry re-arms both. A bar landed by an
+                                # earlier attempt that did reach submitblock
+                                # keeps standing for that attempt's uncertain
+                                # outcome.
+                                self._unmark_accepted_block_payout_landed(
+                                    block_hash
+                                )
+                            raise
+
                     # The epoch fence above is advisory: it releases the lock
                     # after one read, so an append-side bump could still commit
                     # between that read and the RPC below. This one is
                     # authoritative -- the bump acquires the same fence lock, so
                     # holding it across submitblock means no late-visible append
                     # can advance the epoch between this comparison and the
-                    # block entering qbitd. The lock spans exactly one RPC and
-                    # only on this boundary; ordinary share commits never touch
-                    # it (the append side takes it only for rows that predate a
-                    # live anchor, and this landing's own declared anchor stays
-                    # exposed for the landing's duration).
+                    # block entering qbitd. The lock spans the lease
+                    # verification and one RPC, and only on this boundary;
+                    # ordinary share commits never touch it (the append side
+                    # takes it only for rows that predate a live anchor, and
+                    # this landing's own declared anchor stays exposed for
+                    # the landing's duration).
                     append_epoch_raced = False
                     if (
                         effective_append_epoch is None
                         or getattr(context, "collection_only", False)
                     ):
+                        _verify_lease_before_submitblock()
                         node_submission = self._submit_block_candidate_to_node(
                             candidate
                         )
@@ -26216,6 +26516,7 @@ class PrismCoordinator:
                             if live_append_epoch != effective_append_epoch:
                                 append_epoch_raced = True
                             else:
+                                _verify_lease_before_submitblock()
                                 node_submission = (
                                     self._submit_block_candidate_to_node(candidate)
                                 )

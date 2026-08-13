@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 from datetime import datetime, timedelta, timezone
 import threading
+import time
 import urllib.request
 import unittest
 from unittest.mock import patch
@@ -930,6 +932,109 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
                 self.assertEqual(len(constructed), 1)
                 self.assertEqual(constructed[0].requests, 1)
                 self.assertTrue(constructed[0].closed)
+
+    def test_json_rpc_enforces_wall_clock_deadline_on_slow_body(self) -> None:
+        # The socket timeout bounds each recv, not the call: a body dripping
+        # one packet per interval keeps every recv in-timeout while the call
+        # runs unbounded. Lease authority margins treat the timeout as a
+        # wall-clock cap on fence-guarded effects, so the deadline watchdog
+        # must sever the connection and surface a TimeoutError instead.
+        severed = threading.Event()
+
+        class DrippingResponse:
+            status = 200
+
+            def read(self) -> bytes:
+                # Blocks like a slow-dripping body until the watchdog severs
+                # the connection, then fails like a closed socket would. The
+                # wait is a backstop only; the assertion below proves the
+                # watchdog actually severed within its deadline.
+                severed.wait(5)
+                raise ConnectionResetError("connection severed")
+
+        class FakeSock:
+            def shutdown(self, how: int) -> None:
+                severed.set()
+
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.sock = FakeSock()
+
+            def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
+                return None
+
+            def getresponse(self) -> DrippingResponse:
+                return DrippingResponse()
+
+            def close(self) -> None:
+                severed.set()
+
+        rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
+        begun = time.monotonic()
+        with patch("http.client.HTTPConnection", FakeConnection):
+            with self.assertRaisesRegex(TimeoutError, "timed out"):
+                rpc.call("getbestblockhash", timeout=0.2)
+        # The watchdog severed at its ~0.3s allowance, not the 5s backstop:
+        # anything near the backstop means the sever never reached the sock.
+        self.assertLess(time.monotonic() - begun, 2.0)
+        self.assertTrue(severed.is_set())
+
+    def test_json_rpc_connections_never_auto_reconnect(self) -> None:
+        # http.client's auto_open lets request() silently re-open a
+        # connection whose socket was cleared — exactly what the deadline
+        # watchdog's close() does when it lands between the pre-send check
+        # and the send. That implicit fresh socket would live until the
+        # next watchdog sweep, long enough for a short mutating POST to
+        # reach qbitd after the caller released its ordering locks. The
+        # connection must refuse to resurrect itself: a severed socket
+        # makes the send fail, and only call()'s explicit, deadline-checked
+        # connect may open one.
+        rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
+        conn = rpc._acquire_connection(1.0)
+        self.assertEqual(conn.auto_open, 0)
+        with self.assertRaises(http.client.NotConnected):
+            conn.send(b"post-deadline byte")
+
+    def test_json_rpc_deadline_stops_late_name_resolution_before_send(self) -> None:
+        # A stalled name resolution has no socket for the watchdog to sever,
+        # and once resolution returns the caller thread would resume straight
+        # into sendall() — a short mutating POST could reach qbitd between
+        # watchdog sweeps. The explicit connect-then-recheck must make the
+        # late connect lose deterministically: the request is never sent.
+        constructed: list[object] = []
+
+        class FakeSock:
+            def shutdown(self, how: int) -> None:
+                return None
+
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.sock: FakeSock | None = None
+                self.request_calls = 0
+                constructed.append(self)
+
+            def connect(self) -> None:
+                # Name resolution stalls past the deadline, then the
+                # connection comes up as if DNS finally answered.
+                threading.Event().wait(0.45)
+                self.sock = FakeSock()
+
+            def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
+                self.request_calls += 1
+
+            def getresponse(self) -> object:
+                raise AssertionError("request must never be sent past the deadline")
+
+            def close(self) -> None:
+                return None
+
+        rpc = JsonRpc(host="127.0.0.1", port=18452, user="u", password="p")
+        with patch("http.client.HTTPConnection", FakeConnection):
+            with self.assertRaisesRegex(TimeoutError, "timed out"):
+                rpc.call("submitblock", timeout=0.2)
+        # The deadline check fired after the late connect and before any
+        # request byte went out.
+        self.assertEqual(constructed[0].request_calls, 0)
 
 
 if __name__ == "__main__":
