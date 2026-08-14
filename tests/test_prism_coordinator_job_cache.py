@@ -3346,6 +3346,61 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(ledger.current_balance_reads, 0)
         self.assertTrue(server._tip_refresh_retry.is_set())
 
+    def test_preview_publication_survives_window_build_timeout(self) -> None:
+        """Issue #188 acceptance: when the payout window build dies with the
+        slow ledger during found-block publication, the preview must still
+        cross the atomic publication boundary. Admission then reopens and
+        child jobs build against the verified compact preview instead of
+        stalling behind the global publication fence until the ledger
+        recovers."""
+        accepted_hash = "c4" * 32
+        server, rpc = coordinator(
+            template=base_template(height=12, prevhash=accepted_hash)
+        )
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        self.assertTrue(server.pool_readiness_latched())
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+
+        def timing_out_window_build(
+            *_args: object, **_kwargs: object
+        ) -> PayoutLedgerArtifact:
+            raise LedgerOperationTimeout("postgres statement deadline expired")
+
+        server._build_payout_ledger_artifact = (  # type: ignore[method-assign]
+            timing_out_window_build
+        )
+        server._begin_accepted_block_payout_preview(accepted_hash, block_height=11)
+        server._mark_accepted_block_payout_landed(accepted_hash, block_height=11)
+        generation_before = server._payout_state_generation
+        with patch("builtins.print"):
+            published = server._publish_accepted_block_payout_preview(
+                accepted_hash, preview
+            )
+        self.assertEqual(published, preview)
+        # The publication crossed the atomic boundary: a generation was
+        # installed and delivery admission reopened despite the dead build.
+        self.assertFalse(server._payout_state_publication_fenced())
+        self.assertEqual(server._payout_state_generation, generation_before + 1)
+        transition = server._accepted_block_payout_previews[accepted_hash]
+        self.assertEqual(transition.published_generation, generation_before + 1)
+        # Child job construction is admitted and consumes the preview.
+        bundle = server.shared_job_bundle(artifacts, mode="ready")
+        self.assertIsNotNone(bundle)
+        self.assertEqual(recorded["calls"], 1)
+        last_kwargs = recorded["last_kwargs"]
+        assert isinstance(last_kwargs, dict)
+        self.assertEqual(list(last_kwargs["prior_balances"]), preview)
+        server._clear_accepted_block_payout_preview(accepted_hash)
+
     def test_inactive_landed_ancestor_rejects_preview_patched_artifact(
         self,
     ) -> None:

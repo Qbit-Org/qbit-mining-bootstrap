@@ -7741,15 +7741,16 @@ class PrismCoordinator:
                         if published is not None:
                             break
             except Exception as exc:
-                # Degraded preview publication (issue #188): preparing the
-                # full payout-state artifact touches the ledger and can time
-                # out while the durable landing is still slow. Child job
-                # issuance must not stay coupled to that bookkeeping, so fall
-                # through to the fenced local-retention branch below exactly
-                # like a lost atomic publication: admission is force-blocked,
-                # the immutable compact preview becomes visible to waiting
-                # children, and payout-state publication itself stays gated
-                # until the normal retry loop publishes a fresh source.
+                # Last-resort degraded retention (issue #188): candidate
+                # preparation already degrades a ledger-timeout window build
+                # to the cached armed window, so reaching here means an
+                # in-memory publication step itself failed. Fall through to
+                # the fenced local-retention branch below exactly like a
+                # lost atomic publication: admission is force-blocked, the
+                # immutable compact preview remains visible to children
+                # already waiting on the transition, and the tip-refresh
+                # retry loop must publish a fresh source before new job
+                # admission resumes.
                 published = None
                 print(
                     "prism coordinator: accepted block payout preview "
@@ -8429,6 +8430,24 @@ class PrismCoordinator:
                         bypass_interval,
                         True,
                     )
+                except ShutdownInProgress:
+                    raise
+                except Exception as exc:
+                    if not immediate_preview:
+                        raise
+                    # Found-block publication exists to decouple child job
+                    # issuance from slow landing bookkeeping (issue #188). A
+                    # window build that dies with the ledger must not abort
+                    # the atomic publication that reopens admission: degrade
+                    # to the cached armed window below, exactly like a busy
+                    # prepare lock. The preview itself never depends on this
+                    # build; it is the verified balance state either way.
+                    print(
+                        "prism coordinator: found-block payout window build "
+                        f"failed; degrading to cached armed window: {exc}",
+                        flush=True,
+                    )
+                    ledger_artifact = None
                 finally:
                     if immediate_preview:
                         self._payout_state_prepare_lock.release()
