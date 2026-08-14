@@ -2923,6 +2923,93 @@ class JobBundleCacheTests(unittest.TestCase):
             server._clear_accepted_block_payout_preview(block_hash)
         self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
 
+    def test_startup_replay_gate_blocks_job_builds_until_enumeration(self) -> None:
+        server, _rpc = coordinator()
+        enumerated: list[int] = []
+
+        class EnumLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                enumerated.append(limit)
+                return []
+
+        server.ledger = EnumLedger()
+        server._note_block_replay_enumeration_owed()
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "has not enumerated"):
+            server._await_pending_parent_payout_preview("ab" * 32)
+        self.assertEqual(server.replay_pending_block_candidates(), 0)
+        self.assertEqual(enumerated, [32])
+        self.assertFalse(server._block_replay_enumeration_owed())
+        self.assertIsNone(server._await_pending_parent_payout_preview("ab" * 32))
+
+    def test_owed_enumeration_bypasses_live_candidate_short_circuits(self) -> None:
+        server, _rpc = coordinator()
+        enumerated: list[int] = []
+
+        class EnumLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                enumerated.append(limit)
+                return []
+
+        server.ledger = EnumLedger()
+        server.block_landing_db_timeout_seconds = 7.5
+        server._retry_block_candidate = object()
+        # Steady state: a retained retry short-circuits the outbox poll.
+        self.assertEqual(server.replay_pending_block_candidates(), 0)
+        self.assertEqual(enumerated, [])
+        # Owed enumeration is correctness-critical and bypasses the
+        # short-circuits, running with the landing-class budget.
+        server._note_block_replay_enumeration_owed()
+        self.assertEqual(server.replay_pending_block_candidates(), 0)
+        self.assertEqual(enumerated, [32])
+        self.assertFalse(server._block_replay_enumeration_owed())
+        metrics = server.block_ledger_call_class_metrics()
+        self.assertEqual(metrics["fast"]["last_budget_seconds"], 7.5)
+
+    def test_startup_replay_timeout_keeps_job_builds_blocked(self) -> None:
+        server, _rpc = coordinator()
+        release = threading.Event()
+
+        class StallLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                release.wait(5)
+                return []
+
+        server.ledger = StallLedger()
+        server.block_landing_db_timeout_seconds = 0.01
+        server.block_landing_db_timeout_max_seconds = 0.01
+        try:
+            with patch("builtins.print"):
+                self.assertTrue(server._run_startup_block_candidate_replay())
+            self.assertTrue(server._block_replay_enumeration_owed())
+            with self.assertRaisesRegex(
+                TemplateRefreshBlocked, "has not enumerated"
+            ):
+                server._await_pending_parent_payout_preview("ab" * 32)
+        finally:
+            release.set()
+
+    def test_startup_phase_seconds_records_first_occurrence_only(self) -> None:
+        import time as _time
+
+        server, _rpc = coordinator()
+        self.assertEqual(server.startup_phase_seconds(), {})
+        server._record_startup_phase_once("audit_listener_bound")
+        self.assertEqual(server.startup_phase_seconds(), {})
+        server._startup_phase_origin_monotonic = _time.monotonic() - 1.0
+        server._record_startup_phase_once("audit_listener_bound")
+        first = server.startup_phase_seconds()["audit_listener_bound"]
+        self.assertGreaterEqual(first, 1.0)
+        server._record_startup_phase_once("audit_listener_bound")
+        self.assertEqual(
+            server.startup_phase_seconds()["audit_listener_bound"], first
+        )
+
     def test_unmark_landed_clears_unresolved_age(self) -> None:
         server, _rpc = coordinator()
         block_hash = "cd" * 32

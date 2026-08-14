@@ -92,6 +92,34 @@ def publish(
 
 
 class ProgressHealthTests(unittest.TestCase):
+    def test_health_warmup_is_async_and_reports_starting_state(self) -> None:
+        import time as _time
+
+        server, _clock = progress_coordinator()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_stats() -> tuple[int, int]:
+            entered.set()
+            release.wait(5)
+            return (0, 0)
+
+        server.accepted_share_stats = blocking_stats  # type: ignore[method-assign]
+        try:
+            started = _time.monotonic()
+            server.start_health_snapshot_refresher()
+            # The bind path never blocks on the cold accepted-share
+            # aggregate; the warm-up runs in the background loop.
+            self.assertLess(_time.monotonic() - started, 1.0)
+            self.assertTrue(entered.wait(2))
+            status, payload = server.cached_health_payload()
+            self.assertEqual(status, 503)
+            self.assertEqual(payload["state"], "starting")
+            self.assertFalse(payload["ok"])
+        finally:
+            release.set()
+            server.stop_event.set()
+
     def test_publication_progress_uses_template_failure_budget(self) -> None:
         server, clock = progress_coordinator()
         server.template_refresh_failure_exit_seconds = 10.0

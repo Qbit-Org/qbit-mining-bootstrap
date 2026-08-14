@@ -12816,6 +12816,9 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         server.max_blocks = 10
         server.stop_after_block = False
         server.block_submit_db_timeout_seconds = 0.01
+        # The startup enumeration is landing-class (issue #188 fix 4).
+        server.block_landing_db_timeout_seconds = 0.01
+        server.block_landing_db_timeout_max_seconds = 0.01
         server.block_candidate_retry_initial_seconds = 0.01
         ledger = SingleWriterShareLedger()
         server.ledger = ledger

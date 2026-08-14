@@ -8127,6 +8127,16 @@ class PrismCoordinator:
         confirmed read lets children of a pending parent block here instead of
         taking (or caching) balances that omit their new parent.
         """
+        # Startup-replay window (issue #188 fix 4): before the durable outbox
+        # has been enumerated, an unarmed pending parent may exist. A child
+        # built now could pay balances that omit that parent's carry, so job
+        # builds fail closed until enumeration succeeds.
+        if self._block_replay_enumeration_owed():
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "durable block candidate replay has not enumerated pending "
+                "candidates yet"
+            )
         selected = self._accepted_block_payout_transition_for_parent(
             parent_hash,
             parent_height=parent_height,
@@ -12021,6 +12031,7 @@ class PrismCoordinator:
                 )
                 self.initial_job_delivery_latency_count += 1
                 self.last_initial_job_delivery_monotonic = delivered
+                self._record_startup_phase_once("first_job_delivered")
 
     def schedule_initial_job(self, client: ClientState) -> bool:
         """Coalesce and enqueue one first-job request without blocking its handler."""
@@ -12194,6 +12205,7 @@ class PrismCoordinator:
                 self.pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
                 self.last_initial_job_delivery_monotonic = time.monotonic()
+                self._record_startup_phase_once("first_job_delivered")
             elif current is request:
                 self.pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
@@ -13937,7 +13949,9 @@ class PrismCoordinator:
             self._serve_with_listener_stack(listener_stack)
 
     def _serve_with_listener_stack(self, listener_stack: ExitStack) -> None:
+        self._startup_phase_origin_monotonic = time.monotonic()
         lease_heartbeat_thread = self._start_ledger_lease_heartbeat()
+        self._record_startup_phase_once("lease_heartbeat_started")
         # Listeners come up first: connections complete their TCP handshake in
         # the kernel backlog while the rest of startup runs, so a fast restart
         # never bounces miners with connection refused. accept() still starts
@@ -13958,6 +13972,7 @@ class PrismCoordinator:
                     return
         if self.stop_event.is_set():
             return
+        self._record_startup_phase_once("node_rpc_ready")
         self.validate_live_chain_identity()
         self.validate_live_template_and_fee_policy()
         self.prism_payout_policy()
@@ -14135,6 +14150,48 @@ class PrismCoordinator:
             self.shutdown(reason="serve_exit")
             self.drain_non_writer_components(drain_threads)
 
+    def _record_startup_phase_once(self, phase: str) -> None:
+        """Record seconds from serve() start to a named startup phase, once.
+
+        Lease adoption, accepted-stat warm-up, audit binding, replay
+        enumeration, first tip template, and first delivered job are timed
+        separately so a slow phase is attributable instead of folding into
+        one opaque time-to-ready figure (issue #188).
+        """
+        origin = getattr(self, "_startup_phase_origin_monotonic", None)
+        if origin is None:
+            return
+        elapsed = max(0.0, time.monotonic() - float(origin))
+        # Lightweight embedders (signal-handling startup tests) can reach
+        # this before dataclass construction installs self.lock.
+        with getattr(self, "lock", None) or _HOT_PATH_LOCK_INITIALIZATION_LOCK:
+            phases = getattr(self, "_startup_phase_seconds", None)
+            if phases is None:
+                phases = {}
+                self._startup_phase_seconds = phases
+            if phase not in phases:
+                phases[phase] = elapsed
+
+    def startup_phase_seconds(self) -> dict[str, float]:
+        with getattr(self, "lock", None) or _HOT_PATH_LOCK_INITIALIZATION_LOCK:
+            phases = getattr(self, "_startup_phase_seconds", None)
+            return dict(phases) if phases is not None else {}
+
+    def _note_block_replay_enumeration_owed(self) -> None:
+        """Mark that pending durable candidates have not been enumerated yet."""
+        with self.lock:
+            self._block_replay_enumeration_owed_flag = True
+
+    def _clear_block_replay_enumeration_owed(self) -> None:
+        with self.lock:
+            self._block_replay_enumeration_owed_flag = False
+
+    def _block_replay_enumeration_owed(self) -> bool:
+        with self.lock:
+            return bool(
+                getattr(self, "_block_replay_enumeration_owed_flag", False)
+            )
+
     def _run_startup_writer_replay(
         self,
         replay: Callable[[], int],
@@ -14153,6 +14210,12 @@ class PrismCoordinator:
 
     def _run_startup_block_candidate_replay(self) -> bool:
         """Run best-effort pre-accept replay without dying on a slow ledger."""
+        # Until the durable outbox has been enumerated once, this process
+        # cannot know whether a pending accepted candidate exists. Child job
+        # builds fail closed on that uncertainty instead of snapshotting a
+        # payout base that may omit a pending parent's carry (issue #188);
+        # replay_pending_block_candidates clears the flag on success.
+        self._note_block_replay_enumeration_owed()
         try:
             return self._run_startup_writer_replay(
                 self.replay_pending_block_candidates
@@ -14161,8 +14224,9 @@ class PrismCoordinator:
             print(
                 "prism coordinator: startup block candidate replay timed out "
                 "phase=replay-outbox-query "
-                f"timeout={self._block_submitter_db_timeout():g}s; "
-                "continuing startup; block submitter loop will retry",
+                f"timeout={self._block_landing_db_timeout():g}s; "
+                "continuing startup; block submitter loop will retry and "
+                "job builds stay blocked until pending candidates are known",
                 flush=True,
             )
             return True
@@ -14391,15 +14455,20 @@ class PrismCoordinator:
             return True
 
     def start_audit_server(self) -> None:
-        self.start_health_snapshot_refresher()
+        # Bind before the health snapshot warm-up: the cold accepted-share
+        # aggregate can take minutes on a grown ledger, and for that whole
+        # window the listener must answer with an explicit starting state
+        # instead of connection refused (issue #188 fix 4).
         handler_cls = make_audit_handler(self)
         httpd = ThreadingHTTPServer((self.audit_bind or "127.0.0.1", self.audit_port), handler_cls)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
+        self._record_startup_phase_once("audit_listener_bound")
         print(
             f"prism coordinator: audit HTTP listening on {self.audit_bind}:{self.audit_port}",
             flush=True,
         )
+        self.start_health_snapshot_refresher()
 
     def apply_stratum_send_timeout(self, sock: socket.socket) -> None:
         """Bound blocking sends to miners without touching receive semantics.
@@ -15365,6 +15434,7 @@ class PrismCoordinator:
                         if prior_parent is None or prior_parent[0] != token.tip_hash:
                             self.current_tip_parent = None
                     self.tip_template_snapshot = snapshot
+                    self._record_startup_phase_once("first_tip_template_published")
                     self.tip_refresh_divergence_started_monotonic = None
                     if tip_changed:
                         # Retained collection work, the retained ready bundle,
@@ -23972,18 +24042,32 @@ class PrismCoordinator:
     def replay_pending_block_candidates(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
         self._record_block_submitter_phase("replay-check-memory")
+        # While startup enumeration is still owed, correctness requires the
+        # outbox query even if live candidates are queued: job builds stay
+        # blocked until pending candidates are known, and only a successful
+        # enumeration can unblock them.
+        enumeration_owed = self._block_replay_enumeration_owed()
         with self.lock:
-            if getattr(self, "_retry_block_candidate", None) is not None:
+            if (
+                not enumeration_owed
+                and getattr(self, "_retry_block_candidate", None) is not None
+            ):
                 return 0
         # A live wakeup is already the lowest-latency route to qbitd. Never
         # park it behind the outbox query that exists only to recover missing
         # wakeups after queue pressure or restart.
         queue_obj = getattr(self, "block_candidate_queue", None)
-        if queue_obj is not None and not queue_obj.empty():
+        if not enumeration_owed and queue_obj is not None and not queue_obj.empty():
             return 0
         self._ensure_block_replay_state()
-        if not self._block_replay_candidate_queue.empty():
+        if not enumeration_owed and not self._block_replay_candidate_queue.empty():
             return 0
+        # The startup enumeration gates job issuance, so it runs with the
+        # landing-class budget instead of the poll budget (issue #188 fix 4);
+        # the periodic steady-state poll keeps the tight budget.
+        replay_query_timeout = (
+            self._block_landing_db_timeout() if enumeration_owed else None
+        )
         pending_rows = getattr(self.ledger, "pending_block_candidate_rows", None)
         if callable(pending_rows):
             durable_rows = self._run_block_submitter_ledger_call(
@@ -23993,15 +24077,18 @@ class PrismCoordinator:
                 # dedupe lets later rows reach qbitd even while the oldest
                 # candidate is still accounting.
                 lambda: pending_rows(limit=MAX_PENDING_BLOCK_CANDIDATES),
+                timeout_seconds=replay_query_timeout,
             )
         else:
             pending = getattr(self.ledger, "pending_block_candidates", None)
             if not callable(pending):
+                self._clear_block_replay_enumeration_owed()
                 return 0
             pending_intents = self._run_block_submitter_ledger_call(
                 ("replay-outbox-query",),
                 "replay-outbox-query",
                 lambda: pending(limit=MAX_PENDING_BLOCK_CANDIDATES),
+                timeout_seconds=replay_query_timeout,
             )
             durable_rows = [
                 {
@@ -24044,6 +24131,10 @@ class PrismCoordinator:
                     durable_block_hash,
                     "invalid durable candidate intent",
                 )
+        # Every pending candidate is now known and its payout barrier armed
+        # (or quarantined), so child job builds may proceed.
+        self._clear_block_replay_enumeration_owed()
+        self._record_startup_phase_once("block_replay_enumerated")
         if queued:
             print(
                 f"prism coordinator: replayed {queued} pending block candidate(s)",
@@ -24230,13 +24321,20 @@ class PrismCoordinator:
         )
 
     @contextmanager
-    def _block_submitter_ledger_timeout_scope(self) -> Iterator[None]:
+    def _block_submitter_ledger_timeout_scope(
+        self,
+        timeout_seconds: float | None = None,
+    ) -> Iterator[None]:
         """Apply the submitter's PostgreSQL deadline when the ledger supports it."""
         operation_timeout = getattr(self.ledger, "operation_timeout", None)
         if not callable(operation_timeout):
             yield
             return
-        with operation_timeout(self._block_submitter_db_timeout()):
+        with operation_timeout(
+            self._block_submitter_db_timeout()
+            if timeout_seconds is None
+            else timeout_seconds
+        ):
             yield
 
     @contextmanager
@@ -24296,6 +24394,8 @@ class PrismCoordinator:
         key: tuple[object, ...],
         phase: str,
         operation: Callable[[], Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> Any:
         """Run one direct outbox call without letting its driver wedge us.
 
@@ -24305,6 +24405,10 @@ class PrismCoordinator:
         real PostgreSQL statement deadline. Candidate outbox mutations are
         idempotent, so a late completion converges with replay.
         """
+        if timeout_seconds is None:
+            timeout_seconds = self._block_submitter_db_timeout()
+        else:
+            timeout_seconds = max(0.001, float(timeout_seconds))
         self._ensure_block_submitter_ledger_call_state()
         with self._block_submitter_ledger_calls_lock:
             call = self._block_submitter_ledger_calls.get(key)
@@ -24332,7 +24436,9 @@ class PrismCoordinator:
 
                 def run() -> None:
                     try:
-                        with self._block_submitter_ledger_timeout_scope():
+                        with self._block_submitter_ledger_timeout_scope(
+                            timeout_seconds
+                        ):
                             call.result = operation()
                     except BaseException as exc:
                         call.error = exc
@@ -24346,7 +24452,6 @@ class PrismCoordinator:
                     daemon=True,
                 ).start()
 
-        timeout_seconds = self._block_submitter_db_timeout()
         deadline = time.monotonic() + timeout_seconds
         while not call.done.is_set():
             self._record_block_submitter_wait(phase)
@@ -28931,6 +29036,7 @@ class PrismCoordinator:
         with self._job_cache_lock:
             self._health_snapshot = payload
             self._health_snapshot_monotonic = time.monotonic()
+        self._record_startup_phase_once("health_snapshot_warm")
         return payload
 
     def cached_health_payload(self) -> tuple[int, dict[str, object]]:
@@ -28960,7 +29066,8 @@ class PrismCoordinator:
                 {
                     "ok": False,
                     "schema": "qbit.prism.audit-health.v1",
-                    "error": "health snapshot is not available yet",
+                    "state": "starting",
+                    "error": "health snapshot warm-up has not completed yet",
                 },
                 self.progress_health_snapshot(),
             )
@@ -29011,11 +29118,11 @@ class PrismCoordinator:
             if self._health_refresh_loop_running:
                 return
             self._health_refresh_loop_running = True
-        try:
-            self.refresh_health_snapshot()
-        except Exception:
-            print("prism coordinator: initial health snapshot refresh failed", flush=True)
-            traceback.print_exc()
+        # The first refresh seeds the exact accepted-share aggregate, which
+        # can take minutes on a grown ledger. It runs inside the background
+        # loop so the audit listener bind path never blocks on it; until it
+        # completes, cached_health_payload reports an explicit starting
+        # state (issue #188 fix 4).
         threading.Thread(target=self.health_snapshot_loop, daemon=True).start()
 
     def latest_evidence_payload(self) -> dict[str, object] | None:
