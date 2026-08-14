@@ -122,6 +122,25 @@ outbox reads and mutations additionally use a single-flight wrapper so a
 driver that ignores its deadline cannot accumulate retry threads. Timeouts
 leave the row pending and enter the ordinary candidate backoff.
 
+Landing-path observability lives on `/metrics`:
+`qbit_prism_block_ledger_calls_total` / `_call_timeouts_total` /
+`_call_budget_seconds` / `_call_last_duration_seconds` /
+`_call_max_duration_seconds` (labelled by `call_class`, `fast` vs
+`landing`), `qbit_prism_accepted_parent_unresolved_transitions` and
+`_unresolved_oldest_seconds`,
+`qbit_prism_accepted_parent_preview_wait_timeouts_total`,
+`qbit_prism_prior_balances_reads_total` / `_read_last_seconds` /
+`_read_max_seconds`, and `qbit_prism_startup_phase_seconds{phase=...}`.
+Alert before the landing deadline is exhausted, not after: page when
+`qbit_prism_prior_balances_read_max_seconds` exceeds ~20% of the
+landing budget or the poll budget, when any
+`qbit_prism_block_ledger_call_timeouts_total{call_class="landing"}`
+increment occurs, and when
+`qbit_prism_accepted_parent_unresolved_oldest_seconds` exceeds the
+preview wait budget. The #188 prior-balances read crossed the one-second
+line silently over several weeks; these series exist so that growth is a
+ticket, not an outage.
+
 Deadlines are split by call class. The poll-class budget above covers only
 cheap outbox polls and fast-lane-adjacent calls. The landing-class
 accounting tail — persisting an accepted block, reading prior balances,

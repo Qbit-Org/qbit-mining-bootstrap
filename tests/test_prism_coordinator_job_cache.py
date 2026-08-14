@@ -2923,6 +2923,81 @@ class JobBundleCacheTests(unittest.TestCase):
             server._clear_accepted_block_payout_preview(block_hash)
         self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
 
+    def test_landing_observability_metrics_exposition(self) -> None:
+        import contextlib as _contextlib
+        import time as _time
+
+        server, _rpc = coordinator()
+        server.block_landing_db_timeout_seconds = 45.0
+        server.block_landing_db_timeout_max_seconds = 90.0
+
+        @_contextlib.contextmanager
+        def statement_timeout(seconds: float):
+            yield
+
+        original_ledger = server.ledger
+        server.ledger = SimpleNamespace(
+            statement_timeout=statement_timeout,
+            prior_balances_read_stats=lambda: {
+                "reads_total": 3,
+                "last_seconds": 0.004,
+                "max_seconds": 0.021,
+            },
+        )
+        block_hash = "ab" * 32
+        with self.assertRaises(TimeoutError):
+            with server._block_landing_ledger_statement_timeout_scope(block_hash):
+                raise TimeoutError("postgres operation exceeded 45s")
+        server.ledger = original_ledger
+
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        server.accepted_block_payout_preview_wait_seconds = 0.0
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "not ready yet"):
+            server._await_pending_parent_payout_preview(block_hash)
+        server._startup_phase_origin_monotonic = _time.monotonic()
+        server._record_startup_phase_once("audit_listener_bound")
+
+        prior_stats = {
+            "reads_total": 3,
+            "last_seconds": 0.004,
+            "max_seconds": 0.021,
+        }
+        server.ledger.prior_balances_read_stats = (  # type: ignore[attr-defined]
+            lambda: prior_stats
+        )
+        lines = "\n".join(server.landing_observability_metrics_lines())
+        self.assertIn(
+            'qbit_prism_block_ledger_call_timeouts_total{call_class="landing"} 1',
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_block_ledger_call_budget_seconds{call_class="landing"} 45.000000',
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_accepted_parent_unresolved_transitions 1",
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_accepted_parent_preview_wait_timeouts_total 1",
+            lines,
+        )
+        self.assertNotIn(
+            "qbit_prism_accepted_parent_unresolved_oldest_seconds -1",
+            lines,
+        )
+        self.assertIn("qbit_prism_prior_balances_reads_total 3", lines)
+        self.assertIn(
+            "qbit_prism_prior_balances_read_max_seconds 0.021000",
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_startup_phase_seconds{phase="audit_listener_bound"}',
+            lines,
+        )
+        server._clear_accepted_block_payout_preview(block_hash)
+
     def test_startup_replay_gate_blocks_job_builds_until_enumeration(self) -> None:
         server, _rpc = coordinator()
         enumerated: list[int] = []

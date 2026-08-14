@@ -8202,6 +8202,11 @@ class PrismCoordinator:
                 "accepted parent payout preview was withdrawn"
             )
         if timed_out:
+            with self.lock:
+                self._accepted_parent_preview_wait_timeouts = (
+                    int(getattr(self, "_accepted_parent_preview_wait_timeouts", 0))
+                    + 1
+                )
             self._schedule_tip_refresh_retry()
             raise TemplateRefreshBlocked(
                 "accepted parent payout preview is not ready yet"
@@ -29271,6 +29276,89 @@ class PrismCoordinator:
             f"qbit_prism_block_submitter_retry_backoff_seconds {backoff_delay:.6f}",
         ]
 
+    def landing_observability_metrics_lines(self) -> list[str]:
+        """Landing-path metrics for issue #188's pre-deadline alerting.
+
+        The prior-balances read crossed the one-second submitter deadline
+        silently over several weeks; these series make that growth, landing
+        timeouts, and unresolved accepted-parent age visible before they
+        become an outage.
+        """
+        lines: list[str] = [
+            "# HELP qbit_prism_block_ledger_calls_total Submitter ledger calls by deadline class.",
+            "# TYPE qbit_prism_block_ledger_calls_total counter",
+            "# HELP qbit_prism_block_ledger_call_timeouts_total Submitter ledger deadline expiries by deadline class.",
+            "# TYPE qbit_prism_block_ledger_call_timeouts_total counter",
+            "# HELP qbit_prism_block_ledger_call_budget_seconds Most recent statement budget applied per deadline class (escalates for retried landings).",
+            "# TYPE qbit_prism_block_ledger_call_budget_seconds gauge",
+            "# HELP qbit_prism_block_ledger_call_last_duration_seconds Duration of the most recent call per deadline class.",
+            "# TYPE qbit_prism_block_ledger_call_last_duration_seconds gauge",
+            "# HELP qbit_prism_block_ledger_call_max_duration_seconds Longest observed call per deadline class since process start.",
+            "# TYPE qbit_prism_block_ledger_call_max_duration_seconds gauge",
+        ]
+        for call_class, stats in sorted(
+            self.block_ledger_call_class_metrics().items()
+        ):
+            label = self.prometheus_label_value(call_class)
+            lines.extend(
+                [
+                    f'qbit_prism_block_ledger_calls_total{{call_class="{label}"}} {int(stats["calls_total"])}',
+                    f'qbit_prism_block_ledger_call_timeouts_total{{call_class="{label}"}} {int(stats["timeouts_total"])}',
+                    f'qbit_prism_block_ledger_call_budget_seconds{{call_class="{label}"}} {float(stats["last_budget_seconds"]):.6f}',
+                    f'qbit_prism_block_ledger_call_last_duration_seconds{{call_class="{label}"}} {float(stats["last_duration_seconds"]):.6f}',
+                    f'qbit_prism_block_ledger_call_max_duration_seconds{{call_class="{label}"}} {float(stats["max_duration_seconds"]):.6f}',
+                ]
+            )
+        unresolved_ages = self.accepted_parent_unresolved_ages_seconds()
+        oldest_unresolved = max(unresolved_ages) if unresolved_ages else -1.0
+        with self.lock:
+            preview_wait_timeouts = int(
+                getattr(self, "_accepted_parent_preview_wait_timeouts", 0)
+            )
+        lines.extend(
+            [
+                "# HELP qbit_prism_accepted_parent_unresolved_transitions Landed accepted-block transitions whose durable bookkeeping is unresolved.",
+                "# TYPE qbit_prism_accepted_parent_unresolved_transitions gauge",
+                f"qbit_prism_accepted_parent_unresolved_transitions {len(unresolved_ages)}",
+                "# HELP qbit_prism_accepted_parent_unresolved_oldest_seconds Age of the oldest unresolved accepted-parent transition, or -1 when none.",
+                "# TYPE qbit_prism_accepted_parent_unresolved_oldest_seconds gauge",
+                f"qbit_prism_accepted_parent_unresolved_oldest_seconds {oldest_unresolved:.6f}",
+                "# HELP qbit_prism_accepted_parent_preview_wait_timeouts_total Child job builds that timed out waiting for an accepted-parent payout preview.",
+                "# TYPE qbit_prism_accepted_parent_preview_wait_timeouts_total counter",
+                f"qbit_prism_accepted_parent_preview_wait_timeouts_total {preview_wait_timeouts}",
+            ]
+        )
+        prior_stats_fn = getattr(self.ledger, "prior_balances_read_stats", None)
+        if callable(prior_stats_fn):
+            prior_stats = prior_stats_fn()
+            lines.extend(
+                [
+                    "# HELP qbit_prism_prior_balances_reads_total Prior-balances reads served by the ledger.",
+                    "# TYPE qbit_prism_prior_balances_reads_total counter",
+                    f"qbit_prism_prior_balances_reads_total {int(prior_stats['reads_total'])}",
+                    "# HELP qbit_prism_prior_balances_read_last_seconds Duration of the most recent prior-balances read.",
+                    "# TYPE qbit_prism_prior_balances_read_last_seconds gauge",
+                    f"qbit_prism_prior_balances_read_last_seconds {float(prior_stats['last_seconds']):.6f}",
+                    "# HELP qbit_prism_prior_balances_read_max_seconds Longest prior-balances read since process start.",
+                    "# TYPE qbit_prism_prior_balances_read_max_seconds gauge",
+                    f"qbit_prism_prior_balances_read_max_seconds {float(prior_stats['max_seconds']):.6f}",
+                ]
+            )
+        startup_phases = self.startup_phase_seconds()
+        if startup_phases:
+            lines.extend(
+                [
+                    "# HELP qbit_prism_startup_phase_seconds Seconds from serve() start to each startup phase, recorded once.",
+                    "# TYPE qbit_prism_startup_phase_seconds gauge",
+                ]
+            )
+            for phase, seconds in sorted(startup_phases.items()):
+                label = self.prometheus_label_value(phase)
+                lines.append(
+                    f'qbit_prism_startup_phase_seconds{{phase="{label}"}} {float(seconds):.6f}'
+                )
+        return lines
+
     def _accepted_stats_reconcile_metric_lines(self) -> list[str]:
         """Surface reconcile liveness now that failures no longer raise.
 
@@ -29417,6 +29505,7 @@ class PrismCoordinator:
             "# TYPE qbit_prism_accepted_shares_total counter",
             f"qbit_prism_accepted_shares_total {accepted_share_count}",
             *self._accepted_stats_reconcile_metric_lines(),
+            *self.landing_observability_metrics_lines(),
             "# HELP qbit_prism_submitted_shares_total Stratum share submissions seen by the PRISM coordinator.",
             "# TYPE qbit_prism_submitted_shares_total counter",
             f"qbit_prism_submitted_shares_total {submitted_share_count}",

@@ -2080,6 +2080,10 @@ class PsqlShareLedger:
         self._stats_refreshed_monotonic: float | None = None
         self._stats_background_refresh_thread: Thread | None = None
         self._stats_reconcile_failures = 0
+        self._prior_balances_read_stats_lock = Lock()
+        self._prior_balances_reads_total = 0
+        self._prior_balances_read_last_seconds = 0.0
+        self._prior_balances_read_max_seconds = 0.0
         self._native = self._make_native_client(
             native_client_mode,
             database_url,
@@ -3397,11 +3401,31 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM qbit_current_carry_forward_balances();
 """
+        started = time.monotonic()
         with self._operation_gate(self._lock, "writer lock"):
             balances = self._run_retry_safe_read_json(sql)
+        self._note_prior_balances_read(max(0.0, time.monotonic() - started))
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
+
+    def _note_prior_balances_read(self, duration_seconds: float) -> None:
+        with self._prior_balances_read_stats_lock:
+            self._prior_balances_reads_total += 1
+            self._prior_balances_read_last_seconds = duration_seconds
+            self._prior_balances_read_max_seconds = max(
+                self._prior_balances_read_max_seconds, duration_seconds
+            )
+
+    def prior_balances_read_stats(self) -> dict[str, float | int]:
+        """Latency of the prior-balances read, the query whose silent growth
+        past the submitter deadline caused the #188 landing livelock."""
+        with self._prior_balances_read_stats_lock:
+            return {
+                "reads_total": self._prior_balances_reads_total,
+                "last_seconds": self._prior_balances_read_last_seconds,
+                "max_seconds": self._prior_balances_read_max_seconds,
+            }
 
     def carry_forward_integrity_report(self) -> dict[str, object]:
         sql = "SELECT qbit_carry_forward_integrity_report();"
