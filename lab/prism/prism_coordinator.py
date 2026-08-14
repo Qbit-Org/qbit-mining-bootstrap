@@ -24539,11 +24539,16 @@ class PrismCoordinator:
                 )
             )
         self._record_block_submitter_wait(f"{phase}:complete")
+        # A server-side deadline normally completes the worker with a ledger
+        # timeout error before the coordinator-side wait expires. Every
+        # operation behind this wrapper is a database call, so a completed
+        # call carrying a timeout error is still a timed-out call for the
+        # per-class alert series.
         self._record_block_ledger_call(
             call_class=call_class,
             budget_seconds=timeout_seconds,
             duration_seconds=max(0.0, time.monotonic() - call.started_monotonic),
-            timed_out=False,
+            timed_out=isinstance(call.error, TimeoutError),
         )
         with self._block_submitter_ledger_calls_lock:
             if self._block_submitter_ledger_calls.get(key) is call:

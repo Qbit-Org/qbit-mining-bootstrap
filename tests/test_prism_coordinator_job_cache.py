@@ -45,7 +45,11 @@ from lab.prism.prism_coordinator import (
     now_ms,
     qbit_template_fingerprint,
 )
-from lab.prism.share_ledger import PendingShare, SingleWriterShareLedger
+from lab.prism.share_ledger import (
+    LedgerOperationTimeout,
+    PendingShare,
+    SingleWriterShareLedger,
+)
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"
 EXTRANONCE2_SIZE = 8
@@ -3088,6 +3092,28 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(server._block_replay_enumeration_owed())
         metrics = server.block_ledger_call_class_metrics()
         self.assertEqual(metrics["landing"]["last_budget_seconds"], 7.5)
+        self.assertNotIn("fast", metrics)
+
+    def test_worker_reported_deadline_counts_as_landing_timeout(self) -> None:
+        """A server-side cancellation completes the ledger worker with a
+        timeout error before the coordinator-side wait expires; the
+        completion path must still count it for the landing-timeout alert."""
+        server, _rpc = coordinator()
+
+        class CancelledLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                raise LedgerOperationTimeout("postgres statement deadline expired")
+
+        server.ledger = CancelledLedger()
+        server._note_block_replay_enumeration_owed()
+        with patch("builtins.print"):
+            self.assertTrue(server._run_startup_block_candidate_replay())
+        self.assertTrue(server._block_replay_enumeration_owed())
+        metrics = server.block_ledger_call_class_metrics()
+        self.assertEqual(metrics["landing"]["calls_total"], 1)
+        self.assertEqual(metrics["landing"]["timeouts_total"], 1)
         self.assertNotIn("fast", metrics)
 
     def test_startup_enumeration_escalates_past_truncated_batches(self) -> None:
