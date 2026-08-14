@@ -2855,6 +2855,87 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(server._payout_state_publication_fenced())
         self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
 
+    def test_preview_publication_degrades_when_artifact_preparation_times_out(
+        self,
+    ) -> None:
+        server, _rpc = coordinator()
+        parent_hash = "ab" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+
+        def timing_out_preparation(*_args: object, **_kwargs: object) -> object:
+            raise TimeoutError("postgres operation exceeded 30s")
+
+        server._prepared_payout_state_candidate = (  # type: ignore[method-assign]
+            timing_out_preparation
+        )
+        server._begin_accepted_block_payout_preview(parent_hash)
+        with patch("builtins.print"):
+            self.assertEqual(
+                server._publish_accepted_block_payout_preview(parent_hash, preview),
+                preview,
+            )
+
+        # Children of the pending parent receive the immutable compact
+        # preview even though no payout-state generation was published.
+        transition = server._accepted_block_payout_previews[parent_hash]
+        self.assertIsNone(transition.published_generation)
+        self.assertTrue(transition.landed)
+        self.assertEqual(
+            server._prior_balances_for_job_parent(parent_hash),
+            preview,
+        )
+        # Payout-state publication itself stays gated until the landing
+        # reaches a terminal durable state.
+        with self.assertRaisesRegex(
+            _PayoutStatePublicationBlocked, "still pending"
+        ):
+            with server._payout_balance_mutation():
+                pass
+        server._clear_accepted_block_payout_preview(parent_hash)
+
+    def test_unresolved_accepted_parent_depth_cap_fails_closed(self) -> None:
+        server, _rpc = coordinator()
+        server.accepted_parent_unresolved_depth_max = 2
+        server.accepted_block_payout_preview_wait_seconds = 0.01
+        hashes = ["a1" * 32, "a2" * 32, "a3" * 32]
+        for height, block_hash in enumerate(hashes, start=10):
+            server._begin_accepted_block_payout_preview(
+                block_hash, block_height=height
+            )
+            server._mark_accepted_block_payout_landed(
+                block_hash, block_height=height
+            )
+        self.assertEqual(len(server.accepted_parent_unresolved_ages_seconds()), 3)
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "exceeds cap"):
+            server._await_pending_parent_payout_preview(hashes[0])
+        # At or below the cap the ordinary bounded wait applies instead.
+        server._clear_accepted_block_payout_preview(hashes[2])
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "not ready yet"):
+            server._await_pending_parent_payout_preview(hashes[0])
+        for block_hash in hashes[:2]:
+            server._clear_accepted_block_payout_preview(block_hash)
+        self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
+
+    def test_unmark_landed_clears_unresolved_age(self) -> None:
+        server, _rpc = coordinator()
+        block_hash = "cd" * 32
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        ages = server.accepted_parent_unresolved_ages_seconds()
+        self.assertEqual(len(ages), 1)
+        self.assertGreaterEqual(ages[0], 0.0)
+        server._unmark_accepted_block_payout_landed(block_hash)
+        self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
+        server._clear_accepted_block_payout_preview(block_hash)
+
     def test_withdrawn_landed_transition_blocks_active_descendant_fallback(
         self,
     ) -> None:

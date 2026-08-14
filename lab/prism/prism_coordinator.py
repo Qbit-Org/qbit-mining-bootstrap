@@ -536,6 +536,13 @@ BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS = 0.25
 # publishing different lock objects for the same state.
 _HOT_PATH_LOCK_INITIALIZATION_LOCK = threading.Lock()
 DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS = 5.0
+# Fail-closed bound on unresolved accepted-parent transitions (landed
+# candidates whose durable bookkeeping has not reached a terminal state).
+# Child jobs may keep issuing against published previews while landings
+# complete, but once this many transitions are unresolved at once, new job
+# builds block instead of stacking further prospective balance chains. The
+# durable outbox (MAX_PENDING_BLOCK_CANDIDATES) remains the wider bound.
+DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX = 8
 # Credit policies recorded on accepted ledger rows. Normal shares carry no
 # policy; a policy marks a share that was credited by an explicit pool rule
 # (documented in docs/prism-rejections.md) so audits can distinguish them.
@@ -1759,6 +1766,7 @@ class _AcceptedBlockPayoutTransition:
     landed: bool = False
     preview: tuple[tuple[str, str, str, int], ...] | None = None
     published_generation: int | None = None
+    landed_monotonic: float | None = None
 
 
 @dataclass(frozen=True)
@@ -3214,6 +3222,10 @@ class PrismCoordinator:
         self.block_landing_db_timeout_max_seconds = env_positive_float(
             "PRISM_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS",
             DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
+        )
+        self.accepted_parent_unresolved_depth_max = env_positive_int(
+            "PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX",
+            DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
         )
         self.block_submit_lock_wait_log_seconds = env_positive_float(
             "PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS",
@@ -7597,6 +7609,11 @@ class PrismCoordinator:
                 existing,
                 block_height=block_height,
                 landed=True,
+                landed_monotonic=(
+                    existing.landed_monotonic
+                    if existing.landed_monotonic is not None
+                    else time.monotonic()
+                ),
             )
             self._accepted_block_payout_preview_condition.notify_all()
 
@@ -7623,6 +7640,7 @@ class PrismCoordinator:
             self._accepted_block_payout_previews[key] = dataclass_replace(
                 existing,
                 landed=False,
+                landed_monotonic=None,
             )
             self._accepted_block_payout_preview_condition.notify_all()
 
@@ -7664,53 +7682,71 @@ class PrismCoordinator:
                     # must still cross the atomic publication boundary so they
                     # install a generation and reopen admission.
 
-            captured = self._capture_payout_state_source()
-            reserved = self._reserve_payout_state_source_if_current(
-                captured[1],
-                "accepted_block_preview",
-                tip_hash=key,
-                invalidated_monotonic=time.monotonic(),
-            )
-            if reserved is None:
-                candidate = self._prepared_payout_state_candidate(
-                    self._capture_payout_state_source(),
-                    bypass_build_interval=True,
+            published = None
+            try:
+                captured = self._capture_payout_state_source()
+                reserved = self._reserve_payout_state_source_if_current(
+                    captured[1],
+                    "accepted_block_preview",
+                    tip_hash=key,
+                    invalidated_monotonic=time.monotonic(),
                 )
-            else:
-                candidate = self._prepared_payout_state_candidate(reserved)
-            candidate = self._accepted_block_preview_candidate(
-                candidate,
-                block_hash=key,
-                preview=serialized,
-            )
-            # Close delivery admission before exposing the preview. The
-            # generation publication below performs the only atomic pointer
-            # swap and reopens admission; no preparation lock is involved.
-            self._block_payout_state_publication(force=True)
-            published = self._publish_payout_state_candidate(candidate)
-            if published is None:
-                max_retries = max(
-                    0,
-                    int(
-                        getattr(
-                            self,
-                            "payout_reconcile_supersession_retries",
-                            DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
-                        )
-                    ),
-                )
-                for _attempt in range(max_retries):
-                    candidate = self._accepted_block_preview_candidate(
-                        self._prepared_payout_state_candidate(
-                            self._capture_payout_state_source(),
-                            bypass_build_interval=True,
-                        ),
-                        block_hash=key,
-                        preview=serialized,
+                if reserved is None:
+                    candidate = self._prepared_payout_state_candidate(
+                        self._capture_payout_state_source(),
+                        bypass_build_interval=True,
                     )
-                    published = self._publish_payout_state_candidate(candidate)
-                    if published is not None:
-                        break
+                else:
+                    candidate = self._prepared_payout_state_candidate(reserved)
+                candidate = self._accepted_block_preview_candidate(
+                    candidate,
+                    block_hash=key,
+                    preview=serialized,
+                )
+                # Close delivery admission before exposing the preview. The
+                # generation publication below performs the only atomic pointer
+                # swap and reopens admission; no preparation lock is involved.
+                self._block_payout_state_publication(force=True)
+                published = self._publish_payout_state_candidate(candidate)
+                if published is None:
+                    max_retries = max(
+                        0,
+                        int(
+                            getattr(
+                                self,
+                                "payout_reconcile_supersession_retries",
+                                DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
+                            )
+                        ),
+                    )
+                    for _attempt in range(max_retries):
+                        candidate = self._accepted_block_preview_candidate(
+                            self._prepared_payout_state_candidate(
+                                self._capture_payout_state_source(),
+                                bypass_build_interval=True,
+                            ),
+                            block_hash=key,
+                            preview=serialized,
+                        )
+                        published = self._publish_payout_state_candidate(candidate)
+                        if published is not None:
+                            break
+            except Exception as exc:
+                # Degraded preview publication (issue #188): preparing the
+                # full payout-state artifact touches the ledger and can time
+                # out while the durable landing is still slow. Child job
+                # issuance must not stay coupled to that bookkeeping, so fall
+                # through to the fenced local-retention branch below exactly
+                # like a lost atomic publication: admission is force-blocked,
+                # the immutable compact preview becomes visible to waiting
+                # children, and payout-state publication itself stays gated
+                # until the normal retry loop publishes a fresh source.
+                published = None
+                print(
+                    "prism coordinator: accepted block payout preview "
+                    f"publication degraded hash={key}: {exc}",
+                    flush=True,
+                )
             if published is None:
                 self._block_payout_state_publication(force=True)
                 # Admission is now globally fenced, so retaining the compact
@@ -8046,6 +8082,38 @@ class PrismCoordinator:
         _, selected_key, selected_invalidated = max(active_ancestors)
         return selected_key, selected_invalidated
 
+    def _accepted_parent_unresolved_depth_cap(self) -> int:
+        return max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "accepted_parent_unresolved_depth_max",
+                    DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
+                )
+            ),
+        )
+
+    def accepted_parent_unresolved_ages_seconds(self) -> list[float]:
+        """Ages of landed transitions whose bookkeeping is still unresolved."""
+        self._ensure_job_cache_state()
+        now = time.monotonic()
+        with self._accepted_block_payout_preview_condition:
+            return [
+                max(0.0, now - transition.landed_monotonic)
+                for transition in self._accepted_block_payout_previews.values()
+                if transition.landed and transition.landed_monotonic is not None
+            ]
+
+    def _accepted_parent_unresolved_depth(self) -> int:
+        self._ensure_job_cache_state()
+        with self._accepted_block_payout_preview_condition:
+            return sum(
+                1
+                for transition in self._accepted_block_payout_previews.values()
+                if transition.landed
+            )
+
     def _await_pending_parent_payout_preview(
         self,
         parent_hash: str,
@@ -8065,6 +8133,18 @@ class PrismCoordinator:
         )
         if selected is None:
             return None
+        # Fail closed once too many landed transitions remain unresolved:
+        # every published preview a child consumes stacks another prospective
+        # balance chain on unfinished bookkeeping, so the depth of that stack
+        # must stay bounded even while degraded previews keep jobs flowing.
+        unresolved_depth = self._accepted_parent_unresolved_depth()
+        depth_cap = self._accepted_parent_unresolved_depth_cap()
+        if unresolved_depth > depth_cap:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "unresolved accepted-parent depth "
+                f"{unresolved_depth} exceeds cap {depth_cap}"
+            )
         selected_key, selected_invalidated = selected
         if selected_invalidated:
             self._schedule_tip_refresh_retry()
