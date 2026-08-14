@@ -502,6 +502,21 @@ DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS = 1.0
 # Direct outbox calls also run behind a coordinator-side single-flight guard,
 # so a driver that ignores the deadline cannot freeze the submitter thread.
 DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS = 1.0
+# Landing-class deadline. The post-acceptance landing/accounting tail
+# (persist, prior balances, confirm, prepared-state rejection of a terminal
+# candidate) must not share the one-second budget meant for cheap outbox
+# polls and fast-lane-adjacent calls: a structurally slow landing under that
+# ceiling is statement-canceled on every attempt and can never complete
+# (issue #188 — mainnet block 42743's landing was canceled 13 times while
+# Postgres was otherwise idle). The first landing attempt receives this full
+# budget; retries escalate after observed landing timeouts.
+DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS = 30.0
+# Reviewed escalation cap for landing retries. Per-attempt wall clock stays
+# bounded by the escalated statement budget, cycles are paced by the
+# candidate retry backoff, and the stuck-call/coordination watchdogs remain
+# the overall bound. An accepted block's landing is never abandoned outright;
+# it converges through durable replay.
+DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS = 120.0
 BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS = 0.25
 DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS = 5.0
 DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS = 30.0
@@ -3191,6 +3206,14 @@ class PrismCoordinator:
         self.block_submit_db_timeout_seconds = env_positive_float(
             "PRISM_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS",
             DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS,
+        )
+        self.block_landing_db_timeout_seconds = env_positive_float(
+            "PRISM_BLOCK_LANDING_DB_TIMEOUT_SECONDS",
+            DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,
+        )
+        self.block_landing_db_timeout_max_seconds = env_positive_float(
+            "PRISM_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS",
+            DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
         )
         self.block_submit_lock_wait_log_seconds = env_positive_float(
             "PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS",
@@ -23980,6 +24003,96 @@ class PrismCoordinator:
             ),
         )
 
+    def _block_landing_db_timeout(self, block_hash: str | None = None) -> float:
+        """Landing-class deadline, escalated after observed landing timeouts.
+
+        The first attempt already receives the full landing budget; a known
+        landing-class operation never begins at the one-second poll budget.
+        Escalation doubles per timed-out landing attempt for the same block
+        hash up to the reviewed cap.
+        """
+        base = max(
+            0.001,
+            float(
+                getattr(
+                    self,
+                    "block_landing_db_timeout_seconds",
+                    DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,
+                )
+            ),
+        )
+        cap = max(
+            base,
+            float(
+                getattr(
+                    self,
+                    "block_landing_db_timeout_max_seconds",
+                    DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
+                )
+            ),
+        )
+        timeouts = 0
+        if block_hash is not None:
+            with self.lock:
+                counts = getattr(self, "_block_landing_timeout_counts", None)
+                if counts is not None:
+                    timeouts = int(counts.get(block_hash, 0))
+        return min(cap, base * (2.0 ** min(timeouts, 8)))
+
+    def _note_block_landing_timeout(self, block_hash: str | None) -> None:
+        if block_hash is None:
+            return
+        with self.lock:
+            counts = getattr(self, "_block_landing_timeout_counts", None)
+            if counts is None:
+                counts = {}
+                self._block_landing_timeout_counts = counts
+            counts[block_hash] = int(counts.get(block_hash, 0)) + 1
+
+    def _ensure_block_ledger_call_metrics(self) -> None:
+        if not hasattr(self, "_block_ledger_call_metrics_lock"):
+            self._block_ledger_call_metrics_lock = threading.Lock()
+        if not hasattr(self, "_block_ledger_call_metrics"):
+            self._block_ledger_call_metrics = {}
+
+    def _record_block_ledger_call(
+        self,
+        *,
+        call_class: str,
+        budget_seconds: float,
+        duration_seconds: float,
+        timed_out: bool,
+    ) -> None:
+        """Track per-call-class submitter ledger latency and timeout counts."""
+        self._ensure_block_ledger_call_metrics()
+        with self._block_ledger_call_metrics_lock:
+            stats = self._block_ledger_call_metrics.setdefault(
+                call_class,
+                {
+                    "calls_total": 0,
+                    "timeouts_total": 0,
+                    "last_budget_seconds": 0.0,
+                    "last_duration_seconds": 0.0,
+                    "max_duration_seconds": 0.0,
+                },
+            )
+            stats["calls_total"] = int(stats["calls_total"]) + 1
+            if timed_out:
+                stats["timeouts_total"] = int(stats["timeouts_total"]) + 1
+            stats["last_budget_seconds"] = float(budget_seconds)
+            stats["last_duration_seconds"] = float(duration_seconds)
+            stats["max_duration_seconds"] = max(
+                float(stats["max_duration_seconds"]), float(duration_seconds)
+            )
+
+    def block_ledger_call_class_metrics(self) -> dict[str, dict[str, float | int]]:
+        self._ensure_block_ledger_call_metrics()
+        with self._block_ledger_call_metrics_lock:
+            return {
+                call_class: dict(stats)
+                for call_class, stats in self._block_ledger_call_metrics.items()
+            }
+
     def _block_submitter_stuck_call_exit_timeout(self) -> float:
         return max(
             0.001,
@@ -24059,6 +24172,45 @@ class PrismCoordinator:
         with self._block_submitter_ledger_timeout_scope():
             yield
 
+    @contextmanager
+    def _block_landing_ledger_statement_timeout_scope(
+        self,
+        block_hash: str | None = None,
+    ) -> Iterator[None]:
+        """Give each landing-class ledger step the landing budget.
+
+        The accounting tail that lands an accepted block (persist, prior
+        balances, confirm, and the prepared-state rejection of a terminal
+        candidate) runs under this scope instead of the poll-class one.
+        Timed-out steps are recorded so the next attempt for the same block
+        hash escalates its budget; the ledger backends already guarantee
+        server-side cancellation completes and the pooled session is rolled
+        back or replaced before the paced retry re-enters here.
+        """
+        timeout_seconds = self._block_landing_db_timeout(block_hash)
+        scope = getattr(self.ledger, "statement_timeout", None)
+        if not callable(scope):
+            scope = getattr(self.ledger, "operation_timeout", None)
+        started = time.monotonic()
+        timed_out = False
+        try:
+            if callable(scope):
+                with scope(timeout_seconds):
+                    yield
+            else:
+                yield
+        except TimeoutError:
+            timed_out = True
+            self._note_block_landing_timeout(block_hash)
+            raise
+        finally:
+            self._record_block_ledger_call(
+                call_class="landing",
+                budget_seconds=timeout_seconds,
+                duration_seconds=max(0.0, time.monotonic() - started),
+                timed_out=timed_out,
+            )
+
     def _run_block_submitter_ledger_call(
         self,
         key: tuple[object, ...],
@@ -24130,6 +24282,12 @@ class PrismCoordinator:
                     f"phase={phase} timeout={timeout_seconds:g}s",
                     flush=True,
                 )
+                self._record_block_ledger_call(
+                    call_class="fast",
+                    budget_seconds=timeout_seconds,
+                    duration_seconds=timeout_seconds,
+                    timed_out=True,
+                )
                 raise BlockSubmitterDatabaseTimeout(
                     f"{phase} exceeded {timeout_seconds:g}s"
                 )
@@ -24140,6 +24298,12 @@ class PrismCoordinator:
                 )
             )
         self._record_block_submitter_wait(f"{phase}:complete")
+        self._record_block_ledger_call(
+            call_class="fast",
+            budget_seconds=timeout_seconds,
+            duration_seconds=max(0.0, time.monotonic() - call.started_monotonic),
+            timed_out=False,
+        )
         with self._block_submitter_ledger_calls_lock:
             if self._block_submitter_ledger_calls.get(key) is call:
                 self._block_submitter_ledger_calls.pop(key, None)
@@ -24504,7 +24668,7 @@ class PrismCoordinator:
                     )
                 node_submission = self._node_submission_for_candidate_or_retained(candidate)
                 self._mark_block_candidate_attempted(block_hash)
-                with self._block_submitter_ledger_statement_timeout_scope():
+                with self._block_landing_ledger_statement_timeout_scope(block_hash):
                     production_submit = (
                         getattr(self.submit_block_candidate, "__func__", None)
                         is PrismCoordinator.submit_block_candidate
@@ -24535,7 +24699,9 @@ class PrismCoordinator:
                     self._record_block_submitter_phase(
                         "reject-prepared-block"
                     )
-                    with self._block_submitter_ledger_statement_timeout_scope():
+                    with self._block_landing_ledger_statement_timeout_scope(
+                        block_hash
+                    ):
                         self._reject_terminal_prepared_block_candidate(candidate)
                     self._record_block_submitter_phase(
                         "reject-prepared-block:complete"
@@ -25419,7 +25585,7 @@ class PrismCoordinator:
         error = "candidate became stale or submission failed"
         try:
             self._record_block_submitter_phase("accounting")
-            with self._block_submitter_ledger_statement_timeout_scope():
+            with self._block_landing_ledger_statement_timeout_scope(block_hash):
                 production_submit = (
                     getattr(self.submit_block_candidate, "__func__", None)
                     is PrismCoordinator.submit_block_candidate
@@ -25469,7 +25635,7 @@ class PrismCoordinator:
         if not accepted:
             try:
                 self._record_block_submitter_phase("reject-prepared-block")
-                with self._block_submitter_ledger_statement_timeout_scope():
+                with self._block_landing_ledger_statement_timeout_scope(block_hash):
                     self._reject_terminal_prepared_block_candidate(candidate)
                 self._record_block_submitter_phase(
                     "reject-prepared-block:complete"
@@ -25912,6 +26078,9 @@ class PrismCoordinator:
             delays = getattr(self, "block_candidate_retry_delays", None)
             if delays is not None:
                 delays.pop(block_hash, None)
+            landing_timeouts = getattr(self, "_block_landing_timeout_counts", None)
+            if landing_timeouts is not None:
+                landing_timeouts.pop(block_hash, None)
             not_before = getattr(
                 self,
                 "_block_candidate_retry_not_before",

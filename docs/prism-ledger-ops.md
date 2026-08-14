@@ -120,7 +120,24 @@ second). `PRISM_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS` gives each later Postgres
 statement and local ledger gate a fresh deadline (default 1 second); direct
 outbox reads and mutations additionally use a single-flight wrapper so a
 driver that ignores its deadline cannot accumulate retry threads. Timeouts
-leave the row pending and enter the ordinary candidate backoff. Contended
+leave the row pending and enter the ordinary candidate backoff.
+
+Deadlines are split by call class. The poll-class budget above covers only
+cheap outbox polls and fast-lane-adjacent calls. The landing-class
+accounting tail — persisting an accepted block, reading prior balances,
+confirming it, and rejecting the prepared state of a terminal candidate —
+runs each statement under `PRISM_BLOCK_LANDING_DB_TIMEOUT_SECONDS`
+(default 30 seconds) starting with the first attempt. After an observed
+landing timeout the next attempt for the same block hash doubles its
+budget up to `PRISM_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS` (default 120
+seconds); retries stay paced by the candidate backoff, server-side
+cancellation is confirmed by the ledger backends (the pooled session is
+rolled back or replaced, never reused mid-cancel), and the stuck-call and
+coordination watchdogs remain the overall bound. Startup replay of a
+pending accepted candidate re-enters the same landing-class scope. A
+landing-class operation must never start at the poll budget: a
+structurally slow landing under a one-second ceiling is statement-canceled
+on every attempt and can never converge (issue #188). Contended
 submit-path locks are acquired in heartbeat slices and identify the lock in a
 periodic diagnostic controlled by `PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS`
 (default 5 seconds). At most two timeout-ignoring RPC workers and two
