@@ -113,6 +113,37 @@ def assert_equal(actual: object, expected: object, message: str) -> None:
         raise SystemExit(f"{message}: expected {expected!r}, got {actual!r}")
 
 
+def assert_current_matches_recomputed(runner: PsqlShareLedger, message: str) -> None:
+    """The summary-backed current balances must equal the O(history) recompute."""
+    comparison = runner._run_json(
+        """
+SELECT json_build_object(
+    'drift_count', (SELECT count(*) FROM qbit_carry_forward_current_drift()),
+    'current', (
+        SELECT COALESCE(json_agg(json_build_object(
+            'recipient_id', miner_id,
+            'order_key', payout_order_key,
+            'p2mr_program_hex', encode(p2mr_program, 'hex'),
+            'balance_sats', balance_sats::text
+        ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
+        FROM qbit_current_carry_forward_balances()
+    ),
+    'recomputed', (
+        SELECT COALESCE(json_agg(json_build_object(
+            'recipient_id', miner_id,
+            'order_key', payout_order_key,
+            'p2mr_program_hex', encode(p2mr_program, 'hex'),
+            'balance_sats', balance_sats::text
+        ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
+        FROM qbit_recomputed_carry_forward_balances()
+    )
+);
+"""
+    )
+    assert_equal(comparison["current"], comparison["recomputed"], message)
+    assert_equal(int(comparison["drift_count"]), 0, message + " (drift count)")
+
+
 def force_expired_idle_lease(runner: PsqlShareLedger) -> None:
     runner._run_sql(
         """
@@ -843,6 +874,10 @@ assert_equal(
     [{"recipient_id": "alias-miner-a", "order_key": "00", "balance_sats": "300"}],
     "current carry balances aggregate same-payout-program aliases",
 )
+assert_current_matches_recomputed(
+    replacement,
+    "summary balances match recompute with same-payout-program aliases",
+)
 replacement._run_sql(
     """
 UPDATE qbit_payout_carry_forward
@@ -1053,8 +1088,17 @@ assert_equal(
     [(reorg_carry_miner, 250)],
     "later carry row remains independently valid after earlier row reversal",
 )
+assert_current_matches_recomputed(
+    replacement,
+    "summary balances match recompute while recorded chains are stale after mid-history reversal",
+)
 integrity_report = replacement.carry_forward_integrity_report()
 assert_equal(integrity_report["mismatch_count"], 1, "replayed prior mismatch count")
+assert_equal(
+    integrity_report["current_drift_count"],
+    0,
+    "recorded-chain mismatches do not imply summary drift",
+)
 assert_equal(
     integrity_report["audit_chain_version"],
     "qbit.prism.carry-forward-active-delta-chain.v1",
@@ -1095,14 +1139,32 @@ assert_equal(
     0,
     "reorg carry cleanup clears integrity mismatches",
 )
+assert_current_matches_recomputed(
+    replacement,
+    "summary balances match recompute after reorg cleanup",
+)
+
+# Migration seeding: simulate a database that predates the transactionally
+# maintained summary by clearing it, then let the next schema apply (ledger
+# init below) rebuild it from carry history.
+replacement._run_sql("DELETE FROM qbit_payout_carry_forward_current;")
 
 force_expired_idle_lease(replacement)
 final_writer = PsqlShareLedger(
     psql_command=psql,
     writer_id="writer-c",
     writer_epoch=1,
+    initialize_schema=True,
     audit_bundle_canonicalizer=fake_audit_bundle_bytes,
 )
+assert_current_matches_recomputed(
+    final_writer,
+    "schema apply reseeds an empty summary from existing carry history",
+)
+if not final_writer._run_json(
+    "SELECT json_build_object('seeded', EXISTS (SELECT 1 FROM qbit_payout_carry_forward_current));"
+)["seeded"]:
+    raise SystemExit("summary seeding left qbit_payout_carry_forward_current empty")
 try:
     replacement.persist_accepted_block(
         block_hash="88" * 32,

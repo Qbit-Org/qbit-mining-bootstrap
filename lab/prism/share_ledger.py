@@ -872,6 +872,8 @@ class SingleWriterShareLedger:
             "audit_row_count": 0,
             "audit_head_sha256": "00" * 32,
             "mismatch_count": 0,
+            "current_drift_count": 0,
+            "current_drift": [],
             "mismatches": [],
         }
 
@@ -3410,6 +3412,7 @@ FROM qbit_current_carry_forward_balances();
         report.update(audit_head)
         report["checked_active_rows"] = int(report["checked_active_rows"])
         report["mismatch_count"] = int(report["mismatch_count"])
+        report["current_drift_count"] = int(report.get("current_drift_count", 0))
         for row in report.get("mismatches", []):
             for key in (
                 "prior_balance_sats",
