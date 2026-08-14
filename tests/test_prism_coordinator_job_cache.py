@@ -3080,13 +3080,15 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(server.replay_pending_block_candidates(), 0)
         self.assertEqual(enumerated, [])
         # Owed enumeration is correctness-critical and bypasses the
-        # short-circuits, running with the landing-class budget.
+        # short-circuits, running with the landing-class budget and
+        # recording under the landing metrics class.
         server._note_block_replay_enumeration_owed()
         self.assertEqual(server.replay_pending_block_candidates(), 0)
         self.assertEqual(enumerated, [32])
         self.assertFalse(server._block_replay_enumeration_owed())
         metrics = server.block_ledger_call_class_metrics()
-        self.assertEqual(metrics["fast"]["last_budget_seconds"], 7.5)
+        self.assertEqual(metrics["landing"]["last_budget_seconds"], 7.5)
+        self.assertNotIn("fast", metrics)
 
     def test_startup_enumeration_escalates_past_truncated_batches(self) -> None:
         """A full first batch must not end enumeration: rows beyond the batch
@@ -3182,6 +3184,12 @@ class JobBundleCacheTests(unittest.TestCase):
                 TemplateRefreshBlocked, "has not enumerated"
             ):
                 server._await_pending_parent_payout_preview("ab" * 32)
+            # The startup enumeration ran with the landing budget, so its
+            # timeout fires the documented landing-timeout alert instead of
+            # hiding inside the fast-call series.
+            metrics = server.block_ledger_call_class_metrics()
+            self.assertEqual(metrics["landing"]["timeouts_total"], 1)
+            self.assertNotIn("fast", metrics)
         finally:
             release.set()
 

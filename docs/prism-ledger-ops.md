@@ -158,7 +158,11 @@ seconds); retries stay paced by the candidate backoff, server-side
 cancellation is confirmed by the ledger backends (the pooled session is
 rolled back or replaced, never reused mid-cancel), and the stuck-call and
 coordination watchdogs remain the overall bound. Startup replay of a
-pending accepted candidate re-enters the same landing-class scope. A
+pending accepted candidate re-enters the same landing-class scope, and
+the gating startup outbox enumeration both runs with the landing budget
+and records under `call_class="landing"`, so an enumeration timeout
+fires the landing-timeout alert rather than inflating the fast-call
+budget gauge. A
 landing-class operation must never start at the poll budget: a
 structurally slow landing under a one-second ceiling is statement-canceled
 on every attempt and can never converge (issue #188). Contended

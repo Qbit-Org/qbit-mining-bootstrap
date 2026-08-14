@@ -24077,10 +24077,13 @@ class PrismCoordinator:
             return 0
         # The startup enumeration gates job issuance, so it runs with the
         # landing-class budget instead of the poll budget (issue #188 fix 4);
-        # the periodic steady-state poll keeps the tight budget.
+        # the periodic steady-state poll keeps the tight budget. The metrics
+        # class follows the budget so a slow or timed-out startup enumeration
+        # surfaces on the landing series the alerts watch.
         replay_query_timeout = (
             self._block_landing_db_timeout() if enumeration_owed else None
         )
+        replay_query_call_class = "landing" if enumeration_owed else "fast"
         pending_rows = getattr(self.ledger, "pending_block_candidate_rows", None)
         if callable(pending_rows):
 
@@ -24093,6 +24096,7 @@ class PrismCoordinator:
                     # candidate is still accounting.
                     lambda: pending_rows(limit=limit),
                     timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
                 )
 
         else:
@@ -24107,6 +24111,7 @@ class PrismCoordinator:
                     "replay-outbox-query",
                     lambda: pending(limit=limit),
                     timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
                 )
                 return [
                     {
@@ -24441,6 +24446,7 @@ class PrismCoordinator:
         operation: Callable[[], Any],
         *,
         timeout_seconds: float | None = None,
+        call_class: str = "fast",
     ) -> Any:
         """Run one direct outbox call without letting its driver wedge us.
 
@@ -24449,6 +24455,11 @@ class PrismCoordinator:
         unbounded pile of threads when a fake/misbehaving driver ignores the
         real PostgreSQL statement deadline. Candidate outbox mutations are
         idempotent, so a late completion converges with replay.
+
+        call_class labels the per-class latency/timeout metrics and must
+        match the budget in use: a call given the landing deadline records
+        as "landing" so the landing-timeout alert covers it, instead of
+        inflating the fast-call budget gauge.
         """
         if timeout_seconds is None:
             timeout_seconds = self._block_submitter_db_timeout()
@@ -24513,7 +24524,7 @@ class PrismCoordinator:
                     flush=True,
                 )
                 self._record_block_ledger_call(
-                    call_class="fast",
+                    call_class=call_class,
                     budget_seconds=timeout_seconds,
                     duration_seconds=timeout_seconds,
                     timed_out=True,
@@ -24529,7 +24540,7 @@ class PrismCoordinator:
             )
         self._record_block_submitter_wait(f"{phase}:complete")
         self._record_block_ledger_call(
-            call_class="fast",
+            call_class=call_class,
             budget_seconds=timeout_seconds,
             duration_seconds=max(0.0, time.monotonic() - call.started_monotonic),
             timed_out=False,
