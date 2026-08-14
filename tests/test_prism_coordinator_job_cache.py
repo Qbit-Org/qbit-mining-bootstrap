@@ -3085,6 +3085,50 @@ class JobBundleCacheTests(unittest.TestCase):
             server.startup_phase_seconds()["audit_listener_bound"], first
         )
 
+    def test_job_issuance_continues_during_padded_landing(self) -> None:
+        """Acceptance shape for issue #188: a landing padded past its normal
+        duration must not stop child job issuance, and payout-state
+        publication stays gated until the landing reaches a terminal state.
+        The pad is logical (the barrier simply stays unresolved) so the test
+        is instant while pinning the same ordering a 10s landing produces."""
+        server, _rpc = coordinator()
+        parent_hash = "ab" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        server._begin_accepted_block_payout_preview(parent_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(parent_hash, block_height=10)
+        server._publish_accepted_block_payout_preview(parent_hash, preview)
+        # The landing bookkeeping is still unresolved; every child build keeps
+        # receiving the immutable preview instead of blocking or reading
+        # confirmed balances.
+        for _ in range(5):
+            self.assertEqual(
+                server._prior_balances_for_job_parent(parent_hash),
+                preview,
+            )
+        ages = server.accepted_parent_unresolved_ages_seconds()
+        self.assertEqual(len(ages), 1)
+        with self.assertRaisesRegex(
+            _PayoutStatePublicationBlocked, "still pending"
+        ):
+            with server._payout_balance_mutation():
+                pass
+        # Landing completes: the transition clears and confirmed reads resume.
+        server._clear_accepted_block_payout_preview(parent_hash)
+        self.assertEqual(
+            server._prior_balances_for_job_parent(
+                parent_hash, fallback_balances=[]
+            ),
+            [],
+        )
+        self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
+
     def test_unmark_landed_clears_unresolved_age(self) -> None:
         server, _rpc = coordinator()
         block_hash = "cd" * 32
