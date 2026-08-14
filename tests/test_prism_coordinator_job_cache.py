@@ -2995,7 +2995,7 @@ class JobBundleCacheTests(unittest.TestCase):
         block_hash = "ab" * 32
         with self.assertRaises(TimeoutError):
             with server._block_landing_ledger_statement_timeout_scope(block_hash):
-                raise TimeoutError("postgres operation exceeded 45s")
+                raise LedgerOperationTimeout("postgres operation exceeded 45s")
         server.ledger = original_ledger
 
         server._begin_accepted_block_payout_preview(block_hash, block_height=10)

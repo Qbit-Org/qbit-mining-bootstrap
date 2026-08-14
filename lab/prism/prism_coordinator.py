@@ -72,6 +72,7 @@ from lab.prism.share_ledger import (
     IncrementalShareJsonSequence,
     IncrementalWindowAdvanceStats,
     IncrementalWindowFallback,
+    LedgerOperationTimeout,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -24414,6 +24415,12 @@ class PrismCoordinator:
         hash escalates its budget; the ledger backends already guarantee
         server-side cancellation completes and the pooled session is rolled
         back or replaced before the paced retry re-enters here.
+
+        The guarded body also runs node RPCs and audit/build work. Only a
+        ledger-originated deadline may escalate the next landing budget or
+        fire the landing-timeout alert: a node RPC timeout is not a database
+        cancellation, and escalating on it would page and widen PostgreSQL
+        deadlines for a database that never missed one.
         """
         timeout_seconds = self._block_landing_db_timeout(block_hash)
         scope = getattr(self.ledger, "statement_timeout", None)
@@ -24427,7 +24434,7 @@ class PrismCoordinator:
                     yield
             else:
                 yield
-        except TimeoutError:
+        except (LedgerOperationTimeout, BlockSubmitterDatabaseTimeout):
             timed_out = True
             self._note_block_landing_timeout(block_hash)
             raise

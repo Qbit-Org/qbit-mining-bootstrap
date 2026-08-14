@@ -154,7 +154,9 @@ runs each statement under `PRISM_BLOCK_LANDING_DB_TIMEOUT_SECONDS`
 (default 30 seconds) starting with the first attempt. After an observed
 landing timeout the next attempt for the same block hash doubles its
 budget up to `PRISM_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS` (default 120
-seconds); retries stay paced by the candidate backoff, server-side
+seconds); only ledger-originated deadlines count as landing timeouts —
+a node RPC timing out inside the landing tail neither escalates the
+next PostgreSQL budget nor increments the landing-timeout series; retries stay paced by the candidate backoff, server-side
 cancellation is confirmed by the ledger backends (the pooled session is
 rolled back or replaced, never reused mid-cancel), and the stuck-call and
 coordination watchdogs remain the overall bound. Startup replay of a

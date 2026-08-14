@@ -25,6 +25,7 @@ from unittest.mock import patch
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism.share_ledger import (
+    LedgerOperationTimeout,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -13158,7 +13159,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         block_hash = "ab" * 32
         with self.assertRaises(TimeoutError):
             with server._block_landing_ledger_statement_timeout_scope(block_hash):
-                raise TimeoutError("postgres operation exceeded 45s")
+                raise LedgerOperationTimeout("postgres operation exceeded 45s")
         with server._block_landing_ledger_statement_timeout_scope(block_hash):
             pass
         self.assertEqual(scopes, [45.0, 90.0])
@@ -13166,6 +13167,32 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         self.assertEqual(metrics["landing"]["calls_total"], 2)
         self.assertEqual(metrics["landing"]["timeouts_total"], 1)
         self.assertEqual(metrics["landing"]["last_budget_seconds"], 90.0)
+
+    def test_landing_scope_ignores_non_ledger_timeouts(self) -> None:
+        """The scope guards a body that also runs node RPCs; an RPC timeout
+        is not a database cancellation and must not escalate the next
+        PostgreSQL budget or fire the landing-timeout alert."""
+        server, _state, _recording = submit_coordinator()
+        server.block_landing_db_timeout_seconds = 45.0
+        server.block_landing_db_timeout_max_seconds = 120.0
+        scopes: list[float] = []
+
+        @contextlib.contextmanager
+        def statement_timeout(seconds: float):
+            scopes.append(seconds)
+            yield
+
+        server.ledger = SimpleNamespace(statement_timeout=statement_timeout)
+        block_hash = "ab" * 32
+        with self.assertRaises(TimeoutError):
+            with server._block_landing_ledger_statement_timeout_scope(block_hash):
+                raise TimeoutError("getblockhash exceeded 1s")
+        with server._block_landing_ledger_statement_timeout_scope(block_hash):
+            pass
+        self.assertEqual(scopes, [45.0, 45.0])
+        metrics = server.block_ledger_call_class_metrics()
+        self.assertEqual(metrics["landing"]["calls_total"], 2)
+        self.assertEqual(metrics["landing"]["timeouts_total"], 0)
 
     def test_fast_class_ledger_call_metrics_record_timeouts(self) -> None:
         server, _state, _recording = submit_coordinator()
