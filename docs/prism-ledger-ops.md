@@ -102,6 +102,11 @@ work, while an older replay stalled in accounting cannot hide later durable
 rows. The pre-accept startup recovery pass is best-effort under a slow ledger:
 if its database budget expires, the coordinator finishes starting and the
 block-submitter loop retries every durable pending row with ordinary backoff.
+Because job builds stay blocked until every pending candidate is known, the
+startup enumeration must be provably untruncated: a full batch re-queries
+with a doubled window (capped at 1024 rows) until the outbox returns fewer
+rows than requested. If the cap is ever hit, the gate stays closed while the
+restored batch drains and the submitter loop re-enumerates the remainder.
 Before qbitd can observe a candidate, the coordinator installs a short in-memory
 prospective-payout barrier; this prevents startup prewarm from issuing child
 work from the old balance base without falsely claiming that the block landed.

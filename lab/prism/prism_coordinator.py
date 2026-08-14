@@ -265,6 +265,14 @@ MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
 # bound limits RAM; overflow only coalesces a wakeup because Postgres retains
 # the authoritative pending candidate.
 MAX_PENDING_BLOCK_CANDIDATES = 32
+# Startup replay must observe every durable pending candidate before child
+# job builds unblock (issue #188 fix 4): a truncated enumeration could hide
+# the active parent whose payout transition is not yet armed. A full batch
+# therefore re-queries with a doubled window until the result is provably
+# untruncated. This cap bounds one enumeration pass's memory; at the cap the
+# gate simply stays closed while the queued batch drains, and the submitter
+# loop re-enumerates the shrinking remainder.
+MAX_BLOCK_REPLAY_ENUMERATION_ROWS = 1024
 # Accepted shares use a small, bounded group-commit queue.  Every submitter
 # waits for its batch's Postgres commit before receiving Stratum success, so
 # this is a latency-smoothing bound rather than a durable backlog.
@@ -24075,71 +24083,103 @@ class PrismCoordinator:
         )
         pending_rows = getattr(self.ledger, "pending_block_candidate_rows", None)
         if callable(pending_rows):
-            durable_rows = self._run_block_submitter_ledger_call(
-                ("replay-outbox-query",),
-                "replay-outbox-query",
-                # Restore a batch with no per-row database work. In-flight
-                # dedupe lets later rows reach qbitd even while the oldest
-                # candidate is still accounting.
-                lambda: pending_rows(limit=MAX_PENDING_BLOCK_CANDIDATES),
-                timeout_seconds=replay_query_timeout,
-            )
+
+            def fetch_durable_rows(limit: int) -> list[Any]:
+                return self._run_block_submitter_ledger_call(
+                    ("replay-outbox-query", limit),
+                    "replay-outbox-query",
+                    # Restore a batch with no per-row database work. In-flight
+                    # dedupe lets later rows reach qbitd even while the oldest
+                    # candidate is still accounting.
+                    lambda: pending_rows(limit=limit),
+                    timeout_seconds=replay_query_timeout,
+                )
+
         else:
             pending = getattr(self.ledger, "pending_block_candidates", None)
             if not callable(pending):
                 self._clear_block_replay_enumeration_owed()
                 return 0
-            pending_intents = self._run_block_submitter_ledger_call(
-                ("replay-outbox-query",),
-                "replay-outbox-query",
-                lambda: pending(limit=MAX_PENDING_BLOCK_CANDIDATES),
-                timeout_seconds=replay_query_timeout,
-            )
-            durable_rows = [
-                {
-                    "block_hash": (
-                        intent.get("block_hash_hex", "")
-                        if isinstance(intent, dict)
-                        else ""
-                    ),
-                    "candidate": intent,
-                }
-                for intent in pending_intents
-            ]
-        self._record_block_submitter_phase("replay-restore")
+
+            def fetch_durable_rows(limit: int) -> list[Any]:
+                pending_intents = self._run_block_submitter_ledger_call(
+                    ("replay-outbox-query", limit),
+                    "replay-outbox-query",
+                    lambda: pending(limit=limit),
+                    timeout_seconds=replay_query_timeout,
+                )
+                return [
+                    {
+                        "block_hash": (
+                            intent.get("block_hash_hex", "")
+                            if isinstance(intent, dict)
+                            else ""
+                        ),
+                        "candidate": intent,
+                    }
+                    for intent in pending_intents
+                ]
+
         queued = 0
-        for durable_row in durable_rows:
-            durable_block_hash = ""
-            try:
-                if not isinstance(durable_row, dict):
-                    raise ValueError("durable block candidate row is not an object")
-                durable_block_hash = str(durable_row["block_hash"]).lower()
-                intent = durable_row["candidate"]
-                if not isinstance(intent, dict):
-                    raise ValueError("durable block candidate intent is not an object")
-                intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
-                if not durable_block_hash or intent_block_hash != durable_block_hash:
-                    raise ValueError("durable block candidate row key does not match intent")
-                candidate = dataclass_replace(
-                    self.block_candidate_from_intent(intent),
-                    durable_replay=True,
+        enumeration_truncated = False
+        enumeration_limit = MAX_PENDING_BLOCK_CANDIDATES
+        while True:
+            durable_rows = fetch_durable_rows(enumeration_limit)
+            self._record_block_submitter_phase("replay-restore")
+            for durable_row in durable_rows:
+                durable_block_hash = ""
+                try:
+                    if not isinstance(durable_row, dict):
+                        raise ValueError("durable block candidate row is not an object")
+                    durable_block_hash = str(durable_row["block_hash"]).lower()
+                    intent = durable_row["candidate"]
+                    if not isinstance(intent, dict):
+                        raise ValueError("durable block candidate intent is not an object")
+                    intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
+                    if not durable_block_hash or intent_block_hash != durable_block_hash:
+                        raise ValueError("durable block candidate row key does not match intent")
+                    candidate = dataclass_replace(
+                        self.block_candidate_from_intent(intent),
+                        durable_replay=True,
+                    )
+                    # Durable acceptance-state reads stay in accounting. The
+                    # separate replay queue keeps these recovered rows behind any
+                    # live solve while still exposing the whole batch to qbitd.
+                    if self._enqueue_replayed_block_candidate(candidate):
+                        queued += 1
+                except Exception:
+                    print("prism coordinator: invalid durable block candidate intent", flush=True)
+                    traceback.print_exc()
+                    self._queue_invalid_block_candidate_for_quarantine(
+                        durable_block_hash,
+                        "invalid durable candidate intent",
+                    )
+            if len(durable_rows) < enumeration_limit or not enumeration_owed:
+                break
+            # A full batch may hide more pending rows, and a hidden row could
+            # be the active parent whose carry a child job must not omit.
+            # Re-query with a doubled window until the result is provably
+            # untruncated; in-flight dedupe makes re-seen rows free.
+            if enumeration_limit >= MAX_BLOCK_REPLAY_ENUMERATION_ROWS:
+                enumeration_truncated = True
+                print(
+                    "prism coordinator: pending block candidate enumeration "
+                    f"still truncated at {enumeration_limit} rows; job builds "
+                    "stay blocked until a complete enumeration succeeds",
+                    flush=True,
                 )
-                # Durable acceptance-state reads stay in accounting. The
-                # separate replay queue keeps these recovered rows behind any
-                # live solve while still exposing the whole batch to qbitd.
-                if self._enqueue_replayed_block_candidate(candidate):
-                    queued += 1
-            except Exception:
-                print("prism coordinator: invalid durable block candidate intent", flush=True)
-                traceback.print_exc()
-                self._queue_invalid_block_candidate_for_quarantine(
-                    durable_block_hash,
-                    "invalid durable candidate intent",
-                )
-        # Every pending candidate is now known and its payout barrier armed
-        # (or quarantined), so child job builds may proceed.
-        self._clear_block_replay_enumeration_owed()
-        self._record_startup_phase_once("block_replay_enumerated")
+                break
+            enumeration_limit = min(
+                enumeration_limit * 2,
+                MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
+            )
+        if not enumeration_truncated:
+            # Every pending candidate is now known and its payout barrier armed
+            # (or quarantined), so child job builds may proceed. A truncated
+            # pass instead leaves enumeration owed: the queued batch drains,
+            # and the submitter loop re-enumerates the remainder.
+            self._clear_block_replay_enumeration_owed()
+            self._record_startup_phase_once("block_replay_enumerated")
         if queued:
             print(
                 f"prism coordinator: replayed {queued} pending block candidate(s)",

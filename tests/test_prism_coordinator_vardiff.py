@@ -12865,7 +12865,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
                 with server._block_submitter_ledger_calls_lock:
                     startup_call.append(
                         server._block_submitter_ledger_calls[
-                            ("replay-outbox-query",)
+                            ("replay-outbox-query", 32)
                         ]
                     )
                 query_started.set()
@@ -12967,7 +12967,7 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             with server._block_submitter_ledger_calls_lock:
                 self.assertIs(
                     server._block_submitter_ledger_calls.get(
-                        ("replay-outbox-query",)
+                        ("replay-outbox-query", 32)
                     ),
                     startup_call[0],
                 )

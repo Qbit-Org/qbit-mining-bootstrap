@@ -162,6 +162,50 @@ def base_template(height: int = 10, prevhash: str = "11" * 32) -> dict[str, obje
     }
 
 
+def durable_candidate_row(index: int) -> dict[str, object]:
+    """A minimal valid outbox row whose intent survives block_candidate_from_intent."""
+    block_hash = f"{index + 1:064x}"
+    return {
+        "block_hash": block_hash,
+        "candidate": {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": block_hash,
+            "block_hex": "00",
+            "coinbase_tx_hex": "00",
+            "parent_hash": "11" * 32,
+            "expected_height": 10,
+            "template": {
+                "previousblockhash": "11" * 32,
+                "height": 10,
+                "coinbasevalue": 50_00000000,
+            },
+            "shares_json": [],
+            "prior_balances": [],
+            "found_block": {},
+            "prospective_prior_balances": None,
+            "witness_merkle_leaves_hex": [],
+            "extranonce1_hex": "00000001",
+            "extranonce2_hex": "00",
+            "username": "miner-a",
+            "pending_share": {
+                "share_id": f"miner-a:{block_hash}",
+                "miner_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "22" * 32,
+                "share_difficulty": 1,
+                "network_difficulty": 1,
+                "template_height": 10,
+                "job_id": "job-1",
+                "job_issued_at_ms": 1,
+                "accepted_at_ms": 1,
+                "ntime": 1,
+            },
+            "credit_share_on_accept": False,
+            "collection_only": False,
+        },
+    }
+
+
 def worker(payout: str = PAYOUT_ADDRESS, username: str | None = None) -> WorkerIdentity:
     return WorkerIdentity(
         username=username or payout,
@@ -3043,6 +3087,78 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(server._block_replay_enumeration_owed())
         metrics = server.block_ledger_call_class_metrics()
         self.assertEqual(metrics["fast"]["last_budget_seconds"], 7.5)
+
+    def test_startup_enumeration_escalates_past_truncated_batches(self) -> None:
+        """A full first batch must not end enumeration: rows beyond the batch
+        window (potentially the active parent) still need their payout
+        barriers armed before job builds unblock."""
+        server, _rpc = coordinator()
+        requested: list[int] = []
+        total_pending = 33
+
+        class TruncatingLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                requested.append(limit)
+                return [
+                    durable_candidate_row(index)
+                    for index in range(min(limit, total_pending))
+                ]
+
+        server.ledger = TruncatingLedger()
+        server._note_block_replay_enumeration_owed()
+        self.assertEqual(server.replay_pending_block_candidates(), total_pending)
+        self.assertEqual(requested, [32, 64])
+        self.assertFalse(server._block_replay_enumeration_owed())
+        self.assertEqual(
+            server._block_replay_candidate_queue.qsize(), total_pending
+        )
+        # Every restored row armed its payout barrier before the gate opened.
+        self.assertEqual(
+            len(server._accepted_block_payout_previews), total_pending
+        )
+
+    def test_startup_enumeration_stays_owed_at_truncation_cap(self) -> None:
+        """An outbox larger than the enumeration cap keeps job builds blocked
+        instead of silently declaring enumeration complete."""
+        server, _rpc = coordinator()
+        requested: list[int] = []
+
+        class EndlessLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                requested.append(limit)
+                return [durable_candidate_row(index) for index in range(limit)]
+
+        server.ledger = EndlessLedger()
+        server._note_block_replay_enumeration_owed()
+        with patch("builtins.print"):
+            queued = server.replay_pending_block_candidates()
+        self.assertEqual(queued, 1024)
+        self.assertEqual(requested, [32, 64, 128, 256, 512, 1024])
+        self.assertTrue(server._block_replay_enumeration_owed())
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "has not enumerated"):
+            server._await_pending_parent_payout_preview("ab" * 32)
+
+    def test_steady_state_poll_restores_a_single_batch(self) -> None:
+        """Without an owed enumeration, a full batch stays a single query;
+        the next poll picks up later rows after the queue drains."""
+        server, _rpc = coordinator()
+        requested: list[int] = []
+
+        class FullBatchLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                requested.append(limit)
+                return [durable_candidate_row(index) for index in range(limit)]
+
+        server.ledger = FullBatchLedger()
+        self.assertEqual(server.replay_pending_block_candidates(), 32)
+        self.assertEqual(requested, [32])
+        self.assertFalse(server._block_replay_enumeration_owed())
 
     def test_startup_replay_timeout_keeps_job_builds_blocked(self) -> None:
         server, _rpc = coordinator()
