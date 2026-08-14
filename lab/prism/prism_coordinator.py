@@ -14492,10 +14492,18 @@ class PrismCoordinator:
             return True
 
     def start_audit_server(self) -> None:
-        # Bind before the health snapshot warm-up: the cold accepted-share
-        # aggregate can take minutes on a grown ledger, and for that whole
-        # window the listener must answer with an explicit starting state
-        # instead of connection refused (issue #188 fix 4).
+        # Mark the nonblocking refresher running before the listener can
+        # dispatch a request: a probe retrying connection-refused queues in
+        # the accept backlog at listen() time, and a handler serving it
+        # before the flag is set would take cached_health_payload's legacy
+        # inline path -- running the minutes-long accepted-share aggregate
+        # on the handler thread and racing the refresher with a duplicate
+        # query instead of returning the documented starting state.
+        self.start_health_snapshot_refresher()
+        # Bind before the health snapshot warm-up completes: the cold
+        # accepted-share aggregate can take minutes on a grown ledger, and
+        # for that whole window the listener must answer with an explicit
+        # starting state instead of connection refused (issue #188 fix 4).
         handler_cls = make_audit_handler(self)
         httpd = ThreadingHTTPServer((self.audit_bind or "127.0.0.1", self.audit_port), handler_cls)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -14505,7 +14513,6 @@ class PrismCoordinator:
             f"prism coordinator: audit HTTP listening on {self.audit_bind}:{self.audit_port}",
             flush=True,
         )
-        self.start_health_snapshot_refresher()
 
     def apply_stratum_send_timeout(self, sock: socket.socket) -> None:
         """Bound blocking sends to miners without touching receive semantics.

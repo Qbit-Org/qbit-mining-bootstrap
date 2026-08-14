@@ -8997,6 +8997,35 @@ class HealthSnapshotTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
 
+    def test_audit_server_marks_refresher_before_listener_dispatch(self) -> None:
+        """A probe retrying connection-refused queues in the accept backlog at
+        listen() time and can be served the instant the listener thread
+        starts. The refresher flag must already be set by then, or
+        cached_health_payload's legacy inline path would run the cold
+        accepted-share aggregate synchronously on the handler thread instead
+        of returning the documented starting state."""
+        server, _ = coordinator()
+        server.audit_bind = "127.0.0.1"
+        server.audit_port = 0
+        # The spawned refresher loop exits immediately; the running flag is
+        # what gates the handler path and must survive.
+        server.stop_event.set()
+        flag_at_bind: list[bool] = []
+
+        class RecordingServer:
+            def __init__(self, address: object, handler_cls: object) -> None:
+                flag_at_bind.append(bool(server._health_refresh_loop_running))
+
+            def serve_forever(self) -> None:
+                return None
+
+        with patch.object(
+            prism_coordinator_module, "ThreadingHTTPServer", RecordingServer
+        ), patch("builtins.print"):
+            server.start_audit_server()
+        self.assertEqual(flag_at_bind, [True])
+        self.assertTrue(server._health_refresh_loop_running)
+
     def test_cached_health_payload_serves_snapshot_and_flags_staleness(self) -> None:
         server, _ = coordinator()
         mark_progress_healthy(server)
