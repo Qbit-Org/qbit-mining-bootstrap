@@ -8156,13 +8156,17 @@ class PrismCoordinator:
         # every published preview a child consumes stacks another prospective
         # balance chain on unfinished bookkeeping, so the depth of that stack
         # must stay bounded even while degraded previews keep jobs flowing.
+        # Issuance stops at the cap, not past it: a child issued while
+        # exactly depth_cap transitions are unresolved could land and create
+        # a (cap + 1)th, so the configured maximum would not actually bound
+        # the chain.
         unresolved_depth = self._accepted_parent_unresolved_depth()
         depth_cap = self._accepted_parent_unresolved_depth_cap()
-        if unresolved_depth > depth_cap:
+        if unresolved_depth >= depth_cap:
             self._schedule_tip_refresh_retry()
             raise TemplateRefreshBlocked(
                 "unresolved accepted-parent depth "
-                f"{unresolved_depth} exceeds cap {depth_cap}"
+                f"{unresolved_depth} meets or exceeds cap {depth_cap}"
             )
         selected_key, selected_invalidated = selected
         if selected_invalidated:

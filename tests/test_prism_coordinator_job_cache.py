@@ -2963,12 +2963,17 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertEqual(len(server.accepted_parent_unresolved_ages_seconds()), 3)
         with self.assertRaisesRegex(TemplateRefreshBlocked, "exceeds cap"):
             server._await_pending_parent_payout_preview(hashes[0])
-        # At or below the cap the ordinary bounded wait applies instead.
+        # At the cap issuance still blocks: a child issued now could land
+        # and create a (cap + 1)th unresolved transition, so the configured
+        # maximum would no longer bound the prospective balance chain.
         server._clear_accepted_block_payout_preview(hashes[2])
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "exceeds cap"):
+            server._await_pending_parent_payout_preview(hashes[0])
+        # Below the cap the ordinary bounded wait applies instead.
+        server._clear_accepted_block_payout_preview(hashes[1])
         with self.assertRaisesRegex(TemplateRefreshBlocked, "not ready yet"):
             server._await_pending_parent_payout_preview(hashes[0])
-        for block_hash in hashes[:2]:
-            server._clear_accepted_block_payout_preview(block_hash)
+        server._clear_accepted_block_payout_preview(hashes[0])
         self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
 
     def test_landing_observability_metrics_exposition(self) -> None:
