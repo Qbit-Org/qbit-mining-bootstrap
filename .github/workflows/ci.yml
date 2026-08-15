@@ -47,6 +47,9 @@ jobs:
       - name: Run Postgres ledger integration tests
         run: make test-prism-postgres-ledger
 
+      - name: Run Postgres production-scale fixture tests
+        run: make test-prism-postgres-scale
+
       - name: Validate mainnet Compose contract
         run: python -m unittest tests.test_mainnet_compose_contract
 

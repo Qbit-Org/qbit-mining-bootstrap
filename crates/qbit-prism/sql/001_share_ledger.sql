@@ -589,7 +589,353 @@ AS $$
     ORDER BY share_seq ASC;
 $$;
 
+-- Transactionally maintained current carry-forward balances.
+--
+-- qbit_current_carry_forward_balances() used to recompute
+-- SUM(gross_amount_sats - onchain_amount_sats) over every active
+-- qbit_payout_carry_forward row on each call. That read is O(history); on
+-- mainnet it crossed the one-second submitter statement budget at ~1.4M rows
+-- and wedged block landing (issue #188). An index-backed
+-- latest-row-per-recipient read is not an exact replacement: after a
+-- mid-history reversal the recorded carry_forward_balance_sats of later rows
+-- is stale until reconciliation (qbit_carry_forward_integrity_mismatches()
+-- flags exactly that state), while the recomputed aggregate stays correct.
+-- The exact O(active recipients) form is this summary table, maintained by
+-- triggers inside the same transaction as every write that changes the
+-- active carry set, so readers see a snapshot-consistent balance under
+-- concurrent settlement.
+--
+-- One row exists per (miner_id, payout_order_key, p2mr_program) partition
+-- that has ever contributed an active carry row. balance_sats tracks
+-- SUM(gross_amount_sats - onchain_amount_sats) and active_row_count the
+-- number of contributing rows, over exactly the rows the recomputed
+-- aggregate counts: carry.maturity_state <> 'reversed' joined to a pool
+-- block with chain_state = 'confirmed' AND maturity_state <> 'reversed'.
+-- Partitions with active_row_count = 0 are ignored by readers.
+--
+-- Write-path contract: a pool block must not be created with
+-- chain_state = 'confirmed' in the same statement that inserts its carry
+-- rows (both row-level triggers would then count the rows once each).
+-- Blocks are always inserted as 'prepared' and confirmed by
+-- qbit_confirm_pool_block, which preserves single counting.
+CREATE TABLE IF NOT EXISTS qbit_payout_carry_forward_current (
+    miner_id text NOT NULL,
+    payout_order_key text NOT NULL,
+    p2mr_program bytea NOT NULL CHECK (octet_length(p2mr_program) = 32),
+    balance_sats numeric(78, 0) NOT NULL,
+    active_row_count bigint NOT NULL CHECK (active_row_count >= 0),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (miner_id, payout_order_key, p2mr_program)
+);
+
+-- Update-first upsert: INSERT ... ON CONFLICT would evaluate the
+-- active_row_count >= 0 CHECK on the proposed tuple before conflict
+-- resolution, so a negative delta against an existing partition would fail.
+-- A negative delta against a missing partition is an accounting error and is
+-- meant to fail loudly on the INSERT's CHECK constraint.
+CREATE OR REPLACE FUNCTION qbit_carry_forward_current_apply_delta(
+    target_miner_id text,
+    target_payout_order_key text,
+    target_p2mr_program bytea,
+    delta_balance_sats numeric,
+    delta_active_rows bigint
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    LOOP
+        UPDATE qbit_payout_carry_forward_current
+        SET balance_sats = balance_sats + delta_balance_sats,
+            active_row_count = active_row_count + delta_active_rows,
+            updated_at = clock_timestamp()
+        WHERE miner_id = target_miner_id
+          AND payout_order_key = target_payout_order_key
+          AND p2mr_program = target_p2mr_program;
+        IF FOUND THEN
+            RETURN;
+        END IF;
+        BEGIN
+            INSERT INTO qbit_payout_carry_forward_current (
+                miner_id,
+                payout_order_key,
+                p2mr_program,
+                balance_sats,
+                active_row_count
+            )
+            VALUES (
+                target_miner_id,
+                target_payout_order_key,
+                target_p2mr_program,
+                delta_balance_sats,
+                delta_active_rows
+            );
+            RETURN;
+        EXCEPTION WHEN unique_violation THEN
+            -- Concurrent creation of the same partition row; retry the
+            -- additive update against it.
+        END;
+    END LOOP;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_pool_block_counts_for_carry(target_block_hash text)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM qbit_pool_blocks block
+        WHERE block.block_hash = target_block_hash
+          AND block.chain_state = 'confirmed'
+          AND block.maturity_state <> 'reversed'
+    );
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_rebuild_carry_forward_current_balances()
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    rebuilt_count bigint;
+BEGIN
+    DELETE FROM qbit_payout_carry_forward_current;
+    INSERT INTO qbit_payout_carry_forward_current (
+        miner_id,
+        payout_order_key,
+        p2mr_program,
+        balance_sats,
+        active_row_count
+    )
+    SELECT
+        carry.miner_id,
+        carry.payout_order_key,
+        carry.p2mr_program,
+        SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric),
+        COUNT(*)
+    FROM qbit_payout_carry_forward carry
+    JOIN qbit_pool_blocks block
+      ON block.block_hash = carry.block_hash
+    WHERE carry.maturity_state <> 'reversed'
+      AND block.chain_state = 'confirmed'
+      AND block.maturity_state <> 'reversed'
+    GROUP BY
+        carry.miner_id,
+        carry.payout_order_key,
+        carry.p2mr_program;
+    GET DIAGNOSTICS rebuilt_count = ROW_COUNT;
+    RETURN rebuilt_count;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_payout_carry_forward_current_row_sync()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Fast path: nothing that affects the active balance changed
+    -- (covers the immature -> mature maturity sweep).
+    IF TG_OP = 'UPDATE'
+       AND OLD.miner_id = NEW.miner_id
+       AND OLD.payout_order_key = NEW.payout_order_key
+       AND OLD.p2mr_program = NEW.p2mr_program
+       AND OLD.block_hash IS NOT DISTINCT FROM NEW.block_hash
+       AND OLD.gross_amount_sats = NEW.gross_amount_sats
+       AND OLD.onchain_amount_sats = NEW.onchain_amount_sats
+       AND (OLD.maturity_state = 'reversed') = (NEW.maturity_state = 'reversed')
+    THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP IN ('UPDATE', 'DELETE')
+       AND OLD.maturity_state <> 'reversed'
+       AND qbit_pool_block_counts_for_carry(OLD.block_hash)
+    THEN
+        PERFORM qbit_carry_forward_current_apply_delta(
+            OLD.miner_id,
+            OLD.payout_order_key,
+            OLD.p2mr_program,
+            -(OLD.gross_amount_sats::numeric - OLD.onchain_amount_sats::numeric),
+            -1
+        );
+    END IF;
+    IF TG_OP IN ('INSERT', 'UPDATE')
+       AND NEW.maturity_state <> 'reversed'
+       AND qbit_pool_block_counts_for_carry(NEW.block_hash)
+    THEN
+        PERFORM qbit_carry_forward_current_apply_delta(
+            NEW.miner_id,
+            NEW.payout_order_key,
+            NEW.p2mr_program,
+            NEW.gross_amount_sats::numeric - NEW.onchain_amount_sats::numeric,
+            1
+        );
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS qbit_payout_carry_forward_current_sync ON qbit_payout_carry_forward;
+CREATE TRIGGER qbit_payout_carry_forward_current_sync
+    AFTER INSERT OR UPDATE OR DELETE ON qbit_payout_carry_forward
+    FOR EACH ROW
+    EXECUTE FUNCTION qbit_payout_carry_forward_current_row_sync();
+
+CREATE OR REPLACE FUNCTION qbit_pool_blocks_carry_forward_current_sync()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    old_counts boolean := TG_OP IN ('UPDATE', 'DELETE')
+        AND OLD.chain_state = 'confirmed'
+        AND OLD.maturity_state <> 'reversed';
+    new_counts boolean := TG_OP IN ('INSERT', 'UPDATE')
+        AND NEW.chain_state = 'confirmed'
+        AND NEW.maturity_state <> 'reversed';
+BEGIN
+    IF TG_OP = 'UPDATE' AND OLD.block_hash = NEW.block_hash AND old_counts = new_counts THEN
+        RETURN NULL;
+    END IF;
+    IF old_counts THEN
+        PERFORM qbit_carry_forward_current_apply_delta(
+            deltas.miner_id,
+            deltas.payout_order_key,
+            deltas.p2mr_program,
+            -deltas.balance_sats,
+            -deltas.active_rows
+        )
+        FROM (
+            SELECT
+                carry.miner_id,
+                carry.payout_order_key,
+                carry.p2mr_program,
+                SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric) AS balance_sats,
+                COUNT(*) AS active_rows
+            FROM qbit_payout_carry_forward carry
+            WHERE carry.block_hash = OLD.block_hash
+              AND carry.maturity_state <> 'reversed'
+            GROUP BY
+                carry.miner_id,
+                carry.payout_order_key,
+                carry.p2mr_program
+        ) AS deltas;
+    END IF;
+    IF new_counts THEN
+        PERFORM qbit_carry_forward_current_apply_delta(
+            deltas.miner_id,
+            deltas.payout_order_key,
+            deltas.p2mr_program,
+            deltas.balance_sats,
+            deltas.active_rows
+        )
+        FROM (
+            SELECT
+                carry.miner_id,
+                carry.payout_order_key,
+                carry.p2mr_program,
+                SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric) AS balance_sats,
+                COUNT(*) AS active_rows
+            FROM qbit_payout_carry_forward carry
+            WHERE carry.block_hash = NEW.block_hash
+              AND carry.maturity_state <> 'reversed'
+            GROUP BY
+                carry.miner_id,
+                carry.payout_order_key,
+                carry.p2mr_program
+        ) AS deltas;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS qbit_pool_blocks_carry_forward_current_sync ON qbit_pool_blocks;
+CREATE TRIGGER qbit_pool_blocks_carry_forward_current_sync
+    AFTER INSERT OR UPDATE OR DELETE ON qbit_pool_blocks
+    FOR EACH ROW
+    EXECUTE FUNCTION qbit_pool_blocks_carry_forward_current_sync();
+
+CREATE OR REPLACE FUNCTION qbit_carry_forward_current_truncate_sync()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM qbit_rebuild_carry_forward_current_balances();
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS qbit_payout_carry_forward_current_truncate_sync ON qbit_payout_carry_forward;
+CREATE TRIGGER qbit_payout_carry_forward_current_truncate_sync
+    AFTER TRUNCATE ON qbit_payout_carry_forward
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION qbit_carry_forward_current_truncate_sync();
+
+DROP TRIGGER IF EXISTS qbit_pool_blocks_carry_forward_current_truncate_sync ON qbit_pool_blocks;
+CREATE TRIGGER qbit_pool_blocks_carry_forward_current_truncate_sync
+    AFTER TRUNCATE ON qbit_pool_blocks
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION qbit_carry_forward_current_truncate_sync();
+
+-- Seed the summary exactly once when this schema is applied to a database
+-- that already holds active carry history (the summary can only be empty
+-- while active rows exist before the triggers above have ever run).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM qbit_payout_carry_forward_current)
+       AND EXISTS (
+           SELECT 1
+           FROM qbit_payout_carry_forward carry
+           JOIN qbit_pool_blocks block
+             ON block.block_hash = carry.block_hash
+           WHERE carry.maturity_state <> 'reversed'
+             AND block.chain_state = 'confirmed'
+             AND block.maturity_state <> 'reversed'
+       )
+    THEN
+        PERFORM qbit_rebuild_carry_forward_current_balances();
+    END IF;
+END
+$$;
+
 CREATE OR REPLACE FUNCTION qbit_current_carry_forward_balances()
+RETURNS TABLE (
+    miner_id text,
+    payout_order_key text,
+    p2mr_program bytea,
+    balance_sats numeric
+)
+LANGUAGE sql
+STABLE
+AS $$
+    WITH balances AS (
+        SELECT
+            (array_agg(current_balance.miner_id ORDER BY current_balance.payout_order_key, current_balance.miner_id))[1] AS miner_id,
+            (array_agg(current_balance.payout_order_key ORDER BY current_balance.payout_order_key, current_balance.miner_id))[1] AS payout_order_key,
+            current_balance.p2mr_program,
+            SUM(current_balance.balance_sats) AS balance_sats
+        FROM qbit_payout_carry_forward_current current_balance
+        WHERE current_balance.active_row_count > 0
+        GROUP BY
+            current_balance.p2mr_program
+        HAVING SUM(current_balance.balance_sats) <> 0
+    )
+    SELECT
+        balances.miner_id,
+        balances.payout_order_key,
+        balances.p2mr_program,
+        balances.balance_sats
+    FROM balances
+    ORDER BY
+        balances.payout_order_key,
+        balances.miner_id,
+        balances.p2mr_program;
+$$;
+
+-- The original O(history) aggregate, retained as the independent
+-- recomputation used by equivalence tests and the integrity report's drift
+-- check. Must stay semantically identical to the summary-backed
+-- qbit_current_carry_forward_balances().
+CREATE OR REPLACE FUNCTION qbit_recomputed_carry_forward_balances()
 RETURNS TABLE (
     miner_id text,
     payout_order_key text,
@@ -625,6 +971,36 @@ AS $$
         balances.payout_order_key,
         balances.miner_id,
         balances.p2mr_program;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_carry_forward_current_drift()
+RETURNS TABLE (
+    p2mr_program bytea,
+    current_miner_id text,
+    current_payout_order_key text,
+    current_balance_sats numeric,
+    recomputed_miner_id text,
+    recomputed_payout_order_key text,
+    recomputed_balance_sats numeric
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        COALESCE(current_row.p2mr_program, recomputed_row.p2mr_program) AS p2mr_program,
+        current_row.miner_id,
+        current_row.payout_order_key,
+        current_row.balance_sats,
+        recomputed_row.miner_id,
+        recomputed_row.payout_order_key,
+        recomputed_row.balance_sats
+    FROM qbit_current_carry_forward_balances() AS current_row
+    FULL OUTER JOIN qbit_recomputed_carry_forward_balances() AS recomputed_row
+      ON recomputed_row.p2mr_program = current_row.p2mr_program
+    WHERE current_row.balance_sats IS DISTINCT FROM recomputed_row.balance_sats
+       OR current_row.miner_id IS DISTINCT FROM recomputed_row.miner_id
+       OR current_row.payout_order_key IS DISTINCT FROM recomputed_row.payout_order_key
+    ORDER BY 1;
 $$;
 
 CREATE OR REPLACE FUNCTION qbit_current_owed_balances()
@@ -757,6 +1133,25 @@ AS $$
               AND block.maturity_state <> 'reversed'
         ),
         'mismatch_count', (SELECT count(*) FROM qbit_carry_forward_integrity_mismatches()),
+        'current_drift_count', (SELECT count(*) FROM qbit_carry_forward_current_drift()),
+        'current_drift', COALESCE(
+            (
+                SELECT jsonb_agg(
+                    jsonb_build_object(
+                        'p2mr_program_hex', encode(drift.p2mr_program, 'hex'),
+                        'current_recipient_id', drift.current_miner_id,
+                        'current_order_key', drift.current_payout_order_key,
+                        'current_balance_sats', drift.current_balance_sats::text,
+                        'recomputed_recipient_id', drift.recomputed_miner_id,
+                        'recomputed_order_key', drift.recomputed_payout_order_key,
+                        'recomputed_balance_sats', drift.recomputed_balance_sats::text
+                    )
+                    ORDER BY encode(drift.p2mr_program, 'hex')
+                )
+                FROM qbit_carry_forward_current_drift() drift
+            ),
+            '[]'::jsonb
+        ),
         'mismatches', COALESCE(
             (
                 SELECT jsonb_agg(

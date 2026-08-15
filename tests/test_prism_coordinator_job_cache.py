@@ -45,7 +45,11 @@ from lab.prism.prism_coordinator import (
     now_ms,
     qbit_template_fingerprint,
 )
-from lab.prism.share_ledger import PendingShare, SingleWriterShareLedger
+from lab.prism.share_ledger import (
+    LedgerOperationTimeout,
+    PendingShare,
+    SingleWriterShareLedger,
+)
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"
 EXTRANONCE2_SIZE = 8
@@ -159,6 +163,50 @@ def base_template(height: int = 10, prevhash: str = "11" * 32) -> dict[str, obje
         "curtime": 1_700_000_000,
         "coinbasevalue": 50_00000000,
         "transactions": [],
+    }
+
+
+def durable_candidate_row(index: int) -> dict[str, object]:
+    """A minimal valid outbox row whose intent survives block_candidate_from_intent."""
+    block_hash = f"{index + 1:064x}"
+    return {
+        "block_hash": block_hash,
+        "candidate": {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": block_hash,
+            "block_hex": "00",
+            "coinbase_tx_hex": "00",
+            "parent_hash": "11" * 32,
+            "expected_height": 10,
+            "template": {
+                "previousblockhash": "11" * 32,
+                "height": 10,
+                "coinbasevalue": 50_00000000,
+            },
+            "shares_json": [],
+            "prior_balances": [],
+            "found_block": {},
+            "prospective_prior_balances": None,
+            "witness_merkle_leaves_hex": [],
+            "extranonce1_hex": "00000001",
+            "extranonce2_hex": "00",
+            "username": "miner-a",
+            "pending_share": {
+                "share_id": f"miner-a:{block_hash}",
+                "miner_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "22" * 32,
+                "share_difficulty": 1,
+                "network_difficulty": 1,
+                "template_height": 10,
+                "job_id": "job-1",
+                "job_issued_at_ms": 1,
+                "accepted_at_ms": 1,
+                "ntime": 1,
+            },
+            "credit_share_on_accept": False,
+            "collection_only": False,
+        },
     }
 
 
@@ -2855,6 +2903,400 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(server._payout_state_publication_fenced())
         self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
 
+    def test_preview_publication_degrades_when_artifact_preparation_times_out(
+        self,
+    ) -> None:
+        server, _rpc = coordinator()
+        parent_hash = "ab" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+
+        def timing_out_preparation(*_args: object, **_kwargs: object) -> object:
+            raise TimeoutError("postgres operation exceeded 30s")
+
+        server._prepared_payout_state_candidate = (  # type: ignore[method-assign]
+            timing_out_preparation
+        )
+        server._begin_accepted_block_payout_preview(parent_hash)
+        with patch("builtins.print"):
+            self.assertEqual(
+                server._publish_accepted_block_payout_preview(parent_hash, preview),
+                preview,
+            )
+
+        # Children of the pending parent receive the immutable compact
+        # preview even though no payout-state generation was published.
+        transition = server._accepted_block_payout_previews[parent_hash]
+        self.assertIsNone(transition.published_generation)
+        self.assertTrue(transition.landed)
+        self.assertEqual(
+            server._prior_balances_for_job_parent(parent_hash),
+            preview,
+        )
+        # Payout-state publication itself stays gated until the landing
+        # reaches a terminal durable state.
+        with self.assertRaisesRegex(
+            _PayoutStatePublicationBlocked, "still pending"
+        ):
+            with server._payout_balance_mutation():
+                pass
+        server._clear_accepted_block_payout_preview(parent_hash)
+
+    def test_unresolved_accepted_parent_depth_cap_fails_closed(self) -> None:
+        server, _rpc = coordinator()
+        server.accepted_parent_unresolved_depth_max = 2
+        server.accepted_block_payout_preview_wait_seconds = 0.01
+        hashes = ["a1" * 32, "a2" * 32, "a3" * 32]
+        for height, block_hash in enumerate(hashes, start=10):
+            server._begin_accepted_block_payout_preview(
+                block_hash, block_height=height
+            )
+            server._mark_accepted_block_payout_landed(
+                block_hash, block_height=height
+            )
+        self.assertEqual(len(server.accepted_parent_unresolved_ages_seconds()), 3)
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "exceeds cap"):
+            server._await_pending_parent_payout_preview(hashes[0])
+        # At the cap issuance still blocks: a child issued now could land
+        # and create a (cap + 1)th unresolved transition, so the configured
+        # maximum would no longer bound the prospective balance chain.
+        server._clear_accepted_block_payout_preview(hashes[2])
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "exceeds cap"):
+            server._await_pending_parent_payout_preview(hashes[0])
+        # Below the cap the ordinary bounded wait applies instead.
+        server._clear_accepted_block_payout_preview(hashes[1])
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "not ready yet"):
+            server._await_pending_parent_payout_preview(hashes[0])
+        server._clear_accepted_block_payout_preview(hashes[0])
+        self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
+
+    def test_landing_observability_metrics_exposition(self) -> None:
+        import contextlib as _contextlib
+        import time as _time
+
+        server, _rpc = coordinator()
+        server.block_landing_db_timeout_seconds = 45.0
+        server.block_landing_db_timeout_max_seconds = 90.0
+
+        @_contextlib.contextmanager
+        def statement_timeout(seconds: float):
+            yield
+
+        original_ledger = server.ledger
+        server.ledger = SimpleNamespace(
+            statement_timeout=statement_timeout,
+            prior_balances_read_stats=lambda: {
+                "reads_total": 3,
+                "last_seconds": 0.004,
+                "max_seconds": 0.021,
+            },
+        )
+        block_hash = "ab" * 32
+        with self.assertRaises(TimeoutError):
+            with server._block_landing_ledger_statement_timeout_scope(block_hash):
+                raise LedgerOperationTimeout("postgres operation exceeded 45s")
+        server.ledger = original_ledger
+
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        server.accepted_block_payout_preview_wait_seconds = 0.0
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "not ready yet"):
+            server._await_pending_parent_payout_preview(block_hash)
+        server._startup_phase_origin_monotonic = _time.monotonic()
+        server._record_startup_phase_once("audit_listener_bound")
+
+        prior_stats = {
+            "reads_total": 3,
+            "last_seconds": 0.004,
+            "max_seconds": 0.021,
+        }
+        server.ledger.prior_balances_read_stats = (  # type: ignore[attr-defined]
+            lambda: prior_stats
+        )
+        lines = "\n".join(server.landing_observability_metrics_lines())
+        self.assertIn(
+            'qbit_prism_block_ledger_call_timeouts_total{call_class="landing"} 1',
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_block_ledger_call_budget_seconds{call_class="landing"} 45.000000',
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_accepted_parent_unresolved_transitions 1",
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_accepted_parent_preview_wait_timeouts_total 1",
+            lines,
+        )
+        self.assertNotIn(
+            "qbit_prism_accepted_parent_unresolved_oldest_seconds -1",
+            lines,
+        )
+        self.assertIn("qbit_prism_prior_balances_reads_total 3", lines)
+        self.assertIn(
+            "qbit_prism_prior_balances_read_max_seconds 0.021000",
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_startup_phase_seconds{phase="audit_listener_bound"}',
+            lines,
+        )
+        server._clear_accepted_block_payout_preview(block_hash)
+
+    def test_startup_replay_gate_blocks_job_builds_until_enumeration(self) -> None:
+        server, _rpc = coordinator()
+        enumerated: list[int] = []
+
+        class EnumLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                enumerated.append(limit)
+                return []
+
+        server.ledger = EnumLedger()
+        server._note_block_replay_enumeration_owed()
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "has not enumerated"):
+            server._await_pending_parent_payout_preview("ab" * 32)
+        self.assertEqual(server.replay_pending_block_candidates(), 0)
+        self.assertEqual(enumerated, [32])
+        self.assertFalse(server._block_replay_enumeration_owed())
+        self.assertIsNone(server._await_pending_parent_payout_preview("ab" * 32))
+
+    def test_owed_enumeration_bypasses_live_candidate_short_circuits(self) -> None:
+        server, _rpc = coordinator()
+        enumerated: list[int] = []
+
+        class EnumLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                enumerated.append(limit)
+                return []
+
+        server.ledger = EnumLedger()
+        server.block_landing_db_timeout_seconds = 7.5
+        server._retry_block_candidate = object()
+        # Steady state: a retained retry short-circuits the outbox poll.
+        self.assertEqual(server.replay_pending_block_candidates(), 0)
+        self.assertEqual(enumerated, [])
+        # Owed enumeration is correctness-critical and bypasses the
+        # short-circuits, running with the landing-class budget and
+        # recording under the landing metrics class.
+        server._note_block_replay_enumeration_owed()
+        self.assertEqual(server.replay_pending_block_candidates(), 0)
+        self.assertEqual(enumerated, [32])
+        self.assertFalse(server._block_replay_enumeration_owed())
+        metrics = server.block_ledger_call_class_metrics()
+        self.assertEqual(metrics["landing"]["last_budget_seconds"], 7.5)
+        self.assertNotIn("fast", metrics)
+
+    def test_worker_reported_deadline_counts_as_landing_timeout(self) -> None:
+        """A server-side cancellation completes the ledger worker with a
+        timeout error before the coordinator-side wait expires; the
+        completion path must still count it for the landing-timeout alert."""
+        server, _rpc = coordinator()
+
+        class CancelledLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                raise LedgerOperationTimeout("postgres statement deadline expired")
+
+        server.ledger = CancelledLedger()
+        server._note_block_replay_enumeration_owed()
+        with patch("builtins.print"):
+            self.assertTrue(server._run_startup_block_candidate_replay())
+        self.assertTrue(server._block_replay_enumeration_owed())
+        metrics = server.block_ledger_call_class_metrics()
+        self.assertEqual(metrics["landing"]["calls_total"], 1)
+        self.assertEqual(metrics["landing"]["timeouts_total"], 1)
+        self.assertNotIn("fast", metrics)
+
+    def test_startup_enumeration_escalates_past_truncated_batches(self) -> None:
+        """A full first batch must not end enumeration: rows beyond the batch
+        window (potentially the active parent) still need their payout
+        barriers armed before job builds unblock."""
+        server, _rpc = coordinator()
+        requested: list[int] = []
+        total_pending = 33
+
+        class TruncatingLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                requested.append(limit)
+                return [
+                    durable_candidate_row(index)
+                    for index in range(min(limit, total_pending))
+                ]
+
+        server.ledger = TruncatingLedger()
+        server._note_block_replay_enumeration_owed()
+        self.assertEqual(server.replay_pending_block_candidates(), total_pending)
+        self.assertEqual(requested, [32, 64])
+        self.assertFalse(server._block_replay_enumeration_owed())
+        self.assertEqual(
+            server._block_replay_candidate_queue.qsize(), total_pending
+        )
+        # Every restored row armed its payout barrier before the gate opened.
+        self.assertEqual(
+            len(server._accepted_block_payout_previews), total_pending
+        )
+
+    def test_startup_enumeration_stays_owed_at_truncation_cap(self) -> None:
+        """An outbox larger than the enumeration cap keeps job builds blocked
+        instead of silently declaring enumeration complete."""
+        server, _rpc = coordinator()
+        requested: list[int] = []
+
+        class EndlessLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                requested.append(limit)
+                return [durable_candidate_row(index) for index in range(limit)]
+
+        server.ledger = EndlessLedger()
+        server._note_block_replay_enumeration_owed()
+        with patch("builtins.print"):
+            queued = server.replay_pending_block_candidates()
+        self.assertEqual(queued, 1024)
+        self.assertEqual(requested, [32, 64, 128, 256, 512, 1024])
+        self.assertTrue(server._block_replay_enumeration_owed())
+        with self.assertRaisesRegex(TemplateRefreshBlocked, "has not enumerated"):
+            server._await_pending_parent_payout_preview("ab" * 32)
+
+    def test_steady_state_poll_restores_a_single_batch(self) -> None:
+        """Without an owed enumeration, a full batch stays a single query;
+        the next poll picks up later rows after the queue drains."""
+        server, _rpc = coordinator()
+        requested: list[int] = []
+
+        class FullBatchLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                requested.append(limit)
+                return [durable_candidate_row(index) for index in range(limit)]
+
+        server.ledger = FullBatchLedger()
+        self.assertEqual(server.replay_pending_block_candidates(), 32)
+        self.assertEqual(requested, [32])
+        self.assertFalse(server._block_replay_enumeration_owed())
+
+    def test_startup_replay_timeout_keeps_job_builds_blocked(self) -> None:
+        server, _rpc = coordinator()
+        release = threading.Event()
+
+        class StallLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                release.wait(5)
+                return []
+
+        server.ledger = StallLedger()
+        server.block_landing_db_timeout_seconds = 0.01
+        server.block_landing_db_timeout_max_seconds = 0.01
+        try:
+            with patch("builtins.print"):
+                self.assertTrue(server._run_startup_block_candidate_replay())
+            self.assertTrue(server._block_replay_enumeration_owed())
+            with self.assertRaisesRegex(
+                TemplateRefreshBlocked, "has not enumerated"
+            ):
+                server._await_pending_parent_payout_preview("ab" * 32)
+            # The startup enumeration ran with the landing budget, so its
+            # timeout fires the documented landing-timeout alert instead of
+            # hiding inside the fast-call series.
+            metrics = server.block_ledger_call_class_metrics()
+            self.assertEqual(metrics["landing"]["timeouts_total"], 1)
+            self.assertNotIn("fast", metrics)
+        finally:
+            release.set()
+
+    def test_startup_phase_seconds_records_first_occurrence_only(self) -> None:
+        import time as _time
+
+        server, _rpc = coordinator()
+        self.assertEqual(server.startup_phase_seconds(), {})
+        server._record_startup_phase_once("audit_listener_bound")
+        self.assertEqual(server.startup_phase_seconds(), {})
+        server._startup_phase_origin_monotonic = _time.monotonic() - 1.0
+        server._record_startup_phase_once("audit_listener_bound")
+        first = server.startup_phase_seconds()["audit_listener_bound"]
+        self.assertGreaterEqual(first, 1.0)
+        server._record_startup_phase_once("audit_listener_bound")
+        self.assertEqual(
+            server.startup_phase_seconds()["audit_listener_bound"], first
+        )
+
+    def test_job_issuance_continues_during_padded_landing(self) -> None:
+        """Acceptance shape for issue #188: a landing padded past its normal
+        duration must not stop child job issuance, and payout-state
+        publication stays gated until the landing reaches a terminal state.
+        The pad is logical (the barrier simply stays unresolved) so the test
+        is instant while pinning the same ordering a 10s landing produces."""
+        server, _rpc = coordinator()
+        parent_hash = "ab" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        server._begin_accepted_block_payout_preview(parent_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(parent_hash, block_height=10)
+        server._publish_accepted_block_payout_preview(parent_hash, preview)
+        # The landing bookkeeping is still unresolved; every child build keeps
+        # receiving the immutable preview instead of blocking or reading
+        # confirmed balances.
+        for _ in range(5):
+            self.assertEqual(
+                server._prior_balances_for_job_parent(parent_hash),
+                preview,
+            )
+        ages = server.accepted_parent_unresolved_ages_seconds()
+        self.assertEqual(len(ages), 1)
+        with self.assertRaisesRegex(
+            _PayoutStatePublicationBlocked, "still pending"
+        ):
+            with server._payout_balance_mutation():
+                pass
+        # Landing completes: the transition clears and confirmed reads resume.
+        server._clear_accepted_block_payout_preview(parent_hash)
+        self.assertEqual(
+            server._prior_balances_for_job_parent(
+                parent_hash, fallback_balances=[]
+            ),
+            [],
+        )
+        self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
+
+    def test_unmark_landed_clears_unresolved_age(self) -> None:
+        server, _rpc = coordinator()
+        block_hash = "cd" * 32
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        ages = server.accepted_parent_unresolved_ages_seconds()
+        self.assertEqual(len(ages), 1)
+        self.assertGreaterEqual(ages[0], 0.0)
+        server._unmark_accepted_block_payout_landed(block_hash)
+        self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
+        server._clear_accepted_block_payout_preview(block_hash)
+
     def test_withdrawn_landed_transition_blocks_active_descendant_fallback(
         self,
     ) -> None:
@@ -2903,6 +3345,61 @@ class JobBundleCacheTests(unittest.TestCase):
             )
         self.assertEqual(ledger.current_balance_reads, 0)
         self.assertTrue(server._tip_refresh_retry.is_set())
+
+    def test_preview_publication_survives_window_build_timeout(self) -> None:
+        """Issue #188 acceptance: when the payout window build dies with the
+        slow ledger during found-block publication, the preview must still
+        cross the atomic publication boundary. Admission then reopens and
+        child jobs build against the verified compact preview instead of
+        stalling behind the global publication fence until the ledger
+        recovers."""
+        accepted_hash = "c4" * 32
+        server, rpc = coordinator(
+            template=base_template(height=12, prevhash=accepted_hash)
+        )
+        recorded = install_fake_bundle_builder(server)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        self.assertTrue(server.pool_readiness_latched())
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+
+        def timing_out_window_build(
+            *_args: object, **_kwargs: object
+        ) -> PayoutLedgerArtifact:
+            raise LedgerOperationTimeout("postgres statement deadline expired")
+
+        server._build_payout_ledger_artifact = (  # type: ignore[method-assign]
+            timing_out_window_build
+        )
+        server._begin_accepted_block_payout_preview(accepted_hash, block_height=11)
+        server._mark_accepted_block_payout_landed(accepted_hash, block_height=11)
+        generation_before = server._payout_state_generation
+        with patch("builtins.print"):
+            published = server._publish_accepted_block_payout_preview(
+                accepted_hash, preview
+            )
+        self.assertEqual(published, preview)
+        # The publication crossed the atomic boundary: a generation was
+        # installed and delivery admission reopened despite the dead build.
+        self.assertFalse(server._payout_state_publication_fenced())
+        self.assertEqual(server._payout_state_generation, generation_before + 1)
+        transition = server._accepted_block_payout_previews[accepted_hash]
+        self.assertEqual(transition.published_generation, generation_before + 1)
+        # Child job construction is admitted and consumes the preview.
+        bundle = server.shared_job_bundle(artifacts, mode="ready")
+        self.assertIsNotNone(bundle)
+        self.assertEqual(recorded["calls"], 1)
+        last_kwargs = recorded["last_kwargs"]
+        assert isinstance(last_kwargs, dict)
+        self.assertEqual(list(last_kwargs["prior_balances"]), preview)
+        server._clear_accepted_block_payout_preview(accepted_hash)
 
     def test_inactive_landed_ancestor_rejects_preview_patched_artifact(
         self,
@@ -8499,6 +8996,35 @@ class HealthSnapshotTests(unittest.TestCase):
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
+
+    def test_audit_server_marks_refresher_before_listener_dispatch(self) -> None:
+        """A probe retrying connection-refused queues in the accept backlog at
+        listen() time and can be served the instant the listener thread
+        starts. The refresher flag must already be set by then, or
+        cached_health_payload's legacy inline path would run the cold
+        accepted-share aggregate synchronously on the handler thread instead
+        of returning the documented starting state."""
+        server, _ = coordinator()
+        server.audit_bind = "127.0.0.1"
+        server.audit_port = 0
+        # The spawned refresher loop exits immediately; the running flag is
+        # what gates the handler path and must survive.
+        server.stop_event.set()
+        flag_at_bind: list[bool] = []
+
+        class RecordingServer:
+            def __init__(self, address: object, handler_cls: object) -> None:
+                flag_at_bind.append(bool(server._health_refresh_loop_running))
+
+            def serve_forever(self) -> None:
+                return None
+
+        with patch.object(
+            prism_coordinator_module, "ThreadingHTTPServer", RecordingServer
+        ), patch("builtins.print"):
+            server.start_audit_server()
+        self.assertEqual(flag_at_bind, [True])
+        self.assertTrue(server._health_refresh_loop_running)
 
     def test_cached_health_payload_serves_snapshot_and_flags_staleness(self) -> None:
         server, _ = coordinator()

@@ -102,6 +102,11 @@ work, while an older replay stalled in accounting cannot hide later durable
 rows. The pre-accept startup recovery pass is best-effort under a slow ledger:
 if its database budget expires, the coordinator finishes starting and the
 block-submitter loop retries every durable pending row with ordinary backoff.
+Because job builds stay blocked until every pending candidate is known, the
+startup enumeration must be provably untruncated: a full batch re-queries
+with a doubled window (capped at 1024 rows) until the outbox returns fewer
+rows than requested. If the cap is ever hit, the gate stays closed while the
+restored batch drains and the submitter loop re-enumerates the remainder.
 Before qbitd can observe a candidate, the coordinator installs a short in-memory
 prospective-payout barrier; this prevents startup prewarm from issuing child
 work from the old balance base without falsely claiming that the block landed.
@@ -120,7 +125,49 @@ second). `PRISM_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS` gives each later Postgres
 statement and local ledger gate a fresh deadline (default 1 second); direct
 outbox reads and mutations additionally use a single-flight wrapper so a
 driver that ignores its deadline cannot accumulate retry threads. Timeouts
-leave the row pending and enter the ordinary candidate backoff. Contended
+leave the row pending and enter the ordinary candidate backoff.
+
+Landing-path observability lives on `/metrics`:
+`qbit_prism_block_ledger_calls_total` / `_call_timeouts_total` /
+`_call_budget_seconds` / `_call_last_duration_seconds` /
+`_call_max_duration_seconds` (labelled by `call_class`, `fast` vs
+`landing`), `qbit_prism_accepted_parent_unresolved_transitions` and
+`_unresolved_oldest_seconds`,
+`qbit_prism_accepted_parent_preview_wait_timeouts_total`,
+`qbit_prism_prior_balances_reads_total` / `_read_last_seconds` /
+`_read_max_seconds`, and `qbit_prism_startup_phase_seconds{phase=...}`.
+Alert before the landing deadline is exhausted, not after: page when
+`qbit_prism_prior_balances_read_max_seconds` exceeds ~20% of the
+landing budget or the poll budget, when any
+`qbit_prism_block_ledger_call_timeouts_total{call_class="landing"}`
+increment occurs, and when
+`qbit_prism_accepted_parent_unresolved_oldest_seconds` exceeds the
+preview wait budget. The #188 prior-balances read crossed the one-second
+line silently over several weeks; these series exist so that growth is a
+ticket, not an outage.
+
+Deadlines are split by call class. The poll-class budget above covers only
+cheap outbox polls and fast-lane-adjacent calls. The landing-class
+accounting tail — persisting an accepted block, reading prior balances,
+confirming it, and rejecting the prepared state of a terminal candidate —
+runs each statement under `PRISM_BLOCK_LANDING_DB_TIMEOUT_SECONDS`
+(default 30 seconds) starting with the first attempt. After an observed
+landing timeout the next attempt for the same block hash doubles its
+budget up to `PRISM_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS` (default 120
+seconds); only ledger-originated deadlines count as landing timeouts —
+a node RPC timing out inside the landing tail neither escalates the
+next PostgreSQL budget nor increments the landing-timeout series; retries stay paced by the candidate backoff, server-side
+cancellation is confirmed by the ledger backends (the pooled session is
+rolled back or replaced, never reused mid-cancel), and the stuck-call and
+coordination watchdogs remain the overall bound. Startup replay of a
+pending accepted candidate re-enters the same landing-class scope, and
+the gating startup outbox enumeration both runs with the landing budget
+and records under `call_class="landing"`, so an enumeration timeout
+fires the landing-timeout alert rather than inflating the fast-call
+budget gauge. A
+landing-class operation must never start at the poll budget: a
+structurally slow landing under a one-second ceiling is statement-canceled
+on every attempt and can never converge (issue #188). Contended
 submit-path locks are acquired in heartbeat slices and identify the lock in a
 periodic diagnostic controlled by `PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS`
 (default 5 seconds). At most two timeout-ignoring RPC workers and two

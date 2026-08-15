@@ -72,6 +72,7 @@ from lab.prism.share_ledger import (
     IncrementalShareJsonSequence,
     IncrementalWindowAdvanceStats,
     IncrementalWindowFallback,
+    LedgerOperationTimeout,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -265,6 +266,14 @@ MAX_ACTIVE_PRISM_JOBS_PER_CLIENT = 16
 # bound limits RAM; overflow only coalesces a wakeup because Postgres retains
 # the authoritative pending candidate.
 MAX_PENDING_BLOCK_CANDIDATES = 32
+# Startup replay must observe every durable pending candidate before child
+# job builds unblock (issue #188 fix 4): a truncated enumeration could hide
+# the active parent whose payout transition is not yet armed. A full batch
+# therefore re-queries with a doubled window until the result is provably
+# untruncated. This cap bounds one enumeration pass's memory; at the cap the
+# gate simply stays closed while the queued batch drains, and the submitter
+# loop re-enumerates the shrinking remainder.
+MAX_BLOCK_REPLAY_ENUMERATION_ROWS = 1024
 # Accepted shares use a small, bounded group-commit queue.  Every submitter
 # waits for its batch's Postgres commit before receiving Stratum success, so
 # this is a latency-smoothing bound rather than a durable backlog.
@@ -502,6 +511,21 @@ DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS = 1.0
 # Direct outbox calls also run behind a coordinator-side single-flight guard,
 # so a driver that ignores the deadline cannot freeze the submitter thread.
 DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS = 1.0
+# Landing-class deadline. The post-acceptance landing/accounting tail
+# (persist, prior balances, confirm, prepared-state rejection of a terminal
+# candidate) must not share the one-second budget meant for cheap outbox
+# polls and fast-lane-adjacent calls: a structurally slow landing under that
+# ceiling is statement-canceled on every attempt and can never complete
+# (issue #188 — mainnet block 42743's landing was canceled 13 times while
+# Postgres was otherwise idle). The first landing attempt receives this full
+# budget; retries escalate after observed landing timeouts.
+DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS = 30.0
+# Reviewed escalation cap for landing retries. Per-attempt wall clock stays
+# bounded by the escalated statement budget, cycles are paced by the
+# candidate retry backoff, and the stuck-call/coordination watchdogs remain
+# the overall bound. An accepted block's landing is never abandoned outright;
+# it converges through durable replay.
+DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS = 120.0
 BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS = 0.25
 DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS = 5.0
 DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS = 30.0
@@ -521,6 +545,13 @@ BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS = 0.25
 # publishing different lock objects for the same state.
 _HOT_PATH_LOCK_INITIALIZATION_LOCK = threading.Lock()
 DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS = 5.0
+# Fail-closed bound on unresolved accepted-parent transitions (landed
+# candidates whose durable bookkeeping has not reached a terminal state).
+# Child jobs may keep issuing against published previews while landings
+# complete, but once this many transitions are unresolved at once, new job
+# builds block instead of stacking further prospective balance chains. The
+# durable outbox (MAX_PENDING_BLOCK_CANDIDATES) remains the wider bound.
+DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX = 8
 # Credit policies recorded on accepted ledger rows. Normal shares carry no
 # policy; a policy marks a share that was credited by an explicit pool rule
 # (documented in docs/prism-rejections.md) so audits can distinguish them.
@@ -1744,6 +1775,7 @@ class _AcceptedBlockPayoutTransition:
     landed: bool = False
     preview: tuple[tuple[str, str, str, int], ...] | None = None
     published_generation: int | None = None
+    landed_monotonic: float | None = None
 
 
 @dataclass(frozen=True)
@@ -3191,6 +3223,18 @@ class PrismCoordinator:
         self.block_submit_db_timeout_seconds = env_positive_float(
             "PRISM_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS",
             DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS,
+        )
+        self.block_landing_db_timeout_seconds = env_positive_float(
+            "PRISM_BLOCK_LANDING_DB_TIMEOUT_SECONDS",
+            DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,
+        )
+        self.block_landing_db_timeout_max_seconds = env_positive_float(
+            "PRISM_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS",
+            DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
+        )
+        self.accepted_parent_unresolved_depth_max = env_positive_int(
+            "PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX",
+            DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
         )
         self.block_submit_lock_wait_log_seconds = env_positive_float(
             "PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS",
@@ -7574,6 +7618,11 @@ class PrismCoordinator:
                 existing,
                 block_height=block_height,
                 landed=True,
+                landed_monotonic=(
+                    existing.landed_monotonic
+                    if existing.landed_monotonic is not None
+                    else time.monotonic()
+                ),
             )
             self._accepted_block_payout_preview_condition.notify_all()
 
@@ -7600,6 +7649,7 @@ class PrismCoordinator:
             self._accepted_block_payout_previews[key] = dataclass_replace(
                 existing,
                 landed=False,
+                landed_monotonic=None,
             )
             self._accepted_block_payout_preview_condition.notify_all()
 
@@ -7641,53 +7691,72 @@ class PrismCoordinator:
                     # must still cross the atomic publication boundary so they
                     # install a generation and reopen admission.
 
-            captured = self._capture_payout_state_source()
-            reserved = self._reserve_payout_state_source_if_current(
-                captured[1],
-                "accepted_block_preview",
-                tip_hash=key,
-                invalidated_monotonic=time.monotonic(),
-            )
-            if reserved is None:
-                candidate = self._prepared_payout_state_candidate(
-                    self._capture_payout_state_source(),
-                    bypass_build_interval=True,
+            published = None
+            try:
+                captured = self._capture_payout_state_source()
+                reserved = self._reserve_payout_state_source_if_current(
+                    captured[1],
+                    "accepted_block_preview",
+                    tip_hash=key,
+                    invalidated_monotonic=time.monotonic(),
                 )
-            else:
-                candidate = self._prepared_payout_state_candidate(reserved)
-            candidate = self._accepted_block_preview_candidate(
-                candidate,
-                block_hash=key,
-                preview=serialized,
-            )
-            # Close delivery admission before exposing the preview. The
-            # generation publication below performs the only atomic pointer
-            # swap and reopens admission; no preparation lock is involved.
-            self._block_payout_state_publication(force=True)
-            published = self._publish_payout_state_candidate(candidate)
-            if published is None:
-                max_retries = max(
-                    0,
-                    int(
-                        getattr(
-                            self,
-                            "payout_reconcile_supersession_retries",
-                            DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
-                        )
-                    ),
-                )
-                for _attempt in range(max_retries):
-                    candidate = self._accepted_block_preview_candidate(
-                        self._prepared_payout_state_candidate(
-                            self._capture_payout_state_source(),
-                            bypass_build_interval=True,
-                        ),
-                        block_hash=key,
-                        preview=serialized,
+                if reserved is None:
+                    candidate = self._prepared_payout_state_candidate(
+                        self._capture_payout_state_source(),
+                        bypass_build_interval=True,
                     )
-                    published = self._publish_payout_state_candidate(candidate)
-                    if published is not None:
-                        break
+                else:
+                    candidate = self._prepared_payout_state_candidate(reserved)
+                candidate = self._accepted_block_preview_candidate(
+                    candidate,
+                    block_hash=key,
+                    preview=serialized,
+                )
+                # Close delivery admission before exposing the preview. The
+                # generation publication below performs the only atomic pointer
+                # swap and reopens admission; no preparation lock is involved.
+                self._block_payout_state_publication(force=True)
+                published = self._publish_payout_state_candidate(candidate)
+                if published is None:
+                    max_retries = max(
+                        0,
+                        int(
+                            getattr(
+                                self,
+                                "payout_reconcile_supersession_retries",
+                                DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
+                            )
+                        ),
+                    )
+                    for _attempt in range(max_retries):
+                        candidate = self._accepted_block_preview_candidate(
+                            self._prepared_payout_state_candidate(
+                                self._capture_payout_state_source(),
+                                bypass_build_interval=True,
+                            ),
+                            block_hash=key,
+                            preview=serialized,
+                        )
+                        published = self._publish_payout_state_candidate(candidate)
+                        if published is not None:
+                            break
+            except Exception as exc:
+                # Last-resort degraded retention (issue #188): candidate
+                # preparation already degrades a ledger-timeout window build
+                # to the cached armed window, so reaching here means an
+                # in-memory publication step itself failed. Fall through to
+                # the fenced local-retention branch below exactly like a
+                # lost atomic publication: admission is force-blocked, the
+                # immutable compact preview remains visible to children
+                # already waiting on the transition, and the tip-refresh
+                # retry loop must publish a fresh source before new job
+                # admission resumes.
+                published = None
+                print(
+                    "prism coordinator: accepted block payout preview "
+                    f"publication degraded hash={key}: {exc}",
+                    flush=True,
+                )
             if published is None:
                 self._block_payout_state_publication(force=True)
                 # Admission is now globally fenced, so retaining the compact
@@ -8023,6 +8092,38 @@ class PrismCoordinator:
         _, selected_key, selected_invalidated = max(active_ancestors)
         return selected_key, selected_invalidated
 
+    def _accepted_parent_unresolved_depth_cap(self) -> int:
+        return max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "accepted_parent_unresolved_depth_max",
+                    DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
+                )
+            ),
+        )
+
+    def accepted_parent_unresolved_ages_seconds(self) -> list[float]:
+        """Ages of landed transitions whose bookkeeping is still unresolved."""
+        self._ensure_job_cache_state()
+        now = time.monotonic()
+        with self._accepted_block_payout_preview_condition:
+            return [
+                max(0.0, now - transition.landed_monotonic)
+                for transition in self._accepted_block_payout_previews.values()
+                if transition.landed and transition.landed_monotonic is not None
+            ]
+
+    def _accepted_parent_unresolved_depth(self) -> int:
+        self._ensure_job_cache_state()
+        with self._accepted_block_payout_preview_condition:
+            return sum(
+                1
+                for transition in self._accepted_block_payout_previews.values()
+                if transition.landed
+            )
+
     def _await_pending_parent_payout_preview(
         self,
         parent_hash: str,
@@ -8036,12 +8137,38 @@ class PrismCoordinator:
         confirmed read lets children of a pending parent block here instead of
         taking (or caching) balances that omit their new parent.
         """
+        # Startup-replay window (issue #188 fix 4): before the durable outbox
+        # has been enumerated, an unarmed pending parent may exist. A child
+        # built now could pay balances that omit that parent's carry, so job
+        # builds fail closed until enumeration succeeds.
+        if self._block_replay_enumeration_owed():
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "durable block candidate replay has not enumerated pending "
+                "candidates yet"
+            )
         selected = self._accepted_block_payout_transition_for_parent(
             parent_hash,
             parent_height=parent_height,
         )
         if selected is None:
             return None
+        # Fail closed once too many landed transitions remain unresolved:
+        # every published preview a child consumes stacks another prospective
+        # balance chain on unfinished bookkeeping, so the depth of that stack
+        # must stay bounded even while degraded previews keep jobs flowing.
+        # Issuance stops at the cap, not past it: a child issued while
+        # exactly depth_cap transitions are unresolved could land and create
+        # a (cap + 1)th, so the configured maximum would not actually bound
+        # the chain.
+        unresolved_depth = self._accepted_parent_unresolved_depth()
+        depth_cap = self._accepted_parent_unresolved_depth_cap()
+        if unresolved_depth >= depth_cap:
+            self._schedule_tip_refresh_retry()
+            raise TemplateRefreshBlocked(
+                "unresolved accepted-parent depth "
+                f"{unresolved_depth} meets or exceeds cap {depth_cap}"
+            )
         selected_key, selected_invalidated = selected
         if selected_invalidated:
             self._schedule_tip_refresh_retry()
@@ -8089,6 +8216,11 @@ class PrismCoordinator:
                 "accepted parent payout preview was withdrawn"
             )
         if timed_out:
+            with self.lock:
+                self._accepted_parent_preview_wait_timeouts = (
+                    int(getattr(self, "_accepted_parent_preview_wait_timeouts", 0))
+                    + 1
+                )
             self._schedule_tip_refresh_retry()
             raise TemplateRefreshBlocked(
                 "accepted parent payout preview is not ready yet"
@@ -8298,6 +8430,24 @@ class PrismCoordinator:
                         bypass_interval,
                         True,
                     )
+                except ShutdownInProgress:
+                    raise
+                except Exception as exc:
+                    if not immediate_preview:
+                        raise
+                    # Found-block publication exists to decouple child job
+                    # issuance from slow landing bookkeeping (issue #188). A
+                    # window build that dies with the ledger must not abort
+                    # the atomic publication that reopens admission: degrade
+                    # to the cached armed window below, exactly like a busy
+                    # prepare lock. The preview itself never depends on this
+                    # build; it is the verified balance state either way.
+                    print(
+                        "prism coordinator: found-block payout window build "
+                        f"failed; degrading to cached armed window: {exc}",
+                        flush=True,
+                    )
+                    ledger_artifact = None
                 finally:
                     if immediate_preview:
                         self._payout_state_prepare_lock.release()
@@ -11918,6 +12068,7 @@ class PrismCoordinator:
                 )
                 self.initial_job_delivery_latency_count += 1
                 self.last_initial_job_delivery_monotonic = delivered
+                self._record_startup_phase_once("first_job_delivered")
 
     def schedule_initial_job(self, client: ClientState) -> bool:
         """Coalesce and enqueue one first-job request without blocking its handler."""
@@ -12091,6 +12242,7 @@ class PrismCoordinator:
                 self.pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
                 self.last_initial_job_delivery_monotonic = time.monotonic()
+                self._record_startup_phase_once("first_job_delivered")
             elif current is request:
                 self.pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
@@ -13834,7 +13986,9 @@ class PrismCoordinator:
             self._serve_with_listener_stack(listener_stack)
 
     def _serve_with_listener_stack(self, listener_stack: ExitStack) -> None:
+        self._startup_phase_origin_monotonic = time.monotonic()
         lease_heartbeat_thread = self._start_ledger_lease_heartbeat()
+        self._record_startup_phase_once("lease_heartbeat_started")
         # Listeners come up first: connections complete their TCP handshake in
         # the kernel backlog while the rest of startup runs, so a fast restart
         # never bounces miners with connection refused. accept() still starts
@@ -13855,6 +14009,7 @@ class PrismCoordinator:
                     return
         if self.stop_event.is_set():
             return
+        self._record_startup_phase_once("node_rpc_ready")
         self.validate_live_chain_identity()
         self.validate_live_template_and_fee_policy()
         self.prism_payout_policy()
@@ -14032,6 +14187,48 @@ class PrismCoordinator:
             self.shutdown(reason="serve_exit")
             self.drain_non_writer_components(drain_threads)
 
+    def _record_startup_phase_once(self, phase: str) -> None:
+        """Record seconds from serve() start to a named startup phase, once.
+
+        Lease adoption, accepted-stat warm-up, audit binding, replay
+        enumeration, first tip template, and first delivered job are timed
+        separately so a slow phase is attributable instead of folding into
+        one opaque time-to-ready figure (issue #188).
+        """
+        origin = getattr(self, "_startup_phase_origin_monotonic", None)
+        if origin is None:
+            return
+        elapsed = max(0.0, time.monotonic() - float(origin))
+        # Lightweight embedders (signal-handling startup tests) can reach
+        # this before dataclass construction installs self.lock.
+        with getattr(self, "lock", None) or _HOT_PATH_LOCK_INITIALIZATION_LOCK:
+            phases = getattr(self, "_startup_phase_seconds", None)
+            if phases is None:
+                phases = {}
+                self._startup_phase_seconds = phases
+            if phase not in phases:
+                phases[phase] = elapsed
+
+    def startup_phase_seconds(self) -> dict[str, float]:
+        with getattr(self, "lock", None) or _HOT_PATH_LOCK_INITIALIZATION_LOCK:
+            phases = getattr(self, "_startup_phase_seconds", None)
+            return dict(phases) if phases is not None else {}
+
+    def _note_block_replay_enumeration_owed(self) -> None:
+        """Mark that pending durable candidates have not been enumerated yet."""
+        with self.lock:
+            self._block_replay_enumeration_owed_flag = True
+
+    def _clear_block_replay_enumeration_owed(self) -> None:
+        with self.lock:
+            self._block_replay_enumeration_owed_flag = False
+
+    def _block_replay_enumeration_owed(self) -> bool:
+        with self.lock:
+            return bool(
+                getattr(self, "_block_replay_enumeration_owed_flag", False)
+            )
+
     def _run_startup_writer_replay(
         self,
         replay: Callable[[], int],
@@ -14050,6 +14247,12 @@ class PrismCoordinator:
 
     def _run_startup_block_candidate_replay(self) -> bool:
         """Run best-effort pre-accept replay without dying on a slow ledger."""
+        # Until the durable outbox has been enumerated once, this process
+        # cannot know whether a pending accepted candidate exists. Child job
+        # builds fail closed on that uncertainty instead of snapshotting a
+        # payout base that may omit a pending parent's carry (issue #188);
+        # replay_pending_block_candidates clears the flag on success.
+        self._note_block_replay_enumeration_owed()
         try:
             return self._run_startup_writer_replay(
                 self.replay_pending_block_candidates
@@ -14058,8 +14261,9 @@ class PrismCoordinator:
             print(
                 "prism coordinator: startup block candidate replay timed out "
                 "phase=replay-outbox-query "
-                f"timeout={self._block_submitter_db_timeout():g}s; "
-                "continuing startup; block submitter loop will retry",
+                f"timeout={self._block_landing_db_timeout():g}s; "
+                "continuing startup; block submitter loop will retry and "
+                "job builds stay blocked until pending candidates are known",
                 flush=True,
             )
             return True
@@ -14288,11 +14492,23 @@ class PrismCoordinator:
             return True
 
     def start_audit_server(self) -> None:
+        # Mark the nonblocking refresher running before the listener can
+        # dispatch a request: a probe retrying connection-refused queues in
+        # the accept backlog at listen() time, and a handler serving it
+        # before the flag is set would take cached_health_payload's legacy
+        # inline path -- running the minutes-long accepted-share aggregate
+        # on the handler thread and racing the refresher with a duplicate
+        # query instead of returning the documented starting state.
         self.start_health_snapshot_refresher()
+        # Bind before the health snapshot warm-up completes: the cold
+        # accepted-share aggregate can take minutes on a grown ledger, and
+        # for that whole window the listener must answer with an explicit
+        # starting state instead of connection refused (issue #188 fix 4).
         handler_cls = make_audit_handler(self)
         httpd = ThreadingHTTPServer((self.audit_bind or "127.0.0.1", self.audit_port), handler_cls)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
+        self._record_startup_phase_once("audit_listener_bound")
         print(
             f"prism coordinator: audit HTTP listening on {self.audit_bind}:{self.audit_port}",
             flush=True,
@@ -15262,6 +15478,7 @@ class PrismCoordinator:
                         if prior_parent is None or prior_parent[0] != token.tip_hash:
                             self.current_tip_parent = None
                     self.tip_template_snapshot = snapshot
+                    self._record_startup_phase_once("first_tip_template_published")
                     self.tip_refresh_divergence_started_monotonic = None
                     if tip_changed:
                         # Retained collection work, the retained ready bundle,
@@ -23869,78 +24086,136 @@ class PrismCoordinator:
     def replay_pending_block_candidates(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
         self._record_block_submitter_phase("replay-check-memory")
+        # While startup enumeration is still owed, correctness requires the
+        # outbox query even if live candidates are queued: job builds stay
+        # blocked until pending candidates are known, and only a successful
+        # enumeration can unblock them.
+        enumeration_owed = self._block_replay_enumeration_owed()
         with self.lock:
-            if getattr(self, "_retry_block_candidate", None) is not None:
+            if (
+                not enumeration_owed
+                and getattr(self, "_retry_block_candidate", None) is not None
+            ):
                 return 0
         # A live wakeup is already the lowest-latency route to qbitd. Never
         # park it behind the outbox query that exists only to recover missing
         # wakeups after queue pressure or restart.
         queue_obj = getattr(self, "block_candidate_queue", None)
-        if queue_obj is not None and not queue_obj.empty():
+        if not enumeration_owed and queue_obj is not None and not queue_obj.empty():
             return 0
         self._ensure_block_replay_state()
-        if not self._block_replay_candidate_queue.empty():
+        if not enumeration_owed and not self._block_replay_candidate_queue.empty():
             return 0
+        # The startup enumeration gates job issuance, so it runs with the
+        # landing-class budget instead of the poll budget (issue #188 fix 4);
+        # the periodic steady-state poll keeps the tight budget. The metrics
+        # class follows the budget so a slow or timed-out startup enumeration
+        # surfaces on the landing series the alerts watch.
+        replay_query_timeout = (
+            self._block_landing_db_timeout() if enumeration_owed else None
+        )
+        replay_query_call_class = "landing" if enumeration_owed else "fast"
         pending_rows = getattr(self.ledger, "pending_block_candidate_rows", None)
         if callable(pending_rows):
-            durable_rows = self._run_block_submitter_ledger_call(
-                ("replay-outbox-query",),
-                "replay-outbox-query",
-                # Restore a batch with no per-row database work. In-flight
-                # dedupe lets later rows reach qbitd even while the oldest
-                # candidate is still accounting.
-                lambda: pending_rows(limit=MAX_PENDING_BLOCK_CANDIDATES),
-            )
+
+            def fetch_durable_rows(limit: int) -> list[Any]:
+                return self._run_block_submitter_ledger_call(
+                    ("replay-outbox-query", limit),
+                    "replay-outbox-query",
+                    # Restore a batch with no per-row database work. In-flight
+                    # dedupe lets later rows reach qbitd even while the oldest
+                    # candidate is still accounting.
+                    lambda: pending_rows(limit=limit),
+                    timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
+                )
+
         else:
             pending = getattr(self.ledger, "pending_block_candidates", None)
             if not callable(pending):
+                self._clear_block_replay_enumeration_owed()
                 return 0
-            pending_intents = self._run_block_submitter_ledger_call(
-                ("replay-outbox-query",),
-                "replay-outbox-query",
-                lambda: pending(limit=MAX_PENDING_BLOCK_CANDIDATES),
-            )
-            durable_rows = [
-                {
-                    "block_hash": (
-                        intent.get("block_hash_hex", "")
-                        if isinstance(intent, dict)
-                        else ""
-                    ),
-                    "candidate": intent,
-                }
-                for intent in pending_intents
-            ]
-        self._record_block_submitter_phase("replay-restore")
+
+            def fetch_durable_rows(limit: int) -> list[Any]:
+                pending_intents = self._run_block_submitter_ledger_call(
+                    ("replay-outbox-query", limit),
+                    "replay-outbox-query",
+                    lambda: pending(limit=limit),
+                    timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
+                )
+                return [
+                    {
+                        "block_hash": (
+                            intent.get("block_hash_hex", "")
+                            if isinstance(intent, dict)
+                            else ""
+                        ),
+                        "candidate": intent,
+                    }
+                    for intent in pending_intents
+                ]
+
         queued = 0
-        for durable_row in durable_rows:
-            durable_block_hash = ""
-            try:
-                if not isinstance(durable_row, dict):
-                    raise ValueError("durable block candidate row is not an object")
-                durable_block_hash = str(durable_row["block_hash"]).lower()
-                intent = durable_row["candidate"]
-                if not isinstance(intent, dict):
-                    raise ValueError("durable block candidate intent is not an object")
-                intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
-                if not durable_block_hash or intent_block_hash != durable_block_hash:
-                    raise ValueError("durable block candidate row key does not match intent")
-                candidate = dataclass_replace(
-                    self.block_candidate_from_intent(intent),
-                    durable_replay=True,
+        enumeration_truncated = False
+        enumeration_limit = MAX_PENDING_BLOCK_CANDIDATES
+        while True:
+            durable_rows = fetch_durable_rows(enumeration_limit)
+            self._record_block_submitter_phase("replay-restore")
+            for durable_row in durable_rows:
+                durable_block_hash = ""
+                try:
+                    if not isinstance(durable_row, dict):
+                        raise ValueError("durable block candidate row is not an object")
+                    durable_block_hash = str(durable_row["block_hash"]).lower()
+                    intent = durable_row["candidate"]
+                    if not isinstance(intent, dict):
+                        raise ValueError("durable block candidate intent is not an object")
+                    intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
+                    if not durable_block_hash or intent_block_hash != durable_block_hash:
+                        raise ValueError("durable block candidate row key does not match intent")
+                    candidate = dataclass_replace(
+                        self.block_candidate_from_intent(intent),
+                        durable_replay=True,
+                    )
+                    # Durable acceptance-state reads stay in accounting. The
+                    # separate replay queue keeps these recovered rows behind any
+                    # live solve while still exposing the whole batch to qbitd.
+                    if self._enqueue_replayed_block_candidate(candidate):
+                        queued += 1
+                except Exception:
+                    print("prism coordinator: invalid durable block candidate intent", flush=True)
+                    traceback.print_exc()
+                    self._queue_invalid_block_candidate_for_quarantine(
+                        durable_block_hash,
+                        "invalid durable candidate intent",
+                    )
+            if len(durable_rows) < enumeration_limit or not enumeration_owed:
+                break
+            # A full batch may hide more pending rows, and a hidden row could
+            # be the active parent whose carry a child job must not omit.
+            # Re-query with a doubled window until the result is provably
+            # untruncated; in-flight dedupe makes re-seen rows free.
+            if enumeration_limit >= MAX_BLOCK_REPLAY_ENUMERATION_ROWS:
+                enumeration_truncated = True
+                print(
+                    "prism coordinator: pending block candidate enumeration "
+                    f"still truncated at {enumeration_limit} rows; job builds "
+                    "stay blocked until a complete enumeration succeeds",
+                    flush=True,
                 )
-                # Durable acceptance-state reads stay in accounting. The
-                # separate replay queue keeps these recovered rows behind any
-                # live solve while still exposing the whole batch to qbitd.
-                if self._enqueue_replayed_block_candidate(candidate):
-                    queued += 1
-            except Exception:
-                print("prism coordinator: invalid durable block candidate intent", flush=True)
-                traceback.print_exc()
-                self._queue_invalid_block_candidate_for_quarantine(
-                    durable_block_hash,
-                    "invalid durable candidate intent",
-                )
+                break
+            enumeration_limit = min(
+                enumeration_limit * 2,
+                MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
+            )
+        if not enumeration_truncated:
+            # Every pending candidate is now known and its payout barrier armed
+            # (or quarantined), so child job builds may proceed. A truncated
+            # pass instead leaves enumeration owed: the queued batch drains,
+            # and the submitter loop re-enumerates the remainder.
+            self._clear_block_replay_enumeration_owed()
+            self._record_startup_phase_once("block_replay_enumerated")
         if queued:
             print(
                 f"prism coordinator: replayed {queued} pending block candidate(s)",
@@ -23979,6 +24254,96 @@ class PrismCoordinator:
                 )
             ),
         )
+
+    def _block_landing_db_timeout(self, block_hash: str | None = None) -> float:
+        """Landing-class deadline, escalated after observed landing timeouts.
+
+        The first attempt already receives the full landing budget; a known
+        landing-class operation never begins at the one-second poll budget.
+        Escalation doubles per timed-out landing attempt for the same block
+        hash up to the reviewed cap.
+        """
+        base = max(
+            0.001,
+            float(
+                getattr(
+                    self,
+                    "block_landing_db_timeout_seconds",
+                    DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,
+                )
+            ),
+        )
+        cap = max(
+            base,
+            float(
+                getattr(
+                    self,
+                    "block_landing_db_timeout_max_seconds",
+                    DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
+                )
+            ),
+        )
+        timeouts = 0
+        if block_hash is not None:
+            with self.lock:
+                counts = getattr(self, "_block_landing_timeout_counts", None)
+                if counts is not None:
+                    timeouts = int(counts.get(block_hash, 0))
+        return min(cap, base * (2.0 ** min(timeouts, 8)))
+
+    def _note_block_landing_timeout(self, block_hash: str | None) -> None:
+        if block_hash is None:
+            return
+        with self.lock:
+            counts = getattr(self, "_block_landing_timeout_counts", None)
+            if counts is None:
+                counts = {}
+                self._block_landing_timeout_counts = counts
+            counts[block_hash] = int(counts.get(block_hash, 0)) + 1
+
+    def _ensure_block_ledger_call_metrics(self) -> None:
+        if not hasattr(self, "_block_ledger_call_metrics_lock"):
+            self._block_ledger_call_metrics_lock = threading.Lock()
+        if not hasattr(self, "_block_ledger_call_metrics"):
+            self._block_ledger_call_metrics = {}
+
+    def _record_block_ledger_call(
+        self,
+        *,
+        call_class: str,
+        budget_seconds: float,
+        duration_seconds: float,
+        timed_out: bool,
+    ) -> None:
+        """Track per-call-class submitter ledger latency and timeout counts."""
+        self._ensure_block_ledger_call_metrics()
+        with self._block_ledger_call_metrics_lock:
+            stats = self._block_ledger_call_metrics.setdefault(
+                call_class,
+                {
+                    "calls_total": 0,
+                    "timeouts_total": 0,
+                    "last_budget_seconds": 0.0,
+                    "last_duration_seconds": 0.0,
+                    "max_duration_seconds": 0.0,
+                },
+            )
+            stats["calls_total"] = int(stats["calls_total"]) + 1
+            if timed_out:
+                stats["timeouts_total"] = int(stats["timeouts_total"]) + 1
+            stats["last_budget_seconds"] = float(budget_seconds)
+            stats["last_duration_seconds"] = float(duration_seconds)
+            stats["max_duration_seconds"] = max(
+                float(stats["max_duration_seconds"]), float(duration_seconds)
+            )
+
+    def block_ledger_call_class_metrics(self) -> dict[str, dict[str, float | int]]:
+        self._ensure_block_ledger_call_metrics()
+        with self._block_ledger_call_metrics_lock:
+            return {
+                call_class: dict(stats)
+                for call_class, stats in self._block_ledger_call_metrics.items()
+            }
 
     def _block_submitter_stuck_call_exit_timeout(self) -> float:
         return max(
@@ -24037,13 +24402,20 @@ class PrismCoordinator:
         )
 
     @contextmanager
-    def _block_submitter_ledger_timeout_scope(self) -> Iterator[None]:
+    def _block_submitter_ledger_timeout_scope(
+        self,
+        timeout_seconds: float | None = None,
+    ) -> Iterator[None]:
         """Apply the submitter's PostgreSQL deadline when the ledger supports it."""
         operation_timeout = getattr(self.ledger, "operation_timeout", None)
         if not callable(operation_timeout):
             yield
             return
-        with operation_timeout(self._block_submitter_db_timeout()):
+        with operation_timeout(
+            self._block_submitter_db_timeout()
+            if timeout_seconds is None
+            else timeout_seconds
+        ):
             yield
 
     @contextmanager
@@ -24059,11 +24431,59 @@ class PrismCoordinator:
         with self._block_submitter_ledger_timeout_scope():
             yield
 
+    @contextmanager
+    def _block_landing_ledger_statement_timeout_scope(
+        self,
+        block_hash: str | None = None,
+    ) -> Iterator[None]:
+        """Give each landing-class ledger step the landing budget.
+
+        The accounting tail that lands an accepted block (persist, prior
+        balances, confirm, and the prepared-state rejection of a terminal
+        candidate) runs under this scope instead of the poll-class one.
+        Timed-out steps are recorded so the next attempt for the same block
+        hash escalates its budget; the ledger backends already guarantee
+        server-side cancellation completes and the pooled session is rolled
+        back or replaced before the paced retry re-enters here.
+
+        The guarded body also runs node RPCs and audit/build work. Only a
+        ledger-originated deadline may escalate the next landing budget or
+        fire the landing-timeout alert: a node RPC timeout is not a database
+        cancellation, and escalating on it would page and widen PostgreSQL
+        deadlines for a database that never missed one.
+        """
+        timeout_seconds = self._block_landing_db_timeout(block_hash)
+        scope = getattr(self.ledger, "statement_timeout", None)
+        if not callable(scope):
+            scope = getattr(self.ledger, "operation_timeout", None)
+        started = time.monotonic()
+        timed_out = False
+        try:
+            if callable(scope):
+                with scope(timeout_seconds):
+                    yield
+            else:
+                yield
+        except (LedgerOperationTimeout, BlockSubmitterDatabaseTimeout):
+            timed_out = True
+            self._note_block_landing_timeout(block_hash)
+            raise
+        finally:
+            self._record_block_ledger_call(
+                call_class="landing",
+                budget_seconds=timeout_seconds,
+                duration_seconds=max(0.0, time.monotonic() - started),
+                timed_out=timed_out,
+            )
+
     def _run_block_submitter_ledger_call(
         self,
         key: tuple[object, ...],
         phase: str,
         operation: Callable[[], Any],
+        *,
+        timeout_seconds: float | None = None,
+        call_class: str = "fast",
     ) -> Any:
         """Run one direct outbox call without letting its driver wedge us.
 
@@ -24072,7 +24492,16 @@ class PrismCoordinator:
         unbounded pile of threads when a fake/misbehaving driver ignores the
         real PostgreSQL statement deadline. Candidate outbox mutations are
         idempotent, so a late completion converges with replay.
+
+        call_class labels the per-class latency/timeout metrics and must
+        match the budget in use: a call given the landing deadline records
+        as "landing" so the landing-timeout alert covers it, instead of
+        inflating the fast-call budget gauge.
         """
+        if timeout_seconds is None:
+            timeout_seconds = self._block_submitter_db_timeout()
+        else:
+            timeout_seconds = max(0.001, float(timeout_seconds))
         self._ensure_block_submitter_ledger_call_state()
         with self._block_submitter_ledger_calls_lock:
             call = self._block_submitter_ledger_calls.get(key)
@@ -24100,7 +24529,9 @@ class PrismCoordinator:
 
                 def run() -> None:
                     try:
-                        with self._block_submitter_ledger_timeout_scope():
+                        with self._block_submitter_ledger_timeout_scope(
+                            timeout_seconds
+                        ):
                             call.result = operation()
                     except BaseException as exc:
                         call.error = exc
@@ -24114,7 +24545,6 @@ class PrismCoordinator:
                     daemon=True,
                 ).start()
 
-        timeout_seconds = self._block_submitter_db_timeout()
         deadline = time.monotonic() + timeout_seconds
         while not call.done.is_set():
             self._record_block_submitter_wait(phase)
@@ -24130,6 +24560,12 @@ class PrismCoordinator:
                     f"phase={phase} timeout={timeout_seconds:g}s",
                     flush=True,
                 )
+                self._record_block_ledger_call(
+                    call_class=call_class,
+                    budget_seconds=timeout_seconds,
+                    duration_seconds=timeout_seconds,
+                    timed_out=True,
+                )
                 raise BlockSubmitterDatabaseTimeout(
                     f"{phase} exceeded {timeout_seconds:g}s"
                 )
@@ -24140,6 +24576,17 @@ class PrismCoordinator:
                 )
             )
         self._record_block_submitter_wait(f"{phase}:complete")
+        # A server-side deadline normally completes the worker with a ledger
+        # timeout error before the coordinator-side wait expires. Every
+        # operation behind this wrapper is a database call, so a completed
+        # call carrying a timeout error is still a timed-out call for the
+        # per-class alert series.
+        self._record_block_ledger_call(
+            call_class=call_class,
+            budget_seconds=timeout_seconds,
+            duration_seconds=max(0.0, time.monotonic() - call.started_monotonic),
+            timed_out=isinstance(call.error, TimeoutError),
+        )
         with self._block_submitter_ledger_calls_lock:
             if self._block_submitter_ledger_calls.get(key) is call:
                 self._block_submitter_ledger_calls.pop(key, None)
@@ -24504,7 +24951,7 @@ class PrismCoordinator:
                     )
                 node_submission = self._node_submission_for_candidate_or_retained(candidate)
                 self._mark_block_candidate_attempted(block_hash)
-                with self._block_submitter_ledger_statement_timeout_scope():
+                with self._block_landing_ledger_statement_timeout_scope(block_hash):
                     production_submit = (
                         getattr(self.submit_block_candidate, "__func__", None)
                         is PrismCoordinator.submit_block_candidate
@@ -24535,7 +24982,9 @@ class PrismCoordinator:
                     self._record_block_submitter_phase(
                         "reject-prepared-block"
                     )
-                    with self._block_submitter_ledger_statement_timeout_scope():
+                    with self._block_landing_ledger_statement_timeout_scope(
+                        block_hash
+                    ):
                         self._reject_terminal_prepared_block_candidate(candidate)
                     self._record_block_submitter_phase(
                         "reject-prepared-block:complete"
@@ -25419,7 +25868,7 @@ class PrismCoordinator:
         error = "candidate became stale or submission failed"
         try:
             self._record_block_submitter_phase("accounting")
-            with self._block_submitter_ledger_statement_timeout_scope():
+            with self._block_landing_ledger_statement_timeout_scope(block_hash):
                 production_submit = (
                     getattr(self.submit_block_candidate, "__func__", None)
                     is PrismCoordinator.submit_block_candidate
@@ -25469,7 +25918,7 @@ class PrismCoordinator:
         if not accepted:
             try:
                 self._record_block_submitter_phase("reject-prepared-block")
-                with self._block_submitter_ledger_statement_timeout_scope():
+                with self._block_landing_ledger_statement_timeout_scope(block_hash):
                     self._reject_terminal_prepared_block_candidate(candidate)
                 self._record_block_submitter_phase(
                     "reject-prepared-block:complete"
@@ -25912,6 +26361,9 @@ class PrismCoordinator:
             delays = getattr(self, "block_candidate_retry_delays", None)
             if delays is not None:
                 delays.pop(block_hash, None)
+            landing_timeouts = getattr(self, "_block_landing_timeout_counts", None)
+            if landing_timeouts is not None:
+                landing_timeouts.pop(block_hash, None)
             not_before = getattr(
                 self,
                 "_block_candidate_retry_not_before",
@@ -28682,6 +29134,7 @@ class PrismCoordinator:
         with self._job_cache_lock:
             self._health_snapshot = payload
             self._health_snapshot_monotonic = time.monotonic()
+        self._record_startup_phase_once("health_snapshot_warm")
         return payload
 
     def cached_health_payload(self) -> tuple[int, dict[str, object]]:
@@ -28711,7 +29164,8 @@ class PrismCoordinator:
                 {
                     "ok": False,
                     "schema": "qbit.prism.audit-health.v1",
-                    "error": "health snapshot is not available yet",
+                    "state": "starting",
+                    "error": "health snapshot warm-up has not completed yet",
                 },
                 self.progress_health_snapshot(),
             )
@@ -28762,11 +29216,11 @@ class PrismCoordinator:
             if self._health_refresh_loop_running:
                 return
             self._health_refresh_loop_running = True
-        try:
-            self.refresh_health_snapshot()
-        except Exception:
-            print("prism coordinator: initial health snapshot refresh failed", flush=True)
-            traceback.print_exc()
+        # The first refresh seeds the exact accepted-share aggregate, which
+        # can take minutes on a grown ledger. It runs inside the background
+        # loop so the audit listener bind path never blocks on it; until it
+        # completes, cached_health_payload reports an explicit starting
+        # state (issue #188 fix 4).
         threading.Thread(target=self.health_snapshot_loop, daemon=True).start()
 
     def latest_evidence_payload(self) -> dict[str, object] | None:
@@ -28915,6 +29369,89 @@ class PrismCoordinator:
             f"qbit_prism_block_submitter_retry_backoff_seconds {backoff_delay:.6f}",
         ]
 
+    def landing_observability_metrics_lines(self) -> list[str]:
+        """Landing-path metrics for issue #188's pre-deadline alerting.
+
+        The prior-balances read crossed the one-second submitter deadline
+        silently over several weeks; these series make that growth, landing
+        timeouts, and unresolved accepted-parent age visible before they
+        become an outage.
+        """
+        lines: list[str] = [
+            "# HELP qbit_prism_block_ledger_calls_total Submitter ledger calls by deadline class.",
+            "# TYPE qbit_prism_block_ledger_calls_total counter",
+            "# HELP qbit_prism_block_ledger_call_timeouts_total Submitter ledger deadline expiries by deadline class.",
+            "# TYPE qbit_prism_block_ledger_call_timeouts_total counter",
+            "# HELP qbit_prism_block_ledger_call_budget_seconds Most recent statement budget applied per deadline class (escalates for retried landings).",
+            "# TYPE qbit_prism_block_ledger_call_budget_seconds gauge",
+            "# HELP qbit_prism_block_ledger_call_last_duration_seconds Duration of the most recent call per deadline class.",
+            "# TYPE qbit_prism_block_ledger_call_last_duration_seconds gauge",
+            "# HELP qbit_prism_block_ledger_call_max_duration_seconds Longest observed call per deadline class since process start.",
+            "# TYPE qbit_prism_block_ledger_call_max_duration_seconds gauge",
+        ]
+        for call_class, stats in sorted(
+            self.block_ledger_call_class_metrics().items()
+        ):
+            label = self.prometheus_label_value(call_class)
+            lines.extend(
+                [
+                    f'qbit_prism_block_ledger_calls_total{{call_class="{label}"}} {int(stats["calls_total"])}',
+                    f'qbit_prism_block_ledger_call_timeouts_total{{call_class="{label}"}} {int(stats["timeouts_total"])}',
+                    f'qbit_prism_block_ledger_call_budget_seconds{{call_class="{label}"}} {float(stats["last_budget_seconds"]):.6f}',
+                    f'qbit_prism_block_ledger_call_last_duration_seconds{{call_class="{label}"}} {float(stats["last_duration_seconds"]):.6f}',
+                    f'qbit_prism_block_ledger_call_max_duration_seconds{{call_class="{label}"}} {float(stats["max_duration_seconds"]):.6f}',
+                ]
+            )
+        unresolved_ages = self.accepted_parent_unresolved_ages_seconds()
+        oldest_unresolved = max(unresolved_ages) if unresolved_ages else -1.0
+        with self.lock:
+            preview_wait_timeouts = int(
+                getattr(self, "_accepted_parent_preview_wait_timeouts", 0)
+            )
+        lines.extend(
+            [
+                "# HELP qbit_prism_accepted_parent_unresolved_transitions Landed accepted-block transitions whose durable bookkeeping is unresolved.",
+                "# TYPE qbit_prism_accepted_parent_unresolved_transitions gauge",
+                f"qbit_prism_accepted_parent_unresolved_transitions {len(unresolved_ages)}",
+                "# HELP qbit_prism_accepted_parent_unresolved_oldest_seconds Age of the oldest unresolved accepted-parent transition, or -1 when none.",
+                "# TYPE qbit_prism_accepted_parent_unresolved_oldest_seconds gauge",
+                f"qbit_prism_accepted_parent_unresolved_oldest_seconds {oldest_unresolved:.6f}",
+                "# HELP qbit_prism_accepted_parent_preview_wait_timeouts_total Child job builds that timed out waiting for an accepted-parent payout preview.",
+                "# TYPE qbit_prism_accepted_parent_preview_wait_timeouts_total counter",
+                f"qbit_prism_accepted_parent_preview_wait_timeouts_total {preview_wait_timeouts}",
+            ]
+        )
+        prior_stats_fn = getattr(self.ledger, "prior_balances_read_stats", None)
+        if callable(prior_stats_fn):
+            prior_stats = prior_stats_fn()
+            lines.extend(
+                [
+                    "# HELP qbit_prism_prior_balances_reads_total Prior-balances reads served by the ledger.",
+                    "# TYPE qbit_prism_prior_balances_reads_total counter",
+                    f"qbit_prism_prior_balances_reads_total {int(prior_stats['reads_total'])}",
+                    "# HELP qbit_prism_prior_balances_read_last_seconds Duration of the most recent prior-balances read.",
+                    "# TYPE qbit_prism_prior_balances_read_last_seconds gauge",
+                    f"qbit_prism_prior_balances_read_last_seconds {float(prior_stats['last_seconds']):.6f}",
+                    "# HELP qbit_prism_prior_balances_read_max_seconds Longest prior-balances read since process start.",
+                    "# TYPE qbit_prism_prior_balances_read_max_seconds gauge",
+                    f"qbit_prism_prior_balances_read_max_seconds {float(prior_stats['max_seconds']):.6f}",
+                ]
+            )
+        startup_phases = self.startup_phase_seconds()
+        if startup_phases:
+            lines.extend(
+                [
+                    "# HELP qbit_prism_startup_phase_seconds Seconds from serve() start to each startup phase, recorded once.",
+                    "# TYPE qbit_prism_startup_phase_seconds gauge",
+                ]
+            )
+            for phase, seconds in sorted(startup_phases.items()):
+                label = self.prometheus_label_value(phase)
+                lines.append(
+                    f'qbit_prism_startup_phase_seconds{{phase="{label}"}} {float(seconds):.6f}'
+                )
+        return lines
+
     def _accepted_stats_reconcile_metric_lines(self) -> list[str]:
         """Surface reconcile liveness now that failures no longer raise.
 
@@ -29061,6 +29598,7 @@ class PrismCoordinator:
             "# TYPE qbit_prism_accepted_shares_total counter",
             f"qbit_prism_accepted_shares_total {accepted_share_count}",
             *self._accepted_stats_reconcile_metric_lines(),
+            *self.landing_observability_metrics_lines(),
             "# HELP qbit_prism_submitted_shares_total Stratum share submissions seen by the PRISM coordinator.",
             "# TYPE qbit_prism_submitted_shares_total counter",
             f"qbit_prism_submitted_shares_total {submitted_share_count}",
