@@ -23,7 +23,7 @@ from lab.prism.prism_coordinator import (
     _JobBuildFlight,
     _JobBuildRequest,
 )
-from tests.test_prism_coordinator_job_cache import (
+from tests.prism_coordinator_test_support import (
     coordinator,
     install_fake_bundle_builder,
     synthetic_manifest_coinbase_hex,

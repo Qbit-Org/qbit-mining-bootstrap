@@ -15,7 +15,7 @@ from lab.prism.prism_coordinator import (
     WorkerIdentity,
     qbit_template_fingerprint,
 )
-from tests.test_prism_coordinator_job_cache import (
+from tests.prism_coordinator_test_support import (
     base_template,
     client,
     coordinator,

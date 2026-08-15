@@ -36,13 +36,13 @@ from lab.prism.prism_coordinator import (
     canonical_json_sha256,
 )
 from lab.prism.prism_coordinator import ClientState, PrismCoordinator
-from tests.test_prism_coordinator_job_cache import (
+from tests.prism_coordinator_test_support import (
     base_template,
     client,
     coordinator,
     install_fake_bundle_builder,
 )
-from tests.test_prism_coordinator_vardiff import fake_audit_bundle_popen
+from tests.prism_vardiff_test_support import fake_audit_bundle_popen
 from tests.test_prism_initial_job_delivery import wait_until
 
 

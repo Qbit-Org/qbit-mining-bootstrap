@@ -22,13 +22,13 @@ from lab.prism.prism_coordinator import (
     _TipRefreshFanoutSuperseded,
     _TipRefreshTrustBlocked,
 )
-from tests.test_prism_coordinator_job_cache import (
+from tests.prism_coordinator_test_support import (
     base_template,
     client,
     coordinator,
     install_fake_bundle_builder,
 )
-from tests.test_prism_coordinator_vardiff import RecordingLedger
+from tests.prism_vardiff_test_support import RecordingLedger
 
 
 TIP_A = "11" * 32
