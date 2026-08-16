@@ -33,8 +33,8 @@ from lab.prism.prism_coordinator import (
     StratumError,
     TemplateRefreshBlocked,
     WorkerIdentity,
-    default_prism_coinbase_tag_hex,
 )
+from lab.prism.coordinator_config import default_prism_coinbase_tag_hex
 from lab.prism.share_ledger import AcceptedShareRecord, PendingShare
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"

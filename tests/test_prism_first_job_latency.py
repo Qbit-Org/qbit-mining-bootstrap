@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import re
 import threading
 import time
 import unittest
@@ -32,8 +31,10 @@ from lab.prism.prism_coordinator import (
     PayoutLedgerArtifact,
     _compact_share_payload,
     _JobBuildCancellation,
-    _PayoutDeliveryAdmission,
     canonical_json_sha256,
+)
+from lab.prism.payout_state import (
+    PayoutDeliveryAdmission as _PayoutDeliveryAdmission,
 )
 from lab.prism.prism_coordinator import ClientState, PrismCoordinator
 from tests.prism_coordinator_test_support import (

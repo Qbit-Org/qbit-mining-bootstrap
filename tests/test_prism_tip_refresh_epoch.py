@@ -18,9 +18,11 @@ from lab.prism.prism_coordinator import (
     PendingInitialJob,
     PrismCoordinator,
     TipRefreshValidationToken,
-    _PayoutStatePublicationBlocked,
     _TipRefreshFanoutSuperseded,
     _TipRefreshTrustBlocked,
+)
+from lab.prism.payout_state import (
+    PayoutStatePublicationBlocked as _PayoutStatePublicationBlocked,
 )
 from tests.prism_coordinator_test_support import (
     base_template,

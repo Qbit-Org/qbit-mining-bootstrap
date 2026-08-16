@@ -10,8 +10,235 @@ from unittest.mock import patch
 from lab.prism.background_services import (
     BackgroundServiceRegistry,
     BackgroundServiceSpec,
+    WatchdogPorts,
+    WatchdogService,
 )
 from lab.prism.prism_coordinator import PrismCoordinator
+
+
+def make_watchdog_ports(**overrides: object) -> WatchdogPorts:
+    """Inert watchdog ports; individual tests override what they exercise."""
+    ports: dict[str, object] = {
+        "wait_for_stop": lambda _timeout: True,
+        "interval_seconds": lambda: 1.0,
+        "fatal_exit_requested": lambda: False,
+        "publication_state": lambda _now: (None, 0.0, 1.0, 1.0),
+        "hard_exit": lambda _reason: None,
+        "liveness_enabled": lambda: True,
+        "overdue_heartbeats": lambda _now: [],
+        "liveness_timeout_seconds": lambda: 60.0,
+        "coordination_budget_seconds": lambda: 900.0,
+        "publication_budget_seconds": lambda: 30.0,
+        "ensure_job_cache_state": lambda: None,
+        "publication_failure_expired": lambda _now: False,
+        "publication_divergence_since": lambda: None,
+        "lease_release_timeout_seconds": lambda: 0.05,
+        "shutdown_controller": lambda: None,
+        "request_shutdown": lambda: None,
+        "release_ledger_lease": lambda _deadline: True,
+        "lease_failure_reason": lambda: None,
+        "exit_process": lambda _code: None,
+        "log": lambda _message: None,
+    }
+    ports.update(overrides)
+    return WatchdogPorts(**ports)  # type: ignore[arg-type]
+
+
+class WatchdogServiceTests(unittest.TestCase):
+    def test_publication_failure_exits_after_one_bounded_wait(self) -> None:
+        events: list[object] = []
+
+        def hard_exit(reason: str) -> None:
+            events.append(("hard_exit", reason))
+            raise SystemExit(1)
+
+        service = WatchdogService(
+            make_watchdog_ports(
+                wait_for_stop=lambda timeout: events.append(("wait", timeout))
+                or False,
+                interval_seconds=lambda: 2.0,
+                publication_state=lambda _now: ("publication", 0.0, 900.0, 30.0),
+                hard_exit=hard_exit,
+            )
+        )
+
+        with self.assertRaises(SystemExit):
+            service.run()
+
+        self.assertEqual(events[0], ("wait", 2.0))
+        self.assertEqual(events[1], ("hard_exit", "publication"))
+        self.assertIn(
+            "publication-progress watchdog firing",
+            str(service.failure_detail),
+        )
+
+    def test_coordination_classification_precedes_publication(self) -> None:
+        events: list[object] = []
+
+        def hard_exit(reason: str) -> None:
+            events.append(("hard_exit", reason))
+            raise SystemExit(1)
+
+        service = WatchdogService(
+            make_watchdog_ports(
+                wait_for_stop=lambda _timeout: False,
+                publication_state=lambda _now: (
+                    "coordination",
+                    12.5,
+                    10.0,
+                    30.0,
+                ),
+                hard_exit=hard_exit,
+            )
+        )
+
+        with self.assertRaises(SystemExit):
+            service.run()
+
+        self.assertEqual(events, [("hard_exit", "coordination")])
+        self.assertIn("coordination-blocked", str(service.failure_detail))
+        self.assertIn("streak_age=12.500s", str(service.failure_detail))
+
+    def test_requested_stop_does_not_sample_or_exit(self) -> None:
+        service = WatchdogService(
+            make_watchdog_ports(
+                wait_for_stop=lambda _timeout: True,
+                fatal_exit_requested=lambda: False,
+                publication_state=lambda _now: self.fail(
+                    "stopped watchdog sampled publication state"
+                ),
+                hard_exit=lambda _reason: self.fail("stopped watchdog exited"),
+                exit_process=lambda _code: self.fail("stopped watchdog exited"),
+                log=lambda _message: self.fail("stopped watchdog logged"),
+            )
+        )
+
+        service.run()
+
+    def test_fatal_stop_request_exits_nonzero(self) -> None:
+        events: list[object] = []
+        service = WatchdogService(
+            make_watchdog_ports(
+                wait_for_stop=lambda _timeout: True,
+                fatal_exit_requested=lambda: True,
+                exit_process=lambda code: events.append(("exit", code)),
+                log=lambda message: events.append(("log", message)),
+            )
+        )
+
+        service.run()
+
+        self.assertEqual(events[0][0], "log")
+        self.assertIn("fatal block-work restart requested", str(events[0][1]))
+        self.assertEqual(events[1], ("exit", 1))
+
+    def test_claimed_coordination_exit_is_terminal(self) -> None:
+        service = WatchdogService(
+            make_watchdog_ports(coordination_budget_seconds=lambda: 5.0)
+        )
+        service.record_coordination_blocked_refresh(100.0)
+        state = service.publication_watchdog_state(106.0)
+        self.assertEqual(state[0], "coordination")
+        # A refresh completing after the claim cannot cancel the exit.
+        service.clear_coordination_blocked_streak()
+        self.assertGreater(
+            service.coordination_blocked_streak_age_seconds(107.0),
+            0.0,
+        )
+
+    def test_publication_recheck_uses_divergence_snapshot(self) -> None:
+        # The cheap preflight fired, but the locked divergence recheck shows
+        # no divergence old enough: no exit may be claimed.
+        service = WatchdogService(
+            make_watchdog_ports(
+                publication_failure_expired=lambda _now: True,
+                publication_divergence_since=lambda: None,
+            )
+        )
+        state = service.publication_watchdog_state(100.0)
+        self.assertIsNone(state[0])
+        divergent = WatchdogService(
+            make_watchdog_ports(
+                publication_budget_seconds=lambda: 30.0,
+                publication_failure_expired=lambda _now: True,
+                publication_divergence_since=lambda: 50.0,
+            )
+        )
+        self.assertEqual(divergent.publication_watchdog_state(100.0)[0], "publication")
+
+    def test_hard_exit_bounds_release_and_exits_unconditionally(self) -> None:
+        events: list[object] = []
+        controller = SimpleNamespace(
+            begin_shutdown=lambda label: events.append(("begin", label)) or True,
+            wait_for_writer_quiescence=lambda budget: (True, 0.0, []),
+            wait_for_lease_handling=lambda: True,
+        )
+        service = WatchdogService(
+            make_watchdog_ports(
+                shutdown_controller=lambda: controller,
+                request_shutdown=lambda: events.append(("request", None)),
+                release_ledger_lease=lambda deadline: events.append(
+                    ("release", True)
+                )
+                or True,
+                exit_process=lambda code: events.append(("exit", code)),
+                log=lambda message: events.append(("log", message)),
+                lease_release_timeout_seconds=lambda: 0.2,
+            )
+        )
+
+        service.hard_exit("liveness")
+
+        self.assertEqual(events[0], ("request", None))
+        self.assertEqual(events[1], ("begin", "watchdog_liveness"))
+        self.assertEqual(events[2], ("release", True))
+        self.assertEqual(events[3][0], "log")
+        self.assertIn("lease_handled=True", str(events[3][1]))
+        self.assertEqual(events[-1], ("exit", 1))
+
+    def test_hard_exit_withholds_release_when_quiescence_fails(self) -> None:
+        events: list[object] = []
+        controller = SimpleNamespace(
+            begin_shutdown=lambda _label: True,
+            wait_for_writer_quiescence=lambda _budget: (False, 0.05, ["writer"]),
+        )
+        service = WatchdogService(
+            make_watchdog_ports(
+                shutdown_controller=lambda: controller,
+                release_ledger_lease=lambda _deadline: events.append(
+                    ("release", None)
+                )
+                or True,
+                exit_process=lambda code: events.append(("exit", code)),
+                log=lambda message: events.append(("log", message)),
+            )
+        )
+
+        service.hard_exit("publication")
+
+        self.assertNotIn(("release", None), events)
+        self.assertIn("lease_handled=False", str(events[0][1]))
+        self.assertEqual(events[-1], ("exit", 1))
+
+    def test_lease_heartbeat_diagnostic_uses_lease_failure_reason(self) -> None:
+        events: list[object] = []
+        controller = SimpleNamespace(
+            begin_shutdown=lambda _label: True,
+            wait_for_writer_quiescence=lambda _budget: (True, 0.0, []),
+        )
+        service = WatchdogService(
+            make_watchdog_ports(
+                shutdown_controller=lambda: controller,
+                lease_failure_reason=lambda: "lease heartbeat stopped",
+                exit_process=lambda code: events.append(("exit", code)),
+                log=lambda message: events.append(("log", message)),
+            )
+        )
+
+        service.hard_exit("lease_heartbeat")
+
+        self.assertIn("lease heartbeat stopped", str(events[0][1]))
+        self.assertEqual(events[-1], ("exit", 1))
 
 
 class DormantThread:
@@ -557,7 +784,11 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
 
         class LatchObservingThread(DormantThread):
             def start(self) -> None:
-                latch_at_dispatch.append(bool(server._health_refresh_loop_running))
+                latch_at_dispatch.append(
+                    server._ensure_observability_service()
+                    .state()
+                    .health_refresh_loop_running
+                )
                 super().start()
 
         server._background_services = BackgroundServiceRegistry(
@@ -570,12 +801,20 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
         started = server._background_services.snapshot("health_snapshot_refresher")
         self.assertEqual(latch_at_dispatch, [True])
         self.assertTrue(started.started)
-        self.assertTrue(server._health_refresh_loop_running)
+        self.assertTrue(
+            server._ensure_observability_service()
+            .state()
+            .health_refresh_loop_running
+        )
 
         server.start_health_snapshot_refresher()
 
         self.assertEqual(started.thread.start_count, 1)  # type: ignore[union-attr]
-        self.assertTrue(server._health_refresh_loop_running)
+        self.assertTrue(
+            server._ensure_observability_service()
+            .state()
+            .health_refresh_loop_running
+        )
 
 
 if __name__ == "__main__":

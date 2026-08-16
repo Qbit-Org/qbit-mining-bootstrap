@@ -932,7 +932,7 @@ class HealthSnapshotTests(_JobSupportTestCase):
         server, _ = coordinator()
         mark_progress_healthy(server)
         server.refresh_health_snapshot()
-        server._health_refresh_loop_running = True
+        server._ensure_observability_service().set_loop_running_for_test(True)
 
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 200)
@@ -943,7 +943,9 @@ class HealthSnapshotTests(_JobSupportTestCase):
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 200)
 
-        server._health_snapshot_monotonic = time.monotonic() - 1_000
+        server._ensure_observability_service().set_health_snapshot_monotonic_for_test(
+            time.monotonic() - 1_000
+        )
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 503)
         self.assertFalse(payload["ok"])
@@ -976,7 +978,11 @@ class HealthSnapshotTests(_JobSupportTestCase):
 
         class RecordingServer:
             def __init__(self, address: object, handler_cls: object) -> None:
-                flag_at_bind.append(bool(server._health_refresh_loop_running))
+                flag_at_bind.append(
+                    server._ensure_observability_service()
+                    .state()
+                    .health_refresh_loop_running
+                )
                 self.server_address = address
                 self.ready = threading.Event()
                 self.released = threading.Event()
@@ -1001,7 +1007,11 @@ class HealthSnapshotTests(_JobSupportTestCase):
             server.start_audit_server()
             try:
                 self.assertEqual(flag_at_bind, [True])
-                self.assertTrue(server._health_refresh_loop_running)
+                self.assertTrue(
+                    server._ensure_observability_service()
+                    .state()
+                    .health_refresh_loop_running
+                )
             finally:
                 self.assertTrue(server._ensure_audit_http_facade().stop())
 

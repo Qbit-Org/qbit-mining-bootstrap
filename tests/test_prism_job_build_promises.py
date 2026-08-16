@@ -19,7 +19,6 @@ from lab.prism.prism_coordinator import (
     JobBuildCancelled,
     JobBuildSuperseded,
     PrismCoordinator,
-    WorkerIdentity,
     _JobBuildFlight,
     _JobBuildRequest,
 )

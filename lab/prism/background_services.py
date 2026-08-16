@@ -9,10 +9,17 @@ the ledger writer-lease heartbeat/monitor threads, their freshness state, and
 the synchronous exact-session external-effect fence.  Because its startup is
 conditional, creates two coupled threads, and waits for the first proof, it is
 started directly at the serve boundary rather than modeled as two independent
-registry specifications.  Watchdog policy itself (classification, coordination
-streak, emergency exit) remains coordinator-owned at this layer; the lease
-service reaches process exit only through a dynamic coordinator
-``_watchdog_hard_exit`` port.
+registry specifications.
+
+:class:`WatchdogService` owns watchdog policy: the coordination-blocked
+streak, coordination-versus-publication classification, the liveness and
+fatal-stop decisions, failure detail/diagnostics, and the bounded fresh-thread
+shutdown/lease-release attempt followed by an unconditional process exit.
+Generic liveness heartbeat registration/record/pause maps stay coordinator
+runtime state and reach the watchdog through ports.  Both WatchdogService.run
+and the lease service trigger the dynamic coordinator ``_watchdog_hard_exit``
+seam so per-instance monkeypatches intercept every exit path; the coordinator
+delegate routes back into :meth:`WatchdogService.hard_exit`.
 """
 
 from __future__ import annotations
@@ -218,6 +225,265 @@ class BackgroundServiceRegistry:
                 if record.specification.watchdog_monitored
                 and (record.started or not started_only)
             )
+
+
+@dataclass(frozen=True, slots=True)
+class WatchdogPorts:
+    """Dynamic process-supervision capabilities used by the watchdog owner.
+
+    ``publication_state``, ``hard_exit``, ``overdue_heartbeats``, and
+    ``publication_failure_expired`` resolve coordinator methods at call time
+    so per-instance monkeypatches intercept them; the interval/budget/enabled
+    reads stay live per iteration for focused timing overrides.
+    """
+
+    wait_for_stop: Callable[[float], bool]
+    interval_seconds: Callable[[], float]
+    fatal_exit_requested: Callable[[], bool]
+    publication_state: Callable[[float], tuple[str | None, float, float, float]]
+    hard_exit: Callable[[str], None]
+    liveness_enabled: Callable[[], bool]
+    overdue_heartbeats: Callable[[float], list[str]]
+    liveness_timeout_seconds: Callable[[], float]
+    coordination_budget_seconds: Callable[[], float]
+    publication_budget_seconds: Callable[[], float]
+    ensure_job_cache_state: Callable[[], None]
+    publication_failure_expired: Callable[[float], bool]
+    publication_divergence_since: Callable[[], float | None]
+    lease_release_timeout_seconds: Callable[[], float]
+    shutdown_controller: Callable[[], Any]
+    request_shutdown: Callable[[], None]
+    release_ledger_lease: Callable[[float], bool]
+    lease_failure_reason: Callable[[], str | None]
+    exit_process: Callable[[int], None]
+    log: Callable[[str], None]
+
+
+class WatchdogService:
+    """Own watchdog classification, streak state, and bounded emergency exit.
+
+    Progress-health continues to own the publication-divergence timestamps;
+    the classification reads a locked snapshot through a port and rechecks it
+    while claiming an exit.  Lock order is the service's coordination lock,
+    then the progress-health lock — progress-health must never call the
+    watchdog while holding its own lock.
+    """
+
+    def __init__(self, ports: WatchdogPorts) -> None:
+        self._ports = ports
+        self._coordination_blocked_lock = threading.Lock()
+        self._coordination_blocked_since_monotonic: float | None = None
+        self._publication_watchdog_exit_claimed = False
+        self.failure_detail: str | None = None
+
+    def record_coordination_blocked_refresh(self, now: float) -> None:
+        with self._coordination_blocked_lock:
+            if self._publication_watchdog_exit_claimed:
+                return
+            if self._coordination_blocked_since_monotonic is None:
+                self._coordination_blocked_since_monotonic = now
+
+    def clear_coordination_blocked_streak(self) -> None:
+        with self._coordination_blocked_lock:
+            # Once the watchdog claims an expired generation, its hard exit is
+            # the terminal action. Otherwise a refresh completing between the
+            # deadline check and os._exit could appear to cancel an exit that
+            # already won the streak lock.
+            if not self._publication_watchdog_exit_claimed:
+                self._coordination_blocked_since_monotonic = None
+
+    def coordination_blocked_streak_age_seconds(
+        self,
+        now: float | None = None,
+    ) -> float:
+        now = time.monotonic() if now is None else now
+        with self._coordination_blocked_lock:
+            started = self._coordination_blocked_since_monotonic
+        return 0.0 if started is None else max(0.0, now - started)
+
+    def coordination_blocked_streak_expired(self, now: float) -> bool:
+        budget = float(self._ports.coordination_budget_seconds())
+        with self._coordination_blocked_lock:
+            started = self._coordination_blocked_since_monotonic
+        return bool(
+            started is not None
+            and (budget <= 0 or now - started >= budget)
+        )
+
+    def publication_watchdog_state(
+        self,
+        now: float,
+    ) -> tuple[str | None, float, float, float]:
+        """Arbitrate coordination and ordinary publication deadlines.
+
+        The final decision is serialized with coordination streak changes.
+        A streak recorded while the ordinary publication check is in flight
+        therefore owns the longer coordination deadline; once either deadline
+        is claimed, later refresh results cannot cancel the terminal exit.
+        """
+        coordination_budget = float(self._ports.coordination_budget_seconds())
+        publication_budget = float(self._ports.publication_budget_seconds())
+        self._ports.ensure_job_cache_state()
+
+        # This preflight keeps the common healthy case cheap. Its result is
+        # revalidated under both state locks before an ordinary exit is
+        # claimed, so a concurrent publication cannot leave a stale verdict.
+        publication_expired = self._ports.publication_failure_expired(now)
+        with self._coordination_blocked_lock:
+            started = self._coordination_blocked_since_monotonic
+            if started is not None:
+                age = max(0.0, now - started)
+                if coordination_budget <= 0 or age >= coordination_budget:
+                    self._publication_watchdog_exit_claimed = True
+                    return (
+                        "coordination",
+                        age,
+                        coordination_budget,
+                        publication_budget,
+                    )
+                return None, age, coordination_budget, publication_budget
+
+            if publication_expired:
+                # Recheck the divergence timestamp under the progress-health
+                # lock (inside the port) while the coordination lock is held.
+                divergence_since = self._ports.publication_divergence_since()
+                publication_expired = bool(
+                    publication_budget > 0
+                    and divergence_since is not None
+                    and now - divergence_since >= publication_budget
+                )
+                if publication_expired:
+                    self._publication_watchdog_exit_claimed = True
+                    return (
+                        "publication",
+                        0.0,
+                        coordination_budget,
+                        publication_budget,
+                    )
+            return None, 0.0, coordination_budget, publication_budget
+
+    def run(self) -> None:
+        while True:
+            if self._ports.wait_for_stop(self._ports.interval_seconds()):
+                if self._ports.fatal_exit_requested():
+                    self._ports.log(
+                        "prism coordinator: fatal block-work restart requested; "
+                        "exiting non-zero even if the main thread is blocked"
+                    )
+                    self._ports.exit_process(1)
+                return
+            now = time.monotonic()
+            (
+                publication_failure,
+                coordination_age,
+                coordination_budget,
+                publication_budget,
+            ) = self._ports.publication_state(now)
+            if publication_failure == "coordination":
+                self.failure_detail = (
+                    "prism coordinator: publication-progress watchdog firing; "
+                    "template refresh remained coordination-blocked past the "
+                    f"coordination budget={coordination_budget:g}s "
+                    f"streak_age={coordination_age:.3f}s"
+                )
+                self._ports.hard_exit("coordination")
+            if publication_failure == "publication":
+                self.failure_detail = (
+                    "prism coordinator: publication-progress watchdog firing; "
+                    "current tip/generation remained unpublished past the "
+                    f"template refresh failure budget={publication_budget:g}s"
+                )
+                self._ports.hard_exit("publication")
+            overdue = (
+                self._ports.overdue_heartbeats(now)
+                if self._ports.liveness_enabled()
+                else []
+            )
+            if overdue:
+                self.failure_detail = (
+                    "prism coordinator: liveness watchdog firing; unresponsive "
+                    f"subsystems={overdue} "
+                    f"timeout={self._ports.liveness_timeout_seconds():g}s"
+                )
+                # Queued shares have not been acknowledged. Miners reconnect
+                # and retry them after restart; exact-payload replay is
+                # idempotent if Postgres committed just before this exit.
+                self._ports.hard_exit("liveness")
+
+    def hard_exit(
+        self,
+        reason: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        """Bound a fresh-thread lease release, then terminate unconditionally."""
+        try:
+            if timeout_seconds is None:
+                timeout_seconds = float(
+                    self._ports.lease_release_timeout_seconds()
+                )
+            deadline = time.monotonic() + max(0.0, timeout_seconds)
+            release_thread = threading.Thread(
+                target=self._release_ledger_lease,
+                args=(reason, deadline),
+                name="prism-watchdog-lease-release",
+                daemon=True,
+            )
+            release_thread.start()
+            release_thread.join(max(0.0, deadline - time.monotonic()))
+        finally:
+            # Nothing, including timeout logging or thread-start failure, may
+            # extend or suppress the watchdog's terminal action.
+            self._ports.exit_process(1)
+
+    def _release_ledger_lease(self, reason: str, deadline: float) -> bool:
+        """Use only the shutdown controller and a fresh DB connection.
+
+        Do not call ``shutdown`` here: cancellation takes the coordinator
+        control-plane lock, which may belong to the subsystem that triggered
+        the watchdog. Closing writer admission plus the controller's
+        tracked-writer barrier retains the graceful path's release-withheld
+        invariant without that lock.
+
+        Any best-effort diagnostic is emitted only after lease handling on this
+        daemon worker. A blocked container log pipe may park the worker, but it
+        cannot precede the release attempt or extend the caller's hard deadline.
+        """
+        controller = self._ports.shutdown_controller()
+        self._ports.request_shutdown()
+        if not controller.begin_shutdown(f"watchdog_{reason}"):
+            handled = controller.wait_for_lease_handling()
+            self._exit_diagnostic(reason, lease_handled=handled)
+            return handled
+
+        quiesced, _elapsed, _blockers = controller.wait_for_writer_quiescence(
+            max(0.0, deadline - time.monotonic())
+        )
+        if not quiesced:
+            self._exit_diagnostic(reason, lease_handled=False)
+            return False
+        if time.monotonic() >= deadline:
+            self._exit_diagnostic(reason, lease_handled=False)
+            return False
+        handled = self._ports.release_ledger_lease(deadline)
+        self._exit_diagnostic(reason, lease_handled=handled)
+        return handled
+
+    def _exit_diagnostic(self, reason: str, *, lease_handled: bool) -> None:
+        """Best-effort logging after the watchdog's safety-critical work."""
+        detail = (
+            self._ports.lease_failure_reason()
+            if reason == "lease_heartbeat"
+            else self.failure_detail
+        )
+        try:
+            self._ports.log(
+                (detail or f"prism coordinator: {reason} watchdog firing")
+                + ". Exiting non-zero so the restart policy recovers the process. "
+                + f"lease_handled={lease_handled}"
+            )
+        except Exception:
+            pass
 
 
 def guard_session_verifier(ledger: object) -> Callable[..., object] | None:

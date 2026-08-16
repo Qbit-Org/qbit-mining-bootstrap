@@ -7,7 +7,6 @@ import json
 from datetime import datetime, timedelta, timezone
 import threading
 import time
-import urllib.request
 import unittest
 from unittest.mock import patch
 

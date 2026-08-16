@@ -13,12 +13,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lab.auxpow import vardiff
-from lab.prism.prism_coordinator import (
-    ClientState,
-    PendingInitialJob,
+from lab.prism.job_delivery import (
     PRISM_DELIVERY_PRIORITY_INITIAL,
     PRISM_DELIVERY_PRIORITY_NEW_TIP,
     PRISM_DELIVERY_PRIORITY_SAME_TIP,
+)
+from lab.prism.prism_coordinator import (
+    ClientState,
+    PendingInitialJob,
     PrismCoordinator,
     StratumError,
     StratumListenerProfile,

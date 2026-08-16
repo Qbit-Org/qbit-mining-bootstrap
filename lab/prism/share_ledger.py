@@ -25,7 +25,6 @@ from typing import Any, Callable, Iterator
 from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
     AuditArtifactStore,
-    _AuditShareSegmentConflict,
     canonical_audit_bundle_bytes,
 )
 

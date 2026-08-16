@@ -83,9 +83,6 @@ def progress_coordinator() -> tuple[object, FakeMonotonicClock]:
         server._progress_last_refresh_activity_monotonic = None
         server._progress_bundle_build_counter = 0
         server._progress_bundle_builds.clear()
-    server._health_snapshot = None
-    server._health_snapshot_monotonic = None
-    server._health_refresh_loop_running = False
     return server, clock
 
 
@@ -662,7 +659,7 @@ class ProgressHealthTests(unittest.TestCase):
         publish(server, original)
         server.health_refresh_seconds = 60.0
         server.refresh_health_snapshot()
-        server._health_refresh_loop_running = True
+        server._ensure_observability_service().set_loop_running_for_test(True)
 
         changed = snapshot(generation=2, fingerprint="bb" * 32, tip="22" * 32)
         server._record_progress_tip_poll(changed)

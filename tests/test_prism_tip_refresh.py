@@ -86,13 +86,10 @@ class R1FacadeIdentityTests(unittest.TestCase):
             prism_coordinator.PRISM_TIP_REFRESH_BUILD_PHASES,
             tip_refresh.PRISM_TIP_REFRESH_BUILD_PHASES,
         )
-        self.assertIs(
-            prism_coordinator.PRISM_TIP_REFRESH_RESULTS,
-            tip_refresh.PRISM_TIP_REFRESH_RESULTS,
-        )
-        self.assertIs(
-            prism_coordinator.PRISM_TIP_REFRESH_CANCELLATION_STAGES,
-            tip_refresh.PRISM_TIP_REFRESH_CANCELLATION_STAGES,
+        # PR 80 removed the result/cancellation-stage re-exports.
+        self.assertFalse(hasattr(prism_coordinator, "PRISM_TIP_REFRESH_RESULTS"))
+        self.assertFalse(
+            hasattr(prism_coordinator, "PRISM_TIP_REFRESH_CANCELLATION_STAGES")
         )
         # The owner is a leaf: it never imports the coordinator module.
         self.assertFalse(hasattr(tip_refresh, "PrismCoordinator"))
@@ -104,9 +101,8 @@ class R1FacadeIdentityTests(unittest.TestCase):
         self.assertIs(
             prism_coordinator.PayoutStateCandidate, payout_state.PayoutStateCandidate
         )
-        self.assertIs(
-            prism_coordinator.PublishedPayoutState, payout_state.PublishedPayoutState
-        )
+        # PR 80 removed the PublishedPayoutState compatibility re-export.
+        self.assertFalse(hasattr(prism_coordinator, "PublishedPayoutState"))
         self.assertIs(
             prism_coordinator.PayoutLedgerArtifact, payout_state.PayoutLedgerArtifact
         )
@@ -118,20 +114,14 @@ class R1FacadeIdentityTests(unittest.TestCase):
             prism_coordinator.TemplateRefreshSuperseded,
             payout_state.TemplateRefreshSuperseded,
         )
+        # PR 80 removed the four underscore payout aliases; the coordinator
+        # keeps only the unaliased exception it still raises.
+        self.assertFalse(hasattr(prism_coordinator, "_AcceptedBlockPayoutTransition"))
+        self.assertFalse(hasattr(prism_coordinator, "_PayoutDeliveryAdmission"))
+        self.assertFalse(hasattr(prism_coordinator, "_PayoutStateDeliveryGate"))
+        self.assertFalse(hasattr(prism_coordinator, "_PayoutStatePublicationBlocked"))
         self.assertIs(
-            prism_coordinator._AcceptedBlockPayoutTransition,
-            payout_state.AcceptedBlockPayoutTransition,
-        )
-        self.assertIs(
-            prism_coordinator._PayoutDeliveryAdmission,
-            payout_state.PayoutDeliveryAdmission,
-        )
-        self.assertIs(
-            prism_coordinator._PayoutStateDeliveryGate,
-            payout_state.PayoutStateDeliveryGate,
-        )
-        self.assertIs(
-            prism_coordinator._PayoutStatePublicationBlocked,
+            prism_coordinator.PayoutStatePublicationBlocked,
             payout_state.PayoutStatePublicationBlocked,
         )
         # template_artifacts re-imports the exception trio from the final P1

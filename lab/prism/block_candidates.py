@@ -6,8 +6,9 @@ quarantine, retry merge/pacing/finalize-only state, acceptance evidence,
 block-work liveness heartbeats, and the bounded DB/RPC call workers all live
 here. Post-offer accepted-block finalization (``submit_block_candidate``,
 ``_submit_block_candidate_serialized``, ``_land_and_confirm_block_candidate``)
-stays coordinator-owned at this layer and is reached through the runtime seam;
-a later layer moves it to its own finalization owner.
+stays coordinator-owned at this layer and is reached through the injected
+coordinator reference; a later layer moves it to its own finalization owner.
+This module never imports ``prism_coordinator``.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,
 )
 from lab.prism.coordinator_shutdown import ShutdownInProgress
+from lab.prism.job_bundle import PRISM_JOB_BUILD_SECONDS_BUCKETS
 from lab.prism.job_delivery import PrismJobContext
 from lab.prism.rpc import JsonRpc
 from lab.prism.share_ledger import LedgerOperationTimeout, PendingShare
@@ -89,19 +91,6 @@ PRISM_REJECTION_LEDGER_CONFIRMATION_SUPERSEDED = "ledger-confirmation-superseded
 # first-touch callers from ever publishing different containers for the same
 # state.
 _STATE_BACKFILL_LOCK = threading.Lock()
-
-
-def _coordinator_module() -> Any:
-    """Resolve the coordinator module at call time.
-
-    The coordinator imports this module, so a top-level reverse import would
-    be circular. The one consumer (the shared latency bucket registry) only
-    runs once a coordinator exists, at which point the module is guaranteed
-    loaded.
-    """
-    from lab.prism import prism_coordinator
-
-    return prism_coordinator
 
 
 @dataclass(frozen=True)
@@ -418,9 +407,7 @@ class BlockCandidateService:
         self._counted_block_candidate_abandonments: set[str] = set()
         self._block_submit_metrics_lock = threading.Lock()
         if submit_seconds_buckets is None:
-            submit_seconds_buckets = tuple(
-                _coordinator_module().PRISM_JOB_BUILD_SECONDS_BUCKETS
-            )
+            submit_seconds_buckets = tuple(PRISM_JOB_BUILD_SECONDS_BUCKETS)
         # Landed candidate -> submitblock-return interval. Post-submit
         # bookkeeping (audit build, persistence, outbox finalize) is
         # deliberately excluded; the outbox created_at/completed_at span

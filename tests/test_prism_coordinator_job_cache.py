@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import replace as dataclass_replace
-import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -96,7 +95,8 @@ def seed_published_payout_artifact(server: object, sha256: str) -> int:
 class MovedSymbolIdentityTests(unittest.TestCase):
     def test_moved_symbol_reexports_preserve_identity(self) -> None:
         self.assertIs(prism_coordinator.CachedJobBundle, job_bundle.CachedJobBundle)
-        self.assertIs(prism_coordinator.JobBuildKey, job_bundle.JobBuildKey)
+        # PR 80 removed the JobBuildKey compatibility re-export.
+        self.assertFalse(hasattr(prism_coordinator, "JobBuildKey"))
         self.assertIs(
             prism_coordinator.JobBuildSuperseded, job_bundle.JobBuildSuperseded
         )

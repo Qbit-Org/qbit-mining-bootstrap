@@ -44,9 +44,9 @@ class S2FacadeIdentityTests(unittest.TestCase):
         self.assertIs(FacadeEvictedJobEntry, EvictedJobEntry)
         self.assertIs(FacadePendingInitialJob, PendingInitialJob)
         self.assertIs(prism_coordinator._JobBuildFailed, JobBuildFailed)
-        self.assertEqual(
-            prism_coordinator.PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
-            job_delivery_module.PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
+        # PR 80 removed the admission-poll compatibility re-export.
+        self.assertFalse(
+            hasattr(prism_coordinator, "PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS")
         )
         # The owner is a leaf: it never imports the coordinator module.
         self.assertFalse(hasattr(job_delivery_module, "PrismCoordinator"))

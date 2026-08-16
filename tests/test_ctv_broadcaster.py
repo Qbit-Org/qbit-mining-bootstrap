@@ -13,7 +13,6 @@ from lab.prism.ctv_broadcaster import (
     CPFP_CHILD_TX_VERSION,
     REORGED,
     BroadcasterError,
-    BroadcastAttempt,
     CtvFanoutBroadcaster,
     FanoutArtifact,
     RpcError,

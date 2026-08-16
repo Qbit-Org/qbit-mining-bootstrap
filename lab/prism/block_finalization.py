@@ -16,17 +16,17 @@ fenced fallback calls B1's node-offer seam through the runtime.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
 import threading
 import time
 import traceback
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from lab.prism import direct_stratum, public_api
-from lab.prism.audit_artifacts import AuditPublicationIdentity
+from lab.prism.audit_artifacts import AuditArtifactStore, AuditPublicationIdentity
 from lab.prism.block_candidates import (
     PRISM_REJECTION_LEDGER_CONFIRMATION_SUPERSEDED,
     PrismBlockCandidate,
@@ -100,48 +100,367 @@ class FinalizationEvidence:
     publication_persistence: dict[str, Any]
 
 
-class BlockFinalizationService:
-    """Own accepted-block finalization while forwarding infrastructure ports.
+class BlockFinalizationPort(Protocol):
+    """Explicit coordinator capabilities required by finalization.
 
-    The service deliberately receives the whole coordinator as its runtime
-    rather than a narrow ports dataclass: the finalization tail touches many
-    coordinator-owned seams that focused tests monkeypatch per instance, and
-    ``__getattr__``/``__setattr__`` proxying preserves every one of those
-    call-time seams while the bounded phase metrics stay service-owned.
+    Every runtime attribute and method the service touches is declared here,
+    with one intentional exception: the ``verify_bundle`` verifier override is
+    consumed only through ``runtime.__dict__`` as a per-instance escape hatch
+    and deliberately stays out of the port.
     """
 
-    def __init__(self, runtime: Any) -> None:
-        object.__setattr__(self, "runtime", runtime)
-        object.__setattr__(self, "_metrics_lock", threading.Lock())
-        object.__setattr__(
-            self,
-            "_phase_metrics",
-            {
-                phase: {"count": 0, "sum": 0.0, "max": 0.0}
-                for phase in FINALIZATION_PHASES
-            },
-        )
-        object.__setattr__(self, "_last_candidate_started", None)
-        object.__setattr__(
-            self,
-            "_candidate_intervals",
-            {"count": 0, "sum": 0.0, "min": None},
-        )
+    ledger: Any
+    lock: Any
+    rpc: Any
+    accepted_block_count: int
+    latest_coinbase_size_bytes: int | None
+    ledger_writer_public_key_hex: str | None
+    max_blocks: int
+    reorg_reconciler_enabled: bool
+    stop_after_block: bool
+    _accounted_accepted_block_hashes: set[str]
+    _block_candidate_outcome: threading.local | None
+    _block_fast_lane_reservations: set[str]
+    _job_cache_lock: Any
+    _payout_append_landing_fence_lock: Any
+    _payout_balance_mutation_lock: Any
+    _payout_ledger_append_invalidation_epoch: int
+    _payout_state_generation: int
+    _payout_state_source: tuple[int, str | None, str, float]
+    _template_artifacts: Any
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.runtime, name)
+    def _abandon_block_candidate(
+        self,
+        reason: str,
+        message: str,
+        *,
+        block_hash: str,
+        worker: str | None,
+        preserve_if_accepted: bool = False,
+        expected_height: int | None = None,
+        stale_job_class: str | None = None,
+    ) -> bool: ...
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name in {
-            "runtime",
-            "_metrics_lock",
-            "_phase_metrics",
-            "_last_candidate_started",
-            "_candidate_intervals",
-        }:
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self.runtime, name, value)
+    def _accepted_block_payout_preview_from_bundle(
+        self,
+        final_bundle: dict[str, Any],
+        *,
+        prior_balances: list[dict[str, object]] | None = None,
+    ) -> list[dict[str, object]]: ...
+
+    def _accepted_block_payout_transition_landed(self, block_hash: str) -> bool: ...
+
+    def _audit_publication_identity(
+        self,
+        *,
+        block_hash: str,
+        block_height: int,
+        confirmation: Mapping[str, Any],
+    ) -> AuditPublicationIdentity: ...
+
+    def _await_unfenced_appends_predating_anchor(self, anchor_ms: int) -> None: ...
+
+    def _begin_accepted_block_payout_preview(
+        self,
+        block_hash: str,
+        *,
+        block_height: int | None = None,
+    ) -> None: ...
+
+    def _block_candidate_acceptance_recorded(self, block_hash: str) -> bool: ...
+
+    def _block_candidate_chain_probe(
+        self,
+        block_hash: str,
+        *,
+        expected_height: int | None = None,
+    ) -> bool | None: ...
+
+    def _block_candidate_disposition(
+        self,
+        block_hash: str,
+    ) -> AbstractContextManager[Any]: ...
+
+    def _block_candidate_terminal_outcome(self, block_hash: str) -> bool | None: ...
+
+    def _block_payout_state_publication(
+        self,
+        *,
+        force: bool = False,
+        supersede_with: tuple[int, str | None, str, float] | None = None,
+    ) -> None: ...
+
+    def _block_submitter_lock(
+        self,
+        lock: Any,
+        name: str,
+    ) -> AbstractContextManager[None]: ...
+
+    def _cancel_obsolete_job_builds(
+        self,
+        reason: str,
+        *,
+        keep_published_snapshot: bool = False,
+    ) -> None: ...
+
+    def _capture_payout_state_source(
+        self,
+    ) -> tuple[int, int, str | None, str, float]: ...
+
+    def _clear_accepted_block_payout_preview(
+        self,
+        block_hash: str,
+        *,
+        invalidate_published: bool = False,
+    ) -> None: ...
+
+    def _defer_for_pending_parent_payout_transition(
+        self,
+        *,
+        block_hash: str,
+        parent_hash: str,
+        parent_height: int,
+        worker: str | None,
+        active_candidate_hash: str | None = None,
+        active_candidate_height: int | None = None,
+    ) -> bool: ...
+
+    def _ensure_audit_artifact_store(self) -> AuditArtifactStore: ...
+
+    def _ensure_job_cache_state(self) -> None: ...
+
+    def _expose_inflight_scan_anchor(self, anchor_ms: int) -> int: ...
+
+    def _land_and_confirm_block_candidate(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        current_tip: str,
+        already_active: bool,
+        worker: str | None,
+        node_submission: _BlockCandidateNodeSubmission,
+        revalidated_append_epoch: int | None = None,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        AuditPublicationIdentity,
+        dict[str, Any],
+    ] | None: ...
+
+    def _mark_accepted_block_payout_landed(
+        self,
+        block_hash: str,
+        *,
+        block_height: int,
+    ) -> None: ...
+
+    def _mark_tip_refresh_pending(self, _observation: object) -> int: ...
+
+    def _materialize_prior_balance_preview(
+        self,
+        preview: tuple[tuple[str, str, str, int], ...],
+    ) -> list[dict[str, object]]: ...
+
+    def _node_submission_for_direct_candidate(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> _BlockCandidateNodeSubmission: ...
+
+    def _note_tip_observation_for_candidates(self, tip_hash: str) -> None: ...
+
+    def _observe_payout_state_seconds(
+        self,
+        name: str,
+        elapsed_seconds: float,
+        *,
+        relation: str | None = None,
+    ) -> None: ...
+
+    def _payout_balance_serializer_released(
+        self,
+    ) -> AbstractContextManager[None]: ...
+
+    def _payout_source_requires_publication(self, candidate: Any = None) -> bool: ...
+
+    def _payout_state_publication_fenced(self) -> bool: ...
+
+    def _publish_accepted_block_payout_preview(
+        self,
+        block_hash: str,
+        balances: list[dict[str, object]],
+    ) -> list[dict[str, object]]: ...
+
+    def _publish_current_payout_state_with_retry_budget(
+        self,
+        *,
+        initial_attempted: bool = False,
+    ) -> int | None: ...
+
+    def _record_block_candidate_progress(
+        self,
+        phase: str = "accounting-progress",
+    ) -> None: ...
+
+    def _record_block_submitter_phase(self, phase: str) -> None: ...
+
+    def _record_committed_block_candidate_abandonment(
+        self,
+        block_hash: str,
+        outcome: threading.local,
+    ) -> None: ...
+
+    def _register_outstanding_block_candidate(self, block_hash: str) -> None: ...
+
+    def _replayed_payout_window_reproducible(self, context: Any) -> bool: ...
+
+    def _require_fresh_ledger_lease_for_external_side_effect(
+        self,
+        component: str,
+    ) -> None: ...
+
+    def _retire_inflight_scan_anchor(self, token: int | None) -> None: ...
+
+    def _schedule_current_payout_ledger_artifact_if_missing(self) -> None: ...
+
+    def _schedule_payout_ledger_artifact_preparation(
+        self,
+        payout_state_generation: int,
+        network_difficulty: int,
+        *,
+        min_interval_seconds: float | None = None,
+        bypass_build_interval: bool = False,
+    ) -> None: ...
+
+    def _schedule_tip_refresh_retry(self) -> None: ...
+
+    def _submit_block_candidate_serialized(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        node_submission: _BlockCandidateNodeSubmission,
+    ) -> bool: ...
+
+    def _submit_block_candidate_to_node(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> _BlockCandidateNodeSubmission: ...
+
+    def _unmark_accepted_block_payout_landed(self, block_hash: str) -> None: ...
+
+    def accepted_share_stats(self) -> tuple[int, int]: ...
+
+    def active_block_candidate_height(self, block_hash: str) -> int | None: ...
+
+    def append_accepted_share(
+        self,
+        client: Any,
+        context: Any,
+        submission: direct_stratum.DirectQbitSubmission,
+        pending_share: Any,
+        *,
+        credit_policy: str | None = None,
+        candidate_intent: dict[str, Any] | None = None,
+    ) -> str | None: ...
+
+    def block_candidate_intent(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> dict[str, Any]: ...
+
+    def build_audit_bundle(
+        self,
+        *,
+        shares: list[dict[str, object]],
+        found_block: dict[str, object],
+        prior_balances: list[dict[str, object]],
+        coinbase_script_sig_suffix_hex: str,
+        witness_merkle_leaves_hex: list[str] | None = None,
+        ctv_fee_parent_hash: str | None = None,
+        canonical_output_path: Path | None = None,
+        canonical_output_parent_fd: int | None = None,
+        canonical_output_adopter: Callable[[Path, os.stat_result], None] | None = None,
+    ) -> dict[str, Any]: ...
+
+    def coinbase_script_sig_suffix_hex(
+        self,
+        extranonce1_hex: str,
+        extranonce2_hex: str,
+    ) -> str: ...
+
+    def ensure_reorg_reconciled_for_tip(
+        self,
+        tip_hash: str,
+        *,
+        _coalesce_same_tip: bool = True,
+    ) -> bool: ...
+
+    def normalized_prior_balances(
+        self,
+        balances: list[dict[str, object]],
+    ) -> list[dict[str, object]]: ...
+
+    def prior_balances_match_current(
+        self,
+        prior_balances: list[dict[str, object]],
+    ) -> bool: ...
+
+    def reconcile_prism_pool_blocks_once(
+        self,
+        *,
+        tip_hash: str | None = None,
+        _force_publish: bool = False,
+        _source_reserved: bool = False,
+        _wait_for_same_tip_flight: bool = True,
+    ) -> dict[str, object]: ...
+
+    def reject_prepared_block(
+        self,
+        *,
+        block_hash: str,
+        active_tip_height: int,
+    ) -> dict[str, int | str]: ...
+
+    def request_shutdown(self, signum: int | None = None) -> None: ...
+
+    def settlement_balances_by_program(
+        self,
+        balances: list[dict[str, object]],
+    ) -> dict[str, int]: ...
+
+    def trusted_ledger_writer_public_key_hex(
+        self,
+        bundle: dict[str, Any],
+    ) -> str: ...
+
+
+class BlockFinalizationService:
+    """Own accepted-block finalization over explicit infrastructure ports.
+
+    The service deliberately receives the whole coordinator as its runtime:
+    the finalization tail touches many coordinator-owned seams that focused
+    tests monkeypatch per instance, so every runtime capability is reached
+    explicitly through ``self.runtime`` against the typed
+    ``BlockFinalizationPort`` while the bounded phase metrics stay
+    service-owned.
+    """
+
+    runtime: BlockFinalizationPort
+
+    def __init__(self, runtime: BlockFinalizationPort) -> None:
+        self.runtime = runtime
+        self._metrics_lock = threading.Lock()
+        self._phase_metrics = {
+            phase: {"count": 0, "sum": 0.0, "max": 0.0}
+            for phase in FINALIZATION_PHASES
+        }
+        self._last_candidate_started: float | None = None
+        self._candidate_intervals: dict[str, int | float | None] = {
+            "count": 0,
+            "sum": 0.0,
+            "min": None,
+        }
 
     @contextmanager
     def _phase(self, name: str) -> Iterator[None]:
@@ -155,6 +474,15 @@ class BlockFinalizationService:
                 metric["count"] = int(metric["count"]) + 1
                 metric["sum"] = float(metric["sum"]) + elapsed
                 metric["max"] = max(float(metric["max"]), elapsed)
+
+    def _record_block_candidate_progress(
+        self,
+        phase: str = "accounting-progress",
+    ) -> None:
+        # Service-level compatibility seam: progress marks stay dispatched
+        # through the service so focused tests can intercept them with a
+        # subclass override; the base implementation forwards to the port.
+        self.runtime._record_block_candidate_progress(phase)
 
     def _note_candidate_started(self) -> None:
         now = time.monotonic()
@@ -245,15 +573,15 @@ class BlockFinalizationService:
         expected_height = int(context.template["height"])
         block_hash = str(submission.block_hash_hex).lower()
         parent_hash = str(context.template["previousblockhash"])
-        self._ensure_job_cache_state()
+        self.runtime._ensure_job_cache_state()
         durable_payout_state = bool(
-            getattr(self.ledger, "durable_payout_state", False)
+            getattr(self.runtime.ledger, "durable_payout_state", False)
         )
-        with self._block_submitter_lock(
-            self._payout_balance_mutation_lock,
+        with self.runtime._block_submitter_lock(
+            self.runtime._payout_balance_mutation_lock,
             "payout-balance-mutation",
         ):
-            if self._defer_for_pending_parent_payout_transition(
+            if self.runtime._defer_for_pending_parent_payout_transition(
                 block_hash=block_hash,
                 parent_hash=parent_hash,
                 parent_height=expected_height - 1,
@@ -263,8 +591,8 @@ class BlockFinalizationService:
             ):
                 return None
             block_state: dict[str, object] | None = None
-            block_state_reader = getattr(self.ledger, "pool_block_state", None)
-            transition_already_landed = self._accepted_block_payout_transition_landed(
+            block_state_reader = getattr(self.runtime.ledger, "pool_block_state", None)
+            transition_already_landed = self.runtime._accepted_block_payout_transition_landed(
                 block_hash
             )
             reorg_reconciled: bool | None = None
@@ -274,13 +602,13 @@ class BlockFinalizationService:
                 # transition becomes a landed barrier and before validating its
                 # payout base.
                 try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                    reorg_reconciled = self.runtime.ensure_reorg_reconciled_for_tip(
                         current_tip,
                         _coalesce_same_tip=False,
                     )
                 except Exception:
                     traceback.print_exc()
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                         "reorg reconciliation failed before block replay",
                         block_hash=block_hash,
@@ -288,7 +616,7 @@ class BlockFinalizationService:
                     )
                     return None
                 if not reorg_reconciled:
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                         "reorg reconciliation reported an untrusted chain view",
                         block_hash=block_hash,
@@ -296,9 +624,9 @@ class BlockFinalizationService:
                     )
                     return None
             if already_active and callable(block_state_reader):
-                self._record_block_submitter_phase("pool-block-state")
+                self.runtime._record_block_submitter_phase("pool-block-state")
                 block_state = block_state_reader(block_hash=block_hash)
-                self._record_block_submitter_phase("pool-block-state:complete")
+                self.runtime._record_block_submitter_phase("pool-block-state:complete")
             already_confirmed = bool(
                 block_state is not None
                 and str(block_state.get("chain_state", "")) == "confirmed"
@@ -308,14 +636,14 @@ class BlockFinalizationService:
                 # The outbox terminal update can fail after a fully durable
                 # confirmation. Do not replace later global balances with an
                 # ancestor-only preview during exact-idempotent replay.
-                self._clear_accepted_block_payout_preview(block_hash)
+                self.runtime._clear_accepted_block_payout_preview(block_hash)
                 reorg_reconciled = True
             elif already_active:
-                self._begin_accepted_block_payout_preview(
+                self.runtime._begin_accepted_block_payout_preview(
                     block_hash,
                     block_height=expected_height,
                 )
-                self._mark_accepted_block_payout_landed(
+                self.runtime._mark_accepted_block_payout_landed(
                     block_hash,
                     block_height=expected_height,
                 )
@@ -327,13 +655,13 @@ class BlockFinalizationService:
                 reorg_reconciled = True
             else:
                 try:
-                    reorg_reconciled = self.ensure_reorg_reconciled_for_tip(
+                    reorg_reconciled = self.runtime.ensure_reorg_reconciled_for_tip(
                         current_tip,
                         _coalesce_same_tip=False,
                     )
                 except Exception:
                     traceback.print_exc()
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                         "reorg reconciliation failed before block submit",
                         block_hash=block_hash,
@@ -341,7 +669,7 @@ class BlockFinalizationService:
                     )
                     return None
             if not reorg_reconciled:
-                self._abandon_block_candidate(
+                self.runtime._abandon_block_candidate(
                     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                     "reorg reconciliation reported an untrusted chain view",
                     block_hash=block_hash,
@@ -351,7 +679,7 @@ class BlockFinalizationService:
             if (
                 already_active
                 and not already_confirmed
-                and self._defer_for_pending_parent_payout_transition(
+                and self.runtime._defer_for_pending_parent_payout_transition(
                     block_hash=block_hash,
                     parent_hash=parent_hash,
                     parent_height=expected_height - 1,
@@ -381,9 +709,9 @@ class BlockFinalizationService:
                 if context_append_epoch >= 0
                 else revalidated_append_epoch
             )
-            with self._job_cache_lock:
+            with self.runtime._job_cache_lock:
                 live_append_epoch = int(
-                    self._payout_ledger_append_invalidation_epoch
+                    self.runtime._payout_ledger_append_invalidation_epoch
                 )
             if (
                 not already_active
@@ -400,7 +728,7 @@ class BlockFinalizationService:
                 # accepted or duplicate result proceeds to the post-offer
                 # fence, which keeps the as-issued snapshot for
                 # accounting).
-                self._abandon_block_candidate(
+                self.runtime._abandon_block_candidate(
                     PRISM_REJECTION_STALE_JOB,
                     "payout window was invalidated by a late-visible share append",
                     block_hash=block_hash,
@@ -412,9 +740,9 @@ class BlockFinalizationService:
             if (
                 durable_payout_state
                 and not already_active
-                and not self.prior_balances_match_current(context.prior_balances)
+                and not self.runtime.prior_balances_match_current(context.prior_balances)
             ):
-                self._abandon_block_candidate(
+                self.runtime._abandon_block_candidate(
                     PRISM_REJECTION_STALE_JOB,
                     "prior balances changed since the job was issued",
                     block_hash=block_hash,
@@ -424,9 +752,9 @@ class BlockFinalizationService:
                 )
                 return None
             if not already_active and not node_submission.attempted:
-                before_height = int(self.rpc.call("getblockcount"))
+                before_height = int(self.runtime.rpc.call("getblockcount"))
                 if before_height + 1 != expected_height:
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
                         f"stale block height: template={expected_height} tip={before_height}",
                         block_hash=block_hash,
@@ -438,14 +766,14 @@ class BlockFinalizationService:
                 # Register before a fallback submitblock can expose this hash as the new
                 # tip. Child builders will wait for the verified preview rather
                 # than reading balances that omit their new parent.
-                self._begin_accepted_block_payout_preview(
+                self.runtime._begin_accepted_block_payout_preview(
                     block_hash,
                     block_height=expected_height,
                 )
                 # Treat the submit outcome as uncertain before entering RPC.
                 # If transport fails after qbitd accepted the block, this
                 # conservative barrier preserves the coinbase's payout base.
-                self._mark_accepted_block_payout_landed(
+                self.runtime._mark_accepted_block_payout_landed(
                     block_hash,
                     block_height=expected_height,
                 )
@@ -462,7 +790,7 @@ class BlockFinalizationService:
                         # verification taken before the wait would measure
                         # runway the wait then consumes.
                         try:
-                            self._require_fresh_ledger_lease_for_external_side_effect(
+                            self.runtime._require_fresh_ledger_lease_for_external_side_effect(
                                 "submitblock"
                             )
                         except WriterLeaseRenewalDeferred:
@@ -481,7 +809,7 @@ class BlockFinalizationService:
                                 # earlier attempt that did reach submitblock
                                 # keeps standing for that attempt's uncertain
                                 # outcome.
-                                self._unmark_accepted_block_payout_landed(
+                                self.runtime._unmark_accepted_block_payout_landed(
                                     block_hash
                                 )
                             raise
@@ -504,24 +832,24 @@ class BlockFinalizationService:
                         or getattr(context, "collection_only", False)
                     ):
                         _verify_lease_before_submitblock()
-                        node_submission = self._submit_block_candidate_to_node(
+                        node_submission = self.runtime._submit_block_candidate_to_node(
                             candidate
                         )
                     else:
-                        with self._payout_append_landing_fence_lock:
-                            with self._job_cache_lock:
+                        with self.runtime._payout_append_landing_fence_lock:
+                            with self.runtime._job_cache_lock:
                                 live_append_epoch = int(
-                                    self._payout_ledger_append_invalidation_epoch
+                                    self.runtime._payout_ledger_append_invalidation_epoch
                                 )
                             if live_append_epoch != effective_append_epoch:
                                 append_epoch_raced = True
                             else:
                                 _verify_lease_before_submitblock()
                                 node_submission = (
-                                    self._submit_block_candidate_to_node(candidate)
+                                    self.runtime._submit_block_candidate_to_node(candidate)
                                 )
                     if append_epoch_raced:
-                        self._abandon_block_candidate(
+                        self.runtime._abandon_block_candidate(
                             PRISM_REJECTION_STALE_JOB,
                             "payout window was invalidated by a late-visible share append",
                             block_hash=block_hash,
@@ -534,7 +862,7 @@ class BlockFinalizationService:
                     raise node_submission.error
                 result = node_submission.result
                 if result not in (None, "duplicate"):
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_SUBMITBLOCK_REJECTED,
                         f"submitblock rejected candidate: {result}",
                         block_hash=block_hash,
@@ -567,10 +895,10 @@ class BlockFinalizationService:
                     # did-it-actually-land verdict, and the pre-offer fence
                     # above still fails closed while nothing has been
                     # submitted.
-                    with self._payout_append_landing_fence_lock:
-                        with self._job_cache_lock:
+                    with self.runtime._payout_append_landing_fence_lock:
+                        with self.runtime._job_cache_lock:
                             live_append_epoch = int(
-                                self._payout_ledger_append_invalidation_epoch
+                                self.runtime._payout_ledger_append_invalidation_epoch
                             )
                     if live_append_epoch != effective_append_epoch:
                         print(
@@ -582,10 +910,10 @@ class BlockFinalizationService:
                             flush=True,
                         )
                 active_hash = str(
-                    self.rpc.call("getblockhash", [expected_height])
+                    self.runtime.rpc.call("getblockhash", [expected_height])
                 ).lower()
                 if active_hash != block_hash:
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_SUBMITBLOCK_REJECTED,
                         f"submitted block is not active at height {expected_height}",
                         block_hash=block_hash,
@@ -593,9 +921,9 @@ class BlockFinalizationService:
                         expected_height=expected_height,
                     )
                     return None
-                self._cancel_obsolete_job_builds("direct PRISM block accepted")
-                self._mark_tip_refresh_pending(block_hash)
-                self._schedule_tip_refresh_retry()
+                self.runtime._cancel_obsolete_job_builds("direct PRISM block accepted")
+                self.runtime._mark_tip_refresh_pending(block_hash)
+                self.runtime._schedule_tip_refresh_retry()
 
             preview: list[dict[str, object]] | None = None
             issued_preview = getattr(context, "prospective_prior_balances", None)
@@ -603,25 +931,25 @@ class BlockFinalizationService:
                 # The compact preview came from the immutable issued job
                 # summary. Publish it before rebuilding/canonicalizing the full
                 # audit bundle, without retaining that bundle's shares tree.
-                preview = self._materialize_prior_balance_preview(issued_preview)
-                if durable_payout_state and not self.prior_balances_match_current(
+                preview = self.runtime._materialize_prior_balance_preview(issued_preview)
+                if durable_payout_state and not self.runtime.prior_balances_match_current(
                     context.prior_balances
                 ):
-                    self.request_shutdown()
-                    self._clear_accepted_block_payout_preview(
+                    self.runtime.request_shutdown()
+                    self.runtime._clear_accepted_block_payout_preview(
                         block_hash,
                         invalidate_published=True,
                     )
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                         "accepted block payout base changed before preview publication",
                         block_hash=block_hash,
                         worker=worker,
                     )
                     return None
-                self._publish_accepted_block_payout_preview(block_hash, preview)
+                self.runtime._publish_accepted_block_payout_preview(block_hash, preview)
 
-            self._record_block_submitter_phase("audit-build")
+            self.runtime._record_block_submitter_phase("audit-build")
             # The bundle derives only from inputs frozen on the candidate
             # (share window, prior balances, extranonces, template fields),
             # so the serializer is released around the builder/verifier
@@ -630,8 +958,8 @@ class BlockFinalizationService:
             # construction -- and the landed fence keeps reconciliation out
             # while job delivery proceeds. Child builds consume the compact
             # preview published above until the verified preview lands.
-            with self._payout_balance_serializer_released():
-                audit_store = self._ensure_audit_artifact_store()
+            with self.runtime._payout_balance_serializer_released():
+                audit_store = self.runtime._ensure_audit_artifact_store()
                 candidate_artifact = audit_store.issue_candidate(
                     block_hash=submission.block_hash_hex
                 )
@@ -649,11 +977,11 @@ class BlockFinalizationService:
 
                 compiler_parent_fd = audit_store.duplicate_root_directory_fd()
                 try:
-                    final_bundle = self.build_audit_bundle(
+                    final_bundle = self.runtime.build_audit_bundle(
                         shares=context.shares_json,
                         found_block=context.found_block,
                         prior_balances=context.prior_balances,
-                        coinbase_script_sig_suffix_hex=self.coinbase_script_sig_suffix_hex(
+                        coinbase_script_sig_suffix_hex=self.runtime.coinbase_script_sig_suffix_hex(
                             candidate.extranonce1_hex,
                             candidate.extranonce2_hex,
                         ),
@@ -700,12 +1028,12 @@ class BlockFinalizationService:
                     raise
                 if final_coinbase_tx_hex != submission.coinbase_tx_hex.lower():
                     audit_store.discard_candidate(candidate_artifact)
-                    self.request_shutdown()
-                    self._clear_accepted_block_payout_preview(
+                    self.runtime.request_shutdown()
+                    self.runtime._clear_accepted_block_payout_preview(
                         block_hash,
                         invalidate_published=True,
                     )
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
                         "final audit bundle coinbase does not match submitted coinbase",
                         block_hash=block_hash,
@@ -715,11 +1043,14 @@ class BlockFinalizationService:
             payout_commit_started: float | None = None
             payout_commit_source: int | None = None
             try:
-                with self._payout_balance_serializer_released():
-                    self._record_block_submitter_phase("audit-verify")
+                with self.runtime._payout_balance_serializer_released():
+                    self.runtime._record_block_submitter_phase("audit-verify")
+                    # Intentional escape hatch outside the typed port: only a
+                    # per-instance override placed in the runtime's __dict__
+                    # replaces the verifier, never a class-level attribute.
                     verifier_override = self.runtime.__dict__.get("verify_bundle")
                     configured_writer_key = getattr(
-                        self,
+                        self.runtime,
                         "ledger_writer_public_key_hex",
                         None,
                     )
@@ -731,7 +1062,7 @@ class BlockFinalizationService:
                         ),
                         expected_block_height=expected_height,
                         trusted_writer_public_key_hex=(
-                            self.trusted_ledger_writer_public_key_hex(final_bundle)
+                            self.runtime.trusted_ledger_writer_public_key_hex(final_bundle)
                         ),
                         trust_source=(
                             "configured"
@@ -755,27 +1086,27 @@ class BlockFinalizationService:
                         else None
                     )
                     verified_preview = (
-                        self._accepted_block_payout_preview_from_bundle(
+                        self.runtime._accepted_block_payout_preview_from_bundle(
                             final_bundle,
                             prior_balances=context.prior_balances,
                         )
                     )
-                self._record_block_submitter_phase("audit-verify:complete")
+                self.runtime._record_block_submitter_phase("audit-verify:complete")
                 if not already_confirmed:
                     if preview is None and durable_payout_state:
-                        live_prior_balances = self.settlement_balances_by_program(
-                            self.ledger.current_prior_balances()
+                        live_prior_balances = self.runtime.settlement_balances_by_program(
+                            self.runtime.ledger.current_prior_balances()
                         )
-                        expected_prior_balances = self.settlement_balances_by_program(
+                        expected_prior_balances = self.runtime.settlement_balances_by_program(
                             context.prior_balances
                         )
                         if live_prior_balances != expected_prior_balances:
-                            self.request_shutdown()
-                            self._clear_accepted_block_payout_preview(
+                            self.runtime.request_shutdown()
+                            self.runtime._clear_accepted_block_payout_preview(
                                 block_hash,
                                 invalidate_published=True,
                             )
-                            self._abandon_block_candidate(
+                            self.runtime._abandon_block_candidate(
                                 PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                                 "accepted block payout base changed before preview publication",
                                 block_hash=block_hash,
@@ -783,17 +1114,17 @@ class BlockFinalizationService:
                             )
                             return None
                     try:
-                        self._publish_accepted_block_payout_preview(
+                        self.runtime._publish_accepted_block_payout_preview(
                             block_hash,
                             verified_preview,
                         )
                     except RuntimeError as exc:
-                        self.request_shutdown()
-                        self._clear_accepted_block_payout_preview(
+                        self.runtime.request_shutdown()
+                        self.runtime._clear_accepted_block_payout_preview(
                             block_hash,
                             invalidate_published=True,
                         )
-                        self._abandon_block_candidate(
+                        self.runtime._abandon_block_candidate(
                             PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
                             "verified final payout preview does not match the "
                             f"issued block job: {exc}",
@@ -807,9 +1138,9 @@ class BlockFinalizationService:
                 # so persistence can do canonicalization, body writes, copies,
                 # and bulk SQL without owning the delivery gate.
                 payout_commit_started = time.monotonic()
-                payout_commit_source = self._capture_payout_state_source()[1]
-                self._record_block_submitter_phase("persist-accepted-block")
-                persistence = self.ledger.persist_accepted_block(
+                payout_commit_source = self.runtime._capture_payout_state_source()[1]
+                self.runtime._record_block_submitter_phase("persist-accepted-block")
+                persistence = self.runtime.ledger.persist_accepted_block(
                     block_hash=submission.block_hash_hex,
                     block_height=expected_height,
                     parent_hash=parent_hash,
@@ -817,13 +1148,13 @@ class BlockFinalizationService:
                     audit_report=report,
                     canonical_bundle_path=persistence_canonical_bundle_path,
                 )
-                self._record_block_submitter_phase("persist-accepted-block:complete")
+                self.runtime._record_block_submitter_phase("persist-accepted-block:complete")
                 active_hash = str(
-                    self.rpc.call("getblockhash", [expected_height])
+                    self.runtime.rpc.call("getblockhash", [expected_height])
                 ).lower()
                 if active_hash != block_hash:
                     if already_confirmed:
-                        self._abandon_block_candidate(
+                        self.runtime._abandon_block_candidate(
                             PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                             "accepted ancestor left the active chain during replay",
                             block_hash=block_hash,
@@ -843,29 +1174,31 @@ class BlockFinalizationService:
                     # leaves the outbox row pending; restart replay
                     # re-registers the hash and re-evaluates from live chain
                     # state before rejecting.
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
                         "accepted block left the active chain before ledger confirmation",
                         block_hash=block_hash,
                         worker=worker,
                         expected_height=expected_height,
                     )
-                    outcome = getattr(self, "_block_candidate_outcome", None)
+                    outcome = getattr(
+                        self.runtime, "_block_candidate_outcome", None
+                    )
                     sealed_reason = (
                         getattr(outcome, "reason", None)
                         if outcome is not None
                         else None
                     )
                     if sealed_reason == PRISM_REJECTION_BLOCK_STALE:
-                        active_tip_height = int(self.rpc.call("getblockcount"))
-                        self.reject_prepared_block(
+                        active_tip_height = int(self.runtime.rpc.call("getblockcount"))
+                        self.runtime.reject_prepared_block(
                             block_hash=block_hash,
                             active_tip_height=active_tip_height,
                         )
                     return None
-                self._record_block_submitter_phase("confirm-accepted-block")
+                self.runtime._record_block_submitter_phase("confirm-accepted-block")
                 with audit_store.publication_order_guard():
-                    confirmation = self.ledger.confirm_accepted_block(
+                    confirmation = self.runtime.ledger.confirm_accepted_block(
                         block_hash=block_hash,
                         # The ledger confirmation function matches this value
                         # against the candidate row's own height. An accepted
@@ -875,13 +1208,13 @@ class BlockFinalizationService:
                     confirmed_count = int(confirmation.get("confirmed_count", 0))
                     if confirmed_count == 1:
                         audit_publication_identity = (
-                            self._audit_publication_identity(
+                            self.runtime._audit_publication_identity(
                                 block_hash=block_hash,
                                 block_height=expected_height,
                                 confirmation=confirmation,
                             )
                         )
-                self._record_block_submitter_phase(
+                self.runtime._record_block_submitter_phase(
                     "confirm-accepted-block:complete"
                 )
                 if confirmed_count != 1:
@@ -893,13 +1226,13 @@ class BlockFinalizationService:
                     # is reserved for a genuinely unexplained failure.
                     superseded = confirmed_count == -1
                     if not superseded:
-                        self.request_shutdown()
-                    self._clear_accepted_block_payout_preview(
+                        self.runtime.request_shutdown()
+                    self.runtime._clear_accepted_block_payout_preview(
                         block_hash,
                         invalidate_published=True,
                     )
                     if superseded:
-                        self._abandon_block_candidate(
+                        self.runtime._abandon_block_candidate(
                             PRISM_REJECTION_LEDGER_CONFIRMATION_SUPERSEDED,
                             "ledger row for accepted block "
                             f"{block_hash} was superseded before confirmation",
@@ -907,7 +1240,7 @@ class BlockFinalizationService:
                             worker=worker,
                         )
                     else:
-                        self._abandon_block_candidate(
+                        self.runtime._abandon_block_candidate(
                             PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                             f"ledger did not confirm accepted block {block_hash}",
                             block_hash=block_hash,
@@ -923,24 +1256,24 @@ class BlockFinalizationService:
                     # prior post-confirm mismatch instead of silently accepting
                     # the already-confirmed row on the next attempt.
                     as_of_reader = getattr(
-                        self.ledger,
+                        self.runtime.ledger,
                         "prior_balances_after_pool_block",
                         None,
                     )
-                    confirmed_balances = self.normalized_prior_balances(
+                    confirmed_balances = self.runtime.normalized_prior_balances(
                         as_of_reader(block_hash=block_hash)
                         if callable(as_of_reader)
-                        else self.ledger.current_prior_balances()
+                        else self.runtime.ledger.current_prior_balances()
                     )
-                    if self.settlement_balances_by_program(
+                    if self.runtime.settlement_balances_by_program(
                         confirmed_balances
-                    ) != self.settlement_balances_by_program(preview):
-                        self.request_shutdown()
-                        self._clear_accepted_block_payout_preview(
+                    ) != self.runtime.settlement_balances_by_program(preview):
+                        self.runtime.request_shutdown()
+                        self.runtime._clear_accepted_block_payout_preview(
                             block_hash,
                             invalidate_published=True,
                         )
-                        self._abandon_block_candidate(
+                        self.runtime._abandon_block_candidate(
                             PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
                             "confirmed payout balances do not match the published "
                             f"preview for accepted block {block_hash}",
@@ -950,13 +1283,13 @@ class BlockFinalizationService:
                         return None
                 # Durability caught up to the already-published logical state;
                 # clearing the parent override needs no second generation bump.
-                self._clear_accepted_block_payout_preview(block_hash)
-                self._schedule_current_payout_ledger_artifact_if_missing()
+                self.runtime._clear_accepted_block_payout_preview(block_hash)
+                self.runtime._schedule_current_payout_ledger_artifact_if_missing()
                 payout_publication_required = (
-                    self._payout_source_requires_publication()
+                    self.runtime._payout_source_requires_publication()
                 )
                 payout_publication_fenced = (
-                    self._payout_state_publication_fenced()
+                    self.runtime._payout_state_publication_fenced()
                 )
                 if payout_publication_required or payout_publication_fenced:
                     # A covered replay normally has no publication work. The
@@ -966,8 +1299,8 @@ class BlockFinalizationService:
                         payout_publication_fenced
                         and not payout_publication_required
                     )
-                    with self.lock:
-                        pending_cause = self._payout_state_source[2]
+                    with self.runtime.lock:
+                        pending_cause = self.runtime._payout_state_source[2]
                     # A bounded preview-publication loss already left the gate
                     # fenced and its retry scheduled. Do not monopolize the
                     # submitter with a second retry budget. Uncertain commits,
@@ -980,13 +1313,13 @@ class BlockFinalizationService:
                     )
                     published: int | None = None
                     if publish_now and getattr(
-                        self,
+                        self.runtime,
                         "reorg_reconciler_enabled",
                         True,
                     ):
-                        with self.lock:
-                            latest_tip = self._payout_state_source[1]
-                        summary = self.reconcile_prism_pool_blocks_once(
+                        with self.runtime.lock:
+                            latest_tip = self.runtime._payout_state_source[1]
+                        summary = self.runtime.reconcile_prism_pool_blocks_once(
                             tip_hash=latest_tip,
                             _force_publish=True,
                             _source_reserved=True,
@@ -996,7 +1329,7 @@ class BlockFinalizationService:
                             published = reconciled_generation
                     elif publish_now:
                         published = (
-                            self._publish_current_payout_state_with_retry_budget()
+                            self.runtime._publish_current_payout_state_with_retry_budget()
                         )
                     if publish_now and published is None:
                         # The block is durably confirmed; only the payout
@@ -1005,7 +1338,7 @@ class BlockFinalizationService:
                         # for an already-final block. Keep delivery fenced and
                         # let the scheduled tip refresh publish the newest
                         # source; this candidate's durable work is complete.
-                        self._block_payout_state_publication()
+                        self.runtime._block_payout_state_publication()
                         print(
                             "prism coordinator: accepted block confirmed "
                             "durably; payout publication deferred to the "
@@ -1026,7 +1359,7 @@ class BlockFinalizationService:
                     # durable partial commit. Supersede every prepared source
                     # and keep all delivery fenced until replay/reconciliation
                     # proves the resulting ledger state.
-                    self._block_payout_state_publication(
+                    self.runtime._block_payout_state_publication(
                         supersede_with=(
                             payout_commit_source,
                             block_hash,
@@ -1037,7 +1370,7 @@ class BlockFinalizationService:
                 raise
             finally:
                 if payout_commit_started is not None:
-                    self._observe_payout_state_seconds(
+                    self.runtime._observe_payout_state_seconds(
                         "preparation",
                         max(0.0, time.monotonic() - payout_commit_started),
                     )
@@ -1056,10 +1389,10 @@ class BlockFinalizationService:
         acceptance or an accepted race win), or ``None`` for a terminal
         abandonment already recorded through the outcome seam.
         """
-        outcome = getattr(self, "_block_candidate_outcome", None)
+        outcome = getattr(self.runtime, "_block_candidate_outcome", None)
         if outcome is None:
             outcome = threading.local()
-            self._block_candidate_outcome = outcome
+            self.runtime._block_candidate_outcome = outcome
         outcome.reason = None
         outcome.error = None
         outcome.stale_job_class = None
@@ -1069,31 +1402,31 @@ class BlockFinalizationService:
         expected_height = int(context.template["height"])
         block_hash = str(submission.block_hash_hex).lower()
         parent_hash = str(context.template["previousblockhash"])
-        self._ensure_job_cache_state()
+        self.runtime._ensure_job_cache_state()
         # Every disposition (queue drain, synchronous below-target submit,
         # outbox replay, retained retry) marks its hash outstanding so tip
         # observations arriving on other threads can register acceptance.
-        self._register_outstanding_block_candidate(block_hash)
+        self.runtime._register_outstanding_block_candidate(block_hash)
         self._record_block_candidate_progress("disposition-start")
         if (
-            self._block_candidate_acceptance_recorded(block_hash)
+            self.runtime._block_candidate_acceptance_recorded(block_hash)
             and node_submission.error is not None
         ):
             # A concurrent same-hash pass completed the success tail while
             # this duplicate-safe node offer waited for disposition. Do not
             # recreate its payout transition or accounting work.
-            self._clear_accepted_block_payout_preview(block_hash)
+            self.runtime._clear_accepted_block_payout_preview(block_hash)
             return True
-        with self.lock:
-            accepted_count = int(self.accepted_block_count)
+        with self.runtime.lock:
+            accepted_count = int(self.runtime.accepted_block_count)
             pool_closed = (
-                block_hash not in self._accounted_accepted_block_hashes
+                block_hash not in self.runtime._accounted_accepted_block_hashes
                 and (
-                    accepted_count >= int(self.max_blocks)
-                    or (bool(self.stop_after_block) and accepted_count >= 1)
+                    accepted_count >= int(self.runtime.max_blocks)
+                    or (bool(self.runtime.stop_after_block) and accepted_count >= 1)
                 )
             )
-        if pool_closed and self._block_candidate_chain_probe(
+        if pool_closed and self.runtime._block_candidate_chain_probe(
             block_hash,
             expected_height=expected_height,
         ) is True:
@@ -1106,7 +1439,7 @@ class BlockFinalizationService:
             # never fall through to submitblock on stale evidence.
             pool_closed = False
         if pool_closed:
-            self._abandon_block_candidate(
+            self.runtime._abandon_block_candidate(
                 PRISM_REJECTION_POOL_CLOSED,
                 "pool is no longer accepting blocks",
                 block_hash=block_hash,
@@ -1115,7 +1448,7 @@ class BlockFinalizationService:
             )
             return None
         self._record_block_candidate_progress("current-tip-rpc")
-        observed_tip = str(self.rpc.call("getbestblockhash"))
+        observed_tip = str(self.runtime.rpc.call("getbestblockhash"))
         self._record_block_candidate_progress("current-tip-rpc:complete")
         # A successful or transport-ambiguous fast-lane call can change the
         # tip before this post-submit probe. It is still a *fresh* attempt,
@@ -1140,10 +1473,10 @@ class BlockFinalizationService:
             landed_height = expected_height
         elif current_tip != parent_hash:
             try:
-                landed_height = self.active_block_candidate_height(block_hash)
+                landed_height = self.runtime.active_block_candidate_height(block_hash)
             except Exception:
                 traceback.print_exc()
-                self._abandon_block_candidate(
+                self.runtime._abandon_block_candidate(
                     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                     "could not determine whether a prior candidate is active",
                     block_hash=block_hash,
@@ -1152,7 +1485,7 @@ class BlockFinalizationService:
                 return None
         already_active = landed_height == expected_height
         if landed_height is not None and not already_active:
-            self._abandon_block_candidate(
+            self.runtime._abandon_block_candidate(
                 PRISM_REJECTION_BLOCK_STALE,
                 f"candidate active at unexpected height {landed_height}",
                 block_hash=block_hash,
@@ -1164,21 +1497,21 @@ class BlockFinalizationService:
             # A disposition probe is a tip observation too: remember it so a
             # later attempt cannot terminally abandon this hash on a racing
             # chain snapshot after this attempt fails mid-tail.
-            self._note_tip_observation_for_candidates(block_hash)
+            self.runtime._note_tip_observation_for_candidates(block_hash)
             print(
                 "prism coordinator: resuming finalization for active block candidate "
                 f"height={landed_height} hash={submission.block_hash_hex}",
                 flush=True,
             )
         elif parent_hash != current_tip:
-            if self._block_candidate_acceptance_recorded(block_hash):
+            if self.runtime._block_candidate_acceptance_recorded(block_hash):
                 # A duplicate wakeup can reach this check after the accepted
                 # success tail but after a newer tip hides the candidate from
                 # the active-header probe. Its durable work is already done;
                 # let the caller finalize the outbox as submitted.
-                self._clear_accepted_block_payout_preview(block_hash)
+                self.runtime._clear_accepted_block_payout_preview(block_hash)
                 return True
-            accepted_race_won = self._abandon_block_candidate(
+            accepted_race_won = self.runtime._abandon_block_candidate(
                 PRISM_REJECTION_STALE_JOB,
                 f"tip moved before submit: {current_tip}",
                 block_hash=block_hash,
@@ -1194,7 +1527,7 @@ class BlockFinalizationService:
             and node_submission.result not in (None, "duplicate")
             and not already_active
         ):
-            self._abandon_block_candidate(
+            self.runtime._abandon_block_candidate(
                 PRISM_REJECTION_SUBMITBLOCK_REJECTED,
                 f"submitblock rejected candidate: {node_submission.result}",
                 block_hash=block_hash,
@@ -1257,7 +1590,7 @@ class BlockFinalizationService:
                 # disarmed), a replay-shaped append would skip the epoch
                 # bump entirely; exposing the landing window's own anchor
                 # guarantees the bump the fences below check for.
-                landing_anchor_token = self._expose_inflight_scan_anchor(
+                landing_anchor_token = self.runtime._expose_inflight_scan_anchor(
                     int(declared_anchor_ms)
                 )
                 # An append classified as unfenced before that exposure
@@ -1268,7 +1601,7 @@ class BlockFinalizationService:
                 # against the now-exposed anchor) out before any window
                 # revalidation or epoch fence runs; no fence is held
                 # here, so the bump can always proceed.
-                self._await_unfenced_appends_predating_anchor(
+                self.runtime._await_unfenced_appends_predating_anchor(
                     int(declared_anchor_ms)
                 )
         try:
@@ -1276,7 +1609,7 @@ class BlockFinalizationService:
                 not admission.already_active
                 and not collection_only
                 and context_append_epoch < 0
-                and bool(getattr(self.ledger, "durable_payout_state", False))
+                and bool(getattr(self.runtime.ledger, "durable_payout_state", False))
             )
             if reconstructed_needs_revalidation and node_submission.attempted:
                 # Revalidation guards an offer the node has not yet seen: a
@@ -1303,17 +1636,17 @@ class BlockFinalizationService:
                 reconstructed_needs_revalidation
                 and not node_submission.attempted
             ):
-                with self._job_cache_lock:
+                with self.runtime._job_cache_lock:
                     revalidation_base_epoch = int(
-                        self._payout_ledger_append_invalidation_epoch
+                        self.runtime._payout_ledger_append_invalidation_epoch
                     )
                 try:
                     window_reproducible = (
-                        self._replayed_payout_window_reproducible(context)
+                        self.runtime._replayed_payout_window_reproducible(context)
                     )
                 except Exception:
                     traceback.print_exc()
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
                         "durable share-window replay failed for the "
                         "reconstructed candidate",
@@ -1322,7 +1655,7 @@ class BlockFinalizationService:
                     )
                     return None
                 if not window_reproducible:
-                    self._abandon_block_candidate(
+                    self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_STALE_JOB,
                         "replayed payout window omits a durably appended share",
                         block_hash=block_hash,
@@ -1343,14 +1676,14 @@ class BlockFinalizationService:
                 revalidated_append_epoch=revalidated_append_epoch,
             )
         finally:
-            self._retire_inflight_scan_anchor(landing_anchor_token)
+            self.runtime._retire_inflight_scan_anchor(landing_anchor_token)
         if landed is None:
             return None
         return LandedCandidate(*landed)
 
     def _candidate_already_accounted(self, block_hash: str) -> bool:
-        with self.lock:
-            return block_hash in self._accounted_accepted_block_hashes
+        with self.runtime.lock:
+            return block_hash in self.runtime._accounted_accepted_block_hashes
 
     def _persist_ctv_and_credit(
         self,
@@ -1363,7 +1696,7 @@ class BlockFinalizationService:
         ctv_manifest_set = landed.final_bundle.get("ctv_fanout_manifest_set")
         if isinstance(ctv_manifest_set, dict):
             self._record_block_candidate_progress("ctv-manifest-persist")
-            ctv_persistence = self.ledger.persist_ctv_fanout_manifest_set(
+            ctv_persistence = self.runtime.ledger.persist_ctv_fanout_manifest_set(
                 block_hash=block_hash,
                 manifest_set=ctv_manifest_set,
                 manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
@@ -1371,22 +1704,22 @@ class BlockFinalizationService:
             self._record_block_candidate_progress("ctv-manifest-persist:complete")
         if candidate.credit_share_on_accept:
             self._record_block_candidate_progress("accepted-share-credit")
-            self.append_accepted_share(
+            self.runtime.append_accepted_share(
                 candidate.client,
                 admission.context,
                 admission.submission,
                 candidate.pending_share,
-                candidate_intent=self.block_candidate_intent(candidate),
+                candidate_intent=self.runtime.block_candidate_intent(candidate),
             )
             # The preview window was intentionally clamped below this pending
             # winning share. Once the append is durable, enqueue an urgent
             # delta fold so a rapidly found child does not wait for the normal
             # 60-second cadence to include its payout obligation.
-            with self._job_cache_lock:
-                payout_generation = self._payout_state_generation
-                template_artifacts = self._template_artifacts
+            with self.runtime._job_cache_lock:
+                payout_generation = self.runtime._payout_state_generation
+                template_artifacts = self.runtime._template_artifacts
             if template_artifacts is not None:
-                self._schedule_payout_ledger_artifact_preparation(
+                self.runtime._schedule_payout_ledger_artifact_preparation(
                     payout_generation,
                     template_artifacts.network_difficulty,
                     bypass_build_interval=True,
@@ -1409,7 +1742,7 @@ class BlockFinalizationService:
         # exit-and-replay recovery path instead of hanging the disposition
         # invisibly.
         self._record_block_candidate_progress("accepted-share-stats")
-        evidence_share_count, evidence_distinct_miners = self.accepted_share_stats()
+        evidence_share_count, evidence_distinct_miners = self.runtime.accepted_share_stats()
         self._record_block_candidate_progress("accepted-share-stats:complete")
         evidence = {
             "schema": "qbit.prism.live-stratum-evidence.v1",
@@ -1417,7 +1750,7 @@ class BlockFinalizationService:
             "block_height": admission.expected_height,
             "coinbase_tx_hex": admission.submission.coinbase_tx_hex,
             "audit_report": landed.report,
-            "ledger_backend": self.ledger.backend_name,
+            "ledger_backend": self.runtime.ledger.backend_name,
             "persistence": landed.persistence,
             "confirmation": landed.confirmation,
             "audit_verification_identity": landed.audit_verification_identity,
@@ -1443,12 +1776,12 @@ class BlockFinalizationService:
         landed: LandedCandidate,
         prepared: FinalizationEvidence,
     ) -> dict[str, Any]:
-        audit_store = self._ensure_audit_artifact_store()
+        audit_store = self.runtime._ensure_audit_artifact_store()
         self._record_block_candidate_progress("evidence-write")
-        with self._payout_balance_mutation_lock:
+        with self.runtime._payout_balance_mutation_lock:
             with audit_store.publication_order_guard():
                 publication_floor_reader = getattr(
-                    self.ledger,
+                    self.runtime.ledger,
                     "audit_publication_sequence_floor",
                     None,
                 )
@@ -1490,17 +1823,17 @@ class BlockFinalizationService:
         # converting an invalid publication remains a finalization failure.
         del published_evidence
         block_hash = admission.block_hash
-        with self.lock:
-            newly_accounted = block_hash not in self._accounted_accepted_block_hashes
+        with self.runtime.lock:
+            newly_accounted = block_hash not in self.runtime._accounted_accepted_block_hashes
             if newly_accounted:
-                self._accounted_accepted_block_hashes.add(block_hash)
-                self.accepted_block_count += 1
+                self.runtime._accounted_accepted_block_hashes.add(block_hash)
+                self.runtime.accepted_block_count += 1
                 # Replace this hash's provisional capacity reservation with
                 # its durable accounted slot atomically. Keeping both until
                 # the outbox terminal write would double-count the block and
                 # unnecessarily reject an unrelated next solve.
-                self._block_fast_lane_reservations.discard(block_hash)
-            self.latest_coinbase_size_bytes = len(
+                self.runtime._block_fast_lane_reservations.discard(block_hash)
+            self.runtime.latest_coinbase_size_bytes = len(
                 str(
                     landed.final_bundle["signed_coinbase_manifest"]["manifest"][
                         "coinbase_tx_hex"
@@ -1509,7 +1842,7 @@ class BlockFinalizationService:
             ) // 2
             should_stop = (
                 newly_accounted
-                and (self.stop_after_block or self.accepted_block_count >= self.max_blocks)
+                and (self.runtime.stop_after_block or self.runtime.accepted_block_count >= self.runtime.max_blocks)
             )
         if not newly_accounted:
             return True
@@ -1519,7 +1852,7 @@ class BlockFinalizationService:
             flush=True,
         )
         if should_stop:
-            self.request_shutdown()
+            self.runtime.request_shutdown()
         else:
             # The public submitter wrapper performs this fanout only after its
             # writer scope (including outbox finalization) exits. The rare
@@ -1594,7 +1927,7 @@ class BlockFinalizationService:
         """Land one block candidate, then finalize its audit and payout state.
 
         Runs on the block-submitter thread (tests call it synchronously). It
-        never raises for a lost race and holds self.lock only for short
+        never raises for a lost race and holds self.runtime.lock only for short
         in-memory state mutation -- never across RPC, psql, subprocess, or
         file I/O -- so share acks and job pushes stay fast while a block
         lands. The durable candidate outbox is the pre-submit recovery boundary;
@@ -1603,23 +1936,23 @@ class BlockFinalizationService:
         after that finalization completes.
         """
         block_hash = str(candidate.submission.block_hash_hex).lower()
-        with self._block_candidate_disposition(block_hash):
-            terminal_outcome = self._block_candidate_terminal_outcome(block_hash)
+        with self.runtime._block_candidate_disposition(block_hash):
+            terminal_outcome = self.runtime._block_candidate_terminal_outcome(block_hash)
             if terminal_outcome is not None:
                 return terminal_outcome
             if node_submission is None:
-                node_submission = self._node_submission_for_direct_candidate(candidate)
+                node_submission = self.runtime._node_submission_for_direct_candidate(candidate)
             accepted = self.runtime._submit_block_candidate_serialized(
                 candidate,
                 node_submission=node_submission,
             )
             if not accepted:
-                outcome = getattr(self, "_block_candidate_outcome", None)
+                outcome = getattr(self.runtime, "_block_candidate_outcome", None)
                 if outcome is not None:
                     # Direct embedders do not use the outbox-finalization
                     # wrapper. A normal return means the serialized path also
                     # completed any prepared-state rejection it initiated.
-                    self._record_committed_block_candidate_abandonment(
+                    self.runtime._record_committed_block_candidate_abandonment(
                         block_hash,
                         outcome,
                     )

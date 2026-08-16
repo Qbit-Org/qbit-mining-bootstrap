@@ -38,13 +38,15 @@ from lab.prism.prism_coordinator import (
     PrismCoordinator,
     TemplateRefreshBlocked,
     WorkerIdentity,
-    _PayoutStatePublicationBlocked,
     _compact_share_payload,
     canonical_json_sha256,
     canonical_json_text,
-    default_prism_coinbase_tag_hex,
     now_ms,
     qbit_template_fingerprint,
+)
+from lab.prism.coordinator_config import default_prism_coinbase_tag_hex
+from lab.prism.payout_state import (
+    PayoutStatePublicationBlocked as _PayoutStatePublicationBlocked,
 )
 from lab.prism.share_ledger import (
     LedgerOperationTimeout,

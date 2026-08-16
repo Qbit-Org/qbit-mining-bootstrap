@@ -42,12 +42,12 @@ if not __package__:
 
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
+from lab.prism.coordinator_config import default_prism_coinbase_tag_hex
 from lab.prism.prism_coordinator import (
     ClientState,
     PRISM_REJECTION_REASON_IDS,
     PrismCoordinator,
     WorkerIdentity,
-    default_prism_coinbase_tag_hex,
 )
 
 EXTRANONCE2_SIZE = 8

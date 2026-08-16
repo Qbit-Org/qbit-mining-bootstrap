@@ -3939,7 +3939,7 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
         state.send = lambda _payload: None  # type: ignore[method-assign]
         server.clients = {state}
         with server.lock:
-            server._reorg_reconcile_trusted_memo[rpc.tip] = time.monotonic()
+            server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo[rpc.tip] = time.monotonic()
 
         def unexpected_pass(**_kwargs: object) -> dict[str, object]:
             raise AssertionError(
@@ -3957,7 +3957,7 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
 
         self.assertEqual(refreshed, 1)
         # A memo hit never needs the prefetch worker.
-        self.assertIsNone(server._reconcile_prefetch_executor)
+        self.assertIsNone(server._ensure_reorg_reconciler_service()._reconcile_prefetch_executor)
         metrics = server.metrics_payload()
         self.assertIn(
             'qbit_prism_reorg_reconcile_lookups_total{path="tip_refresh",source="memo_hit"} 1',
@@ -4011,7 +4011,7 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
             # A real trusted pass arms the per-tip memo; the join validates
             # the overlapped result against that armed entry.
             with server.lock:
-                server._reorg_reconcile_trusted_memo[tip_hash] = time.monotonic()
+                server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo[tip_hash] = time.monotonic()
             return True
 
         server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
@@ -4115,7 +4115,7 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
                 if method == "getblocktemplate":
                     # Models a detection during the fetch unarming the memo.
                     with server.lock:
-                        server._reorg_reconcile_trusted_memo.clear()
+                        server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo.clear()
                 return super().call(method, params)
 
         rpc = EvictingRpc(template, tip=tip)
@@ -4125,7 +4125,7 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
         state.send = lambda _payload: None  # type: ignore[method-assign]
         server.clients = {state}
         with server.lock:
-            server._reorg_reconcile_trusted_memo[tip] = time.monotonic()
+            server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo[tip] = time.monotonic()
         reconcile_calls: list[str] = []
 
         def fake_ensure(tip_hash: str) -> bool:
@@ -4177,7 +4177,7 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
                         server.tip_detection_epoch = (
                             int(getattr(server, "tip_detection_epoch", 0)) + 2
                         )
-                        server._reorg_reconcile_trusted_memo[tip] = (
+                        server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo[tip] = (
                             time.monotonic()
                         )
                 return super().call(method, params)
@@ -4189,7 +4189,7 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
         state.send = lambda _payload: None  # type: ignore[method-assign]
         server.clients = {state}
         with server.lock:
-            server._reorg_reconcile_trusted_memo[tip] = time.monotonic()
+            server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo[tip] = time.monotonic()
         reconcile_calls: list[str] = []
 
         def fake_ensure(tip_hash: str) -> bool:
@@ -4284,8 +4284,8 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
             # multi-second budget: the configured 0.05s must be what fired.
             self.assertLess(time.monotonic() - join_started, 1.0)
             self.assertTrue(started.is_set())
-            with server._reconcile_prefetch_executor_lock:
-                pending = server._reconcile_prefetch_pending
+            with server._ensure_reorg_reconciler_service()._reconcile_prefetch_executor_lock:
+                pending = server._ensure_reorg_reconciler_service()._reconcile_prefetch_pending
             self.assertIsNotNone(pending)
             assert pending is not None
             first_future = pending[1]
@@ -4295,8 +4295,8 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
             # no additional pass started.
             with self.assertRaises(TemplateRefreshBlocked):
                 server.poll_qbit_tip_template_once()
-            with server._reconcile_prefetch_executor_lock:
-                pending_again = server._reconcile_prefetch_pending
+            with server._ensure_reorg_reconciler_service()._reconcile_prefetch_executor_lock:
+                pending_again = server._ensure_reorg_reconciler_service()._reconcile_prefetch_pending
             assert pending_again is not None
             self.assertIs(pending_again[1], first_future)
             self.assertEqual(pass_calls[0], 1)
@@ -4334,8 +4334,8 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
                 server.poll_qbit_tip_template_once()
             self.assertLess(time.monotonic() - join_started, 1.0)
             self.assertTrue(started.is_set())
-            with server._reconcile_prefetch_executor_lock:
-                pending = server._reconcile_prefetch_pending
+            with server._ensure_reorg_reconciler_service()._reconcile_prefetch_executor_lock:
+                pending = server._ensure_reorg_reconciler_service()._reconcile_prefetch_pending
             self.assertIsNotNone(pending)
             assert pending is not None
             self.assertFalse(pending[1].done())
@@ -4416,12 +4416,12 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
         server, rpc = coordinator()
         server.reorg_reconciler_enabled = True
         with server.lock:
-            server._reorg_reconcile_trusted_memo[rpc.tip] = time.monotonic()
+            server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo[rpc.tip] = time.monotonic()
 
         self.assertTrue(server.ensure_reorg_reconciled_for_current_tip())
 
         with server.lock:
-            server._reorg_reconcile_trusted_memo[rpc.tip] = (
+            server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo[rpc.tip] = (
                 time.monotonic() - 100.0
             )
         serial_tips: list[str] = []
@@ -4474,7 +4474,7 @@ class ReorgReconcileRefreshPathTests(unittest.TestCase):
 
         self.assertEqual(refreshed, 1)
         self.assertEqual(reconcile_calls, [rpc.tip])
-        self.assertIsNone(server._reconcile_prefetch_executor)
+        self.assertIsNone(server._ensure_reorg_reconciler_service()._reconcile_prefetch_executor)
         metrics = server.metrics_payload()
         self.assertIn(
             'qbit_prism_reorg_reconcile_lookups_total{path="tip_refresh",source="serial"} 1',

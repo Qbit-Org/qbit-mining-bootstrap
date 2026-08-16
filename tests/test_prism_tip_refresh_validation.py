@@ -16,7 +16,9 @@ from lab.prism.prism_coordinator import (
     TemplateRefreshSuperseded,
     TipRefreshValidationToken,
     _FanoutCancellation,
-    _PayoutStateDeliveryGate,
+)
+from lab.prism.payout_state import (
+    PayoutStateDeliveryGate as _PayoutStateDeliveryGate,
 )
 from tests.prism_coordinator_test_support import (
     FakeLedger,

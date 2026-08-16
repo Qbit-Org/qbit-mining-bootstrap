@@ -3,30 +3,19 @@
 
 from __future__ import annotations
 
-import base64
 import copy
 from collections import OrderedDict
 from concurrent.futures import (
-    FIRST_COMPLETED,
-    CancelledError as FuturesCancelledError,
     Future,
-    InvalidStateError,
     ThreadPoolExecutor,
-    wait,
 )
 from contextlib import ExitStack, contextmanager
-import errno
 import faulthandler
-from functools import wraps
 import hashlib
-import heapq
-import http.client
-import inspect
 import json
-import math
 import os
 import queue
-import random
+import random  # noqa: F401 - patch seam for tip-refresh holdoff jitter tests
 import shlex
 import signal
 import socket
@@ -36,9 +25,8 @@ import threading
 import time
 import traceback
 import uuid
-import weakref
 from dataclasses import replace as dataclass_replace
-from decimal import Context, Decimal, InvalidOperation, ROUND_CEILING, getcontext, localcontext
+from decimal import Decimal, ROUND_CEILING
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -62,6 +50,8 @@ from lab.prism.background_services import (
     BackgroundServiceSpec,  # noqa: F401 - compatibility re-export
     LedgerLeaseHeartbeatPorts,
     LedgerLeaseHeartbeatService,
+    WatchdogPorts,
+    WatchdogService,
     _LeaseHeartbeatStateField,
     guard_session_verifier as _lease_guard_session_verifier,
 )
@@ -69,7 +59,6 @@ from lab.prism.background_services import (
 from lab.prism.coordinator_shutdown import (
     CoordinatorShutdownController,  # noqa: F401 - compatibility re-export
     ShutdownInProgress,  # noqa: F401 - compatibility re-export
-    _WriterOperationToken,  # noqa: F401 - compatibility re-export
     ledger_writer_operation,  # noqa: F401 - compatibility re-export
 )
 from lab.prism.coordinator_config import (
@@ -77,24 +66,15 @@ from lab.prism.coordinator_config import (
     DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,  # noqa: F401
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,  # noqa: F401
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,  # noqa: F401
-    DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS,
     DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS,  # noqa: F401
     DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS,
     DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS,  # noqa: F401
-    DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS,  # noqa: F401 - compatibility re-export
+    DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS,
     DEFAULT_DIRECT_COINBASE_PAYOUT_FLOOR_SATS,
-    DEFAULT_HIGHDIFF_DIFFICULTY,  # noqa: F401 - compatibility re-export
-    DEFAULT_HIGHDIFF_MAX_DIFFICULTY,  # noqa: F401 - compatibility re-export
     DEFAULT_MAX_COINBASE_SETTLEMENT_OUTPUTS,
     DEFAULT_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION,
     DEFAULT_MAX_DIRECT_COINBASE_OUTPUTS,
-    DEFAULT_MIN_OUTPUT_FEERATE_SATS_PER_BYTE,  # noqa: F401 - compatibility re-export
-    DEFAULT_MIN_OUTPUT_SAFETY_MULTIPLIER,  # noqa: F401 - compatibility re-export
-    DEFAULT_P2MR_SPEND_INPUT_BYTES,  # noqa: F401 - compatibility re-export
-    DEFAULT_PRISM_BLOCKPOLL_SECONDS,
-    DEFAULT_PRISM_BLOCKWAIT_TIMEOUT_SECONDS,
     DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
-    DEFAULT_PRISM_COINBASE_TAG,  # noqa: F401 - compatibility re-export
     DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS,
     DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE,
     DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,  # noqa: F401
@@ -114,8 +94,6 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_METRICS_REFRESH_SECONDS,  # noqa: F401 - compatibility re-export
     DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,  # noqa: F401
     DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,  # noqa: F401
-    DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES,
-    DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS,
     DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS,  # noqa: F401
     DEFAULT_PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS,  # noqa: F401
     DEFAULT_PRISM_PAYOUT_ARTIFACT_MIN_BUILD_INTERVAL_SECONDS,  # noqa: F401
@@ -123,8 +101,6 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,  # noqa: F401
     DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
     DEFAULT_PRISM_ROUTINE_ADMISSION_DEADLINE_SECONDS,  # noqa: F401
-    DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_PER_CONNECTION,
-    DEFAULT_PRISM_SAME_TIP_JOB_RETENTION_SECONDS,
     DEFAULT_PRISM_STALE_GRACE_SECONDS,
     DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS,  # noqa: F401
     DEFAULT_PRISM_STRATUM_BIND_RETRY_SECONDS,  # noqa: F401
@@ -134,11 +110,9 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME,  # noqa: F401
     DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS,
     DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS,
-    DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS,
     DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
     DEFAULT_PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS,  # noqa: F401
     DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS,
-    DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS,  # noqa: F401 - compatibility re-export
     DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS,
     DEFAULT_PRISM_WORKER_METRICS_LIMIT,
     DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS,
@@ -146,57 +120,40 @@ from lab.prism.coordinator_config import (
     DEFAULT_SHARE_COMMIT_BATCH_SIZE,  # noqa: F401 - compatibility re-export
     DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS,  # noqa: F401 - compatibility re-export
     DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS,  # noqa: F401 - compatibility re-export
-    DEFAULT_TESTNET_USERNAME_FALLBACK_ADDRESS,  # noqa: F401 - compatibility re-export
-    MAX_PRISM_COINBASE_TAG_BYTES,  # noqa: F401 - compatibility re-export
     StratumListenerProfile,  # noqa: F401 - compatibility re-export
     TESTNET_QBIT_CHAINS,  # noqa: F401 - compatibility re-export
     VALID_COINBASE_OUTPUT_POLICIES,
-    default_prism_coinbase_tag_hex,  # noqa: F401 - compatibility re-export
     default_prism_payout_policy,
     default_prism_username_fallback_address,  # noqa: F401 - compatibility re-export
     env,
     env_bool,
-    env_decimal,  # noqa: F401 - compatibility re-export
     env_int,
     env_nonnegative_float,
     env_nonnegative_int,
-    env_nonnegative_int_with_legacy,  # noqa: F401 - compatibility re-export
     env_optional,
-    env_optional_bool,  # noqa: F401 - compatibility re-export
-    env_optional_positive_int,  # noqa: F401 - compatibility re-export
+    env_optional_positive_int,
     env_optional_positive_int_with_legacy,
     env_positive_float,
     env_positive_int,
     env_positive_int_with_legacy,
-    env_seed_hex,  # noqa: F401 - compatibility re-export
     load_coordinator_config,
     load_share_weights,
-    load_prism_highdiff_listener,  # noqa: F401 - compatibility re-export
-    load_prism_vardiff_config,  # noqa: F401 - compatibility re-export
-    production_mode,  # noqa: F401 - compatibility re-export
-    require_production_env,  # noqa: F401 - compatibility re-export
     resolve_initial_job_max_workers,  # noqa: F401 - compatibility re-export
     validate_hex,
     validate_initial_job_max_workers,  # noqa: F401 - compatibility re-export
     validate_job_build_executor_workers,  # noqa: F401 - compatibility re-export
     validate_payout_artifact_age_bounds,  # noqa: F401 - compatibility re-export
-    validate_prism_production_gate,  # noqa: F401 - compatibility re-export
-    validate_same_tip_job_retention_limits,  # noqa: F401 - compatibility re-export
 )
 from lab.prism.ctv_broadcaster import CtvFanoutBroadcaster
 from lab.prism.ctv_broadcaster_daemon import (
     CtvFanoutBroadcastDaemon,
     CtvFanoutChunkResult,
     CtvFanoutDaemonResult,
-    MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE,
 )
 # Compatibility re-exports; new callers should import lab.prism.ctv_runtime.
 from lab.prism.ctv_runtime import (
     CtvRuntimeConfig,
     CtvRuntimeService,
-    PRISM_CTV_BROADCASTER_CHUNK_ROWS_BUCKETS,  # noqa: F401
-    PRISM_CTV_BROADCASTER_CHUNK_SECONDS_BUCKETS,  # noqa: F401
-    PRISM_CTV_BROADCASTER_SECONDS_BUCKETS,  # noqa: F401
 )
 # Compatibility re-exports; new callers should import the owning J1 modules.
 from lab.prism.audit_artifacts import (
@@ -250,6 +207,15 @@ from lab.prism.block_finalization import (
     PRISM_REJECTION_SUBMITBLOCK_REJECTED,
     BlockFinalizationService,
 )
+from lab.prism.metrics import MetricsRenderer
+from lab.prism.reorg_reconciler import (
+    DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS,
+    PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS,
+    ReorgCompatibilityField,
+    ReorgPorts,
+    ReorgReconcilerService,
+    qbit_chain_view_untrusted as reorg_chain_view_untrusted,
+)
 from lab.prism.vardiff_service import (
     PRISM_VARDIFF_IDLE_SECONDS_BUCKETS,
     PRISM_VARDIFF_IDLE_SKIP_REASONS,
@@ -269,7 +235,6 @@ from lab.prism.share_submission import (
     PRISM_REJECTION_STALE_JOB,
     PRISM_REJECTION_UNAUTHORIZED_WORKER,
     PRISM_REJECTION_UNKNOWN_JOB,
-    PRISM_SHARE_ACK_RESULTS,
     BlockSolvesDroppedCompatibilityField,
     RecentShareCompatibilityField,
     RecentShareIndex,
@@ -293,25 +258,21 @@ from lab.prism.bundle_compiler import (
 )
 from lab.prism.job_bundle import (
     CachedJobBundle,
-    CollectionIdentityUnavailable,  # noqa: F401 - compatibility re-export
     JobBuildAdmissionDeadlineExceeded,  # noqa: F401 - compatibility re-export
+    PRISM_JOB_BUILD_SECONDS_BUCKETS,
     JobBuildCancellation as _JobBuildCancellation,
     JobBuildCancelled,
     JobBuildFlight as _JobBuildFlight,
-    JobBuildKey,  # noqa: F401 - compatibility re-export
     JobBuildRequest as _JobBuildRequest,
     JobBuildSuperseded,
-    JobBuildWaiterCancelled as _JobBuildCancelled,  # noqa: F401
     JobBundleBuildControl as _JobBundleBuildControl,
     JobBundleBuildSuperseded as _JobBundleBuildSuperseded,
     JobBundleService,
 )
 from lab.prism.job_delivery import (
-    DEFAULT_PRISM_EVICTED_JOB_PRUNE_INTERVAL_SECONDS,  # noqa: F401 - compatibility re-export
     EvictedJobEntry,
     JobBuildFailed as _JobBuildFailed,
     JobDeliveryService,
-    MAX_ACTIVE_PRISM_JOBS_PER_CLIENT,  # noqa: F401 - compatibility re-export
     PRISM_CREDIT_POLICY_STALE_GRACE,
     PRISM_DELIVERY_PRIORITY_INITIAL,
     PRISM_DELIVERY_PRIORITY_NEW_TIP,
@@ -319,12 +280,11 @@ from lab.prism.job_delivery import (
     PRISM_EVICTED_JOB_CAPACITY_SCOPES,
     PRISM_EVICTED_JOB_CLASSES,
     PRISM_EVICTED_JOB_SUBMIT_OUTCOMES,
-    PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
     PendingInitialJob,
     PrismJobContext,
 )
 from lab.prism.payout_state import (
-    PayoutStatePublicationBlocked as _PayoutStatePublicationBlocked,  # noqa: F401
+    PayoutStatePublicationBlocked,
     TemplateRefreshBlocked,
     TemplateRefreshSuperseded,
 )
@@ -336,12 +296,10 @@ from lab.prism.template_artifacts import (
 from lab.prism.tip_refresh import (
     FanoutCancellation as _FanoutCancellation,
     PRISM_TIP_REFRESH_BUILD_PHASES,  # noqa: F401 - compatibility re-export
-    PRISM_TIP_REFRESH_CANCELLATION_STAGES,  # noqa: F401 - compatibility re-export
     PRISM_TIP_REFRESH_COVERAGE_TARGETS,  # noqa: F401 - compatibility re-export
     PRISM_TIP_REFRESH_FAILURE_HOLDOFF_JITTER_FRACTION,  # noqa: F401 - compatibility re-export
     PRISM_TIP_REFRESH_REENTRY_BACKOFF_SECONDS,  # noqa: F401 - compatibility re-export
-    PRISM_TIP_REFRESH_RESULTS,  # noqa: F401 - compatibility re-export
-    PRISM_TIP_REFRESH_SECONDS_BUCKETS,
+    PRISM_TIP_REFRESH_SECONDS_BUCKETS,  # noqa: F401 - compatibility re-export
     PRISM_TIP_REFRESH_WAVE_OUTCOMES,  # noqa: F401 - compatibility re-export
     PRISM_TIP_REFRESH_WAVE_PASS_BUDGET,  # noqa: F401 - compatibility re-export
     RefreshResult,
@@ -354,19 +312,15 @@ from lab.prism.tip_refresh import (
 )
 # Compatibility re-exports; new callers should import lab.prism.payout_state.
 from lab.prism.payout_state import (
-    AcceptedBlockPayoutTransition as _AcceptedBlockPayoutTransition,  # noqa: F401
     DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS,  # noqa: F401 - compatibility re-export
     DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
     PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP,  # noqa: F401 - compatibility re-export
     PRISM_PAYOUT_DELIVERY_GENERATIONS,  # noqa: F401 - compatibility re-export
-    PayoutDeliveryAdmission as _PayoutDeliveryAdmission,  # noqa: F401
     PayoutLedgerArtifact,
     PayoutStateArtifact,
     PayoutStateCandidate,
-    PayoutStateDeliveryGate as _PayoutStateDeliveryGate,  # noqa: F401
     PayoutStateService,
     PayoutStateSnapshot,  # noqa: F401 - compatibility re-export
-    PublishedPayoutState,
     _IncrementalPayoutArtifactWindow,  # noqa: F401 - compatibility re-export
     _PayoutWindowMaterialization,
 )
@@ -394,22 +348,15 @@ from lab.prism.stratum_session import (
     difficulty_payload as stratum_difficulty_payload,
     error_payload as stratum_error_payload,
     job_payload as stratum_job_payload,
-    parse_stratum_password_options,  # noqa: F401 - compatibility re-export
-    parse_worker_username,  # noqa: F401 - compatibility re-export
     result_payload as stratum_result_payload,
-    split_worker_username,  # noqa: F401 - compatibility re-export
     stratum_accept_heartbeat_names as configured_accept_heartbeat_names,
 )
 # Compatibility re-exports; new callers should import lab.prism.progress_health.
 from lab.prism.progress_health import (
-    BundleBuildToken,  # noqa: F401 - compatibility re-export
-    DeliveryProof,
     EligibilitySnapshot,  # noqa: F401 - compatibility re-export
-    PROGRESS_HEALTH_REASONS as PRISM_PROGRESS_HEALTH_REASONS,
     ProgressHealthConfig,
     ProgressHealthService,
     ProgressHealthSnapshot,
-    RefreshActivityToken,  # noqa: F401 - compatibility re-export
     WorkGeneration,
 )
 from lab.prism.rpc import (
@@ -422,11 +369,6 @@ from lab.prism.share_ledger import (
     DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
     DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,  # noqa: F401 - compatibility re-export
-    IncrementalShareWindow,
-    IncrementalShareJsonSequence,
-    IncrementalWindowAdvanceStats,
-    IncrementalWindowFallback,
-    LedgerOperationTimeout,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -436,34 +378,11 @@ from lab.prism.share_ledger import (
 )
 
 MAX_PRISM_JOB_BUNDLE_CACHE_ENTRIES = 128
-# Trusted reconcile outcomes are memoized per tip so an untrusted outcome for
-# one tip cannot unarm the cache for every other tip. The map only ever
-# answers for the current best hash; a small bound merely caps growth while
-# stale entries age out of the TTL.
-PRISM_REORG_RECONCILE_MEMO_MAX_TIPS = 8
-# Same-tip reconcile callers coalesce behind one in-flight pass. The wait is
-# a liveness backstop, not a pacing knob: a follower that outwaits it simply
-# runs its own serialized pass, exactly as every caller did before flights.
-DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS = 30.0
-# Reconcile demand observability: which caller lane asked, and what satisfied
-# it. The tip-refresh lane can be satisfied by the per-tip trusted memo, by a
-# pass overlapped with the template fetch on the prefetch worker, or by a
-# serial pass on the refresh thread; per-client job builds only ever see a
-# memo hit or their own serial pass.
-PRISM_REORG_RECONCILE_LOOKUP_PATHS = ("tip_refresh", "job_build")
-PRISM_REORG_RECONCILE_LOOKUP_SOURCES = ("memo_hit", "overlap", "serial")
+# The reorg reconcile memo/flight/prefetch constants and machinery moved to
+# lab.prism.reorg_reconciler; the two runtime-override defaults the port
+# wiring reads are re-imported above.
 # Read-to-ack latency labels for mining.submit now live with the
 # share-submission owner (PRISM_SHARE_ACK_RESULTS is re-exported above).
-# The overlapped reconcile pass runs ledger reads that can crawl while the
-# chain churns. The tip-refresh join must never park the poll loop on it
-# past the liveness budget: a bounded join leaves the pass running in its
-# single slot (the paced retry re-joins the same future) and keeps the poll
-# loop's heartbeat live while the pass catches up.
-PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS = 20.0
-# Ceiling for operator overrides of the join budget: a value at or above the
-# poll loop's failure/watchdog budgets would silently reinstate the very park
-# the bound exists to prevent.
-PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_CEILING_SECONDS = 60.0
 # Cancellation-check slice while an initial request rides a subscribed
 # publication-priority build promise. Promise completion wakes the waiter
 # immediately; this only bounds how stale a cancellation can go unnoticed.
@@ -494,41 +413,8 @@ PRISM_SNAPSHOT_WINDOW_MARGIN = 2
 # reaches miners; real connections stamp their own extranonce1 into the job.
 # Client extranonce1 values start at 1, so the placeholder never collides.
 PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX = "00000000"
-PRISM_JOB_BUILD_SECONDS_BUCKETS = (
-    0.01,
-    0.025,
-    0.05,
-    0.1,
-    0.25,
-    0.5,
-    1.0,
-    2.5,
-    5.0,
-    10.0,
-    30.0,
-)
-PRISM_JOB_BUILD_PHASES = (
-    "reorg",
-    "template",
-    "merkle",
-    "ledger",
-    "payout_artifact",
-    "payout",
-    "ctv",
-    "input_serialization",
-    "worker",
-    "output_serialization",
-    "assembly",
-    "bundle",
-    "preparation_wait",
-    "executor_queue",
-    "client_lock",
-    "payout_gate",
-    "stamp",
-    "socket_send",
-    "send",
-)
-PRISM_JOB_CACHE_KINDS = ("template", "bundle")
+# The job-build seconds buckets, phase registry, and cache-kind registry are
+# canonical in lab.prism.job_bundle; the metrics renderer imports them there.
 # The ten submit-path rejection reasons moved to lab.prism.share_submission
 # and the four accepted-block finalization reasons moved to
 # lab.prism.block_finalization; both groups are re-exported above. Only the
@@ -691,17 +577,6 @@ def canonical_json_sha256(value: object) -> str:
     if callable(incremental_digest):
         return str(incremental_digest())
     return hashlib.sha256(canonical_json_text(value).encode()).hexdigest()
-
-
-class _ReconcileFlight:
-    """One in-flight reconcile pass shared by concurrent same-tip callers."""
-
-    __slots__ = ("event", "summary", "exception")
-
-    def __init__(self) -> None:
-        self.event = threading.Event()
-        self.summary: dict[str, object] | None = None
-        self.exception: BaseException | None = None
 
 
 class _BundlePreparationSuperseded(TemplateRefreshSuperseded):
@@ -1331,6 +1206,45 @@ class PrismCoordinator:
     # instance dict and are adopted at service construction.
     recent_share_keys = RecentShareCompatibilityField()
     block_solves_dropped_counts = BlockSolvesDroppedCompatibilityField()
+
+    # Reorg reconciler owner state routed through descriptors; the
+    # ReorgReconcilerService holds the single mutable copy once it exists
+    # (see lab/prism/reorg_reconciler.py). Pre-service writes land in
+    # backing slots and are adopted at service construction.
+    reorg_reconciler_enabled = ReorgCompatibilityField("enabled", True)
+    reorg_reconcile_cache_seconds = ReorgCompatibilityField(
+        "cache_seconds",
+        DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
+    )
+    reorg_inactive_block_count = ReorgCompatibilityField(
+        "inactive_block_count",
+        0,
+    )
+    reorg_reactivated_block_count = ReorgCompatibilityField(
+        "reactivated_block_count",
+        0,
+    )
+    reorg_reconcile_skip_count = ReorgCompatibilityField(
+        "reconcile_skip_count",
+        0,
+    )
+    reorg_reconcile_error_count = ReorgCompatibilityField(
+        "reconcile_error_count",
+        0,
+    )
+    matured_payout_count = ReorgCompatibilityField("matured_payout_count", 0)
+    last_reorg_reconciled_tip_hash = ReorgCompatibilityField(
+        "last_tip_hash",
+        None,
+    )
+    last_reorg_reconciled_trusted = ReorgCompatibilityField(
+        "last_trusted",
+        False,
+    )
+    last_reorg_reconciled_monotonic = ReorgCompatibilityField(
+        "last_monotonic",
+        None,
+    )
 
     # J1/template/compiler owner state routed through descriptors; the owner
     # services hold the single mutable copy (see lab/prism/job_bundle.py,
@@ -2201,62 +2115,9 @@ class PrismCoordinator:
                 self.__dict__["_block_finalization_service"] = service
             return service
 
-    # Health snapshot state lives in the observability owner (see
-    # lab/prism/observability.py); the legacy raw fields route there through
-    # these compatibility properties so existing attribute pokes keep working.
-    @property
-    def _health_snapshot(self) -> dict[str, object] | None:
-        return self._ensure_observability_service().state().health_snapshot
-
-    @_health_snapshot.setter
-    def _health_snapshot(self, value: dict[str, object] | None) -> None:
-        self._ensure_observability_service().set_health_snapshot_for_compatibility(
-            value
-        )
-
-    @property
-    def _health_snapshot_monotonic(self) -> float | None:
-        return (
-            self._ensure_observability_service().state().health_snapshot_monotonic
-        )
-
-    @_health_snapshot_monotonic.setter
-    def _health_snapshot_monotonic(self, value: float | None) -> None:
-        self._ensure_observability_service().set_health_snapshot_monotonic_for_compatibility(
-            value
-        )
-
-    @property
-    def _health_refresh_loop_running(self) -> bool:
-        return (
-            self._ensure_observability_service().state().health_refresh_loop_running
-        )
-
-    @_health_refresh_loop_running.setter
-    def _health_refresh_loop_running(self, value: bool) -> None:
-        self._ensure_observability_service().set_loop_running_for_compatibility(value)
-
-    @property
-    def _health_snapshot_lock(self) -> threading.RLock:
-        return self._ensure_observability_service().lock
-
-    @_health_snapshot_lock.setter
-    def _health_snapshot_lock(self, value: threading.RLock) -> None:
-        self._ensure_observability_service().replace_lock_for_test(value)
-
-    @property
-    def health_snapshot_refresh_failure_count(self) -> int:
-        return (
-            self._ensure_observability_service()
-            .state()
-            .health_snapshot_refresh_failure_count
-        )
-
-    @health_snapshot_refresh_failure_count.setter
-    def health_snapshot_refresh_failure_count(self, value: int) -> None:
-        self._ensure_observability_service().set_refresh_failure_count_for_compatibility(
-            value
-        )
+    # The five PR 79 health compatibility properties were removed by this
+    # layer; health snapshot state is read and poked only through the
+    # observability service's state() and narrow *_for_test accessors.
 
     def __init__(self, config: CoordinatorConfig | None = None) -> None:
         self.config = load_coordinator_config() if config is None else config
@@ -2376,9 +2237,8 @@ class PrismCoordinator:
         )
         self.last_successful_template_refresh_monotonic: float | None = None
         self.template_refresh_failure_started_monotonic: float | None = None
-        self._coordination_blocked_lock = threading.Lock()
-        self._coordination_blocked_since_monotonic: float | None = None
-        self._publication_watchdog_exit_claimed = False
+        # Coordination-blocked streak state moved to the WatchdogService
+        # owner (see lab/prism/background_services.py).
         self.reorg_reconcile_cache_seconds = job_config.reorg_reconcile_cache_seconds
         self.health_refresh_seconds = lifecycle_config.health_refresh_seconds
         self.metrics_refresh_seconds = lifecycle_config.metrics_refresh_seconds
@@ -2714,6 +2574,10 @@ class PrismCoordinator:
         self.last_reorg_reconciled_monotonic: float | None = None
         self._prism_payout_policy_cache: dict[str, object] | None = None
         self._ensure_job_cache_state()
+        # Eager reorg owner root: the reconciler service adopts the compat
+        # seed values assigned above and owns every flight/memo/lookup/
+        # prefetch container from here on.
+        self._ensure_reorg_reconciler_service()
         self.stop_event = threading.Event()
         self._shutdown_controller = CoordinatorShutdownController(
             self.writer_quiescence_timeout_seconds
@@ -2793,50 +2657,34 @@ class PrismCoordinator:
             elapsed_seconds,
         )
 
-    def share_ack_metrics_lines(self) -> list[str]:
-        # Prometheus formatting stays here until the PR 80 metrics owner; the
-        # data is the submission owner's copied snapshot. A coordinator whose
-        # submission service was never touched has observed nothing, so it
-        # renders zeroed histograms (or a legacy embedder's seeded state)
-        # without forcing service construction.
+    def share_ack_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Copied share-ACK histograms for the metrics renderer.
+
+        The data is the submission owner's copied snapshot. A coordinator
+        whose submission service was never touched has observed nothing, so
+        it reports zeroed histograms (or a legacy embedder's seeded state)
+        without forcing service construction.
+        """
         service = self.__dict__.get("_share_submission_service")
         if service is not None:
-            histograms = service.share_ack_snapshot()
-        else:
-            legacy = self.__dict__.get("share_ack_histograms")
-            histograms = (
-                {
-                    result: {
-                        "buckets": dict(histogram["buckets"]),
-                        "sum": float(histogram["sum"]),
-                        "count": int(histogram["count"]),
-                    }
-                    for result, histogram in legacy.items()
+            return service.share_ack_snapshot()
+        legacy = self.__dict__.get("share_ack_histograms")
+        return (
+            {
+                result: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
                 }
-                if legacy is not None
-                else empty_share_ack_histograms()
-            )
-        lines = [
-            "# HELP qbit_prism_share_ack_seconds mining.submit line arrival to Stratum response, by outcome.",
-            "# TYPE qbit_prism_share_ack_seconds histogram",
-        ]
-        for result in PRISM_SHARE_ACK_RESULTS:
-            histogram = histograms[result]
-            buckets = histogram["buckets"]
-            lines.extend(
-                f'qbit_prism_share_ack_seconds_bucket{{result="{result}",le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
-                for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
-            )
-            lines.append(
-                f'qbit_prism_share_ack_seconds_bucket{{result="{result}",le="+Inf"}} {histogram["count"]}'
-            )
-            lines.append(
-                f'qbit_prism_share_ack_seconds_sum{{result="{result}"}} {histogram["sum"]:.6f}'
-            )
-            lines.append(
-                f'qbit_prism_share_ack_seconds_count{{result="{result}"}} {histogram["count"]}'
-            )
-        return lines
+                for result, histogram in legacy.items()
+            }
+            if legacy is not None
+            else empty_share_ack_histograms()
+        )
+
+    def share_ack_metrics_lines(self) -> list[str]:
+        # Compatibility wrapper for the extracted metrics owner.
+        return self._ensure_metrics_renderer().share_ack_metrics_lines()
 
     @staticmethod
     def _client_vardiff_lock(client: ClientState) -> threading.RLock:
@@ -3838,6 +3686,132 @@ class PrismCoordinator:
             self.__dict__["stratum_session_service"] = service
         return service
 
+    def _ensure_reorg_reconciler_service(self) -> ReorgReconcilerService:
+        service = self.__dict__.get("_reorg_reconciler_service")
+        if service is not None:
+            return service
+        init_lock = self.__dict__.setdefault(
+            "_reorg_reconciler_service_init_lock",
+            threading.Lock(),
+        )
+        with init_lock:
+            service = self.__dict__.get("_reorg_reconciler_service")
+            if service is not None:
+                return service
+            service = ReorgReconcilerService(
+                ReorgPorts(
+                    rpc_call=lambda *args, **kwargs: self.rpc.call(
+                        *args,
+                        **kwargs,
+                    ),
+                    ledger=lambda: self.ledger,
+                    ensure_job_cache_state=self._ensure_job_cache_state,
+                    # The memo/counter state lock is the coordinator's
+                    # control-plane lock (resolved live: focused tests
+                    # replace it), preserving the atomicity tip observation
+                    # relies on when it evicts memo entries under self.lock.
+                    state_lock=lambda: self.lock,
+                    source_tip=self._reorg_payout_source_tip,
+                    reserve_external_tip=lambda tip: self._reserve_payout_state_source(
+                        "external_tip",
+                        tip_hash=tip,
+                    ),
+                    max_supersession_retries=lambda: getattr(
+                        self,
+                        "payout_reconcile_supersession_retries",
+                        DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
+                    ),
+                    # #113's heartbeat-aware acquisition of the payout-state
+                    # preparation lock.
+                    prepare_lock=lambda: self._block_submitter_lock(
+                        self._payout_state_prepare_lock,
+                        "payout-state-prepare",
+                    ),
+                    capture_source=lambda: self._capture_payout_state_source(),
+                    prepared_candidate=lambda captured, **kwargs: (
+                        self._prepared_payout_state_candidate(
+                            captured,
+                            **kwargs,
+                        )
+                    ),
+                    captured_publication_required=lambda captured: (
+                        self._captured_payout_source_requires_publication(
+                            captured
+                        )
+                    ),
+                    block_publication=lambda **kwargs: (
+                        self._block_payout_state_publication(**kwargs)
+                    ),
+                    publication_guard=lambda: (
+                        self._ensure_audit_artifact_store().publication_order_guard()
+                    ),
+                    publish_candidate=lambda candidate: (
+                        self._publish_payout_state_candidate(candidate)
+                    ),
+                    observe_preparation=lambda elapsed: (
+                        self._observe_payout_state_seconds(
+                            "preparation",
+                            elapsed,
+                        )
+                    ),
+                    chain_view_untrusted=lambda: self.qbit_chain_view_untrusted(),
+                    reorg_proof_snapshot=lambda: (
+                        self._ensure_tip_refresh_service().reorg_proof_snapshot()
+                    ),
+                    flight_wait_seconds=lambda: float(
+                        getattr(
+                            self,
+                            "reconcile_flight_wait_seconds",
+                            DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS,
+                        )
+                    ),
+                    prefetch_join_timeout_seconds=lambda: getattr(
+                        self,
+                        "reconcile_prefetch_join_timeout_seconds",
+                        PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS,
+                    ),
+                    reconcile_with_admission=lambda **kwargs: (
+                        self.reconcile_prism_pool_blocks_once(**kwargs)
+                    ),
+                    reconcile_serialized=lambda **kwargs: (
+                        self._reconcile_prism_pool_blocks_serialized(**kwargs)
+                    ),
+                    ensure_tip=lambda tip: self.ensure_reorg_reconciled_for_tip(
+                        tip
+                    ),
+                ),
+                enabled=bool(self.reorg_reconciler_enabled),
+                cache_seconds=self.reorg_reconcile_cache_seconds,
+                inactive_block_count=int(self.reorg_inactive_block_count),
+                reactivated_block_count=int(self.reorg_reactivated_block_count),
+                reconcile_skip_count=int(self.reorg_reconcile_skip_count),
+                reconcile_error_count=int(self.reorg_reconcile_error_count),
+                matured_payout_count=int(self.matured_payout_count),
+                last_tip_hash=self.last_reorg_reconciled_tip_hash,
+                last_trusted=bool(self.last_reorg_reconciled_trusted),
+                last_monotonic=self.last_reorg_reconciled_monotonic,
+            )
+            self.__dict__["_reorg_reconciler_service"] = service
+            for name in (
+                "enabled",
+                "cache_seconds",
+                "inactive_block_count",
+                "reactivated_block_count",
+                "reconcile_skip_count",
+                "reconcile_error_count",
+                "matured_payout_count",
+                "last_tip_hash",
+                "last_trusted",
+                "last_monotonic",
+            ):
+                self.__dict__.pop(f"_reorg_compat_{name}", None)
+            return service
+
+    def _reorg_payout_source_tip(self) -> str | None:
+        """Payout-state snapshot source tip under the control-plane lock."""
+        with self.lock:
+            return self._payout_state_source[1]
+
     def _ensure_job_cache_state(self) -> None:
         # J1 scheduler/cache/template state lives in its owner service; the
         # legacy raw fields route there through class descriptors and the
@@ -3860,47 +3834,9 @@ class PrismCoordinator:
         # The serve-builder daemon state lives in the compiler owner; the
         # legacy raw fields route there through class descriptors.
         self._ensure_bundle_compiler()
-        if not hasattr(self, "_reconcile_flight_lock"):
-            self._reconcile_flight_lock = threading.Lock()
-        if not hasattr(self, "_reconcile_flights"):
-            # In-flight reconcile passes keyed by tip hash. Unflagged callers
-            # for a tip already being reconciled await that pass's summary
-            # instead of queueing a redundant serialized pass of their own.
-            self._reconcile_flights: dict[str, _ReconcileFlight] = {}
-        if not hasattr(self, "_reorg_reconcile_trusted_memo"):
-            # Monotonic completion time of the last trusted reconcile pass,
-            # per tip hash, guarded by self.lock. Entries are unarmed only by
-            # an untrusted outcome for their own tip (or a reconcile error,
-            # which clears the whole map); see _note_reorg_reconcile_outcome.
-            self._reorg_reconcile_trusted_memo: OrderedDict[str, float] = (
-                OrderedDict()
-            )
-        if not hasattr(self, "_reconcile_prefetch_executor_lock"):
-            self._reconcile_prefetch_executor_lock = threading.Lock()
-        if not hasattr(self, "_reconcile_prefetch_executor"):
-            # Single-worker lane that overlaps the tip-refresh reconcile pass
-            # with the template fetch. Only the refresh singleflight owner
-            # submits, so at most one prefetched pass is in flight; same-tip
-            # followers still coalesce through _reconcile_flights.
-            self._reconcile_prefetch_executor: ThreadPoolExecutor | None = None
-        if not hasattr(self, "_reconcile_prefetch_executor_shutdown"):
-            self._reconcile_prefetch_executor_shutdown = False
-        if not hasattr(self, "_reconcile_prefetch_pending"):
-            # At most one outstanding prefetch, keyed by tip, guarded by
-            # _reconcile_prefetch_executor_lock. Failed refresh attempts
-            # (for example a template-RPC outage) reuse it instead of
-            # queueing another serialized pass per retry.
-            self._reconcile_prefetch_pending: (
-                tuple[str, Future[bool], bool] | None
-            ) = None
-        if not hasattr(self, "reorg_reconcile_lookup_counts"):
-            # Reconcile demand by (caller path, satisfying source), guarded
-            # by self.lock.
-            self.reorg_reconcile_lookup_counts = {
-                (path, source): 0
-                for path in PRISM_REORG_RECONCILE_LOOKUP_PATHS
-                for source in PRISM_REORG_RECONCILE_LOOKUP_SOURCES
-            }
+        # Reorg flight/memo/lookup/prefetch state lives in its owner service
+        # (see lab/prism/reorg_reconciler.py); the service constructor is the
+        # single initializer for those containers.
         if not hasattr(self, "_accounted_accepted_block_hashes"):
             self._accounted_accepted_block_hashes: set[str] = set()
         # The B1 owner (created on first touch) holds the block-submit
@@ -5920,53 +5856,7 @@ class PrismCoordinator:
                 self._resume_watchdog_heartbeat(name)
 
     def watchdog_loop(self) -> None:
-        while True:
-            if self.stop_event.wait(self.watchdog_interval_seconds):
-                if getattr(self, "_fatal_exit_requested", False):
-                    print(
-                        "prism coordinator: fatal block-work restart requested; "
-                        "exiting non-zero even if the main thread is blocked",
-                        flush=True,
-                    )
-                    os._exit(1)
-                return
-            now = time.monotonic()
-            (
-                publication_failure,
-                coordination_age,
-                coordination_budget,
-                publication_budget,
-            ) = self._publication_watchdog_state(now)
-            if publication_failure == "coordination":
-                self._watchdog_failure_detail = (
-                    "prism coordinator: publication-progress watchdog firing; "
-                    "template refresh remained coordination-blocked past the "
-                    f"coordination budget={coordination_budget:g}s "
-                    f"streak_age={coordination_age:.3f}s"
-                )
-                self._watchdog_hard_exit("coordination")
-            if publication_failure == "publication":
-                self._watchdog_failure_detail = (
-                    "prism coordinator: publication-progress watchdog firing; "
-                    "current tip/generation remained unpublished past the "
-                    f"template refresh failure budget={publication_budget:g}s"
-                )
-                self._watchdog_hard_exit("publication")
-            overdue = (
-                self._overdue_heartbeats(now)
-                if getattr(self, "watchdog_enabled", True)
-                else []
-            )
-            if overdue:
-                self._watchdog_failure_detail = (
-                    "prism coordinator: liveness watchdog firing; unresponsive "
-                    f"subsystems={overdue} "
-                    f"timeout={self.watchdog_timeout_seconds:g}s"
-                )
-                # Queued shares have not been acknowledged. Miners reconnect
-                # and retry them after restart; exact-payload replay is
-                # idempotent if Postgres committed just before this exit.
-                self._watchdog_hard_exit("liveness")
+        self._ensure_watchdog_service().run()
 
     def _watchdog_hard_exit(
         self,
@@ -5974,92 +5864,98 @@ class PrismCoordinator:
         *,
         timeout_seconds: float | None = None,
     ) -> None:
-        """Bound a fresh-thread lease release, then terminate unconditionally."""
-        try:
-            if timeout_seconds is None:
-                timeout_seconds = float(
-                    getattr(
-                        self,
-                        "watchdog_lease_release_timeout_seconds",
-                        DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS,
-                    )
-                )
-            deadline = time.monotonic() + max(0.0, timeout_seconds)
-            release_thread = threading.Thread(
-                target=self._watchdog_release_ledger_lease,
-                args=(reason, deadline),
-                name="prism-watchdog-lease-release",
-                daemon=True,
-            )
-            release_thread.start()
-            release_thread.join(max(0.0, deadline - time.monotonic()))
-        finally:
-            # Nothing, including timeout logging or thread-start failure, may
-            # extend or suppress the watchdog's terminal action.
-            os._exit(1)
+        """Dynamic hard-exit seam; the bounded-exit body is service-owned.
 
-    def _watchdog_release_ledger_lease(
-        self,
-        reason: str,
-        deadline: float,
-    ) -> bool:
-        """Use only the shutdown controller and a fresh DB connection.
-
-        Do not call ``shutdown`` here: cancellation takes ``self.lock``, which
-        may belong to the subsystem that triggered the watchdog. Closing
-        writer admission plus the controller's tracked-writer barrier retains
-        the graceful path's release-withheld invariant without that lock.
-
-        Any best-effort diagnostic is emitted only after lease handling on this
-        daemon worker. A blocked container log pipe may park the worker, but it
-        cannot precede the release attempt or extend the caller's hard deadline.
+        Both WatchdogService.run and the ledger-lease heartbeat service
+        trigger this coordinator method at call time so per-instance
+        monkeypatches intercept every exit path.
         """
-        controller = self._ensure_shutdown_controller()
-        controller.request_shutdown(None)
-        self.stop_event.set()
-        if not controller.begin_shutdown(f"watchdog_{reason}"):
-            handled = controller.wait_for_lease_handling()
-            self._watchdog_exit_diagnostic(reason, lease_handled=handled)
-            return handled
+        self._ensure_watchdog_service().hard_exit(
+            reason,
+            timeout_seconds=timeout_seconds,
+        )
 
-        quiesced, _elapsed, _blockers = controller.wait_for_writer_quiescence(
-            max(0.0, deadline - time.monotonic())
-        )
-        if not quiesced:
-            self._watchdog_exit_diagnostic(reason, lease_handled=False)
-            return False
-        if time.monotonic() >= deadline:
-            self._watchdog_exit_diagnostic(reason, lease_handled=False)
-            return False
-        handled = self.release_ledger_lease(
-            fresh_connection=True,
-            deadline=deadline,
-            emit_logs=False,
-        )
-        self._watchdog_exit_diagnostic(reason, lease_handled=handled)
-        return handled
-
-    def _watchdog_exit_diagnostic(
-        self,
-        reason: str,
-        *,
-        lease_handled: bool,
-    ) -> None:
-        """Best-effort logging after the watchdog's safety-critical work."""
-        detail = (
-            getattr(self, "_ledger_lease_heartbeat_failure_reason", None)
-            if reason == "lease_heartbeat"
-            else getattr(self, "_watchdog_failure_detail", None)
-        )
-        try:
-            print(
-                (detail or f"prism coordinator: {reason} watchdog firing")
-                + ". Exiting non-zero so the restart policy recovers the process. "
-                + f"lease_handled={lease_handled}",
-                flush=True,
+    def _ensure_watchdog_service(self) -> WatchdogService:
+        service = self.__dict__.get("_watchdog_service")
+        if service is None:
+            # Idempotent construction; no init lock is needed.
+            service = WatchdogService(
+                WatchdogPorts(
+                    wait_for_stop=lambda timeout: self.stop_event.wait(timeout),
+                    interval_seconds=lambda: self.watchdog_interval_seconds,
+                    fatal_exit_requested=lambda: bool(
+                        getattr(self, "_fatal_exit_requested", False)
+                    ),
+                    publication_state=lambda now: (
+                        self._publication_watchdog_state(now)
+                    ),
+                    hard_exit=lambda reason: self._watchdog_hard_exit(reason),
+                    liveness_enabled=lambda: bool(
+                        getattr(self, "watchdog_enabled", True)
+                    ),
+                    overdue_heartbeats=lambda now: self._overdue_heartbeats(now),
+                    liveness_timeout_seconds=lambda: (
+                        self.watchdog_timeout_seconds
+                    ),
+                    coordination_budget_seconds=lambda: float(
+                        getattr(
+                            self,
+                            "coordination_blocked_exit_seconds",
+                            DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS,
+                        )
+                    ),
+                    publication_budget_seconds=lambda: float(
+                        getattr(
+                            self,
+                            "template_refresh_failure_exit_seconds",
+                            DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
+                        )
+                    ),
+                    ensure_job_cache_state=self._ensure_job_cache_state,
+                    publication_failure_expired=lambda now: (
+                        self.publication_progress_failure_expired(now)
+                    ),
+                    publication_divergence_since=(
+                        self._publication_divergence_since_locked
+                    ),
+                    lease_release_timeout_seconds=lambda: float(
+                        getattr(
+                            self,
+                            "watchdog_lease_release_timeout_seconds",
+                            DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS,
+                        )
+                    ),
+                    shutdown_controller=lambda: self._ensure_shutdown_controller(),
+                    request_shutdown=lambda: self.request_shutdown(None),
+                    release_ledger_lease=lambda deadline: (
+                        self.release_ledger_lease(
+                            fresh_connection=True,
+                            deadline=deadline,
+                            emit_logs=False,
+                        )
+                    ),
+                    lease_failure_reason=lambda: getattr(
+                        self,
+                        "_ledger_lease_heartbeat_failure_reason",
+                        None,
+                    ),
+                    exit_process=lambda code: os._exit(code),
+                    log=lambda message: print(message, flush=True),
+                )
             )
-        except Exception:
-            pass
+            self.__dict__["_watchdog_service"] = service
+        return service
+
+    def _publication_divergence_since_locked(self) -> float | None:
+        """Locked snapshot of the progress-health divergence timestamp.
+
+        Progress-health keeps ownership of the divergence state; the
+        watchdog reads it through this port while holding its own
+        coordination lock (watchdog lock before progress-health lock,
+        never the reverse).
+        """
+        with self._progress_health_lock:
+            return self._progress_publication_divergence_since_monotonic
 
     def _ensure_shutdown_controller(self) -> CoordinatorShutdownController:
         controller = getattr(self, "_shutdown_controller", None)
@@ -6652,123 +6548,34 @@ class PrismCoordinator:
             now,
         )
 
-    def _ensure_coordination_blocked_state(self) -> None:
-        if not hasattr(self, "_coordination_blocked_lock"):
-            self._coordination_blocked_lock = threading.Lock()
-        if not hasattr(self, "_coordination_blocked_since_monotonic"):
-            self._coordination_blocked_since_monotonic: float | None = None
-        if not hasattr(self, "_publication_watchdog_exit_claimed"):
-            self._publication_watchdog_exit_claimed = False
-
     def _record_coordination_blocked_refresh(self, now: float) -> None:
-        self._ensure_coordination_blocked_state()
-        with self._coordination_blocked_lock:
-            if self._publication_watchdog_exit_claimed:
-                return
-            if self._coordination_blocked_since_monotonic is None:
-                self._coordination_blocked_since_monotonic = now
+        self._ensure_watchdog_service().record_coordination_blocked_refresh(now)
 
     def _clear_coordination_blocked_streak(self) -> None:
-        self._ensure_coordination_blocked_state()
-        with self._coordination_blocked_lock:
-            # Once the watchdog claims an expired generation, its hard exit is
-            # the terminal action. Otherwise a refresh completing between the
-            # deadline check and os._exit could appear to cancel an exit that
-            # already won the streak lock.
-            if not self._publication_watchdog_exit_claimed:
-                self._coordination_blocked_since_monotonic = None
+        self._ensure_watchdog_service().clear_coordination_blocked_streak()
 
     def coordination_blocked_streak_age_seconds(
         self,
         now: float | None = None,
     ) -> float:
-        self._ensure_coordination_blocked_state()
-        now = time.monotonic() if now is None else now
-        with self._coordination_blocked_lock:
-            started = self._coordination_blocked_since_monotonic
-        return 0.0 if started is None else max(0.0, now - started)
-
-    def coordination_blocked_streak_expired(self, now: float) -> bool:
-        budget = float(
-            getattr(
-                self,
-                "coordination_blocked_exit_seconds",
-                DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS,
+        return (
+            self._ensure_watchdog_service().coordination_blocked_streak_age_seconds(
+                now
             )
         )
-        self._ensure_coordination_blocked_state()
-        with self._coordination_blocked_lock:
-            started = self._coordination_blocked_since_monotonic
-        return bool(
-            started is not None
-            and (budget <= 0 or now - started >= budget)
+
+    def coordination_blocked_streak_expired(self, now: float) -> bool:
+        return (
+            self._ensure_watchdog_service().coordination_blocked_streak_expired(
+                now
+            )
         )
 
     def _publication_watchdog_state(
         self,
         now: float,
     ) -> tuple[str | None, float, float, float]:
-        """Arbitrate coordination and ordinary publication deadlines.
-
-        The final decision is serialized with coordination streak changes.
-        A streak recorded while the ordinary publication check is in flight
-        therefore owns the longer coordination deadline; once either deadline
-        is claimed, later refresh results cannot cancel the terminal exit.
-        """
-        coordination_budget = float(
-            getattr(
-                self,
-                "coordination_blocked_exit_seconds",
-                DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS,
-            )
-        )
-        publication_budget = float(
-            getattr(
-                self,
-                "template_refresh_failure_exit_seconds",
-                DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
-            )
-        )
-        self._ensure_job_cache_state()
-        self._ensure_coordination_blocked_state()
-
-        # This preflight keeps the common healthy case cheap. Its result is
-        # revalidated under both state locks before an ordinary exit is
-        # claimed, so a concurrent publication cannot leave a stale verdict.
-        publication_expired = self.publication_progress_failure_expired(now)
-        with self._coordination_blocked_lock:
-            started = self._coordination_blocked_since_monotonic
-            if started is not None:
-                age = max(0.0, now - started)
-                if coordination_budget <= 0 or age >= coordination_budget:
-                    self._publication_watchdog_exit_claimed = True
-                    return (
-                        "coordination",
-                        age,
-                        coordination_budget,
-                        publication_budget,
-                    )
-                return None, age, coordination_budget, publication_budget
-
-            if publication_expired:
-                with self._progress_health_lock:
-                    divergence_since = (
-                        self._progress_publication_divergence_since_monotonic
-                    )
-                    publication_expired = bool(
-                        publication_budget > 0
-                        and divergence_since is not None
-                        and now - divergence_since >= publication_budget
-                    )
-                if publication_expired:
-                    self._publication_watchdog_exit_claimed = True
-                    return (
-                        "publication",
-                        0.0,
-                        coordination_budget,
-                        publication_budget,
-                    )
-            return None, 0.0, coordination_budget, publication_budget
+        return self._ensure_watchdog_service().publication_watchdog_state(now)
 
     def _record_template_refresh_failure(self, now: float) -> None:
         return self._ensure_tip_refresh_service()._record_template_refresh_failure(now)
@@ -7284,158 +7091,45 @@ class PrismCoordinator:
         evict_others: bool = False,
         proof_epoch: int | None = None,
     ) -> None:
-        """Record a reconcile outcome in the per-tip trusted memo.
-
-        A trusted pass arms the memo for its own tip. An untrusted outcome
-        (superseded publication, untrusted chain view) unarms only its own
-        tip: it proves nothing about reconciliations already completed for
-        other tips, and unarming them globally forces every job build into a
-        redundant full pass. A pass that applied orphan/maturity row
-        mutations passes evict_others=True: cached proofs for other tips
-        were taken against pre-mutation rows and no longer hold, even if the
-        chain later flips back before any tip observation lands. A reconcile
-        error passes clear_memo=True; a partially applied ledger mutation
-        invalidates every cached outcome. ``proof_epoch`` carries the
-        tip-detection epoch the pass started its reads in: arming is refused
-        when the epoch moved during the pass, so a flip away and back can
-        never re-arm an entry with a proof from the closed epoch (the
-        latest-detected-hash guard alone cannot see the round trip).
-        """
-
-        self._ensure_job_cache_state()
-        now = time.monotonic()
-        with self.lock:
-            self.last_reorg_reconciled_tip_hash = tip_hash
-            self.last_reorg_reconciled_trusted = trusted
-            self.last_reorg_reconciled_monotonic = now
-            memo = self._reorg_reconcile_trusted_memo
-            if clear_memo:
-                memo.clear()
-                return
-            if evict_others:
-                for cached_tip in list(memo):
-                    if cached_tip != tip_hash:
-                        del memo[cached_tip]
-            if tip_hash is None:
-                return
-            if trusted:
-                latest = getattr(self, "latest_detected_tip", None)
-                if latest is not None and latest[0] != tip_hash:
-                    # This pass finished for a tip that is no longer the
-                    # newest detected one; its epoch is over. Arming would
-                    # re-add an entry the newer observation already evicted
-                    # and let a flip-back reuse a pre-flip outcome.
-                    return
-                if proof_epoch is not None and proof_epoch != int(
-                    getattr(self, "tip_detection_epoch", 0)
-                ):
-                    # The pass spanned a detection cycle; every memo
-                    # consumer (refresh joins, initial-job and vardiff-idle
-                    # builds) must see a full re-proof instead.
-                    return
-                memo[tip_hash] = now
-                memo.move_to_end(tip_hash)
-                while len(memo) > PRISM_REORG_RECONCILE_MEMO_MAX_TIPS:
-                    memo.popitem(last=False)
-            else:
-                memo.pop(tip_hash, None)
+        """Compatibility seam for the extracted reorg reconciler owner."""
+        self._ensure_reorg_reconciler_service().note_outcome(
+            tip_hash,
+            trusted=trusted,
+            clear_memo=clear_memo,
+            evict_others=evict_others,
+            proof_epoch=proof_epoch,
+        )
 
     def _evict_reorg_reconcile_memo_for_new_tip_locked(
         self,
         tip_hash: str,
     ) -> None:
-        """Drop trusted-reconcile entries for every tip except ``tip_hash``.
-
-        Called under self.lock when a newer tip is detected. A detected flip
-        ends the epoch of every previously cached outcome: if the chain later
-        flips back to an earlier hash within the cache TTL, pool-block chain
-        state must be re-proven by a fresh pass, not assumed from a pre-flip
-        reconciliation. Detection is observation-sequenced, so only genuinely
-        newer observations evict.
-        """
-
-        self._ensure_job_cache_state()
-        memo = self._reorg_reconcile_trusted_memo
-        for cached_tip in list(memo):
-            if cached_tip != tip_hash:
-                del memo[cached_tip]
+        self._ensure_reorg_reconciler_service().evict_memo_for_new_tip_locked(
+            tip_hash
+        )
 
     def ensure_reorg_reconciled_for_current_tip(
         self,
         *,
         expected_tip_hash: str | None = None,
     ) -> bool:
-        reconciler_enabled = getattr(self, "reorg_reconciler_enabled", True)
-        if not reconciler_enabled and expected_tip_hash is None:
-            return True
-        current_tip = str(self.rpc.call("getbestblockhash"))
-        if expected_tip_hash is not None and current_tip != expected_tip_hash:
-            raise TemplateRefreshSuperseded(
-                "qbit tip changed while prepared work was queued "
-                f"expected={expected_tip_hash} current={current_tip}"
-            )
-        if not reconciler_enabled:
-            return True
-        if self._reorg_reconcile_memo_fresh(current_tip):
-            self._record_reorg_reconcile_lookup("job_build", "memo_hit")
-            return True
-        self._record_reorg_reconcile_lookup("job_build", "serial")
-        return self.ensure_reorg_reconciled_for_tip(current_tip)
+        return self._ensure_reorg_reconciler_service().ensure_current(
+            expected_tip_hash=expected_tip_hash
+        )
 
     def _reorg_reconcile_memo_fresh(self, tip_hash: str) -> bool:
-        """True when a trusted pass for ``tip_hash`` is inside the cache TTL
-        and the live chain view is still trusted.
-
-        A fresh memo entry lets a caller reuse the completed pass instead of
-        queueing a redundant serialized one. The memo is per tip: an
-        untrusted outcome recorded for another tip never unarms this one.
-        The chain-view trust check is NOT cached: headers can run ahead of
-        the validated tip without the best block hash changing (an arriving
-        reorg), and job issuance must pause immediately, not a TTL later.
-        """
-        ttl = getattr(
-            self,
-            "reorg_reconcile_cache_seconds",
-            DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
-        )
-        if ttl <= 0:
-            return False
-        self._ensure_job_cache_state()
-        with self.lock:
-            reconciled_monotonic = self._reorg_reconcile_trusted_memo.get(
-                tip_hash
-            )
-        return bool(
-            reconciled_monotonic is not None
-            and time.monotonic() - reconciled_monotonic <= ttl
-            and not self.qbit_chain_view_untrusted()
-        )
+        return self._ensure_reorg_reconciler_service().memo_fresh(tip_hash)
 
     def _record_reorg_reconcile_lookup(self, path: str, source: str) -> None:
-        if path not in PRISM_REORG_RECONCILE_LOOKUP_PATHS:
-            raise ValueError(f"unknown reorg reconcile lookup path: {path}")
-        if source not in PRISM_REORG_RECONCILE_LOOKUP_SOURCES:
-            raise ValueError(f"unknown reorg reconcile lookup source: {source}")
-        self._ensure_job_cache_state()
-        with self.lock:
-            self.reorg_reconcile_lookup_counts[(path, source)] += 1
+        self._ensure_reorg_reconciler_service().record_lookup(path, source)
 
-    def _reconcile_prefetch_pass(
-        self,
-        tip_hash: str,
-        prove: bool = False,
-    ) -> bool:
-        """One prefetched reconcile, honoring the memo like the join does.
-
-        A prefetch that queued behind a completed same-tip pass (abandoned
-        refresh attempts reuse the slot, but a replaced tip can leave one
-        queued) would otherwise re-run the full serialized pass for nothing.
-        A proving pass (the serial re-prove branches) bypasses the memo:
-        those branches exist precisely because the entry cannot be trusted.
-        """
-        if not prove and self._reorg_reconcile_memo_fresh(tip_hash):
-            return True
-        return self.ensure_reorg_reconciled_for_tip(tip_hash)
+    @property
+    def reorg_reconcile_lookup_counts(self) -> dict[tuple[str, str], int]:
+        """Copied lookup counters from the reorg owner (metrics consumer)."""
+        return (
+            self._ensure_reorg_reconciler_service()
+            .reorg_reconcile_lookup_snapshot()
+        )
 
     def _submit_reconcile_prefetch(
         self,
@@ -7443,161 +7137,27 @@ class PrismCoordinator:
         *,
         prove: bool = False,
     ) -> Future[bool] | None:
-        """Run one reconcile pass on the prefetch worker so it overlaps the
-        caller's template fetch.
-
-        Returns ``None`` once shutdown has retired the executor; the caller
-        falls back to its serial pass. At most one prefetch is outstanding:
-        a refresh attempt that failed before its join (for example a
-        template-RPC outage) leaves its future in the slot, and the retry
-        reuses it for the same tip instead of queueing another serialized
-        pass behind the first.
-        """
-        self._ensure_job_cache_state()
-        stale_future: Future[bool] | None = None
-        future: Future[bool] | None = None
-        with self._reconcile_prefetch_executor_lock:
-            if self._reconcile_prefetch_executor_shutdown:
-                return None
-            pending = self._reconcile_prefetch_pending
-            if pending is not None:
-                pending_tip, pending_future, pending_proves = pending
-                if (
-                    not pending_future.done()
-                    and pending_tip == tip_hash
-                    and (pending_proves or not prove)
-                ):
-                    # A proving pass satisfies both kinds of caller; a
-                    # memo-honoring pass cannot satisfy a prove request and
-                    # is replaced below like a tip change.
-                    return pending_future
-                # Replaced tip or completed future: hand the old future off
-                # for disposal outside this lock -- cancellation runs done
-                # callbacks inline on this thread, and _clear_slot below
-                # re-takes the lock.
-                self._reconcile_prefetch_pending = None
-                if not pending_future.done():
-                    stale_future = pending_future
-            executor = self._reconcile_prefetch_executor
-            if executor is None:
-                executor = ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="prism-reconcile-prefetch",
-                )
-                self._reconcile_prefetch_executor = executor
-            try:
-                future = executor.submit(
-                    self._reconcile_prefetch_pass, tip_hash, prove
-                )
-                self._reconcile_prefetch_pending = (tip_hash, future, prove)
-            except RuntimeError:
-                # Executor shutdown raced this submit; the serial path
-                # covers it (after the stale future is disposed below).
-                future = None
-        if stale_future is not None and not stale_future.cancel():
-            # Already running for a replaced tip; let it finish detached.
-            # The slot holds the new tip, so at most one task ever waits
-            # behind the running one.
-            self._discard_stale_reconcile_prefetch(stale_future)
-        if future is None:
-            return None
-
-        def _clear_slot(done: Future[bool]) -> None:
-            with self._reconcile_prefetch_executor_lock:
-                pending_now = self._reconcile_prefetch_pending
-                if pending_now is not None and pending_now[1] is done:
-                    self._reconcile_prefetch_pending = None
-
-        # Registered outside the slot lock: a completed future runs the
-        # callback inline on this thread.
-        future.add_done_callback(_clear_slot)
-        return future
+        return self._ensure_reorg_reconciler_service().submit_prefetch(
+            tip_hash,
+            prove=prove,
+        )
 
     @staticmethod
     def _discard_stale_reconcile_prefetch(future: Future[bool]) -> None:
-        """Detach a prefetched pass whose tip was superseded during the
-        template fetch.
-
-        The pass cannot be cancelled mid-ledger-mutation and already records
-        its own outcome/error accounting; the serial pass for the current
-        tip re-surfaces any condition that still applies. Consuming the
-        result here only prevents an unretrieved-exception warning.
-        """
-
-        def _consume(done: Future[bool]) -> None:
-            try:
-                done.result()
-            except BaseException:
-                pass
-
-        future.add_done_callback(_consume)
+        ReorgReconcilerService.discard_stale_prefetch(future)
 
     def _join_reconcile_prefetch_bounded(self, prefetch: Future[bool]) -> bool:
-        """Join a reconcile pass under the poll loop's bounded budget.
-
-        On a genuine expiry the pass keeps running in its single prefetch
-        slot -- the paced retry re-joins the same future -- and the timeout
-        surfaces the normal blocked-retry path, keeping the poll loop's
-        liveness heartbeat fed while the pass catches up. The budget is
-        clamped below the loop's failure budget so a misconfigured override
-        cannot reinstate the park this bound exists to prevent.
-        """
-
-        join_timeout = min(
-            PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_CEILING_SECONDS,
-            max(
-                0.001,
-                float(
-                    getattr(
-                        self,
-                        "reconcile_prefetch_join_timeout_seconds",
-                        PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS,
-                    )
-                ),
-            ),
+        return self._ensure_reorg_reconciler_service().join_prefetch_bounded(
+            prefetch
         )
-        try:
-            return prefetch.result(timeout=join_timeout)
-        except TimeoutError:
-            if prefetch.done():
-                # The pass itself raised TimeoutError (socket.timeout is
-                # TimeoutError here): not a join expiry. Propagate silently
-                # so diagnosis points at the pass, not the join.
-                raise
-            print(
-                "prism coordinator: reconcile prefetch join exceeded "
-                f"{join_timeout:g}s; retrying refresh pass while it "
-                "completes",
-                flush=True,
-            )
-            raise
 
     def _reconcile_snapshot_tip_bounded(self, tip_hash: str) -> bool:
-        """Run a snapshot-tip re-prove off-thread with the bounded join.
-
-        The serial re-prove branches run the same crawling pass as the
-        overlapped prefetch; routing them through the prefetch slot gives
-        the poll loop one uniform bounded wait. Falls back to the direct
-        pass only when the prefetch executor has already been retired at
-        shutdown, whose exceptions the caller already maps to a clean exit.
-        """
-
-        prefetch = self._submit_reconcile_prefetch(tip_hash, prove=True)
-        if prefetch is None:
-            return self.ensure_reorg_reconciled_for_tip(tip_hash)
-        return self._join_reconcile_prefetch_bounded(prefetch)
+        return self._ensure_reorg_reconciler_service().snapshot_tip_bounded(
+            tip_hash
+        )
 
     def shutdown_reconcile_prefetch_executor(self) -> None:
-        self._ensure_job_cache_state()
-        with self._reconcile_prefetch_executor_lock:
-            executor = self._reconcile_prefetch_executor
-            self._reconcile_prefetch_executor = None
-            self._reconcile_prefetch_executor_shutdown = True
-            self._reconcile_prefetch_pending = None
-        if executor is not None:
-            # A pass blocked on writer admission aborts via
-            # ShutdownInProgress on its own; never hold shutdown for it.
-            executor.shutdown(wait=False, cancel_futures=True)
+        self._ensure_reorg_reconciler_service().shutdown_prefetch_executor()
 
     def ensure_reorg_reconciled_for_tip(
         self,
@@ -7611,45 +7171,16 @@ class PrismCoordinator:
         leader because it may itself be waiting for the payout-balance
         mutation lock. Their own pass remains visible to ordinary followers.
         """
-        if not getattr(self, "reorg_reconciler_enabled", True):
-            return True
-        if _coalesce_same_tip:
-            summary = self.reconcile_prism_pool_blocks_once(tip_hash=tip_hash)
-        else:
-            summary = self.reconcile_prism_pool_blocks_once(
-                tip_hash=tip_hash,
-                _wait_for_same_tip_flight=False,
-            )
-        return not bool(summary.get("untrusted") or summary.get("superseded"))
+        return self._ensure_reorg_reconciler_service().ensure_tip(
+            tip_hash,
+            _coalesce_same_tip=_coalesce_same_tip,
+        )
 
     def qbit_chain_view_untrusted(self) -> bool:
-        blockchain_info = self.rpc.call("getblockchaininfo")
-        if not isinstance(blockchain_info, dict):
-            raise RuntimeError("getblockchaininfo returned non-object")
-        public_chain = str(getattr(self, "qbit_chain", "regtest")).lower() in {
-            "main",
-            "mainnet",
-            *TESTNET_QBIT_CHAINS,
-        }
-        if (
-            blockchain_info.get("initialblockdownload") is not False
-            if public_chain
-            else bool(blockchain_info.get("initialblockdownload"))
-        ):
-            return True
-        blocks_raw = blockchain_info.get("blocks")
-        headers_raw = blockchain_info.get("headers")
-        if public_chain and (blocks_raw is None or headers_raw is None):
-            return True
-        if blocks_raw is not None and headers_raw is not None:
-            try:
-                blocks = int(blocks_raw)
-                headers = int(headers_raw)
-                if blocks < 0 or headers < 0 or headers != blocks:
-                    return True
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("getblockchaininfo blocks/headers are not integers") from exc
-        return False
+        return reorg_chain_view_untrusted(
+            lambda *args, **kwargs: self.rpc.call(*args, **kwargs),
+            str(getattr(self, "qbit_chain", "regtest")),
+        )
 
     def validate_live_chain_identity(self) -> None:
         """Fail closed when a public-chain node is wrong, isolated, or behind."""
@@ -7775,68 +7306,18 @@ class PrismCoordinator:
         _source_reserved: bool = False,
         _wait_for_same_tip_flight: bool = True,
     ) -> dict[str, object]:
-        """Reconcile pool blocks, coalescing same-tip concurrent callers.
+        """Public reconcile entrypoint: service flight admission runs first.
 
-        Unflagged callers asking about a tip whose pass is already in flight
-        await that pass and share its summary instead of queueing another
-        full serialized pass. Callers carrying side-effect obligations (a
-        forced publication or an already-reserved source) and callers without
-        a tip always run their own pass. Lock-owning callers may disable
-        waiting for an existing flight while still registering as the visible
-        leader when no same-tip flight exists.
+        Same-tip flight coalescing happens *before* the serialized adapter's
+        writer admission so followers never queue behind it; see the service
+        docstring for the full contract.
         """
-        self._ensure_job_cache_state()
-        if tip_hash is None or _force_publish or _source_reserved:
-            return self._reconcile_prism_pool_blocks_serialized(
-                tip_hash=tip_hash,
-                _force_publish=_force_publish,
-                _source_reserved=_source_reserved,
-            )
-        with self._reconcile_flight_lock:
-            flight = self._reconcile_flights.get(tip_hash)
-            leading = flight is None
-            if leading:
-                flight = _ReconcileFlight()
-                self._reconcile_flights[tip_hash] = flight
-        if not leading:
-            if not _wait_for_same_tip_flight:
-                return self._reconcile_prism_pool_blocks_serialized(
-                    tip_hash=tip_hash
-                )
-            wait_seconds = float(
-                getattr(
-                    self,
-                    "reconcile_flight_wait_seconds",
-                    DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS,
-                )
-            )
-            if flight.event.wait(timeout=wait_seconds):
-                exception = flight.exception
-                if exception is not None:
-                    raise exception
-                summary = flight.summary
-                assert summary is not None
-                # Followers get a copy: summaries are mutable dicts and the
-                # leader's caller already holds the original.
-                return dict(summary)
-            # Liveness backstop: the leader outlived the wait. Run our own
-            # pass; the writer lock still serializes the actual work.
-            return self._reconcile_prism_pool_blocks_serialized(
-                tip_hash=tip_hash
-            )
-        try:
-            summary = self._reconcile_prism_pool_blocks_serialized(
-                tip_hash=tip_hash
-            )
-            flight.summary = summary
-            return summary
-        except BaseException as exc:
-            flight.exception = exc
-            raise
-        finally:
-            with self._reconcile_flight_lock:
-                self._reconcile_flights.pop(tip_hash, None)
-            flight.event.set()
+        return self._ensure_reorg_reconciler_service().reconcile_with_flights(
+            tip_hash=tip_hash,
+            _force_publish=_force_publish,
+            _source_reserved=_source_reserved,
+            _wait_for_same_tip_flight=_wait_for_same_tip_flight,
+        )
 
     @ledger_writer_operation("payout_reconciliation")
     def _reconcile_prism_pool_blocks_serialized(
@@ -7846,7 +7327,13 @@ class PrismCoordinator:
         _force_publish: bool = False,
         _source_reserved: bool = False,
     ) -> dict[str, object]:
-        """Serialize reconciliation against accepted-block finalization."""
+        """Serialize reconciliation against accepted-block finalization.
+
+        Cross-owner adapter retained by the coordinator: writer-admission
+        decorator, then the direct payout-balance mutation lock, then the
+        landed-preview fail-closed check, then the service core. Never
+        replace this sequence with the _payout_balance_mutation() wrapper.
+        """
         self._ensure_job_cache_state()
         with self._payout_balance_mutation_lock:
             with self._accepted_block_payout_preview_condition:
@@ -7854,346 +7341,14 @@ class PrismCoordinator:
                     transition.landed
                     for transition in self._accepted_block_payout_previews.values()
                 ):
-                    raise _PayoutStatePublicationBlocked(
+                    raise PayoutStatePublicationBlocked(
                         "accepted block payout confirmation is still pending"
                     )
-            return self._reconcile_prism_pool_blocks_once(
+            return self._ensure_reorg_reconciler_service().reconcile(
                 tip_hash=tip_hash,
-                _force_publish=_force_publish,
-                _source_reserved=_source_reserved,
+                force_publish=_force_publish,
+                source_reserved=_source_reserved,
             )
-
-    def _reconcile_prism_pool_blocks_once(
-        self,
-        *,
-        tip_hash: str | None = None,
-        _force_publish: bool = False,
-        _source_reserved: bool = False,
-    ) -> dict[str, object]:
-        summary: dict[str, object] = {
-            "enabled": bool(getattr(self, "reorg_reconciler_enabled", True)),
-            "untrusted": False,
-            "superseded": False,
-            "published_generation": None,
-            "watched_blocks": 0,
-            "inactive_blocks": 0,
-            "reactivated_blocks": 0,
-            "matured_payouts": 0,
-        }
-        if not getattr(self, "reorg_reconciler_enabled", True):
-            return summary
-        self._ensure_job_cache_state()
-        if not _source_reserved and tip_hash is not None:
-            # Tip observation normally reserves this source before queueing
-            # reconciliation. Direct callers only need a new source when they
-            # are asking about a different tip; repeated reconciliation of the
-            # same tip must not supersede otherwise valid prepared work.
-            with self.lock:
-                current_source_tip = self._payout_state_source[1]
-            if current_source_tip != tip_hash:
-                self._reserve_payout_state_source(
-                    "external_tip",
-                    tip_hash=tip_hash,
-                )
-
-        inactive_blocks_total = 0
-        reactivated_blocks_total = 0
-        matured_payouts_total = 0
-        supersession_retries = 0
-        skip_recorded = False
-        max_supersession_retries = max(
-            0,
-            int(
-                getattr(
-                    self,
-                    "payout_reconcile_supersession_retries",
-                    DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES,
-                )
-            ),
-        )
-
-        proof_epoch = int(getattr(self, "tip_detection_epoch", 0))
-
-        def finish(*, trusted: bool) -> dict[str, object]:
-            with self.lock:
-                self.reorg_inactive_block_count += inactive_blocks_total
-                self.reorg_reactivated_block_count += reactivated_blocks_total
-                self.matured_payout_count += matured_payouts_total
-            self._note_reorg_reconcile_outcome(
-                tip_hash,
-                trusted=trusted,
-                # Row mutations invalidate proofs cached for other tips even
-                # when the mutating pass's tip was never observed (per-client
-                # callers reconcile straight off getbestblockhash).
-                evict_others=bool(
-                    inactive_blocks_total
-                    or reactivated_blocks_total
-                    or matured_payouts_total
-                ),
-                proof_epoch=proof_epoch,
-            )
-            summary["inactive_blocks"] = inactive_blocks_total
-            summary["reactivated_blocks"] = reactivated_blocks_total
-            summary["matured_payouts"] = matured_payouts_total
-            return summary
-
-        def retry_superseded_candidate() -> bool:
-            nonlocal supersession_retries, tip_hash
-            supersession_retries += 1
-            if supersession_retries > max_supersession_retries:
-                summary["superseded"] = True
-                self._block_payout_state_publication()
-                return False
-            with self.lock:
-                latest_tip = self._payout_state_source[1]
-            tip_hash = latest_tip or tip_hash
-            return True
-
-        while True:
-            candidate_to_publish: PayoutStateCandidate | None = None
-            error_candidate: PayoutStateCandidate | None = None
-            attempt_trusted = True
-            # The memo entry this attempt may arm must prove state for the
-            # epoch its reads happen in; a detection cycle during the pass
-            # (away, or away and back) refuses the arm in
-            # _note_reorg_reconcile_outcome.
-            proof_epoch = int(getattr(self, "tip_detection_epoch", 0))
-            try:
-                with self._block_submitter_lock(
-                    self._payout_state_prepare_lock,
-                    "payout-state-prepare",
-                ):
-                    prepared_started = time.monotonic()
-                    captured_source = self._capture_payout_state_source()
-                    payout_changed = False
-                    payout_mutation_attempted = False
-                    inactive_blocks = 0
-                    reactivated_blocks = 0
-                    matured_payouts = 0
-                    summary["untrusted"] = False
-                    summary["watched_blocks"] = 0
-                    try:
-                        if self.qbit_chain_view_untrusted():
-                            if not skip_recorded:
-                                with self.lock:
-                                    self.reorg_reconcile_skip_count += 1
-                                skip_recorded = True
-                            summary["untrusted"] = True
-                            attempt_trusted = False
-                            if _force_publish:
-                                candidate_to_publish = (
-                                    self._prepared_payout_state_candidate(
-                                        captured_source
-                                    )
-                                )
-                        else:
-                            active_tip_height = int(self.rpc.call("getblockcount"))
-                            watch_blocks = getattr(
-                                self.ledger,
-                                "reorg_watch_blocks",
-                                None,
-                            )
-                            if not callable(watch_blocks):
-                                if (
-                                    _force_publish
-                                    or self._captured_payout_source_requires_publication(
-                                        captured_source
-                                    )
-                                ):
-                                    candidate_to_publish = (
-                                        self._prepared_payout_state_candidate(
-                                            captured_source,
-                                            force_full_window_rescan=payout_changed,
-                                        )
-                                    )
-                            else:
-                                rows = watch_blocks(
-                                    active_tip_height=active_tip_height
-                                )
-                                summary["watched_blocks"] = len(rows)
-
-                                for row in rows:
-                                    block_height = int(row["block_height"])
-                                    block_hash = str(row["block_hash"]).lower()
-                                    chain_state = str(row.get("chain_state", ""))
-                                    if block_height > active_tip_height:
-                                        if chain_state == "confirmed":
-                                            payout_mutation_attempted = True
-                                            inactive = (
-                                                self.ledger.mark_pool_block_inactive(
-                                                    block_hash=block_hash,
-                                                    active_tip_height=active_tip_height,
-                                                )
-                                            )
-                                            inactive_count = int(
-                                                inactive.get("inactive_count", 0)
-                                            )
-                                            inactive_blocks += inactive_count
-                                            payout_changed = (
-                                                payout_changed
-                                                or bool(inactive_count)
-                                            )
-                                        continue
-                                    active_hash = str(
-                                        self.rpc.call(
-                                            "getblockhash",
-                                            [block_height],
-                                        )
-                                    ).lower()
-                                    on_active_chain = active_hash == block_hash
-                                    if (
-                                        on_active_chain
-                                        and chain_state == "inactive"
-                                    ):
-                                        payout_mutation_attempted = True
-                                        with self._ensure_audit_artifact_store().publication_order_guard():
-                                            reactivated = self.ledger.reactivate_pool_block(
-                                                block_hash=block_hash,
-                                                active_tip_height=active_tip_height,
-                                            )
-                                        reactivated_count = int(
-                                            reactivated.get(
-                                                "reactivated_count",
-                                                0,
-                                            )
-                                        )
-                                        reactivated_blocks += reactivated_count
-                                        payout_changed = (
-                                            payout_changed
-                                            or bool(reactivated_count)
-                                        )
-                                    elif (
-                                        not on_active_chain
-                                        and chain_state == "confirmed"
-                                    ):
-                                        payout_mutation_attempted = True
-                                        inactive = (
-                                            self.ledger.mark_pool_block_inactive(
-                                                block_hash=block_hash,
-                                                active_tip_height=active_tip_height,
-                                            )
-                                        )
-                                        inactive_count = int(
-                                            inactive.get("inactive_count", 0)
-                                        )
-                                        inactive_blocks += inactive_count
-                                        payout_changed = (
-                                            payout_changed
-                                            or bool(inactive_count)
-                                        )
-
-                                mark_mature = getattr(
-                                    self.ledger,
-                                    "mark_mature_pool_payouts",
-                                    None,
-                                )
-                                if callable(mark_mature):
-                                    payout_mutation_attempted = True
-                                    matured = mark_mature(
-                                        active_tip_height=active_tip_height
-                                    )
-                                    matured_payouts = int(
-                                        matured.get("matured_count", 0)
-                                    )
-                                    payout_changed = (
-                                        payout_changed
-                                        or bool(matured_payouts)
-                                    )
-
-                                inactive_blocks_total += inactive_blocks
-                                reactivated_blocks_total += reactivated_blocks
-                                matured_payouts_total += matured_payouts
-                                if (
-                                    payout_changed
-                                    or _force_publish
-                                    or self._captured_payout_source_requires_publication(
-                                        captured_source
-                                    )
-                                ):
-                                    # Candidate preparation embeds the ledger
-                                    # snapshot artifact; a pass that will not
-                                    # publish must not pay for one only to
-                                    # discard it.
-                                    candidate_to_publish = (
-                                        self._prepared_payout_state_candidate(
-                                            captured_source,
-                                            force_full_window_rescan=payout_changed,
-                                        )
-                                    )
-                    except Exception:
-                        inactive_blocks_total += inactive_blocks
-                        reactivated_blocks_total += reactivated_blocks
-                        matured_payouts_total += matured_payouts
-                        # Durable partial mutations close admission before the
-                        # preparation lock is released. Publication drains old
-                        # socket sends afterward without blocking new ledger
-                        # preparation or snapshot acquisition.
-                        if payout_mutation_attempted:
-                            # A mutator can commit server-side and still raise
-                            # locally when its response is lost. The observed
-                            # row counts are then unavailable, so conservatively
-                            # force the same ledger re-read as a confirmed
-                            # mutation. Read-only failures never reach this flag.
-                            payout_changed = True
-                        if payout_changed:
-                            error_candidate = (
-                                self._prepared_payout_state_candidate(
-                                    captured_source,
-                                    force_full_window_rescan=True,
-                                )
-                            )
-                            self._block_payout_state_publication(force=True)
-                        with self.lock:
-                            self.reorg_inactive_block_count += (
-                                inactive_blocks_total
-                            )
-                            self.reorg_reactivated_block_count += (
-                                reactivated_blocks_total
-                            )
-                            self.matured_payout_count += matured_payouts_total
-                            self.reorg_reconcile_error_count += 1
-                        # A pass that errored mid-mutation invalidates every
-                        # cached outcome, not just its own tip's.
-                        self._note_reorg_reconcile_outcome(
-                            tip_hash,
-                            trusted=False,
-                            clear_memo=True,
-                        )
-                        raise
-                    finally:
-                        self._observe_payout_state_seconds(
-                            "preparation",
-                            max(0.0, time.monotonic() - prepared_started),
-                        )
-
-                    if candidate_to_publish is not None:
-                        # Atomically fence cache/build/delivery admission before
-                        # releasing the ledger snapshot lock. The potentially
-                        # slow drain then happens in publication() below.
-                        self._block_payout_state_publication(force=True)
-            except Exception:
-                if error_candidate is not None:
-                    if (
-                        self._publish_payout_state_candidate(error_candidate)
-                        is None
-                    ):
-                        self._block_payout_state_publication()
-                raise
-
-            if candidate_to_publish is not None:
-                published = self._publish_payout_state_candidate(
-                    candidate_to_publish
-                )
-                if published is None:
-                    # Preserve durable counts and retry iteratively against the
-                    # newest source. The explicit budget prevents tip churn
-                    # from monopolizing preparation indefinitely; the fence
-                    # stays closed between attempts.
-                    if retry_superseded_candidate():
-                        continue
-                    return finish(trusted=False)
-                summary["published_generation"] = published
-            return finish(trusted=attempt_trusted)
 
     def client_can_receive_jobs(self, client: ClientState) -> bool:
         return self._ensure_job_delivery_service().client_can_receive_jobs(client)
@@ -10253,32 +9408,31 @@ class PrismCoordinator:
             pass
         return rss_bytes, open_descriptors
 
-    def coordinator_lock_metrics_lines(self) -> list[str]:
+    def coordinator_lock_contention_snapshot(self) -> tuple[int, float, float]:
+        """Raw (count, wait_sum, wait_max) from the control-plane lock."""
         snapshot = getattr(self.lock, "contention_snapshot", None)
         if callable(snapshot):
             contention_count, wait_sum, wait_max = snapshot()
-        else:
-            contention_count, wait_sum, wait_max = 0, 0.0, 0.0
-        return [
-            "# HELP qbit_prism_coordinator_lock_contentions_total Coordinator control-plane lock acquisitions that had to wait.",
-            "# TYPE qbit_prism_coordinator_lock_contentions_total counter",
-            f"qbit_prism_coordinator_lock_contentions_total {int(contention_count)}",
-            "# HELP qbit_prism_coordinator_lock_wait_seconds Coordinator control-plane lock wait duration for contended acquisitions.",
-            "# TYPE qbit_prism_coordinator_lock_wait_seconds summary",
-            f"qbit_prism_coordinator_lock_wait_seconds_sum {float(wait_sum):.6f}",
-            f"qbit_prism_coordinator_lock_wait_seconds_count {int(contention_count)}",
-            "# HELP qbit_prism_coordinator_lock_wait_seconds_max Longest observed coordinator control-plane lock wait.",
-            "# TYPE qbit_prism_coordinator_lock_wait_seconds_max gauge",
-            f"qbit_prism_coordinator_lock_wait_seconds_max {float(wait_max):.6f}",
-        ]
+            return int(contention_count), float(wait_sum), float(wait_max)
+        return 0, 0.0, 0.0
+
+    def coordinator_lock_metrics_lines(self) -> list[str]:
+        # Compatibility wrapper for the extracted metrics owner.
+        return self._ensure_metrics_renderer().coordinator_lock_metrics_lines()
 
     def _observe_block_submit_seconds(self, elapsed_seconds: float) -> None:
         self._ensure_block_candidate_service()._observe_block_submit_seconds(
             elapsed_seconds
         )
 
-    def block_submitter_metrics_lines(self) -> list[str]:
-        pending_metrics = {
+    def block_submitter_snapshot(self) -> dict[str, object]:
+        """Merged durable pending-candidate and B1 owner snapshot.
+
+        Combines the ledger's durable pending aggregates with the block-
+        candidate service's copied backoff and submit-histogram snapshots;
+        each owner copies under its own lock, so no locks nest here.
+        """
+        pending_metrics: dict[str, object] = {
             "pending_count": -1,
             "oldest_pending_age_seconds": -1.0,
             "oldest_unattempted_age_seconds": -1.0,
@@ -10298,579 +9452,71 @@ class PrismCoordinator:
         submit_buckets, submit_sum, submit_count = (
             service.block_submit_seconds_snapshot()
         )
-        return [
-            "# HELP qbit_prism_block_submit_seconds Seconds from a block candidate landing in this process to its submitblock RPC returning.",
-            "# TYPE qbit_prism_block_submit_seconds histogram",
-            *[
-                f'qbit_prism_block_submit_seconds_bucket{{le="{bucket:g}"}} {int(submit_buckets.get(bucket, 0))}'
-                for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS
-            ],
-            f'qbit_prism_block_submit_seconds_bucket{{le="+Inf"}} {submit_count}',
-            f"qbit_prism_block_submit_seconds_sum {submit_sum:.6f}",
-            f"qbit_prism_block_submit_seconds_count {submit_count}",
-            "# HELP qbit_prism_block_candidates_pending Durable block candidates awaiting a terminal outcome, or -1 if unavailable.",
-            "# TYPE qbit_prism_block_candidates_pending gauge",
-            f"qbit_prism_block_candidates_pending {int(pending_metrics['pending_count'])}",
-            "# HELP qbit_prism_block_candidate_oldest_pending_seconds Age of the oldest durable pending block candidate, or -1 if unavailable.",
-            "# TYPE qbit_prism_block_candidate_oldest_pending_seconds gauge",
-            f"qbit_prism_block_candidate_oldest_pending_seconds {float(pending_metrics['oldest_pending_age_seconds']):.6f}",
-            "# HELP qbit_prism_block_candidate_oldest_unattempted_seconds Age of the oldest durable candidate that has never entered processing, or -1 if unavailable.",
-            "# TYPE qbit_prism_block_candidate_oldest_unattempted_seconds gauge",
-            f"qbit_prism_block_candidate_oldest_unattempted_seconds {float(pending_metrics['oldest_unattempted_age_seconds']):.6f}",
-            "# HELP qbit_prism_block_submitter_retry_backoff_active Whether the submitter is in an intentional interruptible retry wait.",
-            "# TYPE qbit_prism_block_submitter_retry_backoff_active gauge",
-            f"qbit_prism_block_submitter_retry_backoff_active {1 if backoff_active else 0}",
-            "# HELP qbit_prism_block_submitter_retry_backoff_remaining_seconds Remaining intentional submitter retry wait.",
-            "# TYPE qbit_prism_block_submitter_retry_backoff_remaining_seconds gauge",
-            f"qbit_prism_block_submitter_retry_backoff_remaining_seconds {backoff_remaining:.6f}",
-            "# HELP qbit_prism_block_submitter_retry_backoff_seconds Current intentional submitter retry delay.",
-            "# TYPE qbit_prism_block_submitter_retry_backoff_seconds gauge",
-            f"qbit_prism_block_submitter_retry_backoff_seconds {backoff_delay:.6f}",
-        ]
+        pending_metrics.update(
+            {
+                "backoff_active": backoff_active,
+                "backoff_remaining_seconds": backoff_remaining,
+                "backoff_delay_seconds": backoff_delay,
+                "submit_seconds_buckets": submit_buckets,
+                "submit_seconds_sum": submit_sum,
+                "submit_seconds_count": submit_count,
+            }
+        )
+        return pending_metrics
+
+    def block_submitter_metrics_lines(self) -> list[str]:
+        # Compatibility wrapper for the extracted metrics owner.
+        return self._ensure_metrics_renderer().block_submitter_metrics_lines()
 
     def landing_observability_metrics_lines(self) -> list[str]:
-        """Landing-path metrics for issue #188's pre-deadline alerting.
-
-        The prior-balances read crossed the one-second submitter deadline
-        silently over several weeks; these series make that growth, landing
-        timeouts, and unresolved accepted-parent age visible before they
-        become an outage.
-        """
-        lines: list[str] = [
-            "# HELP qbit_prism_block_ledger_calls_total Submitter ledger calls by deadline class.",
-            "# TYPE qbit_prism_block_ledger_calls_total counter",
-            "# HELP qbit_prism_block_ledger_call_timeouts_total Submitter ledger deadline expiries by deadline class.",
-            "# TYPE qbit_prism_block_ledger_call_timeouts_total counter",
-            "# HELP qbit_prism_block_ledger_call_budget_seconds Most recent statement budget applied per deadline class (escalates for retried landings).",
-            "# TYPE qbit_prism_block_ledger_call_budget_seconds gauge",
-            "# HELP qbit_prism_block_ledger_call_last_duration_seconds Duration of the most recent call per deadline class.",
-            "# TYPE qbit_prism_block_ledger_call_last_duration_seconds gauge",
-            "# HELP qbit_prism_block_ledger_call_max_duration_seconds Longest observed call per deadline class since process start.",
-            "# TYPE qbit_prism_block_ledger_call_max_duration_seconds gauge",
-        ]
-        for call_class, stats in sorted(
-            self.block_ledger_call_class_metrics().items()
-        ):
-            label = self.prometheus_label_value(call_class)
-            lines.extend(
-                [
-                    f'qbit_prism_block_ledger_calls_total{{call_class="{label}"}} {int(stats["calls_total"])}',
-                    f'qbit_prism_block_ledger_call_timeouts_total{{call_class="{label}"}} {int(stats["timeouts_total"])}',
-                    f'qbit_prism_block_ledger_call_budget_seconds{{call_class="{label}"}} {float(stats["last_budget_seconds"]):.6f}',
-                    f'qbit_prism_block_ledger_call_last_duration_seconds{{call_class="{label}"}} {float(stats["last_duration_seconds"]):.6f}',
-                    f'qbit_prism_block_ledger_call_max_duration_seconds{{call_class="{label}"}} {float(stats["max_duration_seconds"]):.6f}',
-                ]
-            )
-        unresolved_ages = self.accepted_parent_unresolved_ages_seconds()
-        oldest_unresolved = max(unresolved_ages) if unresolved_ages else -1.0
-        with self.lock:
-            preview_wait_timeouts = int(
-                getattr(self, "_accepted_parent_preview_wait_timeouts", 0)
-            )
-        lines.extend(
-            [
-                "# HELP qbit_prism_accepted_parent_unresolved_transitions Landed accepted-block transitions whose durable bookkeeping is unresolved.",
-                "# TYPE qbit_prism_accepted_parent_unresolved_transitions gauge",
-                f"qbit_prism_accepted_parent_unresolved_transitions {len(unresolved_ages)}",
-                "# HELP qbit_prism_accepted_parent_unresolved_oldest_seconds Age of the oldest unresolved accepted-parent transition, or -1 when none.",
-                "# TYPE qbit_prism_accepted_parent_unresolved_oldest_seconds gauge",
-                f"qbit_prism_accepted_parent_unresolved_oldest_seconds {oldest_unresolved:.6f}",
-                "# HELP qbit_prism_accepted_parent_preview_wait_timeouts_total Child job builds that timed out waiting for an accepted-parent payout preview.",
-                "# TYPE qbit_prism_accepted_parent_preview_wait_timeouts_total counter",
-                f"qbit_prism_accepted_parent_preview_wait_timeouts_total {preview_wait_timeouts}",
-            ]
+        # Compatibility wrapper for the extracted metrics owner.
+        return (
+            self._ensure_metrics_renderer().landing_observability_metrics_lines()
         )
-        prior_stats_fn = getattr(self.ledger, "prior_balances_read_stats", None)
-        if callable(prior_stats_fn):
-            prior_stats = prior_stats_fn()
-            lines.extend(
-                [
-                    "# HELP qbit_prism_prior_balances_reads_total Prior-balances reads served by the ledger.",
-                    "# TYPE qbit_prism_prior_balances_reads_total counter",
-                    f"qbit_prism_prior_balances_reads_total {int(prior_stats['reads_total'])}",
-                    "# HELP qbit_prism_prior_balances_read_last_seconds Duration of the most recent prior-balances read.",
-                    "# TYPE qbit_prism_prior_balances_read_last_seconds gauge",
-                    f"qbit_prism_prior_balances_read_last_seconds {float(prior_stats['last_seconds']):.6f}",
-                    "# HELP qbit_prism_prior_balances_read_max_seconds Longest prior-balances read since process start.",
-                    "# TYPE qbit_prism_prior_balances_read_max_seconds gauge",
-                    f"qbit_prism_prior_balances_read_max_seconds {float(prior_stats['max_seconds']):.6f}",
-                ]
-            )
-        startup_phases = self.startup_phase_seconds()
-        if startup_phases:
-            lines.extend(
-                [
-                    "# HELP qbit_prism_startup_phase_seconds Seconds from serve() start to each startup phase, recorded once.",
-                    "# TYPE qbit_prism_startup_phase_seconds gauge",
-                ]
-            )
-            for phase, seconds in sorted(startup_phases.items()):
-                label = self.prometheus_label_value(phase)
-                lines.append(
-                    f'qbit_prism_startup_phase_seconds{{phase="{label}"}} {float(seconds):.6f}'
-                )
-        return lines
 
     def _accepted_stats_reconcile_metric_lines(self) -> list[str]:
-        """Surface reconcile liveness now that failures no longer raise.
+        # Compatibility wrapper for the extracted metrics owner.
+        return (
+            self._ensure_metrics_renderer().accepted_stats_reconcile_metric_lines()
+        )
 
-        Serving maintained counters means a failing or wedged reconcile is
-        invisible to callers, so its age and failure count must be visible
-        to scrapes for alerting instead.
-        """
-        status_fn = getattr(self.ledger, "accepted_stats_reconcile_status", None)
-        if not callable(status_fn):
-            return []
-        status = status_fn()
-        lines = [
-            "# HELP qbit_prism_accepted_stats_reconcile_failures_total Failed background accepted-stats reconcile passes.",
-            "# TYPE qbit_prism_accepted_stats_reconcile_failures_total counter",
-            f"qbit_prism_accepted_stats_reconcile_failures_total {int(status.get('failures') or 0)}",
-        ]
-        age = status.get("age_seconds")
-        if age is not None:
-            lines.extend(
-                [
-                    "# HELP qbit_prism_accepted_stats_reconcile_age_seconds Seconds since the accepted-share counters were last reconciled against the ledger.",
-                    "# TYPE qbit_prism_accepted_stats_reconcile_age_seconds gauge",
-                    f"qbit_prism_accepted_stats_reconcile_age_seconds {float(age):.6f}",
-                ]
-            )
-        return lines
-
-    def _render_metrics_payload(self) -> str:
-        ledger_metrics = self.ledger.metrics()
-        audit_metrics = self.audit_artifact_metrics()
-        mining_metrics = self.mining_delivery_snapshot()
-        process_rss_bytes, process_open_fds = self.process_resource_metrics()
-        accepted_share_count = self.accepted_share_stats()[0]
-        elapsed = max(0.001, time.monotonic() - self.started_monotonic)
-        shares_per_second = accepted_share_count / elapsed
+    def share_accounting_snapshot(self) -> dict[str, object]:
+        """Copy the hot-path share counters under the accounting lock."""
         self._ensure_share_hot_path_state()
         with self._share_accounting_lock:
-            submitted_share_count = int(getattr(self, "submitted_share_count", 0))
-            stale_share_count = int(getattr(self, "stale_share_count", 0))
-            duplicate_share_count = int(getattr(self, "duplicate_share_count", 0))
-            low_difficulty_share_count = int(
-                getattr(self, "low_difficulty_share_count", 0)
-            )
-            collection_block_submission_count = int(
-                getattr(self, "collection_block_submission_count", 0)
-            )
-            rejection_counts = dict(
-                getattr(self, "rejection_counts_by_reason", {})
-            )
-            grace_credited_share_count = int(
-                getattr(self, "grace_credited_share_count", 0)
-            )
-        # The submission owner's copied snapshot (via the routing descriptor)
-        # is read outside the accounting lock so owner locks never nest.
-        block_solves_dropped_counts = dict(
-            getattr(
-                self,
-                "block_solves_dropped_counts",
-                {"stale_grace": 0},
-            )
-        )
-        stale_percent = 0.0
-        if submitted_share_count > 0:
-            stale_percent = (stale_share_count / submitted_share_count) * 100.0
-        idle_retarget_count = int(getattr(self, "idle_retarget_count", 0))
-        with self.lock:
-            self._ensure_connection_capacity_state()
-            active_connection_count = len(self.clients)
-            connection_limit_rejection_counts = dict(
-                self.connection_limit_rejection_counts
-            )
-            accept_resource_exhaustion_count = int(
-                getattr(self, "accept_resource_exhaustion_count", 0)
-            )
-            connection_setup_failure_count = int(
-                getattr(self, "connection_setup_failure_count", 0)
-            )
-            self._ensure_evicted_job_state()
-            self.prune_evicted_job_graveyard(force=False)
-            same_tip_context_count = len(self.evicted_same_tip_job_ids)
-            evicted_job_context_counts = {
-                "same_tip": same_tip_context_count,
-                "stale_grace": len(self.evicted_job_graveyard) - same_tip_context_count,
+            return {
+                "submitted": int(getattr(self, "submitted_share_count", 0)),
+                "stale": int(getattr(self, "stale_share_count", 0)),
+                "duplicate": int(getattr(self, "duplicate_share_count", 0)),
+                "low_difficulty": int(
+                    getattr(self, "low_difficulty_share_count", 0)
+                ),
+                "collection_block": int(
+                    getattr(self, "collection_block_submission_count", 0)
+                ),
+                "rejections": dict(
+                    getattr(self, "rejection_counts_by_reason", {})
+                ),
+                "grace_credited": int(
+                    getattr(self, "grace_credited_share_count", 0)
+                ),
             }
-            evicted_job_submit_counts = dict(self.evicted_job_submit_counts)
-            evicted_job_expiration_counts = dict(self.evicted_job_expiration_counts)
-            evicted_job_capacity_eviction_counts = dict(
-                self.evicted_job_capacity_eviction_counts
-            )
-            stale_job_abandon_counts = dict(
-                getattr(
-                    self,
-                    "stale_job_abandon_counts",
-                    {
-                        abandon_class: 0
-                        for abandon_class in PRISM_STALE_JOB_ABANDON_CLASSES
-                    },
-                )
-            )
-        self._ensure_worker_metrics_state()
-        with self.worker_metrics_lock:
-            worker_share_counts = {
-                label: dict(counts)
-                for label, counts in self.worker_share_counts.items()
-            }
-            worker_rejection_counts = dict(self.worker_rejection_counts)
-        coinbase_weight_headroom = 2_000_000
-        latest_coinbase_size_bytes = getattr(self, "latest_coinbase_size_bytes", None)
-        if latest_coinbase_size_bytes is not None:
-            coinbase_weight_headroom = 2_000_000 - int(latest_coinbase_size_bytes)
-        ctv_pending = 0
-        ctv_broadcastable = 0
-        ctv_failed = 0
-        pending_ctv_fanouts = getattr(self.ledger, "pending_ctv_fanout_statuses", None)
-        if callable(pending_ctv_fanouts):
-            try:
-                for fanout in pending_ctv_fanouts(limit=1_000):
-                    ctv_pending += 1
-                    status = str(fanout.get("settlement_status", ""))
-                    if status == "broadcastable":
-                        ctv_broadcastable += 1
-                    elif status == "failed":
-                        ctv_failed += 1
-            except Exception:
-                ctv_pending = -1
-                ctv_broadcastable = -1
-                ctv_failed = -1
-        if ctv_failed >= 0:
-            ctv_failed = int(ledger_metrics.get("ctv_fanouts_failed", ctv_failed))
-        ibd = 0
-        peers = 0
-        try:
-            blockchain_info = self.rpc.call("getblockchaininfo")
-            if isinstance(blockchain_info, dict) and blockchain_info.get("initialblockdownload"):
-                ibd = 1
-        except Exception:
-            ibd = -1
-        try:
-            network_info = self.rpc.call("getnetworkinfo")
-            if isinstance(network_info, dict):
-                peers = int(network_info.get("connections", 0))
-        except Exception:
-            peers = -1
-        lines = [
-            "# HELP qbit_prism_accepted_shares_total Accepted shares recorded by the canonical PRISM ledger.",
-            "# TYPE qbit_prism_accepted_shares_total counter",
-            f"qbit_prism_accepted_shares_total {accepted_share_count}",
-            *self._accepted_stats_reconcile_metric_lines(),
-            *self.landing_observability_metrics_lines(),
-            "# HELP qbit_prism_submitted_shares_total Stratum share submissions seen by the PRISM coordinator.",
-            "# TYPE qbit_prism_submitted_shares_total counter",
-            f"qbit_prism_submitted_shares_total {submitted_share_count}",
-            "# HELP qbit_prism_stratum_active_connections Active admitted Stratum connections across all listeners.",
-            "# TYPE qbit_prism_stratum_active_connections gauge",
-            f"qbit_prism_stratum_active_connections {active_connection_count}",
-            "# HELP qbit_prism_stratum_connection_limit Configured global Stratum connection ceiling; zero means unlimited.",
-            "# TYPE qbit_prism_stratum_connection_limit gauge",
-            f"qbit_prism_stratum_connection_limit {mining_metrics['connection_capacity']}",
-            "# HELP qbit_prism_stratum_peak_active_connections Peak admitted Stratum connections since process start.",
-            "# TYPE qbit_prism_stratum_peak_active_connections gauge",
-            f"qbit_prism_stratum_peak_active_connections {mining_metrics['peak_active_connections']}",
-            "# HELP qbit_prism_stratum_subscribed_connections Active subscribed Stratum connections.",
-            "# TYPE qbit_prism_stratum_subscribed_connections gauge",
-            f"qbit_prism_stratum_subscribed_connections {mining_metrics['subscribed_connections']}",
-            "# HELP qbit_prism_stratum_authorized_connections Active subscribed and authorized Stratum connections.",
-            "# TYPE qbit_prism_stratum_authorized_connections gauge",
-            f"qbit_prism_stratum_authorized_connections {mining_metrics['authorized_connections']}",
-            "# HELP qbit_prism_stratum_pending_initial_jobs Authorized clients awaiting their first usable current-tip job.",
-            "# TYPE qbit_prism_stratum_pending_initial_jobs gauge",
-            f"qbit_prism_stratum_pending_initial_jobs {mining_metrics['pending_initial_jobs']}",
-            "# HELP qbit_prism_stratum_pending_initial_job_limit Configured bound for clients awaiting their first usable job.",
-            "# TYPE qbit_prism_stratum_pending_initial_job_limit gauge",
-            f"qbit_prism_stratum_pending_initial_job_limit {mining_metrics['pending_initial_job_capacity']}",
-            "# HELP qbit_prism_stratum_oldest_pending_initial_job_seconds Age of the oldest pending first-job request.",
-            "# TYPE qbit_prism_stratum_oldest_pending_initial_job_seconds gauge",
-            f"qbit_prism_stratum_oldest_pending_initial_job_seconds {mining_metrics['oldest_pending_initial_job_age_seconds']}",
-            "# HELP qbit_prism_stratum_oldest_genuinely_pending_initial_job_seconds Age of the oldest authorized client that has never received usable work.",
-            "# TYPE qbit_prism_stratum_oldest_genuinely_pending_initial_job_seconds gauge",
-            f"qbit_prism_stratum_oldest_genuinely_pending_initial_job_seconds {mining_metrics['oldest_genuinely_pending_initial_job_age_seconds']}",
-            "# HELP qbit_prism_stratum_current_tip_coverage_gap_seconds Continuous age of current-tip job coverage below 95 percent.",
-            "# TYPE qbit_prism_stratum_current_tip_coverage_gap_seconds gauge",
-            f"qbit_prism_stratum_current_tip_coverage_gap_seconds {mining_metrics['current_tip_coverage_gap_age_seconds']}",
-            "# HELP qbit_prism_stratum_initial_job_queue_rejections_total Sessions closed because bounded first-job delivery was full.",
-            "# TYPE qbit_prism_stratum_initial_job_queue_rejections_total counter",
-            f"qbit_prism_stratum_initial_job_queue_rejections_total {mining_metrics['initial_job_queue_rejections']}",
-            "# HELP qbit_prism_stratum_initial_job_timeouts_total Sessions disconnected after first-job delivery timed out.",
-            "# TYPE qbit_prism_stratum_initial_job_timeouts_total counter",
-            f"qbit_prism_stratum_initial_job_timeouts_total {mining_metrics['initial_job_timeout_disconnects']}",
-            "# HELP qbit_prism_stratum_initial_job_tasks_total First-job tasks canceled or coalesced before duplicate work.",
-            "# TYPE qbit_prism_stratum_initial_job_tasks_total counter",
-            f'qbit_prism_stratum_initial_job_tasks_total{{result="cancelled"}} {mining_metrics["initial_job_cancelled_tasks"]}',
-            f'qbit_prism_stratum_initial_job_tasks_total{{result="coalesced"}} {mining_metrics["initial_job_coalesced_tasks"]}',
-            "# HELP qbit_prism_stratum_initial_job_queue_capacity_reclaimed_total Queued first-job admission slots reclaimed immediately by cancellation.",
-            "# TYPE qbit_prism_stratum_initial_job_queue_capacity_reclaimed_total counter",
-            f'qbit_prism_stratum_initial_job_queue_capacity_reclaimed_total {mining_metrics["initial_job_queue_capacity_reclaimed"]}',
-            "# HELP qbit_prism_stratum_clients_with_current_tip_jobs Authorized clients holding usable current-tip work.",
-            "# TYPE qbit_prism_stratum_clients_with_current_tip_jobs gauge",
-            f"qbit_prism_stratum_clients_with_current_tip_jobs {mining_metrics['clients_with_current_tip_jobs']}",
-            "# HELP qbit_prism_stratum_current_tip_job_coverage Ratio of authorized clients holding current-tip work.",
-            "# TYPE qbit_prism_stratum_current_tip_job_coverage gauge",
-            f"qbit_prism_stratum_current_tip_job_coverage {mining_metrics['current_tip_job_coverage']}",
-            "# HELP qbit_prism_stratum_semantic_current_work_ratio Ratio of authorized clients whose work matches the current template fingerprint and payout generation.",
-            "# TYPE qbit_prism_stratum_semantic_current_work_ratio gauge",
-            f"qbit_prism_stratum_semantic_current_work_ratio {mining_metrics['semantic_current_work_ratio']}",
-            "# HELP qbit_prism_stratum_handler_threads Active per-connection Stratum handler threads.",
-            "# TYPE qbit_prism_stratum_handler_threads gauge",
-            f"qbit_prism_stratum_handler_threads {mining_metrics['handler_threads']}",
-            "# HELP qbit_prism_job_delivery_queue_depth Current bounded delivery executor queue depth.",
-            "# TYPE qbit_prism_job_delivery_queue_depth gauge",
-            f"qbit_prism_job_delivery_queue_depth {mining_metrics['delivery_executor_queue_depth']}",
-            "# HELP qbit_prism_job_delivery_active_workers Delivery executor workers currently running tasks.",
-            "# TYPE qbit_prism_job_delivery_active_workers gauge",
-            f"qbit_prism_job_delivery_active_workers {mining_metrics['delivery_executor_active_workers']}",
-            "# HELP qbit_prism_process_resident_memory_bytes Current process RSS bytes, or -1 when unavailable.",
-            "# TYPE qbit_prism_process_resident_memory_bytes gauge",
-            f"qbit_prism_process_resident_memory_bytes {process_rss_bytes}",
-            "# HELP qbit_prism_process_open_file_descriptors Current process open descriptor count, or -1 when unavailable.",
-            "# TYPE qbit_prism_process_open_file_descriptors gauge",
-            f"qbit_prism_process_open_file_descriptors {process_open_fds}",
-            "# HELP qbit_prism_stratum_connection_limit_rejections_total Stratum connections rejected by an explicitly configured admission limit.",
-            "# TYPE qbit_prism_stratum_connection_limit_rejections_total counter",
-            *[
-                f'qbit_prism_stratum_connection_limit_rejections_total{{scope="{scope}"}} {int(connection_limit_rejection_counts.get(scope, 0))}'
-                for scope in ("global", "username")
-            ],
-            "# HELP qbit_prism_stratum_accept_resource_exhaustions_total Recoverable Stratum accept or client-setup failures caused by process or system descriptor exhaustion.",
-            "# TYPE qbit_prism_stratum_accept_resource_exhaustions_total counter",
-            f"qbit_prism_stratum_accept_resource_exhaustions_total {accept_resource_exhaustion_count}",
-            "# HELP qbit_prism_stratum_connection_setup_failures_total Admitted Stratum connections cleaned up after socket or handler-thread setup failure.",
-            "# TYPE qbit_prism_stratum_connection_setup_failures_total counter",
-            f"qbit_prism_stratum_connection_setup_failures_total {connection_setup_failure_count}",
-            "# HELP qbit_prism_stale_shares_total Stratum shares rejected or ignored as stale.",
-            "# TYPE qbit_prism_stale_shares_total counter",
-            f"qbit_prism_stale_shares_total {stale_share_count}",
-            "# HELP qbit_prism_duplicate_shares_total Duplicate Stratum shares rejected.",
-            "# TYPE qbit_prism_duplicate_shares_total counter",
-            f"qbit_prism_duplicate_shares_total {duplicate_share_count}",
-            "# HELP qbit_prism_low_difficulty_shares_total Low-difficulty Stratum shares rejected.",
-            "# TYPE qbit_prism_low_difficulty_shares_total counter",
-            f"qbit_prism_low_difficulty_shares_total {low_difficulty_share_count}",
-            "# HELP qbit_prism_collection_block_submissions_total Solver-pays-all block candidates submitted from collection-mode jobs.",
-            "# TYPE qbit_prism_collection_block_submissions_total counter",
-            f"qbit_prism_collection_block_submissions_total {collection_block_submission_count}",
-            "# HELP qbit_prism_grace_credited_shares_total Accepted shares credited by the stale-grace policy.",
-            "# TYPE qbit_prism_grace_credited_shares_total counter",
-            f"qbit_prism_grace_credited_shares_total {grace_credited_share_count}",
-            "# HELP qbit_prism_block_solves_dropped_total Block-passing submissions intentionally excluded from block submission by a bounded policy reason.",
-            "# TYPE qbit_prism_block_solves_dropped_total counter",
-            *[
-                f'qbit_prism_block_solves_dropped_total{{reason="{reason}"}} {int(block_solves_dropped_counts.get(reason, 0))}'
-                for reason in ("stale_grace",)
-            ],
-            "# HELP qbit_prism_rejections_total PRISM share or block rejections by canonical reason ID.",
-            "# TYPE qbit_prism_rejections_total counter",
-            *[
-                f'qbit_prism_rejections_total{{reason_id="{reason}"}} {int(rejection_counts.get(reason, 0))}'
-                for reason in PRISM_REJECTION_REASON_IDS
-            ],
-            "# HELP qbit_prism_worker_submitted_shares_total Stratum share submissions by bounded worker label.",
-            "# TYPE qbit_prism_worker_submitted_shares_total counter",
-            *[
-                f'qbit_prism_worker_submitted_shares_total{{worker="{self.prometheus_label_value(label)}"}} {int(counts.get("submitted", 0))}'
-                for label, counts in sorted(worker_share_counts.items())
-            ],
-            "# HELP qbit_prism_worker_accepted_shares_total Accepted shares by bounded worker label.",
-            "# TYPE qbit_prism_worker_accepted_shares_total counter",
-            *[
-                f'qbit_prism_worker_accepted_shares_total{{worker="{self.prometheus_label_value(label)}"}} {int(counts.get("accepted", 0))}'
-                for label, counts in sorted(worker_share_counts.items())
-            ],
-            "# HELP qbit_prism_worker_grace_credited_shares_total Stale-grace credited shares by bounded worker label.",
-            "# TYPE qbit_prism_worker_grace_credited_shares_total counter",
-            *[
-                f'qbit_prism_worker_grace_credited_shares_total{{worker="{self.prometheus_label_value(label)}"}} {int(counts.get("grace", 0))}'
-                for label, counts in sorted(worker_share_counts.items())
-            ],
-            "# HELP qbit_prism_worker_rejections_total PRISM share or block rejections by bounded worker label and reason ID.",
-            "# TYPE qbit_prism_worker_rejections_total counter",
-            *[
-                f'qbit_prism_worker_rejections_total{{worker="{self.prometheus_label_value(label)}",reason_id="{reason}"}} {int(count)}'
-                for (label, reason), count in sorted(worker_rejection_counts.items())
-            ],
-            "# HELP qbit_prism_job_build_failures_total Job builds skipped after a template/coinbase error without dropping the client.",
-            "# TYPE qbit_prism_job_build_failures_total counter",
-            f"qbit_prism_job_build_failures_total {self.job_build_failure_count}",
-            "# HELP qbit_prism_block_candidates_dropped_total Legacy counter; durable candidate outbox rows are never dropped on queue overflow.",
-            "# TYPE qbit_prism_block_candidates_dropped_total counter",
-            f"qbit_prism_block_candidates_dropped_total {int(getattr(self, 'block_candidates_dropped', 0))}",
-            "# HELP qbit_prism_block_candidate_wakeups_coalesced_total Candidate queue wakeups coalesced while the durable outbox retained the work.",
-            "# TYPE qbit_prism_block_candidate_wakeups_coalesced_total counter",
-            f"qbit_prism_block_candidate_wakeups_coalesced_total {int(getattr(self, 'block_candidate_wakeups_coalesced', 0))}",
-            "# HELP qbit_prism_block_candidate_retries_total Transient candidate outcomes retained for durable retry.",
-            "# TYPE qbit_prism_block_candidate_retries_total counter",
-            f"qbit_prism_block_candidate_retries_total {int(getattr(self, 'block_candidate_retry_count', 0))}",
-            "# HELP qbit_prism_block_candidate_accept_pending_defers_total Terminal abandonments refused because the candidate is (or was recently observed as) an active chain block; the candidate retries until its accepted success tail finalizes it as submitted.",
-            "# TYPE qbit_prism_block_candidate_accept_pending_defers_total counter",
-            f"qbit_prism_block_candidate_accept_pending_defers_total {int(getattr(self, 'block_candidate_accept_pending_defer_count', 0))}",
-            "# HELP qbit_prism_block_candidate_poisoned_total Invalid durable candidate intents quarantined from replay.",
-            "# TYPE qbit_prism_block_candidate_poisoned_total counter",
-            f"qbit_prism_block_candidate_poisoned_total {int(getattr(self, 'block_candidate_poisoned_count', 0))}",
-            "# HELP qbit_prism_block_candidates_abandoned_total Block candidates that did not land (lost tip race or failed submit), by reason. Not share rejections: the underlying share was accepted.",
-            "# TYPE qbit_prism_block_candidates_abandoned_total counter",
-            *[
-                f'qbit_prism_block_candidates_abandoned_total{{reason_id="{reason}"}} {int(count)}'
-                for reason, count in sorted(getattr(self, "block_candidate_abandoned_counts", {}).items())
-            ],
-            "# HELP qbit_prism_stale_job_abandons_total Terminal stale-job block candidate abandonments by bounded cause.",
-            "# TYPE qbit_prism_stale_job_abandons_total counter",
-            *[
-                f'qbit_prism_stale_job_abandons_total{{class="{abandon_class}"}} {int(stale_job_abandon_counts.get(abandon_class, 0))}'
-                for abandon_class in PRISM_STALE_JOB_ABANDON_CLASSES
-            ],
-            "# HELP qbit_prism_share_append_queue_depth Accepted shares waiting on the ledger writer thread.",
-            "# TYPE qbit_prism_share_append_queue_depth gauge",
-            f"qbit_prism_share_append_queue_depth {self.share_append_queue.qsize() if getattr(self, 'share_append_queue', None) is not None else 0}",
-            "# HELP qbit_prism_share_append_failures_total Shares in group commits that failed before acknowledgement.",
-            "# TYPE qbit_prism_share_append_failures_total counter",
-            f"qbit_prism_share_append_failures_total {int(getattr(self, 'share_append_failure_count', 0))}",
-            "# HELP qbit_prism_shares_recovered_to_disk_total Legacy pre-commit-ACK shares written to the upgrade recovery file.",
-            "# TYPE qbit_prism_shares_recovered_to_disk_total counter",
-            f"qbit_prism_shares_recovered_to_disk_total {int(getattr(self, 'shares_recovered_to_disk', 0))}",
-            "# HELP qbit_prism_shares_replayed_total Recovery-file shares replayed into the ledger at startup.",
-            "# TYPE qbit_prism_shares_replayed_total counter",
-            f"qbit_prism_shares_replayed_total {int(getattr(self, 'shares_replayed', 0))}",
-            "# HELP qbit_prism_share_replay_conflicts_total Recovery-file rows quarantined because the durable row disagrees with the journal payload.",
-            "# TYPE qbit_prism_share_replay_conflicts_total counter",
-            f"qbit_prism_share_replay_conflicts_total {int(getattr(self, 'share_replay_conflicts', 0))}",
-            "# HELP qbit_prism_tip_refresh_jobs_total Client jobs refreshed after qbit tip/template changes.",
-            "# TYPE qbit_prism_tip_refresh_jobs_total counter",
-            f"qbit_prism_tip_refresh_jobs_total {self.tip_refresh_job_count}",
-            "# HELP qbit_prism_active_job_contexts Current retained PRISM job contexts.",
-            "# TYPE qbit_prism_active_job_contexts gauge",
-            f"qbit_prism_active_job_contexts {len(getattr(self, 'jobs', {}))}",
-            "# HELP qbit_prism_evicted_job_contexts Evicted job contexts retained by safety class.",
-            "# TYPE qbit_prism_evicted_job_contexts gauge",
-            *[
-                f'qbit_prism_evicted_job_contexts{{class="{job_class}"}} {evicted_job_context_counts[job_class]}'
-                for job_class in PRISM_EVICTED_JOB_CLASSES
-            ],
-            "# HELP qbit_prism_evicted_job_submits_total Accepted submits validated against an evicted job context.",
-            "# TYPE qbit_prism_evicted_job_submits_total counter",
-            *[
-                f'qbit_prism_evicted_job_submits_total{{outcome="{outcome}"}} {int(evicted_job_submit_counts.get(outcome, 0))}'
-                for outcome in PRISM_EVICTED_JOB_SUBMIT_OUTCOMES
-            ],
-            "# HELP qbit_prism_evicted_job_expirations_total Retained job contexts removed after their class TTL.",
-            "# TYPE qbit_prism_evicted_job_expirations_total counter",
-            *[
-                f'qbit_prism_evicted_job_expirations_total{{class="{job_class}"}} {int(evicted_job_expiration_counts.get(job_class, 0))}'
-                for job_class in PRISM_EVICTED_JOB_CLASSES
-            ],
-            "# HELP qbit_prism_evicted_job_capacity_evictions_total Same-tip retained contexts removed by a configured count limit.",
-            "# TYPE qbit_prism_evicted_job_capacity_evictions_total counter",
-            *[
-                f'qbit_prism_evicted_job_capacity_evictions_total{{scope="{scope}"}} {int(evicted_job_capacity_eviction_counts.get(scope, 0))}'
-                for scope in PRISM_EVICTED_JOB_CAPACITY_SCOPES
-            ],
-            "# HELP qbit_prism_post_accept_refresh_failures_total Immediate clean-job refreshes that failed after direct block acceptance.",
-            "# TYPE qbit_prism_post_accept_refresh_failures_total counter",
-            f"qbit_prism_post_accept_refresh_failures_total {self.post_accept_refresh_failure_count}",
-            "# HELP qbit_prism_reorg_inactive_blocks_total PRISM pool blocks quarantined after leaving the active chain.",
-            "# TYPE qbit_prism_reorg_inactive_blocks_total counter",
-            f"qbit_prism_reorg_inactive_blocks_total {self.reorg_inactive_block_count}",
-            "# HELP qbit_prism_reorg_reactivated_blocks_total Quarantined PRISM pool blocks restored after returning to the active chain.",
-            "# TYPE qbit_prism_reorg_reactivated_blocks_total counter",
-            f"qbit_prism_reorg_reactivated_blocks_total {self.reorg_reactivated_block_count}",
-            "# HELP qbit_prism_reorg_reconcile_skips_total Reorg reconciliation passes skipped because qbitd chain view was not trusted.",
-            "# TYPE qbit_prism_reorg_reconcile_skips_total counter",
-            f"qbit_prism_reorg_reconcile_skips_total {self.reorg_reconcile_skip_count}",
-            "# HELP qbit_prism_reorg_reconcile_errors_total Reorg reconciliation errors that prevented ordered job issuance.",
-            "# TYPE qbit_prism_reorg_reconcile_errors_total counter",
-            f"qbit_prism_reorg_reconcile_errors_total {self.reorg_reconcile_error_count}",
-            "# HELP qbit_prism_reorg_reconcile_lookups_total Reconcile demand by caller path and the source that satisfied it.",
-            "# TYPE qbit_prism_reorg_reconcile_lookups_total counter",
-            *[
-                f'qbit_prism_reorg_reconcile_lookups_total{{path="{path}",source="{source}"}} '
-                f"{int(getattr(self, 'reorg_reconcile_lookup_counts', {}).get((path, source), 0))}"
-                for path in PRISM_REORG_RECONCILE_LOOKUP_PATHS
-                for source in PRISM_REORG_RECONCILE_LOOKUP_SOURCES
-            ],
-            "# HELP qbit_prism_matured_payouts_total Payout entries marked mature by the coordinator tip reconciliation path.",
-            "# TYPE qbit_prism_matured_payouts_total counter",
-            f"qbit_prism_matured_payouts_total {self.matured_payout_count}",
-            "# HELP qbit_prism_vardiff_idle_retargets_total Vardiff retargets triggered by the idle zero-accepted-share sweep.",
-            "# TYPE qbit_prism_vardiff_idle_retargets_total counter",
-            f"qbit_prism_vardiff_idle_retargets_total {idle_retarget_count}",
-            "# HELP qbit_prism_shares_per_second Accepted shares per second since coordinator start.",
-            "# TYPE qbit_prism_shares_per_second gauge",
-            f"qbit_prism_shares_per_second {shares_per_second:.12g}",
-            "# HELP qbit_prism_stale_share_percent Percent of submitted shares classified stale.",
-            "# TYPE qbit_prism_stale_share_percent gauge",
-            f"qbit_prism_stale_share_percent {stale_percent:.12g}",
-            "# HELP qbit_prism_blocks_accepted_total Blocks accepted through the PRISM coordinator.",
-            "# TYPE qbit_prism_blocks_accepted_total counter",
-            f"qbit_prism_blocks_accepted_total {self.accepted_block_count}",
-            "# HELP qbit_prism_persisted_blocks Persisted PRISM pool block rows.",
-            "# TYPE qbit_prism_persisted_blocks gauge",
-            f"qbit_prism_persisted_blocks {ledger_metrics['blocks']}",
-            "# HELP qbit_prism_inactive_pool_blocks PRISM pool block rows currently quarantined as inactive.",
-            "# TYPE qbit_prism_inactive_pool_blocks gauge",
-            f"qbit_prism_inactive_pool_blocks {ledger_metrics.get('inactive_blocks', 0)}",
-            "# HELP qbit_prism_reversed_pool_blocks PRISM pool block rows terminally reversed.",
-            "# TYPE qbit_prism_reversed_pool_blocks gauge",
-            f"qbit_prism_reversed_pool_blocks {ledger_metrics.get('reversed_blocks', 0)}",
-            "# HELP qbit_prism_rejected_pool_blocks PRISM pool block rows rejected before confirmation.",
-            "# TYPE qbit_prism_rejected_pool_blocks gauge",
-            f"qbit_prism_rejected_pool_blocks {ledger_metrics.get('rejected_blocks', 0)}",
-            "# HELP qbit_prism_owed_accounts Current accounts with positive carried owed balances.",
-            "# TYPE qbit_prism_owed_accounts gauge",
-            f"qbit_prism_owed_accounts {ledger_metrics['owed_accounts']}",
-            "# HELP qbit_prism_coinbase_weight_headroom_bytes Remaining qbit block weight bytes after the latest pool coinbase.",
-            "# TYPE qbit_prism_coinbase_weight_headroom_bytes gauge",
-            f"qbit_prism_coinbase_weight_headroom_bytes {coinbase_weight_headroom}",
-            "# HELP qbit_prism_ctv_fanouts_pending Pending non-terminal CTV fanouts known to the ledger, or -1 if unavailable.",
-            "# TYPE qbit_prism_ctv_fanouts_pending gauge",
-            f"qbit_prism_ctv_fanouts_pending {ctv_pending}",
-            "# HELP qbit_prism_ctv_fanouts_broadcastable CTV fanouts that are mature enough to broadcast, or -1 if unavailable.",
-            "# TYPE qbit_prism_ctv_fanouts_broadcastable gauge",
-            f"qbit_prism_ctv_fanouts_broadcastable {ctv_broadcastable}",
-            "# HELP qbit_prism_ctv_fanouts_failed CTV fanouts with failed or rejected broadcast state, or -1 if unavailable.",
-            "# TYPE qbit_prism_ctv_fanouts_failed gauge",
-            f"qbit_prism_ctv_fanouts_failed {ctv_failed}",
-            "# HELP qbit_prism_vardiff_enabled Whether PRISM Stratum vardiff is enabled.",
-            "# TYPE qbit_prism_vardiff_enabled gauge",
-            f"qbit_prism_vardiff_enabled {1 if self.vardiff_config.enabled else 0}",
-            "# HELP qbit_prism_qbitd_initial_block_download qbitd initialblockdownload status, or -1 if unavailable.",
-            "# TYPE qbit_prism_qbitd_initial_block_download gauge",
-            f"qbit_prism_qbitd_initial_block_download {ibd}",
-            "# HELP qbit_prism_qbitd_peers qbitd peer count, or -1 if unavailable.",
-            "# TYPE qbit_prism_qbitd_peers gauge",
-            f"qbit_prism_qbitd_peers {peers}",
-            "# HELP qbit_prism_audit_artifact_bytes Bytes used by PRISM audit artifacts in PRISM_AUDIT_DIR by artifact kind.",
-            "# TYPE qbit_prism_audit_artifact_bytes gauge",
-            *[
-                f'qbit_prism_audit_artifact_bytes{{kind="{kind}"}} {audit_metrics[kind]["bytes"]}'
-                for kind in ("body", "share_segment", "live_bundle", "candidate", "other")
-            ],
-            "# HELP qbit_prism_audit_artifact_files PRISM audit artifact file count in PRISM_AUDIT_DIR by artifact kind.",
-            "# TYPE qbit_prism_audit_artifact_files gauge",
-            *[
-                f'qbit_prism_audit_artifact_files{{kind="{kind}"}} {audit_metrics[kind]["files"]}'
-                for kind in ("body", "share_segment", "live_bundle", "candidate", "other")
-            ],
-            "# HELP qbit_prism_audit_artifact_scan_error Whether the latest PRISM_AUDIT_DIR metric scan failed.",
-            "# TYPE qbit_prism_audit_artifact_scan_error gauge",
-            f"qbit_prism_audit_artifact_scan_error {audit_metrics['scan_error']}",
-        ]
-        lines.extend(self.shutdown_metrics_lines())
-        lines.extend(self.coordinator_lock_metrics_lines())
-        lines.extend(self.block_submitter_metrics_lines())
-        lines.extend(self.share_ack_metrics_lines())
-        lines.extend(self.ctv_fanout_broadcaster_metrics_lines())
-        lines.extend(self.vardiff_idle_metrics_lines())
-        lines.extend(self.block_finalization_metrics_lines())
-        lines.extend(self.job_build_metrics_lines())
-        lines.extend(self.tip_refresh_metrics_lines())
-        lines.extend(self.payout_state_metrics_lines())
-        lines.extend(self.initial_delivery_metrics_lines())
-        lines.extend(self.progress_health_metrics_lines())
-        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def rejection_reason_ids() -> tuple[str, ...]:
+        # The renderer must not import coordinator globals.
+        return PRISM_REJECTION_REASON_IDS
+
+    def _ensure_metrics_renderer(self) -> MetricsRenderer:
+        renderer = self.__dict__.get("_metrics_renderer")
+        if renderer is None:
+            # Idempotent construction; no init lock is needed.
+            renderer = MetricsRenderer(self)
+            self.__dict__["_metrics_renderer"] = renderer
+        return renderer
+
+    def _render_metrics_payload(self) -> str:
+        return self._ensure_metrics_renderer().render()
 
     def metrics_payload(self) -> str:
         """Compatibility renderer; HTTP uses the complete cached snapshot."""
@@ -10878,59 +9524,8 @@ class PrismCoordinator:
         return self._render_metrics_payload()
 
     def shutdown_metrics_lines(self) -> list[str]:
-        snapshot = self._ensure_shutdown_controller().snapshot()
-        quiescence = snapshot["writer_quiescence_outcomes"]
-        release = snapshot["lease_release_outcomes"]
-        active = snapshot["active_writers"]
-        assert isinstance(quiescence, dict)
-        assert isinstance(release, dict)
-        assert isinstance(active, dict)
-        return [
-            "# HELP qbit_prism_shutdowns_total Controlled coordinator shutdown sequences started.",
-            "# TYPE qbit_prism_shutdowns_total counter",
-            f"qbit_prism_shutdowns_total {int(snapshot['shutdowns_total'])}",
-            "# HELP qbit_prism_shutdown_writer_operations Active admitted ledger-mutating operations by component.",
-            "# TYPE qbit_prism_shutdown_writer_operations gauge",
-            *[
-                f'qbit_prism_shutdown_writer_operations{{component="{self.prometheus_label_value(str(component))}"}} {int(count)}'
-                for component, count in sorted(active.items())
-            ],
-            "# HELP qbit_prism_shutdown_writer_quiescence_total Writer-quiescence outcomes.",
-            "# TYPE qbit_prism_shutdown_writer_quiescence_total counter",
-            *[
-                f'qbit_prism_shutdown_writer_quiescence_total{{outcome="{outcome}"}} {int(quiescence.get(outcome, 0))}'
-                for outcome in ("success", "timeout")
-            ],
-            "# HELP qbit_prism_shutdown_writer_quiescence_seconds Duration of the latest writer-quiescence barrier.",
-            "# TYPE qbit_prism_shutdown_writer_quiescence_seconds gauge",
-            f"qbit_prism_shutdown_writer_quiescence_seconds {float(snapshot['writer_quiescence_seconds']):.6f}",
-            "# HELP qbit_prism_shutdown_lease_release_attempts_total Writer-lease release attempts.",
-            "# TYPE qbit_prism_shutdown_lease_release_attempts_total counter",
-            f"qbit_prism_shutdown_lease_release_attempts_total {int(snapshot['lease_release_attempts_total'])}",
-            "# HELP qbit_prism_shutdown_lease_release_total Writer-lease release outcomes.",
-            "# TYPE qbit_prism_shutdown_lease_release_total counter",
-            *[
-                f'qbit_prism_shutdown_lease_release_total{{outcome="{outcome}"}} {int(release.get(outcome, 0))}'
-                for outcome in ("success", "not_held", "unsupported", "failure")
-            ],
-            "# HELP qbit_prism_shutdown_lease_release_seconds Duration of the latest writer-lease release attempt.",
-            "# TYPE qbit_prism_shutdown_lease_release_seconds gauge",
-            f"qbit_prism_shutdown_lease_release_seconds {float(snapshot['lease_release_seconds']):.6f}",
-            "# HELP qbit_prism_shutdown_sigterm_to_lease_release_seconds Time from SIGTERM admission close to safe lease release, or -1 if unobserved.",
-            "# TYPE qbit_prism_shutdown_sigterm_to_lease_release_seconds gauge",
-            "qbit_prism_shutdown_sigterm_to_lease_release_seconds "
-            + (
-                f"{float(snapshot['sigterm_to_lease_release_seconds']):.6f}"
-                if snapshot["sigterm_release_observed"]
-                else "-1"
-            ),
-            "# HELP qbit_prism_shutdown_release_withheld_total Shutdowns that withheld lease release because a writer did not quiesce.",
-            "# TYPE qbit_prism_shutdown_release_withheld_total counter",
-            f"qbit_prism_shutdown_release_withheld_total {int(snapshot['release_withheld_total'])}",
-            "# HELP qbit_prism_shutdown_non_writer_drain_seconds Duration of cleanup after writer lease handling.",
-            "# TYPE qbit_prism_shutdown_non_writer_drain_seconds gauge",
-            f"qbit_prism_shutdown_non_writer_drain_seconds {float(snapshot['non_writer_drain_seconds']):.6f}",
-        ]
+        # Compatibility wrapper for the extracted metrics owner.
+        return self._ensure_metrics_renderer().shutdown_metrics_lines()
 
     def audit_artifact_metrics(self) -> dict[str, dict[str, int] | int]:
         return self._ensure_audit_artifact_store().metrics_snapshot()
@@ -10943,96 +9538,8 @@ class PrismCoordinator:
         return self._ensure_ctv_runtime().metrics_lines()
 
     def initial_delivery_metrics_lines(self) -> list[str]:
-        self._ensure_initial_job_state()
-        mining = self.mining_delivery_snapshot()
-        with self.lock:
-            counts = {
-                "sent": self.initial_job_sent_count,
-                "cancelled": self.initial_job_cancelled_count,
-                "coalesced": self.initial_job_coalesced_count,
-                "failed": self.initial_job_failed_count,
-                "superseded": self.initial_job_superseded_count,
-            }
-            latency_sum = self.initial_job_delivery_latency_seconds_sum
-            latency_count = self.initial_job_delivery_latency_count
-            queue_capacity_reclaimed = (
-                self.initial_job_queue_capacity_reclaimed_count
-            )
-        executor = getattr(self, "_initial_job_executor", None)
-        queued, slots = executor.stats() if executor is not None else (0, 0)
-        configured_workers = int(
-            getattr(
-                self,
-                "initial_job_max_workers",
-                DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
-            )
-        )
-        with self._bundle_preparation_lock:
-            build_counts = dict(self.shared_bundle_build_counts)
-            preparation_sum = self.shared_bundle_preparation_seconds_sum
-            preparation_count = self.shared_bundle_preparation_count
-            waiters = self.shared_bundle_preparation_waiters
-        return [
-            "# HELP qbit_prism_stratum_subscribed_clients Subscribed Stratum clients.",
-            "# TYPE qbit_prism_stratum_subscribed_clients gauge",
-            f'qbit_prism_stratum_subscribed_clients {mining["subscribed_clients"]}',
-            "# HELP qbit_prism_stratum_authorized_clients Subscribed and authorized Stratum clients.",
-            "# TYPE qbit_prism_stratum_authorized_clients gauge",
-            f'qbit_prism_stratum_authorized_clients {mining["authorized_clients"]}',
-            "# HELP qbit_prism_clients_without_current_tip_job Authorized clients without usable current-tip work.",
-            "# TYPE qbit_prism_clients_without_current_tip_job gauge",
-            f'qbit_prism_clients_without_current_tip_job {mining["clients_without_current_tip_job"]}',
-            "# HELP qbit_prism_clients_with_no_active_job Authorized clients with no active job at all.",
-            "# TYPE qbit_prism_clients_with_no_active_job gauge",
-            f'qbit_prism_clients_with_no_active_job {mining["clients_with_no_active_job"]}',
-            "# HELP qbit_prism_clients_with_current_tip_job Authorized clients with usable current-tip work.",
-            "# TYPE qbit_prism_clients_with_current_tip_job gauge",
-            f'qbit_prism_clients_with_current_tip_job {mining["clients_with_current_tip_job"]}',
-            "# HELP qbit_prism_current_tip_job_coverage_ratio Fraction of authorized clients with current-tip work.",
-            "# TYPE qbit_prism_current_tip_job_coverage_ratio gauge",
-            f'qbit_prism_current_tip_job_coverage_ratio {float(mining["current_tip_job_coverage_ratio"]):.12g}',
-            "# HELP qbit_prism_initial_job_deliveries_pending Coalesced initial deliveries queued or running.",
-            "# TYPE qbit_prism_initial_job_deliveries_pending gauge",
-            f'qbit_prism_initial_job_deliveries_pending {mining["clients_pending_initial_job"]}',
-            "# HELP qbit_prism_initial_job_delivery_tasks_inflight Bounded shared delivery slots currently occupied.",
-            "# TYPE qbit_prism_initial_job_delivery_tasks_inflight gauge",
-            f"qbit_prism_initial_job_delivery_tasks_inflight {slots}",
-            "# HELP qbit_prism_initial_job_delivery_queue_depth Initial-job tasks waiting for a dedicated worker.",
-            "# TYPE qbit_prism_initial_job_delivery_queue_depth gauge",
-            f"qbit_prism_initial_job_delivery_queue_depth {queued}",
-            "# HELP qbit_prism_initial_job_delivery_active_workers Dedicated initial-job workers currently running tasks.",
-            "# TYPE qbit_prism_initial_job_delivery_active_workers gauge",
-            f"qbit_prism_initial_job_delivery_active_workers {slots}",
-            "# HELP qbit_prism_initial_job_delivery_configured_workers Configured dedicated initial-job worker count.",
-            "# TYPE qbit_prism_initial_job_delivery_configured_workers gauge",
-            f"qbit_prism_initial_job_delivery_configured_workers {configured_workers}",
-            "# HELP qbit_prism_initial_job_delivery_seconds Authorization-to-current-job latency.",
-            "# TYPE qbit_prism_initial_job_delivery_seconds summary",
-            f"qbit_prism_initial_job_delivery_seconds_sum {latency_sum:.6f}",
-            f"qbit_prism_initial_job_delivery_seconds_count {latency_count}",
-            "# HELP qbit_prism_initial_job_requests_total Initial delivery outcomes.",
-            "# TYPE qbit_prism_initial_job_requests_total counter",
-            *[
-                f'qbit_prism_initial_job_requests_total{{result="{result}"}} {count}'
-                for result, count in sorted(counts.items())
-            ],
-            "# HELP qbit_prism_initial_job_queue_capacity_reclaimed_total Queued initial-job slots reclaimed immediately by cancellation.",
-            "# TYPE qbit_prism_initial_job_queue_capacity_reclaimed_total counter",
-            f"qbit_prism_initial_job_queue_capacity_reclaimed_total {queue_capacity_reclaimed}",
-            "# HELP qbit_prism_shared_bundle_preparation_seconds Heavy shared bundle preparation wall time.",
-            "# TYPE qbit_prism_shared_bundle_preparation_seconds summary",
-            f"qbit_prism_shared_bundle_preparation_seconds_sum {preparation_sum:.6f}",
-            f"qbit_prism_shared_bundle_preparation_seconds_count {preparation_count}",
-            "# HELP qbit_prism_shared_bundle_preparation_waiters Callers waiting on the keyed shared preparation flight.",
-            "# TYPE qbit_prism_shared_bundle_preparation_waiters gauge",
-            f"qbit_prism_shared_bundle_preparation_waiters {waiters}",
-            "# HELP qbit_prism_shared_bundle_builds_total Shared bundle builds by terminal outcome.",
-            "# TYPE qbit_prism_shared_bundle_builds_total counter",
-            *[
-                f'qbit_prism_shared_bundle_builds_total{{result="{result}"}} {count}'
-                for result, count in sorted(build_counts.items())
-            ],
-        ]
+        # Compatibility wrapper for the extracted metrics owner.
+        return self._ensure_metrics_renderer().initial_delivery_metrics_lines()
 
     def vardiff_idle_metrics_lines(self) -> list[str]:
         return self._ensure_vardiff_service().metrics_lines()
@@ -11044,195 +9551,8 @@ class PrismCoordinator:
         return self._ensure_tip_refresh_service().tip_refresh_metrics_lines()
 
     def job_build_metrics_lines(self) -> list[str]:
-        self._ensure_job_cache_state()
-        with self._job_cache_lock:
-            bucket_counts = dict(self.job_build_seconds_bucket_counts)
-            build_sum = self.job_build_seconds_sum
-            build_count = self.job_build_count
-            phase_seconds = dict(self.job_build_phase_seconds)
-            hit_counts = dict(self.job_cache_hit_counts)
-            miss_counts = dict(self.job_cache_miss_counts)
-            health_refresh_failures = self.health_snapshot_refresh_failure_count
-        with self._job_build_scheduler_lock:
-            scheduler_counts = dict(self.job_build_scheduler_counts)
-            priority_counts = dict(self.job_build_priority_counts)
-            priority_admission_seconds = dict(
-                self.job_build_priority_admission_seconds
-            )
-            initial_prepared_counts = dict(
-                self.initial_job_prepared_work_counts
-            )
-            cancellation_seconds = dict(self.job_build_cancellation_seconds)
-            replacement_seconds = dict(self.job_build_replacement_start_seconds)
-            worker_counts = dict(self.job_build_worker_counts)
-            active_builds = int(self._job_build_active is not None)
-            pending_builds = int(self._job_build_pending is not None)
-            priority_requests = tuple(
-                request
-                for request in (
-                    (
-                        self._job_build_active.request
-                        if self._job_build_active is not None
-                        else None
-                    ),
-                    (
-                        self._job_build_retiring.request
-                        if self._job_build_retiring is not None
-                        else None
-                    ),
-                    self._job_build_pending,
-                )
-                if request is not None
-                and not request.cancellation.is_set()
-                and self._job_build_is_publication_critical(request)
-            )
-            priority_preparations = tuple(
-                self._job_build_priority_preparations.values()
-            )
-            priority_active = int(
-                bool(priority_requests or priority_preparations)
-            )
-            priority_age_seconds = max(
-                (
-                    time.monotonic() - request.requested_monotonic
-                    for request in priority_requests
-                ),
-                default=0.0,
-            )
-            priority_age_seconds = max(
-                priority_age_seconds,
-                max(
-                    (
-                        time.monotonic() - started
-                        for started in priority_preparations
-                    ),
-                    default=0.0,
-                ),
-            )
-        lock = getattr(self, "lock", None)
-        if lock is not None:
-            with lock:
-                connected_clients = len(getattr(self, "clients", ()))
-        else:
-            connected_clients = len(getattr(self, "clients", ()))
-        lines = [
-            "# HELP qbit_prism_job_build_seconds Wall time from client job build or prepared submission to completion, including skipped prepared tasks.",
-            "# TYPE qbit_prism_job_build_seconds histogram",
-        ]
-        for bucket in PRISM_JOB_BUILD_SECONDS_BUCKETS:
-            lines.append(
-                f'qbit_prism_job_build_seconds_bucket{{le="{bucket:g}"}} {bucket_counts.get(bucket, 0)}'
-            )
-        lines.extend(
-            [
-                f'qbit_prism_job_build_seconds_bucket{{le="+Inf"}} {build_count}',
-                f"qbit_prism_job_build_seconds_sum {build_sum:.6f}",
-                f"qbit_prism_job_build_seconds_count {build_count}",
-                "# HELP qbit_prism_job_build_phase_seconds_total Cumulative job build wall time by phase.",
-                "# TYPE qbit_prism_job_build_phase_seconds_total counter",
-                *[
-                    f'qbit_prism_job_build_phase_seconds_total{{phase="{phase}"}} {phase_seconds.get(phase, 0.0):.6f}'
-                    for phase in PRISM_JOB_BUILD_PHASES
-                ],
-                "# HELP qbit_prism_job_cache_hits_total Job build cache hits by cache kind.",
-                "# TYPE qbit_prism_job_cache_hits_total counter",
-                *[
-                    f'qbit_prism_job_cache_hits_total{{cache="{kind}"}} {int(hit_counts.get(kind, 0))}'
-                    for kind in PRISM_JOB_CACHE_KINDS
-                ],
-                "# HELP qbit_prism_job_cache_misses_total Job build cache misses by cache kind.",
-                "# TYPE qbit_prism_job_cache_misses_total counter",
-                *[
-                    f'qbit_prism_job_cache_misses_total{{cache="{kind}"}} {int(miss_counts.get(kind, 0))}'
-                    for kind in PRISM_JOB_CACHE_KINDS
-                ],
-                "# HELP qbit_prism_health_snapshot_refresh_failures_total Background health snapshot refreshes that raised.",
-                "# TYPE qbit_prism_health_snapshot_refresh_failures_total counter",
-                f"qbit_prism_health_snapshot_refresh_failures_total {health_refresh_failures}",
-                "# HELP qbit_prism_connected_clients Currently connected Stratum clients.",
-                "# TYPE qbit_prism_connected_clients gauge",
-                f"qbit_prism_connected_clients {connected_clients}",
-                "# HELP qbit_prism_job_build_requests_total Immutable job build requests admitted to the latest-wins scheduler.",
-                "# TYPE qbit_prism_job_build_requests_total counter",
-                f'qbit_prism_job_build_requests_total {int(scheduler_counts.get("requests", 0))}',
-                "# HELP qbit_prism_job_build_starts_total Immutable job builds started by the bounded executor.",
-                "# TYPE qbit_prism_job_build_starts_total counter",
-                f'qbit_prism_job_build_starts_total {int(scheduler_counts.get("starts", 0))}',
-                "# HELP qbit_prism_job_build_completions_total Immutable job build executions completed.",
-                "# TYPE qbit_prism_job_build_completions_total counter",
-                f'qbit_prism_job_build_completions_total {int(scheduler_counts.get("completions", 0))}',
-                "# HELP qbit_prism_job_build_supersessions_total Active or pending builds replaced by a newer immutable key.",
-                "# TYPE qbit_prism_job_build_supersessions_total counter",
-                f'qbit_prism_job_build_supersessions_total {int(scheduler_counts.get("supersessions", 0))}',
-                "# HELP qbit_prism_job_build_obsolete_results_total Obsolete build results discarded before cache or delivery.",
-                "# TYPE qbit_prism_job_build_obsolete_results_total counter",
-                f'qbit_prism_job_build_obsolete_results_total {int(scheduler_counts.get("obsolete_results", 0))}',
-                "# HELP qbit_prism_job_build_orphan_evicted_total Finished flights evicted from scheduler slots after their completion never released them.",
-                "# TYPE qbit_prism_job_build_orphan_evicted_total counter",
-                f'qbit_prism_job_build_orphan_evicted_total {int(scheduler_counts.get("orphan_evicted", 0))}',
-                "# HELP qbit_prism_job_build_active Current latest-generation build executions.",
-                "# TYPE qbit_prism_job_build_active gauge",
-                f"qbit_prism_job_build_active {active_builds}",
-                "# HELP qbit_prism_job_build_pending Newest build request waiting for a bounded executor slot.",
-                "# TYPE qbit_prism_job_build_pending gauge",
-                f"qbit_prism_job_build_pending {pending_builds}",
-                "# HELP qbit_prism_job_build_cancellation_seconds Cancellation signal to obsolete execution completion.",
-                "# TYPE qbit_prism_job_build_cancellation_seconds summary",
-                f'qbit_prism_job_build_cancellation_seconds_sum {float(cancellation_seconds.get("sum", 0.0)):.6f}',
-                f'qbit_prism_job_build_cancellation_seconds_count {int(cancellation_seconds.get("count", 0))}',
-                "# HELP qbit_prism_job_build_replacement_start_seconds Supersession signal to replacement build start.",
-                "# TYPE qbit_prism_job_build_replacement_start_seconds summary",
-                f'qbit_prism_job_build_replacement_start_seconds_sum {float(replacement_seconds.get("sum", 0.0)):.6f}',
-                f'qbit_prism_job_build_replacement_start_seconds_count {int(replacement_seconds.get("count", 0))}',
-                "# HELP qbit_prism_job_build_priority_events_total Publication-critical scheduler admissions and routine-work displacement.",
-                "# TYPE qbit_prism_job_build_priority_events_total counter",
-                *[
-                    f'qbit_prism_job_build_priority_events_total{{result="{result}"}} {int(priority_counts.get(result, 0))}'
-                    for result in (
-                        "started",
-                        "coalesced",
-                        "queued",
-                        "routine_deferred",
-                        "routine_preempted",
-                    )
-                ],
-                "# HELP qbit_prism_job_build_priority_admission_seconds Publication-priority reservation to builder start or exact-flight coalescing.",
-                "# TYPE qbit_prism_job_build_priority_admission_seconds summary",
-                f'qbit_prism_job_build_priority_admission_seconds_sum {float(priority_admission_seconds.get("sum", 0.0)):.6f}',
-                f'qbit_prism_job_build_priority_admission_seconds_count {int(priority_admission_seconds.get("count", 0))}',
-                "# HELP qbit_prism_job_build_priority_active Whether publication-critical build work is preparing, running, retiring, or pending.",
-                "# TYPE qbit_prism_job_build_priority_active gauge",
-                f"qbit_prism_job_build_priority_active {priority_active}",
-                "# HELP qbit_prism_job_build_priority_age_seconds Age of the oldest admitted publication-critical build request.",
-                "# TYPE qbit_prism_job_build_priority_age_seconds gauge",
-                f"qbit_prism_job_build_priority_age_seconds {priority_age_seconds:.6f}",
-                "# HELP qbit_prism_initial_job_prepared_work_total Initial jobs that reused, coalesced behind, or deferred to prepared shared work.",
-                "# TYPE qbit_prism_initial_job_prepared_work_total counter",
-                *[
-                    f'qbit_prism_initial_job_prepared_work_total{{result="{result}"}} {int(initial_prepared_counts.get(result, 0))}'
-                    for result in (
-                        "cache_hit",
-                        "singleflight",
-                        "deferred",
-                        "subscribed",
-                        "admission_deadline",
-                    )
-                ],
-                "# HELP qbit_prism_job_build_worker_events_total Pure builder subprocess lifecycle events.",
-                "# TYPE qbit_prism_job_build_worker_events_total counter",
-                *[
-                    f'qbit_prism_job_build_worker_events_total{{event="{event}"}} {int(worker_counts.get(event, 0))}'
-                    for event in ("starts", "terminations", "crashes", "restarts")
-                ],
-                "# HELP qbit_prism_job_build_configured_workers Configured bounded job-build executor worker count.",
-                "# TYPE qbit_prism_job_build_configured_workers gauge",
-                (
-                    "qbit_prism_job_build_configured_workers "
-                    f"{int(getattr(self, 'job_build_executor_workers', DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS))}"
-                ),
-            ]
-        )
-        return lines
+        # Compatibility wrapper for the extracted metrics owner.
+        return self._ensure_metrics_renderer().job_build_metrics_lines()
 
     def payout_state_metrics_lines(self) -> list[str]:
         return self._ensure_payout_state_service().payout_state_metrics_lines()

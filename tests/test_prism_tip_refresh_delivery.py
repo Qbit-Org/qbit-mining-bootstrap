@@ -1344,8 +1344,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         leader = threading.Thread(target=reconcile, args=(0,))
         leader.start()
         self.assertTrue(entered.wait(timeout=5.0))
-        with server._reconcile_flight_lock:
-            flight = server._reconcile_flights[tip]
+        with server._ensure_reorg_reconciler_service()._reconcile_flight_lock:
+            flight = server._ensure_reorg_reconciler_service()._reconcile_flights[tip]
 
         follower_waiting = threading.Event()
 
@@ -1379,8 +1379,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         self.assertEqual(results[0], results[1])
         self.assertIsNotNone(results[0])
         self.assertIsNot(results[0], results[1])
-        with server._reconcile_flight_lock:
-            self.assertEqual(server._reconcile_flights, {})
+        with server._ensure_reorg_reconciler_service()._reconcile_flight_lock:
+            self.assertEqual(server._ensure_reorg_reconciler_service()._reconcile_flights, {})
 
     def test_lock_owner_reconcile_bypasses_same_tip_flight(self) -> None:
         tip = "5f" * 32
@@ -1450,8 +1450,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             with server._payout_balance_mutation_lock:
                 leader.start()
                 self.assertTrue(leader_lock_attempted.wait(timeout=5.0))
-                with server._reconcile_flight_lock:
-                    flight = server._reconcile_flights[tip]
+                with server._ensure_reorg_reconciler_service()._reconcile_flight_lock:
+                    flight = server._ensure_reorg_reconciler_service()._reconcile_flights[tip]
                     flight.event = WaitForbiddenEvent(  # type: ignore[assignment]
                         flight.event
                     )
@@ -1486,8 +1486,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
                 ("mature", 10),
             ],
         )
-        with server._reconcile_flight_lock:
-            self.assertEqual(server._reconcile_flights, {})
+        with server._ensure_reorg_reconciler_service()._reconcile_flight_lock:
+            self.assertEqual(server._ensure_reorg_reconciler_service()._reconcile_flights, {})
 
     def test_lock_owner_reconcile_leads_visible_flight_when_absent(self) -> None:
         tip = "60" * 32
@@ -1560,8 +1560,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         lock_owner.start()
         try:
             self.assertTrue(entered.wait(timeout=5.0))
-            with server._reconcile_flight_lock:
-                flight = server._reconcile_flights[tip]
+            with server._ensure_reorg_reconciler_service()._reconcile_flight_lock:
+                flight = server._ensure_reorg_reconciler_service()._reconcile_flights[tip]
                 flight.event = SignalingEvent(flight.event)  # type: ignore[assignment]
 
             follower.start()
@@ -1586,8 +1586,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             [("watch", 10), ("mature", 10)],
             "the ordinary caller must reuse the lock owner's visible pass",
         )
-        with server._reconcile_flight_lock:
-            self.assertEqual(server._reconcile_flights, {})
+        with server._ensure_reorg_reconciler_service()._reconcile_flight_lock:
+            self.assertEqual(server._ensure_reorg_reconciler_service()._reconcile_flights, {})
 
     def test_forced_and_reserved_reconciles_bypass_flight_reuse(self) -> None:
         tip = "5e" * 32
@@ -1607,8 +1607,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         flight = _ReconcileFlight()
         flight.summary = sentinel_summary
         flight.event.set()
-        with server._reconcile_flight_lock:
-            server._reconcile_flights[tip] = flight
+        with server._ensure_reorg_reconciler_service()._reconcile_flight_lock:
+            server._ensure_reorg_reconciler_service()._reconcile_flights[tip] = flight
 
         joined = server.reconcile_prism_pool_blocks_once(tip_hash=tip)
         self.assertEqual(joined, sentinel_summary)
@@ -1632,8 +1632,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             [("watch", 10), ("mature", 10), ("watch", 10), ("mature", 10)],
         )
 
-        with server._reconcile_flight_lock:
-            server._reconcile_flights.pop(tip, None)
+        with server._ensure_reorg_reconciler_service()._reconcile_flight_lock:
+            server._ensure_reorg_reconciler_service()._reconcile_flights.pop(tip, None)
 
     def test_pass_spanning_detection_cycle_does_not_arm_memo(self) -> None:
         # A pass whose reads straddle a flip away and back finishes with the
@@ -1664,7 +1664,7 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         self.assertTrue(server.ensure_reorg_reconciled_for_tip(tip))
 
         with server.lock:
-            self.assertNotIn(tip, server._reorg_reconcile_trusted_memo)
+            self.assertNotIn(tip, server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo)
 
     def test_row_mutating_pass_evicts_other_tip_memo_entries(self) -> None:
         tip_a = "a1" * 32
@@ -1688,8 +1688,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         first = server.reconcile_prism_pool_blocks_once(tip_hash=tip_b)
         self.assertEqual(first["published_generation"], 1)
         with server.lock:
-            self.assertIn(tip_a, server._reorg_reconcile_trusted_memo)
-            self.assertIn(tip_b, server._reorg_reconcile_trusted_memo)
+            self.assertIn(tip_a, server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo)
+            self.assertIn(tip_b, server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo)
 
         # A pass that applies orphan/maturity row mutations ends every other
         # tip's memo epoch, even though tip B was never observed by
@@ -1705,8 +1705,8 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         second = server.reconcile_prism_pool_blocks_once(tip_hash=tip_b)
         self.assertEqual(second["inactive_blocks"], 1)
         with server.lock:
-            self.assertNotIn(tip_a, server._reorg_reconcile_trusted_memo)
-            self.assertIn(tip_b, server._reorg_reconcile_trusted_memo)
+            self.assertNotIn(tip_a, server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo)
+            self.assertIn(tip_b, server._ensure_reorg_reconciler_service()._reorg_reconcile_trusted_memo)
 
     def test_coordination_blocked_default_budget_is_fifteen_minutes(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)

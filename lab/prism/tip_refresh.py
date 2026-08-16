@@ -35,7 +35,7 @@ import random
 import threading
 import time
 import traceback
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from lab.prism.bounded_executor import _BoundedPriorityExecutor
 from lab.prism.coordinator_config import (
@@ -45,7 +45,6 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_SUBMIT_TIP_MAX_AGE_SECONDS,
     DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS,
     DEFAULT_PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS,
-    DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS,
 )
 from lab.prism.job_bundle import CachedJobBundle, JobBuildKey, JobBuildSuperseded
 from lab.prism.template_artifacts import (
