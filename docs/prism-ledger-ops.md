@@ -270,6 +270,75 @@ supplied active tip, must not be reversed by that path. qbit coinbase maturity
 is 1000 blocks, so operators must not mark pool payouts mature before
 `block_height + 1000`.
 
+## Publication Ordinal Rollback And Schema Revert
+
+Schema initialization adds a durable publication ordinal to accepted pool
+blocks: `qbit_pool_blocks.audit_publication_sequence`, allocated from
+`qbit_audit_publication_sequence_seq` at the durable prepared -> confirmed
+boundary, unique across the table, and required by a validated CHECK
+constraint on every confirmed row. Historical confirmed and inactive rows are
+backfilled deterministically in `(found_at, block_hash)` order the first time
+the migration runs.
+
+Rolling back coordinator code does not require reverting this schema. The
+`qbit_pool_blocks_assign_publication_ordinal` BEFORE trigger assigns the next
+ordinal to any confirming write that omits it, so a pre-ordinal coordinator
+that confirms with a plain `chain_state` UPDATE keeps satisfying the
+constraint. That trigger is the primary rollback path; prefer it.
+
+`crates/qbit-prism/sql/001_share_ledger_revert_audit_publication_sequence.sql`
+is the second path, for the cases the trigger cannot cover: rolling back more
+than one release, or aligning a live ledger with a restored pre-migration
+base backup. It returns `qbit_pool_blocks` to its pre-ordinal shape by
+dropping, in order, the CHECK constraint, the assignment trigger and its
+function, the unique index, the column, and the sequence, then restores the
+pre-ordinal `qbit_confirm_pool_block` body. The file is one transaction
+serialized behind the same advisory lock as the forward migration: any
+failure aborts the whole revert, and re-running it after the failure is
+resolved -- or on an already-reverted or never-migrated schema -- is safe. An
+object the migration did not create, such as an operator view over the
+ordinal column, fails the revert loudly instead of being dropped.
+
+Before applying the revert:
+
+1. Stop the coordinator and anything else writing to the ledger. The revert
+   takes an ACCESS EXCLUSIVE lock on `qbit_pool_blocks`, so it stalls behind
+   a live writer. Worse, a post-migration coordinator left running (or
+   restarted afterwards) confirms blocks by assigning the ordinal explicitly:
+   every such confirmation fails with `column "audit_publication_sequence"
+   does not exist` the moment the revert commits, and a post-migration
+   coordinator restarted with schema initialization enabled immediately
+   re-applies the forward migration, silently undoing the revert.
+2. Take a base backup, or verify the continuous WAL archive covers this
+   point. The revert discards every assigned publication ordinal; nothing can
+   recover them afterwards except that backup.
+
+What is permanently lost: the recorded confirmed-publication order. The
+ordinal is allocated when a block durably reaches `confirmed` and is reused
+across exact replay and inactive -> confirmed reactivation, so it is the only
+record of the order in which blocks were actually published. After the
+revert, publication currency falls back to what pre-ordinal code used to
+select current evidence -- `found_at`/`block_height` read order -- which is
+not that durable publication order. Re-applying `001_share_ledger.sql` later
+re-adds the column and backfills deterministically by
+`(found_at, block_hash)`, but that is a fresh assignment: it does not
+reproduce the ordinals observed before the revert, and external consumers
+that recorded pre-revert ordinals will see the sequence renumbered.
+
+Apply the revert with the ledger role whose `search_path` selects the PRISM
+schema, and stop on the first error:
+
+```sh
+psql "$PRISM_DATABASE_URL" \
+  --set ON_ERROR_STOP=1 \
+  -f crates/qbit-prism/sql/001_share_ledger_revert_audit_publication_sequence.sql
+```
+
+The full round trip -- migrate, revert, confirm pre-ordinal-style, re-apply,
+re-backfill without double assignment -- is exercised by
+`tests/prism_postgres_a1_revert_gate.py` inside
+`test/test-prism-postgres-ledger.sh`.
+
 ## CTV Fanout Artifact Repair
 
 Schema initialization is also the idempotent repair path for deployed PRISM

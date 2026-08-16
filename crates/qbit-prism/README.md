@@ -26,6 +26,13 @@ Stratum frontends should enqueue share submissions outside this table. Only the
 active ledger writer inserts rows into `qbit_share_ledger`; that is what keeps
 all miners in the same reward universe.
 
+[`sql/001_share_ledger_revert_audit_publication_sequence.sql`](sql/001_share_ledger_revert_audit_publication_sequence.sql)
+returns `qbit_pool_blocks` to its pre-publication-ordinal shape for operators
+rolling back past that migration; it discards assigned ordinals, so read
+"Publication Ordinal Rollback And Schema Revert" in
+[`docs/prism-ledger-ops.md`](../../docs/prism-ledger-ops.md) before applying
+it.
+
 ## Reward Rule
 
 For a found block, PRISM's TIDES-style reward window uses shares whose job was

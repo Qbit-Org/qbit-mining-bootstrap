@@ -156,7 +156,7 @@ ALTER TABLE qbit_payout_carry_forward DISABLE TRIGGER qbit_payout_carry_forward_
 
 INSERT INTO qbit_pool_blocks (
     block_hash, block_height, parent_hash, coinbase_txid,
-    payout_manifest_sha256, chain_state
+    payout_manifest_sha256, chain_state, audit_publication_sequence
 )
 SELECT
     'scale-block-' || lpad(gs::text, 8, '0'),
@@ -164,7 +164,8 @@ SELECT
     'scale-block-' || lpad((gs - 1)::text, 8, '0'),
     md5('coinbase' || gs::text),
     md5('manifest' || gs::text),
-    'confirmed'
+    'confirmed',
+    pg_catalog.nextval('qbit_audit_publication_sequence_seq')
 FROM generate_series(1, {BLOCKS}) AS gs
 ON CONFLICT (block_hash) DO NOTHING;
 

@@ -48,7 +48,12 @@ else
     "${POSTGRES_IMAGE}" >/dev/null
 
   deadline=$((SECONDS + 60))
-  until docker exec "${POSTGRES_CONTAINER}" pg_isready -U qbit -d qbit >/dev/null 2>&1; do
+  # A fresh official image briefly accepts connections on its bootstrap server
+  # before restarting into the durable server. Require readiness across that
+  # handoff so schema initialization cannot race the bootstrap shutdown.
+  until docker exec "${POSTGRES_CONTAINER}" pg_isready -U qbit -d qbit >/dev/null 2>&1 \
+    && sleep 1 \
+    && docker exec "${POSTGRES_CONTAINER}" pg_isready -U qbit -d qbit >/dev/null 2>&1; do
     if [[ "${SECONDS}" -ge "${deadline}" ]]; then
       echo "timed out waiting for PRISM Postgres container" >&2
       docker logs "${POSTGRES_CONTAINER}" >&2 || true
@@ -57,6 +62,14 @@ else
     sleep 1
   done
   PSQL_COMMAND="docker exec -i ${POSTGRES_CONTAINER} psql -U qbit -d qbit"
+fi
+
+if [[ -n "${EXTERNAL_PSQL}" ]]; then
+  GATE_IMAGE="external-postgres"
+  GATE_IMAGE_DIGEST="not-applicable"
+else
+  GATE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${POSTGRES_CONTAINER}")"
+  GATE_IMAGE_DIGEST="$(docker inspect --format '{{.Image}}' "${POSTGRES_CONTAINER}")"
 fi
 
 (
@@ -72,7 +85,12 @@ import os
 import tempfile
 from pathlib import Path
 
-from lab.prism.share_ledger import PendingShare, PsqlShareLedger, ShareReplayConflict
+from lab.prism.share_ledger import (
+    PendingShare,
+    PsqlShareLedger,
+    ShareReplayConflict,
+    SingleWriterShareLedger,
+)
 
 
 def pending(
@@ -798,8 +816,39 @@ WHERE miner_id LIKE 'miner-unanchored-%';
 """
 )
 assert_equal(unanchored_balances, [], "unanchored carry rows require a confirmed pool block")
+unknown_confirmation = replacement.confirm_accepted_block(
+    block_hash="ff" * 32,
+    active_tip_height=7,
+)
+assert_equal(
+    unknown_confirmation,
+    {"backend": "postgres-psql", "confirmed_count": 0},
+    "unknown block confirmation exposes no publication ordinal",
+)
+wrong_height_confirmation = replacement.confirm_accepted_block(
+    block_hash="44" * 32,
+    active_tip_height=8,
+)
+assert_equal(
+    wrong_height_confirmation,
+    {"backend": "postgres-psql", "confirmed_count": 0},
+    "wrong-height confirmation exposes no publication ordinal",
+)
 confirmed = replacement.confirm_accepted_block(block_hash="44" * 32, active_tip_height=7)
 assert_equal(confirmed["confirmed_count"], 1, "confirmed block count")
+first_publication_sequence = int(confirmed["audit_publication_sequence"])
+if first_publication_sequence <= 0:
+    raise SystemExit("first confirmed block received a non-positive publication ordinal")
+confirmed_replay = replacement.confirm_accepted_block(
+    block_hash="44" * 32,
+    active_tip_height=7,
+)
+assert_equal(confirmed_replay["confirmed_count"], 1, "exact confirmation replay count")
+assert_equal(
+    int(confirmed_replay["audit_publication_sequence"]),
+    first_publication_sequence,
+    "exact confirmation replay preserves publication ordinal",
+)
 assert_equal(
     replacement.dashboard_miner_pending_maturity_bits(recipient_id="miner-b"),
     49500,
@@ -823,14 +872,16 @@ INSERT INTO qbit_pool_blocks (
     parent_hash,
     coinbase_txid,
     payout_manifest_sha256,
-    chain_state
+    chain_state,
+    audit_publication_sequence
 ) VALUES (
     '""" + alias_block_hash + """',
     72,
     '""" + "44" * 32 + """',
     '""" + "46" * 32 + """',
     '""" + "47" * 32 + """',
-    'confirmed'
+    'confirmed',
+    nextval('qbit_audit_publication_sequence_seq')
 );
 
 INSERT INTO qbit_payout_carry_forward (
@@ -935,7 +986,13 @@ replacement.persist_accepted_block(
     audit_report=zero_net_report,
 )
 force_expired_idle_lease(replacement)
-replacement.confirm_accepted_block(block_hash="45" * 32, active_tip_height=8)
+second_confirmation = replacement.confirm_accepted_block(
+    block_hash="45" * 32,
+    active_tip_height=8,
+)
+second_publication_sequence = int(second_confirmation["audit_publication_sequence"])
+if second_publication_sequence == first_publication_sequence:
+    raise SystemExit("distinct confirmed blocks shared a publication ordinal")
 zero_net_balances = replacement._run_json(
     """
 SELECT COALESCE(json_agg(json_build_object(
@@ -974,6 +1031,14 @@ assert_equal(
     {"chain_state": "rejected", "maturity_state": "reversed"},
     "rejected prepared block state",
 )
+assert_equal(
+    replacement.confirm_accepted_block(
+        block_hash="46" * 32,
+        active_tip_height=9,
+    ),
+    {"backend": "postgres-psql", "confirmed_count": -1},
+    "rejected block confirmation reports the superseded disposition",
+)
 
 try:
     replacement._run_json("SELECT json_build_object('count', qbit_reverse_immature_pool_block('" + "44" * 32 + "', 7));")
@@ -985,15 +1050,45 @@ else:
 
 inactive_count = replacement.mark_pool_block_inactive(block_hash="44" * 32, active_tip_height=7)["inactive_count"]
 assert_equal(inactive_count, 1, "inactive block quarantine count")
+assert_equal(
+    replacement.mark_pool_block_inactive(
+        block_hash="44" * 32,
+        active_tip_height=7,
+    )["inactive_count"],
+    0,
+    "repeated inactive transition is count-zero",
+)
+assert_equal(
+    replacement.confirm_accepted_block(
+        block_hash="44" * 32,
+        active_tip_height=7,
+    ),
+    {"backend": "postgres-psql", "confirmed_count": -1},
+    "inactive block confirmation reports the superseded disposition",
+)
 assert_equal(replacement.current_owed_balances(), [], "inactive owed balances are excluded")
-reactivated_count = replacement.reactivate_pool_block(block_hash="44" * 32, active_tip_height=7)["reactivated_count"]
-assert_equal(reactivated_count, 1, "inactive block reactivation count")
+reactivated = replacement.reactivate_pool_block(block_hash="44" * 32, active_tip_height=7)
+assert_equal(reactivated["reactivated_count"], 1, "inactive block reactivation count")
+reactivated_publication_sequence = int(reactivated["audit_publication_sequence"])
+assert_equal(
+    reactivated_publication_sequence,
+    first_publication_sequence,
+    "reactivated block preserves its published ordinal",
+)
 if not replacement.current_owed_balances():
     raise SystemExit("reactivated block did not restore owed balances")
 inactive_count = replacement.mark_pool_block_inactive(block_hash="44" * 32, active_tip_height=7)["inactive_count"]
 assert_equal(inactive_count, 1, "inactive block can be quarantined again before final reversal")
 reversed_count = replacement.reverse_immature_block(block_hash="44" * 32, active_tip_height=7)["reversed_count"]
 assert_equal(reversed_count, 6, "reverse immature block/payout/carry/fanout row count")
+assert_equal(
+    replacement.confirm_accepted_block(
+        block_hash="44" * 32,
+        active_tip_height=7,
+    ),
+    {"backend": "postgres-psql", "confirmed_count": -1},
+    "reversed block confirmation reports the superseded disposition",
+)
 assert_equal(replacement.current_owed_balances(), [], "reversed owed balances are excluded")
 
 replacement.persist_accepted_block(
@@ -1453,6 +1548,129 @@ WHERE block_hash = '""" + external_block_hash + """';
         "externalized conflicting duplicate does not write an orphan body file",
     )
 
+external_successor.release_writer_lease()
+
+# A pre-ordinal writer confirms with a plain chain_state UPDATE that never
+# mentions the publication ordinal. The BEFORE INSERT OR UPDATE trigger must
+# assign the next ordinal for that write so the validated CHECK constraint
+# stays satisfiable under a code-only rollback, while an ordinal-aware
+# confirmation that assigns nextval() explicitly stays untouched.
+legacy_confirm_hash = "e9" * 32
+replacement._run_sql(
+    """
+INSERT INTO qbit_pool_blocks (
+    block_hash,
+    block_height,
+    parent_hash,
+    coinbase_txid,
+    payout_manifest_sha256,
+    chain_state
+) VALUES (
+    '""" + legacy_confirm_hash + """',
+    95,
+    '""" + "ab" * 32 + """',
+    '""" + "4a" * 32 + """',
+    '""" + "4b" * 32 + """',
+    'prepared'
+);
+"""
+)
+legacy_before = replacement._run_json(
+    """
+SELECT json_build_object(
+    'ordinal', (
+        SELECT audit_publication_sequence
+        FROM qbit_pool_blocks
+        WHERE block_hash = '""" + legacy_confirm_hash + """'
+    ),
+    'max_ordinal', (
+        SELECT COALESCE(MAX(audit_publication_sequence), 0)
+        FROM qbit_pool_blocks
+    )
+);
+"""
+)
+assert_equal(legacy_before["ordinal"], None, "prepared legacy block carries no ordinal")
+replacement._run_sql(
+    """
+UPDATE qbit_pool_blocks
+SET chain_state = 'confirmed'
+WHERE block_hash = '""" + legacy_confirm_hash + """';
+"""
+)
+legacy_after = replacement._run_json(
+    """
+SELECT json_build_object(
+    'ordinal', (
+        SELECT audit_publication_sequence
+        FROM qbit_pool_blocks
+        WHERE block_hash = '""" + legacy_confirm_hash + """'
+    ),
+    'duplicate_ordinals', (
+        SELECT count(*)
+        FROM (
+            SELECT audit_publication_sequence
+            FROM qbit_pool_blocks
+            WHERE audit_publication_sequence IS NOT NULL
+            GROUP BY audit_publication_sequence
+            HAVING count(*) > 1
+        ) AS duplicated
+    )
+);
+"""
+)
+if legacy_after["ordinal"] is None:
+    raise SystemExit("legacy ordinal-less confirmation was not assigned an ordinal")
+legacy_ordinal = int(legacy_after["ordinal"])
+if legacy_ordinal <= int(legacy_before["max_ordinal"]):
+    raise SystemExit("legacy confirmation ordinal did not extend publication order")
+assert_equal(
+    legacy_after["duplicate_ordinals"],
+    0,
+    "publication ordinals stay unique after a legacy confirmation",
+)
+explicit_confirm_hash = "e8" * 32
+replacement._run_sql(
+    """
+INSERT INTO qbit_pool_blocks (
+    block_hash,
+    block_height,
+    parent_hash,
+    coinbase_txid,
+    payout_manifest_sha256,
+    chain_state
+) VALUES (
+    '""" + explicit_confirm_hash + """',
+    96,
+    '""" + legacy_confirm_hash + """',
+    '""" + "4c" * 32 + """',
+    '""" + "4d" * 32 + """',
+    'prepared'
+);
+
+UPDATE qbit_pool_blocks
+SET chain_state = 'confirmed',
+    audit_publication_sequence = nextval('qbit_audit_publication_sequence_seq')
+WHERE block_hash = '""" + explicit_confirm_hash + """';
+"""
+)
+explicit_after = replacement._run_json(
+    """
+SELECT json_build_object(
+    'ordinal', (
+        SELECT audit_publication_sequence
+        FROM qbit_pool_blocks
+        WHERE block_hash = '""" + explicit_confirm_hash + """'
+    )
+);
+"""
+)
+assert_equal(
+    int(explicit_after["ordinal"]),
+    legacy_ordinal + 1,
+    "explicit ordinal-aware confirmation continues the same allocation order",
+)
+
 # Everything above runs on fixtures far smaller than one 4096-row cutoff page,
 # so the recursive page step of the bounded window readers never executes.
 # Seed enough unit-difficulty shares that the paged cutoff walk must cross page
@@ -1543,4 +1761,18 @@ for network_difficulty, expected_len in [(512, 4096), (1024, 8192), (1025, 8200)
 
 print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity multipage-window=9000")
 PY
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+    python3 -m tests.prism_postgres_a1_gate
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+    python3 -m tests.prism_postgres_a1_migration_gate
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+    python3 -m tests.prism_postgres_a1_revert_gate
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+  QBIT_PRISM_GATE_IMAGE="${GATE_IMAGE}" \
+  QBIT_PRISM_GATE_IMAGE_DIGEST="${GATE_IMAGE_DIGEST}" \
+    python3 -m tests.prism_postgres_a1_process_gate
 )
