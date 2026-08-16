@@ -72,7 +72,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from lab.prism.share_ledger import PendingShare, PsqlShareLedger
+from lab.prism.share_ledger import PendingShare, PsqlShareLedger, ShareReplayConflict
 
 
 def pending(
@@ -195,6 +195,17 @@ candidate_intent = {
 candidate_row = ledger.append_batch([(batch_c, candidate_intent)])[0]
 assert_equal(candidate_row.share_seq, 3, "candidate share sequence")
 assert_equal(ledger.append_batch([(batch_c, candidate_intent)])[0].share_seq, 3, "exact replay")
+recovery_exact = ledger.append_recovered_share(batch_c)
+assert_equal(recovery_exact.disposition, "exact_existing", "typed recovery exact replay")
+assert_equal(recovery_exact.record.share_seq, 3, "typed recovery exact replay keeps sequence")
+try:
+    ledger.append_recovered_share(
+        PendingShare(**{**batch_c.__dict__, "ntime": batch_c.ntime + 1})
+    )
+except ShareReplayConflict:
+    pass
+else:
+    raise SystemExit("typed recovery payload conflict was not rejected")
 assert_equal(ledger.pending_block_candidates(), [candidate_intent], "pending candidate replay")
 assert_equal(
     ledger.pending_block_candidate_rows(),
@@ -215,6 +226,14 @@ assert_equal(ledger.pending_block_candidates(), [candidate_only], "candidate-onl
 assert_equal(ledger.append_batch([(batch_d, candidate_only)])[0].share_seq, 4, "linked solver credit")
 assert ledger.mark_block_candidate_submitted(block_hash="cd" * 32)
 assert_equal(ledger.pending_block_candidates(), [], "linked candidate completion")
+batch_recovered = pending(94, job_ms=908, accepted_ms=909, share_id="batch-recovered")
+recovery_inserted = ledger.append_recovered_share(batch_recovered)
+assert_equal(recovery_inserted.disposition, "inserted", "typed recovery inserts a new row")
+assert_equal(
+    recovery_inserted.record.share_id,
+    "batch-recovered",
+    "typed recovery returns the inserted record",
+)
 poison_hash = "ef" * 32
 poison_candidate = {
     **candidate_intent,

@@ -377,6 +377,9 @@ def install_fake_bundle_builder(server: PrismCoordinator) -> dict[str, object]:
         }
 
     server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
+    server._ensure_bundle_compiler().build_audit_bundle = (  # type: ignore[method-assign]
+        fake_build_audit_bundle
+    )
     return recorded
 
 

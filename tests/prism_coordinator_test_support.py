@@ -25,6 +25,7 @@ from unittest.mock import patch
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism import prism_coordinator as prism_coordinator_module
+from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.prism_coordinator import (
     ClientState,
     JobBuildAdmissionDeadlineExceeded,
@@ -35,7 +36,6 @@ from lab.prism.prism_coordinator import (
     PendingShareAppend,
     PayoutLedgerArtifact,
     PrismCoordinator,
-    ShutdownInProgress,
     TemplateRefreshBlocked,
     WorkerIdentity,
     _PayoutStatePublicationBlocked,
@@ -361,6 +361,9 @@ def install_fake_bundle_builder(server: PrismCoordinator) -> dict[str, object]:
         }
 
     server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
+    server._ensure_bundle_compiler().build_audit_bundle = (  # type: ignore[method-assign]
+        fake_build_audit_bundle
+    )
     return recorded
 
 

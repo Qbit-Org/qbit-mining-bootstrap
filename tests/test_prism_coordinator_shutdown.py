@@ -12,12 +12,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lab.prism import prism_coordinator
-from lab.prism.prism_coordinator import (
+from lab.prism.coordinator_shutdown import (
     CoordinatorShutdownController,
+    ShutdownInProgress,
+)
+from lab.prism.prism_coordinator import (
     PendingShareAppend,
     PRISM_REJECTION_POOL_CLOSED,
     PrismCoordinator,
-    ShutdownInProgress,
     StratumError,
     WriterLeaseRenewalDeferred,
 )
@@ -176,7 +178,112 @@ def coordinator(
     return server
 
 
+class CoordinatorShutdownControllerTests(unittest.TestCase):
+    def test_compatibility_reexports_reference_shutdown_owner(self) -> None:
+        self.assertIs(
+            prism_coordinator.CoordinatorShutdownController,
+            CoordinatorShutdownController,
+        )
+        self.assertIs(prism_coordinator.ShutdownInProgress, ShutdownInProgress)
+
+    def test_nested_writer_inherits_admission_after_shutdown_request(self) -> None:
+        controller = CoordinatorShutdownController(0.5)
+        outer = controller.enter_writer("outer")
+        controller.request_shutdown(signal.SIGTERM)
+        inner = controller.enter_writer("inner")
+
+        controller.exit_writer(inner)
+        controller.exit_writer(outer)
+
+        self.assertEqual(controller.snapshot()["active_writers"], {})
+        with self.assertRaisesRegex(ShutdownInProgress, "coordinator is shutting down"):
+            controller.enter_writer("late")
+
+    def test_transferable_writer_token_finishes_idempotently_on_another_thread(
+        self,
+    ) -> None:
+        controller = CoordinatorShutdownController(0.5)
+        token = controller.reserve_writer("share_persistence")
+
+        finisher = threading.Thread(target=lambda: (token.finish(), token.finish()))
+        finisher.start()
+        finisher.join(1)
+
+        self.assertFalse(finisher.is_alive())
+        self.assertTrue(token.finished)
+        self.assertEqual(controller.snapshot()["active_writers"], {})
+
+
 class PrismCoordinatorShutdownTests(unittest.TestCase):
+    def test_refresh_timeout_still_drains_build_executors(self) -> None:
+        server = coordinator()
+        calls: list[str] = []
+        server.shutdown_initial_job_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("initial")
+        )
+        server.shutdown_job_build_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("job_build")
+        )
+        server.shutdown_payout_artifact_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("payout_artifact")
+        )
+        server.shutdown_reconcile_prefetch_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("reconcile_prefetch")
+        )
+        server.retire_share_window_spool = (  # type: ignore[method-assign]
+            lambda: calls.append("spool")
+        )
+        server.shutdown_serve_builder = (  # type: ignore[method-assign]
+            lambda: calls.append("serve_builder")
+        )
+
+        server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(
+            calls,
+            [
+                "initial",
+                "job_build",
+                "payout_artifact",
+                "reconcile_prefetch",
+                "spool",
+                "serve_builder",
+            ],
+        )
+
+    def test_startup_replay_shutdown_stops_cleanly_and_releases_lease_once(
+        self,
+    ) -> None:
+        ledger = RecordingLeaseLedger()
+        server = coordinator(ledger)
+
+        def rejected_replay() -> int:
+            server.request_shutdown(signal.SIGTERM)
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+
+        started = time.monotonic()
+        with patch("builtins.print"):
+            self.assertFalse(
+                server._run_startup_writer_replay(
+                    rejected_replay,
+                    drain_threads=[],
+                )
+            )
+        elapsed = time.monotonic() - started
+
+        # No writer is active, so the replay exit never waits out the
+        # quiescence budget before releasing the lease exactly once.
+        self.assertLess(elapsed, 0.45)
+        self.assertEqual(ledger.release_calls, 1)
+        snapshot = server._ensure_shutdown_controller().snapshot()
+        self.assertEqual(snapshot["active_writers"], {})
+        self.assertFalse(snapshot["lease_release_withheld"])
+        self.assertEqual(snapshot["release_withheld_total"], 0)
+        self.assertEqual(snapshot["lease_release_outcomes"]["success"], 1)
+        with patch("builtins.print"):
+            server.shutdown(reason="main_finally")
+        self.assertEqual(ledger.release_calls, 1)
+
     def test_lease_heartbeat_start_without_ledger_is_noop(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
 
@@ -1553,6 +1660,9 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             writer_thread.join(1)
             shutdown_thread.join(1)
 
+        self.assertFalse(producer_thread.is_alive(), "producer thread leaked")
+        self.assertFalse(writer_thread.is_alive(), "share writer thread leaked")
+        self.assertFalse(shutdown_thread.is_alive(), "shutdown thread leaked")
         self.assertTrue(entry.committed.is_set())
         self.assertEqual(ledger.release_calls, 1)
 

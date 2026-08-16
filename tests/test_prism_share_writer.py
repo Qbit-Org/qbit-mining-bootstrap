@@ -233,6 +233,10 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(len(flaky.pending), 1)
         self.assertEqual(server.share_append_failure_count, 2)
+        self.assertIn(
+            "qbit_prism_share_append_failures_total 2",
+            server.metrics_payload(),
+        )
         self.assertEqual(waited.call_count, 2)
 
     def _pending_append(self, tag: str, accepted_at_ms: int = 2) -> PendingShareAppend:
@@ -356,8 +360,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             )
             # File kept because a line could not be parsed.
             self.assertTrue(server.share_recovery_path.exists())
-            # Re-running dedups the good shares (ledger is idempotent by id).
-            self.assertEqual(server.replay_recovered_shares(), 2)
+            # Re-running classifies the intact rows as exact-existing. They are
+            # not inserted or counted again, while the torn line keeps the
+            # journal for inspection.
+            self.assertEqual(server.replay_recovered_shares(), 0)
+            self.assertEqual(
+                [p.share_id for p in ledger.pending], ["miner-a:g1", "miner-a:g2"]
+            )
+            self.assertTrue(server.share_recovery_path.exists())
 
     def test_replay_is_idempotent_across_partial_replay(self) -> None:
         # Finding: a partial replay (A commits, B fails transiently) kept the
@@ -372,16 +382,28 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             class DedupLedger:
                 def __init__(self) -> None:
                     self.ids: list[str] = []
+                    self.pending_by_id: dict[str, object] = {}
                     self.fail_b_once = True
 
-                def append(self, pending: object) -> object:
+                def append_recovered_share(self, pending: object) -> object:
                     if pending.share_id == "miner-a:B" and self.fail_b_once:
                         self.fail_b_once = False
                         raise RuntimeError("postgres unavailable")
                     if pending.share_id in self.ids:
-                        raise RuntimeError("duplicate share_id")
+                        if self.pending_by_id[pending.share_id] != pending:
+                            raise ShareReplayConflict(pending.share_id)
+                        return ShareReplayResult(
+                            "exact_existing",
+                            SimpleNamespace(
+                                share_seq=self.ids.index(pending.share_id) + 1
+                            ),
+                        )
                     self.ids.append(pending.share_id)
-                    return SimpleNamespace(share_seq=len(self.ids))
+                    self.pending_by_id[pending.share_id] = pending
+                    return ShareReplayResult(
+                        "inserted",
+                        SimpleNamespace(share_seq=len(self.ids)),
+                    )
 
             server.ledger = DedupLedger()
 
@@ -396,6 +418,56 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             self.assertEqual(server.replay_recovered_shares(), 1)
             self.assertEqual(server.ledger.ids, ["miner-a:A", "miner-a:B"])
             self.assertFalse(server.share_recovery_path.exists())
+
+    def test_replay_quarantines_conflicting_row_and_replays_the_rest(self) -> None:
+        # A ShareReplayConflict is keyed to one share_id; it must not strand
+        # the journal rows behind it, and the conflict must be visible as a
+        # counter, not only in stdout.
+        server, _state, _ledger = submit_coordinator()
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.share_recovery_path = Path(tempdir) / "recovery.jsonl"
+            server._recover_share_to_disk(self._pending_append("A", accepted_at_ms=100), "test")
+            server._recover_share_to_disk(self._pending_append("B", accepted_at_ms=200), "test")
+            server._recover_share_to_disk(self._pending_append("C", accepted_at_ms=300), "test")
+
+            class ConflictingLedger(RecordingLedger):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.ids: list[str] = []
+
+                def append_recovered_share(self, pending: object) -> object:
+                    if pending.share_id == "miner-a:A":
+                        raise ShareReplayConflict(pending.share_id)
+                    if pending.share_id in self.ids:
+                        return ShareReplayResult(
+                            "exact_existing",
+                            SimpleNamespace(
+                                share_seq=self.ids.index(pending.share_id) + 1
+                            ),
+                        )
+                    self.ids.append(pending.share_id)
+                    return ShareReplayResult(
+                        "inserted",
+                        SimpleNamespace(share_seq=len(self.ids)),
+                    )
+
+            server.ledger = ConflictingLedger()
+
+            self.assertEqual(server.replay_recovered_shares(), 2)
+            self.assertTrue(server.share_recovery_path.exists())
+            self.assertEqual(server.ledger.ids, ["miner-a:B", "miner-a:C"])
+            self.assertEqual(server.share_replay_conflicts, 1)
+            self.assertIn(
+                "qbit_prism_share_replay_conflicts_total 1",
+                server.metrics_payload(),
+            )
+
+            # Re-running the retained journal credits nothing twice: B and C
+            # are exact duplicates, A conflicts again, the file stays.
+            self.assertEqual(server.replay_recovered_shares(), 0)
+            self.assertTrue(server.share_recovery_path.exists())
+            self.assertEqual(server.ledger.ids, ["miner-a:B", "miner-a:C"])
+            self.assertEqual(server.share_replay_conflicts, 2)
 
     def test_append_share_entry_reports_persisted_vs_recovered(self) -> None:
         server, _state, ledger = submit_coordinator()

@@ -4495,3 +4495,80 @@ class JobContextStampTests(unittest.TestCase):
         context = server.build_job_for_client(state, clean_jobs=True)
 
         self.assertEqual(context.version_mask, 0x1FFFE000)
+
+
+class ExternallyTerminatedBuilderTests(unittest.TestCase):
+    """A build superseded while its helper runs terminates without a crash."""
+
+    def test_superseded_running_builder_terminates_without_crash(self) -> None:
+        server, rpc = coordinator()
+        server.signing_seed_hex = "42" * 32
+        server.ledger_attestation_signing_seed_hex = "43" * 32
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        real_popen = subprocess.Popen
+
+        def build_with_control(*_args: object, **kwargs: object) -> object:
+            build_request = kwargs["build_request"]
+            return server.build_audit_bundle(
+                shares=[],
+                found_block={
+                    "block_height": 10,
+                    "coinbase_value_sats": 50_00000000,
+                    "network_difficulty": 1,
+                    "anchor_job_issued_at_ms": 1_700_000_000_000,
+                },
+                prior_balances=[],
+                coinbase_script_sig_suffix_hex="00",
+                cancellation=build_request.cancellation,  # type: ignore[union-attr]
+            )
+
+        server.build_shared_job_bundle = build_with_control  # type: ignore[method-assign]
+
+        def cancel_then_exit(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[str]:
+            process = real_popen(*args, **kwargs)  # type: ignore[arg-type]
+            original_poll = process.poll
+            original_wait = process.wait
+            first_poll = True
+
+            def poll() -> int | None:
+                nonlocal first_poll
+                if not first_poll:
+                    return original_poll()
+                first_poll = False
+                with server._job_cache_lock:
+                    controls = list(server._active_job_bundle_builds.values())
+                self.assertEqual(len(controls), 1)
+                # Supersession lands while the helper is still running; the
+                # compiler owns the terminate/kill sequence itself, so this
+                # never counts as a worker crash.
+                controls[0].cancel_event.set()
+                return None
+
+            process.poll = poll  # type: ignore[method-assign]
+            del original_wait
+            return process
+
+        with patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
+        ), patch(
+            "lab.prism.prism_coordinator.subprocess.Popen",
+            side_effect=cancel_then_exit,
+        ):
+            with self.assertRaises(JobBuildSuperseded):
+                server.shared_job_bundle(
+                    artifacts,
+                    mode="ready",
+                    retry_superseded=False,
+                )
+
+        service = server._ensure_job_bundle_service()
+        self.assertEqual(service.shared_bundle_build_counts["superseded"], 1)
+        self.assertEqual(service.shared_bundle_build_counts["failed"], 0)
+        self.assertEqual(server.job_build_worker_counts["terminations"], 1)
+        self.assertEqual(server.job_build_worker_counts["crashes"], 0)
+        self.assertEqual(server.job_build_failure_count, 0)

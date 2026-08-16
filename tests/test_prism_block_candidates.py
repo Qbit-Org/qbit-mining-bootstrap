@@ -8474,3 +8474,71 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         self.assertIsNotNone(lease)
         assert lease is not None
         server._release_block_candidate_disposition(lease)
+
+
+class PendingShareFloorSeamTests(unittest.TestCase):
+    """S3 floor-holder seams used by the block-candidate credit paths.
+
+    At this layer the pending-commit floor keeps the current id-keyed single
+    holder per stamped share; the attempt/candidate release seams are the
+    staged split points a later layer widens into independent holders. These
+    cases pin the seam wiring so a lost release path cannot silently unhook
+    the snapshot-anchor floor from candidate handling.
+    """
+
+    def _stamped_pending_share(self, server, share_id: str):
+        share_writer = server._ensure_share_writer_service()
+        pending = PendingShare(
+            share_id=share_id,
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=9,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=100,
+            ntime=1_700_000_000,
+        )
+        with share_writer._pending_share_commit_lock:
+            share_writer._pending_share_commit_floor[id(pending)] = [
+                pending,
+                time.monotonic(),
+                False,
+            ]
+        return pending
+
+    def test_attempt_and_candidate_seams_release_the_owner_floor(self) -> None:
+        server = coordinator()
+        share_writer = server._ensure_share_writer_service()
+
+        attempt = self._stamped_pending_share(server, "miner-a:attempt")
+        self.assertEqual(server._job_snapshot_anchor_ms(1_000), 99)
+        server._finish_pending_share_attempt(attempt)
+        self.assertEqual(share_writer._pending_share_commit_floor, {})
+        self.assertEqual(server._job_snapshot_anchor_ms(1_000), 999)
+
+        candidate = self._stamped_pending_share(server, "miner-a:candidate")
+        server._finish_pending_share_candidate(candidate)
+        self.assertEqual(share_writer._pending_share_commit_floor, {})
+
+    def test_distinct_same_hash_stamps_hold_independent_floor_entries(self) -> None:
+        server = coordinator()
+        share_writer = server._ensure_share_writer_service()
+
+        first = self._stamped_pending_share(server, "miner-a:same-hash")
+        second = self._stamped_pending_share(server, "miner-a:same-hash")
+
+        # Releasing one stamped object's holder cannot drop the other live
+        # holder for the same durable hash: the anchor floor stays clamped.
+        server._finish_pending_share_candidate(second)
+        self.assertEqual(len(share_writer._pending_share_commit_floor), 1)
+        self.assertIs(
+            share_writer._pending_share_commit_floor[id(first)][0],
+            first,
+        )
+        self.assertEqual(server._job_snapshot_anchor_ms(1_000), 99)
+
+        server._finish_pending_share_attempt(first)
+        self.assertEqual(share_writer._pending_share_commit_floor, {})

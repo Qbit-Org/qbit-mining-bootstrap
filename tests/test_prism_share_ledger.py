@@ -30,6 +30,8 @@ from lab.prism.share_ledger import (
     AUDIT_BUNDLE_V2_SCHEMA,
     PendingShare,
     PsqlShareLedger,
+    ShareReplayConflict,
+    ShareReplayResult,
     LedgerOperationTimeout,
     AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
@@ -260,6 +262,21 @@ class BlockingReadPsqlShareLedger(PsqlShareLedger):
 
 
 class PrismShareLedgerTests(unittest.TestCase):
+    def test_memory_recovery_append_distinguishes_insert_exact_and_conflict(self) -> None:
+        ledger = SingleWriterShareLedger()
+        share = pending_share(1)
+
+        inserted = ledger.append_recovered_share(share)
+        exact = ledger.append_recovered_share(share)
+
+        self.assertIsInstance(inserted, ShareReplayResult)
+        self.assertEqual(inserted.disposition, "inserted")
+        self.assertEqual(exact.disposition, "exact_existing")
+        with self.assertRaises(ShareReplayConflict):
+            ledger.append_recovered_share(
+                PendingShare(**{**share.__dict__, "ntime": share.ntime + 1})
+            )
+
     def test_writer_lease_advisory_guard_is_stable_and_session_scoped(self) -> None:
         statements: list[str] = []
         connect_kwargs: dict[str, object] = {}
@@ -1032,6 +1049,48 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("'candidate_outbox_state'", query)
         self.assertNotIn("ledger.accepted_at IS DISTINCT", query)
         self.assertEqual(query.count("SELECT CASE"), 1)
+
+    def test_postgres_recovery_append_returns_exact_existing_from_batch_comparator(self) -> None:
+        share = pending_share(2)
+        record = {
+            "share_seq": 8,
+            "share_id": share.share_id,
+            "miner_id": share.miner_id,
+            "order_key": share.order_key,
+            "p2mr_program_hex": share.p2mr_program_hex,
+            "share_difficulty": str(share.share_difficulty),
+            "network_difficulty": str(share.network_difficulty),
+            "template_height": share.template_height,
+            "job_id": share.job_id,
+            "job_issued_at_ms": share.job_issued_at_ms,
+            "accepted_at_ms": share.accepted_at_ms,
+            "ntime": share.ntime,
+            "credit_policy": share.credit_policy,
+            "newly_inserted": False,
+        }
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease(), {"records": [record]}]
+        )
+
+        outcome = ledger.append_recovered_share(share)
+
+        self.assertEqual(outcome.disposition, "exact_existing")
+        self.assertEqual(outcome.record.share_seq, 8)
+        self.assertIn("share_mismatch AS", ledger.lease_queries[-1])
+
+    def test_postgres_recovery_append_raises_typed_payload_conflict(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "error": "duplicate share_id payload mismatch",
+                    "error_kind": "share_replay_conflict",
+                },
+            ]
+        )
+
+        with self.assertRaises(ShareReplayConflict):
+            ledger.append_recovered_share(pending_share(3))
 
     def test_postgres_candidate_only_intent_forces_durable_fenced_commit(self) -> None:
         ledger = FakeLeasePsqlShareLedger(

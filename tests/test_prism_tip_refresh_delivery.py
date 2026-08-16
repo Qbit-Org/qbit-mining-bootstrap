@@ -1760,6 +1760,43 @@ class PrismCoordinatorReliabilityTests(_VardiffSupportTestCase):
         server.watchdog_interval_seconds = 15.0
         return server
 
+    def test_blockwait_failure_loop_reuses_existing_stop_event(self) -> None:
+        server = self._bare_coordinator()
+        tip = "aa" * 32
+        server.rpc = SimpleNamespace(call=lambda method: tip)
+        server.blockpoll_seconds = 0.0
+        server.observe_tip_for_refresh = lambda _tip: None  # type: ignore[method-assign]
+        attempts = 0
+
+        def fail_blockwait(_known_tip: str) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 3:
+                server.stop_event.set()
+            raise RuntimeError("transient waitfornewblock failure")
+
+        server.blockwait_once = fail_blockwait  # type: ignore[method-assign]
+        # Construct the R1 owner up front: its own event allocations are
+        # owner state, while the loop itself must reuse the existing
+        # stop_event rather than allocating a fallback.
+        server._ensure_tip_refresh_service()
+
+        with (
+            patch("builtins.print"),
+            patch("lab.prism.tip_refresh.traceback.print_exc"),
+            patch(
+                "lab.prism.tip_refresh.threading.Event",
+                side_effect=AssertionError("allocated fallback stop event"),
+            ),
+            patch(
+                "lab.prism.prism_coordinator.threading.Event",
+                side_effect=AssertionError("allocated fallback stop event"),
+            ),
+        ):
+            server.blockwait_loop()
+
+        self.assertEqual(attempts, 3)
+
     def test_blockwait_parameter_mismatch_is_treated_as_unsupported(self) -> None:
         self.assertTrue(
             PrismCoordinator._blockwait_unsupported(

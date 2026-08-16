@@ -30,6 +30,8 @@ from lab.prism.share_ledger import (
     LedgerOperationTimeout,
     PendingShare,
     PsqlShareLedger,
+    ShareReplayConflict,
+    ShareReplayResult,
     SingleWriterShareLedger,
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
 )
@@ -203,6 +205,18 @@ class RecordingLedger(FakeLedger):
         self.pending.append(pending)
         self.shares += 1
         return SimpleNamespace(share_seq=self.shares, miner_id=getattr(pending, "miner_id", "miner-a"))
+
+    def append_recovered_share(self, pending: PendingShare) -> ShareReplayResult:
+        for index, existing in enumerate(self.pending, start=1):
+            if getattr(existing, "share_id", None) != pending.share_id:
+                continue
+            if existing != pending:
+                raise ShareReplayConflict(pending.share_id)
+            return ShareReplayResult(
+                "exact_existing",
+                SimpleNamespace(share_seq=index, miner_id=pending.miner_id),
+            )
+        return ShareReplayResult("inserted", self.append(pending))
 
     def persist_accepted_block(self, **kwargs: object) -> dict[str, object]:
         self.persisted.append({**kwargs, "submit_seen_at_persist": self.submit_seen})

@@ -8,7 +8,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from concurrent.futures import CancelledError
+
 from lab.prism.prism_coordinator import QbitTipTemplateSnapshot
+from lab.prism.progress_health import (
+    ProgressHealthConfig,
+    ProgressHealthService,
+    WorkGeneration,
+)
 from tests.prism_coordinator_test_support import client, coordinator
 
 
@@ -803,6 +810,147 @@ class ProgressHealthTests(unittest.TestCase):
             "qbit_prism_template_refresh_coordination_blocked_age_seconds 0.000000",
             cleared_metrics,
         )
+
+
+def owner_progress_service(
+    *, bundle_build_deadline_seconds: float = 60.0
+) -> tuple[ProgressHealthService, FakeMonotonicClock, ProgressHealthConfig, float]:
+    clock = FakeMonotonicClock()
+    service = ProgressHealthService(
+        started_monotonic=clock.now,
+        monotonic=clock,
+    )
+    config = ProgressHealthConfig(
+        pending_refresh_deadline_seconds=15.0,
+        tip_poll_deadline_seconds=15.0,
+        bundle_build_deadline_seconds=bundle_build_deadline_seconds,
+    )
+    return service, clock, config, clock.now
+
+
+def work_generation(
+    *, generation: int, fingerprint: str, payout_generation: int = 0
+) -> WorkGeneration:
+    return WorkGeneration(
+        template_generation=generation,
+        template_fingerprint=fingerprint,
+        payout_generation=payout_generation,
+    )
+
+
+def owner_service_health(
+    service: ProgressHealthService,
+    config: ProgressHealthConfig,
+    started_monotonic: float,
+    *,
+    payout_generation: int = 0,
+) -> dict[str, object]:
+    return service.snapshot(
+        lambda _fingerprint, _payout_generation: (0, 0),
+        payout_generation,
+        config,
+        started_monotonic,
+    ).as_mapping()
+
+
+class ProgressTokenOwnershipTests(unittest.TestCase):
+    """Direct R1/J1 token contracts on the extracted G1 owner service."""
+
+    def test_refresh_token_finishes_on_exception(self) -> None:
+        service, _clock, config, started = owner_progress_service()
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            with service.start_refresh():
+                raise RuntimeError("boom")
+
+        health = owner_service_health(service, config, started)
+        self.assertFalse(health["tip_refresh_in_progress"])
+
+    def test_bundle_token_finishes_on_cancellation(self) -> None:
+        service, clock, config, started = owner_progress_service(
+            bundle_build_deadline_seconds=1.0
+        )
+
+        with self.assertRaises(CancelledError):
+            with service.start_bundle_build():
+                raise CancelledError()
+        clock.advance(2)
+
+        health = owner_service_health(service, config, started)
+        self.assertEqual(health["bundle_build_oldest_age_seconds"], 0.0)
+
+    def test_token_finish_is_idempotent(self) -> None:
+        service, _clock, config, started = owner_progress_service()
+        refresh = service.start_refresh()
+        build = service.start_bundle_build()
+
+        refresh.finish()
+        refresh.finish()
+        build.finish()
+        build.finish()
+
+        health = owner_service_health(service, config, started)
+        self.assertFalse(health["tip_refresh_in_progress"])
+        self.assertEqual(health["bundle_build_oldest_age_seconds"], 0.0)
+
+    def test_overlapping_refresh_tokens_finish_independently(self) -> None:
+        service, clock, config, started = owner_progress_service()
+        first = service.start_refresh()
+        clock.advance(5)
+        second = service.start_refresh()
+
+        second.finish()
+        health = owner_service_health(service, config, started)
+        self.assertTrue(health["tip_refresh_in_progress"])
+        first.note_activity()
+        first.finish()
+
+        health = owner_service_health(service, config, started)
+        self.assertFalse(health["tip_refresh_in_progress"])
+
+    def test_oldest_overlapping_bundle_controls_health(self) -> None:
+        service, clock, config, started = owner_progress_service(
+            bundle_build_deadline_seconds=60.0
+        )
+        current = work_generation(generation=1, fingerprint="aa" * 32)
+        service.observe_tip(current)
+        self.assertTrue(service.publish_work(current))
+        first = service.start_bundle_build()
+        clock.advance(10)
+        second = service.start_bundle_build()
+        clock.advance(51)
+        service.observe_tip(
+            work_generation(generation=2, fingerprint="aa" * 32)
+        )
+
+        health = owner_service_health(service, config, started)
+        self.assertIn("bundle_build_stuck", health["reasons"])
+        self.assertEqual(health["bundle_build_oldest_age_seconds"], 61.0)
+
+        first.finish()
+        health = owner_service_health(service, config, started)
+        self.assertNotIn("bundle_build_stuck", health["reasons"])
+        self.assertEqual(health["bundle_build_oldest_age_seconds"], 51.0)
+        second.finish()
+
+    def test_multiple_failures_keep_the_fixed_reason_order(self) -> None:
+        service, clock, config, started = owner_progress_service(
+            bundle_build_deadline_seconds=60.0
+        )
+        build = service.start_bundle_build()
+        clock.advance(61)
+
+        health = owner_service_health(service, config, started)
+
+        self.assertEqual(
+            health["reasons"],
+            [
+                "tip_poll_stale",
+                "bundle_build_stuck",
+                "current_generation_not_published",
+            ],
+        )
+        build.finish()
 
 
 if __name__ == "__main__":
