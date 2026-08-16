@@ -198,6 +198,24 @@ class ShareWriter:
         """
         self.finish_pending_share(pending_share)
 
+    def adopt_pending_share(self, pending_share: PendingShare) -> None:
+        """Register an externally reconstructed share on the pending floor.
+
+        Durable block-candidate replay decodes a credit-bearing PendingShare
+        whose accepted stamp predates this process. Adopting it here clamps
+        job/payout snapshot anchors below that stamp before the replayed
+        candidate becomes visible to issuance, exactly as if the share had
+        been stamped live. Released through the ordinary
+        :meth:`finish_pending_candidate` seam once the candidate reaches a
+        terminal outcome.
+        """
+        with self._pending_share_commit_lock:
+            self._pending_share_commit_floor[id(pending_share)] = [
+                pending_share,
+                time.monotonic(),
+                False,
+            ]
+
     def snapshot_anchor_ms(self, issued_at_ms: int) -> int:
         """Clamp a share-snapshot anchor below every coverable share stamp.
 
