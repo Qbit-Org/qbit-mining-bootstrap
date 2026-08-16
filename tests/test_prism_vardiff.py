@@ -5,10 +5,70 @@
 from __future__ import annotations
 
 import unittest
+from lab.prism.vardiff_service import VardiffService
 from tests.prism_vardiff_test_support import *
 
 
 class PrismCoordinatorVardiffTests(unittest.TestCase):
+    def test_vardiff_owner_initialization_is_single_flight(self) -> None:
+        server = coordinator()
+        server.__dict__.pop("_vardiff_service", None)
+        server.vardiff_idle_queue_depth = 7
+        real_service_type = VardiffService
+        constructor_entered = threading.Event()
+        release_constructor = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def construct(runtime: object) -> VardiffService:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            constructor_entered.set()
+            self.assertTrue(release_constructor.wait(1.0))
+            return real_service_type(runtime)  # type: ignore[arg-type]
+
+        services: list[VardiffService] = []
+        descriptor_write_finished = threading.Event()
+
+        def write_compatibility_field() -> None:
+            server.idle_retarget_count = 9
+            descriptor_write_finished.set()
+
+        with patch(
+            "lab.prism.prism_coordinator.VardiffService",
+            side_effect=construct,
+        ):
+            threads = [
+                threading.Thread(
+                    target=lambda: services.append(
+                        server._ensure_vardiff_service()
+                    )
+                )
+                for _ in range(2)
+            ]
+            threads[0].start()
+            self.assertTrue(constructor_entered.wait(1.0))
+            threads[1].start()
+            descriptor_writer = threading.Thread(target=write_compatibility_field)
+            descriptor_writer.start()
+            time.sleep(0.05)
+            with calls_lock:
+                self.assertEqual(calls, 1)
+            self.assertFalse(descriptor_write_finished.is_set())
+            release_constructor.set()
+            for thread in threads:
+                thread.join(1.0)
+                self.assertFalse(thread.is_alive())
+            descriptor_writer.join(1.0)
+            self.assertFalse(descriptor_writer.is_alive())
+
+        self.assertEqual(len(services), 2)
+        self.assertIs(services[0], services[1])
+        self.assertEqual(services[0].vardiff_idle_queue_depth, 7)
+        self.assertEqual(services[0].idle_retarget_count, 9)
+        self.assertNotIn("idle_retarget_count", server.__dict__)
+
     def test_load_prism_vardiff_config_defaults_to_small_miner_vardiff(self) -> None:
         names = [name for name in os.environ if name.startswith("PRISM_STRATUM_VARDIFF")]
         with patch.dict(os.environ, {}, clear=False):
