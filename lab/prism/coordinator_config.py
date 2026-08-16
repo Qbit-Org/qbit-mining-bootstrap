@@ -100,6 +100,7 @@ DEFAULT_PRISM_ROUTINE_ADMISSION_DEADLINE_SECONDS = 15.0
 DEFAULT_PRISM_CTV_BROADCASTER_CHUNK_SIZE = 5
 DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_REFRESH_SECONDS = 5.0
+DEFAULT_PRISM_METRICS_REFRESH_SECONDS = 5.0
 DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS = 15.0
 DEFAULT_PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS = 15.0
 DEFAULT_PRISM_STRATUM_SEND_TIMEOUT_SECONDS = 20.0
@@ -960,6 +961,7 @@ class CtvConfig:
 @dataclass(frozen=True)
 class LifecycleConfig:
     health_refresh_seconds: float
+    metrics_refresh_seconds: float
     pending_refresh_health_deadline_seconds: float
     coherent_tip_poll_health_deadline_seconds: float
     mining_health_startup_grace_seconds: float
@@ -1514,6 +1516,11 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
     lifecycle = LifecycleConfig(
         health_refresh_seconds=env_positive_float(
             "PRISM_HEALTH_REFRESH_SECONDS", DEFAULT_PRISM_HEALTH_REFRESH_SECONDS, environ=source
+        ),
+        metrics_refresh_seconds=env_positive_float(
+            "PRISM_METRICS_REFRESH_SECONDS",
+            DEFAULT_PRISM_METRICS_REFRESH_SECONDS,
+            environ=source,
         ),
         pending_refresh_health_deadline_seconds=env_positive_float(
             "PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS",

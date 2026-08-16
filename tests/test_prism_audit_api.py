@@ -227,6 +227,22 @@ class UnhealthyCoordinator(FakeCoordinator):
         }
 
 
+class CachedMetricsCoordinator(FakeCoordinator):
+    def cached_metrics_payload(self) -> tuple[int, str]:
+        return 200, "qbit_prism_cached_snapshot 1\n"
+
+    def metrics_payload(self) -> str:
+        raise AssertionError("HTTP scrape reached the live metrics renderer")
+
+
+class UninitializedCachedMetricsCoordinator(FakeCoordinator):
+    def cached_metrics_payload(self) -> tuple[int, str]:
+        return 503, "qbit_prism_metrics_snapshot_age_seconds -1\n"
+
+    def metrics_payload(self) -> str:
+        return "qbit_prism_direct_compatibility 1\n"
+
+
 class PrismAuditApiTests(unittest.TestCase):
     def setUp(self) -> None:
         handler = make_audit_handler(FakeCoordinator())  # type: ignore[arg-type]
@@ -273,6 +289,50 @@ class PrismAuditApiTests(unittest.TestCase):
         self.assertIn("qbit_prism_ctv_fanouts_pending 1", metrics)
         self.assertIn("qbit_prism_ctv_fanouts_broadcastable 1", metrics)
         self.assertIn("qbit_prism_ctv_fanouts_failed 0", metrics)
+
+    def test_metrics_endpoint_reads_only_the_cached_complete_snapshot(self) -> None:
+        handler = make_audit_handler(CachedMetricsCoordinator())  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/metrics",
+                timeout=5,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    response.read().decode(),
+                    "qbit_prism_cached_snapshot 1\n",
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_metrics_endpoint_falls_back_when_compatibility_cache_is_uninitialized(
+        self,
+    ) -> None:
+        handler = make_audit_handler(  # type: ignore[arg-type]
+            UninitializedCachedMetricsCoordinator()
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/metrics",
+                timeout=5,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    response.read().decode(),
+                    "qbit_prism_direct_compatibility 1\n",
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_coordinator_latest_audit_endpoint_preserves_none_and_snapshot_payload(self) -> None:
         coordinator = PrismCoordinator.__new__(PrismCoordinator)

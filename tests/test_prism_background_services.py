@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from lab.prism.background_services import (
     BackgroundServiceRegistry,
@@ -296,6 +297,29 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
             enabled._make_background_service_registry().service_names(),
         )
 
+    def test_audit_http_starts_only_after_both_snapshot_refreshers(self) -> None:
+        # Upstream #120 ordering: both cached-snapshot refreshers are armed
+        # before the listener facade binds; the warm-up itself runs inside
+        # their background loops so the bind path never blocks on it.
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server.audit_bind = "127.0.0.1"
+        server.audit_port = 3341
+        events: list[str] = []
+        server.start_health_snapshot_refresher = lambda: events.append(  # type: ignore[method-assign]
+            "health"
+        )
+        server.start_metrics_snapshot_refresher = lambda: events.append(  # type: ignore[method-assign]
+            "metrics"
+        )
+        server._ensure_audit_http_facade = lambda: SimpleNamespace(  # type: ignore[method-assign]
+            start=lambda: events.append("http")
+        )
+
+        with patch("builtins.print"):
+            server.start_audit_server()
+
+        self.assertEqual(events, ["health", "metrics", "http"])
+
     def test_process_service_specs_preserve_names_and_join_order(self) -> None:
         server = self.coordinator_with_optional_services(True)
 
@@ -316,6 +340,7 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
                 "share_writer",
                 "ctv_fanout_broadcaster",
                 "health_snapshot_refresher",
+                "metrics_snapshot_refresher",
             ),
         )
         expected = {
@@ -332,6 +357,11 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
             ),
             "health_snapshot_refresher": (
                 "prism-health-snapshot-refresher",
+                1.0,
+                False,
+            ),
+            "metrics_snapshot_refresher": (
+                "prism-metrics-snapshot-refresher",
                 1.0,
                 False,
             ),

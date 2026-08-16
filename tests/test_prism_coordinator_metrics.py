@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+from lab.prism import audit_http as audit_http_module
 from tests import prism_coordinator_test_support as _job_support
 from tests import prism_vardiff_test_support as _vardiff_support
 
@@ -968,7 +969,7 @@ class HealthSnapshotTests(_JobSupportTestCase):
         server, _ = coordinator()
         server.audit_bind = "127.0.0.1"
         server.audit_port = 0
-        # The spawned refresher loop exits immediately; the running flag is
+        # The spawned refresher loops exit immediately; the running flag is
         # what gates the handler path and must survive.
         server.stop_event.set()
         flag_at_bind: list[bool] = []
@@ -976,16 +977,61 @@ class HealthSnapshotTests(_JobSupportTestCase):
         class RecordingServer:
             def __init__(self, address: object, handler_cls: object) -> None:
                 flag_at_bind.append(bool(server._health_refresh_loop_running))
+                self.server_address = address
+                self.ready = threading.Event()
+                self.released = threading.Event()
 
-            def serve_forever(self) -> None:
+            def serve_unless_startup_cancelled(self, *, poll_interval: float) -> None:
+                del poll_interval
+                self.ready.set()
+                self.released.wait(2.0)
+
+            def cancel_startup(self) -> bool:
+                return True
+
+            def shutdown(self) -> None:
+                self.released.set()
+
+            def server_close(self) -> None:
                 return None
 
         with patch.object(
-            prism_coordinator_module, "ThreadingHTTPServer", RecordingServer
+            audit_http_module, "_BoundedThreadingHttpServer", RecordingServer
         ), patch("builtins.print"):
             server.start_audit_server()
-        self.assertEqual(flag_at_bind, [True])
-        self.assertTrue(server._health_refresh_loop_running)
+            try:
+                self.assertEqual(flag_at_bind, [True])
+                self.assertTrue(server._health_refresh_loop_running)
+            finally:
+                self.assertTrue(server._ensure_audit_http_facade().stop())
+
+
+class MetricsSnapshotTests(_JobSupportTestCase):
+    def test_cached_metrics_do_not_reenter_complete_renderer(self) -> None:
+        server, _ = coordinator()
+        complete = server.refresh_metrics_snapshot()
+        server._render_metrics_payload = mock.Mock(  # type: ignore[method-assign]
+            side_effect=AssertionError("cached scrape reached live renderer")
+        )
+
+        status, cached = server.cached_metrics_payload()
+
+        self.assertEqual(status, 200)
+        self.assertTrue(cached.startswith(complete))
+        server._render_metrics_payload.assert_not_called()
+        self.assertIn("qbit_prism_metrics_snapshot_generation 1", cached)
+
+    def test_renderer_emits_semantic_current_work_ratio_gauge(self) -> None:
+        # Upstream #107: the complete document carries the semantic-currency
+        # gauge derived from fingerprint + payout generation only.
+        server, _ = coordinator()
+
+        metrics = server._render_metrics_payload()
+
+        self.assertIn(
+            "qbit_prism_stratum_semantic_current_work_ratio 1.0",
+            metrics,
+        )
 
 
 class JobBuildMetricsTests(_JobSupportTestCase):
