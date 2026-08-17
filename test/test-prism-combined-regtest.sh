@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT_DIR}/test/test-lib.sh"
+# shellcheck source=test/prism-postgres-lib.sh
+source "${ROOT_DIR}/test/prism-postgres-lib.sh"
 
 DATADIR="${DATADIR:-$(mktemp -d -t qbit-prism-combined.XXXXXX)}"
 RPC_USER="${RPC_USER:-qbitrpc}"
@@ -79,15 +81,7 @@ else
   postgres_started=1
   PSQL_COMMAND="docker exec -i ${POSTGRES_CONTAINER} psql -U qbit -d qbit"
 
-  deadline=$((SECONDS + 60))
-  until docker exec "${POSTGRES_CONTAINER}" pg_isready -U qbit -d qbit >/dev/null 2>&1; do
-    if [[ "${SECONDS}" -ge "${deadline}" ]]; then
-      echo "timed out waiting for PRISM Postgres container" >&2
-      docker logs "${POSTGRES_CONTAINER}" >&2 || true
-      exit 1
-    fi
-    sleep 1
-  done
+  wait_for_prism_postgres_container "${POSTGRES_CONTAINER}"
 fi
 
 "${QBITD_BIN}" \
