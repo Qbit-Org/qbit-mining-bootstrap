@@ -4942,6 +4942,122 @@ class NativeClientSelectionTests(unittest.TestCase):
             gate.release()
         self.assertLess(time.monotonic() - started, 0.5)
 
+    def test_operation_gate_stamps_progress_while_admission_is_blocked(self) -> None:
+        """A blocked admission wait must report liveness to its caller.
+
+        Landing-class callers run this wait on a watchdog-monitored thread.
+        No statement has been sent yet, so nothing on the server can bound or
+        report the wait; without the progress hook the whole admission budget
+        is silence and the watchdog kills a coordinator that is merely queued
+        behind another writer. Slicing must not extend the wait either: the
+        caller's deadline still ends it with the same error.
+        """
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        gate = threading.Lock()
+        gate.acquire()
+        stamps: list[float] = []
+        started = time.monotonic()
+        try:
+            with ledger.statement_timeout(0.4):
+                with ledger.operation_progress(
+                    lambda: stamps.append(time.monotonic()),
+                    slice_seconds=0.05,
+                ):
+                    with self.assertRaisesRegex(
+                        LedgerOperationTimeout,
+                        "writer lock",
+                    ):
+                        with ledger._operation_gate(gate, "writer lock"):
+                            self.fail("contended writer lock unexpectedly acquired")
+        finally:
+            gate.release()
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(len(stamps), 2)
+        for previous, stamp in zip([started] + stamps, stamps):
+            self.assertLess(stamp - previous, 0.3)
+        self.assertGreaterEqual(elapsed, 0.4)
+        self.assertLess(elapsed, 3.0)
+
+    def test_operation_gate_without_progress_hook_waits_once(self) -> None:
+        """The unhooked path is still a single blocking acquire.
+
+        Ordinary ledger callers have no liveness monitor to satisfy and must
+        not start paying for wakeups they cannot use.
+        """
+        acquires: list[float] = []
+
+        class RecordingGate:
+            def acquire(self, timeout: float = -1) -> bool:
+                acquires.append(timeout)
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("gate released without being acquired")
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        with ledger.statement_timeout(0.02):
+            with self.assertRaisesRegex(LedgerOperationTimeout, "writer lock"):
+                with ledger._operation_gate(RecordingGate(), "writer lock"):
+                    self.fail("contended writer lock unexpectedly acquired")
+        self.assertEqual(acquires, [0.02])
+
+    def test_operation_progress_validates_and_restores_its_slice(self) -> None:
+        """The hook scope matches its sibling timeout scopes exactly."""
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        for slice_seconds in (0.0, -1.0, float("inf"), float("nan")):
+            with self.subTest(slice_seconds=slice_seconds):
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    with ledger.operation_progress(
+                        lambda: None,
+                        slice_seconds=slice_seconds,
+                    ):
+                        self.fail("invalid progress slice unexpectedly accepted")
+        self.assertIsNone(ledger._operation_progress_hook())
+        def outer() -> None:
+            return None
+
+        def inner() -> None:
+            return None
+
+        with ledger.operation_progress(outer, slice_seconds=1.0):
+            self.assertEqual(ledger._operation_progress_hook(), (outer, 1.0))
+            with ledger.operation_progress(inner, slice_seconds=0.25):
+                self.assertEqual(ledger._operation_progress_hook(), (inner, 0.25))
+            self.assertEqual(ledger._operation_progress_hook(), (outer, 1.0))
+        self.assertIsNone(ledger._operation_progress_hook())
+
+    def test_operation_gate_propagates_progress_hook_failures(self) -> None:
+        """A liveness stamp that cannot be taken is a failure, not noise.
+
+        Swallowing it would leave the caller blocked inside a lock wait it
+        believes is being reported, which is the exact silence this hook
+        exists to remove.
+        """
+
+        class Stamped(RuntimeError):
+            pass
+
+        def on_progress() -> None:
+            raise Stamped("heartbeat unavailable")
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        gate = threading.Lock()
+        gate.acquire()
+        try:
+            with ledger.statement_timeout(5.0):
+                with ledger.operation_progress(on_progress, slice_seconds=0.01):
+                    with self.assertRaises(Stamped):
+                        with ledger._operation_gate(gate, "writer lock"):
+                            self.fail("contended writer lock unexpectedly acquired")
+        finally:
+            gate.release()
+
     def test_statement_timeout_refreshes_for_each_database_step(self) -> None:
         ledger = PsqlShareLedger.__new__(PsqlShareLedger)
         ledger._operation_timeout_local = threading.local()

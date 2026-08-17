@@ -8647,6 +8647,12 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
 
     def test_block_landing_db_timeout_escalates_and_clears(self) -> None:
         server, _state, _recording = submit_coordinator()
+        # The doubling sequence below reaches the reviewed 120s cap, which
+        # only a tolerance of at least 240s can grant: the landing budget is
+        # clamped to half the configured watchdog. Pin the production
+        # tolerance explicitly so this test keeps asserting the escalation
+        # ladder itself rather than the ceiling.
+        server.watchdog_timeout_seconds = 300.0
         server.block_landing_db_timeout_seconds = 30.0
         server.block_landing_db_timeout_max_seconds = 120.0
         block_hash = "ab" * 32
@@ -8660,6 +8666,97 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         self.assertEqual(server._block_landing_db_timeout("cd" * 32), 30.0)
         server._clear_block_candidate_retry_state(block_hash)
         self.assertEqual(server._block_landing_db_timeout(block_hash), 30.0)
+
+    def test_escalated_landing_budget_stays_inside_watchdog_tolerance(self) -> None:
+        """Escalation may never grant a budget the watchdog will not wait for.
+
+        A landing step is spent on the watchdog-monitored block-work thread,
+        so a budget above the tolerance does not buy a longer attempt: the
+        watchdog hard-exits mid-landing, the in-memory escalation counts die
+        with the process, and the restart replays the same doomed attempt
+        from the base budget forever (issue #125). The ceiling is derived
+        from the configured tolerance, so raising the watchdog restores the
+        reviewed cap without touching this clamp.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_landing_db_timeout_max_seconds = 120.0
+        block_hash = "ab" * 32
+        for _ in range(8):
+            server._note_block_landing_timeout(block_hash)
+        escalated = server._block_landing_db_timeout(block_hash)
+        self.assertLessEqual(escalated, server.watchdog_timeout_seconds / 2.0)
+        self.assertEqual(escalated, 60.0)
+        # The production override is pinned too: a 300s tolerance leaves a
+        # 150s ceiling, so the reviewed 120s cap is still granted in full and
+        # deployments running that override see no behavior change.
+        server.watchdog_timeout_seconds = 300.0
+        self.assertEqual(server._block_landing_db_timeout(block_hash), 120.0)
+
+    def test_landing_scope_stamps_progress_during_ledger_admission(self) -> None:
+        """Waiting for the ledger's writer lock must not be heartbeat-silent.
+
+        Admission happens before any statement is sent, so no server-side
+        deadline bounds it and nothing reports until the gate opens. The
+        landing scope runs on the block-work owner thread the watchdog
+        monitors, so it installs the ledger's progress hook and the wait
+        stamps its phase in watchdog-sized slices instead.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_submit_db_timeout_seconds = 1.0
+        installed: list[float] = []
+        stamped: list[str] = []
+
+        @contextlib.contextmanager
+        def operation_progress(on_progress, *, slice_seconds: float):
+            installed.append(slice_seconds)
+            on_progress()
+            yield
+
+        @contextlib.contextmanager
+        def statement_timeout(seconds: float):
+            yield
+
+        server.ledger = SimpleNamespace(
+            statement_timeout=statement_timeout,
+            operation_progress=operation_progress,
+        )
+        server._record_block_submitter_wait = lambda phase: stamped.append(phase)
+        with server._block_landing_ledger_statement_timeout_scope("ab" * 32):
+            pass
+        with server._block_submitter_ledger_statement_timeout_scope():
+            pass
+        self.assertEqual(len(installed), 2)
+        for slice_seconds in installed:
+            self.assertGreater(slice_seconds, 0.0)
+            self.assertLessEqual(slice_seconds, server.watchdog_timeout_seconds)
+        self.assertEqual(
+            stamped,
+            [
+                "wait-ledger-admission:landing",
+                "wait-ledger-admission:submit",
+            ],
+        )
+
+    def test_landing_scope_accepts_ledgers_without_a_progress_hook(self) -> None:
+        """Duck-typed ledgers predating the hook keep working unchanged."""
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        scopes: list[float] = []
+
+        @contextlib.contextmanager
+        def statement_timeout(seconds: float):
+            scopes.append(seconds)
+            yield
+
+        server.ledger = SimpleNamespace(statement_timeout=statement_timeout)
+        with server._block_landing_ledger_statement_timeout_scope("ab" * 32):
+            pass
+        self.assertEqual(scopes, [30.0])
 
     def test_landing_scope_uses_landing_budget_from_first_attempt(self) -> None:
         server, _state, _recording = submit_coordinator()
@@ -8684,6 +8781,10 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
 
     def test_landing_scope_timeout_escalates_next_attempt_budget(self) -> None:
         server, _state, _recording = submit_coordinator()
+        # The escalated 90s budget asserted below needs a tolerance of at
+        # least 180s; the landing budget is otherwise clamped to half the
+        # configured watchdog.
+        server.watchdog_timeout_seconds = 300.0
         server.block_landing_db_timeout_seconds = 45.0
         server.block_landing_db_timeout_max_seconds = 120.0
         scopes: list[float] = []

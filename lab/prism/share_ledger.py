@@ -2542,6 +2542,61 @@ class PsqlShareLedger:
             else:
                 timeout_local.timeout_seconds = previous
 
+    @contextmanager
+    def operation_progress(
+        self,
+        on_progress: Callable[[], None],
+        *,
+        slice_seconds: float,
+    ) -> Iterator[None]:
+        """Stamp caller liveness while a ledger admission wait is blocked.
+
+        A landing-class caller runs its ledger step directly on a
+        watchdog-monitored block-work thread. Waiting for the writer lock or
+        the read semaphore is not database work: no statement has been sent,
+        so neither ``statement_timeout`` nor any server-side cancellation
+        bounds it, and the ledger has nothing to report until admission
+        succeeds. Without this hook the whole admission budget is
+        heartbeat-silent, and a coordinator that is merely queued behind
+        another writer is hard-exited by its own watchdog mid-landing --
+        which loses the escalation state the retry depended on and restarts
+        the same doomed cycle.
+
+        The hook fires between acquire slices, so it never runs while this
+        thread holds the gate, and it never replaces the caller's deadline:
+        ``_operation_gate`` still raises at the deadline
+        ``_remaining_operation_timeout`` reports. An exception from
+        ``on_progress`` propagates to the caller; a liveness stamp that
+        cannot be taken is a real failure, not something to swallow inside a
+        lock wait. Nested scopes replace the outer hook and restore it on
+        exit, matching ``operation_timeout``/``statement_timeout``.
+        """
+        slice_seconds = float(slice_seconds)
+        if not math.isfinite(slice_seconds) or slice_seconds <= 0:
+            raise ValueError("operation progress slice must be finite and positive")
+        progress_local = getattr(self, "_operation_progress_local", None)
+        if progress_local is None:
+            progress_local = local()
+            self._operation_progress_local = progress_local
+        previous = getattr(progress_local, "hook", None)
+        progress_local.hook = (on_progress, slice_seconds)
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del progress_local.hook
+                except AttributeError:
+                    pass
+            else:
+                progress_local.hook = previous
+
+    def _operation_progress_hook(self) -> tuple[Callable[[], None], float] | None:
+        progress_local = getattr(self, "_operation_progress_local", None)
+        if progress_local is None:
+            return None
+        return getattr(progress_local, "hook", None)
+
     def _remaining_operation_timeout(self) -> float | None:
         timeout_local = getattr(self, "_operation_timeout_local", None)
         deadline = (
@@ -2572,17 +2627,49 @@ class PsqlShareLedger:
             remaining = min(remaining, float(statement_timeout_seconds))
         return remaining
 
+    def _acquire_operation_gate(self, gate: Any, name: str) -> None:
+        """Wait for one ledger gate inside the caller's remaining deadline.
+
+        With no progress hook installed this is a single blocking acquire, as
+        it has always been: an ordinary caller has no liveness monitor to
+        satisfy and gains nothing from waking up. With a hook installed the
+        same total wait is served in slices so the caller can stamp its
+        heartbeat between them (see ``operation_progress`` for why an
+        admission wait would otherwise be silent). Slicing never widens the
+        wait: the deadline derived from ``_remaining_operation_timeout`` stays
+        authoritative and still produces the same timeout error.
+        """
+        remaining = self._remaining_operation_timeout()
+        hook = self._operation_progress_hook()
+        if hook is None:
+            acquired = (
+                gate.acquire()
+                if remaining is None
+                else gate.acquire(timeout=max(0.0, remaining))
+            )
+            if not acquired:
+                raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+            return
+        on_progress, slice_seconds = hook
+        deadline = (
+            None if remaining is None else time.monotonic() + max(0.0, remaining)
+        )
+        while True:
+            wait_seconds = slice_seconds
+            if deadline is not None:
+                wait_seconds = min(wait_seconds, deadline - time.monotonic())
+            # An expired budget still gets one non-blocking attempt, so a
+            # zero or negative remaining fails exactly where it always did.
+            if gate.acquire(timeout=max(0.0, wait_seconds)):
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+            on_progress()
+
     @contextmanager
     def _operation_gate(self, gate: Any, name: str) -> Iterator[None]:
         """Acquire a ledger lock/semaphore within the caller's deadline."""
-        remaining = self._remaining_operation_timeout()
-        acquired = (
-            gate.acquire()
-            if remaining is None
-            else gate.acquire(timeout=max(0.0, remaining))
-        )
-        if not acquired:
-            raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+        self._acquire_operation_gate(gate, name)
         try:
             yield
         finally:

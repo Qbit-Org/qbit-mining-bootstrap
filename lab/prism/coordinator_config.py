@@ -147,6 +147,11 @@ DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS = 15.0
 DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS = 15.0
 DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS = 120
 DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS = 900.0
+# How long a monitored coordinator thread may stay heartbeat-silent before the
+# watchdog hard-exits the process. Deadlines that are spent on a monitored
+# thread derive their ceiling from this value rather than repeating the number,
+# so retuning the watchdog cannot leave a budget stranded above its tolerance.
+DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS = 120.0
 # A watchdog release must never turn a wedged DB path into a second outage.
 # The release worker is daemonized and the watchdog hard-exits at this total
 # wall-clock deadline whether quiescence or the fresh DB connection completes.
@@ -209,8 +214,22 @@ DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS = 30.0
 # bounded by the escalated statement budget, cycles are paced by the
 # candidate retry backoff, and the stuck-call/coordination watchdogs remain
 # the overall bound. An accepted block's landing is never abandoned outright;
-# it converges through durable replay.
+# it converges through durable replay. This is an upper bound only: landing
+# steps run on watchdog-monitored block-work threads, so the watchdog-derived
+# ceiling below can lower the budget actually granted, and only lower it.
 DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS = 120.0
+# Fraction of the configured watchdog tolerance a landing budget may occupy.
+# A landing step spends its budget on the block-work thread the watchdog
+# monitors, so the reviewed cap and the watchdog are not independent knobs:
+# a cap at or above the tolerance lets a legal, still-running call trip the
+# watchdog, and the in-memory escalation state dies with the process, so the
+# restart replays the same doomed attempt from the base budget forever
+# (issue #125). With the ledger admission wait now stamping progress, the
+# heartbeat-silent span of one landing step is a single server-side
+# statement; holding the budget at half the tolerance therefore leaves a
+# full statement of margin before the watchdog fires, and the two values can
+# no longer drift apart when either is retuned.
+BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION = 0.5
 DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS = 5.0
 DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS = 30.0
 # How long an own-hash tip observation keeps protecting a block candidate
@@ -1549,7 +1568,9 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         ),
         watchdog_enabled=env_bool("PRISM_WATCHDOG_ENABLED", "1", environ=source),
         watchdog_timeout_seconds=env_positive_float(
-            "PRISM_WATCHDOG_TIMEOUT_SECONDS", 120.0, environ=source
+            "PRISM_WATCHDOG_TIMEOUT_SECONDS",
+            DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
+            environ=source,
         ),
         watchdog_interval_seconds=env_positive_float(
             "PRISM_WATCHDOG_INTERVAL_SECONDS", 15.0, environ=source
