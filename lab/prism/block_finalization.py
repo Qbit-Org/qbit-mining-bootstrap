@@ -1809,6 +1809,16 @@ class BlockFinalizationService:
                     evidence=prepared.evidence,
                     verification_identity=landed.audit_verification_identity,
                     created_at=public_api.utc_now_iso(),
+                    # This is the live writer finalizing a block it confirmed
+                    # itself in this landing. Two distinct found blocks can land
+                    # inside one confirm->publish window -- the synchronous
+                    # client-thread tail and the accounting actor do not
+                    # serialise across hashes -- so this publication can arrive
+                    # already superseded on the publication ordinal. It must
+                    # still write its own height+hash live envelope, which is
+                    # the block's only published evidence pointer. A deposed
+                    # writer replaying stale state never reaches here.
+                    restore_superseded_envelope=True,
                 )
         published_evidence = dict(publication.evidence)
         self._record_block_candidate_progress("evidence-write:complete")

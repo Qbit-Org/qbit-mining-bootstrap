@@ -21,6 +21,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -1912,6 +1913,7 @@ class AuditArtifactStore:
         evidence: Mapping[str, Any],
         verification_identity: Mapping[str, Any],
         created_at: str,
+        restore_superseded_envelope: bool = False,
     ) -> AuditPublication:
         self._require_publication_order_guard()
         block_hash = _canonical_hex(identity.block_hash, name="block_hash")
@@ -1970,11 +1972,34 @@ class AuditArtifactStore:
                 if identity.sequence == current.sequence and not exact:
                     raise RuntimeError("audit publication identity conflict")
                 if identity.sequence < current.sequence:
-                    return AuditPublication(
+                    # A superseded ordinal never becomes the current evidence
+                    # reference, but the live envelope is this block's only
+                    # published evidence pointer and lives on its own
+                    # height+hash path. Two distinct blocks landing inside one
+                    # confirm->publish window arrive here in ordinal order, so
+                    # skipping the write erased the earlier block's public
+                    # audit trail permanently and silently.
+                    #
+                    # Only the caller knows whether it is the live writer for
+                    # this landing. A process whose writer lease was taken over
+                    # must stay fenced out of the shared audit root entirely:
+                    # its in-memory report may be stale, and publishing a stale
+                    # report as a block's public evidence is worse than leaving
+                    # the envelope missing. Such callers never opt in.
+                    if not restore_superseded_envelope:
+                        return AuditPublication(
+                            identity=identity,
+                            envelope_path=envelope_path,
+                            evidence=copy.deepcopy(dict(evidence)),
+                            published=False,
+                        )
+                    return self._write_superseded_live_envelope_locked(
                         identity=identity,
                         envelope_path=envelope_path,
-                        evidence=copy.deepcopy(dict(evidence)),
-                        published=False,
+                        report=report,
+                        persistence=persistence,
+                        evidence=evidence,
+                        created_at=created_at,
                     )
                 if exact and self._latest_evidence is not None:
                     expected_envelope = self._build_live_envelope(
@@ -2249,6 +2274,82 @@ class AuditArtifactStore:
             evidence=copy.deepcopy(durable_evidence),
             published=True,
         )
+
+    def _write_superseded_live_envelope_locked(
+        self,
+        *,
+        identity: AuditPublicationIdentity,
+        envelope_path: Path,
+        report: Mapping[str, Any],
+        persistence: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        created_at: str,
+    ) -> AuditPublication:
+        """Persist the live envelope for a ledger-proven superseded ordinal.
+
+        ``publish_success`` has already fenced ``identity.sequence`` at or below
+        the durable publication floor, so this ordinal was durably allocated by
+        the ledger and is unique to this block. The envelope path is keyed by
+        height and hash, so writing it cannot disturb the current evidence
+        reference, which must keep naming the highest published sequence.
+        """
+        self._require_publication_order_guard()
+        superseded = AuditPublication(
+            identity=identity,
+            envelope_path=envelope_path,
+            evidence=copy.deepcopy(dict(evidence)),
+            published=False,
+        )
+        try:
+            self._read_owned_regular_bytes(envelope_path)
+        except FileNotFoundError:
+            pass
+        else:
+            # A same-hash stale replay always finds its own envelope already
+            # present. This path only restores missing evidence; adjudicating
+            # envelope content stays with the exact-replay branch above.
+            return superseded
+        current = self._current_identity
+        envelope = self._build_live_envelope(
+            identity=identity,
+            report=report,
+            persistence=persistence,
+            created_at=created_at,
+        )
+        written_identity = self._write_mutable_json(
+            envelope_path,
+            envelope,
+            sort_keys=True,
+        )
+        try:
+            self._validate_root_identity()
+            self._validate_evidence_parent_identity()
+            self._require_publication_order_guard()
+        except BaseException:
+            try:
+                self._remove_identity_safe(
+                    envelope_path,
+                    written_identity,
+                    allow_detached_authority=True,
+                )
+            except BaseException:
+                pass
+            try:
+                self._fsync_pinned_directory(envelope_path.parent)
+            except BaseException:
+                pass
+            raise
+        # Diagnostics go to stderr because this store is hosted inside
+        # processes that reserve stdout for a strict protocol stream.
+        print(
+            "prism audit: wrote live envelope for superseded publication "
+            f"sequence={identity.sequence} "
+            f"current_sequence={current.sequence if current is not None else None} "
+            f"height={identity.block_height} hash={identity.block_hash}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return superseded
 
     def _build_live_envelope(
         self,
