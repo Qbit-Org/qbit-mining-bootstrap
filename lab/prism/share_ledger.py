@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import BoundedSemaphore, Lock, Thread, local
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Protocol
 
 from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
@@ -1857,6 +1857,61 @@ def _writer_lease_advisory_lock_key(writer_id: str, writer_epoch: int) -> int:
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
+class LedgerSqlPort(Protocol):
+    """The pooled statement-execution seam `PsqlShareLedger` writes through.
+
+    `_NativePostgresClient` is the production implementation. Naming the
+    contract lets a test substitute a whole PostgreSQL model at construction
+    time (see `sql_backend_factory`) instead of reassigning bound methods on
+    a live ledger, which is what the lease and landing concurrency tests
+    need: statement timing, tuple-lock waits and transaction lifetime are
+    properties of this seam, not of any single method.
+    """
+
+    @property
+    def pool_size(self) -> int: ...
+
+    def run_json(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> Any: ...
+
+    def run_script(self, sql: str) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class LeaseGuardPort(Protocol):
+    """The dedicated writer-lease guard session seam.
+
+    `_NativePostgresLeaseGuard` is the production implementation. Unlike
+    `LedgerSqlPort` this session is never transparently replaced: losing it
+    loses the advisory lock and must fence the owning coordinator, so the
+    heartbeat's liveness proof depends on the session's identity surviving.
+    A substitute must honour the same contract, including the serialized
+    query slot that `on_query_start` marks and the in-slot `followup`
+    statement the attribution recheck relies on.
+    """
+
+    def try_acquire(self) -> bool: ...
+
+    @property
+    def held(self) -> bool: ...
+
+    def run_json(
+        self,
+        sql: str,
+        *,
+        on_query_start: Callable[[], None] | None = None,
+        followup: Callable[[Any], str | None] | None = None,
+    ) -> Any: ...
+
+    def close(self) -> None: ...
+
+
 class _NativePostgresClient:
     """Persistent pooled psycopg client for the share ledger.
 
@@ -2197,6 +2252,9 @@ class PsqlShareLedger:
         initialize_schema: bool = False,
         schema_path: Path | None = None,
         lease_retry_sleep: Callable[[float], None] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        sql_backend_factory: Callable[..., LedgerSqlPort | None] | None = None,
+        lease_guard_factory: Callable[..., LeaseGuardPort | None] | None = None,
         lease_retry_max_sleep_seconds: float = 15.0,
         lease_ttl_seconds: float = 60.0,
         lease_authority_margin_seconds: float | None = None,
@@ -2269,6 +2327,15 @@ class PsqlShareLedger:
             f"make_interval(secs => {lease_authority_margin_seconds})"
         )
         self._lease_retry_sleep = lease_retry_sleep or time.sleep
+        # The lease lifecycle's only clock. Every interval this process
+        # measures itself — adoption silence from guard acquisition, caller
+        # deadlines, lease refresh age — reads through here, so a test can
+        # supply a virtual clock and drive an interleaving by advancing it
+        # rather than by sleeping and hoping. Production passes None and gets
+        # time.monotonic.
+        self._monotonic: Callable[[], float] = monotonic or time.monotonic
+        self._sql_backend_factory = sql_backend_factory
+        self._lease_guard_factory = lease_guard_factory
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
         self._lease_adoption_silence_seconds = lease_adoption_silence_seconds
@@ -2326,7 +2393,7 @@ class PsqlShareLedger:
             database_url,
             read_concurrency=read_concurrency,
         )
-        self._writer_lease_guard: _NativePostgresLeaseGuard | None = None
+        self._writer_lease_guard: LeaseGuardPort | None = None
         try:
             self._initialize_writer_lease_guard(database_url)
             if initialize_schema:
@@ -2343,7 +2410,7 @@ class PsqlShareLedger:
         database_url: str | None,
         *,
         read_concurrency: int,
-    ) -> _NativePostgresClient | None:
+    ) -> LedgerSqlPort | None:
         mode = (native_client_mode or "auto").strip().lower()
         if mode in {"0", "false", "no", "off", "psql"}:
             return None
@@ -2358,12 +2425,23 @@ class PsqlShareLedger:
                     "postgres:// DSN inside PRISM_POSTGRES_PSQL_COMMAND"
                 )
             return None
+        # One pooled connection per concurrent reader plus one for the
+        # serialized write path (the coordinator's share writer thread).
+        pool_size = read_concurrency + 1
+        if self._sql_backend_factory is not None:
+            # An injected backend is authoritative: it stands in for the
+            # whole server, so psycopg's availability is irrelevant and a
+            # None return means the same thing it does below (fall back to
+            # the psql subprocess path).
+            return self._sql_backend_factory(
+                conninfo,
+                pool_size=pool_size,
+                application_name=self._pool_application_name,
+            )
         try:
-            # One pooled connection per concurrent reader plus one for the
-            # serialized write path (the coordinator's share writer thread).
             return _NativePostgresClient(
                 conninfo,
-                pool_size=read_concurrency + 1,
+                pool_size=pool_size,
                 application_name=self._pool_application_name,
             )
         except ImportError:
@@ -2378,16 +2456,22 @@ class PsqlShareLedger:
     def _make_writer_lease_guard(
         self,
         database_url: str | None,
-    ) -> _NativePostgresLeaseGuard | None:
+    ) -> LeaseGuardPort | None:
         if self._native is None:
             return None
         conninfo = database_url or database_url_from_psql_command(self._command)
         if conninfo is None:
             return None
-        return _NativePostgresLeaseGuard(
-            conninfo,
-            _writer_lease_advisory_lock_key(self._writer_id, self._writer_epoch),
+        advisory_lock_key = _writer_lease_advisory_lock_key(
+            self._writer_id,
+            self._writer_epoch,
         )
+        if self._lease_guard_factory is not None:
+            return self._lease_guard_factory(
+                conninfo,
+                advisory_lock_key=advisory_lock_key,
+            )
+        return _NativePostgresLeaseGuard(conninfo, advisory_lock_key)
 
     def _initialize_writer_lease_guard(self, database_url: str | None) -> None:
         if not self._writer_session_token.startswith(
@@ -2421,7 +2505,7 @@ class PsqlShareLedger:
                 # failure budget; counting from acquisition guarantees it
                 # that time even when its lease row is already stale because
                 # a long fenced transaction withheld updated_at refreshes.
-                self._writer_lease_guard_acquired_monotonic = time.monotonic()
+                self._writer_lease_guard_acquired_monotonic = self._now_monotonic()
                 return
             guard.close()
             if not warned:
@@ -2494,7 +2578,7 @@ class PsqlShareLedger:
             timeout_local = local()
             self._operation_timeout_local = timeout_local
         previous = getattr(timeout_local, "deadline", None)
-        deadline = time.monotonic() + timeout_seconds
+        deadline = self._now_monotonic() + timeout_seconds
         timeout_local.deadline = (
             deadline if previous is None else min(float(previous), deadline)
         )
@@ -2542,6 +2626,18 @@ class PsqlShareLedger:
             else:
                 timeout_local.timeout_seconds = previous
 
+    def _now_monotonic(self) -> float:
+        """Read the lease lifecycle's monotonic clock.
+
+        Resolved through getattr, matching this class's convention for
+        lazily initialized state: tests that exercise a single statement
+        against an instance built without __init__ still get a working
+        clock, while a fully constructed ledger reads whichever clock was
+        injected.
+        """
+        monotonic = getattr(self, "_monotonic", None)
+        return time.monotonic() if monotonic is None else monotonic()
+
     def _remaining_operation_timeout(self) -> float | None:
         timeout_local = getattr(self, "_operation_timeout_local", None)
         deadline = (
@@ -2565,7 +2661,7 @@ class PsqlShareLedger:
                 if statement_timeout_seconds is None
                 else float(statement_timeout_seconds)
             )
-        remaining = float(deadline) - time.monotonic()
+        remaining = float(deadline) - self._now_monotonic()
         if remaining <= 0:
             raise LedgerOperationTimeout("postgres operation deadline expired")
         if statement_timeout_seconds is not None:
@@ -6753,7 +6849,7 @@ END;
 
     def _ensure_writer_lease(self) -> None:
         while True:
-            acquire_started_monotonic = time.monotonic()
+            acquire_started_monotonic = self._now_monotonic()
             result = self._try_acquire_writer_lease()
             if result.get("acquired"):
                 self._writer_lease_last_refresh_monotonic = (
@@ -6762,7 +6858,7 @@ END;
                 return
             if self._can_adopt_writer_lease(result):
                 observed_session = str(result["writer_session_token"])
-                adoption_started_monotonic = time.monotonic()
+                adoption_started_monotonic = self._now_monotonic()
                 adoption = self._try_adopt_writer_lease(result)
                 if adoption.get("acquired"):
                     self._writer_lease_last_refresh_monotonic = (
@@ -6939,7 +7035,7 @@ SELECT COALESCE(
         )
         guard_held_seconds = max(
             0.0,
-            time.monotonic() - guard_acquired_monotonic,
+            self._now_monotonic() - guard_acquired_monotonic,
         )
         guard_wait_seconds = max(
             0.0,
