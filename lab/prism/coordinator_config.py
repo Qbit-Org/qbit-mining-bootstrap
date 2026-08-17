@@ -18,6 +18,12 @@ from lab.prism.share_ledger import (
     DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
     DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
     DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+    DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+    DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+    DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
 )
 
@@ -921,6 +927,12 @@ class LedgerConfig:
     writer_session_token: str | None
     initialize_schema: bool
     lease_ttl_seconds: float
+    lease_acquire_lock_timeout_seconds: float
+    lease_acquire_attempts: int
+    postgres_idle_in_transaction_timeout_seconds: float
+    postgres_tcp_keepalives_idle_seconds: int
+    postgres_tcp_keepalives_interval_seconds: int
+    postgres_tcp_keepalives_count: int
     read_concurrency: int
     accepted_stats_cache_seconds: float
     reward_window_cache_seconds: float
@@ -1408,6 +1420,36 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         in {"1", "true", "yes"},
         lease_ttl_seconds=env_positive_float(
             "PRISM_LEDGER_LEASE_TTL_SECONDS", 60.0, environ=source
+        ),
+        lease_acquire_lock_timeout_seconds=env_positive_float(
+            "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS",
+            DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+            environ=source,
+        ),
+        lease_acquire_attempts=env_positive_int(
+            "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS",
+            DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+            environ=source,
+        ),
+        postgres_idle_in_transaction_timeout_seconds=env_positive_float(
+            "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS",
+            DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+            environ=source,
+        ),
+        postgres_tcp_keepalives_idle_seconds=env_positive_int(
+            "PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS",
+            DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+            environ=source,
+        ),
+        postgres_tcp_keepalives_interval_seconds=env_positive_int(
+            "PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS",
+            DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
+            environ=source,
+        ),
+        postgres_tcp_keepalives_count=env_positive_int(
+            "PRISM_POSTGRES_TCP_KEEPALIVES_COUNT",
+            DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+            environ=source,
         ),
         read_concurrency=env_positive_int("PRISM_POSTGRES_READ_CONCURRENCY", 4, environ=source),
         accepted_stats_cache_seconds=env_nonnegative_float(

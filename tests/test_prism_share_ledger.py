@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import tracemalloc
+import types
 import unittest
 import unittest.mock
 
@@ -5307,6 +5308,273 @@ class NativeClientSelectionTests(unittest.TestCase):
         self.assertFalse(retry_safe)
         self.assertIn("INSERT INTO qbit_ctv_fanout_broadcast_attempts", sql)
         self.assertIn("broadcast_attempt_count = artifact.broadcast_attempt_count + 1", sql)
+
+
+def make_session_guards(**overrides: Any) -> Any:
+    """Build a PostgresSessionGuards, resolving the class at call time.
+
+    Resolved through the module object so a tree without the session guards
+    fails each guard test individually with a clear AttributeError instead
+    of breaking the whole module import.
+    """
+    kwargs: dict[str, Any] = {
+        "idle_in_transaction_timeout_seconds": 15.0,
+        "tcp_keepalives_idle_seconds": 30,
+        "tcp_keepalives_interval_seconds": 10,
+        "tcp_keepalives_count": 3,
+    }
+    kwargs.update(overrides)
+    return share_ledger_module.PostgresSessionGuards(**kwargs)
+
+
+class PostgresSessionGuardTests(unittest.TestCase):
+    def test_native_pool_connect_carries_session_guard_options(self) -> None:
+        connect_kwargs: list[dict[str, Any]] = []
+
+        class FakeConninfo:
+            @staticmethod
+            def conninfo_to_dict(conninfo: str) -> dict[str, Any]:
+                return {"dbname": "qbit"}
+
+        class FakePsycopg:
+            conninfo = FakeConninfo
+
+            @staticmethod
+            def connect(conninfo: str, **kwargs: Any) -> object:
+                connect_kwargs.append(kwargs)
+                return object()
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        client._conninfo = "postgresql://example.invalid/qbit"
+        client._application_name = "qbit-prism-writer-test"
+        client._session_guards = make_session_guards(
+            idle_in_transaction_timeout_seconds=2.5,
+            tcp_keepalives_idle_seconds=31,
+            tcp_keepalives_interval_seconds=7,
+            tcp_keepalives_count=4,
+        )
+
+        client._connect()
+
+        self.assertEqual(len(connect_kwargs), 1)
+        options = connect_kwargs[0]["options"]
+        self.assertIn("-c idle_in_transaction_session_timeout=2500ms", options)
+        self.assertIn("-c tcp_keepalives_idle=31", options)
+        self.assertIn("-c tcp_keepalives_interval=7", options)
+        self.assertIn("-c tcp_keepalives_count=4", options)
+
+    def test_native_pool_connect_preserves_operator_conninfo_options(self) -> None:
+        connect_kwargs: list[dict[str, Any]] = []
+        operator_options = "-c geqo=off -c idle_in_transaction_session_timeout=0"
+
+        class FakeConninfo:
+            @staticmethod
+            def conninfo_to_dict(conninfo: str) -> dict[str, Any]:
+                return {"dbname": "qbit", "options": operator_options}
+
+        class FakePsycopg:
+            conninfo = FakeConninfo
+
+            @staticmethod
+            def connect(conninfo: str, **kwargs: Any) -> object:
+                connect_kwargs.append(kwargs)
+                return object()
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        client._conninfo = (
+            "postgresql://example.invalid/qbit?options=-c%20geqo%3Doff"
+        )
+        client._application_name = None
+        guards = make_session_guards()
+        client._session_guards = guards
+
+        client._connect()
+
+        options = connect_kwargs[0]["options"]
+        # Both the operator's DSN-level options and the guards are present,
+        # and the guard fragment comes last so its -c duplicates win.
+        self.assertIn("-c geqo=off", options)
+        self.assertTrue(options.endswith(guards.options_fragment()))
+        self.assertLess(
+            options.index("geqo"),
+            options.index("tcp_keepalives_idle"),
+        )
+
+    def test_lease_guard_keeps_statement_timeout_and_gains_session_guards(self) -> None:
+        connect_calls: list[dict[str, Any]] = []
+
+        class FakeGuardConnection:
+            closed = False
+
+            def close(self) -> None:
+                pass
+
+        def fake_connect(conninfo: str, **kwargs: Any) -> FakeGuardConnection:
+            connect_calls.append(kwargs)
+            return FakeGuardConnection()
+
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.connect = fake_connect  # type: ignore[attr-defined]
+        fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+            conninfo_to_dict=lambda conninfo: {"dbname": "qbit"}
+        )
+
+        with unittest.mock.patch.dict(sys.modules, {"psycopg": fake_psycopg}):
+            _NativePostgresLeaseGuard(
+                "postgresql://example.invalid/qbit",
+                1234,
+                session_guards=make_session_guards(),
+            )
+
+        self.assertEqual(len(connect_calls), 1)
+        options = connect_calls[0]["options"]
+        self.assertIn("-c statement_timeout=500", options)
+        self.assertIn("-c idle_in_transaction_session_timeout=15000ms", options)
+        self.assertIn("-c tcp_keepalives_idle=30", options)
+        self.assertIn("-c tcp_keepalives_interval=10", options)
+        self.assertIn("-c tcp_keepalives_count=3", options)
+
+    def test_subprocess_backend_sets_session_guards_without_a_deadline(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        ledger._session_guards = make_session_guards()
+        completed = unittest.mock.Mock(returncode=0, stdout="{}\n", stderr="")
+
+        with unittest.mock.patch.dict(
+            "os.environ",
+            {"PGOPTIONS": "-c geqo=off"},
+        ), unittest.mock.patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ) as run:
+            self.assertIsNone(ledger._remaining_operation_timeout())
+            self.assertEqual(ledger._run_sql("SELECT '{}'::json;"), "{}\n")
+
+        kwargs = run.call_args.kwargs
+        pgoptions = kwargs["env"]["PGOPTIONS"]
+        self.assertIn("-c idle_in_transaction_session_timeout=15000ms", pgoptions)
+        self.assertIn("-c tcp_keepalives_idle=30", pgoptions)
+        self.assertIn("-c tcp_keepalives_interval=10", pgoptions)
+        self.assertIn("-c tcp_keepalives_count=3", pgoptions)
+        # Operator-supplied PGOPTIONS survive, ahead of the guard fragment.
+        self.assertTrue(pgoptions.startswith("-c geqo=off"))
+        # No armed deadline: no per-statement bounds, no subprocess timeout.
+        self.assertNotIn("statement_timeout", pgoptions)
+        self.assertNotIn("lock_timeout", pgoptions)
+        self.assertNotIn("timeout", kwargs)
+
+
+class BoundedLeaseAcquisitionTests(unittest.TestCase):
+    class DeadlineRecordingLeaseLedger(FakeLeasePsqlShareLedger):
+        def __init__(self, lease_results: list[dict[str, object]], **kwargs: Any):
+            self.recorded_deadlines: list[float | None] = []
+            super().__init__(lease_results, **kwargs)
+
+        def _run_json(self, sql: str) -> Any:
+            self.recorded_deadlines.append(self._remaining_operation_timeout())
+            return super()._run_json(sql)
+
+    def test_startup_lease_upsert_runs_under_bounded_deadline(self) -> None:
+        ledger = self.DeadlineRecordingLeaseLedger(
+            [acquired_lease()],
+            writer_id="writer-a",
+            writer_epoch=1,
+        )
+
+        self.assertEqual(len(ledger.recorded_deadlines), 1)
+        # None here is precisely the issue #123 defect: the startup upsert
+        # queueing on the lease row lock with no deadline at all.
+        self.assertIsNotNone(ledger.recorded_deadlines[0])
+        # DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS bounds the statement.
+        self.assertGreater(ledger.recorded_deadlines[0], 0.0)
+        self.assertLessEqual(ledger.recorded_deadlines[0], 5.0)
+
+        configured = self.DeadlineRecordingLeaseLedger(
+            [acquired_lease()],
+            writer_id="writer-a",
+            writer_epoch=1,
+            lease_acquire_lock_timeout_seconds=2.5,
+        )
+        self.assertLessEqual(configured.recorded_deadlines[0], 2.5)
+
+    def test_lock_blocked_acquisition_fails_visibly_after_bounded_retries(self) -> None:
+        attempts: list[str] = []
+        sleeps: list[float] = []
+
+        class LockedLeaseLedger(PsqlShareLedger):
+            def _run_json(self, sql: str) -> Any:
+                attempts.append(sql)
+                raise LedgerOperationTimeout(
+                    "canceling statement due to lock timeout"
+                )
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "writer lease row is locked by an unfinished transaction",
+            ):
+                LockedLeaseLedger(
+                    psql_command="psql postgresql://example.invalid/qbit",
+                    native_client_mode="0",
+                    lease_retry_sleep=sleeps.append,
+                )
+
+        # Exactly DEFAULT_LEASE_ACQUIRE_ATTEMPTS bounded attempts, with a
+        # retry sleep between consecutive attempts, then a visible failure —
+        # never LedgerOperationTimeout leaking out, never an unbounded wait.
+        self.assertEqual(len(attempts), 5)
+        self.assertEqual(len(sleeps), 4)
+        self.assertIn("lock-blocked", stdout.getvalue())
+        self.assertIn("attempt 5/5", stdout.getvalue())
+
+    def test_acquisition_recovers_once_the_orphaned_lock_is_reaped(self) -> None:
+        outcomes: list[Any] = [
+            LedgerOperationTimeout("canceling statement due to lock timeout"),
+            LedgerOperationTimeout("canceling statement due to lock timeout"),
+            acquired_lease(),
+        ]
+
+        class EventuallyReapedLeaseLedger(PsqlShareLedger):
+            def _run_json(self, sql: str) -> Any:
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            ledger = EventuallyReapedLeaseLedger(
+                psql_command="psql postgresql://example.invalid/qbit",
+                native_client_mode="0",
+                lease_retry_sleep=lambda _seconds: None,
+            )
+
+        # The retry budget outlasting idle_in_transaction_session_timeout is
+        # what makes the ordinary orphaned-lock case self-heal: the server
+        # reaps the orphan mid-budget and a later attempt lands the lease.
+        self.assertEqual(outcomes, [])
+        self.assertIn("attempt 2/5", stdout.getvalue())
+        ledger.close()
+
+    def test_init_rejects_disarmed_session_guard_and_lease_bounds(self) -> None:
+        cases = (
+            {"lease_acquire_lock_timeout_seconds": 0},
+            {"lease_acquire_lock_timeout_seconds": -1},
+            {"lease_acquire_attempts": 0},
+            {"postgres_idle_in_transaction_timeout_seconds": 0},
+            {"postgres_tcp_keepalives_idle_seconds": 0},
+            {"postgres_tcp_keepalives_interval_seconds": -1},
+            {"postgres_tcp_keepalives_count": 0},
+        )
+        for overrides in cases:
+            with self.subTest(**overrides), self.assertRaises(ValueError):
+                FakeLeasePsqlShareLedger([acquired_lease()], **overrides)
 
 
 class AcceptedStatsCacheTests(unittest.TestCase):

@@ -86,6 +86,41 @@ path through `qbit_prism_shutdowns_total`,
 `qbit_prism_shutdown_non_writer_drain_seconds`, and
 `qbit_prism_shutdown_release_withheld_total`.
 
+### Orphaned Locks and Bounded Startup Acquisition
+
+A coordinator that vanishes without closing its sockets — network partition,
+`SIGSTOP`, VM pause — can leave a Postgres backend idle in transaction, still
+holding the `qbit_ledger_writer_lease` row lock its landing CTE took. Without
+countermeasures the successor's startup lease upsert queues behind that lock,
+inside ledger construction and before the watchdog arms, until kernel TCP
+keepalive teardown (hours at OS defaults): a full-pool availability outage.
+Settlement correctness is unaffected — the outbox row stays pending and
+replays — only availability is at stake.
+
+Two independent layers bound this. First, every Postgres session the
+coordinator opens (the pooled native client, the dedicated lease-guard
+session, and the psql subprocess backend) carries session guards:
+`idle_in_transaction_session_timeout`
+(`PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`, default 15) makes the
+server abort an orphaned transaction and release its locks, and the
+server-side keepalive GUCs (`PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS`,
+`PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS`,
+`PRISM_POSTGRES_TCP_KEEPALIVES_COUNT`, defaults 30/10/3) tear down the
+server's socket toward a vanished client within 30 + 3x10 = 60 seconds as the
+backstop where the idle-in-transaction timer does not apply.
+
+Second, the startup lease upsert and adoption CAS each run under a bounded
+lock deadline (`PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS`, default 5)
+with a bounded retry (`PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS`, default 5). Each
+timed-out attempt is logged with the attempt number. The retry budget (5x5s =
+25s) deliberately outlasts the idle-in-transaction timeout, so an orphaned
+lock is normally reaped mid-budget and startup self-heals without operator
+action; a lock still held after every attempt fails construction with a
+`RuntimeError` naming the locked lease row, exiting the process visibly for
+the supervisor to restart. Waiting for a *live* holder's lease TTL to expire
+is unchanged — that outer wait is intended failover behaviour; only the
+per-statement lock wait is bounded.
+
 ## Block Candidate Outbox
 
 A block-worthy share transaction also inserts an immutable intent into
