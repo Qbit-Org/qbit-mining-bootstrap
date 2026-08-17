@@ -651,6 +651,8 @@ class SessionRuntime(Protocol):
 
     def handle_suggest_difficulty(self, *args: Any, **kwargs: Any) -> Any: ...
 
+    def record_session_difficulty(self, *args: Any, **kwargs: Any) -> Any: ...
+
     def refresh_jobs_after_pending_accepted_block(
         self, *args: Any, **kwargs: Any
     ) -> Any: ...
@@ -658,6 +660,8 @@ class SessionRuntime(Protocol):
     def request_initial_job_delivery(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def reserve_client_username(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def resume_client_difficulty(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def send_error(self, *args: Any, **kwargs: Any) -> Any: ...
 
@@ -1159,6 +1163,25 @@ class StratumSessionService:
                 return
             runtime._cancel_pending_initial_job_locked(client, count=True)
 
+        # Retirement was just claimed, so this runs once per connection and
+        # outside the coordinator lock: retain the session's converged
+        # difficulty for a reconnect resume. Reached through the runtime seam
+        # so monkeypatched coordinators keep intercepting; a retention
+        # failure must never break disconnect cleanup.
+        record_session_difficulty = getattr(
+            runtime, "record_session_difficulty", None
+        )
+        if record_session_difficulty is not None:
+            try:
+                record_session_difficulty(client)
+            except Exception:
+                print(
+                    "prism coordinator: session difficulty retention failed "
+                    f"address={client.address}",
+                    flush=True,
+                )
+                traceback.print_exc()
+
         # Do not take send_lock here: shutdown must interrupt an in-flight
         # sendall as well as the handler's blocking reader.
         try:
@@ -1265,6 +1288,15 @@ class StratumSessionService:
                 # re-authorize without d=/md= clears any prior override (a stored
                 # suggest_difficulty still applies via the request resolution).
                 with runtime._client_vardiff_lock(client):
+                    # Only the FIRST authorize of a connection may resume the
+                    # worker's retained difficulty (a live session already
+                    # holds a converged value), and it must land before the
+                    # password options: an explicit d= computes its target
+                    # from requested_difficulty and outranks the resume,
+                    # while an md=-only password clamps the just-resumed
+                    # value through the share_difficulty fallback.
+                    if not was_authorized:
+                        runtime.resume_client_difficulty(client)
                     client.requested_difficulty, client.requested_min_difficulty = (
                         parse_stratum_password_options(password)
                     )

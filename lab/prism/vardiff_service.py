@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
@@ -11,7 +12,12 @@ import traceback
 from typing import Any, Callable, Protocol
 
 from lab.auxpow import vardiff
-from lab.prism.coordinator_config import StratumListenerProfile
+from lab.prism.coordinator_config import (
+    DEFAULT_PRISM_VARDIFF_RESUME_MAX_ENTRIES,
+    DEFAULT_PRISM_VARDIFF_RESUME_MAX_START_FACTOR,
+    DEFAULT_PRISM_VARDIFF_RESUME_TTL_SECONDS,
+    StratumListenerProfile,
+)
 from lab.prism.job_bundle import CachedJobBundle, JobBuildSuperseded
 from lab.prism.job_delivery import PrismJobContext
 from lab.prism.stratum_session import (
@@ -46,6 +52,144 @@ PRISM_VARDIFF_IDLE_SKIP_REASONS = (
     "queue_full",
     "superseded",
 )
+# Bounded outcomes for one reconnect difficulty resume attempt; also the
+# metric label order for qbit_prism_vardiff_resume_total.
+PRISM_VARDIFF_RESUME_OUTCOMES = (
+    "resumed",    # retained value adopted unchanged
+    "clamped",    # retained value adopted after being pulled into bounds
+    "expired",    # entry existed, TTL had passed
+    "miss",       # no entry for this key
+    "rejected",   # entry present but unusable (non-finite / non-positive)
+    "disabled",   # retention off, or vardiff disabled for this client
+)
+
+
+@dataclass(frozen=True)
+class RetainedSessionDifficulty:
+    difficulty: Decimal
+    recorded_monotonic: float
+
+
+def session_difficulty_key(client: ClientState) -> tuple[str, str] | None:
+    """The retention identity for one session: (listener name, exact username).
+
+    Scoping by lane keeps the two lanes' resume policies independent: a
+    reconnect to the same port (the reconnect-storm case) always hits, while
+    a lane switch is simply a miss that behaves exactly like today. ``None``
+    means the connection has no reserved worker yet, so nothing is retained.
+    """
+    worker = getattr(client, "worker", None)
+    if worker is None:
+        return None
+    return (str(getattr(client, "listener_name", "default")), worker.username)
+
+
+class SessionDifficultyStore:
+    """Bounded, TTL'd, in-process map of last-converged share difficulty.
+
+    Keyed by :func:`session_difficulty_key`. The internal lock is a leaf
+    lock: nothing here calls back into the coordinator or client locks while
+    holding it. Retention is disabled entirely (``record`` never stores,
+    ``lookup`` always answers ``(None, "disabled")``) when ``max_entries`` or
+    ``ttl_seconds`` is non-positive.
+    """
+
+    def __init__(self, *, max_entries: int, ttl_seconds: float) -> None:
+        self.max_entries = int(max_entries)
+        self.ttl_seconds = float(ttl_seconds)
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[tuple[str, str], RetainedSessionDifficulty] = (
+            OrderedDict()
+        )
+        self.record_count = 0
+        self.hit_count = 0
+        self.expired_count = 0
+        self.miss_count = 0
+        self.evicted_count = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_entries > 0 and self.ttl_seconds > 0
+
+    def record(
+        self,
+        key: tuple[str, str],
+        difficulty: Decimal,
+        *,
+        now: float,
+    ) -> None:
+        if not self.enabled:
+            return
+        if (
+            not isinstance(difficulty, Decimal)
+            or not difficulty.is_finite()
+            or difficulty <= 0
+        ):
+            return
+        with self._lock:
+            self._entries[key] = RetainedSessionDifficulty(
+                difficulty=difficulty,
+                recorded_monotonic=float(now),
+            )
+            self._entries.move_to_end(key)
+            self.record_count += 1
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+                self.evicted_count += 1
+
+    def lookup(
+        self,
+        key: tuple[str, str],
+        *,
+        now: float,
+    ) -> tuple[Decimal | None, str]:
+        if not self.enabled:
+            return None, "disabled"
+        with self._lock:
+            retained = self._entries.get(key)
+            if retained is None:
+                self.miss_count += 1
+                return None, "miss"
+            if now - retained.recorded_monotonic > self.ttl_seconds:
+                self._entries.pop(key, None)
+                self.expired_count += 1
+                return None, "expired"
+            # A hit refreshes LRU recency only. The TTL measures the age of
+            # the retained value, not of the last access, so
+            # recorded_monotonic stays untouched; and the entry survives the
+            # hit because a miner may re-authorize.
+            self._entries.move_to_end(key)
+            self.hit_count += 1
+            return retained.difficulty, "hit"
+
+    def prune(self, *, now: float) -> int:
+        if not self.enabled:
+            return 0
+        with self._lock:
+            expired_keys = [
+                key
+                for key, retained in self._entries.items()
+                if now - retained.recorded_monotonic > self.ttl_seconds
+            ]
+            for key in expired_keys:
+                del self._entries[key]
+            self.expired_count += len(expired_keys)
+            return len(expired_keys)
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "entries": len(self._entries),
+                "records": self.record_count,
+                "hits": self.hit_count,
+                "expired": self.expired_count,
+                "misses": self.miss_count,
+                "evicted": self.evicted_count,
+            }
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
 
 
 @dataclass(frozen=True)
@@ -76,6 +220,10 @@ class VardiffRuntime(Protocol):
     vardiff_config: vardiff.VardiffConfig
     share_difficulty: Decimal
     vardiff_idle_sweep_seconds: float
+    vardiff_resume_enabled: bool
+    vardiff_resume_ttl_seconds: float
+    vardiff_resume_max_entries: int
+    vardiff_resume_max_start_factor: Decimal
 
     def client_can_receive_jobs(self, client: ClientState) -> bool: ...
 
@@ -189,6 +337,40 @@ class VardiffService:
         self.vardiff_idle_task_failures = 0
         self.vardiff_idle_sweep_histogram = _new_histogram()
         self.vardiff_idle_task_histogram = _new_histogram()
+        # Reconnect difficulty retention. Sized once from the runtime's
+        # loaded configuration (getattr keeps lightweight embedder runtimes
+        # working); vardiff_resume_enabled=False behaves exactly as
+        # max_entries=0, so the store never records and always answers
+        # "disabled".
+        resume_enabled = bool(getattr(runtime, "vardiff_resume_enabled", True))
+        self.session_difficulty_store = SessionDifficultyStore(
+            max_entries=(
+                int(
+                    getattr(
+                        runtime,
+                        "vardiff_resume_max_entries",
+                        DEFAULT_PRISM_VARDIFF_RESUME_MAX_ENTRIES,
+                    )
+                )
+                if resume_enabled
+                else 0
+            ),
+            ttl_seconds=float(
+                getattr(
+                    runtime,
+                    "vardiff_resume_ttl_seconds",
+                    DEFAULT_PRISM_VARDIFF_RESUME_TTL_SECONDS,
+                )
+            ),
+        )
+        # Leaf lock for the convergence counters below (resume outcomes and
+        # per-lane accepted shares); never call out of this module while
+        # holding it, and never take it under the store's lock.
+        self._vardiff_convergence_lock = threading.Lock()
+        self.vardiff_resume_outcome_counts = {
+            outcome: 0 for outcome in PRISM_VARDIFF_RESUME_OUTCOMES
+        }
+        self.vardiff_lane_accepted_counts: dict[str, int] = {}
 
     def client_config(self, client: ClientState) -> vardiff.VardiffConfig:
         """The difficulty policy for one client: its per-client specialization
@@ -264,6 +446,13 @@ class VardiffService:
 
     def note_accepted(self, client: ClientState, share_difficulty: Decimal) -> None:
         now = time.monotonic()
+        # Lane share-rate accounting must stay observable even where vardiff
+        # is off, so count before the enabled early-out below.
+        lane = str(getattr(client, "listener_name", "default"))
+        with self._vardiff_convergence_lock:
+            self.vardiff_lane_accepted_counts[lane] = (
+                self.vardiff_lane_accepted_counts.get(lane, 0) + 1
+            )
         with client_vardiff_lock(client):
             config = (
                 client.vardiff_config
@@ -297,6 +486,138 @@ class VardiffService:
             accepted_difficulty=accepted_difficulty,
             elapsed_seconds=elapsed_seconds,
         )
+
+    def _count_resume_outcome(self, outcome: str) -> None:
+        if outcome not in PRISM_VARDIFF_RESUME_OUTCOMES:
+            raise ValueError(f"unknown vardiff resume outcome: {outcome}")
+        with self._vardiff_convergence_lock:
+            self.vardiff_resume_outcome_counts[outcome] += 1
+
+    def record_session_difficulty(
+        self,
+        client: ClientState,
+        difficulty: Decimal | None = None,
+    ) -> None:
+        """Retain a session's converged difficulty for reconnect resume.
+
+        Callers pass the just-committed retarget difficulty explicitly; the
+        disconnect seam omits it and the client's current effective value is
+        read under its vardiff lock instead.
+        """
+        key = session_difficulty_key(client)
+        if key is None:
+            return
+        if difficulty is None:
+            with client_vardiff_lock(client):
+                difficulty = (
+                    client.pending_share_difficulty or client.share_difficulty
+                )
+        self.session_difficulty_store.record(
+            key,
+            difficulty,
+            now=time.monotonic(),
+        )
+
+    def resume_client_difficulty(self, client: ClientState) -> Decimal | None:
+        """The difficulty a reconnecting worker should resume at, or None.
+
+        A retained value is only adopted inside the lane's plausibility
+        bounds: the ceiling is min(lane max, lane start * resume factor), so
+        a stale or absurd entry can never be adopted as-is. A retained value
+        BELOW the lane start is adopted unchanged on purpose -- vardiff
+        targets a share rate, so a session at its converged difficulty is on
+        target by definition, and cold-starting it higher would give the pool
+        fewer shares, not more.
+        """
+        with client_vardiff_lock(client):
+            config = (
+                client.vardiff_config
+                or client.listener_vardiff_config
+                or self.runtime.vardiff_config
+            )
+        if not config.enabled:
+            self._count_resume_outcome("disabled")
+            return None
+        key = session_difficulty_key(client)
+        if key is None:
+            return None
+        retained, outcome = self.session_difficulty_store.lookup(
+            key,
+            now=time.monotonic(),
+        )
+        if retained is None:
+            self._count_resume_outcome(outcome)
+            return None
+        if not retained.is_finite() or retained <= 0:
+            self._count_resume_outcome("rejected")
+            return None
+        factor = getattr(
+            self.runtime,
+            "vardiff_resume_max_start_factor",
+            DEFAULT_PRISM_VARDIFF_RESUME_MAX_START_FACTOR,
+        )
+        ceiling = min(config.max_difficulty, config.startup_difficulty * factor)
+        floor = config.min_difficulty
+        resumed = vardiff.clamp(retained, floor, max(floor, ceiling))
+        self._count_resume_outcome(
+            "resumed" if resumed == retained else "clamped"
+        )
+        return resumed
+
+    def apply_resumed_difficulty(self, client: ClientState) -> Decimal | None:
+        """Adopt the retained difficulty onto a freshly authorizing client."""
+        with client_vardiff_lock(client):
+            resumed = self.resume_client_difficulty(client)
+            if resumed is None:
+                return None
+            current = client.pending_share_difficulty or client.share_difficulty
+            if resumed != current:
+                client.share_difficulty = resumed
+                client.pending_share_difficulty = None
+                client.difficulty_generation = int(
+                    getattr(client, "difficulty_generation", 0)
+                ) + 1
+            return resumed
+
+    def convergence_snapshot(self) -> dict[str, object]:
+        """Copied convergence/retention counters plus the at-ceiling census.
+
+        Lock order in this codebase is client vardiff lock -> coordinator
+        lock, never the reverse; membership is therefore snapshotted under
+        the coordinator lock alone, released, and only then is each client's
+        vardiff lock taken to read its effective policy and difficulty.
+        """
+        with self.runtime.lock:
+            clients = tuple(self.runtime.clients)
+        sessions_at_max = 0
+        for client in clients:
+            with client_vardiff_lock(client):
+                config = (
+                    client.vardiff_config
+                    or client.listener_vardiff_config
+                    or self.runtime.vardiff_config
+                )
+                if not config.enabled:
+                    continue
+                current = (
+                    client.pending_share_difficulty or client.share_difficulty
+                )
+                if current >= config.max_difficulty:
+                    sessions_at_max += 1
+        with self._vardiff_convergence_lock:
+            lane_accepted = dict(self.vardiff_lane_accepted_counts)
+            resume_outcomes = dict(self.vardiff_resume_outcome_counts)
+        # Prune first so the retained-sessions gauge counts only entries a
+        # reconnect could still adopt.
+        self.session_difficulty_store.prune(now=time.monotonic())
+        store = self.session_difficulty_store.snapshot()
+        return {
+            "sessions_at_max_difficulty": sessions_at_max,
+            "lane_accepted_shares": lane_accepted,
+            "resume_outcomes": resume_outcomes,
+            "retained_sessions": int(store["entries"]),
+            "store": store,
+        }
 
     def record_idle_skip(self, reason: str) -> None:
         if reason not in PRISM_VARDIFF_IDLE_SKIP_REASONS:
@@ -911,6 +1232,10 @@ class VardiffService:
             # immediately afterward, but it cannot make already-delivered work
             # speculative again.
             if sent:
+                # Retain the committed difficulty here, not only on
+                # disconnect, so sessions that die without a clean
+                # disconnect still resume at their converged value.
+                self.record_session_difficulty(client, next_difficulty)
                 return True
         except Exception:
             # Cached stamping can surface _JobBuildFailed before delivery, and

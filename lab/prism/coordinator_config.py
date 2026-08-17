@@ -140,6 +140,17 @@ DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS = 60.0
 DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS = 0.25
 DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
+# Reconnect difficulty retention: a reconnecting worker (same listener +
+# exact username) resumes at its last converged difficulty instead of the
+# lane start, so a mass reconnect does not re-flood the share path while
+# every session re-climbs. The TTL bounds how stale a resumed value may be,
+# the entry cap bounds retained state (2x the deployed 4096 connection cap),
+# and the start factor caps a resume at a multiple of the lane's own start
+# difficulty (1024 = five 4x retarget steps, the climb reconnects previously
+# repeated).
+DEFAULT_PRISM_VARDIFF_RESUME_TTL_SECONDS = 900.0
+DEFAULT_PRISM_VARDIFF_RESUME_MAX_ENTRIES = 8192
+DEFAULT_PRISM_VARDIFF_RESUME_MAX_START_FACTOR = Decimal("1024")
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 DEFAULT_SHARE_COMMIT_BATCH_SIZE = 64
 DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS = 5.0
@@ -859,6 +870,14 @@ class StratumConfig:
     disconnected_job_retention: int
     payout_address_cache_max_entries: int
     payout_address_cache_ttl_seconds: float
+    # Reconnect difficulty retention knobs, appended with defaults so existing
+    # positional constructions keep working.
+    vardiff_resume_enabled: bool = True
+    vardiff_resume_ttl_seconds: float = DEFAULT_PRISM_VARDIFF_RESUME_TTL_SECONDS
+    vardiff_resume_max_entries: int = DEFAULT_PRISM_VARDIFF_RESUME_MAX_ENTRIES
+    vardiff_resume_max_start_factor: Decimal = (
+        DEFAULT_PRISM_VARDIFF_RESUME_MAX_START_FACTOR
+    )
 
 
 @dataclass(frozen=True)
@@ -1142,6 +1161,16 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    vardiff_resume_max_start_factor = env_decimal(
+        "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR",
+        str(DEFAULT_PRISM_VARDIFF_RESUME_MAX_START_FACTOR),
+        environ=source,
+    )
+    if vardiff_resume_max_start_factor < 1:
+        raise SystemExit(
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR must be at least 1"
+        )
+
     stratum = StratumConfig(
         bind=bind,
         port=port,
@@ -1211,6 +1240,20 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
             DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS,
             environ=source,
         ),
+        vardiff_resume_enabled=env_bool(
+            "PRISM_STRATUM_VARDIFF_RESUME", "1", environ=source
+        ),
+        vardiff_resume_ttl_seconds=env_nonnegative_float(
+            "PRISM_STRATUM_VARDIFF_RESUME_TTL_SECONDS",
+            DEFAULT_PRISM_VARDIFF_RESUME_TTL_SECONDS,
+            environ=source,
+        ),
+        vardiff_resume_max_entries=env_nonnegative_int(
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_ENTRIES",
+            DEFAULT_PRISM_VARDIFF_RESUME_MAX_ENTRIES,
+            environ=source,
+        ),
+        vardiff_resume_max_start_factor=vardiff_resume_max_start_factor,
     )
 
     jobs = JobPipelineConfig(
