@@ -25,9 +25,14 @@ from lab.prism.ctv_broadcaster_daemon import (
     MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE,
     artifact_from_status_row,
 )
-from lab.prism.run_ctv_broadcaster_daemon import env_positive_int, make_daemon_from_env
+from lab.prism.backfill_ctv_fanouts import build_parser, ledger_from_args
+from lab.prism.run_ctv_broadcaster_daemon import (
+    env_positive_int,
+    make_daemon_from_env,
+    make_ledger_from_env,
+)
 from lab.prism.prism_coordinator import JsonRpc
-from lab.prism.share_ledger import SingleWriterShareLedger
+from lab.prism.share_ledger import PsqlShareLedger, SingleWriterShareLedger
 
 
 def pending_row(fanout_txid: str = "aa" * 32) -> dict[str, object]:
@@ -807,6 +812,62 @@ class CtvFanoutBroadcastDaemonTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(SystemExit, "PRISM_CTV_BROADCASTER_WALLET"):
                 make_daemon_from_env()
+
+    # The lease/session-guard env vars below tune caller-side lease
+    # acquisition and the server-side session guards (#137). These two
+    # operator-run scripts construct PsqlShareLedger directly, so the tests
+    # pin that operator tuning actually reaches the constructed ledger
+    # instead of silently falling back to the class defaults. Construction
+    # is kept offline by stubbing the two lease I/O steps at the end of
+    # PsqlShareLedger.__init__; everything asserted is set before them.
+
+    LEASE_KNOB_ENV = {
+        "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS": "2.5",
+        "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS": "7",
+        "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS": "33.5",
+        "PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS": "17",
+        "PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS": "4",
+        "PRISM_POSTGRES_TCP_KEEPALIVES_COUNT": "9",
+    }
+
+    def assert_lease_knobs_applied(self, ledger: object) -> None:
+        self.assertIsInstance(ledger, PsqlShareLedger)
+        self.assertEqual(ledger._lease_acquire_lock_timeout_seconds, 2.5)
+        self.assertEqual(ledger._lease_acquire_attempts, 7)
+        guards = ledger._session_guards
+        self.assertEqual(guards.idle_in_transaction_timeout_seconds, 33.5)
+        self.assertEqual(guards.tcp_keepalives_idle_seconds, 17)
+        self.assertEqual(guards.tcp_keepalives_interval_seconds, 4)
+        self.assertEqual(guards.tcp_keepalives_count, 9)
+
+    def test_make_ledger_from_env_honours_lease_and_session_guard_env(self) -> None:
+        environ = {
+            "PRISM_POSTGRES_PSQL_COMMAND": "psql postgresql://qbit@127.0.0.1:1/qbit",
+            **self.LEASE_KNOB_ENV,
+        }
+        with patch.dict("os.environ", environ, clear=True), patch.object(
+            PsqlShareLedger, "_initialize_writer_lease_guard", lambda self, database_url: None
+        ), patch.object(PsqlShareLedger, "_ensure_writer_lease", lambda self: None):
+            ledger = make_ledger_from_env()
+            try:
+                self.assert_lease_knobs_applied(ledger)
+            finally:
+                ledger.close()
+
+    def test_backfill_construction_honours_lease_and_session_guard_env(self) -> None:
+        environ = {
+            "PRISM_POSTGRES_PSQL_COMMAND": "psql postgresql://qbit@127.0.0.1:1/qbit",
+            **self.LEASE_KNOB_ENV,
+        }
+        with patch.dict("os.environ", environ, clear=True), patch.object(
+            PsqlShareLedger, "_initialize_writer_lease_guard", lambda self, database_url: None
+        ), patch.object(PsqlShareLedger, "_ensure_writer_lease", lambda self: None):
+            args = build_parser().parse_args(["--no-init-schema"])
+            ledger = ledger_from_args(args)
+            try:
+                self.assert_lease_knobs_applied(ledger)
+            finally:
+                ledger.close()
 
     def test_json_rpc_wallet_call_uses_wallet_url(self) -> None:
         seen: list[tuple[str, str]] = []

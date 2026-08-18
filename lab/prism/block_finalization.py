@@ -1853,24 +1853,18 @@ class BlockFinalizationService:
             "_require_fresh_ledger_lease_for_external_side_effect",
             None,
         )
-        if callable(require_fresh_lease):
-            try:
-                require_fresh_lease(lease_fence_component)
-            except (ShutdownInProgress, WriterLeaseRenewalDeferred) as exc:
-                restore_superseded_envelope = False
-                # Withheld authority silently reverts to the historical lossy
-                # behaviour for a superseded publication, so it must be
-                # visible. Diagnostics go to stderr because worker processes
-                # reserve stdout for a strict JSON-lines protocol.
-                print(
-                    "prism coordinator: withholding superseded-envelope "
-                    f"restore authority component={lease_fence_component} "
-                    f"error={type(exc).__name__}: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+        withheld_restore_authority: Exception | None = None
         with self.runtime._payout_balance_mutation_lock:
             with audit_store.publication_order_guard():
+                # The proof runs with both locks held: the wait on either
+                # lock is unbounded, so a writer deposed while queued must
+                # not restore on authority it proved before the wait.
+                if callable(require_fresh_lease):
+                    try:
+                        require_fresh_lease(lease_fence_component)
+                    except (ShutdownInProgress, WriterLeaseRenewalDeferred) as exc:
+                        restore_superseded_envelope = False
+                        withheld_restore_authority = exc
                 publication_floor_reader = getattr(
                     self.runtime.ledger,
                     "audit_publication_sequence_floor",
@@ -1904,6 +1898,20 @@ class BlockFinalizationService:
                     # replaying stale state never receives restore authority.
                     restore_superseded_envelope=restore_superseded_envelope,
                 )
+        if withheld_restore_authority is not None:
+            # Withheld authority silently reverts to the historical lossy
+            # behaviour for a superseded publication, so it must be
+            # visible. Diagnostics go to stderr because worker processes
+            # reserve stdout for a strict JSON-lines protocol, and are
+            # emitted only after the store locks are released (see below).
+            print(
+                "prism coordinator: withholding superseded-envelope "
+                f"restore authority component={lease_fence_component} "
+                f"error={type(withheld_restore_authority).__name__}: "
+                f"{withheld_restore_authority}",
+                file=sys.stderr,
+                flush=True,
+            )
         if publication.superseded_envelope_written:
             # Emitted only after the balance lock and the publication order
             # guard have been released: an undrained stderr must never block

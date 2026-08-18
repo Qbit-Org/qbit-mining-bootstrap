@@ -6463,6 +6463,7 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         self,
         *,
         lease_error: BaseException | None = None,
+        lease_error_only_inside_publication_guard: bool = False,
     ) -> SimpleNamespace:
         """Interleave two distinct-hash landings across the production tails.
 
@@ -6473,7 +6474,11 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         inside that gap and publishes first, so A reaches publication already
         superseded on the publication ordinal. ``lease_error`` is raised from
         the coordinator's fresh-lease fence when provided, modelling a writer
-        whose lease authority cannot be proven inside the gap.
+        whose lease authority cannot be proven inside the gap. With
+        ``lease_error_only_inside_publication_guard`` the restore-authority
+        proof succeeds anywhere outside the store's publication order guard
+        and fails inside it, modelling a writer deposed while queued on the
+        publication locks.
         """
         old_tip = "00" * 32
         hash_a = "a1" * 32
@@ -6495,9 +6500,15 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         server.refresh_jobs_after_pending_accepted_block = (  # type: ignore[method-assign]
             lambda *_args, **_kwargs: 0
         )
+        publication_guard_holders: set[int] = set()
         if lease_error is not None:
 
             def failing_lease_fence(component: str) -> None:
+                if lease_error_only_inside_publication_guard:
+                    if component != "superseded_audit_envelope_restore":
+                        return
+                    if threading.get_ident() not in publication_guard_holders:
+                        return
                 raise lease_error
 
             server._require_fresh_ledger_lease_for_external_side_effect = (  # type: ignore[method-assign]
@@ -6626,6 +6637,23 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             server.audit_dir = Path(tempdir)
             server.evidence_path = Path(tempdir) / "evidence.json"
             audit_store = server._ensure_audit_artifact_store()
+            if lease_error_only_inside_publication_guard:
+                real_publication_order_guard = audit_store.publication_order_guard
+
+                @contextlib.contextmanager
+                def tracking_publication_order_guard():
+                    with real_publication_order_guard():
+                        publication_guard_holders.add(threading.get_ident())
+                        try:
+                            yield
+                        finally:
+                            publication_guard_holders.discard(
+                                threading.get_ident()
+                            )
+
+                audit_store.publication_order_guard = (  # type: ignore[method-assign]
+                    tracking_publication_order_guard
+                )
             envelope_a = audit_store.live_envelope_path(
                 block_height=10,
                 block_hash=hash_a,
@@ -6748,6 +6776,29 @@ class PrismStampedJobFloorTests(unittest.TestCase):
             lease_error=WriterLeaseRenewalDeferred(
                 "writer lease renewal is deferred behind an in-flight write"
             ),
+        )
+        self.assertFalse(result.envelope_a_exists)
+
+    def test_restore_authority_is_proven_after_the_publication_locks(
+        self,
+    ) -> None:
+        """Deposal during the publication lock wait withholds the restore.
+
+        The fresh-lease proof once ran before the payout balance lock and
+        the publication order guard were acquired -- a check-then-act across
+        an unbounded wait, so a writer deposed while queued on those locks
+        still restored. This fence models that deposal: the proof succeeds
+        anywhere outside the publication order guard and fails inside it,
+        so the restore is withheld only if authority is evaluated at the
+        moment of action, with the locks held.
+        """
+        from lab.prism.share_ledger import WriterLeaseRenewalDeferred
+
+        result = self._drive_interleaved_distinct_hash_landings(
+            lease_error=WriterLeaseRenewalDeferred(
+                "writer lease was deposed during the publication lock wait"
+            ),
+            lease_error_only_inside_publication_guard=True,
         )
         self.assertFalse(result.envelope_a_exists)
 

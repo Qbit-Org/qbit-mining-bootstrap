@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import subprocess
 import sys
 import tempfile
@@ -128,6 +130,57 @@ class CoordinatorConfigLoadingTests(unittest.TestCase):
                 "PRISM_METRICS_REFRESH_SECONDS must be positive",
             ):
                 load_coordinator_config(source)
+
+    def test_watchdog_timeout_floor_rejects_sub_second_tolerances(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = minimal_environment(Path(temp_dir))
+            for raw in ("0.0005", "0.5", "0.999"):
+                with self.subTest(raw=raw):
+                    with self.assertRaisesRegex(
+                        SystemExit,
+                        "PRISM_WATCHDOG_TIMEOUT_SECONDS must be at least 1",
+                    ):
+                        load_coordinator_config(
+                            {**base, "PRISM_WATCHDOG_TIMEOUT_SECONDS": raw}
+                        )
+            for raw, expected in (("1.0", 1.0), ("120", 120.0)):
+                with self.subTest(raw=raw):
+                    config = load_coordinator_config(
+                        {**base, "PRISM_WATCHDOG_TIMEOUT_SECONDS": raw}
+                    )
+                    self.assertEqual(
+                        config.lifecycle.watchdog_timeout_seconds, expected
+                    )
+
+    def test_idle_in_transaction_reap_outside_lease_budget_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = minimal_environment(Path(temp_dir))
+            inverted = {
+                **base,
+                "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS": "2",
+                "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS": "3",
+                "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS": "10",
+            }
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                load_coordinator_config(inverted)
+            warning = stderr.getvalue()
+            self.assertIn("prism coordinator: ", warning)
+            self.assertIn(
+                "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS (10s)",
+                warning,
+            )
+            self.assertIn(
+                "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS (2s)",
+                warning,
+            )
+            self.assertIn("PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS (3)", warning)
+            self.assertIn("lower the idle-in-transaction timeout", warning)
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                load_coordinator_config(base)
+            self.assertEqual(stderr.getvalue(), "")
 
     def test_zero_argument_coordinator_still_loads_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

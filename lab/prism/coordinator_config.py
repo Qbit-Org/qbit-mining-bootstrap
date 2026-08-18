@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import shlex
+import sys
 from os import environ as _PROCESS_ENVIRON
 from dataclasses import dataclass, replace as dataclass_replace
 from decimal import Decimal, InvalidOperation
@@ -1476,6 +1477,42 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
             "PRISM_LEDGER_WRITER_SESSION_TOKEN requires "
             "PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN=1 for local tests"
         )
+    lease_acquire_lock_timeout_seconds = env_positive_float(
+        "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS",
+        DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+        environ=source,
+    )
+    lease_acquire_attempts = env_positive_int(
+        "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS",
+        DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+        environ=source,
+    )
+    postgres_idle_in_transaction_timeout_seconds = env_positive_float(
+        "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS",
+        DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+        environ=source,
+    )
+    lease_acquire_budget_seconds = (
+        lease_acquire_attempts * lease_acquire_lock_timeout_seconds
+    )
+    if postgres_idle_in_transaction_timeout_seconds > lease_acquire_budget_seconds:
+        print(
+            "prism coordinator: "
+            "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS "
+            f"({postgres_idle_in_transaction_timeout_seconds:g}s) exceeds the "
+            "writer-lease acquire budget "
+            f"PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS ({lease_acquire_attempts}) x "
+            "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS "
+            f"({lease_acquire_lock_timeout_seconds:g}s) = "
+            f"{lease_acquire_budget_seconds:g}s: an orphaned "
+            "idle-in-transaction backend holding the lease row lock is not "
+            "reaped mid-budget, so startup exhausts every acquire attempt at "
+            "the same locked row instead of self-healing; raise the acquire "
+            "lock deadline or attempts, or lower the idle-in-transaction "
+            "timeout",
+            file=sys.stderr,
+            flush=True,
+        )
     ledger = LedgerConfig(
         psql_command=psql_command,
         database_url=database_url or None,
@@ -1489,20 +1526,10 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         lease_ttl_seconds=env_positive_float(
             "PRISM_LEDGER_LEASE_TTL_SECONDS", 60.0, environ=source
         ),
-        lease_acquire_lock_timeout_seconds=env_positive_float(
-            "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS",
-            DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
-            environ=source,
-        ),
-        lease_acquire_attempts=env_positive_int(
-            "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS",
-            DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
-            environ=source,
-        ),
-        postgres_idle_in_transaction_timeout_seconds=env_positive_float(
-            "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS",
-            DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
-            environ=source,
+        lease_acquire_lock_timeout_seconds=lease_acquire_lock_timeout_seconds,
+        lease_acquire_attempts=lease_acquire_attempts,
+        postgres_idle_in_transaction_timeout_seconds=(
+            postgres_idle_in_transaction_timeout_seconds
         ),
         postgres_tcp_keepalives_idle_seconds=env_positive_int(
             "PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS",
@@ -1623,6 +1650,18 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         ),
     )
 
+    watchdog_timeout_seconds = env_positive_float(
+        "PRISM_WATCHDOG_TIMEOUT_SECONDS",
+        DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
+        environ=source,
+    )
+    if watchdog_timeout_seconds < 1.0:
+        raise SystemExit(
+            "PRISM_WATCHDOG_TIMEOUT_SECONDS must be at least 1 so the "
+            "escalated landing-budget ceiling derived from half of it stays "
+            "below the tolerance"
+        )
+
     lifecycle = LifecycleConfig(
         health_refresh_seconds=env_positive_float(
             "PRISM_HEALTH_REFRESH_SECONDS", DEFAULT_PRISM_HEALTH_REFRESH_SECONDS, environ=source
@@ -1658,11 +1697,7 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
             environ=source,
         ),
         watchdog_enabled=env_bool("PRISM_WATCHDOG_ENABLED", "1", environ=source),
-        watchdog_timeout_seconds=env_positive_float(
-            "PRISM_WATCHDOG_TIMEOUT_SECONDS",
-            DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
-            environ=source,
-        ),
+        watchdog_timeout_seconds=watchdog_timeout_seconds,
         watchdog_interval_seconds=env_positive_float(
             "PRISM_WATCHDOG_INTERVAL_SECONDS", 15.0, environ=source
         ),

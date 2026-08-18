@@ -93,6 +93,12 @@ class SessionDifficultyStore:
     holding it. Retention is disabled entirely (``record`` never stores,
     ``lookup`` always answers ``(None, "disabled")``) when ``max_entries`` or
     ``ttl_seconds`` is non-positive.
+
+    In-memory only: the store does not survive a coordinator restart,
+    including the liveness watchdog's terminal ``exit_process(1)`` in
+    ``background_services.py``. The mass-reconnect wave right after such a
+    restart therefore finds an empty store and every session starts at lane
+    start, unsmoothed by retention.
     """
 
     def __init__(self, *, max_entries: int, ttl_seconds: float) -> None:

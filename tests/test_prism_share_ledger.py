@@ -5009,10 +5009,58 @@ class NativeClientSelectionTests(unittest.TestCase):
             gate.release()
         elapsed = time.monotonic() - started
         self.assertGreaterEqual(len(stamps), 2)
-        for previous, stamp in zip([started] + stamps, stamps):
-            self.assertLess(stamp - previous, 0.3)
+        # No per-gap upper bound: a loaded CI host can stall a 0.05s slice
+        # wakeup well past any tight cutoff, and cadence is already proven
+        # deterministically under a virtual clock elsewhere in this module.
         self.assertGreaterEqual(elapsed, 0.4)
         self.assertLess(elapsed, 3.0)
+
+    def test_operation_gate_slicing_times_out_on_the_virtual_clock(self) -> None:
+        """The sliced admission wait is driven by the injected clock.
+
+        With a virtual clock installed and a gate that consumes each slice
+        without yielding, the deadline must expire exactly when the virtual
+        clock crosses the admission budget — never on wall time — so the
+        slicing loop can be exercised deterministically.
+        """
+        clock = FakeMonotonicClock()
+        started = clock.now
+
+        class SliceConsumingGate:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def acquire(self, timeout: float = -1) -> bool:
+                self.timeouts.append(timeout)
+                if len(self.timeouts) > 50:
+                    raise AssertionError(
+                        "admission wait ignored the virtual-clock deadline"
+                    )
+                clock.sleep(timeout)
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("gate released without being acquired")
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        ledger._monotonic = clock.monotonic
+        gate = SliceConsumingGate()
+        stamps: list[float] = []
+        with ledger.statement_timeout(1.0):
+            with ledger.operation_progress(
+                lambda: stamps.append(clock.now),
+                slice_seconds=0.25,
+            ):
+                with self.assertRaisesRegex(LedgerOperationTimeout, "writer lock"):
+                    ledger._acquire_operation_gate(gate, "writer lock")
+        self.assertEqual(clock.now, started + 1.0)
+        self.assertEqual(gate.timeouts, [0.25, 0.25, 0.25, 0.25])
+        self.assertEqual(
+            stamps,
+            [started + 0.25, started + 0.5, started + 0.75],
+        )
 
     def test_operation_gate_without_progress_hook_waits_once(self) -> None:
         """The unhooked path is still a single blocking acquire.
