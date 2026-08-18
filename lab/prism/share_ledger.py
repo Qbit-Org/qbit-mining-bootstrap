@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import BoundedSemaphore, Lock, Thread, local
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Protocol, runtime_checkable
 
 from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
@@ -1883,6 +1883,60 @@ def _writer_lease_advisory_lock_key(writer_id: str, writer_epoch: int) -> int:
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
+@runtime_checkable
+class LedgerSqlPort(Protocol):
+    """The pooled statement-execution seam `PsqlShareLedger` writes through.
+
+    `_NativePostgresClient` is the production implementation. Naming the
+    contract lets a test substitute a whole PostgreSQL model at construction
+    time (see `sql_backend_factory`) instead of reassigning bound methods on
+    a live ledger, which is what the lease and landing concurrency tests
+    need: statement timing, tuple-lock waits and transaction lifetime are
+    properties of this seam, not of any single method.
+    """
+
+    def run_json(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> Any: ...
+
+    def run_script(self, sql: str) -> None: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class LeaseGuardPort(Protocol):
+    """The dedicated writer-lease guard session seam.
+
+    `_NativePostgresLeaseGuard` is the production implementation. Unlike
+    `LedgerSqlPort` this session is never transparently replaced: losing it
+    loses the advisory lock and must fence the owning coordinator, so the
+    heartbeat's liveness proof depends on the session's identity surviving.
+    A substitute must honour the same contract, including the serialized
+    query slot that `on_query_start` marks and the in-slot `followup`
+    statement the attribution recheck relies on.
+    """
+
+    def try_acquire(self) -> bool: ...
+
+    @property
+    def held(self) -> bool: ...
+
+    def run_json(
+        self,
+        sql: str,
+        *,
+        on_query_start: Callable[[], None] | None = None,
+        followup: Callable[[Any], str | None] | None = None,
+    ) -> Any: ...
+
+    def close(self) -> None: ...
+
+
 @dataclass(frozen=True)
 class PostgresSessionGuards:
     """Session-level GUCs that let the server disown a vanished coordinator.
@@ -2261,6 +2315,14 @@ class PsqlShareLedger:
 
     durable_payout_state = True
 
+    # The lease lifecycle's clock, as a class attribute so an instance built
+    # without __init__ (several tests exercise one statement that way) still
+    # reads a working clock. __init__ overrides it per instance with whatever
+    # was injected. Declaring it here rather than resolving it through getattr
+    # at each call site means a rename fails loudly at the assignment instead
+    # of silently reverting every scenario to wall-clock time.
+    _monotonic: Callable[[], float] = staticmethod(time.monotonic)
+
     @staticmethod
     def _resolve_lease_authority_margin_seconds(
         lease_ttl_seconds: float,
@@ -2318,6 +2380,10 @@ class PsqlShareLedger:
         initialize_schema: bool = False,
         schema_path: Path | None = None,
         lease_retry_sleep: Callable[[float], None] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        pool_application_name: str | None = None,
+        sql_backend_factory: Callable[..., LedgerSqlPort | None] | None = None,
+        lease_guard_factory: Callable[..., LeaseGuardPort | None] | None = None,
         lease_retry_max_sleep_seconds: float = 15.0,
         lease_ttl_seconds: float = 60.0,
         lease_authority_margin_seconds: float | None = None,
@@ -2413,7 +2479,9 @@ class PsqlShareLedger:
         # than a competing expiry claim. Unique per ledger instance: a
         # predecessor or replacement process never shares it, so their
         # in-flight writes still fence this session out.
-        self._pool_application_name = f"qbit-prism-writer-{uuid.uuid4().hex}"
+        self._pool_application_name = (
+            pool_application_name or f"qbit-prism-writer-{uuid.uuid4().hex}"
+        )
         self._lease_ttl_seconds = lease_ttl_seconds
         # SQL fragment for the writer-lease expiry. The lease is refreshed on
         # every append (the dominant liveness signal during active mining), so a
@@ -2430,6 +2498,18 @@ class PsqlShareLedger:
             f"make_interval(secs => {lease_authority_margin_seconds})"
         )
         self._lease_retry_sleep = lease_retry_sleep or time.sleep
+        # The lease lifecycle's only clock. Every interval this process
+        # measures itself — adoption silence from guard acquisition, caller
+        # deadlines, lease refresh age — reads through here, so a test can
+        # supply a virtual clock and drive an interleaving by advancing it
+        # rather than by sleeping and hoping. Production passes None and gets
+        # time.monotonic.
+        # Resolved at construction, not at each call: an instance built the
+        # ordinary way binds whichever clock is in force now, while the class
+        # attribute above still covers instances built without __init__.
+        self._monotonic = monotonic or time.monotonic
+        self._sql_backend_factory = sql_backend_factory
+        self._lease_guard_factory = lease_guard_factory
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
         self._lease_adoption_silence_seconds = lease_adoption_silence_seconds
@@ -2449,6 +2529,15 @@ class PsqlShareLedger:
         )
         self._operation_timeout_local = local()
         self._statement_timeout_local = local()
+        # Created here, not lazily in operation_progress: that scope's
+        # check-then-set is not atomic, so two block-work threads entering
+        # their first-ever scope on a fresh ledger can each build a local()
+        # and have one assignment win. The loser's hook would then live on an
+        # orphaned object and its admission wait would silently fall back to
+        # the heartbeat-silent path -- the exact failure the hook exists to
+        # remove. The scope keeps its lazy fallback for ledgers built through
+        # __new__ in focused tests; the production path must not race.
+        self._operation_progress_local = local()
         self._lock = Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         audit_share_segment_size = int(audit_share_segment_size)
@@ -2501,7 +2590,7 @@ class PsqlShareLedger:
             database_url,
             read_concurrency=read_concurrency,
         )
-        self._writer_lease_guard: _NativePostgresLeaseGuard | None = None
+        self._writer_lease_guard: LeaseGuardPort | None = None
         try:
             self._initialize_writer_lease_guard(database_url)
             if initialize_schema:
@@ -2518,7 +2607,7 @@ class PsqlShareLedger:
         database_url: str | None,
         *,
         read_concurrency: int,
-    ) -> _NativePostgresClient | None:
+    ) -> LedgerSqlPort | None:
         mode = (native_client_mode or "auto").strip().lower()
         if mode in {"0", "false", "no", "off", "psql"}:
             return None
@@ -2533,12 +2622,23 @@ class PsqlShareLedger:
                     "postgres:// DSN inside PRISM_POSTGRES_PSQL_COMMAND"
                 )
             return None
+        # One pooled connection per concurrent reader plus one for the
+        # serialized write path (the coordinator's share writer thread).
+        pool_size = read_concurrency + 1
+        if self._sql_backend_factory is not None:
+            # An injected backend is authoritative: it stands in for the
+            # whole server, so psycopg's availability is irrelevant and a
+            # None return means the same thing it does below (fall back to
+            # the psql subprocess path).
+            return self._sql_backend_factory(
+                conninfo,
+                pool_size=pool_size,
+                application_name=self._pool_application_name,
+            )
         try:
-            # One pooled connection per concurrent reader plus one for the
-            # serialized write path (the coordinator's share writer thread).
             return _NativePostgresClient(
                 conninfo,
-                pool_size=read_concurrency + 1,
+                pool_size=pool_size,
                 application_name=self._pool_application_name,
                 session_guards=getattr(self, "_session_guards", None),
             )
@@ -2554,15 +2654,24 @@ class PsqlShareLedger:
     def _make_writer_lease_guard(
         self,
         database_url: str | None,
-    ) -> _NativePostgresLeaseGuard | None:
+    ) -> LeaseGuardPort | None:
         if self._native is None:
             return None
         conninfo = database_url or database_url_from_psql_command(self._command)
         if conninfo is None:
             return None
+        advisory_lock_key = _writer_lease_advisory_lock_key(
+            self._writer_id,
+            self._writer_epoch,
+        )
+        if self._lease_guard_factory is not None:
+            return self._lease_guard_factory(
+                conninfo,
+                advisory_lock_key=advisory_lock_key,
+            )
         return _NativePostgresLeaseGuard(
             conninfo,
-            _writer_lease_advisory_lock_key(self._writer_id, self._writer_epoch),
+            advisory_lock_key,
             session_guards=getattr(self, "_session_guards", None),
         )
 
@@ -2598,7 +2707,7 @@ class PsqlShareLedger:
                 # failure budget; counting from acquisition guarantees it
                 # that time even when its lease row is already stale because
                 # a long fenced transaction withheld updated_at refreshes.
-                self._writer_lease_guard_acquired_monotonic = time.monotonic()
+                self._writer_lease_guard_acquired_monotonic = self._monotonic()
                 return
             guard.close()
             if not warned:
@@ -2671,7 +2780,7 @@ class PsqlShareLedger:
             timeout_local = local()
             self._operation_timeout_local = timeout_local
         previous = getattr(timeout_local, "deadline", None)
-        deadline = time.monotonic() + timeout_seconds
+        deadline = self._monotonic() + timeout_seconds
         timeout_local.deadline = (
             deadline if previous is None else min(float(previous), deadline)
         )
@@ -2719,6 +2828,102 @@ class PsqlShareLedger:
             else:
                 timeout_local.timeout_seconds = previous
 
+    @contextmanager
+    def operation_progress(
+        self,
+        on_progress: Callable[[], None],
+        *,
+        slice_seconds: float,
+    ) -> Iterator[None]:
+        """Stamp caller liveness while a ledger admission wait is blocked.
+
+        A landing-class caller runs its ledger step directly on a
+        watchdog-monitored block-work thread. Waiting for the writer lock or
+        the read semaphore is not database work: no statement has been sent,
+        so neither ``statement_timeout`` nor any server-side cancellation
+        bounds it, and the ledger has nothing to report until admission
+        succeeds. Without this hook the whole admission budget is
+        heartbeat-silent, and a coordinator that is merely queued behind
+        another writer is hard-exited by its own watchdog mid-landing --
+        which loses the escalation state the retry depended on and restarts
+        the same doomed cycle.
+
+        The hook fires between acquire slices, so it never runs while this
+        thread holds the gate, and it never replaces the caller's deadline:
+        ``_operation_gate`` still raises at the deadline
+        ``_remaining_operation_timeout`` reports. An exception from
+        ``on_progress`` propagates to the caller; a liveness stamp that
+        cannot be taken is a real failure, not something to swallow inside a
+        lock wait.
+
+        Nesting merges the way ``operation_timeout``/``statement_timeout``
+        merge: the effective slice is the minimum of the enclosing slices, so
+        an inner scope can only tighten the stamp cadence, never widen it. A
+        nested scope carrying a larger slice would otherwise lengthen the
+        heartbeat gaps its enclosing caller had already sized against its own
+        monitor. The callback itself does replace -- the innermost caller is
+        the one whose liveness is at stake -- and the outer pair is restored
+        on exit.
+        """
+        slice_seconds = float(slice_seconds)
+        if not math.isfinite(slice_seconds) or slice_seconds <= 0:
+            raise ValueError("operation progress slice must be finite and positive")
+        progress_local = getattr(self, "_operation_progress_local", None)
+        if progress_local is None:
+            progress_local = local()
+            self._operation_progress_local = progress_local
+        previous = getattr(progress_local, "hook", None)
+        progress_local.hook = (
+            (on_progress, slice_seconds)
+            if previous is None
+            else (on_progress, min(float(previous[1]), slice_seconds))
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del progress_local.hook
+                except AttributeError:
+                    pass
+            else:
+                progress_local.hook = previous
+
+    def _operation_progress_hook(self) -> tuple[Callable[[], None], float] | None:
+        progress_local = getattr(self, "_operation_progress_local", None)
+        if progress_local is None:
+            return None
+        return getattr(progress_local, "hook", None)
+
+    def _note_operation_progress(self) -> None:
+        """Report liveness between the statements of one gate-holding step.
+
+        ``_acquire_operation_gate`` stamps only while a caller is *waiting*
+        for a gate, which is all a single-statement operation needs: once the
+        gate opens the caller is inside one server-side statement, and its
+        liveness monitor is sized for exactly that. An operation that issues
+        a second statement without releasing the gate breaks that sizing.
+        No admission slice runs between the two -- the gate is already held --
+        so the monitor sees one unbroken silence of two statement budgets
+        where it was promised one. That is indistinguishable from a wedged
+        operation, and a watchdog with any tolerance below twice the budget
+        hard-exits a coordinator that is in fact making normal progress
+        (issue #125). Reporting here restores the contract: the first
+        statement's full round trip has completed, which is precisely the
+        evidence a liveness monitor watches for, while a genuinely stuck
+        statement still produces no report at all.
+
+        With no hook installed this does nothing; an ordinary ledger caller
+        has no monitor to satisfy. An exception from the hook propagates,
+        matching ``_acquire_operation_gate``: a liveness stamp that cannot be
+        taken is a real failure, not something to swallow mid-operation.
+        """
+        hook = self._operation_progress_hook()
+        if hook is None:
+            return
+        on_progress, _slice_seconds = hook
+        on_progress()
+
     def _remaining_operation_timeout(self) -> float | None:
         timeout_local = getattr(self, "_operation_timeout_local", None)
         deadline = (
@@ -2742,24 +2947,56 @@ class PsqlShareLedger:
                 if statement_timeout_seconds is None
                 else float(statement_timeout_seconds)
             )
-        remaining = float(deadline) - time.monotonic()
+        remaining = float(deadline) - self._monotonic()
         if remaining <= 0:
             raise LedgerOperationTimeout("postgres operation deadline expired")
         if statement_timeout_seconds is not None:
             remaining = min(remaining, float(statement_timeout_seconds))
         return remaining
 
+    def _acquire_operation_gate(self, gate: Any, name: str) -> None:
+        """Wait for one ledger gate inside the caller's remaining deadline.
+
+        With no progress hook installed this is a single blocking acquire, as
+        it has always been: an ordinary caller has no liveness monitor to
+        satisfy and gains nothing from waking up. With a hook installed the
+        same total wait is served in slices so the caller can stamp its
+        heartbeat between them (see ``operation_progress`` for why an
+        admission wait would otherwise be silent). Slicing never widens the
+        wait: the deadline derived from ``_remaining_operation_timeout`` stays
+        authoritative and still produces the same timeout error.
+        """
+        remaining = self._remaining_operation_timeout()
+        hook = self._operation_progress_hook()
+        if hook is None:
+            acquired = (
+                gate.acquire()
+                if remaining is None
+                else gate.acquire(timeout=max(0.0, remaining))
+            )
+            if not acquired:
+                raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+            return
+        on_progress, slice_seconds = hook
+        deadline = (
+            None if remaining is None else time.monotonic() + max(0.0, remaining)
+        )
+        while True:
+            wait_seconds = slice_seconds
+            if deadline is not None:
+                wait_seconds = min(wait_seconds, deadline - time.monotonic())
+            # An expired budget still gets one non-blocking attempt, so a
+            # zero or negative remaining fails exactly where it always did.
+            if gate.acquire(timeout=max(0.0, wait_seconds)):
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+            on_progress()
+
     @contextmanager
     def _operation_gate(self, gate: Any, name: str) -> Iterator[None]:
         """Acquire a ledger lock/semaphore within the caller's deadline."""
-        remaining = self._remaining_operation_timeout()
-        acquired = (
-            gate.acquire()
-            if remaining is None
-            else gate.acquire(timeout=max(0.0, remaining))
-        )
-        if not acquired:
-            raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+        self._acquire_operation_gate(gate, name)
         try:
             yield
         finally:
@@ -3877,6 +4114,12 @@ FROM qbit_current_carry_forward_balances();
         sql = "SELECT qbit_carry_forward_integrity_report();"
         with self._operation_gate(self._lock, "writer lock"):
             report = self._run_retry_safe_read_json(sql)
+            # The audit head is a second statement under the same held lock:
+            # the two reads must observe one another's rows, so the gate
+            # cannot be released between them. Report the first statement's
+            # completed round trip so the pair costs a monitor one budget of
+            # silence at a time (see _note_operation_progress).
+            self._note_operation_progress()
             audit_head = self._carry_forward_audit_head_locked()
         report["backend"] = "postgres-psql"
         report.update(audit_head)
@@ -6704,6 +6947,14 @@ SELECT json_build_object(
                 # command snapshot, so a join in that same statement cannot see
                 # the freshly assigned ordinal. Read it in the next statement
                 # while retaining the ledger writer lock.
+                #
+                # Holding the lock across both statements is what makes this
+                # step's heartbeat-silent span two statement budgets rather
+                # than one: no admission slice runs in between, so a landing
+                # caller's liveness monitor gets nothing until the second
+                # statement returns. Report the completed first round trip
+                # before starting the second (see _note_operation_progress).
+                self._note_operation_progress()
                 state = self._run_retry_safe_read_json(
                     f"""
 SELECT json_build_object(
@@ -6845,6 +7096,13 @@ SELECT json_build_object(
             reactivated_count = int(result["reactivated_count"])
             publication_sequence: object | None = None
             if reactivated_count == 1:
+                # Same two-statements-under-one-gate shape as
+                # confirm_accepted_block: the mutating statement's command
+                # snapshot cannot see the ordinal it just assigned, so the
+                # read runs next while the writer lock is still held. Report
+                # the completed first statement so a landing caller's monitor
+                # is not asked to sit through both budgets in silence.
+                self._note_operation_progress()
                 state = self._run_retry_safe_read_json(
                     f"""
 SELECT json_build_object(
@@ -6930,7 +7188,7 @@ END;
 
     def _ensure_writer_lease(self) -> None:
         while True:
-            acquire_started_monotonic = time.monotonic()
+            acquire_started_monotonic = self._monotonic()
             result = self._try_acquire_writer_lease()
             if result.get("acquired"):
                 self._writer_lease_last_refresh_monotonic = (
@@ -6939,7 +7197,7 @@ END;
                 return
             if self._can_adopt_writer_lease(result):
                 observed_session = str(result["writer_session_token"])
-                adoption_started_monotonic = time.monotonic()
+                adoption_started_monotonic = self._monotonic()
                 adoption = self._try_adopt_writer_lease(result)
                 if adoption.get("acquired"):
                     self._writer_lease_last_refresh_monotonic = (
@@ -7177,7 +7435,7 @@ SELECT COALESCE(
         )
         guard_held_seconds = max(
             0.0,
-            time.monotonic() - guard_acquired_monotonic,
+            self._monotonic() - guard_acquired_monotonic,
         )
         guard_wait_seconds = max(
             0.0,

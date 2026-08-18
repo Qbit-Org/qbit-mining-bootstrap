@@ -50,6 +50,11 @@ PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS = 20.0
 PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_CEILING_SECONDS = 60.0
 
 
+def _no_reconcile_progress(phase: str) -> None:
+    """Discard reconcile progress stamps for ports built without a recorder."""
+    return None
+
+
 class _ReconcileFlight:
     """One in-flight reconcile pass shared by concurrent same-tip callers."""
 
@@ -96,6 +101,16 @@ class ReorgPorts:
     reconcile_with_admission: Callable[..., Mapping[str, object]]
     reconcile_serialized: Callable[..., dict[str, object]]
     ensure_tip: Callable[[str], bool]
+    # Liveness stamp for a reconcile pass running inline on a
+    # watchdog-monitored thread. An accepted-block landing calls
+    # ``ensure_tip`` on the block-work thread, and one pass is an unbounded
+    # chain walk -- a getblockhash plus up to two ledger statements per
+    # watched block -- so bracketing the call from outside would still leave
+    # a silence proportional to the number of watched blocks. The coordinator
+    # supplies its block-work phase recorder, which no-ops on every other
+    # thread; ports built without one get a sink so background reconciliation
+    # and focused tests are unchanged.
+    record_progress: Callable[[str], None] = _no_reconcile_progress
 
 
 @dataclass(frozen=True)
@@ -736,6 +751,15 @@ class ReorgReconcilerService:
                                     )
                                 )
                         else:
+                            # Every stamp below marks one completed round
+                            # trip. A landing thread's watchdog budget is
+                            # sized for a single statement, and this pass
+                            # crosses an unbounded number of them, so the
+                            # stamps have to follow the work itself rather
+                            # than bracket the pass as a whole.
+                            self._ports.record_progress(
+                                "reorg-reconcile:tip-height"
+                            )
                             active_tip_height = int(
                                 self._ports.rpc_call("getblockcount")
                             )
@@ -759,12 +783,23 @@ class ReorgReconcilerService:
                                         )
                                     )
                             else:
+                                self._ports.record_progress(
+                                    "reorg-reconcile:watch-blocks"
+                                )
                                 rows = watch_blocks(
                                     active_tip_height=active_tip_height
                                 )
                                 summary["watched_blocks"] = len(rows)
 
                                 for row in rows:
+                                    # Per row, not per pass: the row count is
+                                    # bounded only by how many pool blocks the
+                                    # reorg window holds, and each iteration
+                                    # can spend a getblockhash plus a ledger
+                                    # mutation.
+                                    self._ports.record_progress(
+                                        "reorg-reconcile:watch-block"
+                                    )
                                     block_height = int(row["block_height"])
                                     block_hash = str(row["block_hash"]).lower()
                                     chain_state = str(row.get("chain_state", ""))
@@ -841,6 +876,9 @@ class ReorgReconcilerService:
                                 )
                                 if callable(mark_mature):
                                     payout_mutation_attempted = True
+                                    self._ports.record_progress(
+                                        "reorg-reconcile:mature-payouts"
+                                    )
                                     matured = mark_mature(
                                         active_tip_height=active_tip_height
                                     )
@@ -866,6 +904,9 @@ class ReorgReconcilerService:
                                     # snapshot artifact; a pass that will not
                                     # publish must not pay for one only to
                                     # discard it.
+                                    self._ports.record_progress(
+                                        "reorg-reconcile:prepare-candidate"
+                                    )
                                     candidate_to_publish = (
                                         self._ports.prepared_candidate(
                                             captured_source,
@@ -932,6 +973,7 @@ class ReorgReconcilerService:
                 raise
 
             if candidate_to_publish is not None:
+                self._ports.record_progress("reorg-reconcile:publish")
                 published = self._ports.publish_candidate(
                     candidate_to_publish
                 )

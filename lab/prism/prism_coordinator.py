@@ -62,6 +62,7 @@ from lab.prism.coordinator_shutdown import (
     ledger_writer_operation,  # noqa: F401 - compatibility re-export
 )
 from lab.prism.coordinator_config import (
+    BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION,  # noqa: F401
     CoordinatorConfig,
     DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,  # noqa: F401
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,  # noqa: F401
@@ -114,6 +115,7 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS,  # noqa: F401
     DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS,
     DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS,
+    DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,  # noqa: F401
     DEFAULT_PRISM_WORKER_METRICS_LIMIT,
     DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS,
     LEASE_AUTHORITY_MARGIN_HEADROOM_SECONDS,
@@ -2203,6 +2205,15 @@ class PrismCoordinator:
         self.job_build_timeout_seconds = job_config.job_build_timeout_seconds
         self.job_build_cancel_grace_seconds = job_config.job_build_cancel_grace_seconds
         self.vardiff_idle_sweep_seconds = stratum_config.vardiff_idle_sweep_seconds
+        # Reconnect difficulty retention: a reconnecting worker resumes at
+        # its last converged difficulty instead of the lane start. Off
+        # restores lane-start behavior exactly.
+        self.vardiff_resume_enabled = stratum_config.vardiff_resume_enabled
+        self.vardiff_resume_ttl_seconds = stratum_config.vardiff_resume_ttl_seconds
+        self.vardiff_resume_max_entries = stratum_config.vardiff_resume_max_entries
+        self.vardiff_resume_max_start_factor = (
+            stratum_config.vardiff_resume_max_start_factor
+        )
         # Zero collapses every worker into the overflow label (per-worker
         # metrics effectively off) without touching the aggregate counters.
         self.worker_metrics_limit = job_config.worker_metrics_limit
@@ -3832,6 +3843,14 @@ class PrismCoordinator:
                     ),
                     ensure_tip=lambda tip: self.ensure_reorg_reconciled_for_tip(
                         tip
+                    ),
+                    # Accepted-block landings run a reconcile pass inline on
+                    # the watchdog-monitored block-work thread. The recorder
+                    # stamps only from that thread's registered owner, so
+                    # background reconciliation passes and per-client callers
+                    # keep recording nothing at all.
+                    record_progress=lambda phase: (
+                        self._record_block_submitter_phase(phase)
                     ),
                 ),
                 enabled=bool(self.reorg_reconciler_enabled),
@@ -7586,6 +7605,21 @@ class PrismCoordinator:
     def client_minimum_advertised_difficulty(self, client: ClientState) -> Decimal:
         return self._ensure_vardiff_service().minimum_advertised_difficulty(client)
 
+    def resume_client_difficulty(self, client: ClientState) -> Decimal | None:
+        return self._ensure_vardiff_service().apply_resumed_difficulty(client)
+
+    def note_vardiff_resume_overridden(self) -> None:
+        self._ensure_vardiff_service().note_resume_overridden()
+
+    def record_session_difficulty(self, client: ClientState) -> None:
+        # Only a connection that produced an accepted share may refresh the
+        # retained value's TTL. Without that evidence a reconnect loop of
+        # silent sessions would re-stamp the entry forever and defeat the TTL.
+        self._ensure_vardiff_service().record_session_difficulty(
+            client,
+            share_backed=bool(getattr(client, "vardiff_accepted_any", False)),
+        )
+
     def apply_job_difficulty(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
         return self._ensure_job_delivery_service().apply_job_difficulty(client, job)
 
@@ -9597,6 +9631,9 @@ class PrismCoordinator:
 
     def vardiff_idle_metrics_lines(self) -> list[str]:
         return self._ensure_vardiff_service().metrics_lines()
+
+    def vardiff_convergence_snapshot(self) -> dict[str, object]:
+        return self._ensure_vardiff_service().convergence_snapshot()
 
     def block_finalization_metrics_lines(self) -> list[str]:
         return self._ensure_block_finalization_service().metrics_lines()

@@ -4394,3 +4394,71 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
                 (0, int(artifacts.network_difficulty)),
             )
             self.assertEqual(executor.submissions, 1)
+
+
+class UnfencedAppendDrainTests(unittest.TestCase):
+    def test_drain_waits_in_stamped_slices_without_returning_early(self) -> None:
+        """The drain stays unbounded; only its silence is broken up.
+
+        A landing calls this inline on the watchdog-monitored block-work
+        thread right after exposing its declared anchor. Bounding the wait is
+        not an option -- it enforces the fencing contract, and returning
+        early would let the landing arm its epoch fences ahead of an append
+        that must be drained first -- so the fix is to wait in
+        watchdog-sized slices and stamp each one. The ``while`` re-check
+        makes the timed wait semantically identical to the untimed one.
+        """
+        server, _rpc = coordinator()
+        server._ensure_job_cache_state()
+        stamps: list[tuple[str, object]] = []
+        server._record_heartbeat = (  # type: ignore[method-assign]
+            lambda name, phase=None: stamps.append((name, phase))
+        )
+        server._block_work_wait_slice = lambda: 0.01  # type: ignore[method-assign]
+        anchor = 1000
+        with server._payout_unfenced_append_drained:
+            server._payout_unfenced_append_inflight_stamps[1] = anchor - 1
+        returned = threading.Event()
+
+        def drain() -> None:
+            server._block_submitter_thread_ident = threading.get_ident()
+            server._await_unfenced_appends_predating_anchor(anchor)
+            returned.set()
+
+        worker_thread = threading.Thread(target=drain)
+        worker_thread.start()
+        try:
+            # The predating append is still in flight: no number of expired
+            # slices may let the drain return.
+            self.assertFalse(returned.wait(0.2))
+            drain_stamps = [
+                stamp
+                for stamp in stamps
+                if stamp == ("block_submitter", "wait-unfenced-append-drain")
+            ]
+            self.assertGreaterEqual(len(drain_stamps), 2)
+            with server._payout_unfenced_append_drained:
+                server._payout_unfenced_append_inflight_stamps.pop(1, None)
+                server._payout_unfenced_append_drained.notify_all()
+            self.assertTrue(returned.wait(5))
+        finally:
+            with server._payout_unfenced_append_drained:
+                server._payout_unfenced_append_inflight_stamps.pop(1, None)
+                server._payout_unfenced_append_drained.notify_all()
+            worker_thread.join(5)
+
+    def test_drain_with_nothing_in_flight_stamps_nothing(self) -> None:
+        """The common path never enters the loop, so it never stamps."""
+        server, _rpc = coordinator()
+        server._ensure_job_cache_state()
+        stamps: list[object] = []
+        server._record_heartbeat = (  # type: ignore[method-assign]
+            lambda name, phase=None: stamps.append((name, phase))
+        )
+        server._block_submitter_thread_ident = threading.get_ident()
+        server._await_unfenced_appends_predating_anchor(1000)
+        self.assertEqual(stamps, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

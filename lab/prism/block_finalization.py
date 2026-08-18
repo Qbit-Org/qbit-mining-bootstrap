@@ -20,6 +20,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 import traceback
@@ -32,6 +33,7 @@ from lab.prism.block_candidates import (
     PrismBlockCandidate,
     _BlockCandidateNodeSubmission,
 )
+from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.share_ledger import WriterLeaseRenewalDeferred, sha256_json_hex
 from lab.prism.share_submission import (
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
@@ -484,6 +486,27 @@ class BlockFinalizationService:
         # subclass override; the base implementation forwards to the port.
         self.runtime._record_block_candidate_progress(phase)
 
+    def _stamped_prior_balances_match_current(
+        self,
+        prior_balances: list[dict[str, object]],
+    ) -> bool:
+        """Compare the job's payout base against the ledger, bracketed.
+
+        The comparison is a ledger read run inline on the landing's
+        block-work thread, between the reorg-reconcile stretch and the
+        audit build. Bracketing it keeps that statement attributable: an
+        owner parked in ``prior-balances-check`` is waiting on a known
+        database read rather than sitting in an unnamed silence the
+        watchdog cannot tell from a wedge. Both landing call sites route
+        through here so the pair of stamps cannot drift apart. The stampers
+        no-op off the block-work owner thread, so client-thread
+        dispositions are unaffected.
+        """
+        self.runtime._record_block_submitter_phase("prior-balances-check")
+        matched = bool(self.runtime.prior_balances_match_current(prior_balances))
+        self.runtime._record_block_submitter_phase("prior-balances-check:complete")
+        return matched
+
     def _note_candidate_started(self) -> None:
         now = time.monotonic()
         with self._metrics_lock:
@@ -602,9 +625,19 @@ class BlockFinalizationService:
                 # transition becomes a landed barrier and before validating its
                 # payout base.
                 try:
+                    # Reconciliation is the longest heartbeat-silent stretch
+                    # in the landing scope: a chain walk of ledger statements
+                    # and getblockhash calls, one pair per watched block. The
+                    # pass stamps its own per-row progress internally; these
+                    # boundary stamps mark the stretch itself so a landing
+                    # that enters it is never mistaken for a wedged thread.
+                    self.runtime._record_block_submitter_phase("reorg-reconcile")
                     reorg_reconciled = self.runtime.ensure_reorg_reconciled_for_tip(
                         current_tip,
                         _coalesce_same_tip=False,
+                    )
+                    self.runtime._record_block_submitter_phase(
+                        "reorg-reconcile:complete"
                     )
                 except Exception:
                     traceback.print_exc()
@@ -655,9 +688,14 @@ class BlockFinalizationService:
                 reorg_reconciled = True
             else:
                 try:
+                    # Same unbounded chain walk as the replay path above.
+                    self.runtime._record_block_submitter_phase("reorg-reconcile")
                     reorg_reconciled = self.runtime.ensure_reorg_reconciled_for_tip(
                         current_tip,
                         _coalesce_same_tip=False,
+                    )
+                    self.runtime._record_block_submitter_phase(
+                        "reorg-reconcile:complete"
                     )
                 except Exception:
                     traceback.print_exc()
@@ -740,7 +778,9 @@ class BlockFinalizationService:
             if (
                 durable_payout_state
                 and not already_active
-                and not self.runtime.prior_balances_match_current(context.prior_balances)
+                and not self._stamped_prior_balances_match_current(
+                    context.prior_balances
+                )
             ):
                 self.runtime._abandon_block_candidate(
                     PRISM_REJECTION_STALE_JOB,
@@ -752,7 +792,12 @@ class BlockFinalizationService:
                 )
                 return None
             if not already_active and not node_submission.attempted:
+                # One RPC round trip, but it runs between two already-stamped
+                # stretches on the block-work thread; leaving it unnamed puts
+                # an unbounded node response inside somebody else's phase.
+                self.runtime._record_block_submitter_phase("tip-height-rpc")
                 before_height = int(self.runtime.rpc.call("getblockcount"))
+                self.runtime._record_block_submitter_phase("tip-height-rpc:complete")
                 if before_height + 1 != expected_height:
                     self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
@@ -932,8 +977,10 @@ class BlockFinalizationService:
                 # summary. Publish it before rebuilding/canonicalizing the full
                 # audit bundle, without retaining that bundle's shares tree.
                 preview = self.runtime._materialize_prior_balance_preview(issued_preview)
-                if durable_payout_state and not self.runtime.prior_balances_match_current(
-                    context.prior_balances
+                if durable_payout_state and not (
+                    self._stamped_prior_balances_match_current(
+                        context.prior_balances
+                    )
                 ):
                     self.runtime.request_shutdown()
                     self.runtime._clear_accepted_block_payout_preview(
@@ -1778,6 +1825,50 @@ class BlockFinalizationService:
     ) -> dict[str, Any]:
         audit_store = self.runtime._ensure_audit_artifact_store()
         self._record_block_candidate_progress("evidence-write")
+        # This is the live writer finalizing a block it confirmed itself in
+        # this landing. Two distinct found blocks can land inside one
+        # confirm->publish window -- the synchronous client-thread tail and
+        # the accounting actor do not serialise across hashes -- so this
+        # publication can arrive already superseded on the publication
+        # ordinal. It must then still write its own height+hash live
+        # envelope, which is the block's only published evidence pointer.
+        #
+        # Confirming with a valid lease does not prove the lease survived the
+        # confirm->publish gap: a writer deposed inside the gap would reach
+        # this call site with only stale reads behind it. Restoring a
+        # superseded envelope is a mutation of the shared audit root that the
+        # current evidence reference never re-validates, so restore authority
+        # requires a fresh bounded non-blocking proof of the exact guarded
+        # session (a no-op for ledgers without the writer lease guard). The
+        # proof gates only the restore: withholding authority degrades to the
+        # pre-restore behaviour of skipping the superseded envelope write,
+        # which is always safe, whereas failing the publication on a lease
+        # hiccup would be a live regression on the found-block path. The
+        # fence may arm a hard exit internally for a genuinely dead lease;
+        # that exit proceeds on its own and is not undone here.
+        restore_superseded_envelope = True
+        lease_fence_component = "superseded_audit_envelope_restore"
+        require_fresh_lease = getattr(
+            self.runtime,
+            "_require_fresh_ledger_lease_for_external_side_effect",
+            None,
+        )
+        if callable(require_fresh_lease):
+            try:
+                require_fresh_lease(lease_fence_component)
+            except (ShutdownInProgress, WriterLeaseRenewalDeferred) as exc:
+                restore_superseded_envelope = False
+                # Withheld authority silently reverts to the historical lossy
+                # behaviour for a superseded publication, so it must be
+                # visible. Diagnostics go to stderr because worker processes
+                # reserve stdout for a strict JSON-lines protocol.
+                print(
+                    "prism coordinator: withholding superseded-envelope "
+                    f"restore authority component={lease_fence_component} "
+                    f"error={type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         with self.runtime._payout_balance_mutation_lock:
             with audit_store.publication_order_guard():
                 publication_floor_reader = getattr(
@@ -1809,7 +1900,23 @@ class BlockFinalizationService:
                     evidence=prepared.evidence,
                     verification_identity=landed.audit_verification_identity,
                     created_at=public_api.utc_now_iso(),
+                    # Granted by the fresh-lease proof above; a deposed writer
+                    # replaying stale state never receives restore authority.
+                    restore_superseded_envelope=restore_superseded_envelope,
                 )
+        if publication.superseded_envelope_written:
+            # Emitted only after the balance lock and the publication order
+            # guard have been released: an undrained stderr must never block
+            # the found-block path while a store lock is held.
+            print(
+                "prism coordinator: wrote live envelope for superseded "
+                f"publication sequence={publication.identity.sequence} "
+                f"floor_sequence={publication_floor_sequence} "
+                f"height={publication.identity.block_height} "
+                f"hash={publication.identity.block_hash}",
+                file=sys.stderr,
+                flush=True,
+            )
         published_evidence = dict(publication.evidence)
         self._record_block_candidate_progress("evidence-write:complete")
         return published_evidence

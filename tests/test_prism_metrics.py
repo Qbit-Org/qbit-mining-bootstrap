@@ -10,6 +10,7 @@ Prometheus document byte-for-byte for identical inputs.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 import time
@@ -42,6 +43,7 @@ from lab.prism.share_submission import (
     PRISM_SHARE_ACK_RESULTS,
     empty_share_ack_histograms,
 )
+from lab.prism.vardiff_service import PRISM_VARDIFF_RESUME_OUTCOMES
 from tests import prism_vardiff_test_support as support
 
 
@@ -600,6 +602,46 @@ def reference_job_build_metrics_lines(server) -> list[str]:
     return lines
 
 
+def reference_vardiff_convergence_metrics_lines(server) -> list[str]:
+    snapshot = server.vardiff_convergence_snapshot()
+    lane_accepted = snapshot["lane_accepted_shares"]
+    assert isinstance(lane_accepted, dict)
+    resume_outcomes = snapshot["resume_outcomes"]
+    assert isinstance(resume_outcomes, dict)
+    lanes = [
+        str(profile.name)
+        for profile in getattr(server, "listener_profiles", ()) or ()
+    ]
+    lanes.extend(sorted(lane for lane in lane_accepted if lane not in lanes))
+    elapsed = max(0.001, time.monotonic() - server.started_monotonic)
+    return [
+        "# HELP qbit_prism_vardiff_sessions_at_max_difficulty Sessions whose current difficulty sits at their effective vardiff ceiling.",
+        "# TYPE qbit_prism_vardiff_sessions_at_max_difficulty gauge",
+        f"qbit_prism_vardiff_sessions_at_max_difficulty {int(snapshot['sessions_at_max_difficulty'])}",
+        "# HELP qbit_prism_vardiff_lane_accepted_shares_total Accepted shares by Stratum lane.",
+        "# TYPE qbit_prism_vardiff_lane_accepted_shares_total counter",
+        *[
+            f'qbit_prism_vardiff_lane_accepted_shares_total{{lane="{server.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0))}'
+            for lane in lanes
+        ],
+        "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. Kept on the same elapsed formula as qbit_prism_shares_per_second so the two stay comparable.",
+        "# TYPE qbit_prism_vardiff_lane_accepted_shares_per_second gauge",
+        *[
+            f'qbit_prism_vardiff_lane_accepted_shares_per_second{{lane="{server.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0)) / elapsed:.12g}'
+            for lane in lanes
+        ],
+        "# HELP qbit_prism_vardiff_resume_total Reconnect difficulty resume attempts by outcome; clamped means the retained value was pulled into the lane's plausibility bounds, overridden means an adopted value was superseded by an explicit difficulty request in the same authorize, so resumed + clamped - overridden is the number that stuck.",
+        "# TYPE qbit_prism_vardiff_resume_total counter",
+        *[
+            f'qbit_prism_vardiff_resume_total{{outcome="{outcome}"}} {int(resume_outcomes.get(outcome, 0))}'
+            for outcome in PRISM_VARDIFF_RESUME_OUTCOMES
+        ],
+        "# HELP qbit_prism_vardiff_resume_retained_sessions Worker sessions holding a retained difficulty eligible for resume.",
+        "# TYPE qbit_prism_vardiff_resume_retained_sessions gauge",
+        f"qbit_prism_vardiff_resume_retained_sessions {int(snapshot['retained_sessions'])}",
+    ]
+
+
 def reference_render_metrics_payload(server) -> str:
     ledger_metrics = server.ledger.metrics()
     audit_metrics = server.audit_artifact_metrics()
@@ -1024,6 +1066,7 @@ def reference_render_metrics_payload(server) -> str:
     lines.extend(reference_share_ack_metrics_lines(server))
     lines.extend(server.ctv_fanout_broadcaster_metrics_lines())
     lines.extend(server.vardiff_idle_metrics_lines())
+    lines.extend(reference_vardiff_convergence_metrics_lines(server))
     lines.extend(server.block_finalization_metrics_lines())
     lines.extend(reference_job_build_metrics_lines(server))
     lines.extend(server.tip_refresh_metrics_lines())
@@ -1137,6 +1180,24 @@ class MetricsRenderParityTests(unittest.TestCase):
         server.observe_job_build_elapsed(0.05, {"assemble": 0.02, "payout": 0.01})
         server._record_job_cache_event("template", hit=True)
         server._record_job_cache_event("bundle", hit=False)
+        # Vardiff convergence/resume state via the vardiff owner.
+        server.listener_profiles = [
+            SimpleNamespace(name="default"),
+            SimpleNamespace(name="highdiff"),
+        ]
+        vardiff_service = server._ensure_vardiff_service()
+        with vardiff_service._vardiff_convergence_lock:
+            vardiff_service.vardiff_lane_accepted_counts["default"] = 9
+            vardiff_service.vardiff_lane_accepted_counts["highdiff"] = 2
+            vardiff_service.vardiff_resume_outcome_counts["resumed"] = 3
+            vardiff_service.vardiff_resume_outcome_counts["clamped"] = 1
+            vardiff_service.vardiff_resume_outcome_counts["overridden"] = 2
+        vardiff_service.session_difficulty_store.record(
+            ("default", "alice"),
+            Decimal("32768"),
+            now=time.monotonic(),
+            share_backed=True,
+        )
         return server
 
     def test_full_render_parity_with_frozen_reference(self) -> None:
@@ -1168,6 +1229,10 @@ class MetricsRenderParityTests(unittest.TestCase):
             "qbit_prism_accepted_parent_preview_wait_timeouts_total 2",
             "qbit_prism_tip_refresh_wave_outcomes_total",
             "qbit_prism_payout_artifact_events_total",
+            "qbit_prism_vardiff_sessions_at_max_difficulty",
+            'qbit_prism_vardiff_resume_total{outcome="clamped"}',
+            'qbit_prism_vardiff_resume_total{outcome="overridden"} 2',
+            'qbit_prism_vardiff_lane_accepted_shares_per_second{lane="default"}',
         ):
             self.assertIn(needle, actual)
 

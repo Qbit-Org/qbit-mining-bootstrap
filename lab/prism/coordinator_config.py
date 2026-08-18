@@ -146,6 +146,17 @@ DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS = 60.0
 DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS = 0.25
 DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
+# Reconnect difficulty retention: a reconnecting worker (same listener +
+# exact username) resumes at its last converged difficulty instead of the
+# lane start, so a mass reconnect does not re-flood the share path while
+# every session re-climbs. The TTL bounds how stale a resumed value may be,
+# the entry cap bounds retained state (2x the deployed 4096 connection cap),
+# and the start factor caps a resume at a multiple of the lane's own start
+# difficulty (1024 = five 4x retarget steps, the climb reconnects previously
+# repeated).
+DEFAULT_PRISM_VARDIFF_RESUME_TTL_SECONDS = 900.0
+DEFAULT_PRISM_VARDIFF_RESUME_MAX_ENTRIES = 8192
+DEFAULT_PRISM_VARDIFF_RESUME_MAX_START_FACTOR = Decimal("1024")
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 DEFAULT_SHARE_COMMIT_BATCH_SIZE = 64
 DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS = 5.0
@@ -153,6 +164,11 @@ DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS = 15.0
 DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS = 15.0
 DEFAULT_PRISM_TEMPLATE_MAX_AGE_SECONDS = 120
 DEFAULT_PRISM_COORDINATION_BLOCKED_EXIT_SECONDS = 900.0
+# How long a monitored coordinator thread may stay heartbeat-silent before the
+# watchdog hard-exits the process. Deadlines that are spent on a monitored
+# thread derive their ceiling from this value rather than repeating the number,
+# so retuning the watchdog cannot leave a budget stranded above its tolerance.
+DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS = 120.0
 # A watchdog release must never turn a wedged DB path into a second outage.
 # The release worker is daemonized and the watchdog hard-exits at this total
 # wall-clock deadline whether quiescence or the fresh DB connection completes.
@@ -215,8 +231,28 @@ DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS = 30.0
 # bounded by the escalated statement budget, cycles are paced by the
 # candidate retry backoff, and the stuck-call/coordination watchdogs remain
 # the overall bound. An accepted block's landing is never abandoned outright;
-# it converges through durable replay.
+# it converges through durable replay. This is an upper bound only: landing
+# steps run on watchdog-monitored block-work threads, so the watchdog-derived
+# ceiling below can lower the budget actually granted, and only lower it.
 DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS = 120.0
+# Fraction of the configured watchdog tolerance a landing budget may occupy.
+# A landing step spends its budget on the block-work thread the watchdog
+# monitors, so the reviewed cap and the watchdog are not independent knobs:
+# a cap at or above the tolerance lets a legal, still-running call trip the
+# watchdog, and the in-memory escalation state dies with the process, so the
+# restart replays the same doomed attempt from the base budget forever
+# (issue #125). The landing scope is bracketed to keep that span short: the
+# ledger admission wait stamps in slices, gate bodies that hold their lock
+# across two statements report between them, and the reorg walk, prior-
+# balance checks, tip-height RPC and unfenced-append drain each stamp their
+# own phases. What remains between two stamps is normally one server-side
+# statement, so half the tolerance leaves roughly a statement of margin
+# before the watchdog fires, and the two values can no longer drift apart
+# when either is retuned. It is a margin, not a guarantee: a network stall
+# mid-statement has no client-side socket-read deadline on the native
+# psycopg path and can outlast any budget -- that case is a genuinely
+# wedged process, and a watchdog exit is the correct outcome.
+BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION = 0.5
 DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS = 5.0
 DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS = 30.0
 # How long an own-hash tip observation keeps protecting a block candidate
@@ -865,6 +901,14 @@ class StratumConfig:
     disconnected_job_retention: int
     payout_address_cache_max_entries: int
     payout_address_cache_ttl_seconds: float
+    # Reconnect difficulty retention knobs, appended with defaults so existing
+    # positional constructions keep working.
+    vardiff_resume_enabled: bool = True
+    vardiff_resume_ttl_seconds: float = DEFAULT_PRISM_VARDIFF_RESUME_TTL_SECONDS
+    vardiff_resume_max_entries: int = DEFAULT_PRISM_VARDIFF_RESUME_MAX_ENTRIES
+    vardiff_resume_max_start_factor: Decimal = (
+        DEFAULT_PRISM_VARDIFF_RESUME_MAX_START_FACTOR
+    )
 
 
 @dataclass(frozen=True)
@@ -1154,6 +1198,16 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    vardiff_resume_max_start_factor = env_decimal(
+        "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR",
+        str(DEFAULT_PRISM_VARDIFF_RESUME_MAX_START_FACTOR),
+        environ=source,
+    )
+    if vardiff_resume_max_start_factor < 1:
+        raise SystemExit(
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR must be at least 1"
+        )
+
     stratum = StratumConfig(
         bind=bind,
         port=port,
@@ -1223,6 +1277,20 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
             DEFAULT_PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS,
             environ=source,
         ),
+        vardiff_resume_enabled=env_bool(
+            "PRISM_STRATUM_VARDIFF_RESUME", "1", environ=source
+        ),
+        vardiff_resume_ttl_seconds=env_nonnegative_float(
+            "PRISM_STRATUM_VARDIFF_RESUME_TTL_SECONDS",
+            DEFAULT_PRISM_VARDIFF_RESUME_TTL_SECONDS,
+            environ=source,
+        ),
+        vardiff_resume_max_entries=env_nonnegative_int(
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_ENTRIES",
+            DEFAULT_PRISM_VARDIFF_RESUME_MAX_ENTRIES,
+            environ=source,
+        ),
+        vardiff_resume_max_start_factor=vardiff_resume_max_start_factor,
     )
 
     jobs = JobPipelineConfig(
@@ -1591,7 +1659,9 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         ),
         watchdog_enabled=env_bool("PRISM_WATCHDOG_ENABLED", "1", environ=source),
         watchdog_timeout_seconds=env_positive_float(
-            "PRISM_WATCHDOG_TIMEOUT_SECONDS", 120.0, environ=source
+            "PRISM_WATCHDOG_TIMEOUT_SECONDS",
+            DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
+            environ=source,
         ),
         watchdog_interval_seconds=env_positive_float(
             "PRISM_WATCHDOG_INTERVAL_SECONDS", 15.0, environ=source

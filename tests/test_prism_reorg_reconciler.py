@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace as dataclass_replace
 from types import SimpleNamespace
 
 from lab.prism.prism_coordinator import PrismCoordinator
@@ -165,6 +166,52 @@ class ReorgReconcilerServiceTests(unittest.TestCase):
         self.assertTrue(state.last_trusted)
         # A trusted pass for the latest detected tip arms the per-tip memo.
         self.assertIn("tip", service._reorg_reconcile_trusted_memo)
+
+    def test_reconcile_stamps_progress_through_its_unbounded_chain_walk(self) -> None:
+        """One pass is many statements, so one bracket around it is not enough.
+
+        An accepted-block landing runs ``ensure_tip`` inline on the
+        watchdog-monitored block-work thread. The pass walks every watched
+        pool block, spending a getblockhash and up to two ledger statements
+        per row, so its heartbeat-silent span grows with the reorg window.
+        Bracketing the call from the outside would leave that growth
+        unreported; the stamps have to follow the work (issue #125).
+        """
+        ledger = FakeLedger()
+        ports, _events = make_ports(ledger=ledger)
+        phases: list[str] = []
+        service = ReorgReconcilerService(
+            dataclass_replace(ports, record_progress=phases.append)
+        )
+
+        service.reconcile(tip_hash="tip", force_publish=True)
+
+        # FakeLedger watches two blocks; each row gets its own stamp.
+        self.assertEqual(phases.count("reorg-reconcile:watch-block"), 2)
+        self.assertEqual(
+            phases[:3],
+            [
+                "reorg-reconcile:tip-height",
+                "reorg-reconcile:watch-blocks",
+                "reorg-reconcile:watch-block",
+            ],
+        )
+        for phase in (
+            "reorg-reconcile:mature-payouts",
+            "reorg-reconcile:prepare-candidate",
+            "reorg-reconcile:publish",
+        ):
+            self.assertIn(phase, phases)
+
+    def test_reconcile_ports_without_a_recorder_stamp_nothing(self) -> None:
+        """Background passes and focused tests keep their existing ports."""
+        ledger = FakeLedger()
+        ports, _events = make_ports(ledger=ledger)
+        summary = ReorgReconcilerService(ports).reconcile(
+            tip_hash="tip",
+            force_publish=True,
+        )
+        self.assertEqual(summary["watched_blocks"], 2)
 
     def test_untrusted_pass_records_skip_and_does_not_arm_memo(self) -> None:
         ports, _events = make_ports(chain_untrusted=True)
