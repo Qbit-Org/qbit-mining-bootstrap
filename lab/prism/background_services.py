@@ -433,7 +433,10 @@ class WatchdogService:
             release_thread.join(max(0.0, deadline - time.monotonic()))
         finally:
             # Nothing, including timeout logging or thread-start failure, may
-            # extend or suppress the watchdog's terminal action.
+            # extend or suppress the watchdog's terminal action. Exiting also
+            # discards the in-memory vardiff retention store (see
+            # vardiff_service.SessionDifficultyStore), so the post-restart
+            # reconnect wave is not smoothed by difficulty resume.
             self._ports.exit_process(1)
 
     def _release_ledger_lease(self, reason: str, deadline: float) -> bool:
