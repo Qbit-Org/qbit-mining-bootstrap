@@ -624,13 +624,13 @@ def reference_vardiff_convergence_metrics_lines(server) -> list[str]:
             f'qbit_prism_vardiff_lane_accepted_shares_total{{lane="{server.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0))}'
             for lane in lanes
         ],
-        "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane since coordinator start.",
+        "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. Kept on the same elapsed formula as qbit_prism_shares_per_second so the two stay comparable.",
         "# TYPE qbit_prism_vardiff_lane_accepted_shares_per_second gauge",
         *[
             f'qbit_prism_vardiff_lane_accepted_shares_per_second{{lane="{server.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0)) / elapsed:.12g}'
             for lane in lanes
         ],
-        "# HELP qbit_prism_vardiff_resume_total Reconnect difficulty resume attempts by outcome; clamped means the retained value was pulled into the lane's plausibility bounds.",
+        "# HELP qbit_prism_vardiff_resume_total Reconnect difficulty resume attempts by outcome; clamped means the retained value was pulled into the lane's plausibility bounds, overridden means an adopted value was superseded by an explicit difficulty request in the same authorize, so resumed + clamped - overridden is the number that stuck.",
         "# TYPE qbit_prism_vardiff_resume_total counter",
         *[
             f'qbit_prism_vardiff_resume_total{{outcome="{outcome}"}} {int(resume_outcomes.get(outcome, 0))}'
@@ -1191,10 +1191,12 @@ class MetricsRenderParityTests(unittest.TestCase):
             vardiff_service.vardiff_lane_accepted_counts["highdiff"] = 2
             vardiff_service.vardiff_resume_outcome_counts["resumed"] = 3
             vardiff_service.vardiff_resume_outcome_counts["clamped"] = 1
+            vardiff_service.vardiff_resume_outcome_counts["overridden"] = 2
         vardiff_service.session_difficulty_store.record(
             ("default", "alice"),
             Decimal("32768"),
             now=time.monotonic(),
+            share_backed=True,
         )
         return server
 
@@ -1229,6 +1231,7 @@ class MetricsRenderParityTests(unittest.TestCase):
             "qbit_prism_payout_artifact_events_total",
             "qbit_prism_vardiff_sessions_at_max_difficulty",
             'qbit_prism_vardiff_resume_total{outcome="clamped"}',
+            'qbit_prism_vardiff_resume_total{outcome="overridden"} 2',
             'qbit_prism_vardiff_lane_accepted_shares_per_second{lane="default"}',
         ):
             self.assertIn(needle, actual)

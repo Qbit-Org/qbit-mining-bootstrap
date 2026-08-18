@@ -106,6 +106,12 @@ class ClientState:
     vardiff_window_submitted: int = 0
     vardiff_window_work: Decimal = Decimal("0")
     vardiff_difficulty_estimate: Decimal | None = None
+    # Per-connection evidence that this session's difficulty is real: set on
+    # the first accepted share of the connection and never reset within it.
+    # Reconnect retention reads it to decide whether re-recording an
+    # unchanged difficulty may refresh its TTL; a session that resumed a
+    # retained value and submitted nothing must let that value keep ageing.
+    vardiff_accepted_any: bool = False
     # Owns all per-client difficulty policy, estimates, and Vardiff windows.
     # Share handlers release it before acquiring job_update_lock or the
     # coordinator lock; job delivery may acquire it while job_update_lock is
@@ -650,6 +656,8 @@ class SessionRuntime(Protocol):
     def handle_submit(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def handle_suggest_difficulty(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def note_vardiff_resume_overridden(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def record_session_difficulty(self, *args: Any, **kwargs: Any) -> Any: ...
 
@@ -1295,14 +1303,23 @@ class StratumSessionService:
                     # from requested_difficulty and outranks the resume,
                     # while an md=-only password clamps the just-resumed
                     # value through the share_difficulty fallback.
+                    resumed: Decimal | None = None
                     if not was_authorized:
-                        runtime.resume_client_difficulty(client)
+                        resumed = runtime.resume_client_difficulty(client)
                     client.requested_difficulty, client.requested_min_difficulty = (
                         parse_stratum_password_options(password)
                     )
                     target = runtime.apply_client_difficulty_requests(client)
                     if target is not None:
                         current = client.pending_share_difficulty or client.share_difficulty
+                        if resumed is not None and target != resumed:
+                            # The resume applied a value and this authorize
+                            # immediately replaced it, so it never stuck.
+                            # resumed/clamped stay attempt counters; this
+                            # subtracts the ones an explicit difficulty
+                            # request (d=/md=, or a suggestion sent before
+                            # authorize) overrode.
+                            runtime.note_vardiff_resume_overridden()
                         if target != current:
                             if not was_authorized:
                                 client.share_difficulty = target

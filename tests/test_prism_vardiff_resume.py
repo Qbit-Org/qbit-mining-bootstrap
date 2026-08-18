@@ -10,17 +10,23 @@ ordering, the plausibility clamp, the kill switch, and the new metrics.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import threading
 import time
 import unittest
+from typing import Iterator
 from unittest import mock
 
 from lab.auxpow import vardiff
 from lab.prism.coordinator_config import load_coordinator_config
 from lab.prism.metrics import MetricsRenderer
-from lab.prism.stratum_session import ClientState
+from lab.prism.prism_coordinator import PrismCoordinator
+from lab.prism.rpc import JsonRpc
+from lab.prism.stratum_session import ClientState, StratumError
 from lab.prism.vardiff_service import (
     PRISM_VARDIFF_RESUME_OUTCOMES,
     SessionDifficultyStore,
@@ -57,9 +63,9 @@ class SessionDifficultyStoreTests(unittest.TestCase):
     def test_lru_bound_evicts_oldest_and_counts(self) -> None:
         store = SessionDifficultyStore(max_entries=2, ttl_seconds=900.0)
         now = time.monotonic()
-        store.record(("default", "a"), Decimal("512"), now=now)
-        store.record(("default", "b"), Decimal("256"), now=now)
-        store.record(("default", "c"), Decimal("128"), now=now)
+        store.record(("default", "a"), Decimal("512"), now=now, share_backed=True)
+        store.record(("default", "b"), Decimal("256"), now=now, share_backed=True)
+        store.record(("default", "c"), Decimal("128"), now=now, share_backed=True)
 
         self.assertEqual(len(store), 2)
         self.assertEqual(store.lookup(("default", "a"), now=now), (None, "miss"))
@@ -71,15 +77,15 @@ class SessionDifficultyStoreTests(unittest.TestCase):
     def test_hit_refreshes_recency_but_not_ttl_and_keeps_the_entry(self) -> None:
         store = SessionDifficultyStore(max_entries=2, ttl_seconds=10.0)
         now = time.monotonic()
-        store.record(("default", "a"), Decimal("512"), now=now)
-        store.record(("default", "b"), Decimal("1"), now=now + 1)
+        store.record(("default", "a"), Decimal("512"), now=now, share_backed=True)
+        store.record(("default", "b"), Decimal("1"), now=now + 1, share_backed=True)
 
         # A hit does not remove the entry (a miner may re-authorize) and it
         # refreshes LRU recency: the next capacity eviction takes "b".
         self.assertEqual(
             store.lookup(("default", "a"), now=now + 2), (Decimal("512"), "hit")
         )
-        store.record(("default", "c"), Decimal("2"), now=now + 2)
+        store.record(("default", "c"), Decimal("2"), now=now + 2, share_backed=True)
         self.assertEqual(store.lookup(("default", "b"), now=now + 2), (None, "miss"))
         self.assertEqual(
             store.lookup(("default", "a"), now=now + 6), (Decimal("512"), "hit")
@@ -94,10 +100,12 @@ class SessionDifficultyStoreTests(unittest.TestCase):
     def test_record_silently_ignores_unusable_difficulties(self) -> None:
         store = SessionDifficultyStore(max_entries=4, ttl_seconds=10.0)
         now = time.monotonic()
-        store.record(("default", "a"), Decimal("0"), now=now)
-        store.record(("default", "a"), Decimal("-4"), now=now)
-        store.record(("default", "a"), Decimal("NaN"), now=now)
-        store.record(("default", "a"), Decimal("Infinity"), now=now)
+        store.record(("default", "a"), Decimal("0"), now=now, share_backed=True)
+        store.record(("default", "a"), Decimal("-4"), now=now, share_backed=True)
+        store.record(("default", "a"), Decimal("NaN"), now=now, share_backed=True)
+        store.record(
+            ("default", "a"), Decimal("Infinity"), now=now, share_backed=True
+        )
         self.assertEqual(len(store), 0)
 
     def test_non_positive_bounds_disable_retention_entirely(self) -> None:
@@ -106,7 +114,7 @@ class SessionDifficultyStoreTests(unittest.TestCase):
             SessionDifficultyStore(max_entries=0, ttl_seconds=10.0),
             SessionDifficultyStore(max_entries=8, ttl_seconds=0.0),
         ):
-            store.record(("default", "a"), Decimal("512"), now=now)
+            store.record(("default", "a"), Decimal("512"), now=now, share_backed=True)
             self.assertEqual(len(store), 0)
             self.assertEqual(
                 store.lookup(("default", "a"), now=now), (None, "disabled")
@@ -115,14 +123,72 @@ class SessionDifficultyStoreTests(unittest.TestCase):
     def test_prune_drops_only_expired_entries(self) -> None:
         store = SessionDifficultyStore(max_entries=4, ttl_seconds=10.0)
         now = time.monotonic()
-        store.record(("default", "old"), Decimal("512"), now=now)
-        store.record(("default", "new"), Decimal("256"), now=now + 8)
+        store.record(("default", "old"), Decimal("512"), now=now, share_backed=True)
+        store.record(
+            ("default", "new"), Decimal("256"), now=now + 8, share_backed=True
+        )
 
         self.assertEqual(store.prune(now=now + 11), 1)
         self.assertEqual(len(store), 1)
         self.assertEqual(
             store.lookup(("default", "new"), now=now + 11),
             (Decimal("256"), "hit"),
+        )
+
+    def test_unchanged_value_without_share_evidence_keeps_ageing(self) -> None:
+        # The disconnect seam records on EVERY disconnect. If that refreshed
+        # the timestamp, a session that resumes a retained value, submits
+        # nothing and disconnects would keep the value alive forever on
+        # reconnect cycles shorter than the TTL.
+        store = SessionDifficultyStore(max_entries=4, ttl_seconds=10.0)
+        now = time.monotonic()
+        store.record(("default", "a"), Decimal("512"), now=now, share_backed=True)
+        store.record(
+            ("default", "a"), Decimal("512"), now=now + 8, share_backed=False
+        )
+
+        self.assertEqual(
+            store.lookup(("default", "a"), now=now + 9), (Decimal("512"), "hit")
+        )
+        self.assertEqual(
+            store.lookup(("default", "a"), now=now + 11), (None, "expired")
+        )
+
+    def test_ttl_refreshes_on_re_validation_only(self) -> None:
+        store = SessionDifficultyStore(max_entries=4, ttl_seconds=10.0)
+        now = time.monotonic()
+        # An unchanged value backed by accepted shares was re-validated.
+        store.record(("default", "a"), Decimal("512"), now=now, share_backed=True)
+        store.record(
+            ("default", "a"), Decimal("512"), now=now + 8, share_backed=True
+        )
+        self.assertEqual(
+            store.lookup(("default", "a"), now=now + 17), (Decimal("512"), "hit")
+        )
+        # A value that actually moved is new information, share-backed or not
+        # (an idle step-down carries no shares but does lower the value).
+        store.record(("default", "b"), Decimal("512"), now=now, share_backed=True)
+        store.record(
+            ("default", "b"), Decimal("128"), now=now + 8, share_backed=False
+        )
+        self.assertEqual(
+            store.lookup(("default", "b"), now=now + 17), (Decimal("128"), "hit")
+        )
+
+    def test_non_refreshing_record_still_moves_lru_recency(self) -> None:
+        # Keeping the old timestamp must not turn record() into a no-op:
+        # recency and the TTL stay independent, so the LRU bound keeps
+        # evicting genuinely cold entries.
+        store = SessionDifficultyStore(max_entries=2, ttl_seconds=100.0)
+        now = time.monotonic()
+        store.record(("default", "a"), Decimal("512"), now=now, share_backed=True)
+        store.record(("default", "b"), Decimal("256"), now=now + 1, share_backed=True)
+        store.record(("default", "a"), Decimal("512"), now=now + 2, share_backed=False)
+        store.record(("default", "c"), Decimal("128"), now=now + 3, share_backed=True)
+
+        self.assertEqual(store.lookup(("default", "b"), now=now + 3), (None, "miss"))
+        self.assertEqual(
+            store.lookup(("default", "a"), now=now + 3), (Decimal("512"), "hit")
         )
 
     def test_session_difficulty_key_requires_a_reserved_worker(self) -> None:
@@ -193,6 +259,35 @@ def converge_and_disconnect(server, state: ClientState, difficulty: Decimal) -> 
     server.disconnect_client(state)
 
 
+@contextmanager
+def frozen_clock(now: float) -> Iterator[None]:
+    """Run a reconnect cycle at an exact monotonic instant.
+
+    Retention timestamps come from time.monotonic() inside the vardiff
+    service, so the whole record/lookup path has to see the injected value.
+    """
+    with mock.patch.object(time, "monotonic", return_value=now):
+        yield
+
+
+def silent_reconnect_cycle(server, connection_id: int, now: float) -> ClientState:
+    """Connect, authorize, submit nothing, disconnect -- all at ``now``."""
+    with frozen_clock(now):
+        state = connect_client(server, connection_id)
+        authorize(server, state)
+        server.disconnect_client(state)
+    return state
+
+
+def retained_difficulty(server, now: float | None = None) -> Decimal | None:
+    store = server._ensure_vardiff_service().session_difficulty_store
+    retained, _outcome = store.lookup(
+        ("default", PAYOUT_ADDRESS),
+        now=time.monotonic() if now is None else now,
+    )
+    return retained
+
+
 def resume_outcomes(server) -> dict[str, int]:
     outcomes = server.vardiff_convergence_snapshot()["resume_outcomes"]
     assert isinstance(outcomes, dict)
@@ -239,6 +334,7 @@ class ReconnectResumeTests(unittest.TestCase):
             ("default", PAYOUT_ADDRESS),
             Decimal("1e15"),
             now=time.monotonic(),
+            share_backed=True,
         )
 
         state = connect_client(server, 1)
@@ -283,6 +379,7 @@ class ReconnectResumeTests(unittest.TestCase):
             ("default", PAYOUT_ADDRESS),
             Decimal("262144"),
             now=time.monotonic(),
+            share_backed=True,
         )
 
         state = connect_client(server, 1)
@@ -298,6 +395,7 @@ class ReconnectResumeTests(unittest.TestCase):
             ("default", PAYOUT_ADDRESS),
             Decimal("262144"),
             now=time.monotonic(),
+            share_backed=True,
         )
 
         state = connect_client(server, 1)
@@ -318,12 +416,215 @@ class ReconnectResumeTests(unittest.TestCase):
             ("default", PAYOUT_ADDRESS),
             Decimal("262144"),
             now=time.monotonic(),
+            share_backed=True,
         )
 
         authorize(server, state)
 
         self.assertEqual(state.share_difficulty, Decimal("65536"))
         self.assertEqual(resume_outcomes(server)["resumed"], 0)
+
+    def test_silent_reconnect_cycles_never_extend_the_retention_ttl(self) -> None:
+        # The review repro: with the idle step-down sweep disabled (as
+        # deployed), a session resumed above its true hashrate produces no
+        # accepted shares and cannot step itself down. If each disconnect
+        # re-stamped the entry, cycles shorter than the TTL would keep that
+        # value adoptable forever and the short TTL would protect nothing.
+        server = resume_coordinator(vardiff_resume_ttl_seconds=900.0)
+        start = time.monotonic()
+        with frozen_clock(start):
+            first = connect_client(server, 1)
+            authorize(server, first)
+            converge_and_disconnect(server, first, Decimal("262144"))
+
+        # Three reconnect cycles inside the TTL, each submitting nothing.
+        for index, offset in enumerate((300.0, 600.0, 900.0), start=2):
+            state = silent_reconnect_cycle(server, index, start + offset)
+            self.assertEqual(
+                state.share_difficulty,
+                Decimal("262144"),
+                f"cycle at +{offset}s should still resume",
+            )
+
+        # The entry ages from the original convergence at `start`, not from
+        # the last silent disconnect: it is gone one cycle later.
+        with frozen_clock(start + 1200.0):
+            last = connect_client(server, 5)
+            authorize(server, last)
+
+        self.assertEqual(last.share_difficulty, STANDARD_LANE_START)
+        outcomes = resume_outcomes(server)
+        self.assertEqual(outcomes["resumed"], 3)
+        self.assertEqual(outcomes["expired"], 1)
+        self.assertIsNone(retained_difficulty(server, now=start + 1200.0))
+
+    def test_reconnect_with_an_accepted_share_refreshes_the_ttl(self) -> None:
+        # The counterpart: an accepted share re-validates the retained value,
+        # so its TTL restarts and the session keeps resuming.
+        server = resume_coordinator(vardiff_resume_ttl_seconds=900.0)
+        service = server._ensure_vardiff_service()
+        start = time.monotonic()
+        with frozen_clock(start):
+            first = connect_client(server, 1)
+            authorize(server, first)
+            converge_and_disconnect(server, first, Decimal("262144"))
+
+        with frozen_clock(start + 800.0):
+            second = connect_client(server, 2)
+            authorize(server, second)
+            self.assertEqual(second.share_difficulty, Decimal("262144"))
+            # Open the vardiff window at the injected instant so the share
+            # below only marks the connection, leaving the retarget path
+            # (covered separately) out of this test.
+            with server._client_vardiff_lock(second):
+                second.vardiff_window_started_monotonic = start + 800.0
+            service.note_accepted(second, Decimal("262144"))
+            self.assertTrue(second.vardiff_accepted_any)
+            self.assertIsNone(second.pending_share_difficulty)
+            server.disconnect_client(second)
+
+        with frozen_clock(start + 1600.0):
+            third = connect_client(server, 3)
+            authorize(server, third)
+
+        self.assertEqual(third.share_difficulty, Decimal("262144"))
+        outcomes = resume_outcomes(server)
+        self.assertEqual(outcomes["resumed"], 2)
+        self.assertEqual(outcomes["expired"], 0)
+
+    def test_disconnect_retains_the_delivered_difficulty_not_a_pending_one(
+        self,
+    ) -> None:
+        # pending_share_difficulty is advertised with a FUTURE job, so a
+        # disconnect racing an in-flight retarget must not retain a value the
+        # miner was never given. A retarget that did land records itself at
+        # its own commit point.
+        server = resume_coordinator()
+        state = connect_client(server, 1)
+        authorize(server, state)
+        with server._client_vardiff_lock(state):
+            state.share_difficulty = Decimal("262144")
+            state.pending_share_difficulty = Decimal("1048576")
+
+        server.disconnect_client(state)
+
+        self.assertEqual(retained_difficulty(server), Decimal("262144"))
+
+    def test_committed_retarget_retains_the_new_difficulty(self) -> None:
+        # The `if sent:` commit point inside retarget_locked: a delivered
+        # retarget retains its own value, with share evidence taken from the
+        # window that drove it.
+        server = resume_coordinator()
+        service = server._ensure_vardiff_service()
+        state = connect_client(server, 1)
+        authorize(server, state)
+        recorded: list[tuple[Decimal, bool]] = []
+        store = service.session_difficulty_store
+        store_record = store.record
+
+        def spy(key, difficulty, *, now, share_backed):  # type: ignore[no-untyped-def]
+            recorded.append((difficulty, share_backed))
+            store_record(key, difficulty, now=now, share_backed=share_backed)
+
+        store.record = spy  # type: ignore[method-assign]
+
+        # A share-driven window at four times the target share rate.
+        server.retarget_client(
+            state,
+            current_difficulty=STANDARD_LANE_START,
+            accepted_shares=80,
+            submitted_shares=80,
+            accepted_difficulty=STANDARD_LANE_START * 80,
+            elapsed_seconds=Decimal("300"),
+        )
+
+        self.assertEqual(state.pending_share_difficulty, Decimal("65536"))
+        self.assertEqual(recorded, [(Decimal("65536"), True)])
+        self.assertEqual(retained_difficulty(server), Decimal("65536"))
+
+        # A zero-share window steps back down; it carries no share evidence,
+        # but it moves the value, so the store refreshes the TTL anyway.
+        server.retarget_client(
+            state,
+            current_difficulty=Decimal("65536"),
+            accepted_shares=0,
+            submitted_shares=0,
+            accepted_difficulty=Decimal("0"),
+            elapsed_seconds=Decimal("300"),
+        )
+
+        self.assertEqual(recorded[-1], (STANDARD_LANE_START, False))
+        self.assertEqual(retained_difficulty(server), STANDARD_LANE_START)
+
+    def test_explicit_password_difficulty_counts_an_overridden_resume(self) -> None:
+        server = resume_coordinator()
+        service = server._ensure_vardiff_service()
+        service.session_difficulty_store.record(
+            ("default", PAYOUT_ADDRESS),
+            Decimal("262144"),
+            now=time.monotonic(),
+            share_backed=True,
+        )
+
+        state = connect_client(server, 1)
+        authorize(server, state, password="d=32768")
+
+        self.assertEqual(state.share_difficulty, Decimal("32768"))
+        outcomes = resume_outcomes(server)
+        # resumed stays an attempt counter; overridden subtracts the ones an
+        # explicit request replaced, so resumed + clamped - overridden is the
+        # number of resumes that actually stuck.
+        self.assertEqual(outcomes["resumed"], 1)
+        self.assertEqual(outcomes["overridden"], 1)
+
+    def test_a_resume_that_sticks_is_not_counted_as_overridden(self) -> None:
+        server = resume_coordinator()
+        service = server._ensure_vardiff_service()
+        service.session_difficulty_store.record(
+            ("default", PAYOUT_ADDRESS),
+            Decimal("262144"),
+            now=time.monotonic(),
+            share_backed=True,
+        )
+
+        # No password request at all, then a request that resolves to exactly
+        # the resumed value: neither supersedes the resume.
+        first = connect_client(server, 1)
+        authorize(server, first)
+        second = connect_client(server, 2)
+        authorize(server, second, password="d=262144")
+
+        self.assertEqual(first.share_difficulty, Decimal("262144"))
+        self.assertEqual(second.share_difficulty, Decimal("262144"))
+        outcomes = resume_outcomes(server)
+        self.assertEqual(outcomes["resumed"], 2)
+        self.assertEqual(outcomes["overridden"], 0)
+
+    def test_failed_username_reservation_neither_resumes_nor_retains(self) -> None:
+        server = resume_coordinator()
+        service = server._ensure_vardiff_service()
+        service.session_difficulty_store.record(
+            ("default", PAYOUT_ADDRESS),
+            Decimal("262144"),
+            now=time.monotonic(),
+            share_backed=True,
+        )
+        server.reserve_client_username = lambda client, worker: False
+        state = connect_client(server, 1)
+
+        with self.assertRaises(StratumError):
+            authorize(server, state)
+
+        self.assertFalse(state.authorized)
+        self.assertEqual(state.share_difficulty, STANDARD_LANE_START)
+        outcomes = resume_outcomes(server)
+        self.assertEqual(outcomes["resumed"], 0)
+        self.assertEqual(outcomes["clamped"], 0)
+        # No reserved worker means no retention identity, so the disconnect
+        # that follows the rejection writes nothing either.
+        server.disconnect_client(state)
+        self.assertEqual(service.session_difficulty_store.snapshot()["records"], 1)
+        self.assertEqual(retained_difficulty(server), Decimal("262144"))
 
     def test_kill_switch_restores_lane_start_reconnects(self) -> None:
         server = resume_coordinator(vardiff_resume_enabled=False)
@@ -372,6 +673,56 @@ class ResumeConfigTests(unittest.TestCase):
         self.assertEqual(tuned.vardiff_resume_ttl_seconds, 120.0)
         self.assertEqual(tuned.vardiff_resume_max_entries, 16)
         self.assertEqual(tuned.vardiff_resume_max_start_factor, Decimal("64"))
+
+    def test_env_sizes_the_coordinator_store_end_to_end(self) -> None:
+        # env -> StratumConfig -> PrismCoordinator attributes ->
+        # SessionDifficultyStore. The service reads those attributes through
+        # getattr defaults, so a rename anywhere in the chain would silently
+        # fall back to the defaults instead of failing; this asserts the
+        # configured values actually reach the store.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = {
+                **self.BASE_ENV,
+                "PRISM_ALLOW_MEMORY_LEDGER": "1",
+                "PRISM_AUDIT_DIR": str(root),
+                "PRISM_EVIDENCE_PATH": str(root / "evidence.json"),
+                "PRISM_STRATUM_VARDIFF_RESUME_TTL_SECONDS": "123",
+                "PRISM_STRATUM_VARDIFF_RESUME_MAX_ENTRIES": "17",
+            }
+            config = load_coordinator_config(source)
+            with mock.patch.object(
+                JsonRpc, "call", side_effect=RuntimeError("offline")
+            ):
+                server = PrismCoordinator(config)
+
+        self.assertEqual(server.vardiff_resume_ttl_seconds, 123.0)
+        self.assertEqual(server.vardiff_resume_max_entries, 17)
+        store = server._ensure_vardiff_service().session_difficulty_store
+        self.assertEqual(store.ttl_seconds, 123.0)
+        self.assertEqual(store.max_entries, 17)
+        self.assertTrue(store.enabled)
+
+    def test_kill_switch_env_disables_the_coordinator_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = {
+                **self.BASE_ENV,
+                "PRISM_ALLOW_MEMORY_LEDGER": "1",
+                "PRISM_AUDIT_DIR": str(root),
+                "PRISM_EVIDENCE_PATH": str(root / "evidence.json"),
+                "PRISM_STRATUM_VARDIFF_RESUME": "0",
+            }
+            config = load_coordinator_config(source)
+            with mock.patch.object(
+                JsonRpc, "call", side_effect=RuntimeError("offline")
+            ):
+                server = PrismCoordinator(config)
+
+        self.assertFalse(server.vardiff_resume_enabled)
+        store = server._ensure_vardiff_service().session_difficulty_store
+        self.assertEqual(store.max_entries, 0)
+        self.assertFalse(store.enabled)
 
     def test_start_factor_below_one_fails_startup(self) -> None:
         with self.assertRaises(SystemExit) as raised:
@@ -436,6 +787,7 @@ class ConvergenceObservabilityTests(unittest.TestCase):
             ("default", "miner-a"),
             Decimal("262144"),
             now=time.monotonic(),
+            share_backed=True,
         )
 
         snapshot = service.convergence_snapshot()

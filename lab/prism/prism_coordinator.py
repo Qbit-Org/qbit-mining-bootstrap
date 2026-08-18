@@ -7544,8 +7544,17 @@ class PrismCoordinator:
     def resume_client_difficulty(self, client: ClientState) -> Decimal | None:
         return self._ensure_vardiff_service().apply_resumed_difficulty(client)
 
+    def note_vardiff_resume_overridden(self) -> None:
+        self._ensure_vardiff_service().note_resume_overridden()
+
     def record_session_difficulty(self, client: ClientState) -> None:
-        self._ensure_vardiff_service().record_session_difficulty(client)
+        # Only a connection that produced an accepted share may refresh the
+        # retained value's TTL. Without that evidence a reconnect loop of
+        # silent sessions would re-stamp the entry forever and defeat the TTL.
+        self._ensure_vardiff_service().record_session_difficulty(
+            client,
+            share_backed=bool(getattr(client, "vardiff_accepted_any", False)),
+        )
 
     def apply_job_difficulty(self, client: ClientState, job: direct_stratum.DirectQbitStratumJob) -> None:
         return self._ensure_job_delivery_service().apply_job_difficulty(client, job)

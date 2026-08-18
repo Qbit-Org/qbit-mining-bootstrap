@@ -55,12 +55,13 @@ PRISM_VARDIFF_IDLE_SKIP_REASONS = (
 # Bounded outcomes for one reconnect difficulty resume attempt; also the
 # metric label order for qbit_prism_vardiff_resume_total.
 PRISM_VARDIFF_RESUME_OUTCOMES = (
-    "resumed",    # retained value adopted unchanged
-    "clamped",    # retained value adopted after being pulled into bounds
-    "expired",    # entry existed, TTL had passed
-    "miss",       # no entry for this key
-    "rejected",   # entry present but unusable (non-finite / non-positive)
-    "disabled",   # retention off, or vardiff disabled for this client
+    "resumed",     # retained value adopted unchanged
+    "clamped",     # retained value adopted after being pulled into bounds
+    "overridden",  # adopted, then superseded by an explicit difficulty request
+    "expired",     # entry existed, TTL had passed
+    "miss",        # no entry for this key
+    "rejected",    # entry present but unusable (non-finite / non-positive)
+    "disabled",    # retention off, or vardiff disabled for this client
 )
 
 
@@ -117,7 +118,20 @@ class SessionDifficultyStore:
         difficulty: Decimal,
         *,
         now: float,
+        share_backed: bool,
     ) -> None:
+        """Retain ``difficulty`` for ``key``, ageing the entry honestly.
+
+        The stored difficulty is always updated, but ``recorded_monotonic``
+        (what the TTL measures) is refreshed only when the value was
+        genuinely re-validated: a first record, a value that actually moved,
+        or an unchanged value backed by accepted shares. Re-recording an
+        unchanged value with no share evidence -- a session that resumed a
+        retained difficulty, submitted nothing and disconnected -- keeps the
+        original timestamp, so a reconnect loop shorter than the TTL can no
+        longer keep a stale value alive forever. LRU recency is independent
+        of the TTL and still moves on every record, exactly as on ``lookup``.
+        """
         if not self.enabled:
             return
         if (
@@ -127,9 +141,18 @@ class SessionDifficultyStore:
         ):
             return
         with self._lock:
+            existing = self._entries.get(key)
+            if (
+                existing is None
+                or difficulty != existing.difficulty
+                or share_backed
+            ):
+                recorded_monotonic = float(now)
+            else:
+                recorded_monotonic = existing.recorded_monotonic
             self._entries[key] = RetainedSessionDifficulty(
                 difficulty=difficulty,
-                recorded_monotonic=float(now),
+                recorded_monotonic=recorded_monotonic,
             )
             self._entries.move_to_end(key)
             self.record_count += 1
@@ -454,6 +477,12 @@ class VardiffService:
                 self.vardiff_lane_accepted_counts.get(lane, 0) + 1
             )
         with client_vardiff_lock(client):
+            # Per-connection evidence for reconnect retention, set before the
+            # enabled early-out so it holds where vardiff is disabled too.
+            # Never reset within a connection: one accepted share is enough to
+            # prove the difficulty this session is running at is real, which
+            # is what lets disconnect refresh the retained value's TTL.
+            client.vardiff_accepted_any = True
             config = (
                 client.vardiff_config
                 or client.listener_vardiff_config
@@ -497,26 +526,46 @@ class VardiffService:
         self,
         client: ClientState,
         difficulty: Decimal | None = None,
+        *,
+        share_backed: bool,
     ) -> None:
         """Retain a session's converged difficulty for reconnect resume.
 
         Callers pass the just-committed retarget difficulty explicitly; the
-        disconnect seam omits it and the client's current effective value is
-        read under its vardiff lock instead.
+        disconnect seam omits it and the client's DELIVERED difficulty is
+        read under its vardiff lock instead. pending_share_difficulty is
+        deliberately not consulted here: it is advertised with a future job,
+        so a disconnect racing an in-flight retarget would otherwise retain a
+        value the miner was never given. Nothing is lost -- a retarget whose
+        paired send completed records its own value at that commit point.
+
+        ``share_backed`` says whether this difficulty is backed by accepted
+        shares; the store uses it to decide whether re-recording an unchanged
+        value may refresh its TTL.
         """
         key = session_difficulty_key(client)
         if key is None:
             return
         if difficulty is None:
             with client_vardiff_lock(client):
-                difficulty = (
-                    client.pending_share_difficulty or client.share_difficulty
-                )
+                difficulty = client.share_difficulty
         self.session_difficulty_store.record(
             key,
             difficulty,
             now=time.monotonic(),
+            share_backed=share_backed,
         )
+
+    def note_resume_overridden(self) -> None:
+        """Count a resumed difficulty that an explicit request superseded.
+
+        resumed/clamped stay attempt counters, so
+        ``resumed + clamped - overridden`` is the number of resumes that
+        actually stuck. The caller is the authorize path: it is the only
+        place that knows both the value the resume applied and the target a
+        password ``d=``/``md=`` or a pending suggestion resolved to.
+        """
+        self._count_resume_outcome("overridden")
 
     def resume_client_difficulty(self, client: ClientState) -> Decimal | None:
         """The difficulty a reconnecting worker should resume at, or None.
@@ -586,6 +635,13 @@ class VardiffService:
         lock, never the reverse; membership is therefore snapshotted under
         the coordinator lock alone, released, and only then is each client's
         vardiff lock taken to read its effective policy and difficulty.
+
+        The at-ceiling census is therefore O(connections) lock acquisitions
+        per call, bounded by the deployed 4096-connection cap. That cost is
+        acceptable because this runs on the background metrics refresher and
+        /metrics serves its cached payload, and because each vardiff lock is
+        held for a few field reads only -- no client vardiff lock is ever
+        held across a socket write, so a slow miner cannot convoy the census.
         """
         with self.runtime.lock:
             clients = tuple(self.runtime.clients)
@@ -1234,8 +1290,15 @@ class VardiffService:
             if sent:
                 # Retain the committed difficulty here, not only on
                 # disconnect, so sessions that die without a clean
-                # disconnect still resume at their converged value.
-                self.record_session_difficulty(client, next_difficulty)
+                # disconnect still resume at their converged value. An idle
+                # step-down carries no accepted shares, but it also moves the
+                # value, so the store refreshes its TTL on the changed-value
+                # branch instead.
+                self.record_session_difficulty(
+                    client,
+                    next_difficulty,
+                    share_backed=accepted_shares > 0,
+                )
                 return True
         except Exception:
             # Cached stamping can surface _JobBuildFailed before delivery, and

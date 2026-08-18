@@ -651,13 +651,13 @@ class MetricsRenderer:
                 f'qbit_prism_vardiff_lane_accepted_shares_total{{lane="{self.port.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0))}'
                 for lane in lanes
             ],
-            "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane since coordinator start.",
+            "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. Kept on the same elapsed formula as qbit_prism_shares_per_second so the two stay comparable.",
             "# TYPE qbit_prism_vardiff_lane_accepted_shares_per_second gauge",
             *[
                 f'qbit_prism_vardiff_lane_accepted_shares_per_second{{lane="{self.port.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0)) / elapsed:.12g}'
                 for lane in lanes
             ],
-            "# HELP qbit_prism_vardiff_resume_total Reconnect difficulty resume attempts by outcome; clamped means the retained value was pulled into the lane's plausibility bounds.",
+            "# HELP qbit_prism_vardiff_resume_total Reconnect difficulty resume attempts by outcome; clamped means the retained value was pulled into the lane's plausibility bounds, overridden means an adopted value was superseded by an explicit difficulty request in the same authorize, so resumed + clamped - overridden is the number that stuck.",
             "# TYPE qbit_prism_vardiff_resume_total counter",
             *[
                 f'qbit_prism_vardiff_resume_total{{outcome="{outcome}"}} {int(resume_outcomes.get(outcome, 0))}'
