@@ -34,6 +34,7 @@ from lab.prism.reorg_reconciler import (
     PRISM_REORG_RECONCILE_LOOKUP_SOURCES,
 )
 from lab.prism.share_submission import PRISM_SHARE_ACK_RESULTS
+from lab.prism.vardiff_service import PRISM_VARDIFF_RESUME_OUTCOMES
 
 
 class MetricsPort(Protocol):
@@ -68,6 +69,7 @@ class MetricsPort(Protocol):
     started_monotonic: Any
     tip_refresh_job_count: Any
     vardiff_config: Any
+    listener_profiles: Any
     accept_resource_exhaustion_count: Any
     block_candidate_abandoned_counts: Any
     block_candidate_accept_pending_defer_count: Any
@@ -152,6 +154,7 @@ class MetricsPort(Protocol):
     def share_ack_snapshot(self) -> dict[str, dict[str, Any]]: ...
     def startup_phase_seconds(self) -> dict[str, float]: ...
     def tip_refresh_metrics_lines(self) -> Any: ...
+    def vardiff_convergence_snapshot(self) -> Any: ...
     def vardiff_idle_metrics_lines(self) -> Any: ...
 
 
@@ -586,6 +589,7 @@ class MetricsRenderer:
         lines.extend(self.share_ack_metrics_lines())
         lines.extend(self.port.ctv_fanout_broadcaster_metrics_lines())
         lines.extend(self.port.vardiff_idle_metrics_lines())
+        lines.extend(self.vardiff_convergence_metrics_lines())
         lines.extend(self.port.block_finalization_metrics_lines())
         lines.extend(self.job_build_metrics_lines())
         lines.extend(self.port.tip_refresh_metrics_lines())
@@ -617,6 +621,52 @@ class MetricsRenderer:
                 f'qbit_prism_share_ack_seconds_count{{result="{result}"}} {histogram["count"]}'
             )
         return lines
+
+    def vardiff_convergence_metrics_lines(self) -> list[str]:
+        """Vardiff convergence and reconnect-resume observability.
+
+        The lane label set is deterministic: configured listener profiles in
+        order, then any additional lane names observed in the counters,
+        sorted. The per-second gauge uses the same elapsed formula as
+        qbit_prism_shares_per_second so the two stay comparable.
+        """
+        snapshot = self.port.vardiff_convergence_snapshot()
+        lane_accepted = snapshot["lane_accepted_shares"]
+        assert isinstance(lane_accepted, dict)
+        resume_outcomes = snapshot["resume_outcomes"]
+        assert isinstance(resume_outcomes, dict)
+        lanes = [
+            str(profile.name)
+            for profile in getattr(self.port, "listener_profiles", ()) or ()
+        ]
+        lanes.extend(sorted(lane for lane in lane_accepted if lane not in lanes))
+        elapsed = max(0.001, time.monotonic() - self.port.started_monotonic)
+        return [
+            "# HELP qbit_prism_vardiff_sessions_at_max_difficulty Sessions whose current difficulty sits at their effective vardiff ceiling.",
+            "# TYPE qbit_prism_vardiff_sessions_at_max_difficulty gauge",
+            f"qbit_prism_vardiff_sessions_at_max_difficulty {int(snapshot['sessions_at_max_difficulty'])}",
+            "# HELP qbit_prism_vardiff_lane_accepted_shares_total Accepted shares by Stratum lane.",
+            "# TYPE qbit_prism_vardiff_lane_accepted_shares_total counter",
+            *[
+                f'qbit_prism_vardiff_lane_accepted_shares_total{{lane="{self.port.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0))}'
+                for lane in lanes
+            ],
+            "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. Kept on the same elapsed formula as qbit_prism_shares_per_second so the two stay comparable.",
+            "# TYPE qbit_prism_vardiff_lane_accepted_shares_per_second gauge",
+            *[
+                f'qbit_prism_vardiff_lane_accepted_shares_per_second{{lane="{self.port.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0)) / elapsed:.12g}'
+                for lane in lanes
+            ],
+            "# HELP qbit_prism_vardiff_resume_total Reconnect difficulty resume attempts by outcome; clamped means the retained value was pulled into the lane's plausibility bounds, overridden means an adopted value was superseded by an explicit difficulty request in the same authorize, so resumed + clamped - overridden is the number that stuck.",
+            "# TYPE qbit_prism_vardiff_resume_total counter",
+            *[
+                f'qbit_prism_vardiff_resume_total{{outcome="{outcome}"}} {int(resume_outcomes.get(outcome, 0))}'
+                for outcome in PRISM_VARDIFF_RESUME_OUTCOMES
+            ],
+            "# HELP qbit_prism_vardiff_resume_retained_sessions Worker sessions holding a retained difficulty eligible for resume.",
+            "# TYPE qbit_prism_vardiff_resume_retained_sessions gauge",
+            f"qbit_prism_vardiff_resume_retained_sessions {int(snapshot['retained_sessions'])}",
+        ]
 
     def coordinator_lock_metrics_lines(self) -> list[str]:
         contention_count, wait_sum, wait_max = (
