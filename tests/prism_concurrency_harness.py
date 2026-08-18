@@ -752,12 +752,20 @@ class FakePostgres:
                 self.lease = replace(self.lease, xmax=None)
 
     def orphan(self, transaction: Transaction) -> None:
-        """The client vanished without RST: the transaction stays open forever.
+        """The client vanished without RST: the transaction stays open.
 
         PostgreSQL finished executing the statement and is waiting for a
-        COMMIT that will never arrive. Nothing releases the tuple lock until
-        TCP keepalive teardown, and nothing in this repository sets
-        ``idle_in_transaction_session_timeout``.
+        COMMIT that will never arrive, so it keeps the tuple lock.
+
+        This model does not implement a reaper. Production now sets
+        ``idle_in_transaction_session_timeout``
+        (``PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS``, 15s by
+        default) on every coordinator session, so a real orphan of *this*
+        deployment's making is aborted and its locks released. An orphan here
+        is therefore the worst case rather than the only case: the foreign
+        session the guard cannot reach, or the window before it fires.
+        Scenarios that want the reap must model it explicitly; nothing in the
+        harness ends an orphan on its own.
         """
         transaction.orphaned = True
 
@@ -1317,6 +1325,24 @@ class FakeSqlBackend:
             # a statement that evaluates to SQL NULL raises here, exactly as
             # it does for a real client.
             return parse_single_json_value(result)
+        except LockTimeout as exc:
+            if transaction is not None and backend.transaction is transaction:
+                self.server._rollback(transaction)
+            if timeout_seconds is None:
+                raise
+            # Both shipped `LedgerSqlPort` implementations translate a
+            # cancellation caused by the caller's own deadline into
+            # `LedgerOperationTimeout`, and only when that deadline was armed:
+            # `_NativePostgresClient.run_json` gates on
+            # `timeout_seconds is not None and _is_postgres_deadline_error`,
+            # and the psql backend applies the same test to stderr. That
+            # translation is the contract callers retry against, so a model of
+            # this seam that skipped it would let a caller-side retry loop look
+            # dead here while working in production. Nothing exercised it
+            # before a deadline reached a pooled lease statement.
+            raise LedgerOperationTimeout(
+                f"postgres operation exceeded {timeout_seconds:g}s"
+            ) from exc
         except BaseException:
             if transaction is not None and backend.transaction is transaction:
                 self.server._rollback(transaction)

@@ -44,6 +44,32 @@ DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
 DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
 DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
 DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE = 512
+# Startup writer-lease acquisition runs each statement under this per-attempt
+# lock/statement deadline and gives up after this many timed-out attempts (see
+# _run_lease_acquisition_json). 5 attempts x 5s per attempt (~25s) is sized to
+# outlast a typical orphan reap rather than to guarantee one: the 15s
+# idle_in_transaction_session_timeout below runs on the blocking backend's own
+# clock, started when its transaction went idle and not when the successor
+# began retrying, so the two are not directly comparable. In the common case
+# the reap lands inside the budget and a later attempt acquires the lease with
+# no operator action; a budget that runs out reaches the fatal error, which is
+# still the point — a bounded visible failure instead of an unbounded wait.
+DEFAULT_LEASE_ACQUIRE_ATTEMPTS = 5
+DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS = 5.0
+# Session guards every coordinator Postgres session carries (see
+# PostgresSessionGuards). idle_in_transaction_session_timeout makes the server
+# abort a transaction whose client vanished between statements — the failure
+# that otherwise leaves the qbit_ledger_writer_lease row lock held until TCP
+# keepalive teardown (hours at OS defaults). The server-side tcp_keepalives_*
+# GUCs are the backstop for backends idle *outside* a transaction, where the
+# idle-in-transaction timer does not apply: on a TCP connection whose platform
+# implements them, the defaults bound the server's teardown of a socket toward
+# a vanished client at 30 + 3x10 = 60 seconds. Unix-socket connections ignore
+# them, leaving the idle-in-transaction timeout as the guard there.
+DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS = 15.0
+DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT = 3
+DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS = 30
+DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS = 10
 # Only the coordinator assigns this prefix, and PsqlShareLedger preserves it
 # only after acquiring the writer/epoch advisory guard. Other ledger users and
 # psql-only deployments retain ordinary TTL fencing and are never treated as
@@ -1911,6 +1937,69 @@ class LeaseGuardPort(Protocol):
     def close(self) -> None: ...
 
 
+@dataclass(frozen=True)
+class PostgresSessionGuards:
+    """Session-level GUCs that let the server disown a vanished coordinator.
+
+    A coordinator client that disappears without an RST — network partition,
+    SIGSTOP, VM pause — can leave its backend idle in transaction, still
+    holding every row lock the transaction took. The writer-lease landing CTE
+    row-locks the qbit_ledger_writer_lease singleton, so one such orphan
+    blocks a successor's startup lease upsert until the kernel's TCP
+    keepalive teardown (hours at OS defaults). These GUCs make the *server*
+    resolve that on its own: idle_in_transaction_session_timeout aborts the
+    orphaned transaction and releases its locks, and the server-side
+    tcp_keepalives_* settings (all PGC_USERSET, settable per session) bound
+    how long the server keeps a dead socket alive for backends the
+    idle-in-transaction timer cannot cover.
+
+    Constructed once in PsqlShareLedger.__init__ and shared by all three
+    connection paths — the pooled native client, the dedicated lease-guard
+    session, and the psql subprocess backend. The coverage is real but
+    bounded: the tcp_keepalives_* settings are silently ignored on
+    Unix-socket connections and on platforms that do not implement them, so
+    idle_in_transaction_session_timeout is the guard that always applies;
+    and these are session settings, so they reach only the sessions *this*
+    coordinator opens. A foreign session already holding the lease row —
+    another deployment's coordinator, an operator's psql — is bounded only
+    by the caller-side acquisition deadline in _run_lease_acquisition_json.
+    """
+
+    idle_in_transaction_timeout_seconds: float
+    tcp_keepalives_idle_seconds: int
+    tcp_keepalives_interval_seconds: int
+    tcp_keepalives_count: int
+
+    def options_fragment(self) -> str:
+        """Render the guards as libpq ``options`` / PGOPTIONS ``-c`` flags."""
+        idle_ms = max(1, int(self.idle_in_transaction_timeout_seconds * 1000))
+        return (
+            f"-c idle_in_transaction_session_timeout={idle_ms}ms "
+            f"-c tcp_keepalives_idle={self.tcp_keepalives_idle_seconds} "
+            f"-c tcp_keepalives_interval={self.tcp_keepalives_interval_seconds} "
+            f"-c tcp_keepalives_count={self.tcp_keepalives_count}"
+        )
+
+
+def _merged_session_options(
+    psycopg_module: Any,
+    conninfo: str,
+    *coordinator_fragments: str,
+) -> str:
+    """Merge the coordinator's session options with the conninfo's own.
+
+    Passing ``options`` as a connect kwarg replaces any ``options`` value the
+    operator embedded in the DSN outright, so that value must be read back
+    out of the conninfo and kept. The coordinator's fragments go last: libpq
+    applies ``-c`` settings left to right with the last duplicate winning, so
+    a DSN-level default can never silently disable the session guards.
+    """
+    existing = psycopg_module.conninfo.conninfo_to_dict(conninfo).get("options")
+    fragments = [str(existing).strip()] if existing else []
+    fragments.extend(coordinator_fragments)
+    return " ".join(fragment for fragment in fragments if fragment)
+
+
 class _NativePostgresClient:
     """Persistent pooled psycopg client for the share ledger.
 
@@ -1937,12 +2026,14 @@ class _NativePostgresClient:
         *,
         pool_size: int,
         application_name: str | None = None,
+        session_guards: PostgresSessionGuards | None = None,
     ):
         import psycopg  # deferred: the subprocess backend must work without it
 
         self._psycopg = psycopg
         self._conninfo = conninfo
         self._application_name = application_name
+        self._session_guards = session_guards
         self._pool_size = max(1, int(pool_size))
         self._slots = BoundedSemaphore(self._pool_size)
         self._idle: list[Any] = []
@@ -1962,6 +2053,16 @@ class _NativePostgresClient:
             kwargs["connect_timeout"] = max(1, math.ceil(timeout_seconds))
         if self._application_name is not None:
             kwargs["application_name"] = self._application_name
+        session_guards = getattr(self, "_session_guards", None)
+        if session_guards is not None:
+            # Every pooled session carries the orphan-reaping guards, merged
+            # so an operator's DSN-level options value survives with the
+            # guard fragment last (last -c duplicate wins).
+            kwargs["options"] = _merged_session_options(
+                self._psycopg,
+                self._conninfo,
+                session_guards.options_fragment(),
+            )
         return self._psycopg.connect(self._conninfo, **kwargs)
 
     @contextmanager
@@ -2101,14 +2202,34 @@ class _NativePostgresLeaseGuard:
     coordinator. The lease heartbeat runs on this same isolated session.
     """
 
-    def __init__(self, conninfo: str, advisory_lock_key: int):
+    def __init__(
+        self,
+        conninfo: str,
+        advisory_lock_key: int,
+        *,
+        session_guards: PostgresSessionGuards | None = None,
+    ):
         import psycopg  # deferred: psql-only users retain TTL fencing
 
+        # The short statement_timeout stays: the guard session must never
+        # queue behind a fenced write (see verify_writer_lease_guard_session).
+        # The session guards ride the same options string so this dedicated
+        # connection carries the same orphan bounds as every pooled one.
+        # Merged with any operator DSN-level options, coordinator fragments
+        # last so they win.
+        options = "-c statement_timeout=500"
+        if session_guards is not None:
+            options = _merged_session_options(
+                psycopg,
+                conninfo,
+                options,
+                session_guards.options_fragment(),
+            )
         self._connection = psycopg.connect(
             conninfo,
             autocommit=True,
             connect_timeout=2,
-            options="-c statement_timeout=500",
+            options=options,
         )
         self._advisory_lock_key = advisory_lock_key
         self._query_lock = Lock()
@@ -2267,6 +2388,12 @@ class PsqlShareLedger:
         lease_ttl_seconds: float = 60.0,
         lease_authority_margin_seconds: float | None = None,
         lease_adoption_silence_seconds: float = DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
+        lease_acquire_lock_timeout_seconds: float = DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+        lease_acquire_attempts: int = DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+        postgres_idle_in_transaction_timeout_seconds: float = DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+        postgres_tcp_keepalives_idle_seconds: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+        postgres_tcp_keepalives_interval_seconds: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
+        postgres_tcp_keepalives_count: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
         read_concurrency: int = 4,
         accepted_stats_cache_seconds: float = 60.0,
         reward_window_cache_seconds: float = 30.0,
@@ -2303,6 +2430,40 @@ class PsqlShareLedger:
             or lease_adoption_silence_seconds <= 0
         ):
             raise ValueError("lease_adoption_silence_seconds must be finite and positive")
+        # Validated here, not only in load_config: run_ctv_broadcaster_daemon
+        # and backfill_ctv_fanouts construct this class directly and must not
+        # be able to disarm the lease-acquisition bound or the session guards
+        # with a zero or negative value.
+        lease_acquire_lock_timeout_seconds = float(lease_acquire_lock_timeout_seconds)
+        if (
+            not math.isfinite(lease_acquire_lock_timeout_seconds)
+            or lease_acquire_lock_timeout_seconds <= 0
+        ):
+            raise ValueError("lease_acquire_lock_timeout_seconds must be finite and positive")
+        lease_acquire_attempts = int(lease_acquire_attempts)
+        if lease_acquire_attempts <= 0:
+            raise ValueError("lease_acquire_attempts must be positive")
+        postgres_idle_in_transaction_timeout_seconds = float(
+            postgres_idle_in_transaction_timeout_seconds
+        )
+        if (
+            not math.isfinite(postgres_idle_in_transaction_timeout_seconds)
+            or postgres_idle_in_transaction_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "postgres_idle_in_transaction_timeout_seconds must be finite and positive"
+            )
+        postgres_tcp_keepalives_idle_seconds = int(postgres_tcp_keepalives_idle_seconds)
+        if postgres_tcp_keepalives_idle_seconds <= 0:
+            raise ValueError("postgres_tcp_keepalives_idle_seconds must be positive")
+        postgres_tcp_keepalives_interval_seconds = int(
+            postgres_tcp_keepalives_interval_seconds
+        )
+        if postgres_tcp_keepalives_interval_seconds <= 0:
+            raise ValueError("postgres_tcp_keepalives_interval_seconds must be positive")
+        postgres_tcp_keepalives_count = int(postgres_tcp_keepalives_count)
+        if postgres_tcp_keepalives_count <= 0:
+            raise ValueError("postgres_tcp_keepalives_count must be positive")
         read_concurrency = int(read_concurrency)
         if read_concurrency <= 0:
             raise ValueError("read_concurrency must be positive")
@@ -2352,6 +2513,20 @@ class PsqlShareLedger:
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
         self._lease_adoption_silence_seconds = lease_adoption_silence_seconds
+        self._lease_acquire_lock_timeout_seconds = lease_acquire_lock_timeout_seconds
+        self._lease_acquire_attempts = lease_acquire_attempts
+        # One immutable guard set shared by all three connection paths (the
+        # pooled native client, the dedicated lease-guard session, and the
+        # psql subprocess backend), so a session this coordinator opens is
+        # disowned by the server instead of holding the lease row on after
+        # its client vanishes. See PostgresSessionGuards for what the guards
+        # do and do not reach.
+        self._session_guards = PostgresSessionGuards(
+            idle_in_transaction_timeout_seconds=postgres_idle_in_transaction_timeout_seconds,
+            tcp_keepalives_idle_seconds=postgres_tcp_keepalives_idle_seconds,
+            tcp_keepalives_interval_seconds=postgres_tcp_keepalives_interval_seconds,
+            tcp_keepalives_count=postgres_tcp_keepalives_count,
+        )
         self._operation_timeout_local = local()
         self._statement_timeout_local = local()
         # Created here, not lazily in operation_progress: that scope's
@@ -2465,6 +2640,7 @@ class PsqlShareLedger:
                 conninfo,
                 pool_size=pool_size,
                 application_name=self._pool_application_name,
+                session_guards=getattr(self, "_session_guards", None),
             )
         except ImportError:
             if required:
@@ -2493,7 +2669,11 @@ class PsqlShareLedger:
                 conninfo,
                 advisory_lock_key=advisory_lock_key,
             )
-        return _NativePostgresLeaseGuard(conninfo, advisory_lock_key)
+        return _NativePostgresLeaseGuard(
+            conninfo,
+            advisory_lock_key,
+            session_guards=getattr(self, "_session_guards", None),
+        )
 
     def _initialize_writer_lease_guard(self, database_url: str | None) -> None:
         if not self._writer_session_token.startswith(
@@ -7059,6 +7239,67 @@ END;
             )
             self._lease_retry_sleep(sleep_seconds)
 
+    def _run_lease_acquisition_json(self, sql: str, description: str) -> Any:
+        """Run one lease-acquisition statement under a bounded lock deadline.
+
+        The startup lease upsert and the adoption CAS both row-lock the
+        qbit_ledger_writer_lease singleton. Unbounded, either statement
+        queues behind whatever transaction already holds that row — in the
+        worst case an orphaned idle-in-transaction backend of a vanished
+        predecessor — inside PsqlShareLedger.__init__, before the
+        coordinator's watchdog arms, for as long as the kernel keeps the
+        dead peer's socket alive. Each attempt therefore runs under the
+        configured lock/statement deadline (statement_timeout arms both
+        SET LOCAL statement_timeout and lock_timeout on the native backend,
+        and the PGOPTIONS equivalents plus a subprocess timeout on psql).
+
+        The retry budget (5 attempts x 5s by default) is sized to outlast a
+        typical orphan reap rather than to guarantee one: the session guards'
+        idle_in_transaction_session_timeout runs from the moment the blocking
+        transaction went idle, not from the moment this process started
+        retrying, so an orphan frequently clears partway through the budget
+        and a later attempt lands the lease with no operator action. A
+        statement still hitting its deadline on every attempt becomes the
+        fatal RuntimeError, which __init__'s close-and-reraise turns into a
+        visible process exit the supervisor can restart, instead of a silent
+        multi-hour hang.
+
+        A deadline expiry names the lock conflict first because it is by far
+        the most common cause, but it is not proof of one: a connect timeout,
+        an exhausted pool slot, and a healthy-but-overloaded server all
+        surface as the same LedgerOperationTimeout. Both the per-attempt line
+        and the fatal error therefore quote the underlying exception and the
+        fatal error chains it, so the operator diagnoses from the cause rather
+        than from this layer's guess.
+        """
+        attempts = self._lease_acquire_attempts
+        lock_timeout_seconds = self._lease_acquire_lock_timeout_seconds
+        cause: LedgerOperationTimeout | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with self.statement_timeout(lock_timeout_seconds):
+                    return self._run_json(sql)
+            except LedgerOperationTimeout as exc:
+                cause = exc
+                print(
+                    f"prism ledger {description}: attempt {attempt}/{attempts} "
+                    f"did not complete within its {lock_timeout_seconds:g}s "
+                    "deadline (commonly the qbit_ledger_writer_lease row is "
+                    "lock-blocked by another transaction, but an unreachable "
+                    f"or overloaded server produces the same signal): {exc}",
+                    flush=True,
+                )
+                if attempt < attempts:
+                    self._lease_retry_sleep(self._lease_retry_min_sleep_seconds)
+        raise RuntimeError(
+            f"qbit ledger {description} did not complete within its "
+            f"{lock_timeout_seconds:g}s deadline on any of {attempts} attempts "
+            "(commonly the qbit_ledger_writer_lease row is lock-blocked by "
+            "another transaction, but an unreachable or overloaded server "
+            f"produces the same signal): {cause}; the coordinator is exiting "
+            "rather than blocking startup indefinitely"
+        ) from cause
+
     def _try_acquire_writer_lease(self) -> dict[str, Any]:
         payload = {
             "writer_id": self._writer_id,
@@ -7130,7 +7371,7 @@ SELECT COALESCE(
     )
 );
 """
-        result = self._run_json(sql)
+        result = self._run_lease_acquisition_json(sql, "writer lease acquisition")
         if not isinstance(result, dict):
             raise RuntimeError("psql writer lease query returned non-object JSON")
         return result
@@ -7271,7 +7512,7 @@ SELECT COALESCE(
     )
 );
 """
-        result = self._run_json(sql)
+        result = self._run_lease_acquisition_json(sql, "writer lease adoption")
         if not isinstance(result, dict):
             raise RuntimeError("psql writer lease adoption query returned non-object JSON")
         return result
@@ -7756,24 +7997,38 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
         ]
         timeout_seconds = self._remaining_operation_timeout()
         run_kwargs: dict[str, Any] = {}
+        # The session guards ride every psql invocation, deadline or not: an
+        # orphaned idle-in-transaction backend is exactly the failure that
+        # occurs when no deadline-scoped work is running, so building
+        # PGOPTIONS only for deadline-bearing statements would leave the
+        # unbounded sessions — the dangerous ones — unguarded. A deadline,
+        # when armed, appends its per-statement bounds after the guards.
+        session_guards = getattr(self, "_session_guards", None)
+        option_fragments: list[str] = []
+        if session_guards is not None:
+            option_fragments.append(session_guards.options_fragment())
         if timeout_seconds is not None:
             timeout_ms = max(1, int(timeout_seconds * 1000))
-            subprocess_env = dict(os.environ)
-            existing_options = subprocess_env.get("PGOPTIONS", "").strip()
-            timeout_options = (
+            option_fragments.append(
                 f"-c statement_timeout={timeout_ms}ms "
                 f"-c lock_timeout={timeout_ms}ms"
             )
+        if option_fragments:
+            subprocess_env = dict(os.environ)
+            # Operator-supplied PGOPTIONS stay, ahead of the coordinator's
+            # fragments so a later -c duplicate resolves in our favor.
+            existing_options = subprocess_env.get("PGOPTIONS", "").strip()
             subprocess_env["PGOPTIONS"] = " ".join(
-                option for option in (existing_options, timeout_options) if option
+                option
+                for option in (existing_options, *option_fragments)
+                if option
             )
-            subprocess_env["PGCONNECT_TIMEOUT"] = str(
+            run_kwargs["env"] = subprocess_env
+        if timeout_seconds is not None:
+            run_kwargs["env"]["PGCONNECT_TIMEOUT"] = str(
                 max(1, math.ceil(timeout_seconds))
             )
-            run_kwargs = {
-                "env": subprocess_env,
-                "timeout": timeout_seconds,
-            }
+            run_kwargs["timeout"] = timeout_seconds
         try:
             completed = subprocess.run(
                 cmd,

@@ -30,6 +30,7 @@ import unittest
 from typing import Any
 
 from lab.prism import share_ledger as share_ledger_module
+from lab.prism.share_ledger import DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS
 from tests.prism_concurrency_harness import (
     HarnessError,
     LeaseHarness,
@@ -414,6 +415,9 @@ class SchedulerTests(unittest.TestCase):
                 [
                     "alpha@alpha.begin:acquire",
                     "alpha@alpha.done:acquire",
+                    # The acquire runs under #123's acquisition deadline, so
+                    # it commits explicitly and offers a precommit stop.
+                    "alpha@alpha.precommit",
                     "alpha@done:startup",
                 ],
             )
@@ -469,15 +473,32 @@ class PostgresModelTests(unittest.TestCase):
 
         A client that vanishes mid-statement leaves an orphan only when the
         COMMIT is a separate message it never sends. Autocommit has no such
-        message: PostgreSQL finishes the statement and commits it. #123 says
-        the orphan shape did not exist before the deadline plumbing arrived,
-        and a harness that let a scenario build it anyway would argue for a
-        fix to a defect that path cannot reach.
+        message: PostgreSQL finishes the statement and commits it. A harness
+        that let a scenario build the orphan shape on such a path would argue
+        for a fix to a defect that path cannot reach.
+
+        This used to drive the startup lease acquire, which was autocommit
+        because no caller armed a deadline on it. #123's fix arms one, so the
+        acquire is no longer an example of this property — see
+        ``test_vanishing_mid_acquire_orphans_now_that_it_is_deadline_scoped``
+        for what that path does instead. An unscoped renewal is still a plain
+        autocommit statement and demonstrates the property unchanged; the
+        property under test never was about the acquire in particular.
         """
         with LeaseHarness() as harness:
             alpha = harness.coordinator("alpha")
             alpha.start()
-            harness.run_until(alpha, "alpha.done:acquire")
+            harness.run_until(alpha, "done:startup")
+
+            # No operation_timeout: run_json gets timeout_seconds=None, so
+            # the model runs it the way _NativePostgresClient does, without
+            # an enclosing conn.transaction().
+            alpha.submit(lambda: alpha.ledger.renew_writer_lease(), label="renew")
+            harness.run_until(alpha, "alpha.done:renew")
+            self.assertIsNotNone(
+                harness.server.lease_lock_holder,
+                "the statement is mid-flight and holds the tuple lock",
+            )
 
             alpha.vanish()
 
@@ -488,6 +509,68 @@ class PostgresModelTests(unittest.TestCase):
             row = harness.lease_row()
             assert row is not None
             self.assertEqual(row.writer_session_token, "heartbeat-v1:alpha-1")
+            self.assertIsNone(
+                row.xmax,
+                "no transaction is left holding the row",
+            )
+
+    def test_vanishing_mid_acquire_orphans_now_that_it_is_deadline_scoped(
+        self,
+    ) -> None:
+        """#123's fix widens the orphan shape onto the startup acquire itself.
+
+        ``_run_lease_acquisition_json`` wraps the acquire in
+        ``statement_timeout(...)`` so that a successor cannot queue forever
+        on the lease tuple. That deadline is also what makes
+        ``_NativePostgresClient`` run the statement inside an explicit
+        transaction with a separate COMMIT — so a coordinator that vanishes
+        mid-acquire now leaves exactly the orphan #123 is about, on a path
+        that previously could not produce one.
+
+        This is an accepted trade rather than a regression, and it is pinned
+        here so it stays deliberate. The orphan #123 describes was unbounded;
+        this one is bounded by ``idle_in_transaction_session_timeout``
+        (``PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS``, 15s by
+        default), which the same fix sets on every coordinator session. That
+        is why the session guard is not optional, and
+        docs/prism-ledger-ops.md records the trade.
+
+        The reap itself is not asserted here: this harness models no
+        idle-in-transaction reaper, and faking one would pin the model's
+        opinion rather than PostgreSQL's. That the option is actually set on
+        every connection path is pinned directly against the shipped client
+        by ``PostgresSessionGuardTests`` in tests/test_prism_share_ledger.py.
+        What this test pins is what the model does support: the orphan is
+        real, it holds the lease lock, and a successor that meets it is
+        bounded rather than stuck.
+        """
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha", writer_epoch=1)
+            alpha.start()
+            # A checkpoint that did not exist on this path before the fix.
+            harness.run_until(alpha, "alpha.precommit")
+            alpha.vanish()
+
+            orphan = harness.server.lease_lock_holder
+            self.assertIsNotNone(orphan)
+            assert orphan is not None
+            self.assertTrue(orphan.orphaned)
+            self.assertTrue(orphan.explicit, "the deadline is what opened it")
+            self.assertIsNone(
+                harness.lease_row(),
+                "the acquire never committed, so no lease row exists at all",
+            )
+
+            # The successor still gets out, which is the half that matters:
+            # this orphan costs a bounded startup delay, not an outage.
+            beta = harness.coordinator("beta", writer_epoch=2)
+            beta.start()
+            harness.run_until_blocked(beta, "beta.lockwait:acquire")
+            self.assertEqual(
+                beta.actor.wake_at,
+                harness.clock.monotonic()
+                + DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+            )
 
     def test_vanishing_inside_a_deadline_scoped_statement_does_orphan(self) -> None:
         """The contrast: a separate COMMIT the client never sends."""
@@ -510,15 +593,24 @@ class PostgresModelTests(unittest.TestCase):
             self.assertTrue(orphan.orphaned)
 
     def test_autocommit_statements_never_leave_a_transaction_open(self) -> None:
-        """The shape #123 says did not exist before deadline plumbing."""
+        """No caller deadline, so no explicit transaction to be caught inside.
+
+        Also drove the startup acquire until #123's fix armed a deadline on
+        it. Asserting the absence of a precommit stop only means something on
+        a statement that genuinely has no caller deadline, so this drives an
+        unscoped renewal; on the acquire the assertion would now be checking
+        the wrong path and passing for the wrong reason.
+        """
         with LeaseHarness() as harness:
             alpha = harness.coordinator("alpha")
             alpha.start()
-            harness.run_until(alpha, "alpha.done:acquire")
-            # No caller deadline, so no explicit transaction and no precommit
-            # checkpoint to vanish inside.
-            self.assertNotIn("alpha@alpha.precommit", harness.trace)
             harness.run_until(alpha, "done:startup")
+
+            mark = len(harness.trace)
+            alpha.submit(lambda: alpha.ledger.renew_writer_lease(), label="renew")
+            harness.run_until(alpha, "done:renew")
+
+            self.assertNotIn("alpha@alpha.precommit", harness.trace[mark:])
             self.assertIsNone(harness.server.lease_lock_holder)
 
 

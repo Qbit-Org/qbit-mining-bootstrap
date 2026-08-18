@@ -86,6 +86,75 @@ path through `qbit_prism_shutdowns_total`,
 `qbit_prism_shutdown_non_writer_drain_seconds`, and
 `qbit_prism_shutdown_release_withheld_total`.
 
+### Orphaned Locks and Bounded Startup Acquisition
+
+A coordinator that vanishes without closing its sockets — network partition,
+`SIGSTOP`, VM pause — can leave a Postgres backend idle in transaction, still
+holding the `qbit_ledger_writer_lease` row lock its landing CTE took. Without
+countermeasures the successor's startup lease upsert queues behind that lock,
+inside ledger construction and before the watchdog arms, until kernel TCP
+keepalive teardown (hours at OS defaults): a full-pool availability outage.
+Settlement correctness is unaffected — the outbox row stays pending and
+replays — only availability is at stake.
+
+Two independent layers bound this. First, every Postgres session the
+coordinator opens (the pooled native client, the dedicated lease-guard
+session, and the psql subprocess backend) carries session guards:
+`idle_in_transaction_session_timeout`
+(`PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`, default 15) makes the
+server abort an orphaned transaction and release its locks, and the
+server-side keepalive GUCs (`PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS`,
+`PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS`,
+`PRISM_POSTGRES_TCP_KEEPALIVES_COUNT`, defaults 30/10/3) bound the server's
+teardown of a socket toward a vanished client at 30 + 3x10 = 60 seconds, the
+backstop where the idle-in-transaction timer does not apply.
+
+Second, the startup lease upsert and adoption CAS each run under a bounded
+lock deadline (`PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS`, default 5)
+with a bounded retry (`PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS`, default 5). Each
+timed-out attempt is logged with its attempt number and the underlying error.
+The retry budget (5x5s = 25s) is sized to outlast the idle-in-transaction
+timeout — which runs on the blocking backend's own clock, from when its
+transaction went idle rather than from when the successor started retrying —
+so an orphaned lock is normally reaped mid-budget and startup self-heals
+without operator action. An acquisition that never completes within the budget
+fails construction with a `RuntimeError`, exiting the process visibly for the
+supervisor to restart. That error names the lock conflict as the likeliest
+cause but does not assert it: a connect timeout, an exhausted connection-pool
+slot, and a server that is merely overloaded all expire the same deadline, so
+read the chained cause it quotes before assuming a stuck transaction. Waiting
+for a *live* holder's lease TTL to expire is unchanged — that outer wait is
+intended failover behaviour; only the per-statement lock wait is bounded.
+
+Arming that deadline widens the orphan shape slightly, and the trade is
+deliberate. A deadline is what makes the native client wrap a statement in an
+explicit transaction whose `COMMIT` is a separate client message, so the
+startup acquire is now transaction-scoped where it used to be plain
+autocommit. A coordinator that vanishes mid-acquire can therefore orphan the
+lease-row lock itself — on a path that previously could not produce one,
+because autocommit leaves no transaction for the server to hold open. The two
+orphans are not comparable in cost: the one this fix removes was bounded only
+by TCP keepalive teardown, hours at OS defaults, while the one it introduces
+is bounded by `PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` (default
+15) and delays a successor by at most that. It is also why the session guard
+is not optional and why disarming it is rejected at construction: without it
+the acquisition deadline would trade an unbounded wait for an unbounded wait
+of its own making.
+
+The session guards carry three deployment caveats. The guards travel as
+libpq startup options, so native connections now always set the `options`
+connect parameter: a deployment routing `PRISM_DATABASE_URL` through a
+connection pooler that rejects startup options (older PgBouncer builds) will
+fail at connect rather than silently drop them, visibly at coordinator
+startup. The default compose topology connects directly to `prism-postgres`
+and is unaffected. The psql-subprocess backend delivers the same guards
+through `PGOPTIONS`, so a wrapper script standing in for `psql`
+(`PRISM_POSTGRES_PSQL_COMMAND`) that does not forward its environment drops
+them without any error. On a Unix-socket DSN the `tcp_keepalives_*` GUCs are
+ignored — accepted and inert — leaving
+`PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` as the guard that still
+applies; it is the one that covers the orphaned lease-row lock in any case.
+
 ## Block Candidate Outbox
 
 A block-worthy share transaction also inserts an immutable intent into

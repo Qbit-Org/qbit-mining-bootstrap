@@ -370,6 +370,12 @@ from lab.prism.share_ledger import (
     DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
     DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
     DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+    DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+    DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+    DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,  # noqa: F401 - compatibility re-export
     PendingShare,
     PsqlShareLedger,
@@ -3259,6 +3265,54 @@ class PrismCoordinator:
                 ledger_config.lease_ttl_seconds
                 if ledger_config is not None
                 else env_positive_float("PRISM_LEDGER_LEASE_TTL_SECONDS", 60.0)
+            ),
+            lease_acquire_lock_timeout_seconds=(
+                ledger_config.lease_acquire_lock_timeout_seconds
+                if ledger_config is not None
+                else env_positive_float(
+                    "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS",
+                    DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+                )
+            ),
+            lease_acquire_attempts=(
+                ledger_config.lease_acquire_attempts
+                if ledger_config is not None
+                else env_positive_int(
+                    "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS",
+                    DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+                )
+            ),
+            postgres_idle_in_transaction_timeout_seconds=(
+                ledger_config.postgres_idle_in_transaction_timeout_seconds
+                if ledger_config is not None
+                else env_positive_float(
+                    "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS",
+                    DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+                )
+            ),
+            postgres_tcp_keepalives_idle_seconds=(
+                ledger_config.postgres_tcp_keepalives_idle_seconds
+                if ledger_config is not None
+                else env_positive_int(
+                    "PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS",
+                    DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+                )
+            ),
+            postgres_tcp_keepalives_interval_seconds=(
+                ledger_config.postgres_tcp_keepalives_interval_seconds
+                if ledger_config is not None
+                else env_positive_int(
+                    "PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS",
+                    DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
+                )
+            ),
+            postgres_tcp_keepalives_count=(
+                ledger_config.postgres_tcp_keepalives_count
+                if ledger_config is not None
+                else env_positive_int(
+                    "PRISM_POSTGRES_TCP_KEEPALIVES_COUNT",
+                    DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+                )
             ),
             # The own-write deferral margin must cover the longest RPC the
             # lease fence can authorize — submitblock's dedicated deadline

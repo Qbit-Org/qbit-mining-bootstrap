@@ -200,13 +200,18 @@ def drive_lost_adoption_cas(harness: LeaseHarness) -> dict[str, object]:
     """Land a predecessor renewal between the successor's observation and CAS.
 
     The interleaving is forced by PostgreSQL's own ordering rather than by
-    scheduling luck. At ``beta.done:acquire`` the successor's autocommit
-    transaction still holds the lease tuple lock, so the predecessor's
-    renewal queues behind it; letting the successor take one step commits the
-    observation and releases the lock, at which point the renewal lands and
-    changes ``updated_at`` -- the exact column the adoption CAS compares.
-    The successor is then at ``beta.begin:adopt`` with a stale observation
-    and no way to know it.
+    scheduling luck. At ``beta.done:acquire`` the successor's transaction
+    still holds the lease tuple lock, so the predecessor's renewal queues
+    behind it; letting the successor run on to its COMMIT releases the lock,
+    at which point the renewal lands and changes ``updated_at`` -- the exact
+    column the adoption CAS compares. The successor is then at
+    ``beta.begin:adopt`` with a stale observation and no way to know it.
+
+    Since #123's fix the observation is deadline-scoped, so that COMMIT is an
+    explicit message and reaching it takes a ``beta.precommit`` stop and then
+    a step, where an autocommit statement committed itself in one. The
+    interleaving is the same one and lands at the same place; only the number
+    of scheduler steps needed to reach it changed.
     """
     alpha = start_predecessor(harness)
     harness.advance(PREDECESSOR_SILENT_SECONDS)
@@ -223,8 +228,9 @@ def drive_lost_adoption_cas(harness: LeaseHarness) -> dict[str, object]:
     renewal = alpha.submit(alpha.ledger.renew_writer_lease, label="renew")
     harness.run_until_blocked(alpha, "alpha.lockwait:renew")
 
-    # One step commits the observation and carries the successor to the CAS
-    # statement, which has begun a transaction but not yet taken the lock.
+    # Commit the observation and carry the successor to the CAS statement,
+    # which has begun a transaction but not yet taken the lock.
+    harness.run_until(beta, "beta.precommit")
     harness.step(beta)
     stop_before_cas = beta.actor.stop
     harness.run_until(alpha, "done:renew")
@@ -435,14 +441,20 @@ class AdoptionSilenceIsMeasuredFromGuardAcquisitionTests(unittest.TestCase):
             [
                 "alpha@alpha.begin:acquire",
                 "alpha@alpha.done:acquire",
+                # Since #123 the acquire/adopt statements carry an acquisition
+                # deadline, so each commits explicitly and offers a precommit stop.
+                "alpha@alpha.precommit",
                 "alpha@done:startup",
                 "beta@beta.begin:acquire",
                 "beta@beta.done:acquire",
+                "beta@beta.precommit",
                 "beta@sleep:5",
                 "beta@beta.begin:acquire",
                 "beta@beta.done:acquire",
+                "beta@beta.precommit",
                 "beta@beta.begin:adopt",
                 "beta@beta.done:adopt",
+                "beta@beta.precommit",
                 "beta@done:startup",
             ],
         )
@@ -596,23 +608,29 @@ class LostAdoptionCasTests(unittest.TestCase):
             [
                 "alpha@alpha.begin:acquire",
                 "alpha@alpha.done:acquire",
+                "alpha@alpha.precommit",
                 "alpha@done:startup",
                 "beta@beta.begin:acquire",
                 "beta@beta.done:acquire",
+                "beta@beta.precommit",
                 "beta@sleep:5",
                 "beta@beta.begin:acquire",
                 "beta@beta.done:acquire",
                 "alpha@alpha.begin:renew",
                 "alpha@alpha.lockwait:renew",
+                "beta@beta.precommit",
                 "beta@beta.begin:adopt",
                 "alpha@alpha.done:renew",
                 "alpha@done:renew",
                 "beta@beta.done:adopt",
+                "beta@beta.precommit",
                 "beta@sleep:5",
                 "beta@beta.begin:acquire",
                 "beta@beta.done:acquire",
+                "beta@beta.precommit",
                 "beta@beta.begin:adopt",
                 "beta@beta.done:adopt",
+                "beta@beta.precommit",
                 "beta@done:startup",
             ],
         )

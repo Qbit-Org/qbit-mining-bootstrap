@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
-from lab.prism.coordinator_config import env_decimal
+from pathlib import Path
+
+from lab.prism.coordinator_config import env_decimal, load_coordinator_config
 from tests.prism_vardiff_test_support import *
 
 
@@ -2186,3 +2189,100 @@ class PrismListenerProfileTests(unittest.TestCase):
             highdiff_listener.close()
             for thread in threads:
                 thread.join(timeout=5)
+
+
+class LedgerSessionGuardConfigTests(unittest.TestCase):
+    # (env var, LedgerConfig field, default) for the postgres session guards
+    # and the bounded startup lease acquisition, all six added for issue #123.
+    SESSION_GUARD_SETTINGS = (
+        (
+            "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS",
+            "postgres_idle_in_transaction_timeout_seconds",
+            15.0,
+        ),
+        (
+            "PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS",
+            "postgres_tcp_keepalives_idle_seconds",
+            30,
+        ),
+        (
+            "PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS",
+            "postgres_tcp_keepalives_interval_seconds",
+            10,
+        ),
+        (
+            "PRISM_POSTGRES_TCP_KEEPALIVES_COUNT",
+            "postgres_tcp_keepalives_count",
+            3,
+        ),
+        (
+            "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS",
+            "lease_acquire_lock_timeout_seconds",
+            5.0,
+        ),
+        (
+            "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS",
+            "lease_acquire_attempts",
+            5,
+        ),
+    )
+
+    @staticmethod
+    def minimal_environment(root: Path) -> dict[str, str]:
+        return {
+            "QBIT_RPC_HOST": "qbit.example",
+            "QBIT_RPC_USER": "rpc-user",
+            "QBIT_RPC_PASSWORD": "rpc-password",
+            "PRISM_ALLOW_MEMORY_LEDGER": "1",
+            "PRISM_ALLOW_TEST_SIGNING_SEEDS": "1",
+            "PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY": "1",
+            "PRISM_AUDIT_DIR": str(root),
+            "PRISM_EVIDENCE_PATH": str(root / "evidence.json"),
+        }
+
+    def test_session_guard_defaults_land_on_ledger_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_coordinator_config(
+                self.minimal_environment(Path(temp_dir))
+            )
+
+        for _env_name, field_name, default in self.SESSION_GUARD_SETTINGS:
+            with self.subTest(field=field_name):
+                self.assertEqual(getattr(config.ledger, field_name), default)
+
+    def test_session_guard_overrides_land_on_ledger_config(self) -> None:
+        overrides = {
+            "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS": "7.5",
+            "PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS": "17",
+            "PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS": "6",
+            "PRISM_POSTGRES_TCP_KEEPALIVES_COUNT": "2",
+            "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS": "3.5",
+            "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS": "9",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_coordinator_config(
+                {**self.minimal_environment(Path(temp_dir)), **overrides}
+            )
+
+        ledger = config.ledger
+        self.assertEqual(ledger.postgres_idle_in_transaction_timeout_seconds, 7.5)
+        self.assertEqual(ledger.postgres_tcp_keepalives_idle_seconds, 17)
+        self.assertEqual(ledger.postgres_tcp_keepalives_interval_seconds, 6)
+        self.assertEqual(ledger.postgres_tcp_keepalives_count, 2)
+        self.assertEqual(ledger.lease_acquire_lock_timeout_seconds, 3.5)
+        self.assertEqual(ledger.lease_acquire_attempts, 9)
+
+    def test_session_guard_settings_fail_closed_on_invalid_values(self) -> None:
+        # Empty, non-numeric, zero, and negative values must all abort the
+        # load: a disarmed or nonsensical guard silently recreates the
+        # unbounded startup blocking these settings exist to prevent.
+        for env_name, _field_name, _default in self.SESSION_GUARD_SETTINGS:
+            for raw in ("", "not-a-number", "0", "-1"):
+                with self.subTest(name=env_name, raw=raw):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        source = {
+                            **self.minimal_environment(Path(temp_dir)),
+                            env_name: raw,
+                        }
+                        with self.assertRaises(SystemExit):
+                            load_coordinator_config(source)
