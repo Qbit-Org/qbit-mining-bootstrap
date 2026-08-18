@@ -4,13 +4,13 @@
 #123 describes a coordinator that vanishes mid-statement — a network
 partition, a SIGSTOP, a VM pause — after PostgreSQL has finished executing a
 deadline-scoped landing statement but before the client's COMMIT arrives. The
-server keeps the transaction open, keeps the ``qbit_ledger_writer_lease``
-tuple lock, and nothing in this repository bounds how long it holds them:
-``idle_in_transaction_session_timeout`` is set nowhere, server-side TCP
-keepalives are configured nowhere, and the startup lease upsert runs with no
-``lock_timeout``. A successor coordinator then waits inside
-``PsqlShareLedger.__init__`` until TCP keepalive teardown, which with default
-settings is hours.
+server keeps the transaction open and keeps the ``qbit_ledger_writer_lease``
+tuple lock. Before the fix nothing bounded how long it held them:
+``idle_in_transaction_session_timeout`` was set nowhere, server-side TCP
+keepalives were configured nowhere, and the startup lease upsert ran with no
+``lock_timeout``, so a successor coordinator waited inside
+``PsqlShareLedger.__init__`` until TCP keepalive teardown — hours at OS
+defaults.
 
 The issue was written as a hypothesis with a hand-derived trigger sequence
 because no test could express it: reproducing the interleaving meant a live
@@ -22,30 +22,35 @@ acquisition path — the real retry loop, the real CAS SQL, the real
 Two tests, doing two different jobs:
 
 ``OrphanedLeaseLockInterleavingTests``
-    Proves the harness expresses the interleaving: the schedule is stable
-    across repeated runs, the orphan really does hold the tuple lock, and the
-    successor really does park on it with nothing that can ever wake it.
-    These pass today and are the evidence #128 asked for.
+    Proves the harness still expresses the interleaving: the schedule is
+    stable across repeated runs, the orphan really does hold the tuple lock,
+    and the successor really does park on it. That evidence is what #128
+    asked for, and the fix does not remove any of it — the successor still
+    queues behind an orphan it cannot clear. What changed is that the wait is
+    now bounded, so the tests pin the bound instead of its absence.
 
 ``OrphanedLeaseLockFailoverBoundTests``
     Asserts the behaviour #123's fix must produce: a successor's startup
-    finishes, one way or the other, within a bounded time. **That assertion
-    does not hold on 2.x.x, because #123 is not fixed on 2.x.x**, so it is
-    marked ``expectedFailure``.
+    finishes, one way or the other, within a bounded time.
 
-    The marker is not a weakening. The assertion is written against the
-    fixed behaviour and is left exactly as strong as it would be without it;
-    what the marker changes is only who is told. ``unittest`` reports an
-    unexpected success as a suite failure, so the day someone fixes #123 the
-    suite goes red and hands them this file — which is the right moment to
-    learn about it, and better than a permanently red check that everyone
-    has already learned to ignore.
+    That assertion was authored against the fixed behaviour while 2.x.x was
+    still unfixed, and carried an ``expectedFailure`` marker so the suite
+    would go red the day it started passing. It now passes, so the marker is
+    gone — removed by the commit that fixed #123, exactly as this file
+    demanded. The assertion itself is unchanged and is the strongest
+    evidence the fix works: it was written by someone who had not seen the
+    fix, against a model of PostgreSQL that knows nothing about it.
 """
 
 from __future__ import annotations
 
 import unittest
 
+from lab.prism.share_ledger import (
+    DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+    DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+    LedgerOperationTimeout,
+)
 from tests.prism_concurrency_harness import (
     LeaseHarness,
     assert_deterministic,
@@ -61,6 +66,12 @@ LANDING_BUDGET_SECONDS = 120.0
 # Well past any plausible watchdog, restart or retry interval, and still far
 # short of the "on the order of hours" TCP keepalive teardown #123 describes.
 FAILOVER_HORIZON_SECONDS = 6 * 60 * 60
+
+# PsqlShareLedger's floor between acquisition attempts (_lease_retry_sleep is
+# called with _lease_retry_min_sleep_seconds, which is min(0.25, max sleep)).
+# Not a tunable of this fix; named so the elapsed-time assertion below can be
+# exact rather than approximate.
+RETRY_SLEEP_SECONDS = 0.25
 
 
 def drive_orphaned_lock_interleaving(harness: LeaseHarness) -> dict[str, object]:
@@ -102,6 +113,7 @@ def drive_orphaned_lock_interleaving(harness: LeaseHarness) -> dict[str, object]
         "orphan_open": orphan is not None and orphan.orphaned,
         "orphan_holds_lease_lock": harness.server.lease_lock_holder is orphan,
         "beta_blocked_at": beta.actor.block_reason,
+        "beta_parked_at": harness.clock.monotonic(),
         "beta_wake_at": beta.actor.wake_at,
         "scheduler_next_deadline": harness.scheduler.next_deadline(),
         "lease_holder_session": harness.lease_holder_session(),
@@ -158,18 +170,25 @@ class OrphanedLeaseLockInterleavingTests(unittest.TestCase):
                 "the orphaned transaction must still hold the lease tuple lock",
             )
             self.assertEqual(observed["beta_blocked_at"], "beta.lockwait:acquire")
-            # The successor's startup upsert runs with no caller deadline, so
-            # _NativePostgresClient sets neither statement_timeout nor
-            # lock_timeout. There is therefore no time at which the wait ends
-            # on its own.
-            self.assertIsNone(
+            # The interleaving #123 names is intact: the orphan holds the
+            # tuple lock and the successor is parked on it. What the fix
+            # changes is the only thing that was ever wrong with it — the
+            # wait now ends. _run_lease_acquisition_json arms
+            # lock_timeout/statement_timeout on every attempt, so the
+            # successor parks with a wake time rather than forever.
+            self.assertEqual(
                 observed["beta_wake_at"],
-                "the successor's lease upsert must be waiting with no deadline "
-                "for this to be #123 rather than a bounded retry",
+                observed["beta_parked_at"]
+                + DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+                "the successor must park under the configured acquisition "
+                "lock deadline, not indefinitely",
             )
-            self.assertIsNone(
+            self.assertEqual(
                 observed["scheduler_next_deadline"],
-                "nothing anywhere in the system bounds the wait",
+                observed["beta_wake_at"],
+                "and that deadline must be the thing the whole system is "
+                "waiting on: nothing else is pending, so it is what releases "
+                "the successor",
             )
             # The predecessor's renewal never committed, so the committed row
             # still names its session: the successor is queued behind a write
@@ -183,25 +202,75 @@ class OrphanedLeaseLockInterleavingTests(unittest.TestCase):
                 ["acquire", "renew", "acquire"],
             )
 
-    def test_wait_does_not_end_within_a_failover_horizon(self) -> None:
-        """Six virtual hours pass and the successor is still not runnable."""
+    def test_wait_ends_in_bounded_attempts_and_a_visible_failure(self) -> None:
+        """How the wait ends, now that it ends.
+
+        This test used to assert ``finished is False``: six virtual hours
+        passed and the successor was still parked, because nothing bounded
+        the wait. The fix inverts that premise outright, and simply flipping
+        the assertion would duplicate
+        ``OrphanedLeaseLockFailoverBoundTests``, which already pins *that*
+        the wait ends.
+
+        So it pins *how* it ends instead, which nothing else covers: the
+        successor spends exactly its configured retry budget on the lock,
+        each attempt bounded by the configured deadline, and then fails
+        visibly with a ``RuntimeError`` that chains the underlying
+        ``LedgerOperationTimeout``. Retrying matters because an orphan is
+        often reaped partway through the budget; giving up visibly matters
+        because a coordinator that cannot take the lease must exit for its
+        supervisor rather than hang in ``__init__``. The evidence the old
+        assertion carried — that nothing releases the orphan's lock, so the
+        successor never actually starts — is kept below.
+        """
         with LeaseHarness() as harness:
             drive_orphaned_lock_interleaving(harness)
             beta = harness.coordinators["beta"]
+            before = harness.clock.monotonic()
 
             finished = drive_successor_to_quiescence(harness, beta)
 
-            self.assertFalse(
-                finished,
-                "the successor is still parked on the orphaned tuple lock",
-            )
-            self.assertFalse(
-                beta.actor.runnable(),
-                "and nothing can make it runnable again",
-            )
+            self.assertTrue(finished, "the bounded retry must terminate")
             self.assertFalse(
                 beta.started,
-                "the successor never finished PsqlShareLedger.__init__",
+                "and it must not have started: the orphan still holds the "
+                "lease lock, so there was never a lease to take",
+            )
+            # The orphan is untouched — this is still #123's interleaving,
+            # not a scenario that quietly resolved itself.
+            orphan = harness.server.lease_lock_holder
+            self.assertIsNotNone(orphan)
+            assert orphan is not None
+            self.assertTrue(orphan.orphaned)
+
+            # Exactly the configured budget of attempts, no more and no
+            # fewer: one attempt would abandon orphans that clear on their
+            # own, and an unbounded count is the outage this fix removes.
+            self.assertEqual(
+                harness.statement_kinds().count("acquire"),
+                1 + DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+                "alpha's successful acquire plus beta's full retry budget",
+            )
+            # Every attempt ran the deadline out, so the wall time is the
+            # budget itself rather than an accident of scheduling.
+            self.assertEqual(
+                harness.clock.monotonic() - before,
+                DEFAULT_LEASE_ACQUIRE_ATTEMPTS
+                * DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS
+                + (DEFAULT_LEASE_ACQUIRE_ATTEMPTS - 1) * RETRY_SLEEP_SECONDS,
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "did not complete within its .*deadline on any of "
+                f"{DEFAULT_LEASE_ACQUIRE_ATTEMPTS} attempts",
+            ) as raised:
+                beta.actor.calls[0].value()
+            # Chained, not swallowed: the operator diagnoses from the cause
+            # rather than from this layer's guess at one.
+            self.assertIsInstance(
+                raised.exception.__cause__,
+                LedgerOperationTimeout,
             )
 
     def test_interleaving_is_order_stable_across_repeated_runs(self) -> None:
@@ -217,6 +286,10 @@ class OrphanedLeaseLockInterleavingTests(unittest.TestCase):
             [
                 "alpha@alpha.begin:acquire",
                 "alpha@alpha.done:acquire",
+                # New since the fix: the startup acquire is deadline-scoped,
+                # so it runs in an explicit transaction with its own COMMIT.
+                # docs/prism-ledger-ops.md records what that costs.
+                "alpha@alpha.precommit",
                 "alpha@done:startup",
                 "alpha@alpha.begin:renew",
                 "alpha@alpha.done:renew",
@@ -266,14 +339,6 @@ class OrphanedLeaseLockInterleavingTests(unittest.TestCase):
 class OrphanedLeaseLockFailoverBoundTests(unittest.TestCase):
     """The bound #123's fix must establish. Does not hold until #123 is fixed."""
 
-    # Expected to fail on this line, and required to stop failing once #123
-    # is fixed: unittest treats an unexpected success as a suite failure, so
-    # this marker is self-removing rather than a suppression that rots. Both
-    # candidate fixes named in #123 — lock_timeout alone, and lock_timeout
-    # with a bounded retry — turn the assertion below green, which is what
-    # makes the marker safe to apply rather than a way of hiding a test that
-    # would stay red regardless.
-    @unittest.expectedFailure
     def test_successor_startup_must_not_wait_unboundedly(self) -> None:
         """A successor must fail fast and visibly, not queue for hours.
 
@@ -290,11 +355,12 @@ class OrphanedLeaseLockFailoverBoundTests(unittest.TestCase):
         looking at a red test their correct fix did not turn green, and
         reaching for the same weakening this test exists to refuse.
 
-        This assertion is deliberately written against the fixed behaviour
-        rather than against today's. On 2.x.x it does not hold, and that is
-        the point: it is the first executable statement of what #123 asks
-        for. Remove the ``expectedFailure`` marker in the same commit that
-        fixes #123 — the suite will demand it.
+        This assertion was deliberately written against the fixed behaviour
+        rather than against the behaviour of the day. It carried an
+        ``expectedFailure`` marker until #123 was fixed; the marker is gone
+        because the bound now holds, which is the removal this docstring
+        asked the fixing commit to make. The assertion is otherwise
+        untouched.
         """
         with LeaseHarness() as harness:
             drive_orphaned_lock_interleaving(harness)
@@ -307,9 +373,10 @@ class OrphanedLeaseLockFailoverBoundTests(unittest.TestCase):
                 "the successor's PsqlShareLedger.__init__ is still waiting on "
                 f"the orphaned lease-tuple lock after "
                 f"{FAILOVER_HORIZON_SECONDS / 3600:g} virtual hours, with no "
-                "deadline left anywhere that could release it. #123 is unfixed "
-                "on this line: the startup lease upsert runs with no "
-                "lock_timeout, so nothing bounds the wait.",
+                "deadline left anywhere that could release it. #123 has "
+                "regressed: the startup lease upsert is reaching the tuple "
+                "lock without a lock_timeout again, so nothing bounds the "
+                "wait.",
             )
 
 

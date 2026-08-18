@@ -126,6 +126,21 @@ read the chained cause it quotes before assuming a stuck transaction. Waiting
 for a *live* holder's lease TTL to expire is unchanged — that outer wait is
 intended failover behaviour; only the per-statement lock wait is bounded.
 
+Arming that deadline widens the orphan shape slightly, and the trade is
+deliberate. A deadline is what makes the native client wrap a statement in an
+explicit transaction whose `COMMIT` is a separate client message, so the
+startup acquire is now transaction-scoped where it used to be plain
+autocommit. A coordinator that vanishes mid-acquire can therefore orphan the
+lease-row lock itself — on a path that previously could not produce one,
+because autocommit leaves no transaction for the server to hold open. The two
+orphans are not comparable in cost: the one this fix removes was bounded only
+by TCP keepalive teardown, hours at OS defaults, while the one it introduces
+is bounded by `PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` (default
+15) and delays a successor by at most that. It is also why the session guard
+is not optional and why disarming it is rejected at construction: without it
+the acquisition deadline would trade an unbounded wait for an unbounded wait
+of its own making.
+
 The session guards carry three deployment caveats. The guards travel as
 libpq startup options, so native connections now always set the `options`
 connect parameter: a deployment routing `PRISM_DATABASE_URL` through a

@@ -423,6 +423,9 @@ class ExpiryClaimFailClosedTests(unittest.TestCase):
             [
                 "alpha@alpha.begin:acquire",
                 "alpha@alpha.done:acquire",
+                # Since #123 the acquire/adopt statements carry an acquisition
+                # deadline, so each commits explicitly and offers a precommit stop.
+                "alpha@alpha.precommit",
                 "alpha@done:startup",
                 "claimant@claimant.begin:acquire",
                 "claimant@claimant.done:acquire",
@@ -509,6 +512,7 @@ class AttributionRecheckTests(unittest.TestCase):
             [
                 "alpha@alpha.begin:acquire",
                 "alpha@alpha.done:acquire",
+                "alpha@alpha.precommit",
                 "alpha@done:startup",
                 "alpha@alpha.begin:renew",
                 "alpha@alpha.done:renew",
