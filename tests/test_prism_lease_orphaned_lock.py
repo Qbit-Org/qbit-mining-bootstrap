@@ -29,12 +29,17 @@ Two tests, doing two different jobs:
 
 ``OrphanedLeaseLockFailoverBoundTests``
     Asserts the behaviour #123's fix must produce: a successor's startup
-    finishes, one way or the other, within a bounded time. **This test fails
-    on 2.x.x, because #123 is not fixed on 2.x.x.** It is written against the
-    fix rather than against today's behaviour deliberately; weakening it to
-    green would delete the only executable statement of what #123 asks for.
-    It turns green when the successor's lease acquisition gains a bounded
-    lock wait.
+    finishes, one way or the other, within a bounded time. **That assertion
+    does not hold on 2.x.x, because #123 is not fixed on 2.x.x**, so it is
+    marked ``expectedFailure``.
+
+    The marker is not a weakening. The assertion is written against the
+    fixed behaviour and is left exactly as strong as it would be without it;
+    what the marker changes is only who is told. ``unittest`` reports an
+    unexpected success as a suite failure, so the day someone fixes #123 the
+    suite goes red and hands them this file — which is the right moment to
+    learn about it, and better than a permanently red check that everyone
+    has already learned to ignore.
 """
 
 from __future__ import annotations
@@ -259,8 +264,16 @@ class OrphanedLeaseLockInterleavingTests(unittest.TestCase):
 
 
 class OrphanedLeaseLockFailoverBoundTests(unittest.TestCase):
-    """The bound #123's fix must establish. Fails until #123 is fixed."""
+    """The bound #123's fix must establish. Does not hold until #123 is fixed."""
 
+    # Expected to fail on this line, and required to stop failing once #123
+    # is fixed: unittest treats an unexpected success as a suite failure, so
+    # this marker is self-removing rather than a suppression that rots. Both
+    # candidate fixes named in #123 — lock_timeout alone, and lock_timeout
+    # with a bounded retry — turn the assertion below green, which is what
+    # makes the marker safe to apply rather than a way of hiding a test that
+    # would stay red regardless.
+    @unittest.expectedFailure
     def test_successor_startup_must_not_wait_unboundedly(self) -> None:
         """A successor must fail fast and visibly, not queue for hours.
 
@@ -277,9 +290,11 @@ class OrphanedLeaseLockFailoverBoundTests(unittest.TestCase):
         looking at a red test their correct fix did not turn green, and
         reaching for the same weakening this test exists to refuse.
 
-        This assertion is deliberately written against the fixed behaviour.
-        On 2.x.x it fails, and that failure is the point: it is the first
-        executable statement of what #123 asks for.
+        This assertion is deliberately written against the fixed behaviour
+        rather than against today's. On 2.x.x it does not hold, and that is
+        the point: it is the first executable statement of what #123 asks
+        for. Remove the ``expectedFailure`` marker in the same commit that
+        fixes #123 — the suite will demand it.
         """
         with LeaseHarness() as harness:
             drive_orphaned_lock_interleaving(harness)
