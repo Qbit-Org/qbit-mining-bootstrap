@@ -19,7 +19,23 @@ from lab.prism.ctv_broadcaster_daemon import (
     CtvFanoutDaemonResult,
     MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE,
 )
-from lab.prism.coordinator_config import env, env_bool, env_int, env_positive_float
+from lab.prism.coordinator_config import (
+    DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+    DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+    DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
+    env,
+    env_bool,
+    env_int,
+    env_positive_float,
+)
+
+# The module-level env_positive_int below keeps its required-missing
+# semantics for the daemon's own knobs; the coordinator_config variant is
+# aliased for the ledger knobs so both scripts read them identically.
+from lab.prism.coordinator_config import env_positive_int as config_env_positive_int
 from lab.prism.rpc import JsonRpc
 from lab.prism.share_ledger import PsqlShareLedger, SingleWriterShareLedger
 
@@ -81,6 +97,30 @@ def make_ledger_from_env() -> SingleWriterShareLedger | PsqlShareLedger:
         writer_session_token=os.environ.get("PRISM_LEDGER_WRITER_SESSION_TOKEN"),
         initialize_schema=env("PRISM_POSTGRES_INIT_SCHEMA", "0") in {"1", "true", "yes"},
         lease_ttl_seconds=env_positive_float("PRISM_LEDGER_LEASE_TTL_SECONDS", 60.0),
+        lease_acquire_lock_timeout_seconds=env_positive_float(
+            "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS",
+            DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+        ),
+        lease_acquire_attempts=config_env_positive_int(
+            "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS",
+            DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+        ),
+        postgres_idle_in_transaction_timeout_seconds=env_positive_float(
+            "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS",
+            DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+        ),
+        postgres_tcp_keepalives_idle_seconds=config_env_positive_int(
+            "PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS",
+            DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+        ),
+        postgres_tcp_keepalives_interval_seconds=config_env_positive_int(
+            "PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS",
+            DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
+        ),
+        postgres_tcp_keepalives_count=config_env_positive_int(
+            "PRISM_POSTGRES_TCP_KEEPALIVES_COUNT",
+            DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+        ),
     )
 
 

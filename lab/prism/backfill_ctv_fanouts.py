@@ -16,6 +16,16 @@ from typing import Any
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from lab.prism.coordinator_config import (
+    DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+    DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+    DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+    DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
+    env_positive_float,
+    env_positive_int,
+)
 from lab.prism.share_ledger import (
     AUDIT_BODY_REF_SCHEMA,
     AUDIT_BUNDLE_V2_SCHEMA,
@@ -239,11 +249,76 @@ def build_parser() -> argparse.ArgumentParser:
         default=float(os.environ.get("PRISM_LEDGER_LEASE_TTL_SECONDS", "60")),
     )
     parser.add_argument(
+        "--lease-acquire-lock-timeout-seconds",
+        type=float,
+        default=env_positive_float(
+            "PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS",
+            DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+        ),
+    )
+    parser.add_argument(
+        "--lease-acquire-attempts",
+        type=int,
+        default=env_positive_int(
+            "PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS",
+            DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+        ),
+    )
+    parser.add_argument(
+        "--postgres-idle-in-transaction-timeout-seconds",
+        type=float,
+        default=env_positive_float(
+            "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS",
+            DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+        ),
+    )
+    parser.add_argument(
+        "--postgres-tcp-keepalives-idle-seconds",
+        type=int,
+        default=env_positive_int(
+            "PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS",
+            DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+        ),
+    )
+    parser.add_argument(
+        "--postgres-tcp-keepalives-interval-seconds",
+        type=int,
+        default=env_positive_int(
+            "PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS",
+            DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
+        ),
+    )
+    parser.add_argument(
+        "--postgres-tcp-keepalives-count",
+        type=int,
+        default=env_positive_int(
+            "PRISM_POSTGRES_TCP_KEEPALIVES_COUNT",
+            DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+        ),
+    )
+    parser.add_argument(
         "--no-init-schema",
         action="store_true",
         help="do not run the idempotent PRISM schema repair before backfilling",
     )
     return parser
+
+
+def ledger_from_args(args: argparse.Namespace) -> PsqlShareLedger:
+    return PsqlShareLedger(
+        psql_command=psql_command_from_env(args.psql_command),
+        writer_id=args.writer_id,
+        writer_epoch=args.writer_epoch,
+        writer_session_token=args.writer_session_token,
+        initialize_schema=not args.no_init_schema,
+        lease_ttl_seconds=args.lease_ttl_seconds,
+        lease_acquire_lock_timeout_seconds=args.lease_acquire_lock_timeout_seconds,
+        lease_acquire_attempts=args.lease_acquire_attempts,
+        postgres_idle_in_transaction_timeout_seconds=args.postgres_idle_in_transaction_timeout_seconds,
+        postgres_tcp_keepalives_idle_seconds=args.postgres_tcp_keepalives_idle_seconds,
+        postgres_tcp_keepalives_interval_seconds=args.postgres_tcp_keepalives_interval_seconds,
+        postgres_tcp_keepalives_count=args.postgres_tcp_keepalives_count,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -266,14 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     if not path_inputs and not db_hashes and not args.db_block_height:
         raise SystemExit("provide at least one path, --db-block-hash, or --db-block-height")
 
-    ledger = PsqlShareLedger(
-        psql_command=psql_command_from_env(args.psql_command),
-        writer_id=args.writer_id,
-        writer_epoch=args.writer_epoch,
-        writer_session_token=args.writer_session_token,
-        initialize_schema=not args.no_init_schema,
-        lease_ttl_seconds=args.lease_ttl_seconds,
-    )
+    ledger = ledger_from_args(args)
 
     for height in args.db_block_height:
         height_hashes = db_block_hashes_for_height(ledger, height)
