@@ -49,8 +49,10 @@ Four things are proved, and one of them is the reason the others mean anything:
 
 from __future__ import annotations
 
+import threading
 import unittest
 
+from lab.prism import share_ledger as share_ledger_module
 from tests.prism_concurrency_harness import (
     LeaseHarness,
     LockTimeout,
@@ -499,15 +501,66 @@ class OwnWriteRenewalDeferralTests(unittest.TestCase):
 class GuardQuerySlotTests(unittest.TestCase):
     """One guard connection, one statement at a time."""
 
+    def test_production_guard_serializes_callers_on_one_query_slot(self) -> None:
+        """The shipped guard, not the harness's model of it.
+
+        The scheduler test below drives ``FakeLeaseGuard``, whose slot is a
+        reimplementation: deleting ``with self._query_lock:`` from
+        ``_NativePostgresLeaseGuard.run_json`` would leave every assertion
+        there green. This one holds the production lock and shows the
+        production method waiting for it, which is the claim the module
+        actually wants to make. It needs no server — the serialization is a
+        plain lock around the statement, above the connection.
+        """
+        guard = share_ledger_module._NativePostgresLeaseGuard.__new__(
+            share_ledger_module._NativePostgresLeaseGuard
+        )
+        guard._advisory_lock_key = 0
+        guard._query_lock = threading.Lock()
+        guard._closed = False
+        guard._held = True
+        guard._connection = None
+
+        entered = threading.Event()
+        released = threading.Event()
+
+        def second_caller() -> None:
+            entered.set()
+            try:
+                # Reaching the statement requires the slot; `held` is True and
+                # `_connection` is None, so arrival is observable as the
+                # AttributeError that follows.
+                guard.run_json("SELECT 1")
+            except Exception:
+                pass
+            released.set()
+
+        guard._query_lock.acquire()
+        caller = threading.Thread(target=second_caller, daemon=True)
+        caller.start()
+        self.assertTrue(entered.wait(2.0))
+        self.assertFalse(
+            released.wait(0.2),
+            "run_json entered the statement while another caller held the "
+            "query slot; the guard session is not serialized",
+        )
+        guard._query_lock.release()
+        self.assertTrue(
+            released.wait(2.0),
+            "releasing the slot must let the queued caller proceed",
+        )
+        caller.join(timeout=2.0)
+
     def test_a_second_caller_parks_on_the_guard_query_slot(self) -> None:
-        """The serialization is the guard being one session, not a lease lock.
+        """The harness models that serialization as an interleaving point.
 
         Both callers run the non-blocking verification, so neither can be
         queued on the lease tuple; the only thing that can hold one up is the
-        other's occupancy of the single guard connection. Asserting that the
-        second caller's own statement never starts until the first has
-        finished is what distinguishes a serialized session from two
-        statements racing on one backend.
+        other's occupancy of the single guard connection. This pins the
+        harness's rendering of it — that the second caller stops at a named
+        checkpoint and is released by the holder rather than by a timeout —
+        so scenarios can schedule around it. The production serialization
+        itself is pinned by the test above.
         """
         with LeaseHarness(lease_ttl_seconds=LEASE_TTL_SECONDS) as harness:
             alpha = harness.coordinator("alpha")

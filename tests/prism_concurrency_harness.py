@@ -82,7 +82,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lab.prism.share_ledger import (  # noqa: E402
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
+    LedgerOperationTimeout,
     PsqlShareLedger,
+    parse_single_json_value,
 )
 
 # Real seconds the controller will wait for an actor to hand the baton back
@@ -659,6 +661,7 @@ class FakePostgres:
         self.lease: LeaseRow | None = None
         self.statements: list[Statement] = []
         self._lease_lock_holder: Transaction | None = None
+        self._lease_lock_waiters: list[Transaction] = []
         self._backends: list[Backend] = []
         self._advisory_owners: dict[tuple[int, int], Backend] = {}
         self._next_pid = 1
@@ -821,9 +824,50 @@ class FakePostgres:
     ) -> Any:
         if statement.kind is LeaseOp.VERIFY:
             return self._evaluate_verify(statement, transaction, tag)
-        # Every other lease statement writes the singleton row, so it needs
-        # the exclusive tuple lock and queues for it. That queue is the whole
-        # of #123: nothing bounds it unless the caller armed a deadline.
+
+        # READ COMMITTED takes one snapshot per command, *before* any lock
+        # wait. This is the distinction that makes a queued statement report
+        # stale data: after the wait, only the conflicting tuple is re-read
+        # (EvalPlanQual) to re-evaluate the write predicate, while every other
+        # scan in the statement — including the arm that builds the whole
+        # not-acquired result — still reads `snapshot`. A model that re-read
+        # committed state everywhere would report a fresh row and a small
+        # lease_age_seconds where the real server reports the pre-wait row and
+        # an age that has silently absorbed the entire wait.
+        snapshot = self._visible_lease(transaction)
+
+        if statement.kind is LeaseOp.ACQUIRE:
+            # INSERT ... ON CONFLICT DO UPDATE locks the conflicting tuple
+            # before evaluating its WHERE, so it queues even when the
+            # predicate would exclude the row.
+            self._await_lease_lock(
+                statement,
+                transaction,
+                timeout_seconds,
+                tag,
+                timeout_kind,
+            )
+            return self._evaluate_acquire(statement, transaction, snapshot)
+
+        # A plain UPDATE evaluates its WHERE against the snapshot version
+        # first and never locks a row the predicate already excludes: it
+        # returns zero rows immediately rather than queueing. Getting this
+        # wrong matters to any fencing argument, where "the predecessor is
+        # blocked" and "the predecessor already knows it lost" are different
+        # states.
+        evaluators = {
+            LeaseOp.ADOPT: (self._adopt_matches, self._evaluate_adopt),
+            LeaseOp.RENEW: (self._renew_matches, self._evaluate_renew),
+            LeaseOp.RELEASE: (self._release_matches, self._evaluate_release),
+        }
+        try:
+            matches, evaluate = evaluators[statement.kind]
+        except KeyError:
+            raise UnsupportedStatement(
+                f"unhandled lease operation {statement.kind}"
+            ) from None
+        if snapshot is None or not matches(statement, snapshot):
+            return evaluate(statement, transaction, None)
         self._await_lease_lock(
             statement,
             transaction,
@@ -831,15 +875,12 @@ class FakePostgres:
             tag,
             timeout_kind,
         )
-        if statement.kind is LeaseOp.ACQUIRE:
-            return self._evaluate_acquire(statement, transaction)
-        if statement.kind is LeaseOp.ADOPT:
-            return self._evaluate_adopt(statement, transaction)
-        if statement.kind is LeaseOp.RENEW:
-            return self._evaluate_renew(statement, transaction)
-        if statement.kind is LeaseOp.RELEASE:
-            return self._evaluate_release(statement, transaction)
-        raise UnsupportedStatement(f"unhandled lease operation {statement.kind}")
+        # EvalPlanQual: the qual is re-checked against the version this
+        # statement just locked, which a concurrent commit may have moved.
+        current = self._visible_lease(transaction)
+        if current is None or not matches(statement, current):
+            return evaluate(statement, transaction, None)
+        return evaluate(statement, transaction, current)
 
     def _await_lease_lock(
         self,
@@ -858,18 +899,39 @@ class FakePostgres:
             if timeout_seconds is None
             else self.clock.monotonic() + max(0.0, timeout_seconds)
         )
-        while self.lease_lock_held_by_other(transaction):
-            if deadline is not None and self.clock.monotonic() >= deadline:
-                raise LockTimeout(
-                    f"canceling statement due to {timeout_kind} timeout\n"
-                    "CONTEXT:  while updating tuple (0,1) in relation "
-                    '"qbit_ledger_writer_lease"'
-                )
-            self.scheduler.block(
-                f"{tag}.lockwait:{statement.kind.value}",
-                ready=lambda: not self.lease_lock_held_by_other(transaction),
-                wake_at=deadline,
+
+        def granted() -> bool:
+            # PostgreSQL serializes tuple-lock waiters through a heavyweight
+            # lock and grants in arrival order, so a later arrival cannot
+            # overtake a queued waiter. Without the queue the model could
+            # express a grant order the server never produces — which matters
+            # precisely because the schedule is an input here.
+            if self.lease_lock_held_by_other(transaction):
+                return False
+            return (
+                not self._lease_lock_waiters
+                or self._lease_lock_waiters[0] is transaction
             )
+
+        if granted():
+            self._take_lease_lock(transaction)
+            return
+        self._lease_lock_waiters.append(transaction)
+        try:
+            while not granted():
+                if deadline is not None and self.clock.monotonic() >= deadline:
+                    raise LockTimeout(
+                        f"canceling statement due to {timeout_kind} timeout\n"
+                        "CONTEXT:  while updating tuple (0,1) in relation "
+                        '"qbit_ledger_writer_lease"'
+                    )
+                self.scheduler.block(
+                    f"{tag}.lockwait:{statement.kind.value}",
+                    ready=granted,
+                    wake_at=deadline,
+                )
+        finally:
+            self._lease_lock_waiters.remove(transaction)
         self._take_lease_lock(transaction)
 
     def _take_lease_lock(self, transaction: Transaction) -> None:
@@ -905,108 +967,126 @@ class FakePostgres:
         self,
         statement: Statement,
         transaction: Transaction,
-    ) -> dict[str, Any]:
-        payload = statement.payload
-        now = self.clock.now()
-        ttl = self._ttl(statement)
-        row = self._visible_lease(transaction)
-        if row is None:
-            self._stage(
-                transaction,
-                LeaseRow(
-                    writer_id=str(payload["writer_id"]),
-                    writer_epoch=int(payload["writer_epoch"]),
-                    writer_session_token=str(payload["writer_session_token"]),
-                    lease_expires_at=now + timedelta(seconds=ttl),
-                    updated_at=now,
-                ),
-            )
-            return {
-                "acquired": True,
-                "writer_id": payload["writer_id"],
-                "writer_epoch": int(payload["writer_epoch"]),
-                "writer_session_token": payload["writer_session_token"],
-            }
-        same_session = (
-            row.writer_id == payload["writer_id"]
-            and row.writer_epoch == int(payload["writer_epoch"])
-            and row.writer_session_token == payload["writer_session_token"]
-        )
-        if same_session or row.lease_expires_at <= now:
-            self._stage(
-                transaction,
-                LeaseRow(
-                    writer_id=str(payload["writer_id"]),
-                    writer_epoch=int(payload["writer_epoch"]),
-                    writer_session_token=str(payload["writer_session_token"]),
-                    lease_expires_at=now + timedelta(seconds=ttl),
-                    updated_at=now,
-                ),
-            )
-            return {
-                "acquired": True,
-                "writer_id": payload["writer_id"],
-                "writer_epoch": int(payload["writer_epoch"]),
-                "writer_session_token": payload["writer_session_token"],
-            }
-        return self._observed(row, acquired=False)
+        snapshot: LeaseRow | None,
+    ) -> dict[str, Any] | None:
+        """INSERT ... ON CONFLICT DO UPDATE, with EPQ on the locked tuple.
 
-    def _evaluate_adopt(
-        self,
-        statement: Statement,
-        transaction: Transaction,
-    ) -> dict[str, Any]:
+        Returns None when the statement evaluates to SQL NULL, which the
+        ports turn into production's "postgres query returned no JSON" the
+        same way `parse_single_json_value` does. That is a reachable
+        production outcome, not a harness edge case: when two coordinators
+        race the very first acquire, the loser's DO UPDATE affects zero rows
+        and its COALESCE fallback reads a snapshot in which no row exists
+        yet, so the whole statement returns NULL.
+        """
         payload = statement.payload
         now = self.clock.now()
         ttl = self._ttl(statement)
-        row = self._visible_lease(transaction)
-        if row is None:
-            raise HarnessError("adoption ran against a missing lease row")
-        matches = (
-            row.writer_id == payload["writer_id"]
-            and row.writer_epoch == int(payload["writer_epoch"])
-            and row.writer_session_token == payload["observed_writer_session_token"]
-            and VirtualClock.timestamp_text(row.updated_at)
-            == payload["observed_lease_updated_at"]
-            and row.lease_expires_at > now
-        )
-        if not matches:
-            observed = self._observed(row, acquired=False)
-            observed["adopted"] = False
-            return observed
-        self._stage(
-            transaction,
-            replace(
-                row,
-                writer_session_token=str(payload["writer_session_token"]),
-                lease_expires_at=now + timedelta(seconds=ttl),
-                updated_at=now,
-                xmax=None,
-            ),
-        )
-        return {
+        acquired = {
             "acquired": True,
-            "adopted": True,
             "writer_id": payload["writer_id"],
             "writer_epoch": int(payload["writer_epoch"]),
             "writer_session_token": payload["writer_session_token"],
         }
 
+        def claim() -> None:
+            self._stage(
+                transaction,
+                LeaseRow(
+                    writer_id=str(payload["writer_id"]),
+                    writer_epoch=int(payload["writer_epoch"]),
+                    writer_session_token=str(payload["writer_session_token"]),
+                    lease_expires_at=now + timedelta(seconds=ttl),
+                    updated_at=now,
+                ),
+            )
+
+        # The conflict is resolved against the tuple this statement locked,
+        # not against its snapshot.
+        current = self._visible_lease(transaction)
+        if current is None:
+            claim()
+            return acquired
+        if self._is_exact_session(current, payload) or (
+            current.lease_expires_at <= now
+        ):
+            claim()
+            return acquired
+        if snapshot is None:
+            return None
+        return self._observed(snapshot, acquired=False)
+
+    @staticmethod
+    def _adopt_matches(statement: Statement, row: LeaseRow) -> bool:
+        payload = statement.payload
+        return (
+            row.writer_id == payload["writer_id"]
+            and row.writer_epoch == int(payload["writer_epoch"])
+            and row.writer_session_token
+            == payload["observed_writer_session_token"]
+            and VirtualClock.timestamp_text(row.updated_at)
+            == payload["observed_lease_updated_at"]
+        )
+
+    @staticmethod
+    def _renew_matches(statement: Statement, row: LeaseRow) -> bool:
+        return FakePostgres._is_exact_session(row, statement.payload)
+
+    _release_matches = _renew_matches
+
+    def _evaluate_adopt(
+        self,
+        statement: Statement,
+        transaction: Transaction,
+        matched: LeaseRow | None,
+    ) -> dict[str, Any] | None:
+        payload = statement.payload
+        now = self.clock.now()
+        ttl = self._ttl(statement)
+        # `lease_expires_at > clock_timestamp()` is evaluated with the rest of
+        # the predicate but depends on live time rather than on the row
+        # version, so it is checked here rather than in _adopt_matches.
+        if matched is not None and matched.lease_expires_at > now:
+            self._stage(
+                transaction,
+                replace(
+                    matched,
+                    writer_session_token=str(payload["writer_session_token"]),
+                    lease_expires_at=now + timedelta(seconds=ttl),
+                    updated_at=now,
+                    xmax=None,
+                ),
+            )
+            return {
+                "acquired": True,
+                "adopted": True,
+                "writer_id": payload["writer_id"],
+                "writer_epoch": int(payload["writer_epoch"]),
+                "writer_session_token": payload["writer_session_token"],
+            }
+        # The CAS affected no rows, so the COALESCE fallback reports whatever
+        # this statement's snapshot holds.
+        snapshot = self._visible_lease(transaction)
+        if snapshot is None:
+            return None
+        observed = self._observed(snapshot, acquired=False)
+        observed["adopted"] = False
+        return observed
+
     def _evaluate_renew(
         self,
         statement: Statement,
         transaction: Transaction,
+        matched: LeaseRow | None,
     ) -> dict[str, Any]:
-        payload = statement.payload
         now = self.clock.now()
         ttl = self._ttl(statement)
-        row = self._visible_lease(transaction)
-        if row is None or not self._is_exact_session(row, payload):
+        if matched is None:
             return {"error": "writer lease is not active"}
         self._stage(
             transaction,
             replace(
-                row,
+                matched,
                 lease_expires_at=now + timedelta(seconds=ttl),
                 updated_at=now,
                 xmax=None,
@@ -1018,16 +1098,15 @@ class FakePostgres:
         self,
         statement: Statement,
         transaction: Transaction,
+        matched: LeaseRow | None,
     ) -> dict[str, Any]:
-        payload = statement.payload
         now = self.clock.now()
-        row = self._visible_lease(transaction)
-        if row is None or not self._is_exact_session(row, payload):
+        if matched is None:
             return {"released": 0}
         self._stage(
             transaction,
             replace(
-                row,
+                matched,
                 lease_expires_at=now - timedelta(seconds=1),
                 updated_at=now,
                 xmax=None,
@@ -1172,11 +1251,23 @@ class FakeSqlBackend:
     def pool_size(self) -> int:
         return self._pool_size
 
-    def _acquire(self) -> Backend:
+    def _acquire(self, timeout_seconds: float | None = None) -> Backend:
+        deadline = (
+            None
+            if timeout_seconds is None
+            else self.server.clock.monotonic() + max(0.0, timeout_seconds)
+        )
         while not self._free:
+            if deadline is not None and self.server.clock.monotonic() >= deadline:
+                # _NativePostgresClient.connection raises exactly this rather
+                # than waiting past the caller's budget.
+                raise LedgerOperationTimeout(
+                    "timed out waiting for a postgres pool slot"
+                )
             self.server.scheduler.block(
                 f"{self.tag}.pool:exhausted",
                 ready=lambda: bool(self._free),
+                wake_at=deadline,
             )
         backend = self._free.pop(0)
         self._in_use.append(backend)
@@ -1197,7 +1288,7 @@ class FakeSqlBackend:
     ) -> Any:
         if self.closed:
             raise RuntimeError("connection pool is closed")
-        backend = self._acquire()
+        backend = self._acquire(timeout_seconds)
         transaction: Transaction | None = None
         try:
             if timeout_seconds is not None:
@@ -1214,7 +1305,10 @@ class FakeSqlBackend:
             if transaction is not None:
                 self.server.scheduler.checkpoint(f"{self.tag}.precommit")
                 self.server._commit(transaction)
-            return result
+            # Production's own NULL handling, called rather than re-described:
+            # a statement that evaluates to SQL NULL raises here, exactly as
+            # it does for a real client.
+            return parse_single_json_value(result)
         except BaseException:
             if transaction is not None and backend.transaction is transaction:
                 self.server._rollback(transaction)
@@ -1297,23 +1391,27 @@ class FakeLeaseGuard:
                 on_query_start()
             if not self.held:
                 raise RuntimeError("postgres writer lease guard is not held")
-            result = self.server.execute(
-                self.backend,
-                sql,
-                transaction=None,
-                timeout_seconds=None,
-                tag=self.tag,
+            result = parse_single_json_value(
+                self.server.execute(
+                    self.backend,
+                    sql,
+                    transaction=None,
+                    timeout_seconds=None,
+                    tag=self.tag,
+                )
             )
             while followup is not None:
                 next_sql = followup(result)
                 if next_sql is None:
                     break
-                result = self.server.execute(
-                    self.backend,
-                    next_sql,
-                    transaction=None,
-                    timeout_seconds=None,
-                    tag=self.tag,
+                result = parse_single_json_value(
+                    self.server.execute(
+                        self.backend,
+                        next_sql,
+                        transaction=None,
+                        timeout_seconds=None,
+                        tag=self.tag,
+                    )
                 )
             return result
         finally:

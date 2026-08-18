@@ -27,6 +27,7 @@ from __future__ import annotations
 import inspect
 import threading
 import unittest
+from typing import Any
 
 from lab.prism import share_ledger as share_ledger_module
 from tests.prism_concurrency_harness import (
@@ -66,8 +67,11 @@ class StatementClassificationTests(unittest.TestCase):
             )
             alpha.call(alpha.ledger.release_writer_lease, label="release")
 
-            # Adoption only runs against a silent same-identity predecessor,
-            # so it needs a second coordinator rather than another call.
+            # A second coordinator, to pin the acquire path a successor takes.
+            # This one finds the lease released and takes it through the
+            # ordinary expiry CAS rather than adopting; the adoption CAS is
+            # pinned separately by test_adoption_statement_classifies, which
+            # is the only place that statement is emitted here.
             beta = harness.coordinator(
                 "beta",
                 session_token="heartbeat-v1:beta-successor",
@@ -75,17 +79,12 @@ class StatementClassificationTests(unittest.TestCase):
             beta.start()
             harness.run_until(beta, "done:startup")
 
+            # Every statement above reached FakePostgres and was classified
+            # as the operation it performs; an unrecognised one would have
+            # raised UnsupportedStatement inside the ledger call.
             self.assertEqual(
                 harness.statement_kinds(),
                 ["acquire", "renew", "verify", "release", "acquire"],
-            )
-            # Every statement above reached FakePostgres and was classified;
-            # an unrecognised one would have raised inside the ledger call.
-            self.assertTrue(
-                all(
-                    isinstance(statement.kind, LeaseOp)
-                    for statement in harness.server.statements
-                )
             )
 
     def test_adoption_statement_classifies(self) -> None:
@@ -99,8 +98,6 @@ class StatementClassificationTests(unittest.TestCase):
             alpha = harness.coordinator("alpha")
             alpha.start()
             harness.run_until(alpha, "done:startup")
-            sql = alpha.ledger._try_adopt_writer_lease.__wrapped__ if False else None
-            del sql
             # Build the statement through the real method, capturing it at the
             # port rather than reconstructing it here.
             observed = {
@@ -162,7 +159,82 @@ class StatementClassificationTests(unittest.TestCase):
 
 
 class PortContractTests(unittest.TestCase):
-    """The fakes must keep matching the production classes they replace."""
+    """The fakes must keep matching the production classes they replace.
+
+    The repository runs no mypy — CI is `compileall` plus `unittest discover`
+    — so structural typing is never checked statically. Without these the two
+    protocols would be documentation: nothing would notice a fake that
+    stopped implementing one, or a production class that outgrew it.
+    """
+
+    def _guard_stub(self) -> Any:
+        guard = share_ledger_module._NativePostgresLeaseGuard.__new__(
+            share_ledger_module._NativePostgresLeaseGuard
+        )
+        guard._connection = None
+        guard._advisory_lock_key = 0
+        guard._query_lock = threading.Lock()
+        guard._closed = False
+        guard._held = True
+        return guard
+
+    def test_production_classes_satisfy_their_own_ports(self) -> None:
+        client = share_ledger_module._NativePostgresClient.__new__(
+            share_ledger_module._NativePostgresClient
+        )
+        self.assertIsInstance(client, share_ledger_module.LedgerSqlPort)
+        self.assertIsInstance(
+            self._guard_stub(),
+            share_ledger_module.LeaseGuardPort,
+        )
+
+    def test_fakes_satisfy_the_ports_they_stand_in_for(self) -> None:
+        from tests.prism_concurrency_harness import FakeLeaseGuard, FakeSqlBackend
+
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+
+            self.assertIsInstance(alpha.sql_backend, FakeSqlBackend)
+            self.assertIsInstance(alpha.guard, FakeLeaseGuard)
+            self.assertIsInstance(
+                alpha.sql_backend,
+                share_ledger_module.LedgerSqlPort,
+            )
+            self.assertIsInstance(
+                alpha.guard,
+                share_ledger_module.LeaseGuardPort,
+            )
+
+    def test_every_port_method_matches_production_signature(self) -> None:
+        """Full signatures, not just parameter names.
+
+        Comparing `list(signature.parameters)` alone would stay green if a
+        keyword-only argument became positional or lost its default, which is
+        exactly the kind of drift that makes a fake silently stop modelling
+        the thing it replaces.
+        """
+        from tests.prism_concurrency_harness import FakeLeaseGuard, FakeSqlBackend
+
+        for production, fake, methods in (
+            (
+                share_ledger_module._NativePostgresClient,
+                FakeSqlBackend,
+                ("run_json", "run_script", "close"),
+            ),
+            (
+                share_ledger_module._NativePostgresLeaseGuard,
+                FakeLeaseGuard,
+                ("run_json", "try_acquire", "close"),
+            ),
+        ):
+            for method in methods:
+                with self.subTest(production=production.__name__, method=method):
+                    self.assertEqual(
+                        inspect.signature(getattr(production, method)),
+                        inspect.signature(getattr(fake, method)),
+                    )
 
     def test_sql_backend_matches_native_client_signature(self) -> None:
         from tests.prism_concurrency_harness import FakeSqlBackend
@@ -264,11 +336,12 @@ class SchedulerTests(unittest.TestCase):
             harness.run_until(alpha, "alpha.begin:acquire")
             harness.run_until(beta, "beta.begin:acquire")
             harness.drain([alpha, beta])
+            beta_error = beta.actor.calls[0].error
             return {
                 "holder": harness.lease_holder_session(),
                 "kinds": harness.statement_kinds(),
                 "alpha_failed": alpha.actor.calls[0].error is not None,
-                "beta_failed": beta.actor.calls[0].error is not None,
+                "beta_error": None if beta_error is None else str(beta_error),
             }
 
         run = assert_deterministic(self, scenario, repeats=25)
@@ -278,7 +351,58 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(run.outcome["holder"], "heartbeat-v1:alpha-1")
         self.assertEqual(run.outcome["kinds"], ["acquire", "acquire"])
         self.assertFalse(run.outcome["alpha_failed"])
-        self.assertTrue(run.outcome["beta_failed"])
+        # The loser does not get a clean refusal. Its DO UPDATE matches
+        # nothing, and the COALESCE fallback reads a snapshot taken before the
+        # winner's row existed, so the whole statement evaluates to SQL NULL.
+        # See test_first_acquire_race_loser_gets_an_unhelpful_error.
+        self.assertEqual(
+            run.outcome["beta_error"],
+            "postgres query returned no JSON",
+        )
+
+    def test_first_acquire_race_loser_gets_an_unhelpful_error(self) -> None:
+        """Two coordinators racing the first-ever acquire: the loser dies badly.
+
+        The losing ``INSERT ... ON CONFLICT DO UPDATE`` affects zero rows, and
+        the ``COALESCE`` arm that would report the holder reads this
+        statement's own snapshot — taken before the winner's row was
+        committed — so it finds nothing and the statement returns SQL NULL.
+        ``parse_single_json_value`` turns that into ``postgres query returned
+        no JSON``, which ``_ensure_writer_lease`` does not catch, so
+        ``PsqlShareLedger.__init__`` dies with an error naming nothing about
+        leases or about the coordinator that holds it.
+
+        Pinned here rather than left implicit because it is a real production
+        outcome that reads like a driver fault, and because it is the shape a
+        fix would have to change: the operator-facing message is the whole
+        difference between this and the ordinary "lease is held by" refusal.
+        """
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha", writer_epoch=1)
+            beta = harness.coordinator("beta", writer_epoch=2)
+            alpha.start()
+            beta.start()
+            harness.run_until(alpha, "alpha.begin:acquire")
+            harness.run_until(beta, "beta.begin:acquire")
+            harness.drain([alpha, beta])
+
+            alpha.actor.calls[0].value()
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "postgres query returned no JSON",
+            ):
+                beta.actor.calls[0].value()
+
+            # Contrast: once the winner's row is visible in the loser's
+            # snapshot, the same race produces the ordinary refusal.
+            gamma = harness.coordinator("gamma", writer_epoch=3)
+            gamma.start()
+            harness.run_until(gamma, "done:startup")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "qbit ledger writer lease is held by",
+            ):
+                gamma.actor.calls[0].value()
 
     def test_trace_names_the_actor_and_the_stop(self) -> None:
         with LeaseHarness() as harness:

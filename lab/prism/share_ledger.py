@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import BoundedSemaphore, Lock, Thread, local
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Protocol, runtime_checkable
 
 from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
@@ -1857,6 +1857,7 @@ def _writer_lease_advisory_lock_key(writer_id: str, writer_epoch: int) -> int:
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
+@runtime_checkable
 class LedgerSqlPort(Protocol):
     """The pooled statement-execution seam `PsqlShareLedger` writes through.
 
@@ -1867,9 +1868,6 @@ class LedgerSqlPort(Protocol):
     need: statement timing, tuple-lock waits and transaction lifetime are
     properties of this seam, not of any single method.
     """
-
-    @property
-    def pool_size(self) -> int: ...
 
     def run_json(
         self,
@@ -1884,6 +1882,7 @@ class LedgerSqlPort(Protocol):
     def close(self) -> None: ...
 
 
+@runtime_checkable
 class LeaseGuardPort(Protocol):
     """The dedicated writer-lease guard session seam.
 
@@ -2195,6 +2194,14 @@ class PsqlShareLedger:
 
     durable_payout_state = True
 
+    # The lease lifecycle's clock, as a class attribute so an instance built
+    # without __init__ (several tests exercise one statement that way) still
+    # reads a working clock. __init__ overrides it per instance with whatever
+    # was injected. Declaring it here rather than resolving it through getattr
+    # at each call site means a rename fails loudly at the assignment instead
+    # of silently reverting every scenario to wall-clock time.
+    _monotonic: Callable[[], float] = staticmethod(time.monotonic)
+
     @staticmethod
     def _resolve_lease_authority_margin_seconds(
         lease_ttl_seconds: float,
@@ -2253,6 +2260,7 @@ class PsqlShareLedger:
         schema_path: Path | None = None,
         lease_retry_sleep: Callable[[float], None] | None = None,
         monotonic: Callable[[], float] | None = None,
+        pool_application_name: str | None = None,
         sql_backend_factory: Callable[..., LedgerSqlPort | None] | None = None,
         lease_guard_factory: Callable[..., LeaseGuardPort | None] | None = None,
         lease_retry_max_sleep_seconds: float = 15.0,
@@ -2310,7 +2318,9 @@ class PsqlShareLedger:
         # than a competing expiry claim. Unique per ledger instance: a
         # predecessor or replacement process never shares it, so their
         # in-flight writes still fence this session out.
-        self._pool_application_name = f"qbit-prism-writer-{uuid.uuid4().hex}"
+        self._pool_application_name = (
+            pool_application_name or f"qbit-prism-writer-{uuid.uuid4().hex}"
+        )
         self._lease_ttl_seconds = lease_ttl_seconds
         # SQL fragment for the writer-lease expiry. The lease is refreshed on
         # every append (the dominant liveness signal during active mining), so a
@@ -2333,7 +2343,10 @@ class PsqlShareLedger:
         # supply a virtual clock and drive an interleaving by advancing it
         # rather than by sleeping and hoping. Production passes None and gets
         # time.monotonic.
-        self._monotonic: Callable[[], float] = monotonic or time.monotonic
+        # Resolved at construction, not at each call: an instance built the
+        # ordinary way binds whichever clock is in force now, while the class
+        # attribute above still covers instances built without __init__.
+        self._monotonic = monotonic or time.monotonic
         self._sql_backend_factory = sql_backend_factory
         self._lease_guard_factory = lease_guard_factory
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
@@ -2505,7 +2518,7 @@ class PsqlShareLedger:
                 # failure budget; counting from acquisition guarantees it
                 # that time even when its lease row is already stale because
                 # a long fenced transaction withheld updated_at refreshes.
-                self._writer_lease_guard_acquired_monotonic = self._now_monotonic()
+                self._writer_lease_guard_acquired_monotonic = self._monotonic()
                 return
             guard.close()
             if not warned:
@@ -2578,7 +2591,7 @@ class PsqlShareLedger:
             timeout_local = local()
             self._operation_timeout_local = timeout_local
         previous = getattr(timeout_local, "deadline", None)
-        deadline = self._now_monotonic() + timeout_seconds
+        deadline = self._monotonic() + timeout_seconds
         timeout_local.deadline = (
             deadline if previous is None else min(float(previous), deadline)
         )
@@ -2626,18 +2639,6 @@ class PsqlShareLedger:
             else:
                 timeout_local.timeout_seconds = previous
 
-    def _now_monotonic(self) -> float:
-        """Read the lease lifecycle's monotonic clock.
-
-        Resolved through getattr, matching this class's convention for
-        lazily initialized state: tests that exercise a single statement
-        against an instance built without __init__ still get a working
-        clock, while a fully constructed ledger reads whichever clock was
-        injected.
-        """
-        monotonic = getattr(self, "_monotonic", None)
-        return time.monotonic() if monotonic is None else monotonic()
-
     def _remaining_operation_timeout(self) -> float | None:
         timeout_local = getattr(self, "_operation_timeout_local", None)
         deadline = (
@@ -2661,7 +2662,7 @@ class PsqlShareLedger:
                 if statement_timeout_seconds is None
                 else float(statement_timeout_seconds)
             )
-        remaining = float(deadline) - self._now_monotonic()
+        remaining = float(deadline) - self._monotonic()
         if remaining <= 0:
             raise LedgerOperationTimeout("postgres operation deadline expired")
         if statement_timeout_seconds is not None:
@@ -6849,7 +6850,7 @@ END;
 
     def _ensure_writer_lease(self) -> None:
         while True:
-            acquire_started_monotonic = self._now_monotonic()
+            acquire_started_monotonic = self._monotonic()
             result = self._try_acquire_writer_lease()
             if result.get("acquired"):
                 self._writer_lease_last_refresh_monotonic = (
@@ -6858,7 +6859,7 @@ END;
                 return
             if self._can_adopt_writer_lease(result):
                 observed_session = str(result["writer_session_token"])
-                adoption_started_monotonic = self._now_monotonic()
+                adoption_started_monotonic = self._monotonic()
                 adoption = self._try_adopt_writer_lease(result)
                 if adoption.get("acquired"):
                     self._writer_lease_last_refresh_monotonic = (
@@ -7035,7 +7036,7 @@ SELECT COALESCE(
         )
         guard_held_seconds = max(
             0.0,
-            self._now_monotonic() - guard_acquired_monotonic,
+            self._monotonic() - guard_acquired_monotonic,
         )
         guard_wait_seconds = max(
             0.0,

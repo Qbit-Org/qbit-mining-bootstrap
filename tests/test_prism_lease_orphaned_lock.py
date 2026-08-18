@@ -104,6 +104,39 @@ def drive_orphaned_lock_interleaving(harness: LeaseHarness) -> dict[str, object]
     }
 
 
+def drive_successor_to_quiescence(
+    harness: LeaseHarness,
+    successor: object,
+    *,
+    horizon_seconds: float = FAILOVER_HORIZON_SECONDS,
+) -> bool:
+    """Run the successor until it finishes or nothing can move it again.
+
+    Draining once is not enough to decide "did the wait end". A fix built
+    from ``lock_timeout`` plus a bounded retry — which is what #123 proposes
+    — parks the successor on a succession of short deadlines, and a single
+    ``advance`` followed by a single ``drain`` would leave it stopped at the
+    first of them and report a wait that never ended. Advancing to each
+    pending deadline in turn asks the question the assertion actually means:
+    is there any sequence of timeouts that gets this coordinator out?
+
+    Returns True when startup finished, by acquiring or by raising. Returns
+    False when the successor is stuck with no deadline left to reach, which
+    is the state ``2.x.x`` produces.
+    """
+    startup = successor.actor.calls[0]  # type: ignore[attr-defined]
+    deadline = harness.clock.monotonic() + horizon_seconds
+    while not startup.done and harness.clock.monotonic() < deadline:
+        harness.drain([successor])
+        if startup.done:
+            break
+        if harness.advance_to_next_deadline() is None:
+            # Nothing in the system is waiting on time, so no amount of
+            # further waiting changes anything.
+            break
+    return startup.done
+
+
 class OrphanedLeaseLockInterleavingTests(unittest.TestCase):
     """The harness can express and reproduce #123's interleaving."""
 
@@ -151,12 +184,15 @@ class OrphanedLeaseLockInterleavingTests(unittest.TestCase):
             drive_orphaned_lock_interleaving(harness)
             beta = harness.coordinators["beta"]
 
-            harness.advance(FAILOVER_HORIZON_SECONDS)
-            harness.drain([beta])
+            finished = drive_successor_to_quiescence(harness, beta)
 
             self.assertFalse(
-                beta.actor.runnable(),
+                finished,
                 "the successor is still parked on the orphaned tuple lock",
+            )
+            self.assertFalse(
+                beta.actor.runnable(),
+                "and nothing can make it runnable again",
             )
             self.assertFalse(
                 beta.started,
@@ -234,6 +270,13 @@ class OrphanedLeaseLockFailoverBoundTests(unittest.TestCase):
         by raising something an operator can see — rather than waiting on a
         lock nobody will ever release.
 
+        The successor is driven through every deadline it reaches rather than
+        drained once, so a fix whose bounded wait spans several short
+        timeouts satisfies this as readily as one that fails on the first.
+        Asserting anything narrower would leave the person who lands #123
+        looking at a red test their correct fix did not turn green, and
+        reaching for the same weakening this test exists to refuse.
+
         This assertion is deliberately written against the fixed behaviour.
         On 2.x.x it fails, and that failure is the point: it is the first
         executable statement of what #123 asks for.
@@ -242,16 +285,15 @@ class OrphanedLeaseLockFailoverBoundTests(unittest.TestCase):
             drive_orphaned_lock_interleaving(harness)
             beta = harness.coordinators["beta"]
 
-            harness.advance(FAILOVER_HORIZON_SECONDS)
-            harness.drain([beta])
+            finished = drive_successor_to_quiescence(harness, beta)
 
-            startup = beta.actor.calls[0]
             self.assertTrue(
-                startup.done,
+                finished,
                 "the successor's PsqlShareLedger.__init__ is still waiting on "
                 f"the orphaned lease-tuple lock after "
-                f"{FAILOVER_HORIZON_SECONDS / 3600:g} virtual hours. #123 is "
-                "unfixed on this line: the startup lease upsert runs with no "
+                f"{FAILOVER_HORIZON_SECONDS / 3600:g} virtual hours, with no "
+                "deadline left anywhere that could release it. #123 is unfixed "
+                "on this line: the startup lease upsert runs with no "
                 "lock_timeout, so nothing bounds the wait.",
             )
 
