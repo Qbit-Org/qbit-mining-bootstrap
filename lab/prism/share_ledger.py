@@ -2979,17 +2979,17 @@ class PsqlShareLedger:
             return
         on_progress, slice_seconds = hook
         deadline = (
-            None if remaining is None else time.monotonic() + max(0.0, remaining)
+            None if remaining is None else self._monotonic() + max(0.0, remaining)
         )
         while True:
             wait_seconds = slice_seconds
             if deadline is not None:
-                wait_seconds = min(wait_seconds, deadline - time.monotonic())
+                wait_seconds = min(wait_seconds, deadline - self._monotonic())
             # An expired budget still gets one non-blocking attempt, so a
             # zero or negative remaining fails exactly where it always did.
             if gate.acquire(timeout=max(0.0, wait_seconds)):
                 return
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline is not None and self._monotonic() >= deadline:
                 raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
             on_progress()
 

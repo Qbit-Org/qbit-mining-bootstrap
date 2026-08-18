@@ -68,6 +68,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import re
 import sys
 import threading
@@ -98,8 +99,12 @@ from lab.prism.share_ledger import (  # noqa: E402
 # real threading.Lock, a real socket) trips it instead of hanging the suite.
 # It is not free of consequence — an actor that genuinely took this long to
 # reach its next checkpoint would fail a run that ought to pass — but the
-# margin against microseconds of work is enormous.
-BATON_TIMEOUT_SECONDS = 20.0
+# margin against microseconds of work is enormous. The env override exists
+# for heavily oversubscribed CI hosts where 20s of scheduler stall is a real
+# false red; it widens the failure detector only and never affects ordering.
+BATON_TIMEOUT_SECONDS = float(
+    os.environ.get("PRISM_HARNESS_BATON_TIMEOUT_SECONDS", "20.0")
+)
 
 # Virtual epoch origin for clock_timestamp(). Fixed so timestamp text is
 # byte-identical across runs, which matters: the adoption CAS compares
