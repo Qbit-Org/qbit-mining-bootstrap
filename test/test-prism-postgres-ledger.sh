@@ -1038,8 +1038,45 @@ replacement.persist_accepted_block(
     final_bundle=zero_net_bundle,
     audit_report=zero_net_report,
 )
+# The stranded-prepared sweep finds exactly the rows the reorg watch read
+# structurally cannot: prepared and buried past the reject depth floor.
+# Nothing else re-examines them once their outbox row is gone.
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 100,
+        min_depth=100,
+    ),
+    [{"block_hash": "46" * 32, "block_height": 9, "parent_hash": "45" * 32}],
+    "stranded prepared sweep finds a buried prepared row",
+)
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 99,
+        min_depth=100,
+    ),
+    [],
+    "stranded prepared sweep leaves rows inside the depth floor alone",
+)
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 100,
+        min_depth=100,
+        limit=0,
+    ),
+    [],
+    "stranded prepared sweep honours its page bound",
+)
 rejected_count = replacement.reject_prepared_block(block_hash="46" * 32, active_tip_height=8)["rejected_count"]
 assert_equal(rejected_count, 3, "reject prepared block/payout/carry row count")
+# The fenced rejection is what retires the row from the sweep.
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 100,
+        min_depth=100,
+    ),
+    [],
+    "rejected block leaves the stranded prepared sweep",
+)
 rejected_state = replacement._run_json(
     """
 SELECT json_build_object(

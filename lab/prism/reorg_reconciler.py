@@ -48,6 +48,23 @@ PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_SECONDS = 20.0
 # Hard ceiling for the operator override: the join must stay comfortably
 # below the template-refresh failure budget or the bound stops bounding.
 PRISM_RECONCILE_PREFETCH_JOIN_TIMEOUT_CEILING_SECONDS = 60.0
+# How deeply a pool block must be buried before the stranded-prepared sweep
+# will reject it.
+#
+# A prepared row is owned by the live submit/replay path while its outbox
+# entry exists; the sweep exists only for rows that lost that owner, and it
+# cannot tell the two apart from the ledger alone. Depth is the proxy. 100
+# blocks is far past any legitimate in-flight finalization — a landing that
+# is still retrying, an ancestor replay working its way forward, a
+# confirmation racing its own audit publication all resolve within a handful
+# of blocks — while still healing a genuinely stranded row within roughly
+# two hours of block time rather than leaving its payout entries, carry
+# forward, and CTV fanout artifacts pinned immature indefinitely.
+STRANDED_PREPARED_REJECT_MIN_DEPTH = 100
+# One pass's bound on the sweep. Each returned row costs a getblockhash and
+# possibly a fenced ledger mutation, and the pass already walks the reorg
+# watch set; the remainder is picked up by the next pass.
+STRANDED_PREPARED_SWEEP_LIMIT = 64
 
 
 def _no_reconcile_progress(phase: str) -> None:
@@ -658,6 +675,8 @@ class ReorgReconcilerService:
             "inactive_blocks": 0,
             "reactivated_blocks": 0,
             "matured_payouts": 0,
+            "stranded_prepared_rejected": 0,
+            "stranded_prepared_canonical": 0,
         }
         if not self.enabled:
             return summary
@@ -674,6 +693,8 @@ class ReorgReconcilerService:
         inactive_blocks_total = 0
         reactivated_blocks_total = 0
         matured_payouts_total = 0
+        stranded_prepared_rejected_total = 0
+        stranded_prepared_canonical_total = 0
         supersession_retries = 0
         skip_recorded = False
         max_supersession_retries = max(
@@ -698,12 +719,19 @@ class ReorgReconcilerService:
                     inactive_blocks_total
                     or reactivated_blocks_total
                     or matured_payouts_total
+                    or stranded_prepared_rejected_total
                 ),
                 proof_epoch=proof_epoch,
             )
             summary["inactive_blocks"] = inactive_blocks_total
             summary["reactivated_blocks"] = reactivated_blocks_total
             summary["matured_payouts"] = matured_payouts_total
+            summary["stranded_prepared_rejected"] = (
+                stranded_prepared_rejected_total
+            )
+            summary["stranded_prepared_canonical"] = (
+                stranded_prepared_canonical_total
+            )
             return summary
 
         def retry_superseded_candidate() -> bool:
@@ -734,6 +762,8 @@ class ReorgReconcilerService:
                     inactive_blocks = 0
                     reactivated_blocks = 0
                     matured_payouts = 0
+                    stranded_prepared_rejected = 0
+                    stranded_prepared_canonical = 0
                     summary["untrusted"] = False
                     summary["watched_blocks"] = 0
                     try:
@@ -869,6 +899,98 @@ class ReorgReconcilerService:
                                             or bool(inactive_count)
                                         )
 
+                                # Rows the watch loop above structurally
+                                # cannot see: it selects confirmed/inactive
+                                # only, because a prepared row belongs to the
+                                # live submit/replay path that holds its
+                                # outbox entry. When that entry is gone the
+                                # row has no owner left, and an orphaned one
+                                # pins its payout entries, carry forward, and
+                                # CTV fanout artifacts immature forever.
+                                stranded_prepared = getattr(
+                                    ledger,
+                                    "stranded_prepared_blocks",
+                                    None,
+                                )
+                                if callable(stranded_prepared):
+                                    self._ports.record_progress(
+                                        "reorg-reconcile:stranded-prepared-blocks"
+                                    )
+                                    stranded_rows = stranded_prepared(
+                                        active_tip_height=active_tip_height,
+                                        min_depth=(
+                                            STRANDED_PREPARED_REJECT_MIN_DEPTH
+                                        ),
+                                        limit=STRANDED_PREPARED_SWEEP_LIMIT,
+                                    )
+                                    for row in stranded_rows:
+                                        # Per row for the same reason as the
+                                        # watch loop: a getblockhash plus a
+                                        # fenced ledger mutation each.
+                                        self._ports.record_progress(
+                                            "reorg-reconcile:stranded-prepared"
+                                        )
+                                        block_height = int(row["block_height"])
+                                        block_hash = str(
+                                            row["block_hash"]
+                                        ).lower()
+                                        active_hash = str(
+                                            self._ports.rpc_call(
+                                                "getblockhash",
+                                                [block_height],
+                                            )
+                                        ).lower()
+                                        if active_hash == block_hash:
+                                            # Canonical but never confirmed:
+                                            # the confirm path owns audit
+                                            # publication sequencing, so this
+                                            # sweep must never take the row
+                                            # from under it. Report loudly and
+                                            # leave it alone.
+                                            stranded_prepared_canonical += 1
+                                            print(
+                                                "prism coordinator: stranded "
+                                                "prepared pool block is "
+                                                "canonical and needs operator "
+                                                "review "
+                                                f"hash={block_hash} "
+                                                f"height={block_height} "
+                                                "depth="
+                                                f"{active_tip_height - block_height}",
+                                                flush=True,
+                                            )
+                                            continue
+                                        payout_mutation_attempted = True
+                                        rejected = ledger.reject_prepared_block(
+                                            block_hash=block_hash,
+                                            active_tip_height=active_tip_height,
+                                        )
+                                        # The fenced ledger function cascades
+                                        # payout entries, carry forward, and
+                                        # fanout artifacts, and returns 0 when
+                                        # the row already moved under us.
+                                        rejected_count = int(
+                                            rejected.get("rejected_count", 0)
+                                        )
+                                        stranded_prepared_rejected += (
+                                            rejected_count
+                                        )
+                                        payout_changed = (
+                                            payout_changed
+                                            or bool(rejected_count)
+                                        )
+                                        if rejected_count:
+                                            print(
+                                                "prism coordinator: rejected "
+                                                "orphaned stranded prepared "
+                                                "pool block "
+                                                f"hash={block_hash} "
+                                                f"height={block_height} "
+                                                "depth="
+                                                f"{active_tip_height - block_height}",
+                                                flush=True,
+                                            )
+
                                 mark_mature = getattr(
                                     ledger,
                                     "mark_mature_pool_payouts",
@@ -893,6 +1015,12 @@ class ReorgReconcilerService:
                                 inactive_blocks_total += inactive_blocks
                                 reactivated_blocks_total += reactivated_blocks
                                 matured_payouts_total += matured_payouts
+                                stranded_prepared_rejected_total += (
+                                    stranded_prepared_rejected
+                                )
+                                stranded_prepared_canonical_total += (
+                                    stranded_prepared_canonical
+                                )
                                 if (
                                     payout_changed
                                     or force_publish
@@ -917,6 +1045,12 @@ class ReorgReconcilerService:
                         inactive_blocks_total += inactive_blocks
                         reactivated_blocks_total += reactivated_blocks
                         matured_payouts_total += matured_payouts
+                        stranded_prepared_rejected_total += (
+                            stranded_prepared_rejected
+                        )
+                        stranded_prepared_canonical_total += (
+                            stranded_prepared_canonical
+                        )
                         # Durable partial mutations close admission before the
                         # preparation lock is released. Publication drains old
                         # socket sends afterward without blocking new ledger

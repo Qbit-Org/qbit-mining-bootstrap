@@ -859,6 +859,87 @@ class PrismShareLedgerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ledger.pending_block_candidate_rows(after_cursor=cursor)
 
+    def test_stranded_prepared_blocks_filter_by_depth_and_state(self) -> None:
+        """The sweep's read only surfaces rows an operator-free heal may touch.
+
+        reorg_watch_blocks selects confirmed/inactive rows only, so a
+        prepared row whose outbox entry is gone has nothing left to
+        re-examine it. The depth floor is what separates that from a
+        finalization still legitimately in flight.
+        """
+        ledger = SingleWriterShareLedger()
+        heights = {
+            "deep": ("a1" * 32, 100),
+            "at_floor": ("a2" * 32, 900),
+            "shallow": ("a3" * 32, 901),
+            "confirmed": ("a4" * 32, 200),
+        }
+        for block_hash, block_height in heights.values():
+            ledger.persist_accepted_block(
+                block_hash=block_hash,
+                block_height=block_height,
+                parent_hash="bb" * 32,
+                final_bundle={},
+                audit_report={},
+            )
+        confirmed_hash, confirmed_height = heights["confirmed"]
+        self.assertEqual(
+            ledger.confirm_accepted_block(
+                block_hash=confirmed_hash,
+                active_tip_height=confirmed_height,
+            )["confirmed_count"],
+            1,
+        )
+
+        stranded = ledger.stranded_prepared_blocks(
+            active_tip_height=1000,
+            min_depth=100,
+        )
+
+        self.assertEqual(
+            [(row["block_hash"], row["block_height"]) for row in stranded],
+            [
+                (heights["deep"][0], heights["deep"][1]),
+                (heights["at_floor"][0], heights["at_floor"][1]),
+            ],
+        )
+        self.assertEqual(stranded[0]["parent_hash"], "bb" * 32)
+        # A confirmed row belongs to the watch loop, not this sweep, and a
+        # row shallower than the floor may still be finalizing.
+        returned = {str(row["block_hash"]) for row in stranded}
+        self.assertNotIn(heights["confirmed"][0], returned)
+        self.assertNotIn(heights["shallow"][0], returned)
+        # The limit bounds one pass; the remainder waits for the next one.
+        self.assertEqual(
+            [
+                row["block_hash"]
+                for row in ledger.stranded_prepared_blocks(
+                    active_tip_height=1000,
+                    min_depth=100,
+                    limit=1,
+                )
+            ],
+            [heights["deep"][0]],
+        )
+        # Rejecting through the fenced method retires the row from the sweep.
+        self.assertEqual(
+            ledger.reject_prepared_block(
+                block_hash=heights["deep"][0],
+                active_tip_height=1000,
+            )["rejected_count"],
+            1,
+        )
+        self.assertEqual(
+            [
+                row["block_hash"]
+                for row in ledger.stranded_prepared_blocks(
+                    active_tip_height=1000,
+                    min_depth=100,
+                )
+            ],
+            [heights["at_floor"][0]],
+        )
+
     def test_batch_validation_is_all_or_nothing(self) -> None:
         ledger = SingleWriterShareLedger()
         first = pending_share(1)
@@ -1562,6 +1643,55 @@ class PrismShareLedgerTests(unittest.TestCase):
             after_cursor=["2026-07-08T21:02:03.123456Z", "ef' OR true --"],
         )
         self.assertIn("'ef'' OR true --'", ledger.lease_queries[-1])
+
+    def test_postgres_stranded_prepared_blocks_bound_depth_and_page(self) -> None:
+        """The sweep read is depth-floored, state-filtered, and bounded."""
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                [
+                    {
+                        "block_hash": "19" * 32,
+                        "block_height": "30822",
+                        "parent_hash": "20" * 32,
+                    }
+                ],
+            ]
+        )
+
+        self.assertEqual(
+            ledger.stranded_prepared_blocks(
+                active_tip_height=31000,
+                min_depth=100,
+                limit=64,
+            ),
+            [
+                {
+                    "block_hash": "19" * 32,
+                    "block_height": 30822,
+                    "parent_hash": "20" * 32,
+                }
+            ],
+        )
+
+        query = ledger.lease_queries[-1]
+        self.assertIn("FROM qbit_pool_blocks", query)
+        # Leads with the qbit_pool_blocks_maturity_idx columns.
+        self.assertIn("WHERE maturity_state = 'immature'", query)
+        self.assertIn("AND block_height <= 30900", query)
+        self.assertIn("AND chain_state = 'prepared'", query)
+        self.assertIn("ORDER BY block_height ASC, block_hash ASC", query)
+        self.assertIn("LIMIT 64", query)
+        # Nothing is fetched at all when the caller allows no rows.
+        self.assertEqual(
+            ledger.stranded_prepared_blocks(
+                active_tip_height=31000,
+                min_depth=100,
+                limit=0,
+            ),
+            [],
+        )
+        self.assertIs(ledger.lease_queries[-1], query)
 
     def test_postgres_pending_candidate_metrics_are_aggregate_and_indexable(self) -> None:
         ledger = FakeLeasePsqlShareLedger(

@@ -1718,6 +1718,39 @@ class SingleWriterShareLedger:
     def reorg_watch_blocks(self, *, active_tip_height: int) -> list[dict[str, object]]:
         return []
 
+    def stranded_prepared_blocks(
+        self,
+        *,
+        active_tip_height: int,
+        min_depth: int,
+        limit: int = 64,
+    ) -> list[dict[str, object]]:
+        """Return deeply buried rows still parked in the prepared state.
+
+        ``reorg_watch_blocks`` deliberately watches only confirmed/inactive
+        rows, and a prepared row is normally resolved by the live
+        submit/replay path that owns it. A row whose outbox entry is gone
+        (quarantined, or completed by a process that died before confirming)
+        therefore has nothing left to re-examine it, and stays prepared
+        forever. This read finds those rows; the caller decides, against the
+        active chain, which ones are provably orphaned.
+        """
+        with self._lock:
+            rows = [
+                {
+                    "block_hash": block_hash,
+                    "block_height": int(block[0]),
+                    "parent_hash": str(block[2]),
+                }
+                for block_hash, block in self._memory_pool_blocks.items()
+                # The memory backend derives maturity_state from chain_state
+                # (see pool_block_state): 'prepared' is always 'immature'.
+                if block[1] == "prepared"
+                and int(block[0]) <= int(active_tip_height) - int(min_depth)
+            ]
+        rows.sort(key=lambda row: (int(row["block_height"]), str(row["block_hash"])))
+        return rows[: max(0, int(limit))]
+
     def mark_pool_block_inactive(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
         block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
         with self._lock:
@@ -7159,6 +7192,54 @@ FROM qbit_pool_blocks
 WHERE chain_state IN ('confirmed', 'inactive')
   AND maturity_state = 'immature'
 ;
+"""
+        with self._operation_gate(self._lock, "writer lock"):
+            rows = self._run_retry_safe_read_json(sql)
+        for row in rows:
+            row["block_height"] = int(row["block_height"])
+        return rows
+
+    def stranded_prepared_blocks(
+        self,
+        *,
+        active_tip_height: int,
+        min_depth: int,
+        limit: int = 64,
+    ) -> list[dict[str, object]]:
+        """Return deeply buried rows still parked in the prepared state.
+
+        ``reorg_watch_blocks`` deliberately watches only confirmed/inactive
+        rows, and a prepared row is normally resolved by the live
+        submit/replay path that owns it through its outbox entry. A row
+        whose outbox entry is gone (quarantined, or completed by a process
+        that died before confirming) therefore has nothing left to
+        re-examine it, and stays prepared forever — holding immature payout
+        entries, carry-forward, and CTV fanout artifacts open with it. This
+        read finds those rows; the caller decides, against the active chain,
+        which ones are provably orphaned.
+
+        The predicate leads with ``maturity_state`` and ``block_height`` so
+        it rides ``qbit_pool_blocks_maturity_idx``, and the depth floor
+        keeps the scan to rows the caller could actually act on.
+        """
+        if limit <= 0:
+            return []
+        depth_ceiling = int(active_tip_height) - int(min_depth)
+        sql = f"""
+SELECT COALESCE(json_agg(json_build_object(
+    'block_hash', block_hash,
+    'block_height', block_height,
+    'parent_hash', parent_hash
+) ORDER BY block_height ASC, block_hash ASC), '[]'::json)
+FROM (
+    SELECT block_hash, block_height, parent_hash
+    FROM qbit_pool_blocks
+    WHERE maturity_state = 'immature'
+      AND block_height <= {depth_ceiling}
+      AND chain_state = 'prepared'
+    ORDER BY block_height ASC, block_hash ASC
+    LIMIT {int(limit)}
+) stranded;
 """
         with self._operation_gate(self._lock, "writer lock"):
             rows = self._run_retry_safe_read_json(sql)
