@@ -6455,6 +6455,298 @@ class PrismStampedJobFloorTests(unittest.TestCase):
         )
         self.assertEqual(server._block_candidate_disposition_flights, {})
 
+    def _drive_interleaved_distinct_hash_landings(
+        self,
+        *,
+        lease_error: BaseException | None = None,
+    ) -> SimpleNamespace:
+        """Interleave two distinct-hash landings across the production tails.
+
+        Block A lands on the synchronous miner-connection tail and pauses in
+        its confirm->publish gap (the accepted-share-stats aggregate) with the
+        payout balance lock and the publication order guard released. Block B
+        lands through the production submitter->accounting-actor handoff
+        inside that gap and publishes first, so A reaches publication already
+        superseded on the publication ordinal. ``lease_error`` is raised from
+        the coordinator's fresh-lease fence when provided, modelling a writer
+        whose lease authority cannot be proven inside the gap.
+        """
+        old_tip = "00" * 32
+        hash_a = "a1" * 32
+        hash_b = "b2" * 32
+        server, state, _recording = submit_coordinator(tip=old_tip)
+        server.max_blocks = 10
+        server.stop_after_block = False
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server.build_audit_bundle = (  # type: ignore[method-assign]
+            lambda **_kwargs: verified_block_bundle()
+        )
+        server.verify_bundle = (  # type: ignore[method-assign]
+            lambda *_args, **kwargs: verified_audit_report(
+                block_height=int(kwargs["expected_block_height"])
+            )
+        )
+        server.ledger_writer_public_key_hex = "aa" * 32
+        server.refresh_jobs_after_pending_accepted_block = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: 0
+        )
+        if lease_error is not None:
+
+            def failing_lease_fence(component: str) -> None:
+                raise lease_error
+
+            server._require_fresh_ledger_lease_for_external_side_effect = (  # type: ignore[method-assign]
+                failing_lease_fence
+            )
+        submission_a = SimpleNamespace(
+            header_hex="a1" * 80,
+            coinbase_tx_hex="c0ffee",
+            block_hex="00",
+            block_hash_hex=hash_a,
+            share_pass=False,
+            block_pass=True,
+        )
+        context_b = SimpleNamespace(
+            job=SimpleNamespace(
+                job_id="job-2",
+                share_target=target_from_compact("207fffff"),
+                share_difficulty=Decimal("1"),
+                transaction_hexes=(),
+            ),
+            template={
+                "previousblockhash": hash_a,
+                "height": 11,
+                "coinbasevalue": 50_00000000,
+            },
+            found_block={"network_difficulty": 1},
+            issued_at_ms=12345,
+            collection_only=False,
+            worker=state.worker,
+            shares_json=[],
+            prior_balances=[],
+        )
+        server.jobs["job-2"] = context_b
+        submission_b = SimpleNamespace(
+            header_hex="b2" * 80,
+            coinbase_tx_hex="c0ffee",
+            block_hex="01",
+            block_hash_hex=hash_b,
+            share_pass=True,
+            block_pass=True,
+        )
+
+        class TwoBlockRpc:
+            def __init__(self) -> None:
+                self.tip = old_tip
+                self.height = 9
+                self.hashes = {9: old_tip}
+                self.submitted: list[str] = []
+
+            def call(self, method: str, params: object = None) -> object:
+                if method == "getbestblockhash":
+                    return self.tip
+                if method == "getblockcount":
+                    return self.height
+                if method == "submitblock":
+                    block_hex = str((params or [""])[0])  # type: ignore[index]
+                    block_hash = hash_a if block_hex == "00" else hash_b
+                    self.height += 1
+                    self.tip = block_hash
+                    self.hashes[self.height] = block_hash
+                    self.submitted.append(block_hash)
+                    return None
+                if method == "getblockhash":
+                    return self.hashes[int((params or [0])[0])]  # type: ignore[index]
+                raise RuntimeError(method)
+
+        server.rpc = TwoBlockRpc()
+
+        sync_gap_open = threading.Event()
+        release_sync_gap = threading.Event()
+        confirmed_hashes: list[str] = []
+        synchronous_results: list[bool] = []
+        sync_errors: list[BaseException] = []
+        actor_errors: list[BaseException] = []
+        synchronous_thread: threading.Thread | None = None
+        original_confirm = ledger.confirm_accepted_block
+        original_stats = server.accepted_share_stats
+
+        def confirm_accepted_block(
+            *,
+            block_hash: str,
+            active_tip_height: int,
+        ) -> dict[str, int | str]:
+            result = original_confirm(
+                block_hash=block_hash,
+                active_tip_height=active_tip_height,
+            )
+            confirmed_hashes.append(block_hash)
+            return result
+
+        def pause_synchronous_gap() -> tuple[int, int]:
+            # Only A's synchronous tail pauses; B's accounting-actor landing
+            # runs the same aggregate inside the gap unimpeded.
+            if threading.current_thread() is synchronous_thread:
+                sync_gap_open.set()
+                if not release_sync_gap.wait(10):
+                    raise AssertionError(
+                        "timed out waiting to release the synchronous gap"
+                    )
+            return original_stats()
+
+        ledger.confirm_accepted_block = confirm_accepted_block  # type: ignore[method-assign]
+        server.accepted_share_stats = pause_synchronous_gap  # type: ignore[method-assign]
+
+        def submit_synchronously() -> None:
+            try:
+                synchronous_results.append(
+                    server.handle_submit(
+                        state,
+                        [
+                            "miner-a",
+                            "job-1",
+                            "00" * 8,
+                            "00000001",
+                            "00000002",
+                        ],
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                sync_errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as tempdir, patch(
+            "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+            return_value=submission_a,
+        ):
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            audit_store = server._ensure_audit_artifact_store()
+            envelope_a = audit_store.live_envelope_path(
+                block_height=10,
+                block_hash=hash_a,
+            )
+            envelope_b = audit_store.live_envelope_path(
+                block_height=11,
+                block_hash=hash_b,
+            )
+            synchronous_thread = threading.Thread(target=submit_synchronously)
+            synchronous_thread.start()
+            actor_thread: threading.Thread | None = None
+            try:
+                self.assertTrue(
+                    sync_gap_open.wait(5),
+                    msg=f"synchronous submit exited early: {sync_errors!r}",
+                )
+                # A is durably confirmed with ordinal 1 and both the payout
+                # balance lock and the publication order guard are released,
+                # but its live envelope is not yet written.
+                self.assertEqual(confirmed_hashes, [hash_a])
+                self.assertEqual(ledger.audit_publication_sequence_floor(), 1)
+                self.assertFalse(envelope_a.exists())
+
+                # B rides the production handoff: the submitter claims the
+                # disposition, offers the block to the node, and transfers the
+                # lease to the accounting actor, which lands and publishes.
+                server.enqueue_block_candidate(
+                    block_candidate(server, state, submission_b, job_id="job-2")
+                )
+                handoff: list[object] = []
+                server._enqueue_block_accounting_task = (  # type: ignore[method-assign]
+                    lambda task: (handoff.append(task), True)[1]
+                )
+                self.assertTrue(
+                    server.submit_next_block_candidate(defer_accounting=True)
+                )
+                self.assertEqual(len(handoff), 1)
+
+                def run_accounting_actor() -> None:
+                    try:
+                        server._run_block_accounting_task(handoff[0])
+                    except BaseException as exc:  # noqa: BLE001 - asserted below
+                        actor_errors.append(exc)
+
+                actor_thread = threading.Thread(target=run_accounting_actor)
+                actor_thread.start()
+                actor_thread.join(10)
+                self.assertFalse(actor_thread.is_alive())
+                self.assertEqual(actor_errors, [])
+                self.assertEqual(confirmed_hashes, [hash_a, hash_b])
+                self.assertEqual(ledger.audit_publication_sequence_floor(), 2)
+                self.assertTrue(envelope_b.exists())
+                # The interleave is real: B published while A had not.
+                self.assertFalse(envelope_a.exists())
+            finally:
+                release_sync_gap.set()
+                synchronous_thread.join(10)
+                if actor_thread is not None:
+                    actor_thread.join(10)
+
+            self.assertFalse(synchronous_thread.is_alive())
+            if sync_errors:
+                raise sync_errors[0]
+            # Whatever happened to A's envelope, the publication itself must
+            # have completed on both tails.
+            self.assertEqual(synchronous_results, [False])
+            self.assertEqual(server.accepted_block_count, 2)
+
+            # The current evidence reference still names the highest
+            # published sequence; a superseded publication never moves it.
+            self.assertTrue(envelope_b.exists())
+            latest = audit_store.latest_evidence()
+            assert latest is not None
+            self.assertEqual(latest["block_hash"], hash_b)
+            self.assertEqual(
+                latest["audit_publication_identity"]["sequence"],
+                2,
+            )
+            return SimpleNamespace(
+                hash_a=hash_a,
+                envelope_a_exists=envelope_a.exists(),
+                landed_a=(
+                    json.loads(envelope_a.read_text(encoding="utf-8"))
+                    if envelope_a.exists()
+                    else None
+                ),
+            )
+
+    def test_interleaved_distinct_hash_landings_write_both_live_envelopes(self) -> None:
+        """Both live envelopes survive an interleaved distinct-hash landing.
+
+        A's own height+hash live envelope is its block's only published
+        evidence pointer and must be written even though A publishes already
+        superseded; skipping it was the silent permanent loss of the original
+        defect. This pins the production opt-in wiring end to end: with
+        ``restore_superseded_envelope=False`` at the publish call site, this
+        test fails.
+        """
+        result = self._drive_interleaved_distinct_hash_landings()
+        self.assertTrue(result.envelope_a_exists)
+        assert result.landed_a is not None
+        self.assertEqual(result.landed_a["block_hash"], result.hash_a)
+        self.assertEqual(result.landed_a["block_height"], 10)
+
+    def test_withheld_lease_authority_skips_restore_without_failing_publication(
+        self,
+    ) -> None:
+        """A failed lease proof degrades the restore; it never fails the landing.
+
+        The fresh-lease fence gates only the superseded-envelope restore
+        authority. When it raises, the publication must still complete
+        exactly as before the restore existed -- withholding degrades to the
+        historical behaviour of skipping the superseded envelope write,
+        because failing the publication on a lease hiccup would be a live
+        regression on the found-block path.
+        """
+        from lab.prism.share_ledger import WriterLeaseRenewalDeferred
+
+        result = self._drive_interleaved_distinct_hash_landings(
+            lease_error=WriterLeaseRenewalDeferred(
+                "writer lease renewal is deferred behind an in-flight write"
+            ),
+        )
+        self.assertFalse(result.envelope_a_exists)
+
 
 class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
     """Blockwait-first acceptance must survive every abandon-capable path.
