@@ -72,11 +72,15 @@ import re
 import sys
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from typing import Self
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -88,10 +92,13 @@ from lab.prism.share_ledger import (  # noqa: E402
 )
 
 # Real seconds the controller will wait for an actor to hand the baton back
-# before declaring the harness itself broken. This is a failure detector
-# only: it never orders anything, so it cannot make a passing run flaky. An
-# actor that blocks on a resource the harness does not know about (a real
-# threading.Lock, a real socket) trips it instead of hanging the suite.
+# before declaring the harness itself broken. It is a failure detector, not
+# an ordering input: no schedule depends on it, so it cannot change what a
+# run does. An actor that blocks on a resource the harness does not model (a
+# real threading.Lock, a real socket) trips it instead of hanging the suite.
+# It is not free of consequence — an actor that genuinely took this long to
+# reach its next checkpoint would fail a run that ought to pass — but the
+# margin against microseconds of work is enormous.
 BATON_TIMEOUT_SECONDS = 20.0
 
 # Virtual epoch origin for clock_timestamp(). Fixed so timestamp text is
@@ -240,12 +247,10 @@ class Actor:
             return True
         if self._ready is not None and self._ready():
             return True
-        if (
+        return (
             self._wake_at is not None
             and self.scheduler.clock.monotonic() >= self._wake_at
-        ):
-            return True
-        return False
+        )
 
     # -- actor side --------------------------------------------------------
 
@@ -261,7 +266,7 @@ class Actor:
                 call = self.queue.pop(0)
                 try:
                     call.result = call.fn()
-                except BaseException as exc:  # noqa: BLE001 - recorded, not swallowed
+                except BaseException as exc:  # recorded, not swallowed
                     if isinstance(exc, _ActorAbort):
                         raise
                     call.error = exc
@@ -475,7 +480,10 @@ class Statement:
     sql: str
 
 
-_PAYLOAD_RE = re.compile(r"\$(qbit_prism_json(?:_x)*)\$(.*?)\$\1\$::jsonb", re.S)
+_PAYLOAD_RE = re.compile(
+    r"\$(qbit_prism_json(?:_x)*)\$(.*?)\$\1\$::jsonb",
+    re.DOTALL,
+)
 _INTERVAL_RE = re.compile(r"make_interval\(secs => ([0-9eE\.\+\-]+)\)")
 _CLASSID_RE = re.compile(r"classid = (\d+)::oid")
 _OBJID_RE = re.compile(r"objid = (\d+)::oid")
@@ -1599,7 +1607,7 @@ class LeaseHarness:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def __enter__(self) -> LeaseHarness:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -1829,8 +1837,8 @@ __all__ = [
     "LeaseRow",
     "LockTimeout",
     "NotRunnable",
-    "SchedulerStall",
     "ScenarioRun",
+    "SchedulerStall",
     "Statement",
     "Transaction",
     "UnsupportedStatement",

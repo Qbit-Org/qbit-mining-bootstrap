@@ -522,17 +522,20 @@ class GuardQuerySlotTests(unittest.TestCase):
         guard._connection = None
 
         entered = threading.Event()
+        arrived = threading.Event()
         released = threading.Event()
 
         def second_caller() -> None:
             entered.set()
+            # Reaching the statement requires the slot; `held` is True and
+            # `_connection` is None, so arrival past the slot is observable as
+            # the AttributeError the statement itself then raises. Catching
+            # that exact type is what makes this evidence: any other outcome
+            # means run_json did not get where this test claims it got.
             try:
-                # Reaching the statement requires the slot; `held` is True and
-                # `_connection` is None, so arrival is observable as the
-                # AttributeError that follows.
                 guard.run_json("SELECT 1")
-            except Exception:
-                pass
+            except AttributeError:
+                arrived.set()
             released.set()
 
         guard._query_lock.acquire()
@@ -548,6 +551,11 @@ class GuardQuerySlotTests(unittest.TestCase):
         self.assertTrue(
             released.wait(2.0),
             "releasing the slot must let the queued caller proceed",
+        )
+        self.assertTrue(
+            arrived.is_set(),
+            "the queued caller must have reached the statement itself, not "
+            "merely returned",
         )
         caller.join(timeout=2.0)
 
