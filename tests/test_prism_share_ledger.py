@@ -5063,6 +5063,121 @@ class NativeClientSelectionTests(unittest.TestCase):
             self.assertEqual(ledger._operation_progress_hook(), (outer, 1.0))
         self.assertIsNone(ledger._operation_progress_hook())
 
+    def test_operation_progress_local_is_created_before_any_scope(self) -> None:
+        """The production path must never lazily create the thread-local.
+
+        ``operation_progress``'s ``getattr``-then-assign is not atomic, so a
+        ledger that reaches its first scope without the attribute already in
+        place can lose one caller's hook to a concurrent installer.
+        """
+        with contextlib.redirect_stdout(io.StringIO()):
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                writer_id="writer-a",
+                writer_epoch=1,
+            )
+        self.assertIn("_operation_progress_local", vars(ledger))
+        self.assertIsInstance(
+            vars(ledger)["_operation_progress_local"],
+            threading.local,
+        )
+
+    def test_concurrent_first_scopes_share_one_progress_local(self) -> None:
+        """Two first-ever scopes at once must both keep their own hook.
+
+        The lazy check-then-set lets both callers build a ``local()`` and one
+        assignment win; the loser's hook then lives on an object the ledger
+        no longer references, so its admission wait silently reverts to the
+        heartbeat-silent path -- the exact failure this hook exists to
+        remove. The patched ``local`` below makes that interleaving
+        deterministic rather than a sleep race: it parks every constructing
+        thread on a two-party barrier, so neither can assign before the other
+        has decided to construct. A ledger that built the thread-local in
+        ``__init__`` never constructs one here at all, and the barrier is
+        simply never reached.
+        """
+        with contextlib.redirect_stdout(io.StringIO()):
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                writer_id="writer-a",
+                writer_epoch=1,
+            )
+        constructing = threading.Barrier(2, timeout=10)
+        installed = threading.Barrier(2, timeout=10)
+
+        def racing_local() -> threading.local:
+            # Neither thread may leave the constructor until both have
+            # decided to build one, so the check-then-set cannot serialize
+            # itself by luck.
+            constructing.wait()
+            return threading.local()
+
+        def first_stamp() -> None:
+            return None
+
+        def second_stamp() -> None:
+            return None
+
+        observed: dict[str, object] = {}
+        errors: list[BaseException] = []
+
+        def install(name: str, hook: Any) -> None:
+            try:
+                with ledger.operation_progress(hook, slice_seconds=0.5):
+                    # Both hooks are installed before either is read, so a
+                    # lost assignment cannot hide behind thread ordering.
+                    installed.wait()
+                    observed[name] = ledger._operation_progress_hook()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with unittest.mock.patch.object(
+            share_ledger_module,
+            "local",
+            racing_local,
+        ):
+            threads = [
+                threading.Thread(target=install, args=("first", first_stamp)),
+                threading.Thread(target=install, args=("second", second_stamp)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(errors, [])
+        self.assertEqual(observed.get("first"), (first_stamp, 0.5))
+        self.assertEqual(observed.get("second"), (second_stamp, 0.5))
+
+    def test_operation_progress_nesting_keeps_the_tighter_slice(self) -> None:
+        """Nesting tightens the stamp cadence, exactly like its siblings.
+
+        ``operation_timeout`` and ``statement_timeout`` merge by minimum, so
+        a nested scope can only narrow what the enclosing caller allowed. A
+        progress scope that replaced the slice outright would let an inner
+        caller widen the heartbeat gaps an outer caller had already sized
+        against its own monitor.
+        """
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+
+        def outer() -> None:
+            return None
+
+        def inner() -> None:
+            return None
+
+        with ledger.operation_progress(outer, slice_seconds=0.25):
+            self.assertEqual(ledger._operation_progress_hook(), (outer, 0.25))
+            # A larger inner slice does not widen the cadence; the callback
+            # is still the inner caller's, because it is the one whose
+            # liveness the wait now belongs to.
+            with ledger.operation_progress(inner, slice_seconds=4.0):
+                self.assertEqual(
+                    ledger._operation_progress_hook(),
+                    (inner, 0.25),
+                )
+            self.assertEqual(ledger._operation_progress_hook(), (outer, 0.25))
+        self.assertIsNone(ledger._operation_progress_hook())
+
     def test_operation_gate_propagates_progress_hook_failures(self) -> None:
         """A liveness stamp that cannot be taken is a failure, not noise.
 

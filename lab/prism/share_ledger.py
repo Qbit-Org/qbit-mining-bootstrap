@@ -2274,6 +2274,15 @@ class PsqlShareLedger:
         self._lease_adoption_silence_seconds = lease_adoption_silence_seconds
         self._operation_timeout_local = local()
         self._statement_timeout_local = local()
+        # Created here, not lazily in operation_progress: that scope's
+        # check-then-set is not atomic, so two block-work threads entering
+        # their first-ever scope on a fresh ledger can each build a local()
+        # and have one assignment win. The loser's hook would then live on an
+        # orphaned object and its admission wait would silently fall back to
+        # the heartbeat-silent path -- the exact failure the hook exists to
+        # remove. The scope keeps its lazy fallback for ledgers built through
+        # __new__ in focused tests; the production path must not race.
+        self._operation_progress_local = local()
         self._lock = Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         audit_share_segment_size = int(audit_share_segment_size)
@@ -2568,8 +2577,16 @@ class PsqlShareLedger:
         ``_remaining_operation_timeout`` reports. An exception from
         ``on_progress`` propagates to the caller; a liveness stamp that
         cannot be taken is a real failure, not something to swallow inside a
-        lock wait. Nested scopes replace the outer hook and restore it on
-        exit, matching ``operation_timeout``/``statement_timeout``.
+        lock wait.
+
+        Nesting merges the way ``operation_timeout``/``statement_timeout``
+        merge: the effective slice is the minimum of the enclosing slices, so
+        an inner scope can only tighten the stamp cadence, never widen it. A
+        nested scope carrying a larger slice would otherwise lengthen the
+        heartbeat gaps its enclosing caller had already sized against its own
+        monitor. The callback itself does replace -- the innermost caller is
+        the one whose liveness is at stake -- and the outer pair is restored
+        on exit.
         """
         slice_seconds = float(slice_seconds)
         if not math.isfinite(slice_seconds) or slice_seconds <= 0:
@@ -2579,7 +2596,11 @@ class PsqlShareLedger:
             progress_local = local()
             self._operation_progress_local = progress_local
         previous = getattr(progress_local, "hook", None)
-        progress_local.hook = (on_progress, slice_seconds)
+        progress_local.hook = (
+            (on_progress, slice_seconds)
+            if previous is None
+            else (on_progress, min(float(previous[1]), slice_seconds))
+        )
         try:
             yield
         finally:

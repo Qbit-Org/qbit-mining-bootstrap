@@ -1084,7 +1084,15 @@ class BlockCandidateService:
         system, not two independent settings. Deriving the ceiling from the
         configured tolerance keeps them in step through every override
         instead of pinning a second literal that silently goes stale.
+
+        A deployment that turned the watchdog off has no hard-exit hazard to
+        stay under, and clamping it anyway would cost the operator budget for
+        no safety at all -- so that case gets no ceiling. The attribute is
+        read defensively and defaults to *enabled*: clamping is the safe
+        answer when the setting cannot be determined.
         """
+        if not bool(getattr(self._coordinator, "watchdog_enabled", True)):
+            return float("inf")
         return max(
             0.001,
             float(
@@ -1095,6 +1103,50 @@ class BlockCandidateService:
                 )
             )
             * BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION,
+        )
+
+    def _note_block_landing_budget_clamped(
+        self,
+        *,
+        configured_base: float,
+        configured_cap: float,
+        ceiling: float,
+    ) -> None:
+        """Say once that the watchdog is granting less than was configured.
+
+        Without this the operator's configured landing budget is quietly
+        reduced -- at the 120s default tolerance the reviewed 120s cap
+        becomes 60s -- and the two states an operator most needs to tell
+        apart become indistinguishable in the logs: escalation exhausted at
+        the configured cap, versus escalation that never reached it because
+        the ceiling stopped it first. Emitted once per process because
+        _block_landing_db_timeout runs on every landing attempt and a
+        per-attempt line would bury the landing's own diagnostics; the flag
+        flips under the coordinator lock so concurrent first landings still
+        print exactly one line. The print stays outside that lock -- no I/O
+        under a coordinator-wide lock on the landing path.
+        """
+        with self._coordinator.lock:
+            if getattr(self, "_block_landing_budget_clamp_logged", False):
+                return
+            self._block_landing_budget_clamp_logged = True
+        watchdog_seconds = float(
+            getattr(
+                self._coordinator,
+                "watchdog_timeout_seconds",
+                DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
+            )
+        )
+        print(
+            "prism coordinator: landing db budget clamped by watchdog "
+            f"configured_base={configured_base:g}s "
+            f"configured_max={configured_cap:g}s "
+            f"granted_base={min(configured_base, ceiling):g}s "
+            f"granted_max={min(configured_cap, ceiling):g}s "
+            f"ceiling={ceiling:g}s "
+            f"watchdog_timeout={watchdog_seconds:g}s "
+            f"fraction={BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION:g}",
+            flush=True,
         )
 
     def _block_landing_db_timeout(self, block_hash: str | None = None) -> float:
@@ -1114,35 +1166,44 @@ class BlockCandidateService:
         base budget and repeats the same doomed cycle (issue #125). At the
         120s default tolerance the ceiling is 60s and escalation runs
         30s -> 60s; at the 300s production tolerance the ceiling is 150s and
-        the configured 120s cap is unchanged.
+        the configured 120s cap is unchanged. A deployment running with the
+        watchdog disabled has no ceiling at all and keeps its configured
+        values in full. Any clamp is announced once (see
+        _note_block_landing_budget_clamped) so a reduced budget is never a
+        silent behavior change.
         """
         ceiling = self._block_landing_watchdog_ceiling()
-        base = min(
-            max(
-                0.001,
-                float(
-                    getattr(
-                        self._coordinator,
-                        "block_landing_db_timeout_seconds",
-                        DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,
-                    )
-                ),
+        configured_base = max(
+            0.001,
+            float(
+                getattr(
+                    self._coordinator,
+                    "block_landing_db_timeout_seconds",
+                    DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,
+                )
             ),
-            ceiling,
         )
-        cap = min(
-            max(
-                base,
-                float(
-                    getattr(
-                        self._coordinator,
-                        "block_landing_db_timeout_max_seconds",
-                        DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
-                    )
-                ),
+        configured_cap = max(
+            configured_base,
+            float(
+                getattr(
+                    self._coordinator,
+                    "block_landing_db_timeout_max_seconds",
+                    DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
+                )
             ),
-            ceiling,
         )
+        base = min(configured_base, ceiling)
+        cap = min(configured_cap, ceiling)
+        if base < configured_base or cap < configured_cap:
+            # An infinite ceiling (watchdog disabled) can never compare below
+            # a finite configured value, so a deployment that opted out of the
+            # watchdog never reaches this line.
+            self._note_block_landing_budget_clamped(
+                configured_base=configured_base,
+                configured_cap=configured_cap,
+                ceiling=ceiling,
+            )
         timeouts = 0
         if block_hash is not None:
             with self._coordinator.lock:

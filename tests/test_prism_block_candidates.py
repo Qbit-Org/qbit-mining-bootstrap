@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import dataclasses
+import io
 import unittest
 from unittest import mock
 from tests.prism_vardiff_test_support import *
+from lab.prism.coordinator_config import LifecycleConfig
 from lab.prism.audit_artifacts import (
     AuditArtifactStore,
     AuditPublicationIdentity,
@@ -8694,6 +8697,110 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         # deployments running that override see no behavior change.
         server.watchdog_timeout_seconds = 300.0
         self.assertEqual(server._block_landing_db_timeout(block_hash), 120.0)
+
+    def test_watchdog_ceiling_clamps_the_configured_base_not_only_the_cap(self) -> None:
+        """A tolerance below the base budget must lower the base too.
+
+        The first landing attempt already spends the base budget on the
+        watchdog-monitored thread, so a base above the ceiling trips the
+        watchdog before any escalation has happened at all -- the clamp
+        cannot be a cap-only concern.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 40.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_landing_db_timeout_max_seconds = 120.0
+        block_hash = "ab" * 32
+        service = server._ensure_block_candidate_service()
+        self.assertEqual(service._block_landing_watchdog_ceiling(), 20.0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(server._block_landing_db_timeout(block_hash), 20.0)
+            for _ in range(8):
+                server._note_block_landing_timeout(block_hash)
+            self.assertEqual(server._block_landing_db_timeout(block_hash), 20.0)
+
+    def test_disabled_watchdog_grants_the_configured_landing_budget(self) -> None:
+        """No hard-exit hazard means no reason to spend the operator's cap.
+
+        The clamp exists solely because a landing budget above the watchdog
+        tolerance buys a hard exit instead of a longer attempt. A deployment
+        that turned the watchdog off has no such exit to avoid, so halving
+        its cap would be pure loss. The attribute is read defensively and
+        defaults to enabled, since clamping is the safe answer.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_landing_db_timeout_max_seconds = 120.0
+        block_hash = "ab" * 32
+        for _ in range(8):
+            server._note_block_landing_timeout(block_hash)
+
+        server.watchdog_enabled = False
+        service = server._ensure_block_candidate_service()
+        self.assertEqual(service._block_landing_watchdog_ceiling(), float("inf"))
+        with contextlib.redirect_stdout(io.StringIO()) as quiet:
+            self.assertEqual(server._block_landing_db_timeout(block_hash), 120.0)
+            self.assertEqual(server._block_landing_db_timeout(None), 30.0)
+        # An infinite ceiling never compares below a configured value, so the
+        # clamp notice must stay silent as well.
+        self.assertEqual(quiet.getvalue(), "")
+
+        server.watchdog_enabled = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(server._block_landing_db_timeout(block_hash), 60.0)
+
+    def test_lifecycle_config_still_carries_the_watchdog_enabled_switch(self) -> None:
+        """The clamp's defensive read must not outlive the attribute itself.
+
+        ``getattr(..., True)`` would keep clamping silently if the setting
+        were ever renamed, so pin the name the coordinator assigns from.
+        """
+        self.assertIn(
+            "watchdog_enabled",
+            {field.name for field in dataclasses.fields(LifecycleConfig)},
+        )
+
+    def test_landing_budget_clamp_is_announced_exactly_once(self) -> None:
+        """A silently reduced budget is a config mismatch nobody can see.
+
+        Without the notice the operator's configured cap simply does not
+        happen -- at the 120s default tolerance a 120s cap becomes 60s -- and
+        "escalation exhausted at my cap" reads identically to "escalation
+        never reached my cap". It is emitted once because the budget is
+        recomputed on every landing attempt, and the flag flips under the
+        coordinator lock so concurrent first landings cannot both print.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_landing_db_timeout_max_seconds = 120.0
+        block_hash = "ab" * 32
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            barrier = threading.Barrier(4, timeout=10)
+
+            def landing_budget() -> None:
+                barrier.wait()
+                for _ in range(5):
+                    server._block_landing_db_timeout(block_hash)
+
+            threads = [threading.Thread(target=landing_budget) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            server._block_landing_db_timeout(block_hash)
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if "landing db budget clamped by watchdog" in line
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("configured_max=120s", lines[0])
+        self.assertIn("granted_max=60s", lines[0])
+        self.assertIn("ceiling=60s", lines[0])
+        self.assertIn("watchdog_timeout=120s", lines[0])
 
     def test_landing_scope_stamps_progress_during_ledger_admission(self) -> None:
         """Waiting for the ledger's writer lock must not be heartbeat-silent.
