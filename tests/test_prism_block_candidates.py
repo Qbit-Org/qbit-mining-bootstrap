@@ -16,12 +16,15 @@ from lab.prism.audit_artifacts import (
     RetentionResult,
 )
 from lab.prism.block_candidates import (
+    MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
+    MAX_PENDING_BLOCK_CANDIDATES,
     BlockCandidateAttemptResult,
     BlockCandidateRunResult,
     _BlockCandidateNodeSubmission,
     block_candidate_from_intent,
     block_candidate_intent,
 )
+from tests.prism_coordinator_test_support import durable_candidate_row
 from lab.prism.bundle_compiler import BundleCompiler
 from lab.prism.prism_coordinator import PrismCoordinator
 
@@ -8890,6 +8893,246 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         self.assertEqual(submitted, ["e5"])
         self.assertEqual(accounted, [block_hash])
         self.assertEqual(ledger.pending_block_candidates(), [])
+
+    def _pending_outbox_backlog(
+        self,
+        server: PrismCoordinator,
+        state: ClientState,
+        ledger: SingleWriterShareLedger,
+        count: int,
+    ) -> list[str]:
+        """Persist ``count`` pending outbox rows and return their hashes."""
+        hashes: list[str] = []
+        for index in range(1, count + 1):
+            block_hash = f"{index:064x}"
+            hashes.append(block_hash)
+            pending = PendingShare(
+                share_id=f"miner-a:{block_hash}",
+                miner_id="miner-a",
+                order_key="miner-a",
+                p2mr_program_hex="11" * 32,
+                share_difficulty=1,
+                network_difficulty=1,
+                template_height=9,
+                job_id="job-1",
+                job_issued_at_ms=1,
+                accepted_at_ms=index,
+                ntime=1,
+            )
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="00",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+                pending_share=pending,
+            )
+            ledger.append_batch(
+                [(pending, server.block_candidate_intent(candidate))]
+            )
+        return hashes
+
+    def test_startup_enumeration_pages_a_backlog_larger_than_one_window(
+        self,
+    ) -> None:
+        """A backlog past the enumeration cap must still enumerate completely.
+
+        The doubling window this replaces fails closed once one query would
+        have to hold the entire backlog, so ~5,000 pending rows kept the
+        job-build gate shut until the outbox drained under the cap on its
+        own (testnet4, 2026-08-18: ~25 minutes of refused job builds). A
+        keyset walk adopts every row in bounded pages and ends only on a
+        page proven short.
+        """
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        hashes = self._pending_outbox_backlog(server, state, ledger, 5)
+
+        queries: list[tuple[int, object]] = []
+        original_rows = ledger.pending_block_candidate_rows
+
+        def recording_rows(
+            *,
+            limit: int = 32,
+            after_cursor: object | None = None,
+        ) -> list[dict[str, object]]:
+            queries.append((limit, after_cursor))
+            return original_rows(limit=limit, after_cursor=after_cursor)
+
+        ledger.pending_block_candidate_rows = recording_rows  # type: ignore[method-assign]
+        server._note_block_replay_enumeration_owed()
+
+        # Both constants shrink together so five pending rows reproduce the
+        # incident's shape: under the doubling window this backlog starts at
+        # the cap, every pass is "truncated", and the gate never opens.
+        with patch(
+            "lab.prism.block_candidates.MAX_BLOCK_REPLAY_ENUMERATION_ROWS",
+            2,
+        ), patch(
+            "lab.prism.block_candidates.MAX_PENDING_BLOCK_CANDIDATES",
+            2,
+        ), patch("builtins.print"):
+            queued = server.replay_pending_block_candidates()
+
+        # Every durable row was adopted exactly once.
+        self.assertEqual(queued, len(hashes))
+        self.assertEqual(server._block_replay_candidate_queue.qsize(), len(hashes))
+        replayed = [
+            server._block_replay_candidate_queue.get_nowait()
+            for _ in range(len(hashes))
+        ]
+        self.assertEqual(
+            sorted(
+                str(candidate.submission.block_hash_hex) for candidate in replayed
+            ),
+            sorted(hashes),
+        )
+        # Three pages of two, two, one: each page is the same bounded query,
+        # and the short one is what proves the enumeration complete.
+        self.assertEqual([limit for limit, _cursor in queries], [2, 2, 2])
+        self.assertIsNone(queries[0][1])
+        self.assertIsNotNone(queries[1][1])
+        self.assertNotEqual(queries[1][1], queries[2][1])
+        # Every restored row armed its payout barrier before the gate opened.
+        self.assertEqual(len(server._accepted_block_payout_previews), len(hashes))
+        self.assertFalse(server._block_replay_enumeration_owed())
+
+    def test_startup_enumeration_pages_are_distinct_ledger_calls(self) -> None:
+        """Distinct pages must not collapse onto one in-flight ledger call.
+
+        A timed-out outbox call stays registered under its dedupe key so the
+        next paced retry can reuse it. If every page shared one key, page
+        N+1 would be answered by page N's call and a whole page of pending
+        candidates would vanish from an enumeration that then declared
+        itself complete.
+        """
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        self._pending_outbox_backlog(server, state, ledger, 3)
+
+        keys: list[tuple[object, ...]] = []
+        original_call = server._run_block_submitter_ledger_call
+
+        def recording_call(key, phase, operation, **kwargs):  # type: ignore[no-untyped-def]
+            if phase == "replay-outbox-query":
+                keys.append(key)
+            return original_call(key, phase, operation, **kwargs)
+
+        server._run_block_submitter_ledger_call = recording_call  # type: ignore[method-assign]
+        server._note_block_replay_enumeration_owed()
+
+        with patch(
+            "lab.prism.block_candidates.MAX_BLOCK_REPLAY_ENUMERATION_ROWS",
+            1,
+        ), patch("builtins.print"):
+            self.assertEqual(server.replay_pending_block_candidates(), 3)
+
+        self.assertEqual(len(keys), 4)
+        self.assertEqual(len(set(keys)), 4)
+        # Every key is hashable and carries its page ordinal.
+        self.assertEqual([key[2] for key in keys], [1, 2, 3, 4])
+
+    def test_steady_state_poll_never_paginates(self) -> None:
+        """Without an owed enumeration the poll stays one small query."""
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        self._pending_outbox_backlog(server, state, ledger, 3)
+
+        queries: list[tuple[int, object]] = []
+        original_rows = ledger.pending_block_candidate_rows
+
+        def recording_rows(
+            *,
+            limit: int = 32,
+            after_cursor: object | None = None,
+        ) -> list[dict[str, object]]:
+            queries.append((limit, after_cursor))
+            return original_rows(limit=limit, after_cursor=after_cursor)
+
+        ledger.pending_block_candidate_rows = recording_rows  # type: ignore[method-assign]
+
+        with patch(
+            "lab.prism.block_candidates.MAX_BLOCK_REPLAY_ENUMERATION_ROWS",
+            1,
+        ), patch("builtins.print"):
+            self.assertEqual(server.replay_pending_block_candidates(), 3)
+
+        self.assertEqual(queries, [(MAX_PENDING_BLOCK_CANDIDATES, None)])
+
+    def test_startup_enumeration_falls_back_when_cursors_are_unsupported(
+        self,
+    ) -> None:
+        """A ledger without cursor support keeps today's exact semantics.
+
+        The wrapper here takes ``**kwargs`` -- the shape an instrumenting or
+        forwarding double really has -- so signature introspection cannot
+        rule the cursor out and the keyword probe is what discovers the
+        legacy ledger underneath. The pass must then walk the old doubling
+        window and, past the cap, still fail closed with enumeration owed.
+        """
+        server, _state, _recording = submit_coordinator()
+        requested: list[int] = []
+
+        def legacy_rows(*, limit: int = 32) -> list[dict[str, object]]:
+            requested.append(limit)
+            return [durable_candidate_row(index) for index in range(limit)]
+
+        def forwarding_rows(**kwargs: object) -> list[dict[str, object]]:
+            return legacy_rows(**kwargs)  # type: ignore[arg-type]
+
+        server.ledger = SimpleNamespace(
+            pending_block_candidate_rows=forwarding_rows,
+        )
+        server._note_block_replay_enumeration_owed()
+
+        with patch("builtins.print"):
+            queued = server.replay_pending_block_candidates()
+
+        # The probe raised TypeError and adopted nothing, so the windowed
+        # walk starts from the first batch exactly as it always did.
+        self.assertEqual(requested, [32, 64, 128, 256, 512, 1024])
+        self.assertEqual(queued, MAX_BLOCK_REPLAY_ENUMERATION_ROWS)
+        # Fail closed: an unproven enumeration must not open the job-build
+        # gate.
+        self.assertTrue(server._block_replay_enumeration_owed())
+
+    def test_startup_enumeration_fails_closed_on_a_page_without_a_cursor(
+        self,
+    ) -> None:
+        """A full page that cannot advance the walk must not claim success."""
+        server, _state, _recording = submit_coordinator()
+        pages: list[object] = []
+
+        def uncursored_rows(
+            *,
+            limit: int = 32,
+            after_cursor: object | None = None,
+        ) -> list[dict[str, object]]:
+            pages.append(after_cursor)
+            return [durable_candidate_row(index) for index in range(limit)]
+
+        server.ledger = SimpleNamespace(
+            pending_block_candidate_rows=uncursored_rows,
+        )
+        server._note_block_replay_enumeration_owed()
+
+        with patch(
+            "lab.prism.block_candidates.MAX_BLOCK_REPLAY_ENUMERATION_ROWS",
+            2,
+        ), patch("builtins.print"):
+            self.assertEqual(server.replay_pending_block_candidates(), 2)
+
+        # One page, then a stop: the rows carry no cursor, so there is no
+        # way to prove what follows them.
+        self.assertEqual(pages, [None])
+        self.assertTrue(server._block_replay_enumeration_owed())
 
     def test_startup_block_replay_catches_psql_server_timeout(self) -> None:
         server, _state, _recording = submit_coordinator()

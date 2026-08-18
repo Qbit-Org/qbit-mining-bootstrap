@@ -529,6 +529,42 @@ class BlockCandidateIntentPersistResult:
         return self.inserted
 
 
+def _block_candidate_cursor_parts(cursor: object) -> tuple[object, str]:
+    """Split one opaque pending-candidate cursor into its ordering parts.
+
+    The cursor is whatever ``pending_block_candidate_rows`` handed back on a
+    prior row and travels through the caller (and, for the Postgres backend,
+    through JSON) untouched, so it is validated on the way back in rather
+    than trusted. The shape is deliberately the two ordering columns and
+    nothing else: ordering by the creation stamp alone cannot resume, because
+    equal stamps would either re-emit or skip their peers.
+    """
+    if isinstance(cursor, str) or not isinstance(cursor, Sequence):
+        raise ValueError("pending block candidate cursor is not a two-element list")
+    parts = list(cursor)
+    if len(parts) != 2:
+        raise ValueError("pending block candidate cursor is not a two-element list")
+    created_at, block_hash = parts
+    if not isinstance(block_hash, str) or not block_hash:
+        raise ValueError("pending block candidate cursor has no block hash")
+    return created_at, block_hash
+
+
+def _memory_block_candidate_row_key(row: dict[str, Any]) -> tuple[float, str]:
+    """Total-order key for one in-memory pending outbox row."""
+    return (float(row.get("created_monotonic", 0.0)), str(row["block_hash"]))
+
+
+def _memory_block_candidate_cursor_key(cursor: object) -> tuple[float, str]:
+    """Rebuild the in-memory ordering key from a returned cursor."""
+    created_monotonic, block_hash = _block_candidate_cursor_parts(cursor)
+    if isinstance(created_monotonic, bool) or not isinstance(
+        created_monotonic, (int, float)
+    ):
+        raise ValueError("pending block candidate cursor has no creation stamp")
+    return (float(created_monotonic), block_hash)
+
+
 class ShareReplayConflict(RuntimeError):
     """A recovery row reused a share ID with a different durable payload."""
 
@@ -818,9 +854,38 @@ class SingleWriterShareLedger:
             for row in self.pending_block_candidate_rows(limit=limit)
         ]
 
-    def pending_block_candidate_rows(self, *, limit: int = 32) -> list[dict[str, Any]]:
-        """Return pending payloads together with their authoritative row keys."""
+    def pending_block_candidate_rows(
+        self,
+        *,
+        limit: int = 32,
+        after_cursor: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return pending payloads together with their authoritative row keys.
+
+        Rows carry an opaque ``cursor`` the caller passes back verbatim as
+        ``after_cursor`` to resume strictly after that row. The order is the
+        total order ``(created, block_hash)``, so a page shorter than
+        ``limit`` proves no further pending row existed at query time and a
+        backlog of any size enumerates completely in bounded pages. The
+        block-hash tiebreak is what makes it a *total* order: creation
+        stamps collide (``time.monotonic`` here, one transaction's
+        ``clock_timestamp`` in Postgres), and a cursor on a colliding stamp
+        alone would either replay or skip its peers.
+        """
+        after = (
+            None
+            if after_cursor is None
+            else _memory_block_candidate_cursor_key(after_cursor)
+        )
         with self._lock:
+            ordered = sorted(
+                (
+                    (_memory_block_candidate_row_key(row), row)
+                    for row in self._block_candidate_outbox.values()
+                    if row["state"] == "pending"
+                ),
+                key=lambda entry: entry[0],
+            )
             return [
                 {
                     "block_hash": str(row["block_hash"]),
@@ -829,9 +894,10 @@ class SingleWriterShareLedger:
                         if isinstance(row["candidate"], dict)
                         else row["candidate"]
                     ),
+                    "cursor": list(key),
                 }
-                for row in self._block_candidate_outbox.values()
-                if row["state"] == "pending"
+                for key, row in ordered
+                if after is None or key > after
             ][:limit]
 
     def block_candidate_pending_metrics(self) -> dict[str, int | float]:
@@ -3475,22 +3541,69 @@ END;
             for row in self.pending_block_candidate_rows(limit=limit)
         ]
 
-    def pending_block_candidate_rows(self, *, limit: int = 32) -> list[dict[str, Any]]:
-        """Return pending payloads together with their authoritative row keys."""
+    def pending_block_candidate_rows(
+        self,
+        *,
+        limit: int = 32,
+        after_cursor: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return pending payloads together with their authoritative row keys.
+
+        Rows carry an opaque ``cursor`` the caller passes back verbatim as
+        ``after_cursor`` to resume strictly after that row, so a backlog
+        larger than one window enumerates completely in bounded pages
+        instead of forcing an ever-wider single query. The keyset predicate
+        and the ordering both stay on ``(created_at, block_hash)``, which is
+        exactly the partial index
+        ``qbit_block_candidate_outbox_pending_idx``: every page is one
+        bounded index range scan regardless of how far in the backlog it
+        starts.
+
+        The cursor stamp is rendered at microsecond precision with an
+        explicit UTC marker because ``created_at`` is a ``timestamptz`` whose
+        stored resolution is microseconds: a second-precision stamp (the
+        format the public API endpoints use) would truncate, and the
+        resulting predicate would re-emit or skip whole sub-second groups.
+        """
         if limit <= 0:
             return []
+        after_predicate = ""
+        if after_cursor is not None:
+            created_at_text, cursor_block_hash = _block_candidate_cursor_parts(
+                after_cursor
+            )
+            if not isinstance(created_at_text, str):
+                raise ValueError(
+                    "pending block candidate cursor has no creation stamp"
+                )
+            after_predicate = (
+                "\n      AND (created_at, block_hash) > "
+                f"({self._text_literal(created_at_text)}::timestamptz, "
+                f"{self._text_literal(cursor_block_hash)})"
+            )
         sql = f"""
 SELECT COALESCE(
     json_agg(
-        json_build_object('block_hash', block_hash, 'candidate', candidate)
+        json_build_object(
+            'block_hash', block_hash,
+            'candidate', candidate,
+            'cursor', json_build_array(cursor_created_at, block_hash)
+        )
         ORDER BY created_at, block_hash
     ),
     '[]'::json
 )
 FROM (
-    SELECT candidate, created_at, block_hash
+    SELECT
+        candidate,
+        created_at,
+        to_char(
+            created_at AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+        ) AS cursor_created_at,
+        block_hash
     FROM qbit_block_candidate_outbox
-    WHERE state = 'pending'
+    WHERE state = 'pending'{after_predicate}
     ORDER BY created_at, block_hash
     LIMIT {int(limit)}
 ) pending;

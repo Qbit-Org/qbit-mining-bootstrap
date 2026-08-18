@@ -225,10 +225,34 @@ except ShareReplayConflict:
 else:
     raise SystemExit("typed recovery payload conflict was not rejected")
 assert_equal(ledger.pending_block_candidates(), [candidate_intent], "pending candidate replay")
+pending_rows = ledger.pending_block_candidate_rows()
 assert_equal(
-    ledger.pending_block_candidate_rows(),
+    [
+        {key: value for key, value in row.items() if key != "cursor"}
+        for row in pending_rows
+    ],
     [{"block_hash": "ab" * 32, "candidate": candidate_intent}],
     "pending candidate replay retains authoritative outbox key",
+)
+# Startup enumeration pages this read with a keyset cursor, so the cursor
+# has to round-trip through the server exactly: a truncated stamp would
+# make a page re-emit or skip its equal-timestamp peers.
+assert_equal(
+    ledger.pending_block_candidate_rows(after_cursor=pending_rows[0]["cursor"]),
+    [],
+    "pending candidate cursor resumes strictly after its own row",
+)
+cursor_stamp, cursor_hash = pending_rows[0]["cursor"]
+assert_equal(cursor_hash, "ab" * 32, "pending candidate cursor carries its row key")
+assert_equal(
+    ledger._run_json(
+        "SELECT json_build_object('matched', ("
+        "SELECT count(*) FROM qbit_block_candidate_outbox "
+        f"WHERE created_at = '{cursor_stamp}'::timestamptz "
+        f"AND block_hash = '{cursor_hash}'))"
+    )["matched"],
+    1,
+    "pending candidate cursor stamp round-trips at full precision",
 )
 assert ledger.mark_block_candidate_submitted(block_hash="ab" * 32)
 assert_equal(ledger.pending_block_candidates(), [], "submitted candidate leaves pending set")

@@ -95,6 +95,39 @@ PRISM_REJECTION_LEDGER_CONFIRMATION_SUPERSEDED = "ledger-confirmation-superseded
 _STATE_BACKFILL_LOCK = threading.Lock()
 
 
+def _pending_rows_accepts_cursor(pending_rows: Callable[..., Any]) -> bool:
+    """Report whether a ledger's pending-row reader can paginate.
+
+    Signature introspection runs first because the alternative — probing
+    with the keyword and catching TypeError — spends a bounded ledger
+    worker and records a landing-class ledger-call sample on every startup
+    against a ledger that never supported cursors. The probe still runs
+    (and still falls back) whenever a callable cannot be introspected; this
+    only skips it where the answer is already knowable.
+    """
+    try:
+        parameters = inspect.signature(pending_rows).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == "after_cursor"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _block_replay_cursor_key(after_cursor: object | None) -> str | None:
+    """Fold one opaque enumeration cursor into a hashable dedupe-key part.
+
+    The cursor is a JSON-safe list, so it cannot go into a tuple key as-is.
+    Only identity matters here: two calls share an in-flight ledger worker
+    exactly when they are the same query.
+    """
+    if after_cursor is None:
+        return None
+    return json.dumps(after_cursor, separators=(",", ":"), default=repr)
+
+
 @dataclass(frozen=True)
 class PrismBlockCandidate:
     """A block-worthy submission queued for the block-submitter thread.
@@ -601,6 +634,60 @@ class BlockCandidateService:
             self._block_quarantine_hashes.add(key)
         self._block_quarantine_queue.put_nowait((key, error, pending_share))
 
+    def _adopt_durable_block_candidate_rows(
+        self,
+        durable_rows: list[Any],
+    ) -> int:
+        """Decode and queue one fetched batch, quarantining malformed rows.
+
+        Shared by both enumeration shapes (keyset pages and the legacy
+        widening window) so a fallback pass restores rows through exactly
+        the same decode, dedupe, and poison path.
+        """
+        queued = 0
+        self._coordinator._record_block_submitter_phase("replay-restore")
+        for durable_row in durable_rows:
+            durable_block_hash = ""
+            # Published to poison cleanup only after its durable credit
+            # holder was adopted successfully (the instance decode adopts
+            # the credit floor before the candidate is visible anywhere).
+            decoded_candidate: PrismBlockCandidate | None = None
+            try:
+                if not isinstance(durable_row, dict):
+                    raise ValueError("durable block candidate row is not an object")
+                durable_block_hash = str(durable_row["block_hash"]).lower()
+                intent = durable_row["candidate"]
+                if not isinstance(intent, dict):
+                    raise ValueError("durable block candidate intent is not an object")
+                intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
+                if not durable_block_hash or intent_block_hash != durable_block_hash:
+                    raise ValueError("durable block candidate row key does not match intent")
+                decoded_candidate = dataclass_replace(
+                    self._coordinator.block_candidate_from_intent(intent),
+                    durable_replay=True,
+                )
+                # Durable acceptance-state reads stay in accounting. The
+                # separate replay queue keeps these recovered rows behind any
+                # live solve while still exposing the whole batch to qbitd.
+                if self._coordinator._enqueue_replayed_block_candidate(
+                    decoded_candidate
+                ):
+                    queued += 1
+            except Exception:
+                print("prism coordinator: invalid durable block candidate intent", flush=True)
+                traceback.print_exc()
+                self._coordinator._queue_invalid_block_candidate_for_quarantine(
+                    durable_block_hash,
+                    "invalid durable candidate intent",
+                    pending_share=(
+                        decoded_candidate.pending_share
+                        if decoded_candidate is not None
+                        and decoded_candidate.credit_share_on_accept
+                        else None
+                    ),
+                )
+        return queued
+
     def replay_pending(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
         self._coordinator._record_block_submitter_phase("replay-check-memory")
@@ -637,6 +724,7 @@ class BlockCandidateService:
             "pending_block_candidate_rows",
             None,
         )
+        fetch_durable_page: Callable[..., list[Any]] | None = None
         if callable(pending_rows):
 
             def fetch_durable_rows(limit: int) -> list[Any]:
@@ -650,6 +738,36 @@ class BlockCandidateService:
                     timeout_seconds=replay_query_timeout,
                     call_class=replay_query_call_class,
                 )
+
+            if _pending_rows_accepts_cursor(pending_rows):
+
+                def fetch_durable_page(
+                    limit: int,
+                    *,
+                    page: int,
+                    after_cursor: object | None,
+                ) -> list[Any]:
+                    return self._coordinator._run_block_submitter_ledger_call(
+                        # The page ordinal and its cursor belong in the
+                        # dedupe key: a timed-out call stays registered for
+                        # the next paced retry to reuse, and reusing page
+                        # N's in-flight call to answer page N+1 would
+                        # silently drop a whole page of pending candidates
+                        # from the enumeration.
+                        (
+                            "replay-outbox-query",
+                            limit,
+                            page,
+                            _block_replay_cursor_key(after_cursor),
+                        ),
+                        "replay-outbox-query",
+                        lambda: pending_rows(
+                            limit=limit,
+                            after_cursor=after_cursor,
+                        ),
+                        timeout_seconds=replay_query_timeout,
+                        call_class=replay_query_call_class,
+                    )
 
         else:
             pending = getattr(
@@ -683,69 +801,93 @@ class BlockCandidateService:
 
         queued = 0
         enumeration_truncated = False
-        enumeration_limit = MAX_PENDING_BLOCK_CANDIDATES
-        while True:
-            durable_rows = fetch_durable_rows(enumeration_limit)
-            self._coordinator._record_block_submitter_phase("replay-restore")
-            for durable_row in durable_rows:
-                durable_block_hash = ""
-                # Published to poison cleanup only after its durable credit
-                # holder was adopted successfully (the instance decode adopts
-                # the credit floor before the candidate is visible anywhere).
-                decoded_candidate: PrismBlockCandidate | None = None
+        enumeration_paginated = False
+        if enumeration_owed and fetch_durable_page is not None:
+            # Pagination, not a widening window: the doubling loop below
+            # fails closed once one page would have to hold the entire
+            # backlog, so a backlog larger than the cap kept enumeration
+            # owed (and every job build blocked) until it drained under the
+            # cap on its own. A keyset cursor walks a backlog of any size
+            # with the same bounded per-query cost, and only a page proven
+            # short ends the walk.
+            page = 0
+            after_cursor: object | None = None
+            while True:
+                page += 1
                 try:
-                    if not isinstance(durable_row, dict):
-                        raise ValueError("durable block candidate row is not an object")
-                    durable_block_hash = str(durable_row["block_hash"]).lower()
-                    intent = durable_row["candidate"]
-                    if not isinstance(intent, dict):
-                        raise ValueError("durable block candidate intent is not an object")
-                    intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
-                    if not durable_block_hash or intent_block_hash != durable_block_hash:
-                        raise ValueError("durable block candidate row key does not match intent")
-                    decoded_candidate = dataclass_replace(
-                        self._coordinator.block_candidate_from_intent(intent),
-                        durable_replay=True,
+                    durable_rows = fetch_durable_page(
+                        MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
+                        page=page,
+                        after_cursor=after_cursor,
                     )
-                    # Durable acceptance-state reads stay in accounting. The
-                    # separate replay queue keeps these recovered rows behind any
-                    # live solve while still exposing the whole batch to qbitd.
-                    if self._coordinator._enqueue_replayed_block_candidate(
-                        decoded_candidate
-                    ):
-                        queued += 1
-                except Exception:
-                    print("prism coordinator: invalid durable block candidate intent", flush=True)
-                    traceback.print_exc()
-                    self._coordinator._queue_invalid_block_candidate_for_quarantine(
-                        durable_block_hash,
-                        "invalid durable candidate intent",
-                        pending_share=(
-                            decoded_candidate.pending_share
-                            if decoded_candidate is not None
-                            and decoded_candidate.credit_share_on_accept
-                            else None
-                        ),
-                    )
-            if len(durable_rows) < enumeration_limit or not enumeration_owed:
-                break
-            # A full batch may hide more pending rows, and a hidden row could
-            # be the active parent whose carry a child job must not omit.
-            # Re-query with a doubled window until the result is provably
-            # untruncated; in-flight dedupe makes re-seen rows free.
-            if enumeration_limit >= MAX_BLOCK_REPLAY_ENUMERATION_ROWS:
-                enumeration_truncated = True
+                except TypeError:
+                    if page > 1:
+                        # Cursor support was already proven by an earlier
+                        # page, so this is a real fault and not a legacy
+                        # ledger; adopted rows must not be re-adopted by a
+                        # fallback pass that starts over from the top.
+                        raise
+                    # A ledger without cursor support keeps exactly today's
+                    # windowed semantics, fail-closed truncation included.
+                    break
+                enumeration_paginated = True
+                queued += self._adopt_durable_block_candidate_rows(durable_rows)
                 print(
                     "prism coordinator: pending block candidate enumeration "
-                    f"still truncated at {enumeration_limit} rows; job builds "
-                    "stay blocked until a complete enumeration succeeds",
+                    f"page={page} rows={len(durable_rows)}",
                     flush=True,
                 )
-                break
-            enumeration_limit = min(
-                enumeration_limit * 2,
-                MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
-            )
+                if len(durable_rows) < MAX_BLOCK_REPLAY_ENUMERATION_ROWS:
+                    # A short page proves no pending row followed it at query
+                    # time, which is the completeness the job-build gate waits
+                    # on.
+                    break
+                next_cursor = (
+                    durable_rows[-1].get("cursor")
+                    if isinstance(durable_rows[-1], dict)
+                    else None
+                )
+                if next_cursor is None or next_cursor == after_cursor:
+                    # Either the ledger accepted the keyword without keying
+                    # its rows, or it accepted the cursor without honouring
+                    # it (a **kwargs double, say) and re-served the same
+                    # page. Both leave the walk unable to advance, so fail
+                    # closed instead of looping forever or declaring an
+                    # unproven enumeration complete.
+                    enumeration_truncated = True
+                    print(
+                        "prism coordinator: pending block candidate "
+                        f"enumeration page={page} did not advance its "
+                        "cursor; job builds stay blocked until a complete "
+                        "enumeration succeeds",
+                        flush=True,
+                    )
+                    break
+                after_cursor = next_cursor
+        if not enumeration_paginated:
+            enumeration_limit = MAX_PENDING_BLOCK_CANDIDATES
+            while True:
+                durable_rows = fetch_durable_rows(enumeration_limit)
+                queued += self._adopt_durable_block_candidate_rows(durable_rows)
+                if len(durable_rows) < enumeration_limit or not enumeration_owed:
+                    break
+                # A full batch may hide more pending rows, and a hidden row could
+                # be the active parent whose carry a child job must not omit.
+                # Re-query with a doubled window until the result is provably
+                # untruncated; in-flight dedupe makes re-seen rows free.
+                if enumeration_limit >= MAX_BLOCK_REPLAY_ENUMERATION_ROWS:
+                    enumeration_truncated = True
+                    print(
+                        "prism coordinator: pending block candidate enumeration "
+                        f"still truncated at {enumeration_limit} rows; job builds "
+                        "stay blocked until a complete enumeration succeeds",
+                        flush=True,
+                    )
+                    break
+                enumeration_limit = min(
+                    enumeration_limit * 2,
+                    MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
+                )
         if not enumeration_truncated:
             # Every pending candidate is now known and its payout barrier armed
             # (or quarantined), so child job builds may proceed. A truncated
