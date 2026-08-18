@@ -15,6 +15,7 @@ from lab.prism.audit_artifacts import (
 from lab.prism.block_candidates import (
     BlockCandidateAttemptResult,
     BlockCandidateRunResult,
+    _BlockCandidateNodeSubmission,
     block_candidate_from_intent,
     block_candidate_intent,
 )
@@ -8757,6 +8758,162 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         with server._block_landing_ledger_statement_timeout_scope("ab" * 32):
             pass
         self.assertEqual(scopes, [30.0])
+
+    def _landing_phase_recorder(self, server: PrismCoordinator) -> list[str]:
+        """Capture the block-work phases one landing pass stamps, in order."""
+        phases: list[str] = []
+        server._record_block_submitter_phase = phases.append  # type: ignore[method-assign]
+        return phases
+
+    def test_landing_brackets_the_reorg_walk_and_prior_balance_check(self) -> None:
+        """Neither stretch may sit inside the landing scope unnamed.
+
+        Between the current-tip RPC and the audit build the landing thread
+        spends a full reorg reconciliation -- ledger statements and chain
+        RPCs, one pair per watched block -- and then a prior-balances read.
+        The budget granted to a landing step is derived from the watchdog on
+        the assumption that a heartbeat-silent stretch is about one
+        statement long, so an unstamped multi-statement stretch here is
+        exactly the hazard the derivation was supposed to remove (issue
+        #125).
+        """
+        parent_hash = "00" * 32
+        block_hash = "cd" * 32
+        server, state, ledger = submit_coordinator(tip=parent_hash)
+        ledger.durable_payout_state = True
+        phases = self._landing_phase_recorder(server)
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            lambda _tip, **_kwargs: True
+        )
+        # A stale payout base abandons the candidate right after the check,
+        # so the landing stops with both bracketed stretches behind it.
+        server.prior_balances_match_current = (  # type: ignore[method-assign]
+            lambda _balances: False
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+        landed = server._land_and_confirm_block_candidate(
+            block_candidate(server, state, submission),
+            current_tip=block_hash,
+            already_active=False,
+            worker="miner-a",
+            node_submission=_BlockCandidateNodeSubmission(attempted=False),
+        )
+        self.assertIsNone(landed)
+        self.assertEqual(
+            phases,
+            [
+                "reorg-reconcile",
+                "reorg-reconcile:complete",
+                "prior-balances-check",
+                "prior-balances-check:complete",
+            ],
+        )
+
+    def test_landing_brackets_the_tip_height_rpc(self) -> None:
+        """A node round trip between two stamped stretches gets its own name."""
+
+        class StaleHeightTipRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 42
+                return super().call(method, params)
+
+        parent_hash = "00" * 32
+        block_hash = "cd" * 32
+        server, state, ledger = submit_coordinator(tip=parent_hash)
+        ledger.durable_payout_state = True
+        server.rpc = StaleHeightTipRpc(parent_hash)
+        phases = self._landing_phase_recorder(server)
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            lambda _tip, **_kwargs: True
+        )
+        server.prior_balances_match_current = (  # type: ignore[method-assign]
+            lambda _balances: True
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+        landed = server._land_and_confirm_block_candidate(
+            block_candidate(server, state, submission),
+            current_tip=block_hash,
+            already_active=False,
+            worker="miner-a",
+            node_submission=_BlockCandidateNodeSubmission(attempted=False),
+        )
+        # The reported tip is far ahead of the template, so the candidate
+        # abandons as stale immediately after the bracketed RPC.
+        self.assertIsNone(landed)
+        self.assertEqual(
+            phases[-2:],
+            ["tip-height-rpc", "tip-height-rpc:complete"],
+        )
+
+    def test_block_submitter_phase_never_stamps_from_a_foreign_thread(self) -> None:
+        """A stamp off the owner thread must not refresh a wedged owner.
+
+        The landing brackets added around the reorg walk, the prior-balance
+        check and the tip-height RPC all run through this stamper, and the
+        same code paths also execute on client connection threads. If those
+        stamps counted, a frozen dedicated thread would look alive for as
+        long as clients kept solving.
+        """
+        server, _state, _ledger = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        clock = {"now": 1000.0}
+        owner_ready = threading.Event()
+        release_owner = threading.Event()
+
+        def frozen_owner() -> None:
+            server._block_submitter_thread_ident = threading.get_ident()
+            server._record_heartbeat("block_submitter")
+            owner_ready.set()
+            release_owner.wait(5)
+
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            owner = threading.Thread(target=frozen_owner)
+            owner.start()
+            try:
+                self.assertTrue(owner_ready.wait(5))
+                clock["now"] += server.watchdog_timeout_seconds + 1.0
+                self.assertEqual(
+                    server._overdue_heartbeats(clock["now"]),
+                    ["block_submitter"],
+                )
+                foreign = threading.Thread(
+                    target=lambda: server._record_block_submitter_phase(
+                        "prior-balances-check"
+                    )
+                )
+                foreign.start()
+                foreign.join(5)
+                self.assertEqual(
+                    server._overdue_heartbeats(clock["now"]),
+                    ["block_submitter"],
+                )
+                self.assertNotEqual(
+                    getattr(
+                        server._ensure_block_candidate_service(),
+                        "_block_submitter_phase",
+                        None,
+                    ),
+                    "prior-balances-check",
+                )
+            finally:
+                release_owner.set()
+                owner.join(5)
 
     def test_landing_scope_uses_landing_budget_from_first_attempt(self) -> None:
         server, _state, _recording = submit_coordinator()

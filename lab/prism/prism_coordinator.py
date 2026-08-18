@@ -3781,6 +3781,14 @@ class PrismCoordinator:
                     ensure_tip=lambda tip: self.ensure_reorg_reconciled_for_tip(
                         tip
                     ),
+                    # Accepted-block landings run a reconcile pass inline on
+                    # the watchdog-monitored block-work thread. The recorder
+                    # stamps only from that thread's registered owner, so
+                    # background reconciliation passes and per-client callers
+                    # keep recording nothing at all.
+                    record_progress=lambda phase: (
+                        self._record_block_submitter_phase(phase)
+                    ),
                 ),
                 enabled=bool(self.reorg_reconciler_enabled),
                 cache_seconds=self.reorg_reconcile_cache_seconds,

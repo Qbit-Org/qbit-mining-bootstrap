@@ -2597,6 +2597,35 @@ class PsqlShareLedger:
             return None
         return getattr(progress_local, "hook", None)
 
+    def _note_operation_progress(self) -> None:
+        """Report liveness between the statements of one gate-holding step.
+
+        ``_acquire_operation_gate`` stamps only while a caller is *waiting*
+        for a gate, which is all a single-statement operation needs: once the
+        gate opens the caller is inside one server-side statement, and its
+        liveness monitor is sized for exactly that. An operation that issues
+        a second statement without releasing the gate breaks that sizing.
+        No admission slice runs between the two -- the gate is already held --
+        so the monitor sees one unbroken silence of two statement budgets
+        where it was promised one. That is indistinguishable from a wedged
+        operation, and a watchdog with any tolerance below twice the budget
+        hard-exits a coordinator that is in fact making normal progress
+        (issue #125). Reporting here restores the contract: the first
+        statement's full round trip has completed, which is precisely the
+        evidence a liveness monitor watches for, while a genuinely stuck
+        statement still produces no report at all.
+
+        With no hook installed this does nothing; an ordinary ledger caller
+        has no monitor to satisfy. An exception from the hook propagates,
+        matching ``_acquire_operation_gate``: a liveness stamp that cannot be
+        taken is a real failure, not something to swallow mid-operation.
+        """
+        hook = self._operation_progress_hook()
+        if hook is None:
+            return
+        on_progress, _slice_seconds = hook
+        on_progress()
+
     def _remaining_operation_timeout(self) -> float | None:
         timeout_local = getattr(self, "_operation_timeout_local", None)
         deadline = (
@@ -3787,6 +3816,12 @@ FROM qbit_current_carry_forward_balances();
         sql = "SELECT qbit_carry_forward_integrity_report();"
         with self._operation_gate(self._lock, "writer lock"):
             report = self._run_retry_safe_read_json(sql)
+            # The audit head is a second statement under the same held lock:
+            # the two reads must observe one another's rows, so the gate
+            # cannot be released between them. Report the first statement's
+            # completed round trip so the pair costs a monitor one budget of
+            # silence at a time (see _note_operation_progress).
+            self._note_operation_progress()
             audit_head = self._carry_forward_audit_head_locked()
         report["backend"] = "postgres-psql"
         report.update(audit_head)
@@ -6614,6 +6649,14 @@ SELECT json_build_object(
                 # command snapshot, so a join in that same statement cannot see
                 # the freshly assigned ordinal. Read it in the next statement
                 # while retaining the ledger writer lock.
+                #
+                # Holding the lock across both statements is what makes this
+                # step's heartbeat-silent span two statement budgets rather
+                # than one: no admission slice runs in between, so a landing
+                # caller's liveness monitor gets nothing until the second
+                # statement returns. Report the completed first round trip
+                # before starting the second (see _note_operation_progress).
+                self._note_operation_progress()
                 state = self._run_retry_safe_read_json(
                     f"""
 SELECT json_build_object(
@@ -6755,6 +6798,13 @@ SELECT json_build_object(
             reactivated_count = int(result["reactivated_count"])
             publication_sequence: object | None = None
             if reactivated_count == 1:
+                # Same two-statements-under-one-gate shape as
+                # confirm_accepted_block: the mutating statement's command
+                # snapshot cannot see the ordinal it just assigned, so the
+                # read runs next while the writer lock is still held. Report
+                # the completed first statement so a landing caller's monitor
+                # is not asked to sit through both budgets in silence.
+                self._note_operation_progress()
                 state = self._run_retry_safe_read_json(
                     f"""
 SELECT json_build_object(

@@ -44,6 +44,9 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS,
     DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,
 )
+from lab.prism.coordinator_shutdown import (
+    BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS,
+)
 from lab.prism.share_ledger import (
     IncrementalShareJsonSequence,  # noqa: F401 - annotation/compatibility export
     IncrementalShareWindow,
@@ -508,6 +511,10 @@ class PayoutStateRuntime(Protocol):
     def _ensure_shutdown_controller(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def _record_heartbeat(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def _record_block_submitter_phase(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def _block_work_wait_slice(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def _record_progress_payout_generation(self, *args: Any, **kwargs: Any) -> Any: ...
 
@@ -3843,6 +3850,34 @@ class PayoutStateService:
         with runtime._payout_append_landing_fence_lock:
             yield True
 
+    def _block_work_wait_slice(self) -> float:
+        """Slice length for a condition wait taken on the block-work thread.
+
+        The block-candidate owner derives this from the configured watchdog
+        tolerance, so reusing it keeps every sliced wait on that thread in
+        step with the watchdog through operator overrides instead of pinning
+        a second literal that goes stale. Duck-typed runtimes in focused
+        tests do not carry the helper; they fall back to the same
+        admission-wait slice the shutdown controller keeps its own copy of.
+        """
+        wait_slice = getattr(self._runtime, "_block_work_wait_slice", None)
+        if callable(wait_slice):
+            return max(0.001, float(wait_slice()))
+        return BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS
+
+    def _record_block_work_phase(self, phase: str) -> None:
+        """Stamp a block-work liveness phase when the runtime records them.
+
+        The recorder itself decides whether the calling thread is a
+        registered block-work owner and records nothing otherwise, which is
+        what keeps a share-writer or client thread from refreshing the
+        budget of an owner that is genuinely wedged. Duck-typed runtimes
+        without the recorder simply do not stamp.
+        """
+        recorder = getattr(self._runtime, "_record_block_submitter_phase", None)
+        if callable(recorder):
+            recorder(phase)
+
     def _await_unfenced_appends_predating_anchor(self, anchor_ms: int) -> None:
         """Wait until no unfenced in-flight append can predate ``anchor_ms``.
 
@@ -3870,6 +3905,19 @@ class PayoutStateService:
         runtime = self._runtime
         runtime._ensure_job_cache_state()
         anchor = int(anchor_ms)
+        # The drain is unbounded by design and stays that way: it enforces
+        # the fencing contract above, so a deadline here could let a landing
+        # proceed past appends whose epoch bumps its own fences must see.
+        # What an untimed wait may not do is run heartbeat-silent -- this
+        # call happens inline on the watchdog-monitored block-work thread,
+        # where an unbroken silence longer than the tolerance is a hard exit
+        # mid-landing (issue #125). Waiting in watchdog-sized slices and
+        # stamping each one that still finds the predicate true keeps the
+        # wait exactly as long as it was while making it visible; the
+        # ``while`` re-check is what makes a timed wait semantically
+        # transparent. The common path -- nothing in flight predates the
+        # anchor -- never enters the loop and so stamps nothing at all.
+        slice_seconds = self._block_work_wait_slice()
         with runtime._payout_unfenced_append_drained:
             while any(
                 stamp_ms <= anchor
@@ -3877,7 +3925,10 @@ class PayoutStateService:
                     runtime._payout_unfenced_append_inflight_stamps.values()
                 )
             ):
-                runtime._payout_unfenced_append_drained.wait()
+                self._record_block_work_phase("wait-unfenced-append-drain")
+                runtime._payout_unfenced_append_drained.wait(
+                    timeout=slice_seconds
+                )
 
     def _record_late_visible_payout_append(
         self,

@@ -224,11 +224,17 @@ DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS = 120.0
 # a cap at or above the tolerance lets a legal, still-running call trip the
 # watchdog, and the in-memory escalation state dies with the process, so the
 # restart replays the same doomed attempt from the base budget forever
-# (issue #125). With the ledger admission wait now stamping progress, the
-# heartbeat-silent span of one landing step is a single server-side
-# statement; holding the budget at half the tolerance therefore leaves a
-# full statement of margin before the watchdog fires, and the two values can
-# no longer drift apart when either is retuned.
+# (issue #125). The landing scope is bracketed to keep that span short: the
+# ledger admission wait stamps in slices, gate bodies that hold their lock
+# across two statements report between them, and the reorg walk, prior-
+# balance checks, tip-height RPC and unfenced-append drain each stamp their
+# own phases. What remains between two stamps is normally one server-side
+# statement, so half the tolerance leaves roughly a statement of margin
+# before the watchdog fires, and the two values can no longer drift apart
+# when either is retuned. It is a margin, not a guarantee: a network stall
+# mid-statement has no client-side socket-read deadline on the native
+# psycopg path and can outlast any budget -- that case is a genuinely
+# wedged process, and a watchdog exit is the correct outcome.
 BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION = 0.5
 DEFAULT_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS = 5.0
 DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS = 30.0
