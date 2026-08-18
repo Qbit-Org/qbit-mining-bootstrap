@@ -62,6 +62,7 @@ from lab.prism.coordinator_shutdown import (
     ledger_writer_operation,  # noqa: F401 - compatibility re-export
 )
 from lab.prism.coordinator_config import (
+    BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION,  # noqa: F401
     CoordinatorConfig,
     DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,  # noqa: F401
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,  # noqa: F401
@@ -114,6 +115,7 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS,  # noqa: F401
     DEFAULT_PRISM_TIP_REFRESH_MAX_WORKERS,
     DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS,
+    DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,  # noqa: F401
     DEFAULT_PRISM_WORKER_METRICS_LIMIT,
     DEFAULT_PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS,
     LEASE_AUTHORITY_MARGIN_HEADROOM_SECONDS,
@@ -3787,6 +3789,14 @@ class PrismCoordinator:
                     ),
                     ensure_tip=lambda tip: self.ensure_reorg_reconciled_for_tip(
                         tip
+                    ),
+                    # Accepted-block landings run a reconcile pass inline on
+                    # the watchdog-monitored block-work thread. The recorder
+                    # stamps only from that thread's registered owner, so
+                    # background reconciliation passes and per-client callers
+                    # keep recording nothing at all.
+                    record_progress=lambda phase: (
+                        self._record_block_submitter_phase(phase)
                     ),
                 ),
                 enabled=bool(self.reorg_reconciler_enabled),

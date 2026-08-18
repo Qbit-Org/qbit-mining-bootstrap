@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import dataclasses
+import io
 import unittest
 from unittest import mock
 from tests.prism_vardiff_test_support import *
+from lab.prism.coordinator_config import LifecycleConfig
 from lab.prism.audit_artifacts import (
     AuditArtifactStore,
     AuditPublicationIdentity,
@@ -15,6 +18,7 @@ from lab.prism.audit_artifacts import (
 from lab.prism.block_candidates import (
     BlockCandidateAttemptResult,
     BlockCandidateRunResult,
+    _BlockCandidateNodeSubmission,
     block_candidate_from_intent,
     block_candidate_intent,
 )
@@ -8939,6 +8943,12 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
 
     def test_block_landing_db_timeout_escalates_and_clears(self) -> None:
         server, _state, _recording = submit_coordinator()
+        # The doubling sequence below reaches the reviewed 120s cap, which
+        # only a tolerance of at least 240s can grant: the landing budget is
+        # clamped to half the configured watchdog. Pin the production
+        # tolerance explicitly so this test keeps asserting the escalation
+        # ladder itself rather than the ceiling.
+        server.watchdog_timeout_seconds = 300.0
         server.block_landing_db_timeout_seconds = 30.0
         server.block_landing_db_timeout_max_seconds = 120.0
         block_hash = "ab" * 32
@@ -8952,6 +8962,357 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
         self.assertEqual(server._block_landing_db_timeout("cd" * 32), 30.0)
         server._clear_block_candidate_retry_state(block_hash)
         self.assertEqual(server._block_landing_db_timeout(block_hash), 30.0)
+
+    def test_escalated_landing_budget_stays_inside_watchdog_tolerance(self) -> None:
+        """Escalation may never grant a budget the watchdog will not wait for.
+
+        A landing step is spent on the watchdog-monitored block-work thread,
+        so a budget above the tolerance does not buy a longer attempt: the
+        watchdog hard-exits mid-landing, the in-memory escalation counts die
+        with the process, and the restart replays the same doomed attempt
+        from the base budget forever (issue #125). The ceiling is derived
+        from the configured tolerance, so raising the watchdog restores the
+        reviewed cap without touching this clamp.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_landing_db_timeout_max_seconds = 120.0
+        block_hash = "ab" * 32
+        for _ in range(8):
+            server._note_block_landing_timeout(block_hash)
+        escalated = server._block_landing_db_timeout(block_hash)
+        self.assertLessEqual(escalated, server.watchdog_timeout_seconds / 2.0)
+        self.assertEqual(escalated, 60.0)
+        # The production override is pinned too: a 300s tolerance leaves a
+        # 150s ceiling, so the reviewed 120s cap is still granted in full and
+        # deployments running that override see no behavior change.
+        server.watchdog_timeout_seconds = 300.0
+        self.assertEqual(server._block_landing_db_timeout(block_hash), 120.0)
+
+    def test_watchdog_ceiling_clamps_the_configured_base_not_only_the_cap(self) -> None:
+        """A tolerance below the base budget must lower the base too.
+
+        The first landing attempt already spends the base budget on the
+        watchdog-monitored thread, so a base above the ceiling trips the
+        watchdog before any escalation has happened at all -- the clamp
+        cannot be a cap-only concern.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 40.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_landing_db_timeout_max_seconds = 120.0
+        block_hash = "ab" * 32
+        service = server._ensure_block_candidate_service()
+        self.assertEqual(service._block_landing_watchdog_ceiling(), 20.0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(server._block_landing_db_timeout(block_hash), 20.0)
+            for _ in range(8):
+                server._note_block_landing_timeout(block_hash)
+            self.assertEqual(server._block_landing_db_timeout(block_hash), 20.0)
+
+    def test_disabled_watchdog_grants_the_configured_landing_budget(self) -> None:
+        """No hard-exit hazard means no reason to spend the operator's cap.
+
+        The clamp exists solely because a landing budget above the watchdog
+        tolerance buys a hard exit instead of a longer attempt. A deployment
+        that turned the watchdog off has no such exit to avoid, so halving
+        its cap would be pure loss. The attribute is read defensively and
+        defaults to enabled, since clamping is the safe answer.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_landing_db_timeout_max_seconds = 120.0
+        block_hash = "ab" * 32
+        for _ in range(8):
+            server._note_block_landing_timeout(block_hash)
+
+        server.watchdog_enabled = False
+        service = server._ensure_block_candidate_service()
+        self.assertEqual(service._block_landing_watchdog_ceiling(), float("inf"))
+        with contextlib.redirect_stdout(io.StringIO()) as quiet:
+            self.assertEqual(server._block_landing_db_timeout(block_hash), 120.0)
+            self.assertEqual(server._block_landing_db_timeout(None), 30.0)
+        # An infinite ceiling never compares below a configured value, so the
+        # clamp notice must stay silent as well.
+        self.assertEqual(quiet.getvalue(), "")
+
+        server.watchdog_enabled = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(server._block_landing_db_timeout(block_hash), 60.0)
+
+    def test_lifecycle_config_still_carries_the_watchdog_enabled_switch(self) -> None:
+        """The clamp's defensive read must not outlive the attribute itself.
+
+        ``getattr(..., True)`` would keep clamping silently if the setting
+        were ever renamed, so pin the name the coordinator assigns from.
+        """
+        self.assertIn(
+            "watchdog_enabled",
+            {field.name for field in dataclasses.fields(LifecycleConfig)},
+        )
+
+    def test_landing_budget_clamp_is_announced_exactly_once(self) -> None:
+        """A silently reduced budget is a config mismatch nobody can see.
+
+        Without the notice the operator's configured cap simply does not
+        happen -- at the 120s default tolerance a 120s cap becomes 60s -- and
+        "escalation exhausted at my cap" reads identically to "escalation
+        never reached my cap". It is emitted once because the budget is
+        recomputed on every landing attempt, and the flag flips under the
+        coordinator lock so concurrent first landings cannot both print.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_landing_db_timeout_max_seconds = 120.0
+        block_hash = "ab" * 32
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            barrier = threading.Barrier(4, timeout=10)
+
+            def landing_budget() -> None:
+                barrier.wait()
+                for _ in range(5):
+                    server._block_landing_db_timeout(block_hash)
+
+            threads = [threading.Thread(target=landing_budget) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            server._block_landing_db_timeout(block_hash)
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if "landing db budget clamped by watchdog" in line
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("configured_max=120s", lines[0])
+        self.assertIn("granted_max=60s", lines[0])
+        self.assertIn("ceiling=60s", lines[0])
+        self.assertIn("watchdog_timeout=120s", lines[0])
+
+    def test_landing_scope_stamps_progress_during_ledger_admission(self) -> None:
+        """Waiting for the ledger's writer lock must not be heartbeat-silent.
+
+        Admission happens before any statement is sent, so no server-side
+        deadline bounds it and nothing reports until the gate opens. The
+        landing scope runs on the block-work owner thread the watchdog
+        monitors, so it installs the ledger's progress hook and the wait
+        stamps its phase in watchdog-sized slices instead.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        server.block_submit_db_timeout_seconds = 1.0
+        installed: list[float] = []
+        stamped: list[str] = []
+
+        @contextlib.contextmanager
+        def operation_progress(on_progress, *, slice_seconds: float):
+            installed.append(slice_seconds)
+            on_progress()
+            yield
+
+        @contextlib.contextmanager
+        def statement_timeout(seconds: float):
+            yield
+
+        server.ledger = SimpleNamespace(
+            statement_timeout=statement_timeout,
+            operation_progress=operation_progress,
+        )
+        server._record_block_submitter_wait = lambda phase: stamped.append(phase)
+        with server._block_landing_ledger_statement_timeout_scope("ab" * 32):
+            pass
+        with server._block_submitter_ledger_statement_timeout_scope():
+            pass
+        self.assertEqual(len(installed), 2)
+        for slice_seconds in installed:
+            self.assertGreater(slice_seconds, 0.0)
+            self.assertLessEqual(slice_seconds, server.watchdog_timeout_seconds)
+        self.assertEqual(
+            stamped,
+            [
+                "wait-ledger-admission:landing",
+                "wait-ledger-admission:submit",
+            ],
+        )
+
+    def test_landing_scope_accepts_ledgers_without_a_progress_hook(self) -> None:
+        """Duck-typed ledgers predating the hook keep working unchanged."""
+        server, _state, _recording = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        server.block_landing_db_timeout_seconds = 30.0
+        scopes: list[float] = []
+
+        @contextlib.contextmanager
+        def statement_timeout(seconds: float):
+            scopes.append(seconds)
+            yield
+
+        server.ledger = SimpleNamespace(statement_timeout=statement_timeout)
+        with server._block_landing_ledger_statement_timeout_scope("ab" * 32):
+            pass
+        self.assertEqual(scopes, [30.0])
+
+    def _landing_phase_recorder(self, server: PrismCoordinator) -> list[str]:
+        """Capture the block-work phases one landing pass stamps, in order."""
+        phases: list[str] = []
+        server._record_block_submitter_phase = phases.append  # type: ignore[method-assign]
+        return phases
+
+    def test_landing_brackets_the_reorg_walk_and_prior_balance_check(self) -> None:
+        """Neither stretch may sit inside the landing scope unnamed.
+
+        Between the current-tip RPC and the audit build the landing thread
+        spends a full reorg reconciliation -- ledger statements and chain
+        RPCs, one pair per watched block -- and then a prior-balances read.
+        The budget granted to a landing step is derived from the watchdog on
+        the assumption that a heartbeat-silent stretch is about one
+        statement long, so an unstamped multi-statement stretch here is
+        exactly the hazard the derivation was supposed to remove (issue
+        #125).
+        """
+        parent_hash = "00" * 32
+        block_hash = "cd" * 32
+        server, state, ledger = submit_coordinator(tip=parent_hash)
+        ledger.durable_payout_state = True
+        phases = self._landing_phase_recorder(server)
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            lambda _tip, **_kwargs: True
+        )
+        # A stale payout base abandons the candidate right after the check,
+        # so the landing stops with both bracketed stretches behind it.
+        server.prior_balances_match_current = (  # type: ignore[method-assign]
+            lambda _balances: False
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+        landed = server._land_and_confirm_block_candidate(
+            block_candidate(server, state, submission),
+            current_tip=block_hash,
+            already_active=False,
+            worker="miner-a",
+            node_submission=_BlockCandidateNodeSubmission(attempted=False),
+        )
+        self.assertIsNone(landed)
+        self.assertEqual(
+            phases,
+            [
+                "reorg-reconcile",
+                "reorg-reconcile:complete",
+                "prior-balances-check",
+                "prior-balances-check:complete",
+            ],
+        )
+
+    def test_landing_brackets_the_tip_height_rpc(self) -> None:
+        """A node round trip between two stamped stretches gets its own name."""
+
+        class StaleHeightTipRpc(TipRpc):
+            def call(
+                self,
+                method: str,
+                params: list[object] | None = None,
+            ) -> object:
+                if method == "getblockcount":
+                    return 42
+                return super().call(method, params)
+
+        parent_hash = "00" * 32
+        block_hash = "cd" * 32
+        server, state, ledger = submit_coordinator(tip=parent_hash)
+        ledger.durable_payout_state = True
+        server.rpc = StaleHeightTipRpc(parent_hash)
+        phases = self._landing_phase_recorder(server)
+        server.ensure_reorg_reconciled_for_tip = (  # type: ignore[method-assign]
+            lambda _tip, **_kwargs: True
+        )
+        server.prior_balances_match_current = (  # type: ignore[method-assign]
+            lambda _balances: True
+        )
+        submission = SimpleNamespace(
+            coinbase_tx_hex="c0ffee",
+            block_hash_hex=block_hash,
+            block_hex="00",
+        )
+        landed = server._land_and_confirm_block_candidate(
+            block_candidate(server, state, submission),
+            current_tip=block_hash,
+            already_active=False,
+            worker="miner-a",
+            node_submission=_BlockCandidateNodeSubmission(attempted=False),
+        )
+        # The reported tip is far ahead of the template, so the candidate
+        # abandons as stale immediately after the bracketed RPC.
+        self.assertIsNone(landed)
+        self.assertEqual(
+            phases[-2:],
+            ["tip-height-rpc", "tip-height-rpc:complete"],
+        )
+
+    def test_block_submitter_phase_never_stamps_from_a_foreign_thread(self) -> None:
+        """A stamp off the owner thread must not refresh a wedged owner.
+
+        The landing brackets added around the reorg walk, the prior-balance
+        check and the tip-height RPC all run through this stamper, and the
+        same code paths also execute on client connection threads. If those
+        stamps counted, a frozen dedicated thread would look alive for as
+        long as clients kept solving.
+        """
+        server, _state, _ledger = submit_coordinator()
+        server.watchdog_timeout_seconds = 120.0
+        clock = {"now": 1000.0}
+        owner_ready = threading.Event()
+        release_owner = threading.Event()
+
+        def frozen_owner() -> None:
+            server._block_submitter_thread_ident = threading.get_ident()
+            server._record_heartbeat("block_submitter")
+            owner_ready.set()
+            release_owner.wait(5)
+
+        with patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            owner = threading.Thread(target=frozen_owner)
+            owner.start()
+            try:
+                self.assertTrue(owner_ready.wait(5))
+                clock["now"] += server.watchdog_timeout_seconds + 1.0
+                self.assertEqual(
+                    server._overdue_heartbeats(clock["now"]),
+                    ["block_submitter"],
+                )
+                foreign = threading.Thread(
+                    target=lambda: server._record_block_submitter_phase(
+                        "prior-balances-check"
+                    )
+                )
+                foreign.start()
+                foreign.join(5)
+                self.assertEqual(
+                    server._overdue_heartbeats(clock["now"]),
+                    ["block_submitter"],
+                )
+                self.assertNotEqual(
+                    getattr(
+                        server._ensure_block_candidate_service(),
+                        "_block_submitter_phase",
+                        None,
+                    ),
+                    "prior-balances-check",
+                )
+            finally:
+                release_owner.set()
+                owner.join(5)
 
     def test_landing_scope_uses_landing_budget_from_first_attempt(self) -> None:
         server, _state, _recording = submit_coordinator()
@@ -8976,6 +9337,10 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
 
     def test_landing_scope_timeout_escalates_next_attempt_budget(self) -> None:
         server, _state, _recording = submit_coordinator()
+        # The escalated 90s budget asserted below needs a tolerance of at
+        # least 180s; the landing budget is otherwise clamped to half the
+        # configured watchdog.
+        server.watchdog_timeout_seconds = 300.0
         server.block_landing_db_timeout_seconds = 45.0
         server.block_landing_db_timeout_max_seconds = 120.0
         scopes: list[float] = []

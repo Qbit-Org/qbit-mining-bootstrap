@@ -2354,6 +2354,15 @@ class PsqlShareLedger:
         self._lease_adoption_silence_seconds = lease_adoption_silence_seconds
         self._operation_timeout_local = local()
         self._statement_timeout_local = local()
+        # Created here, not lazily in operation_progress: that scope's
+        # check-then-set is not atomic, so two block-work threads entering
+        # their first-ever scope on a fresh ledger can each build a local()
+        # and have one assignment win. The loser's hook would then live on an
+        # orphaned object and its admission wait would silently fall back to
+        # the heartbeat-silent path -- the exact failure the hook exists to
+        # remove. The scope keeps its lazy fallback for ledgers built through
+        # __new__ in focused tests; the production path must not race.
+        self._operation_progress_local = local()
         self._lock = Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         audit_share_segment_size = int(audit_share_segment_size)
@@ -2639,6 +2648,102 @@ class PsqlShareLedger:
             else:
                 timeout_local.timeout_seconds = previous
 
+    @contextmanager
+    def operation_progress(
+        self,
+        on_progress: Callable[[], None],
+        *,
+        slice_seconds: float,
+    ) -> Iterator[None]:
+        """Stamp caller liveness while a ledger admission wait is blocked.
+
+        A landing-class caller runs its ledger step directly on a
+        watchdog-monitored block-work thread. Waiting for the writer lock or
+        the read semaphore is not database work: no statement has been sent,
+        so neither ``statement_timeout`` nor any server-side cancellation
+        bounds it, and the ledger has nothing to report until admission
+        succeeds. Without this hook the whole admission budget is
+        heartbeat-silent, and a coordinator that is merely queued behind
+        another writer is hard-exited by its own watchdog mid-landing --
+        which loses the escalation state the retry depended on and restarts
+        the same doomed cycle.
+
+        The hook fires between acquire slices, so it never runs while this
+        thread holds the gate, and it never replaces the caller's deadline:
+        ``_operation_gate`` still raises at the deadline
+        ``_remaining_operation_timeout`` reports. An exception from
+        ``on_progress`` propagates to the caller; a liveness stamp that
+        cannot be taken is a real failure, not something to swallow inside a
+        lock wait.
+
+        Nesting merges the way ``operation_timeout``/``statement_timeout``
+        merge: the effective slice is the minimum of the enclosing slices, so
+        an inner scope can only tighten the stamp cadence, never widen it. A
+        nested scope carrying a larger slice would otherwise lengthen the
+        heartbeat gaps its enclosing caller had already sized against its own
+        monitor. The callback itself does replace -- the innermost caller is
+        the one whose liveness is at stake -- and the outer pair is restored
+        on exit.
+        """
+        slice_seconds = float(slice_seconds)
+        if not math.isfinite(slice_seconds) or slice_seconds <= 0:
+            raise ValueError("operation progress slice must be finite and positive")
+        progress_local = getattr(self, "_operation_progress_local", None)
+        if progress_local is None:
+            progress_local = local()
+            self._operation_progress_local = progress_local
+        previous = getattr(progress_local, "hook", None)
+        progress_local.hook = (
+            (on_progress, slice_seconds)
+            if previous is None
+            else (on_progress, min(float(previous[1]), slice_seconds))
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del progress_local.hook
+                except AttributeError:
+                    pass
+            else:
+                progress_local.hook = previous
+
+    def _operation_progress_hook(self) -> tuple[Callable[[], None], float] | None:
+        progress_local = getattr(self, "_operation_progress_local", None)
+        if progress_local is None:
+            return None
+        return getattr(progress_local, "hook", None)
+
+    def _note_operation_progress(self) -> None:
+        """Report liveness between the statements of one gate-holding step.
+
+        ``_acquire_operation_gate`` stamps only while a caller is *waiting*
+        for a gate, which is all a single-statement operation needs: once the
+        gate opens the caller is inside one server-side statement, and its
+        liveness monitor is sized for exactly that. An operation that issues
+        a second statement without releasing the gate breaks that sizing.
+        No admission slice runs between the two -- the gate is already held --
+        so the monitor sees one unbroken silence of two statement budgets
+        where it was promised one. That is indistinguishable from a wedged
+        operation, and a watchdog with any tolerance below twice the budget
+        hard-exits a coordinator that is in fact making normal progress
+        (issue #125). Reporting here restores the contract: the first
+        statement's full round trip has completed, which is precisely the
+        evidence a liveness monitor watches for, while a genuinely stuck
+        statement still produces no report at all.
+
+        With no hook installed this does nothing; an ordinary ledger caller
+        has no monitor to satisfy. An exception from the hook propagates,
+        matching ``_acquire_operation_gate``: a liveness stamp that cannot be
+        taken is a real failure, not something to swallow mid-operation.
+        """
+        hook = self._operation_progress_hook()
+        if hook is None:
+            return
+        on_progress, _slice_seconds = hook
+        on_progress()
+
     def _remaining_operation_timeout(self) -> float | None:
         timeout_local = getattr(self, "_operation_timeout_local", None)
         deadline = (
@@ -2669,17 +2774,49 @@ class PsqlShareLedger:
             remaining = min(remaining, float(statement_timeout_seconds))
         return remaining
 
+    def _acquire_operation_gate(self, gate: Any, name: str) -> None:
+        """Wait for one ledger gate inside the caller's remaining deadline.
+
+        With no progress hook installed this is a single blocking acquire, as
+        it has always been: an ordinary caller has no liveness monitor to
+        satisfy and gains nothing from waking up. With a hook installed the
+        same total wait is served in slices so the caller can stamp its
+        heartbeat between them (see ``operation_progress`` for why an
+        admission wait would otherwise be silent). Slicing never widens the
+        wait: the deadline derived from ``_remaining_operation_timeout`` stays
+        authoritative and still produces the same timeout error.
+        """
+        remaining = self._remaining_operation_timeout()
+        hook = self._operation_progress_hook()
+        if hook is None:
+            acquired = (
+                gate.acquire()
+                if remaining is None
+                else gate.acquire(timeout=max(0.0, remaining))
+            )
+            if not acquired:
+                raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+            return
+        on_progress, slice_seconds = hook
+        deadline = (
+            None if remaining is None else time.monotonic() + max(0.0, remaining)
+        )
+        while True:
+            wait_seconds = slice_seconds
+            if deadline is not None:
+                wait_seconds = min(wait_seconds, deadline - time.monotonic())
+            # An expired budget still gets one non-blocking attempt, so a
+            # zero or negative remaining fails exactly where it always did.
+            if gate.acquire(timeout=max(0.0, wait_seconds)):
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+            on_progress()
+
     @contextmanager
     def _operation_gate(self, gate: Any, name: str) -> Iterator[None]:
         """Acquire a ledger lock/semaphore within the caller's deadline."""
-        remaining = self._remaining_operation_timeout()
-        acquired = (
-            gate.acquire()
-            if remaining is None
-            else gate.acquire(timeout=max(0.0, remaining))
-        )
-        if not acquired:
-            raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+        self._acquire_operation_gate(gate, name)
         try:
             yield
         finally:
@@ -3797,6 +3934,12 @@ FROM qbit_current_carry_forward_balances();
         sql = "SELECT qbit_carry_forward_integrity_report();"
         with self._operation_gate(self._lock, "writer lock"):
             report = self._run_retry_safe_read_json(sql)
+            # The audit head is a second statement under the same held lock:
+            # the two reads must observe one another's rows, so the gate
+            # cannot be released between them. Report the first statement's
+            # completed round trip so the pair costs a monitor one budget of
+            # silence at a time (see _note_operation_progress).
+            self._note_operation_progress()
             audit_head = self._carry_forward_audit_head_locked()
         report["backend"] = "postgres-psql"
         report.update(audit_head)
@@ -6624,6 +6767,14 @@ SELECT json_build_object(
                 # command snapshot, so a join in that same statement cannot see
                 # the freshly assigned ordinal. Read it in the next statement
                 # while retaining the ledger writer lock.
+                #
+                # Holding the lock across both statements is what makes this
+                # step's heartbeat-silent span two statement budgets rather
+                # than one: no admission slice runs in between, so a landing
+                # caller's liveness monitor gets nothing until the second
+                # statement returns. Report the completed first round trip
+                # before starting the second (see _note_operation_progress).
+                self._note_operation_progress()
                 state = self._run_retry_safe_read_json(
                     f"""
 SELECT json_build_object(
@@ -6765,6 +6916,13 @@ SELECT json_build_object(
             reactivated_count = int(result["reactivated_count"])
             publication_sequence: object | None = None
             if reactivated_count == 1:
+                # Same two-statements-under-one-gate shape as
+                # confirm_accepted_block: the mutating statement's command
+                # snapshot cannot see the ordinal it just assigned, so the
+                # read runs next while the writer lock is still held. Report
+                # the completed first statement so a landing caller's monitor
+                # is not asked to sit through both budgets in silence.
+                self._note_operation_progress()
                 state = self._run_retry_safe_read_json(
                     f"""
 SELECT json_build_object(

@@ -486,6 +486,27 @@ class BlockFinalizationService:
         # subclass override; the base implementation forwards to the port.
         self.runtime._record_block_candidate_progress(phase)
 
+    def _stamped_prior_balances_match_current(
+        self,
+        prior_balances: list[dict[str, object]],
+    ) -> bool:
+        """Compare the job's payout base against the ledger, bracketed.
+
+        The comparison is a ledger read run inline on the landing's
+        block-work thread, between the reorg-reconcile stretch and the
+        audit build. Bracketing it keeps that statement attributable: an
+        owner parked in ``prior-balances-check`` is waiting on a known
+        database read rather than sitting in an unnamed silence the
+        watchdog cannot tell from a wedge. Both landing call sites route
+        through here so the pair of stamps cannot drift apart. The stampers
+        no-op off the block-work owner thread, so client-thread
+        dispositions are unaffected.
+        """
+        self.runtime._record_block_submitter_phase("prior-balances-check")
+        matched = bool(self.runtime.prior_balances_match_current(prior_balances))
+        self.runtime._record_block_submitter_phase("prior-balances-check:complete")
+        return matched
+
     def _note_candidate_started(self) -> None:
         now = time.monotonic()
         with self._metrics_lock:
@@ -604,9 +625,19 @@ class BlockFinalizationService:
                 # transition becomes a landed barrier and before validating its
                 # payout base.
                 try:
+                    # Reconciliation is the longest heartbeat-silent stretch
+                    # in the landing scope: a chain walk of ledger statements
+                    # and getblockhash calls, one pair per watched block. The
+                    # pass stamps its own per-row progress internally; these
+                    # boundary stamps mark the stretch itself so a landing
+                    # that enters it is never mistaken for a wedged thread.
+                    self.runtime._record_block_submitter_phase("reorg-reconcile")
                     reorg_reconciled = self.runtime.ensure_reorg_reconciled_for_tip(
                         current_tip,
                         _coalesce_same_tip=False,
+                    )
+                    self.runtime._record_block_submitter_phase(
+                        "reorg-reconcile:complete"
                     )
                 except Exception:
                     traceback.print_exc()
@@ -657,9 +688,14 @@ class BlockFinalizationService:
                 reorg_reconciled = True
             else:
                 try:
+                    # Same unbounded chain walk as the replay path above.
+                    self.runtime._record_block_submitter_phase("reorg-reconcile")
                     reorg_reconciled = self.runtime.ensure_reorg_reconciled_for_tip(
                         current_tip,
                         _coalesce_same_tip=False,
+                    )
+                    self.runtime._record_block_submitter_phase(
+                        "reorg-reconcile:complete"
                     )
                 except Exception:
                     traceback.print_exc()
@@ -742,7 +778,9 @@ class BlockFinalizationService:
             if (
                 durable_payout_state
                 and not already_active
-                and not self.runtime.prior_balances_match_current(context.prior_balances)
+                and not self._stamped_prior_balances_match_current(
+                    context.prior_balances
+                )
             ):
                 self.runtime._abandon_block_candidate(
                     PRISM_REJECTION_STALE_JOB,
@@ -754,7 +792,12 @@ class BlockFinalizationService:
                 )
                 return None
             if not already_active and not node_submission.attempted:
+                # One RPC round trip, but it runs between two already-stamped
+                # stretches on the block-work thread; leaving it unnamed puts
+                # an unbounded node response inside somebody else's phase.
+                self.runtime._record_block_submitter_phase("tip-height-rpc")
                 before_height = int(self.runtime.rpc.call("getblockcount"))
+                self.runtime._record_block_submitter_phase("tip-height-rpc:complete")
                 if before_height + 1 != expected_height:
                     self.runtime._abandon_block_candidate(
                         PRISM_REJECTION_BLOCK_STALE,
@@ -934,8 +977,10 @@ class BlockFinalizationService:
                 # summary. Publish it before rebuilding/canonicalizing the full
                 # audit bundle, without retaining that bundle's shares tree.
                 preview = self.runtime._materialize_prior_balance_preview(issued_preview)
-                if durable_payout_state and not self.runtime.prior_balances_match_current(
-                    context.prior_balances
+                if durable_payout_state and not (
+                    self._stamped_prior_balances_match_current(
+                        context.prior_balances
+                    )
                 ):
                     self.runtime.request_shutdown()
                     self.runtime._clear_accepted_block_payout_preview(

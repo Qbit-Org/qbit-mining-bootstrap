@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterator
 
 from lab.prism import direct_stratum
 from lab.prism.coordinator_config import (
+    BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION,
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,
     DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS,
@@ -34,6 +35,7 @@ from lab.prism.coordinator_config import (
     DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS,
     DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS,
     DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,
+    DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
 )
 from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.job_bundle import PRISM_JOB_BUILD_SECONDS_BUCKETS
@@ -1074,6 +1076,79 @@ class BlockCandidateService:
             ),
         )
 
+    def _block_landing_watchdog_ceiling(self) -> float:
+        """Largest landing budget the configured watchdog can tolerate.
+
+        Landing-class work runs on the block-work thread the watchdog
+        monitors, so the landing budget and the watchdog tolerance are one
+        system, not two independent settings. Deriving the ceiling from the
+        configured tolerance keeps them in step through every override
+        instead of pinning a second literal that silently goes stale.
+
+        A deployment that turned the watchdog off has no hard-exit hazard to
+        stay under, and clamping it anyway would cost the operator budget for
+        no safety at all -- so that case gets no ceiling. The attribute is
+        read defensively and defaults to *enabled*: clamping is the safe
+        answer when the setting cannot be determined.
+        """
+        if not bool(getattr(self._coordinator, "watchdog_enabled", True)):
+            return float("inf")
+        return max(
+            0.001,
+            float(
+                getattr(
+                    self._coordinator,
+                    "watchdog_timeout_seconds",
+                    DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
+                )
+            )
+            * BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION,
+        )
+
+    def _note_block_landing_budget_clamped(
+        self,
+        *,
+        configured_base: float,
+        configured_cap: float,
+        ceiling: float,
+    ) -> None:
+        """Say once that the watchdog is granting less than was configured.
+
+        Without this the operator's configured landing budget is quietly
+        reduced -- at the 120s default tolerance the reviewed 120s cap
+        becomes 60s -- and the two states an operator most needs to tell
+        apart become indistinguishable in the logs: escalation exhausted at
+        the configured cap, versus escalation that never reached it because
+        the ceiling stopped it first. Emitted once per process because
+        _block_landing_db_timeout runs on every landing attempt and a
+        per-attempt line would bury the landing's own diagnostics; the flag
+        flips under the coordinator lock so concurrent first landings still
+        print exactly one line. The print stays outside that lock -- no I/O
+        under a coordinator-wide lock on the landing path.
+        """
+        with self._coordinator.lock:
+            if getattr(self, "_block_landing_budget_clamp_logged", False):
+                return
+            self._block_landing_budget_clamp_logged = True
+        watchdog_seconds = float(
+            getattr(
+                self._coordinator,
+                "watchdog_timeout_seconds",
+                DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
+            )
+        )
+        print(
+            "prism coordinator: landing db budget clamped by watchdog "
+            f"configured_base={configured_base:g}s "
+            f"configured_max={configured_cap:g}s "
+            f"granted_base={min(configured_base, ceiling):g}s "
+            f"granted_max={min(configured_cap, ceiling):g}s "
+            f"ceiling={ceiling:g}s "
+            f"watchdog_timeout={watchdog_seconds:g}s "
+            f"fraction={BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION:g}",
+            flush=True,
+        )
+
     def _block_landing_db_timeout(self, block_hash: str | None = None) -> float:
         """Landing-class deadline, escalated after observed landing timeouts.
 
@@ -1081,8 +1156,24 @@ class BlockCandidateService:
         landing-class operation never begins at the one-second poll budget.
         Escalation doubles per timed-out landing attempt for the same block
         hash up to the reviewed cap.
+
+        The reviewed cap is an upper bound, not the granted budget: every
+        value here is clamped to the watchdog-derived ceiling, which can only
+        lower it. Landing steps are spent on the watchdog-monitored block-work
+        thread, so an escalated budget that outruns the watchdog tolerance is
+        not a longer attempt but a hard exit mid-landing -- and because the
+        escalation counts live only in memory, the restart drops back to the
+        base budget and repeats the same doomed cycle (issue #125). At the
+        120s default tolerance the ceiling is 60s and escalation runs
+        30s -> 60s; at the 300s production tolerance the ceiling is 150s and
+        the configured 120s cap is unchanged. A deployment running with the
+        watchdog disabled has no ceiling at all and keeps its configured
+        values in full. Any clamp is announced once (see
+        _note_block_landing_budget_clamped) so a reduced budget is never a
+        silent behavior change.
         """
-        base = max(
+        ceiling = self._block_landing_watchdog_ceiling()
+        configured_base = max(
             0.001,
             float(
                 getattr(
@@ -1092,8 +1183,8 @@ class BlockCandidateService:
                 )
             ),
         )
-        cap = max(
-            base,
+        configured_cap = max(
+            configured_base,
             float(
                 getattr(
                     self._coordinator,
@@ -1102,6 +1193,17 @@ class BlockCandidateService:
                 )
             ),
         )
+        base = min(configured_base, ceiling)
+        cap = min(configured_cap, ceiling)
+        if base < configured_base or cap < configured_cap:
+            # An infinite ceiling (watchdog disabled) can never compare below
+            # a finite configured value, so a deployment that opted out of the
+            # watchdog never reaches this line.
+            self._note_block_landing_budget_clamped(
+                configured_base=configured_base,
+                configured_cap=configured_cap,
+                ceiling=ceiling,
+            )
         timeouts = 0
         if block_hash is not None:
             with self._coordinator.lock:
@@ -1242,6 +1344,38 @@ class BlockCandidateService:
             yield
 
     @contextmanager
+    def _block_work_ledger_progress_scope(self, phase: str) -> Iterator[None]:
+        """Keep a ledger admission wait visible to the block-work watchdog.
+
+        A statement deadline only bounds work the server can cancel. Before
+        any SQL is sent the ledger must first win its own writer lock or read
+        semaphore, and that wait is local: no statement exists to cancel and
+        nothing reports until admission succeeds. The scopes below run on the
+        block-work owner thread the watchdog monitors, so an admission wait
+        that stamps nothing is indistinguishable from a wedged thread and can
+        cost the coordinator a hard exit while it is merely queued behind
+        another writer.
+
+        Installing the ledger's progress hook makes that wait heartbeat in
+        watchdog-sized slices, using the same phase-stamping helper the
+        bounded-call wait loop already uses (it no-ops safely off the owner
+        thread). Ledgers predating the hook are left exactly as they were.
+        """
+        operation_progress = getattr(
+            self._coordinator.ledger,
+            "operation_progress",
+            None,
+        )
+        if not callable(operation_progress):
+            yield
+            return
+        with operation_progress(
+            lambda: self._coordinator._record_block_submitter_wait(phase),
+            slice_seconds=self._block_work_wait_slice(),
+        ):
+            yield
+
+    @contextmanager
     def _block_submitter_ledger_statement_timeout_scope(self) -> Iterator[None]:
         """Give each post-submit ledger step a fresh short deadline."""
         statement_timeout = getattr(
@@ -1250,8 +1384,11 @@ class BlockCandidateService:
             None,
         )
         if callable(statement_timeout):
-            with statement_timeout(self._block_submitter_db_timeout()):
-                yield
+            with self._block_work_ledger_progress_scope(
+                "wait-ledger-admission:submit"
+            ):
+                with statement_timeout(self._block_submitter_db_timeout()):
+                    yield
             return
         # Duck-typed ledgers predating per-statement scopes still receive a
         # bounded operation, even though their budget spans the whole tail.
@@ -1287,8 +1424,11 @@ class BlockCandidateService:
         timed_out = False
         try:
             if callable(scope):
-                with scope(timeout_seconds):
-                    yield
+                with self._block_work_ledger_progress_scope(
+                    "wait-ledger-admission:landing"
+                ):
+                    with scope(timeout_seconds):
+                        yield
             else:
                 yield
         except (LedgerOperationTimeout, BlockSubmitterDatabaseTimeout):

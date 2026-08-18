@@ -227,6 +227,39 @@ class QueryCapturePsqlShareLedger(PsqlShareLedger):
         return []
 
 
+class GateStatementRecordingPsqlShareLedger(PsqlShareLedger):
+    """Ledger whose gate-held statements and progress stamps interleave.
+
+    Built for the multi-statement gate bodies (confirm/reactivate/carry-forward
+    integrity), where the ordering of the stamp relative to each statement is
+    the property under test, not merely that a stamp happened.
+    """
+
+    def __init__(self, results: list[object]) -> None:
+        self._lock = threading.Lock()
+        self._read_semaphore = threading.BoundedSemaphore(1)
+        self._operation_timeout_local = threading.local()
+        self._statement_timeout_local = threading.local()
+        self._operation_progress_local = threading.local()
+        self._writer_id = "writer-a"
+        self._writer_epoch = 1
+        self._writer_session_token = "session-a"
+        self._lease_interval_sql = "make_interval(secs => 30)"
+        self._pending_results = list(results)
+        self.events: list[str] = []
+        self.statements = 0
+
+    def note_progress(self) -> None:
+        self.events.append("progress")
+
+    def _run_json(self, sql: str) -> Any:
+        self.statements += 1
+        self.events.append(f"statement-{self.statements}")
+        if not self._pending_results:
+            raise AssertionError(f"unexpected extra statement: {sql[:80]}")
+        return self._pending_results.pop(0)
+
+
 class BlockingReadPsqlShareLedger(PsqlShareLedger):
     def __init__(self, *, read_concurrency: int) -> None:
         self._lock = threading.Lock()
@@ -4941,6 +4974,369 @@ class NativeClientSelectionTests(unittest.TestCase):
         finally:
             gate.release()
         self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_operation_gate_stamps_progress_while_admission_is_blocked(self) -> None:
+        """A blocked admission wait must report liveness to its caller.
+
+        Landing-class callers run this wait on a watchdog-monitored thread.
+        No statement has been sent yet, so nothing on the server can bound or
+        report the wait; without the progress hook the whole admission budget
+        is silence and the watchdog kills a coordinator that is merely queued
+        behind another writer. Slicing must not extend the wait either: the
+        caller's deadline still ends it with the same error.
+        """
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        gate = threading.Lock()
+        gate.acquire()
+        stamps: list[float] = []
+        started = time.monotonic()
+        try:
+            with ledger.statement_timeout(0.4):
+                with ledger.operation_progress(
+                    lambda: stamps.append(time.monotonic()),
+                    slice_seconds=0.05,
+                ):
+                    with self.assertRaisesRegex(
+                        LedgerOperationTimeout,
+                        "writer lock",
+                    ):
+                        with ledger._operation_gate(gate, "writer lock"):
+                            self.fail("contended writer lock unexpectedly acquired")
+        finally:
+            gate.release()
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(len(stamps), 2)
+        for previous, stamp in zip([started] + stamps, stamps):
+            self.assertLess(stamp - previous, 0.3)
+        self.assertGreaterEqual(elapsed, 0.4)
+        self.assertLess(elapsed, 3.0)
+
+    def test_operation_gate_without_progress_hook_waits_once(self) -> None:
+        """The unhooked path is still a single blocking acquire.
+
+        Ordinary ledger callers have no liveness monitor to satisfy and must
+        not start paying for wakeups they cannot use.
+        """
+        acquires: list[float] = []
+
+        class RecordingGate:
+            def acquire(self, timeout: float = -1) -> bool:
+                acquires.append(timeout)
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("gate released without being acquired")
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        with ledger.statement_timeout(0.02):
+            with self.assertRaisesRegex(LedgerOperationTimeout, "writer lock"):
+                with ledger._operation_gate(RecordingGate(), "writer lock"):
+                    self.fail("contended writer lock unexpectedly acquired")
+        self.assertEqual(acquires, [0.02])
+
+    def test_operation_progress_validates_and_restores_its_slice(self) -> None:
+        """The hook scope matches its sibling timeout scopes exactly."""
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        for slice_seconds in (0.0, -1.0, float("inf"), float("nan")):
+            with self.subTest(slice_seconds=slice_seconds):
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    with ledger.operation_progress(
+                        lambda: None,
+                        slice_seconds=slice_seconds,
+                    ):
+                        self.fail("invalid progress slice unexpectedly accepted")
+        self.assertIsNone(ledger._operation_progress_hook())
+        def outer() -> None:
+            return None
+
+        def inner() -> None:
+            return None
+
+        with ledger.operation_progress(outer, slice_seconds=1.0):
+            self.assertEqual(ledger._operation_progress_hook(), (outer, 1.0))
+            with ledger.operation_progress(inner, slice_seconds=0.25):
+                self.assertEqual(ledger._operation_progress_hook(), (inner, 0.25))
+            self.assertEqual(ledger._operation_progress_hook(), (outer, 1.0))
+        self.assertIsNone(ledger._operation_progress_hook())
+
+    def test_operation_progress_local_is_created_before_any_scope(self) -> None:
+        """The production path must never lazily create the thread-local.
+
+        ``operation_progress``'s ``getattr``-then-assign is not atomic, so a
+        ledger that reaches its first scope without the attribute already in
+        place can lose one caller's hook to a concurrent installer.
+        """
+        with contextlib.redirect_stdout(io.StringIO()):
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                writer_id="writer-a",
+                writer_epoch=1,
+            )
+        self.assertIn("_operation_progress_local", vars(ledger))
+        self.assertIsInstance(
+            vars(ledger)["_operation_progress_local"],
+            threading.local,
+        )
+
+    def test_concurrent_first_scopes_share_one_progress_local(self) -> None:
+        """Two first-ever scopes at once must both keep their own hook.
+
+        The lazy check-then-set lets both callers build a ``local()`` and one
+        assignment win; the loser's hook then lives on an object the ledger
+        no longer references, so its admission wait silently reverts to the
+        heartbeat-silent path -- the exact failure this hook exists to
+        remove. The patched ``local`` below makes that interleaving
+        deterministic rather than a sleep race: it parks every constructing
+        thread on a two-party barrier, so neither can assign before the other
+        has decided to construct. A ledger that built the thread-local in
+        ``__init__`` never constructs one here at all, and the barrier is
+        simply never reached.
+        """
+        with contextlib.redirect_stdout(io.StringIO()):
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease()],
+                writer_id="writer-a",
+                writer_epoch=1,
+            )
+        constructing = threading.Barrier(2, timeout=10)
+        installed = threading.Barrier(2, timeout=10)
+
+        def racing_local() -> threading.local:
+            # Neither thread may leave the constructor until both have
+            # decided to build one, so the check-then-set cannot serialize
+            # itself by luck.
+            constructing.wait()
+            return threading.local()
+
+        def first_stamp() -> None:
+            return None
+
+        def second_stamp() -> None:
+            return None
+
+        observed: dict[str, object] = {}
+        errors: list[BaseException] = []
+
+        def install(name: str, hook: Any) -> None:
+            try:
+                with ledger.operation_progress(hook, slice_seconds=0.5):
+                    # Both hooks are installed before either is read, so a
+                    # lost assignment cannot hide behind thread ordering.
+                    installed.wait()
+                    observed[name] = ledger._operation_progress_hook()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with unittest.mock.patch.object(
+            share_ledger_module,
+            "local",
+            racing_local,
+        ):
+            threads = [
+                threading.Thread(target=install, args=("first", first_stamp)),
+                threading.Thread(target=install, args=("second", second_stamp)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(errors, [])
+        self.assertEqual(observed.get("first"), (first_stamp, 0.5))
+        self.assertEqual(observed.get("second"), (second_stamp, 0.5))
+
+    def test_operation_progress_nesting_keeps_the_tighter_slice(self) -> None:
+        """Nesting tightens the stamp cadence, exactly like its siblings.
+
+        ``operation_timeout`` and ``statement_timeout`` merge by minimum, so
+        a nested scope can only narrow what the enclosing caller allowed. A
+        progress scope that replaced the slice outright would let an inner
+        caller widen the heartbeat gaps an outer caller had already sized
+        against its own monitor.
+        """
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+
+        def outer() -> None:
+            return None
+
+        def inner() -> None:
+            return None
+
+        with ledger.operation_progress(outer, slice_seconds=0.25):
+            self.assertEqual(ledger._operation_progress_hook(), (outer, 0.25))
+            # A larger inner slice does not widen the cadence; the callback
+            # is still the inner caller's, because it is the one whose
+            # liveness the wait now belongs to.
+            with ledger.operation_progress(inner, slice_seconds=4.0):
+                self.assertEqual(
+                    ledger._operation_progress_hook(),
+                    (inner, 0.25),
+                )
+            self.assertEqual(ledger._operation_progress_hook(), (outer, 0.25))
+        self.assertIsNone(ledger._operation_progress_hook())
+
+    def test_operation_gate_propagates_progress_hook_failures(self) -> None:
+        """A liveness stamp that cannot be taken is a failure, not noise.
+
+        Swallowing it would leave the caller blocked inside a lock wait it
+        believes is being reported, which is the exact silence this hook
+        exists to remove.
+        """
+
+        class Stamped(RuntimeError):
+            pass
+
+        def on_progress() -> None:
+            raise Stamped("heartbeat unavailable")
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        gate = threading.Lock()
+        gate.acquire()
+        try:
+            with ledger.statement_timeout(5.0):
+                with ledger.operation_progress(on_progress, slice_seconds=0.01):
+                    with self.assertRaises(Stamped):
+                        with ledger._operation_gate(gate, "writer lock"):
+                            self.fail("contended writer lock unexpectedly acquired")
+        finally:
+            gate.release()
+
+    def test_note_operation_progress_reports_only_when_a_hook_is_installed(self) -> None:
+        """The between-statements reporter is opt-in, exactly like the wait.
+
+        Ordinary ledger callers have no liveness monitor, so an operation
+        that reports unconditionally would be paying for stamps nobody
+        reads. The hook is installed only by callers whose thread is
+        watchdog-monitored.
+        """
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        # No hook installed: reporting must be a silent no-op, not an error.
+        ledger._note_operation_progress()
+        stamps: list[int] = []
+        with ledger.operation_progress(
+            lambda: stamps.append(len(stamps)),
+            slice_seconds=0.05,
+        ):
+            ledger._note_operation_progress()
+            ledger._note_operation_progress()
+        self.assertEqual(stamps, [0, 1])
+        # The scope restored the previous (absent) hook, so this is silent.
+        ledger._note_operation_progress()
+        self.assertEqual(stamps, [0, 1])
+
+    def test_note_operation_progress_propagates_hook_failures(self) -> None:
+        """A stamp that cannot be taken is a failure, as inside the gate wait."""
+
+        class Stamped(RuntimeError):
+            pass
+
+        def on_progress() -> None:
+            raise Stamped("heartbeat unavailable")
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        with ledger.operation_progress(on_progress, slice_seconds=0.05):
+            with self.assertRaises(Stamped):
+                ledger._note_operation_progress()
+
+    def test_confirm_accepted_block_reports_between_its_two_statements(self) -> None:
+        """The publication-ordinal read must not extend one silent span.
+
+        confirm_accepted_block holds the writer lock across a mutating
+        statement and the follow-up read its command snapshot could not see.
+        No admission slice runs between them, so without a report the caller's
+        monitor is asked to sit through two statement budgets in a row -- at
+        the 120s default that is the whole watchdog tolerance with no margin
+        at all (issue #125).
+        """
+        ledger = GateStatementRecordingPsqlShareLedger(
+            [
+                {"backend": "postgres-psql", "confirmed_count": 1},
+                {"audit_publication_sequence": 7},
+            ]
+        )
+        with ledger.operation_progress(
+            ledger.note_progress,
+            slice_seconds=0.05,
+        ):
+            response = ledger.confirm_accepted_block(
+                block_hash="ab" * 32,
+                active_tip_height=10,
+            )
+        self.assertEqual(response["audit_publication_sequence"], 7)
+        self.assertEqual(
+            ledger.events,
+            ["statement-1", "progress", "statement-2"],
+        )
+
+    def test_confirmed_count_zero_stays_a_single_silent_statement(self) -> None:
+        """A one-statement gate body must not add stamps it does not owe."""
+        ledger = GateStatementRecordingPsqlShareLedger(
+            [{"backend": "postgres-psql", "confirmed_count": 0}]
+        )
+        with ledger.operation_progress(
+            ledger.note_progress,
+            slice_seconds=0.05,
+        ):
+            ledger.confirm_accepted_block(
+                block_hash="ab" * 32,
+                active_tip_height=10,
+            )
+        self.assertEqual(ledger.events, ["statement-1"])
+
+    def test_reactivate_pool_block_reports_between_its_two_statements(self) -> None:
+        """The reorg-walk twin of confirm_accepted_block's ordinal read."""
+        ledger = GateStatementRecordingPsqlShareLedger(
+            [
+                {"backend": "postgres-psql", "reactivated_count": 1},
+                {"audit_publication_sequence": 4},
+            ]
+        )
+        with ledger.operation_progress(
+            ledger.note_progress,
+            slice_seconds=0.05,
+        ):
+            response = ledger.reactivate_pool_block(
+                block_hash="cd" * 32,
+                active_tip_height=10,
+            )
+        self.assertEqual(response["audit_publication_sequence"], 4)
+        self.assertEqual(
+            ledger.events,
+            ["statement-1", "progress", "statement-2"],
+        )
+
+    def test_carry_forward_integrity_report_reports_between_its_reads(self) -> None:
+        """Two reads that must see one another cannot release the lock.
+
+        The report and its audit head are consistent only because they run
+        under one held writer lock, so the report between them is the only
+        liveness a caller's monitor can get.
+        """
+        ledger = GateStatementRecordingPsqlShareLedger(
+            [
+                {"checked_active_rows": 0, "mismatch_count": 0},
+                [],
+            ]
+        )
+        with ledger.operation_progress(
+            ledger.note_progress,
+            slice_seconds=0.05,
+        ):
+            report = ledger.carry_forward_integrity_report()
+        self.assertEqual(report["audit_row_count"], 0)
+        self.assertEqual(
+            ledger.events,
+            ["statement-1", "progress", "statement-2"],
+        )
 
     def test_statement_timeout_refreshes_for_each_database_step(self) -> None:
         ledger = PsqlShareLedger.__new__(PsqlShareLedger)
