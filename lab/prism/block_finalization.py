@@ -20,6 +20,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 import traceback
@@ -32,6 +33,7 @@ from lab.prism.block_candidates import (
     PrismBlockCandidate,
     _BlockCandidateNodeSubmission,
 )
+from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.share_ledger import WriterLeaseRenewalDeferred, sha256_json_hex
 from lab.prism.share_submission import (
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
@@ -1778,6 +1780,50 @@ class BlockFinalizationService:
     ) -> dict[str, Any]:
         audit_store = self.runtime._ensure_audit_artifact_store()
         self._record_block_candidate_progress("evidence-write")
+        # This is the live writer finalizing a block it confirmed itself in
+        # this landing. Two distinct found blocks can land inside one
+        # confirm->publish window -- the synchronous client-thread tail and
+        # the accounting actor do not serialise across hashes -- so this
+        # publication can arrive already superseded on the publication
+        # ordinal. It must then still write its own height+hash live
+        # envelope, which is the block's only published evidence pointer.
+        #
+        # Confirming with a valid lease does not prove the lease survived the
+        # confirm->publish gap: a writer deposed inside the gap would reach
+        # this call site with only stale reads behind it. Restoring a
+        # superseded envelope is a mutation of the shared audit root that the
+        # current evidence reference never re-validates, so restore authority
+        # requires a fresh bounded non-blocking proof of the exact guarded
+        # session (a no-op for ledgers without the writer lease guard). The
+        # proof gates only the restore: withholding authority degrades to the
+        # pre-restore behaviour of skipping the superseded envelope write,
+        # which is always safe, whereas failing the publication on a lease
+        # hiccup would be a live regression on the found-block path. The
+        # fence may arm a hard exit internally for a genuinely dead lease;
+        # that exit proceeds on its own and is not undone here.
+        restore_superseded_envelope = True
+        lease_fence_component = "superseded_audit_envelope_restore"
+        require_fresh_lease = getattr(
+            self.runtime,
+            "_require_fresh_ledger_lease_for_external_side_effect",
+            None,
+        )
+        if callable(require_fresh_lease):
+            try:
+                require_fresh_lease(lease_fence_component)
+            except (ShutdownInProgress, WriterLeaseRenewalDeferred) as exc:
+                restore_superseded_envelope = False
+                # Withheld authority silently reverts to the historical lossy
+                # behaviour for a superseded publication, so it must be
+                # visible. Diagnostics go to stderr because worker processes
+                # reserve stdout for a strict JSON-lines protocol.
+                print(
+                    "prism coordinator: withholding superseded-envelope "
+                    f"restore authority component={lease_fence_component} "
+                    f"error={type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         with self.runtime._payout_balance_mutation_lock:
             with audit_store.publication_order_guard():
                 publication_floor_reader = getattr(
@@ -1809,7 +1855,23 @@ class BlockFinalizationService:
                     evidence=prepared.evidence,
                     verification_identity=landed.audit_verification_identity,
                     created_at=public_api.utc_now_iso(),
+                    # Granted by the fresh-lease proof above; a deposed writer
+                    # replaying stale state never receives restore authority.
+                    restore_superseded_envelope=restore_superseded_envelope,
                 )
+        if publication.superseded_envelope_written:
+            # Emitted only after the balance lock and the publication order
+            # guard have been released: an undrained stderr must never block
+            # the found-block path while a store lock is held.
+            print(
+                "prism coordinator: wrote live envelope for superseded "
+                f"publication sequence={publication.identity.sequence} "
+                f"floor_sequence={publication_floor_sequence} "
+                f"height={publication.identity.block_height} "
+                f"hash={publication.identity.block_hash}",
+                file=sys.stderr,
+                flush=True,
+            )
         published_evidence = dict(publication.evidence)
         self._record_block_candidate_progress("evidence-write:complete")
         return published_evidence

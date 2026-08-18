@@ -1106,6 +1106,247 @@ with store.publication_order_guard():
             self.assertEqual(store.evidence_path.read_bytes(), durable_before)
             self.assertTrue(durable_identity.matches(store.evidence_path.stat()))
 
+    def test_interleaved_distinct_landings_preserve_the_superseded_envelope(
+        self,
+    ) -> None:
+        """Two distinct blocks land inside one confirm->publish window.
+
+        The synchronous client-thread tail confirms block A under the payout
+        balance lock and the publication order guard, then releases both before
+        it publishes. The accounting-actor tail lands block B inside that gap
+        and publishes first, so A reaches publication already superseded. A
+        must not become the current evidence reference, but its own height+hash
+        live envelope is its block's only published evidence and must be
+        written.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root, live_bundle_retention=4)
+            ledger = SingleWriterShareLedger()
+            balance_lock = threading.RLock()
+
+            def persist(block_hash: str, height: int) -> None:
+                ledger.persist_accepted_block(
+                    block_hash=block_hash,
+                    block_height=height,
+                    parent_hash="00" * 32,
+                    final_bundle={},
+                    audit_report={},
+                )
+
+            persist(BLOCK_A, 1)
+            confirmed_a = ledger.confirm_accepted_block(
+                block_hash=BLOCK_A,
+                active_tip_height=1,
+            )
+            sequence_a = int(confirmed_a["audit_publication_sequence"])
+            identity_a = AuditPublicationIdentity(sequence_a, 1, BLOCK_A)
+            envelope_a = store.live_envelope_path(block_height=1, block_hash=BLOCK_A)
+
+            confirm_gap_open = threading.Event()
+            resume_publish_a = threading.Event()
+            errors: list[BaseException] = []
+            publications: dict[str, object] = {}
+
+            def synchronous_tail_publishes_a() -> None:
+                try:
+                    # The confirm scope releases the balance lock and the
+                    # publication guard before the publish scope is entered.
+                    # Holding either across the gap would make the interleaving
+                    # unreachable and the regression invisible.
+                    with balance_lock:
+                        with store.publication_order_guard():
+                            if ledger.audit_publication_sequence_floor() != sequence_a:
+                                raise AssertionError("confirm floor is unexpected")
+                    confirm_gap_open.set()
+                    if not resume_publish_a.wait(5):
+                        raise AssertionError("publish release timed out")
+                    with balance_lock:
+                        with store.publication_order_guard():
+                            publications["a"] = store.publish_success(
+                                identity=identity_a,
+                                publication_floor_sequence=(
+                                    ledger.audit_publication_sequence_floor()
+                                ),
+                                report=self.report(block_height=1),
+                                persistence=self.persistence(),
+                                evidence={"confirmation": confirmed_a},
+                                created_at="a",
+                                # The live writer finalizing its own landing,
+                                # exactly as the block finalization path does.
+                                restore_superseded_envelope=True,
+                            )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            def actor_tail_lands_b() -> None:
+                try:
+                    with balance_lock:
+                        with store.publication_order_guard():
+                            persist(BLOCK_B, 2)
+                            confirmed_b = ledger.confirm_accepted_block(
+                                block_hash=BLOCK_B,
+                                active_tip_height=2,
+                            )
+                            identity_b = AuditPublicationIdentity(
+                                int(confirmed_b["audit_publication_sequence"]),
+                                2,
+                                BLOCK_B,
+                            )
+                            publications["b_identity"] = identity_b
+                            publications["b"] = store.publish_success(
+                                identity=identity_b,
+                                publication_floor_sequence=(
+                                    ledger.audit_publication_sequence_floor()
+                                ),
+                                report=self.report(block_height=2),
+                                persistence=self.persistence(),
+                                evidence={"confirmation": confirmed_b},
+                                created_at="b",
+                            )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            synchronous = threading.Thread(target=synchronous_tail_publishes_a)
+            synchronous.start()
+            actor: threading.Thread | None = None
+            envelope_b_before = b""
+            try:
+                self.assertTrue(confirm_gap_open.wait(5))
+                actor = threading.Thread(target=actor_tail_lands_b)
+                actor.start()
+                actor.join(timeout=5)
+                self.assertFalse(actor.is_alive())
+                self.assertFalse(errors)
+                b = publications["b"]
+                self.assertTrue(b.published)
+                self.assertEqual(
+                    publications["b_identity"].sequence,
+                    sequence_a + 1,
+                )
+                self.assertEqual(ledger.audit_publication_sequence_floor(), sequence_a + 1)
+                envelope_b_before = b.envelope_path.read_bytes()
+                self.assertFalse(envelope_a.exists())
+            finally:
+                resume_publish_a.set()
+                synchronous.join(timeout=5)
+                if actor is not None:
+                    actor.join(timeout=5)
+            self.assertFalse(synchronous.is_alive())
+            self.assertFalse(errors)
+
+            a = publications["a"]
+            self.assertEqual(a.identity.sequence, sequence_a)
+            self.assertFalse(a.published)
+            self.assertTrue(a.envelope_path.exists())
+            self.assertEqual(a.envelope_path, envelope_a)
+            landed_a = json.loads(envelope_a.read_text(encoding="utf-8"))
+            self.assertEqual(landed_a["block_hash"], BLOCK_A)
+            self.assertEqual(landed_a["block_height"], 1)
+
+            latest = store.latest_evidence()
+            assert latest is not None
+            self.assertEqual(latest["block_hash"], BLOCK_B)
+            b = publications["b"]
+            self.assertTrue(b.envelope_path.exists())
+            self.assertEqual(b.envelope_path.read_bytes(), envelope_b_before)
+
+    def test_superseded_landing_converges_after_the_peer_publishes(self) -> None:
+        """The second interleaving shape: B is confirmed but not yet published.
+
+        A publishes at its own ordinal against a floor the peer already
+        advanced, which is retained as retryable. Once B publishes, A's retry
+        lands its live envelope without disturbing the durable evidence
+        pointer.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root, live_bundle_retention=4)
+            ledger = SingleWriterShareLedger()
+
+            def persist(block_hash: str, height: int) -> None:
+                ledger.persist_accepted_block(
+                    block_hash=block_hash,
+                    block_height=height,
+                    parent_hash="00" * 32,
+                    final_bundle={},
+                    audit_report={},
+                )
+
+            persist(BLOCK_A, 1)
+            confirmed_a = ledger.confirm_accepted_block(
+                block_hash=BLOCK_A,
+                active_tip_height=1,
+            )
+            identity_a = AuditPublicationIdentity(
+                int(confirmed_a["audit_publication_sequence"]),
+                1,
+                BLOCK_A,
+            )
+            persist(BLOCK_B, 2)
+            confirmed_b = ledger.confirm_accepted_block(
+                block_hash=BLOCK_B,
+                active_tip_height=2,
+            )
+            identity_b = AuditPublicationIdentity(
+                int(confirmed_b["audit_publication_sequence"]),
+                2,
+                BLOCK_B,
+            )
+            self.assertEqual(identity_b.sequence, identity_a.sequence + 1)
+            floor = ledger.audit_publication_sequence_floor()
+            self.assertEqual(floor, identity_b.sequence)
+            envelope_a = store.live_envelope_path(block_height=1, block_hash=BLOCK_A)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "behind the durable ledger floor",
+            ):
+                store.publish_success(
+                    identity=identity_a,
+                    publication_floor_sequence=floor,
+                    report=self.report(block_height=1),
+                    persistence=self.persistence(),
+                    evidence={"confirmation": confirmed_a},
+                    created_at="a-early",
+                )
+            self.assertFalse(envelope_a.exists())
+            self.assertIsNone(store.latest_evidence())
+
+            published_b = store.publish_success(
+                identity=identity_b,
+                publication_floor_sequence=floor,
+                report=self.report(block_height=2),
+                persistence=self.persistence(),
+                evidence={"confirmation": confirmed_b},
+                created_at="b",
+            )
+            self.assertTrue(published_b.published)
+            durable_before = store.evidence_path.read_bytes()
+            durable_identity = _FileIdentity.from_stat(store.evidence_path.stat())
+
+            retried_a = store.publish_success(
+                identity=identity_a,
+                publication_floor_sequence=(
+                    ledger.audit_publication_sequence_floor()
+                ),
+                report=self.report(block_height=1),
+                persistence=self.persistence(),
+                evidence={"confirmation": confirmed_a},
+                created_at="a-retry",
+                restore_superseded_envelope=True,
+            )
+            self.assertFalse(retried_a.published)
+            self.assertTrue(envelope_a.exists())
+            landed_a = json.loads(envelope_a.read_text(encoding="utf-8"))
+            self.assertEqual(landed_a["block_hash"], BLOCK_A)
+            self.assertEqual(landed_a["block_height"], 1)
+            latest = store.latest_evidence()
+            assert latest is not None
+            self.assertEqual(latest["block_hash"], BLOCK_B)
+            self.assertEqual(store.evidence_path.read_bytes(), durable_before)
+            self.assertTrue(durable_identity.matches(store.evidence_path.stat()))
+
     def test_reconfigure_busy_and_post_swap_failure_are_atomic_and_fd_clean(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

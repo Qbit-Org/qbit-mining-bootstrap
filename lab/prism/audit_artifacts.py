@@ -227,6 +227,10 @@ class AuditPublication:
     envelope_path: Path
     evidence: Mapping[str, Any]
     published: bool
+    # True when this superseded publication restored its own missing live
+    # envelope. Recorded instead of logging inside the store's locked region;
+    # the caller emits the diagnostic after every lock scope has exited.
+    superseded_envelope_written: bool = False
 
 
 @dataclass(frozen=True)
@@ -1912,6 +1916,7 @@ class AuditArtifactStore:
         evidence: Mapping[str, Any],
         verification_identity: Mapping[str, Any],
         created_at: str,
+        restore_superseded_envelope: bool = False,
     ) -> AuditPublication:
         self._require_publication_order_guard()
         block_hash = _canonical_hex(identity.block_hash, name="block_hash")
@@ -1970,11 +1975,34 @@ class AuditArtifactStore:
                 if identity.sequence == current.sequence and not exact:
                     raise RuntimeError("audit publication identity conflict")
                 if identity.sequence < current.sequence:
-                    return AuditPublication(
+                    # A superseded ordinal never becomes the current evidence
+                    # reference, but the live envelope is this block's only
+                    # published evidence pointer and lives on its own
+                    # height+hash path. Two distinct blocks landing inside one
+                    # confirm->publish window arrive here in ordinal order, so
+                    # skipping the write erased the earlier block's public
+                    # audit trail permanently and silently.
+                    #
+                    # Only the caller knows whether it is the live writer for
+                    # this landing. A process whose writer lease was taken over
+                    # must stay fenced out of the shared audit root entirely:
+                    # its in-memory report may be stale, and publishing a stale
+                    # report as a block's public evidence is worse than leaving
+                    # the envelope missing. Such callers never opt in.
+                    if not restore_superseded_envelope:
+                        return AuditPublication(
+                            identity=identity,
+                            envelope_path=envelope_path,
+                            evidence=copy.deepcopy(dict(evidence)),
+                            published=False,
+                        )
+                    return self._write_superseded_live_envelope_locked(
                         identity=identity,
                         envelope_path=envelope_path,
-                        evidence=copy.deepcopy(dict(evidence)),
-                        published=False,
+                        report=report,
+                        persistence=persistence,
+                        evidence=evidence,
+                        created_at=created_at,
                     )
                 if exact and self._latest_evidence is not None:
                     expected_envelope = self._build_live_envelope(
@@ -2030,28 +2058,10 @@ class AuditArtifactStore:
                     except FileNotFoundError:
                         envelope_present = False
                     else:
-                        try:
-                            disk_envelope = json.loads(disk_envelope_bytes)
-                        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                            raise RuntimeError(
-                                "existing live audit envelope is invalid"
-                            ) from exc
-                        if not isinstance(disk_envelope, dict):
-                            raise RuntimeError(
-                                "existing live audit envelope is invalid"
-                            )
-                        if {
-                            key: value
-                            for key, value in disk_envelope.items()
-                            if key != "created_at"
-                        } != {
-                            key: value
-                            for key, value in expected_envelope.items()
-                            if key != "created_at"
-                        }:
-                            raise RuntimeError(
-                                "existing live audit envelope conflicts"
-                            )
+                        self._match_existing_live_envelope(
+                            disk_envelope_bytes,
+                            expected_envelope,
+                        )
                     try:
                         disk_evidence_bytes, _value = (
                             self._read_owned_regular_bytes(self._evidence_path)
@@ -2119,24 +2129,7 @@ class AuditArtifactStore:
                 old_envelope = None
             reuse_envelope = False
             if old_envelope is not None:
-                try:
-                    existing_envelope = json.loads(old_envelope)
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise RuntimeError(
-                        "existing live audit envelope is invalid"
-                    ) from exc
-                if not isinstance(existing_envelope, dict):
-                    raise RuntimeError("existing live audit envelope is invalid")
-                immutable_existing = {
-                    key: value
-                    for key, value in existing_envelope.items()
-                    if key != "created_at"
-                }
-                immutable_new = {
-                    key: value for key, value in envelope.items() if key != "created_at"
-                }
-                if immutable_existing != immutable_new:
-                    raise RuntimeError("existing live audit envelope conflicts")
+                self._match_existing_live_envelope(old_envelope, envelope)
                 reuse_envelope = True
             durable_evidence = self._normalized_durable_evidence(
                 identity=identity,
@@ -2249,6 +2242,111 @@ class AuditArtifactStore:
             evidence=copy.deepcopy(durable_evidence),
             published=True,
         )
+
+    def _write_superseded_live_envelope_locked(
+        self,
+        *,
+        identity: AuditPublicationIdentity,
+        envelope_path: Path,
+        report: Mapping[str, Any],
+        persistence: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        created_at: str,
+    ) -> AuditPublication:
+        """Persist the live envelope for a ledger-proven superseded ordinal.
+
+        ``publish_success`` has already fenced ``identity.sequence`` at or below
+        the durable publication floor, so this ordinal was durably allocated by
+        the ledger and is unique to this block. The envelope path is keyed by
+        height and hash, so writing it cannot disturb the current evidence
+        reference, which must keep naming the highest published sequence.
+        """
+        self._require_publication_order_guard()
+        envelope = self._build_live_envelope(
+            identity=identity,
+            report=report,
+            persistence=persistence,
+            created_at=created_at,
+        )
+        try:
+            existing_envelope_bytes, _existing_stat = (
+                self._read_owned_regular_bytes(envelope_path)
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            # A same-hash stale replay always finds its own envelope already
+            # present. This path only restores missing evidence -- but
+            # accepting arbitrary present bytes would silently retain a
+            # truncated or corrupt envelope forever, so present bytes are held
+            # to the main publish path's immutable-content standard, and a
+            # match is made durable exactly like a reused envelope there.
+            self._match_existing_live_envelope(existing_envelope_bytes, envelope)
+            self._fsync_directory(envelope_path.parent)
+            return AuditPublication(
+                identity=identity,
+                envelope_path=envelope_path,
+                evidence=copy.deepcopy(dict(evidence)),
+                published=False,
+            )
+        written_identity = self._write_mutable_json(
+            envelope_path,
+            envelope,
+            sort_keys=True,
+        )
+        try:
+            self._validate_root_identity()
+            self._validate_evidence_parent_identity()
+            self._require_publication_order_guard()
+        except BaseException:
+            try:
+                self._remove_identity_safe(
+                    envelope_path,
+                    written_identity,
+                    allow_detached_authority=True,
+                )
+            except BaseException:
+                pass
+            try:
+                self._fsync_pinned_directory(envelope_path.parent)
+            except BaseException:
+                pass
+            raise
+        return AuditPublication(
+            identity=identity,
+            envelope_path=envelope_path,
+            evidence=copy.deepcopy(dict(evidence)),
+            published=False,
+            superseded_envelope_written=True,
+        )
+
+    def _match_existing_live_envelope(
+        self,
+        existing_bytes: bytes,
+        envelope: Mapping[str, Any],
+    ) -> None:
+        """Hold present envelope bytes to the immutable-content standard.
+
+        ``created_at`` is the only field a lawful republication may vary; any
+        other divergence, and unparseable or non-object bytes, are conflicts
+        because a live envelope is immutable once published.
+        """
+        try:
+            existing_envelope = json.loads(existing_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("existing live audit envelope is invalid") from exc
+        if not isinstance(existing_envelope, dict):
+            raise RuntimeError("existing live audit envelope is invalid")
+        immutable_existing = {
+            key: value
+            for key, value in existing_envelope.items()
+            if key != "created_at"
+        }
+        immutable_new = {
+            key: value for key, value in envelope.items() if key != "created_at"
+        }
+        if immutable_existing != immutable_new:
+            raise RuntimeError("existing live audit envelope conflicts")
 
     def _build_live_envelope(
         self,
