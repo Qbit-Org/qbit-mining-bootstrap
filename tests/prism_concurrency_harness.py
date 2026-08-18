@@ -780,15 +780,27 @@ class FakePostgres:
 
         self.scheduler.checkpoint(f"{tag}.begin:{statement.kind.value}")
 
+        # A caller deadline arrives as SET LOCAL lock_timeout; the guard
+        # session's bound is a connection-level statement_timeout. PostgreSQL
+        # reports them with different messages and SQLSTATEs, and the whole
+        # point of the SKIP LOCKED heartbeat was that the guard's bound is the
+        # fatal one, so the model must not blur them.
         effective_timeout = timeout_seconds
-        if backend.statement_timeout_seconds is not None:
-            effective_timeout = (
-                backend.statement_timeout_seconds
-                if effective_timeout is None
-                else min(effective_timeout, backend.statement_timeout_seconds)
-            )
+        timeout_kind = "lock"
+        session_bound = backend.statement_timeout_seconds
+        if session_bound is not None and (
+            effective_timeout is None or session_bound <= effective_timeout
+        ):
+            effective_timeout = session_bound
+            timeout_kind = "statement"
         try:
-            result = self._evaluate(statement, transaction, effective_timeout, tag)
+            result = self._evaluate(
+                statement,
+                transaction,
+                effective_timeout,
+                tag,
+                timeout_kind,
+            )
         except BaseException:
             if autocommit:
                 self._rollback(transaction)
@@ -805,13 +817,20 @@ class FakePostgres:
         transaction: Transaction,
         timeout_seconds: float | None,
         tag: str,
+        timeout_kind: str = "lock",
     ) -> Any:
         if statement.kind is LeaseOp.VERIFY:
             return self._evaluate_verify(statement, transaction, tag)
         # Every other lease statement writes the singleton row, so it needs
         # the exclusive tuple lock and queues for it. That queue is the whole
         # of #123: nothing bounds it unless the caller armed a deadline.
-        self._await_lease_lock(statement, transaction, timeout_seconds, tag)
+        self._await_lease_lock(
+            statement,
+            transaction,
+            timeout_seconds,
+            tag,
+            timeout_kind,
+        )
         if statement.kind is LeaseOp.ACQUIRE:
             return self._evaluate_acquire(statement, transaction)
         if statement.kind is LeaseOp.ADOPT:
@@ -828,6 +847,7 @@ class FakePostgres:
         transaction: Transaction,
         timeout_seconds: float | None,
         tag: str,
+        timeout_kind: str = "lock",
     ) -> None:
         # Waiting is not conditional on a *committed* row existing. Two
         # concurrent INSERTs conflict on the singleton unique index, and the
@@ -841,7 +861,7 @@ class FakePostgres:
         while self.lease_lock_held_by_other(transaction):
             if deadline is not None and self.clock.monotonic() >= deadline:
                 raise LockTimeout(
-                    "canceling statement due to lock timeout\n"
+                    f"canceling statement due to {timeout_kind} timeout\n"
                     "CONTEXT:  while updating tuple (0,1) in relation "
                     '"qbit_ledger_writer_lease"'
                 )
@@ -1414,9 +1434,20 @@ class Coordinator:
     def vanish(self) -> None:
         """Abandon this coordinator where it stands, without releasing anything.
 
-        A partition, SIGSTOP or VM pause: the process stops responding, the
-        server never sees a COMMIT or an RST, and every lock the session holds
-        stays held.
+        A partition, SIGSTOP or VM pause: the process stops responding and no
+        RST reaches the server.
+
+        What survives server-side depends on the transaction shape, and the
+        distinction is the whole of #123 rather than a detail. A
+        deadline-scoped statement runs inside an explicit transaction whose
+        COMMIT is a separate client message, so the server is left holding an
+        open transaction and its locks indefinitely. A plain autocommit
+        statement has no such message: PostgreSQL finishes executing it and
+        commits it on its own, and the vanished client merely never reads the
+        answer. Modelling both as orphans would let a scenario construct the
+        outage shape on a code path that provably cannot produce it — #123 is
+        explicit that the shape did not exist before the deadline plumbing
+        arrived.
         """
         actor = self.actor
         if not actor.blocked and actor.stop is None:
@@ -1424,8 +1455,13 @@ class Coordinator:
         for backend in [
             *(self.sql_backend._in_use if self.sql_backend else []),
         ]:
-            if backend.transaction is not None:
-                self.harness.server.orphan(backend.transaction)
+            transaction = backend.transaction
+            if transaction is None:
+                continue
+            if transaction.explicit:
+                self.harness.server.orphan(transaction)
+            else:
+                self.harness.server._commit(transaction)
         actor.parked_forever = True
         actor._blocked = True
         actor._ready = lambda: False

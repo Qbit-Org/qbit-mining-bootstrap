@@ -340,6 +340,51 @@ class PostgresModelTests(unittest.TestCase):
             assert row is not None
             self.assertIsNone(row.xmax)
 
+    def test_vanishing_during_an_autocommit_statement_leaves_no_orphan(self) -> None:
+        """The model must not offer #123's shape on a path that cannot produce it.
+
+        A client that vanishes mid-statement leaves an orphan only when the
+        COMMIT is a separate message it never sends. Autocommit has no such
+        message: PostgreSQL finishes the statement and commits it. #123 says
+        the orphan shape did not exist before the deadline plumbing arrived,
+        and a harness that let a scenario build it anyway would argue for a
+        fix to a defect that path cannot reach.
+        """
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "alpha.done:acquire")
+
+            alpha.vanish()
+
+            self.assertIsNone(
+                harness.server.lease_lock_holder,
+                "the server finished and committed the autocommit statement",
+            )
+            row = harness.lease_row()
+            assert row is not None
+            self.assertEqual(row.writer_session_token, "heartbeat-v1:alpha-1")
+
+    def test_vanishing_inside_a_deadline_scoped_statement_does_orphan(self) -> None:
+        """The contrast: a separate COMMIT the client never sends."""
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+
+            def deadline_scoped_write() -> object:
+                with alpha.ledger.operation_timeout(30.0):
+                    return alpha.ledger.renew_writer_lease()
+
+            alpha.submit(deadline_scoped_write, label="write")
+            harness.run_until(alpha, "alpha.precommit")
+            alpha.vanish()
+
+            orphan = harness.server.lease_lock_holder
+            self.assertIsNotNone(orphan)
+            assert orphan is not None
+            self.assertTrue(orphan.orphaned)
+
     def test_autocommit_statements_never_leave_a_transaction_open(self) -> None:
         """The shape #123 says did not exist before deadline plumbing."""
         with LeaseHarness() as harness:
