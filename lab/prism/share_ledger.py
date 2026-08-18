@@ -46,12 +46,14 @@ DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
 DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE = 512
 # Startup writer-lease acquisition runs each statement under this per-attempt
 # lock/statement deadline and gives up after this many timed-out attempts (see
-# _run_lease_acquisition_json). 5 attempts x 5s per attempt (~25s) deliberately
-# exceeds the 15s idle_in_transaction_session_timeout below: when the lease row
-# lock is an orphaned idle-in-transaction backend, the server reaps it mid-way
-# through the retry budget and a successor acquires the lease on a later
-# attempt without operator intervention. Only a lock that is *still* held after
-# the full budget — a genuinely stuck transaction — reaches the fatal error.
+# _run_lease_acquisition_json). 5 attempts x 5s per attempt (~25s) is sized to
+# outlast a typical orphan reap rather than to guarantee one: the 15s
+# idle_in_transaction_session_timeout below runs on the blocking backend's own
+# clock, started when its transaction went idle and not when the successor
+# began retrying, so the two are not directly comparable. In the common case
+# the reap lands inside the budget and a later attempt acquires the lease with
+# no operator action; a budget that runs out reaches the fatal error, which is
+# still the point — a bounded visible failure instead of an unbounded wait.
 DEFAULT_LEASE_ACQUIRE_ATTEMPTS = 5
 DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS = 5.0
 # Session guards every coordinator Postgres session carries (see
@@ -60,8 +62,10 @@ DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS = 5.0
 # that otherwise leaves the qbit_ledger_writer_lease row lock held until TCP
 # keepalive teardown (hours at OS defaults). The server-side tcp_keepalives_*
 # GUCs are the backstop for backends idle *outside* a transaction, where the
-# idle-in-transaction timer does not apply: with the defaults the server tears
-# down its socket toward a vanished client within 30 + 3x10 = 60 seconds.
+# idle-in-transaction timer does not apply: on a TCP connection whose platform
+# implements them, the defaults bound the server's teardown of a socket toward
+# a vanished client at 30 + 3x10 = 60 seconds. Unix-socket connections ignore
+# them, leaving the idle-in-transaction timeout as the guard there.
 DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS = 15.0
 DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT = 3
 DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS = 30
@@ -1897,8 +1901,14 @@ class PostgresSessionGuards:
 
     Constructed once in PsqlShareLedger.__init__ and shared by all three
     connection paths — the pooled native client, the dedicated lease-guard
-    session, and the psql subprocess backend — so no session the coordinator
-    opens can become an unreapable lock holder.
+    session, and the psql subprocess backend. The coverage is real but
+    bounded: the tcp_keepalives_* settings are silently ignored on
+    Unix-socket connections and on platforms that do not implement them, so
+    idle_in_transaction_session_timeout is the guard that always applies;
+    and these are session settings, so they reach only the sessions *this*
+    coordinator opens. A foreign session already holding the lease row —
+    another deployment's coordinator, an operator's psql — is bounded only
+    by the caller-side acquisition deadline in _run_lease_acquisition_json.
     """
 
     idle_in_transaction_timeout_seconds: float
@@ -2150,9 +2160,9 @@ class _NativePostgresLeaseGuard:
         # The short statement_timeout stays: the guard session must never
         # queue behind a fenced write (see verify_writer_lease_guard_session).
         # The session guards ride the same options string so this dedicated
-        # connection, like every pooled one, cannot strand an orphaned
-        # transaction or a dead socket on the server. Merged with any
-        # operator DSN-level options, coordinator fragments last so they win.
+        # connection carries the same orphan bounds as every pooled one.
+        # Merged with any operator DSN-level options, coordinator fragments
+        # last so they win.
         options = "-c statement_timeout=500"
         if session_guards is not None:
             options = _merged_session_options(
@@ -2427,9 +2437,10 @@ class PsqlShareLedger:
         self._lease_acquire_attempts = lease_acquire_attempts
         # One immutable guard set shared by all three connection paths (the
         # pooled native client, the dedicated lease-guard session, and the
-        # psql subprocess backend), so no session this coordinator opens can
-        # keep holding the lease row after its client has vanished. See
-        # PostgresSessionGuards.
+        # psql subprocess backend), so a session this coordinator opens is
+        # disowned by the server instead of holding the lease row on after
+        # its client vanishes. See PostgresSessionGuards for what the guards
+        # do and do not reach.
         self._session_guards = PostgresSessionGuards(
             idle_in_transaction_timeout_seconds=postgres_idle_in_transaction_timeout_seconds,
             tcp_keepalives_idle_seconds=postgres_tcp_keepalives_idle_seconds,
@@ -6984,38 +6995,52 @@ END;
         SET LOCAL statement_timeout and lock_timeout on the native backend,
         and the PGOPTIONS equivalents plus a subprocess timeout on psql).
 
-        The retry budget deliberately outlasts the session guards' 15s
-        idle_in_transaction_session_timeout (5 attempts x 5s by default):
-        when the blocker is an orphan, the server reaps it partway through
-        the budget and a later attempt acquires the lease without operator
-        intervention. Only a lock still held after every attempt — a
-        genuinely stuck transaction — becomes the fatal RuntimeError, which
-        __init__'s close-and-reraise turns into a visible process exit the
-        supervisor can restart, instead of a silent multi-hour hang.
+        The retry budget (5 attempts x 5s by default) is sized to outlast a
+        typical orphan reap rather than to guarantee one: the session guards'
+        idle_in_transaction_session_timeout runs from the moment the blocking
+        transaction went idle, not from the moment this process started
+        retrying, so an orphan frequently clears partway through the budget
+        and a later attempt lands the lease with no operator action. A
+        statement still hitting its deadline on every attempt becomes the
+        fatal RuntimeError, which __init__'s close-and-reraise turns into a
+        visible process exit the supervisor can restart, instead of a silent
+        multi-hour hang.
+
+        A deadline expiry names the lock conflict first because it is by far
+        the most common cause, but it is not proof of one: a connect timeout,
+        an exhausted pool slot, and a healthy-but-overloaded server all
+        surface as the same LedgerOperationTimeout. Both the per-attempt line
+        and the fatal error therefore quote the underlying exception and the
+        fatal error chains it, so the operator diagnoses from the cause rather
+        than from this layer's guess.
         """
         attempts = self._lease_acquire_attempts
         lock_timeout_seconds = self._lease_acquire_lock_timeout_seconds
+        cause: LedgerOperationTimeout | None = None
         for attempt in range(1, attempts + 1):
             try:
                 with self.statement_timeout(lock_timeout_seconds):
                     return self._run_json(sql)
-            except LedgerOperationTimeout:
+            except LedgerOperationTimeout as exc:
+                cause = exc
                 print(
-                    f"prism ledger {description}: qbit_ledger_writer_lease "
-                    "row is lock-blocked by another transaction; attempt "
-                    f"{attempt}/{attempts} timed out after "
-                    f"{lock_timeout_seconds:g}s",
+                    f"prism ledger {description}: attempt {attempt}/{attempts} "
+                    f"did not complete within its {lock_timeout_seconds:g}s "
+                    "deadline (commonly the qbit_ledger_writer_lease row is "
+                    "lock-blocked by another transaction, but an unreachable "
+                    f"or overloaded server produces the same signal): {exc}",
                     flush=True,
                 )
                 if attempt < attempts:
                     self._lease_retry_sleep(self._lease_retry_min_sleep_seconds)
         raise RuntimeError(
-            "qbit ledger writer lease row is locked by an unfinished "
-            f"transaction: {description} timed out on all {attempts} "
-            f"attempts ({lock_timeout_seconds:g}s lock deadline each); "
-            "the coordinator is exiting rather than blocking startup "
-            "indefinitely"
-        )
+            f"qbit ledger {description} did not complete within its "
+            f"{lock_timeout_seconds:g}s deadline on any of {attempts} attempts "
+            "(commonly the qbit_ledger_writer_lease row is lock-blocked by "
+            "another transaction, but an unreachable or overloaded server "
+            f"produces the same signal): {cause}; the coordinator is exiting "
+            "rather than blocking startup indefinitely"
+        ) from cause
 
     def _try_acquire_writer_lease(self) -> dict[str, Any]:
         payload = {

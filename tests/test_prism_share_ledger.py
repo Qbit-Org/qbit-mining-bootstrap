@@ -5515,10 +5515,7 @@ class BoundedLeaseAcquisitionTests(unittest.TestCase):
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "writer lease row is locked by an unfinished transaction",
-            ):
+            with self.assertRaises(RuntimeError) as caught:
                 LockedLeaseLedger(
                     psql_command="psql postgresql://example.invalid/qbit",
                     native_client_mode="0",
@@ -5530,8 +5527,20 @@ class BoundedLeaseAcquisitionTests(unittest.TestCase):
         # never LedgerOperationTimeout leaking out, never an unbounded wait.
         self.assertEqual(len(attempts), 5)
         self.assertEqual(len(sleeps), 4)
-        self.assertIn("lock-blocked", stdout.getvalue())
         self.assertIn("attempt 5/5", stdout.getvalue())
+        # The diagnostic names the lock conflict as the likely cause without
+        # asserting it — an unreachable or overloaded server expires the same
+        # deadline — and quotes the underlying error on every line.
+        message = str(caught.exception)
+        self.assertIn("did not complete within its 5s deadline", message)
+        self.assertIn("commonly", message)
+        self.assertIn("lock-blocked", message)
+        self.assertIn("canceling statement due to lock timeout", message)
+        self.assertIn("lock-blocked", stdout.getvalue())
+        self.assertIn("canceling statement due to lock timeout", stdout.getvalue())
+        # The originating timeout is chained, not discarded: it is the only
+        # record of which of the several causes actually fired.
+        self.assertIsInstance(caught.exception.__cause__, LedgerOperationTimeout)
 
     def test_acquisition_recovers_once_the_orphaned_lock_is_reaped(self) -> None:
         outcomes: list[Any] = [
@@ -5561,6 +5570,188 @@ class BoundedLeaseAcquisitionTests(unittest.TestCase):
         self.assertEqual(outcomes, [])
         self.assertIn("attempt 2/5", stdout.getvalue())
         ledger.close()
+
+    @staticmethod
+    def _adoptable_predecessor_lease_results(
+        *,
+        old_session: str,
+        new_session: str,
+        updated_at: str,
+    ) -> list[dict[str, object]]:
+        """Two observations of a silent predecessor, then a won CAS.
+
+        Mirrors test_postgres_startup_adopts_after_one_guard_acquisition_silence:
+        the row is already silent for a full interval, so the second
+        observation lands once the guard-acquisition edge has elapsed too and
+        _ensure_writer_lease proceeds to the adoption CAS.
+        """
+        return [
+            held_lease(
+                session=old_session,
+                updated_at=updated_at,
+                age_seconds=DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
+            ),
+            held_lease(
+                session=old_session,
+                updated_at=updated_at,
+                age_seconds=DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS * 2,
+            ),
+            acquired_lease(session=new_session) | {"adopted": True},
+        ]
+
+    def test_adoption_cas_runs_under_bounded_deadline(self) -> None:
+        """The adoption CAS row-locks the lease too, so it must be bounded.
+
+        Reached through the real _ensure_writer_lease adoption path rather
+        than by calling the CAS helper directly: an unbounded
+        _try_adopt_writer_lease reintroduces the issue #123 startup hang on
+        exactly this branch, where the predecessor left the row locked.
+        """
+        updated_at = "2026-06-26 19:49:22.233718+00"
+        old_session = f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}old-session"
+        new_session = f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}new-session"
+        clock = FakeMonotonicClock()
+
+        with contextlib.redirect_stdout(io.StringIO()), unittest.mock.patch.object(
+            share_ledger_module.time,
+            "monotonic",
+            clock.monotonic,
+        ):
+            ledger = self.DeadlineRecordingLeaseLedger(
+                self._adoptable_predecessor_lease_results(
+                    old_session=old_session,
+                    new_session=new_session,
+                    updated_at=updated_at,
+                ),
+                writer_id="writer-a",
+                writer_epoch=1,
+                writer_session_token=new_session,
+                lease_acquire_lock_timeout_seconds=2.5,
+                lease_retry_sleep=clock.sleep,
+            )
+
+        self.assertEqual(len(ledger.lease_queries), 3)
+        # The third query is the CAS, not another observation.
+        self.assertIn("observed_writer_session_token", ledger.lease_queries[2])
+        adoption_deadline = ledger.recorded_deadlines[2]
+        # None here is the issue #123 defect on the adoption branch: the CAS
+        # queueing on the lease row lock with no deadline at all.
+        self.assertIsNotNone(adoption_deadline)
+        self.assertGreater(adoption_deadline, 0.0)
+        self.assertLessEqual(adoption_deadline, 2.5)
+
+    def test_lock_blocked_adoption_fails_visibly_after_bounded_retries(self) -> None:
+        updated_at = "2026-06-26 19:49:22.233718+00"
+        old_session = f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}old-session"
+        new_session = f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}new-session"
+        clock = FakeMonotonicClock()
+        adoption_deadlines: list[float | None] = []
+
+        class BlockedAdoptionLeaseLedger(FakeLeasePsqlShareLedger):
+            def _run_json(self, sql: str) -> Any:
+                if "observed_writer_session_token" not in sql:
+                    return super()._run_json(sql)
+                adoption_deadlines.append(self._remaining_operation_timeout())
+                raise LedgerOperationTimeout(
+                    "canceling statement due to lock timeout"
+                )
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), unittest.mock.patch.object(
+            share_ledger_module.time,
+            "monotonic",
+            clock.monotonic,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                BlockedAdoptionLeaseLedger(
+                    self._adoptable_predecessor_lease_results(
+                        old_session=old_session,
+                        new_session=new_session,
+                        updated_at=updated_at,
+                    ),
+                    writer_id="writer-a",
+                    writer_epoch=1,
+                    writer_session_token=new_session,
+                    lease_retry_sleep=clock.sleep,
+                )
+
+        # Every CAS attempt ran under the bound, and the budget stopped at
+        # DEFAULT_LEASE_ACQUIRE_ATTEMPTS instead of retrying forever.
+        self.assertEqual(len(adoption_deadlines), 5)
+        for deadline in adoption_deadlines:
+            self.assertIsNotNone(deadline)
+            self.assertLessEqual(deadline, 5.0)
+        message = str(caught.exception)
+        self.assertIn("writer lease adoption", message)
+        self.assertIn("did not complete within its 5s deadline", message)
+        self.assertIsInstance(caught.exception.__cause__, LedgerOperationTimeout)
+        self.assertIn("adoption: attempt 5/5", stdout.getvalue())
+
+    def test_non_timeout_lease_failure_propagates_without_retry(self) -> None:
+        """Only deadline expiries are retried; everything else propagates.
+
+        Swallowing a broader exception class into the retry loop would spend
+        the whole budget on an error no retry can fix and then relabel it as
+        a possible lock conflict, hiding the real fault from the operator.
+        """
+
+        class FakeIdleInTransactionSessionTimeout(Exception):
+            """Shaped like psycopg.errors.IdleInTransactionSessionTimeout.
+
+            sqlstate 25P03 is class 25 (invalid transaction state), which
+            psycopg raises as an InternalError, not an OperationalError, so
+            _NativePostgresClient.run_json's handler never wraps it and it
+            reaches the lease helper raw. The stand-in keeps this case
+            meaningful on interpreters without psycopg installed.
+            """
+
+            sqlstate = "25P03"
+
+        errors: list[Exception] = [
+            # What run_json raises for a wrapped, non-deadline OperationalError.
+            RuntimeError("postgres query failed: server closed the connection"),
+            FakeIdleInTransactionSessionTimeout(
+                "terminating connection due to idle-in-transaction timeout"
+            ),
+        ]
+        try:
+            import psycopg
+        except ImportError:
+            psycopg = None  # type: ignore[assignment]
+        if psycopg is not None:
+            real_idle_timeout = psycopg.errors.IdleInTransactionSessionTimeout
+            self.assertFalse(issubclass(real_idle_timeout, psycopg.OperationalError))
+            errors.append(
+                real_idle_timeout(
+                    "terminating connection due to idle-in-transaction timeout"
+                )
+            )
+
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                attempts: list[str] = []
+                sleeps: list[float] = []
+
+                class FailingLeaseLedger(PsqlShareLedger):
+                    def _run_json(self, sql: str) -> Any:
+                        attempts.append(sql)
+                        raise error
+
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    with self.assertRaises(type(error)) as caught:
+                        FailingLeaseLedger(
+                            psql_command="psql postgresql://example.invalid/qbit",
+                            native_client_mode="0",
+                            lease_retry_sleep=sleeps.append,
+                        )
+
+                # Unchanged, on the first attempt, with no retry and none of
+                # the deadline wording.
+                self.assertIs(caught.exception, error)
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(sleeps, [])
+                self.assertEqual(stdout.getvalue(), "")
 
     def test_init_rejects_disarmed_session_guard_and_lease_bounds(self) -> None:
         cases = (
