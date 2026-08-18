@@ -426,9 +426,19 @@ services:
       - ${PRISM_POSTGRES_DATA_SOURCE:-prism-postgres-data}:/var/lib/postgresql/data
       - ${PRISM_POSTGRES_WAL_SOURCE:-prism-postgres-wal}:/var/lib/postgresql/wal
     healthcheck:
+      # A socket-only pg_isready is racy: the image's initdb-time temporary
+      # server accepts unix-socket connections (with listen_addresses='')
+      # and then shuts down, so a dependent can be released against the
+      # throwaway server. Gate on the real server's TCP listener first, then
+      # confirm with a real query. $$ keeps the variables for the container
+      # shell (the image sets POSTGRES_USER/POSTGRES_DB/POSTGRES_PASSWORD).
       test:
         - CMD-SHELL
-        - pg_isready -U ${PRISM_POSTGRES_USER:-qbit} -d ${PRISM_POSTGRES_DB:-qbit}
+        - >-
+          pg_isready -h 127.0.0.1 -p 5432
+          && PGPASSWORD="$$POSTGRES_PASSWORD"
+          psql -h 127.0.0.1 -p 5432 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+          -c 'SELECT 1' >/dev/null
       interval: 5s
       timeout: 5s
       retries: 30
