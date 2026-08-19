@@ -47,6 +47,12 @@ PUBLIC_ERROR_CODES = {
     # already in the documented error enum, because the condition is exactly
     # that: the data behind this route is too old to answer with.
     "stale_read_model": "upstream_unavailable",
+    # The public read tier's replica is missing, writable, or its replication
+    # stream has gone silent past the configured bound, so this route has no
+    # data it is willing to answer with. Same documented wire code as
+    # stale_read_model for the same reason: from a client's side the two are
+    # one condition.
+    "replica_unavailable": "upstream_unavailable",
 }
 
 

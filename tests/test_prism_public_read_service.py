@@ -136,12 +136,14 @@ class ServiceHarness:
         response_cache: object | None = None,
         readiness: object | None = None,
         metrics: object | None = None,
+        replica: object | None = None,
     ) -> None:
         self.service = public_read_service.PublicReadService(
             coordinator,
             response_cache=response_cache,  # type: ignore[arg-type]
             metrics=metrics,  # type: ignore[arg-type]
             readiness=readiness,  # type: ignore[arg-type]
+            replica=replica,  # type: ignore[arg-type]
         )
         handler = public_read_service.make_handler(self.service)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -711,6 +713,340 @@ class StalenessContractTests(unittest.TestCase):
             "qbit_prism_public_staleness_refusals_total 1",
             metrics.body.decode(),
         )
+
+
+class FakeClock:
+    """Monotonic time the test moves by hand."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class ScriptedReplica:
+    """A read_replica_status() whose answers -- and failures -- the test picks."""
+
+    def __init__(self, *answers: object) -> None:
+        self.answers = list(answers)
+        self.calls = 0
+
+    def __call__(self) -> dict[str, object]:
+        self.calls += 1
+        answer = self.answers[min(self.calls, len(self.answers)) - 1]
+        if isinstance(answer, Exception):
+            raise answer
+        assert isinstance(answer, dict)
+        return answer
+
+
+def standby(heartbeat: float | None = 1.0, replay_lag: float | None = 2.0) -> dict:
+    return {
+        "in_recovery": True,
+        "receiver_heartbeat_age_seconds": heartbeat,
+        "replay_lag_seconds": replay_lag,
+        "apply_backlog_bytes": 4096,
+    }
+
+
+PRIMARY_STATUS = {
+    "in_recovery": False,
+    "receiver_heartbeat_age_seconds": None,
+    "replay_lag_seconds": None,
+    "apply_backlog_bytes": None,
+}
+
+
+class ReplicaContractTests(unittest.TestCase):
+    """Serve from a live standby, or refuse and say which part failed.
+
+    The bound is on the walreceiver heartbeat rather than replay lag; see
+    ReplicaProbe. These tests drive the probe directly with a fake clock, so
+    they pin the freshness rules without a Postgres.
+    """
+
+    def probe(
+        self,
+        *answers: object,
+        max_lag_seconds: float = 60.0,
+    ) -> tuple[public_read_service.ReplicaProbe, FakeClock]:
+        clock = FakeClock()
+        probe = public_read_service.ReplicaProbe(
+            ScriptedReplica(*answers),
+            max_lag_seconds=max_lag_seconds,
+            monotonic=clock,
+        )
+        return probe, clock
+
+    def harness(self, probe: object, **kwargs: object) -> ServiceHarness:
+        harness = ServiceHarness(
+            FakeCoordinator(ledger=FullReadModelLedger()),
+            replica=probe,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        self.addCleanup(harness.close)
+        return harness
+
+    def test_before_the_first_probe_replica_routes_are_warming_up(self) -> None:
+        probe, _ = self.probe(standby())
+        served = self.harness(probe).get("/public/v1/blocks")
+
+        self.assertEqual(503, served.status)
+        self.assertIn("warming up", served.payload["error"]["message"])
+
+    def test_a_live_standby_is_served(self) -> None:
+        probe, _ = self.probe(standby())
+        probe.check()
+        served = self.harness(probe).get("/public/v1/blocks")
+
+        self.assertEqual(200, served.status)
+
+    def test_a_writable_primary_is_refused(self) -> None:
+        probe, _ = self.probe(PRIMARY_STATUS)
+        self.assertFalse(probe.check())
+        served = self.harness(probe).get("/public/v1/blocks")
+
+        self.assertEqual(503, served.status)
+        self.assertIn("not in recovery", served.payload["error"]["message"])
+
+    def test_a_refusal_uses_the_documented_public_error_enum(self) -> None:
+        # PUBLIC_ERROR_CODES silently rewrites an unknown code to
+        # internal_error, so an undocumented one would ship a 503 that says
+        # "internal error" and never fail a test that only reads the message.
+        probe, _ = self.probe(PRIMARY_STATUS)
+        probe.check()
+        served = self.harness(probe).get("/public/v1/blocks")
+
+        self.assertEqual("prism.dashboard.error.v1", served.payload["schema"])
+        self.assertEqual("upstream_unavailable", served.payload["error"]["code"])
+
+    def test_a_disconnected_walreceiver_is_refused(self) -> None:
+        probe, _ = self.probe(standby(heartbeat=None))
+        probe.check()
+        served = self.harness(probe).get("/public/v1/blocks")
+
+        self.assertEqual(503, served.status)
+        self.assertIn("not connected", served.payload["error"]["message"])
+
+    def test_a_heartbeat_past_the_bound_is_refused(self) -> None:
+        probe, _ = self.probe(standby(heartbeat=61.0), max_lag_seconds=60.0)
+        probe.check()
+        served = self.harness(probe).get("/public/v1/blocks")
+
+        self.assertEqual(503, served.status)
+        self.assertIn("silent for", served.payload["error"]["message"])
+
+    def test_a_failing_probe_ages_its_last_good_answer_out(self) -> None:
+        """The gate fails closed: a dead probe must not pin a fresh verdict.
+
+        This is the whole reason freshness is computed as "heartbeat age when
+        last probed, plus how long ago that was". Without the second term a
+        replica that stopped answering entirely keeps serving 200 forever off
+        its last good snapshot.
+        """
+        probe, clock = self.probe(
+            standby(heartbeat=1.0),
+            RuntimeError("connection refused"),
+            max_lag_seconds=60.0,
+        )
+        probe.check()
+        harness = self.harness(probe)
+
+        # Probe starts failing; the snapshot is still inside the bound.
+        for _ in range(100):
+            with self.assertRaises(RuntimeError):
+                probe.check()
+        clock.advance(30.0)
+        self.assertEqual(200, harness.get("/public/v1/blocks").status)
+
+        # Past the bound, the same unchanged snapshot must now refuse.
+        clock.advance(30.0)
+        served = harness.get("/public/v1/blocks")
+        self.assertEqual(503, served.status)
+        self.assertIn("silent for", served.payload["error"]["message"])
+        self.assertIn("connection refused", served.payload["error"]["message"])
+
+    def test_a_refusal_is_not_masked_by_a_warm_cache(self) -> None:
+        """The gate runs before the cache, not after.
+
+        A replica outage does not expire cache entries, so a check placed after
+        the cache would keep answering 200 from the last good snapshot for as
+        long as traffic kept it warm.
+        """
+        probe, clock = self.probe(standby(heartbeat=1.0), max_lag_seconds=60.0)
+        probe.check()
+        harness = self.harness(probe, response_cache=StubCache(0))
+
+        self.assertEqual(200, harness.get("/public/v1/blocks").status)
+        clock.advance(120.0)
+        self.assertEqual(503, harness.get("/public/v1/blocks").status)
+
+    def test_routes_that_read_no_replica_state_keep_serving(self) -> None:
+        probe, _ = self.probe(PRIMARY_STATUS)
+        probe.check()
+        harness = self.harness(probe)
+
+        self.assertEqual(503, harness.get("/public/v1/blocks").status)
+        self.assertEqual(
+            200, harness.get("/public/v1/mining-configuration").status
+        )
+
+    def test_immutable_artifacts_are_not_replica_gated(self) -> None:
+        # Content-addressed: the body either hashes to the requested sha256 or
+        # it does not, which replication lag cannot change. The registry gives
+        # these no staleness budget for the same reason.
+        probe, _ = self.probe(PRIMARY_STATUS)
+        probe.check()
+        harness = self.harness(probe)
+
+        self.assertFalse(
+            public_read_service.path_reads_replica(
+                f"/public/v1/artifacts/{ARTIFACT_SHA256}"
+            )
+        )
+        self.assertEqual(
+            200, harness.get(f"/public/v1/artifacts/{ARTIFACT_SHA256}").status
+        )
+
+    def test_every_replica_backed_route_is_gated(self) -> None:
+        """Exhaustive, not a sample: every extracted route that reads a read
+        slot must refuse, and the classification must come from the registry."""
+
+        probe, _ = self.probe(PRIMARY_STATUS)
+        probe.check()
+        harness = self.harness(probe)
+
+        gated = 0
+        for route in EXTRACTED_ROUTES:
+            path = route[0]
+            endpoint = endpoint_registry.endpoint_for_request_path(path)
+            assert endpoint is not None
+            expected_gated = (
+                not endpoint.immutable_content
+                and endpoint_registry.LedgerAccess.READ_SLOT in endpoint.access
+            )
+            with self.subTest(path=path):
+                self.assertEqual(
+                    expected_gated,
+                    public_read_service.path_reads_replica(path),
+                )
+                served = harness.get(request_path(route))
+                if expected_gated:
+                    gated += 1
+                    self.assertEqual(503, served.status)
+                    self.assertIn(
+                        "not in recovery", served.payload["error"]["message"]
+                    )
+                else:
+                    self.assertNotEqual(503, served.status)
+        self.assertGreater(gated, 0, "no route exercised the replica gate")
+
+    def test_observed_replay_lag_travels_on_the_response(self) -> None:
+        probe, clock = self.probe(standby(heartbeat=1.0, replay_lag=2.0))
+        probe.check()
+        clock.advance(3.0)
+        served = self.harness(probe).get("/public/v1/blocks")
+
+        self.assertEqual(200, served.status)
+        self.assertEqual(
+            "5.000",
+            served.headers.get(public_read_service.REPLICA_LAG_HEADER),
+        )
+
+    def test_healthz_carries_the_replication_facts(self) -> None:
+        probe, _ = self.probe(standby(heartbeat=1.0))
+        probe.check()
+        served = self.harness(probe).get("/healthz")
+
+        self.assertEqual(200, served.status)
+        self.assertEqual(True, served.payload["replica"]["in_recovery"])
+        self.assertEqual(
+            1.0, served.payload["replica"]["receiver_heartbeat_age_seconds"]
+        )
+        self.assertEqual(60.0, served.payload["replica"]["max_lag_seconds"])
+
+    def test_healthz_goes_unready_when_the_contract_fails(self) -> None:
+        probe, _ = self.probe(PRIMARY_STATUS)
+        probe.check()
+        served = self.harness(probe).get("/healthz")
+
+        self.assertEqual(503, served.status)
+        self.assertFalse(served.payload["ok"])
+        self.assertIn("not in recovery", served.payload["error"])
+
+    def test_metrics_publish_the_replica_gauges_and_refusals(self) -> None:
+        probe, _ = self.probe(standby(heartbeat=1.0, replay_lag=2.0))
+        probe.check()
+        harness = self.harness(probe)
+        harness.get("/public/v1/blocks")
+
+        body = harness.get("/metrics").body.decode()
+        self.assertIn("qbit_prism_public_replica_in_recovery 1", body)
+        self.assertIn(
+            "qbit_prism_public_replica_heartbeat_age_seconds 1.000", body
+        )
+        self.assertIn("qbit_prism_public_replica_replay_lag_seconds 2.000", body)
+        self.assertIn("qbit_prism_public_replica_apply_backlog_bytes 4096.000", body)
+        self.assertIn("qbit_prism_public_replica_max_lag_seconds 60.000", body)
+        self.assertIn("qbit_prism_public_replica_refusals_total 0", body)
+
+    def test_replica_refusals_are_counted(self) -> None:
+        probe, _ = self.probe(PRIMARY_STATUS)
+        probe.check()
+        harness = self.harness(probe)
+        harness.get("/public/v1/blocks")
+
+        self.assertIn(
+            "qbit_prism_public_replica_refusals_total 1",
+            harness.get("/metrics").body.decode(),
+        )
+
+    def test_unknown_numbers_report_minus_one_rather_than_zero(self) -> None:
+        probe, _ = self.probe(standby(heartbeat=None, replay_lag=None))
+        probe.check()
+        harness = self.harness(probe)
+
+        body = harness.get("/metrics").body.decode()
+        self.assertIn("qbit_prism_public_replica_heartbeat_age_seconds -1", body)
+        self.assertIn("qbit_prism_public_replica_replay_lag_seconds -1", body)
+
+
+class ReplicaModeTests(unittest.TestCase):
+    """PRISM_PUBLIC_REPLICA_MODE decides whether the contract is enforced."""
+
+    class Ledger:
+        def read_replica_status(self) -> dict[str, object]:
+            return standby()
+
+    def test_absent_mode_enforces_nothing(self) -> None:
+        # The default must not 503 a deployment that merged this before it
+        # provisioned a standby; the shipped compose sets require explicitly.
+        self.assertEqual(
+            public_read_service.REPLICA_MODE_OFF,
+            public_read_service.resolve_replica_mode({}),
+        )
+        self.assertIsNone(public_read_service.build_replica_probe(self.Ledger(), {}))
+
+    def test_require_builds_the_probe(self) -> None:
+        probe = public_read_service.build_replica_probe(
+            self.Ledger(), {"PRISM_PUBLIC_REPLICA_MODE": "require"}
+        )
+        self.assertIsInstance(probe, public_read_service.ReplicaProbe)
+
+    def test_an_unrecognised_mode_refuses_startup(self) -> None:
+        # Neither default is safe to guess: the two modes disagree about
+        # whether this process may read the coordinator's primary.
+        with self.assertRaises(
+            public_read_service.PublicReadConfigurationError
+        ) as raised:
+            public_read_service.resolve_replica_mode(
+                {"PRISM_PUBLIC_REPLICA_MODE": "yes"}
+            )
+        self.assertIn("PRISM_PUBLIC_REPLICA_MODE", str(raised.exception))
 
 
 class FailClosedStartupTests(unittest.TestCase):

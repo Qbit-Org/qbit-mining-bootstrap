@@ -67,6 +67,11 @@ DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS = 5.0
 # a vanished client at 30 + 3x10 = 60 seconds. Unix-socket connections ignore
 # them, leaving the idle-in-transaction timeout as the guard there.
 DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS = 15.0
+# read_replica_status() runs on the public read service's background probe
+# thread on a 5s cadence by default; a probe that outlives its own interval
+# tells the freshness gate nothing it does not already know from the previous
+# answer's age, so bound it well inside one interval.
+DEFAULT_READ_REPLICA_PROBE_TIMEOUT_SECONDS = 3.0
 DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT = 3
 DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS = 30
 DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS = 10
@@ -2940,6 +2945,62 @@ class PsqlShareLedger:
     @property
     def backend_name(self) -> str:
         return "postgres-psql"
+
+    def read_replica_status(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_READ_REPLICA_PROBE_TIMEOUT_SECONDS,
+    ) -> dict[str, object]:
+        """Replication-state probe backing the public read staleness contract.
+
+        Returns:
+
+        - ``in_recovery`` -- true only on a hot standby;
+        - ``replay_lag_seconds`` -- wall clock minus the newest replayed
+          transaction's commit time (None before any replay). This is an
+          informational staleness *indicator*, not a freshness proof: on an
+          idle primary it grows with wall time even though the replica is
+          fully caught up;
+        - ``receiver_heartbeat_age_seconds`` -- wall clock minus the newest
+          message from the primary's WAL sender (None when the walreceiver
+          is not connected). Heartbeats flow every
+          ``wal_receiver_status_interval`` (default 10s) even when the
+          primary is idle, so this is the replica-side liveness proof the
+          public read service enforces;
+        - ``apply_backlog_bytes`` -- WAL bytes received but not yet replayed.
+
+        The extracted public read service (issue #145) polls this to enforce
+        its bounded-staleness contract and to refuse serving from a writable
+        primary. Reads run through the ordinary read pool, so the probe never
+        touches the writer lease.
+
+        Bounded by default: this runs on the service's background probe
+        thread, and an unbounded probe against a wedged standby would leave
+        the freshness gate holding its last answer indefinitely rather than
+        ageing out into a refusal.
+        """
+        sql = """
+SELECT json_build_object(
+    'in_recovery', pg_is_in_recovery(),
+    'replay_lag_seconds', CASE
+        WHEN pg_last_xact_replay_timestamp() IS NULL THEN NULL
+        ELSE extract(epoch FROM (clock_timestamp() - pg_last_xact_replay_timestamp()))
+    END,
+    'receiver_heartbeat_age_seconds', CASE
+        WHEN (SELECT last_msg_receipt_time FROM pg_stat_wal_receiver) IS NULL THEN NULL
+        ELSE extract(epoch FROM (clock_timestamp() - (SELECT last_msg_receipt_time FROM pg_stat_wal_receiver)))
+    END,
+    'apply_backlog_bytes', CASE
+        WHEN pg_last_wal_receive_lsn() IS NULL OR pg_last_wal_replay_lsn() IS NULL THEN NULL
+        ELSE pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())
+    END
+);
+"""
+        with self.operation_timeout(timeout_seconds):
+            row = self._run_read_json(sql)
+        if not isinstance(row, dict):
+            raise RuntimeError("read replica status probe did not return an object")
+        return row
 
     @contextmanager
     def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:

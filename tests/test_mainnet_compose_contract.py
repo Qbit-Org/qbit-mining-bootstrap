@@ -20,6 +20,9 @@ OPERATOR_SERVICES = {
     "bitcoind",
     "auxpow-stratum",
     "prism-postgres",
+    # The standby the public read tier answers from, so public read volume
+    # reaches neither the coordinator's process nor its primary.
+    "prism-postgres-replica",
     "prism-coordinator",
     # The /public/v1 read tier runs in its own process (issue #145) so public
     # read volume cannot contend with share acknowledgement or block landing.
@@ -201,6 +204,12 @@ class MainnetComposeContractTests(unittest.TestCase):
             ("prism-coordinator", "/var/lib/qbit-prism/audit"): (
                 "/srv/qbit-mining-bootstrap/mainnet/prism/audit"
             ),
+            ("prism-postgres-replica", "/var/lib/postgresql/data"): (
+                "/srv/qbit-mining-bootstrap/mainnet/postgres-replica/data"
+            ),
+            ("prism-public-api", "/var/lib/qbit-prism/audit"): (
+                "/srv/qbit-mining-bootstrap/mainnet/prism/audit"
+            ),
         }
 
         for (service, target), source in expected.items():
@@ -231,6 +240,46 @@ class MainnetComposeContractTests(unittest.TestCase):
             mounts["/var/lib/postgresql/wal"],
         )
         self.assertEqual(postgres["environment"]["POSTGRES_INITDB_WALDIR"], "/var/lib/postgresql/wal")
+
+    def test_public_read_tier_serves_from_the_standby(self) -> None:
+        # Issue #145: the public read routes answer from a replica, so public
+        # traffic reaches neither the coordinator's process nor the primary it
+        # lands blocks through. Rendered from the mainnet .env, which is where
+        # a deployment that names the primary in PRISM_DATABASE_URL would show
+        # up as the public tier silently reading it.
+        environment = self._environment("prism-public-api")
+
+        self.assertIn("prism-postgres-replica", environment["PRISM_DATABASE_URL"])
+        self.assertNotIn("@prism-postgres:", environment["PRISM_DATABASE_URL"])
+        self.assertEqual(environment["PRISM_PUBLIC_REPLICA_MODE"], "require")
+        self.assertEqual(environment["PRISM_PUBLIC_REPLICA_MAX_LAG_SECONDS"], "60")
+
+        # The coordinator keeps the primary.
+        coordinator = self._environment("prism-coordinator")
+        self.assertIn("@prism-postgres:", coordinator["PRISM_DATABASE_URL"])
+
+    def test_public_read_tier_waits_on_the_standby_not_the_primary(self) -> None:
+        depends_on = self.config["services"]["prism-public-api"]["depends_on"]
+
+        self.assertEqual({"prism-postgres-replica"}, set(depends_on))
+        self.assertEqual(
+            "service_healthy", depends_on["prism-postgres-replica"]["condition"]
+        )
+
+    def test_replica_storage_is_separate_from_the_primary(self) -> None:
+        # A standby sharing the primary's data directory is not a standby.
+        sources = {
+            service: {
+                volume["source"]
+                for volume in self.config["services"][service]["volumes"]
+                if isinstance(volume, dict)
+            }
+            for service in ("prism-postgres", "prism-postgres-replica")
+        }
+
+        self.assertEqual(
+            set(), sources["prism-postgres"] & sources["prism-postgres-replica"]
+        )
 
     def test_ckpool_runtimes_receive_template_freshness_limit(self) -> None:
         environment = self._environment("ckpool")
