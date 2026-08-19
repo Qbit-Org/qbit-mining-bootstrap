@@ -117,6 +117,9 @@ jobs:
       - name: Run native PostgreSQL ledger integration tests
         run: make test-prism-postgres-native-ledger
 
+      - name: Run carry-forward seed guard regression tests
+        run: make test-prism-postgres-seed-guard
+
   docker-builds:
     name: Build lightweight Docker images
     runs-on: blacksmith-2vcpu-ubuntu-2404

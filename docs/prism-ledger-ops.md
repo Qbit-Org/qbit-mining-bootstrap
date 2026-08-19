@@ -322,6 +322,34 @@ reward-window calls, pool-block confirmation/reactivation, and audit evidence
 publication because required columns, functions, and the durable publication
 ordinal will be missing.
 
+Apply the file in a single transaction and stop the PRISM share writer
+first. The script enforces this itself with a `BEGIN`/`COMMIT` wrapper, so
+even a plain autocommit `psql -f` runs as one transaction — but pass
+`--single-transaction` (or `-1`) anyway, together with `ON_ERROR_STOP`, so
+the intent is explicit and a failure cannot strand an open transaction:
+
+```sh
+psql "$PRISM_DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 \
+  -f crates/qbit-prism/sql/001_share_ledger.sql
+```
+
+Before that wrapper existed, a per-statement autocommit apply could commit
+the carry-forward summary triggers before the summary seeding block later in
+the file ran. If the apply was interrupted in that gap, or a still-running
+writer confirmed or reversed a block in it, the summary received only those
+post-trigger deltas: every miner's balance was silently under-reported by
+their full pre-upgrade carry, and the seed's emptiness guard locked that
+partial state in permanently. The schema's seed guard now compares the
+summary against the carry history it summarizes and repairs a partial
+summary on the next apply. The writer must still be stopped during the
+apply: concurrent mutations block on the apply's table locks and then fire
+the freshly (re)created triggers after it commits, which invites long
+lock waits and deadlocks even though the apply itself is atomic. Note that
+combining `--single-transaction` with the script's own `BEGIN`/`COMMIT`
+wrapper makes psql print two harmless warnings ("there is already a
+transaction in progress" / "there is no transaction in progress"); the apply
+is still exactly one transaction.
+
 ### Audit publication ordering migration
 
 Existing databases must receive the new `audit_publication_sequence` migration.
@@ -336,16 +364,16 @@ audit publication.
 
 The migration includes `ALTER TABLE` operations that require PostgreSQL's
 `ACCESS EXCLUSIVE` table lock. They wait for existing readers and writers and
-can interrupt new reads as well as writes while held. A later serialized phase
-takes a transaction-scoped advisory lock and a `SHARE ROW EXCLUSIVE` lock on
+can interrupt new reads as well as writes while held. A serialized phase takes
+a transaction-scoped advisory lock and a `SHARE ROW EXCLUSIVE` lock on
 `qbit_pool_blocks`, and the unique index is built non-concurrently. Treat the
 whole migration as read-impacting: stop the old coordinator or use a reviewed
 maintenance window, take the normal database backup, and apply the file with
-`ON_ERROR_STOP` using the same database role and schema search path as PRISM.
-For example:
+`ON_ERROR_STOP` inside a single transaction (see the apply requirements above),
+using the same database role and schema search path as PRISM. For example:
 
 ```sh
-psql "$PRISM_DATABASE_URL" -v ON_ERROR_STOP=1 \
+psql "$PRISM_DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 \
   -f crates/qbit-prism/sql/001_share_ledger.sql
 ```
 
@@ -436,10 +464,13 @@ reproduce the ordinals observed before the revert, and external consumers
 that recorded pre-revert ordinals will see the sequence renumbered.
 
 Apply the revert with the ledger role whose `search_path` selects the PRISM
-schema, and stop on the first error:
+schema, inside a single transaction, and stop on the first error (the revert
+script wraps itself in one `BEGIN`/`COMMIT` and relies on it, matching the
+forward script):
 
 ```sh
 psql "$PRISM_DATABASE_URL" \
+  --single-transaction \
   --set ON_ERROR_STOP=1 \
   -f crates/qbit-prism/sql/001_share_ledger_revert_audit_publication_sequence.sql
 ```

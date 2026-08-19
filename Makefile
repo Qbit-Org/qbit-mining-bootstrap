@@ -59,7 +59,7 @@ compose_env_value() { \
 	};
 endef
 
-.PHONY: doctor prism-self-check require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres-ledger test-prism-postgres-scale test-prism-postgres-native-ledger test-prism-postgres-throughput test-prism-public-read-replica test-prism-stratum-regtest-live test-prism-stratum-postgres-regtest-live test-prism-combined-regtest test-compose-prism-config up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
+.PHONY: doctor prism-self-check require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres-ledger test-prism-postgres-scale test-prism-postgres-native-ledger test-prism-postgres-seed-guard test-prism-postgres-throughput test-prism-public-read-replica test-prism-stratum-regtest-live test-prism-stratum-postgres-regtest-live test-prism-combined-regtest test-compose-prism-config up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
 
 require-lab-mode:
 	@bash scripts/check-env.sh --require-lab
@@ -98,6 +98,9 @@ test-prism-postgres-scale:
 
 test-prism-postgres-native-ledger:
 	bash test/test-prism-postgres-native-ledger.sh
+
+test-prism-postgres-seed-guard:
+	bash test/test-prism-postgres-seed-guard.sh
 
 test-prism-postgres-throughput:
 	bash test/test-prism-postgres-throughput.sh

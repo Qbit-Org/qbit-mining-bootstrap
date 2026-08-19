@@ -6000,6 +6000,39 @@ class NativeClientSelectionTests(unittest.TestCase):
                     native_client_mode="1",
                 )
 
+    def test_auto_native_psycopg_import_fallback_warns(self) -> None:
+        stdout = io.StringIO()
+        with unittest.mock.patch.dict(sys.modules, {"psycopg": None}):
+            with contextlib.redirect_stdout(stdout):
+                ledger = CannedQueryPsqlShareLedger(
+                    [acquired_lease_result()],
+                    native_client_mode="auto",
+                )
+        self.assertIsNone(ledger._native)
+        self.assertEqual(ledger.execution_backend, "psql-subprocess")
+        self.assertIn(
+            "psycopg import failed; falling back to the psql subprocess backend",
+            stdout.getvalue(),
+        )
+
+    def test_psql_run_sql_uses_single_transaction(self) -> None:
+        recorded: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            recorded["cmd"] = list(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="{}\n", stderr="")
+
+        ledger = CannedQueryPsqlShareLedger([acquired_lease_result()])
+        with unittest.mock.patch.object(
+            share_ledger_module.subprocess, "run", side_effect=fake_run
+        ):
+            output = ledger._run_sql("SELECT '{}'::json;")
+        self.assertEqual(output, "{}\n")
+        cmd = recorded["cmd"]
+        self.assertIn("--single-transaction", cmd)
+        self.assertIn("--no-psqlrc", cmd)
+        self.assertIn("ON_ERROR_STOP=1", cmd)
+
     def test_parse_single_json_value_contract(self) -> None:
         self.assertEqual(parse_single_json_value('{"a": 1}'), {"a": 1})
         self.assertEqual(parse_single_json_value({"a": 1}), {"a": 1})
