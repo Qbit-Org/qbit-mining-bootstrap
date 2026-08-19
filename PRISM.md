@@ -519,10 +519,22 @@ API readers.
 
 ## HTTP Surfaces
 
-The coordinator exposes a private audit/ops listener and a dashboard-safe public
-API from the same process.
+PRISM serves two HTTP surfaces from two separate processes.
 
-Private/internal endpoints include:
+The **coordinator** (`prism-coordinator`) exposes only the private audit/ops
+listener. The **public read tier** (`prism-public-api`, `python3 -m
+lab.prism.public_read_service`) serves the dashboard-safe `/public/v1` API and
+nothing else. They were split because public read traffic scales with public
+interest rather than with hashrate: served in-process it put an uncontrolled
+workload on the same GIL that acknowledges shares and lands blocks, and on the
+same primary Postgres the lease-holding writer commits through.
+
+The public tier reads through bounded read slots only, never acquires a writer
+lease, and depends on Postgres rather than on the coordinator — so it keeps
+serving across coordinator restarts, and a surge of dashboard polling cannot
+slow block landing.
+
+Private/internal endpoints, served by the coordinator, include:
 
 - `/healthz`
 - `/metrics`
@@ -539,13 +551,25 @@ Private/internal endpoints include:
 Do not expose `/audit/*`, `/metrics`, `/healthz`, Postgres, qbit RPC, or Docker
 volumes directly to the internet.
 
-Dashboard-safe endpoints live under `/public/v1`. The public API contract is:
+Dashboard-safe endpoints live under `/public/v1`, served by `prism-public-api`
+on `PRISM_PUBLIC_API_PORT` (default `3342`). The public API contract is:
 
 - [docs/public-dashboard-api/README.md](docs/public-dashboard-api/README.md)
 - [docs/public-dashboard-api-v1.openapi.yaml](docs/public-dashboard-api-v1.openapi.yaml)
 
 Operators can expose only `/public/v1` through a reverse proxy or dashboard
-frontend.
+frontend. Because that surface now has its own process, the reverse proxy points
+at `prism-public-api` rather than at the coordinator's audit port, and the
+coordinator's listener need not be reachable from the proxy at all.
+
+The public tier also serves its own `/healthz` and `/metrics` describing that
+process (readiness, request counts, cache hit/miss, staleness refusals). These
+are operator surfaces like the coordinator's own — do not expose them publicly.
+
+`prism-public-api` refuses to start unless `PRISM_PUBLIC_STRATUM_URL` is set: it
+runs no Stratum listener, so it cannot infer the pool's endpoint, and the
+fallback would advertise `127.0.0.1` to miners. It also refuses to run on the
+in-memory ledger.
 
 ## Run PRISM Locally
 

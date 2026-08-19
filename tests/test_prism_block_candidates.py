@@ -1549,6 +1549,172 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         # fence must revalidate the recorded window instead.
         self.assertEqual(replayed.context.payout_append_invalidation_epoch, -1)
 
+    def test_b1_intent_refuses_a_submission_with_no_serialized_block(self) -> None:
+        """An unmaterialized block must never become a durable intent.
+
+        ``assemble_submission`` builds ``block_hex`` only for a hash that
+        solved the block, which every candidate route requires. If that
+        coupling were ever broken the block is already lost; persisting the
+        empty value would lose it again after every restart, as a candidate
+        that can never be offered to the node. Fail on the client thread
+        instead, before the durable write.
+        """
+        server, state, _ledger = submit_coordinator()
+        candidate = block_candidate(
+            server,
+            state,
+            direct_stratum.DirectQbitSubmission(
+                coinbase_tx_hex="11",
+                coinbase_txid_preimage_hex="",
+                header_hex="",
+                block_hex="",
+                block_hash_hex="cb" * 32,
+                block_hash_int=1,
+                share_pass=True,
+                block_pass=True,
+                applied_version_hex="",
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "carries no serialized block"):
+            block_candidate_intent(candidate)
+
+    def test_b1_intent_still_tolerates_an_embedder_without_block_bytes(self) -> None:
+        """The invariant belongs to the real submission type, not to stubs.
+
+        Some integrations retain no block bytes at all; the landing path
+        already guards them by attribute probe. Tightening the codec must not
+        turn those into hard failures.
+        """
+        server, state, _ledger = submit_coordinator()
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                block_hash_hex="cc" * 32,
+                coinbase_tx_hex="11",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=PendingShare(
+                share_id="embedder-share",
+                miner_id="miner-a",
+                order_key="miner-a",
+                p2mr_program_hex="11" * 32,
+                share_difficulty=1,
+                network_difficulty=1,
+                template_height=10,
+                job_id="job-1",
+                job_issued_at_ms=1,
+                accepted_at_ms=2,
+                ntime=3,
+            ),
+        )
+
+        intent = block_candidate_intent(candidate)
+
+        self.assertEqual(intent["block_hex"], "")
+
+    def test_b1_replayed_intent_re_encodes_without_tripping_the_guard(self) -> None:
+        """Decode erases duck-typing, so the guard must exempt a replay.
+
+        An embedder that retains no block bytes writes ``""`` and is tolerated.
+        ``block_candidate_from_intent`` then rebuilds every replayed candidate
+        as a real ``DirectQbitSubmission``, so that tolerated value comes back
+        wearing the strict type. The only caller that re-encodes a replayed
+        candidate is the credit-on-accept append, which runs after the block
+        has landed -- raising there would fail a credit for a block already in
+        the chain. Re-persisting an intent the row already holds is not the
+        write the guard exists to stop.
+        """
+        server, state, _ledger = submit_coordinator()
+        pending = PendingShare(
+            share_id="replay-share",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=10,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=2,
+            ntime=3,
+        )
+        written = block_candidate_intent(
+            block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    block_hash_hex="cf" * 32,
+                    coinbase_tx_hex="11",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+                pending_share=pending,
+                credit_share_on_accept=True,
+            )
+        )
+        self.assertEqual(written["block_hex"], "")
+
+        replayed = dataclasses.replace(
+            block_candidate_from_intent(written),
+            durable_replay=True,
+        )
+        # Decode really does hand back the strict type; without the replay
+        # exemption this is exactly what would trip the guard.
+        self.assertIsInstance(
+            replayed.submission,
+            direct_stratum.DirectQbitSubmission,
+        )
+        self.assertEqual(replayed.submission.block_hex, "")
+
+        self.assertEqual(block_candidate_intent(replayed)["block_hex"], "")
+
+    def test_b1_replayed_intent_preserves_a_real_serialized_block(self) -> None:
+        """The ordinary replay: block bytes survive the round trip intact."""
+        server, state, _ledger = submit_coordinator()
+        pending = PendingShare(
+            share_id="replay-real-share",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=10,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=2,
+            ntime=3,
+        )
+        written = block_candidate_intent(
+            block_candidate(
+                server,
+                state,
+                direct_stratum.DirectQbitSubmission(
+                    coinbase_tx_hex="11",
+                    coinbase_txid_preimage_hex="",
+                    header_hex="",
+                    block_hex="0badc0de",
+                    block_hash_hex="da" * 32,
+                    block_hash_int=1,
+                    share_pass=True,
+                    block_pass=True,
+                    applied_version_hex="",
+                ),
+                pending_share=pending,
+                credit_share_on_accept=True,
+            )
+        )
+
+        replayed = dataclasses.replace(
+            block_candidate_from_intent(written),
+            durable_replay=True,
+        )
+
+        self.assertEqual(replayed.submission.block_hex, "0badc0de")
+        self.assertEqual(block_candidate_intent(replayed)["block_hex"], "0badc0de")
+
     def test_b1_service_owns_queue_and_structured_attempt_results(self) -> None:
         server, state, _ledger = submit_coordinator()
         service = server._ensure_block_candidate_service()
@@ -3302,6 +3468,157 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         )
         self.assertFalse(server._payout_state_publication_blocked)
         self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
+
+    def test_at_tip_idempotent_confirm_replay_skips_publication(self) -> None:
+        """An at-tip replay reports the idempotent disposition, not a flip.
+
+        qbit_confirm_pool_block returns 2 when its UPDATE matched nothing but
+        the row is already confirmed at that (hash, height): the call changed
+        nothing and allocated no publication ordinal. Before that split the
+        same replay reported 1 and was indistinguishable from a fresh flip,
+        so the window after finding a block -- where the candidate replays
+        while its own block is still the best tip -- republished payout state
+        on every pass. The replay must complete the candidate without
+        reserving a source, bumping the generation, wiping the job-bundle
+        cache or scheduling refresh churn, and must never be mistaken for a
+        failed confirmation, which fences delivery, republishes a withdrawal
+        and halts the pool (issue #61).
+        """
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.max_blocks = 2
+        server.stop_after_block = False
+        block_hash = "da" * 32
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+            self.assertEqual(server._payout_state_generation, 1)
+            self.assertEqual(
+                server._published_payout_state.source_tip_hash,
+                block_hash,
+            )
+            self.assertEqual(server._payout_state_source[0], 1)
+            flipped_sequence = int(
+                ledger._audit_publication_sequences[block_hash]
+            )
+
+            # Replay the durable candidate while its own block is still the
+            # best tip -- no successor has arrived, so nothing about the
+            # active chain distinguishes this pass from the original landing.
+
+            class AtTipReplayRpc:
+                def call(self, method: str, params: object = None) -> object:
+                    if method == "getbestblockhash":
+                        return block_hash
+                    if method == "getblockheader":
+                        if params != [block_hash]:
+                            raise AssertionError(params)
+                        return {"height": 10, "confirmations": 1}
+                    if method == "getblockhash":
+                        if params != [10]:
+                            raise AssertionError(params)
+                        return block_hash
+                    if method == "getblockcount":
+                        return 10
+                    if method == "submitblock":
+                        raise AssertionError(
+                            "active tip must not be resubmitted"
+                        )
+                    raise RuntimeError(method)
+
+            server.rpc = AtTipReplayRpc()
+            ledger.pool_block_state = (  # type: ignore[attr-defined]
+                lambda **_kwargs: {
+                    "chain_state": "confirmed",
+                    "maturity_state": "immature",
+                }
+            )
+
+            def confirm_at_tip_replay(**kwargs: object) -> dict[str, object]:
+                self.assertEqual(kwargs["block_hash"], block_hash)
+                self.assertEqual(kwargs["active_tip_height"], 10)
+                # The idempotent arm returns the ordinal the original flip
+                # allocated and burns no sequence.
+                return {
+                    "backend": "fake",
+                    "confirmed_count": 2,
+                    "audit_publication_sequence": flipped_sequence,
+                }
+
+            ledger.confirm_accepted_block = confirm_at_tip_replay  # type: ignore[method-assign]
+            retry_calls = 0
+
+            def count_retry() -> None:
+                nonlocal retry_calls
+                retry_calls += 1
+
+            server._schedule_tip_refresh_retry = count_retry  # type: ignore[method-assign]
+            cache_key = ("sentinel",)
+            server._job_bundle_cache[cache_key] = object()
+            discarded_before = server.payout_state_candidates_discarded
+            pending_marks_before = server._tip_refresh_pending_counter
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+            latest_evidence = server.latest_evidence
+
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._published_payout_state.source_generation, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, block_hash)
+        self.assertEqual(server._payout_state_source[0], 1)
+        self.assertIn(cache_key, server._job_bundle_cache)
+        self.assertEqual(retry_calls, 0)
+        self.assertEqual(
+            server._tip_refresh_pending_counter,
+            pending_marks_before,
+        )
+        self.assertEqual(
+            server.payout_state_candidates_discarded,
+            discarded_before,
+        )
+        self.assertFalse(server._payout_state_publication_blocked)
+        self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
+        # A covered replay is not a confirmation failure: no shutdown, and the
+        # candidate stays accepted rather than being abandoned.
+        self.assertFalse(server.stop_event.is_set())
+        self.assertEqual(server.accepted_block_count, 1)
+        # The audit publication replays exactly against the ordinal the flip
+        # allocated. The disposition itself is observational -- reporting 2
+        # where the published evidence recorded 1 must not strand the replay
+        # as a payload conflict.
+        self.assertIsNotNone(latest_evidence)
+        assert latest_evidence is not None
+        self.assertEqual(
+            latest_evidence["audit_publication_identity"]["sequence"],
+            flipped_sequence,
+        )
+        self.assertEqual(latest_evidence["confirmation"]["confirmed_count"], 1)
 
     def test_leaked_publication_fence_replay_republishes(self) -> None:
         server, state, ledger = submit_coordinator()

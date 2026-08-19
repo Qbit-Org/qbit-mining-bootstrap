@@ -67,6 +67,11 @@ DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS = 5.0
 # a vanished client at 30 + 3x10 = 60 seconds. Unix-socket connections ignore
 # them, leaving the idle-in-transaction timeout as the guard there.
 DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS = 15.0
+# read_replica_status() runs on the public read service's background probe
+# thread on a 5s cadence by default; a probe that outlives its own interval
+# tells the freshness gate nothing it does not already know from the previous
+# answer's age, so bound it well inside one interval.
+DEFAULT_READ_REPLICA_PROBE_TIMEOUT_SECONDS = 3.0
 DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT = 3
 DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS = 30
 DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS = 10
@@ -107,6 +112,40 @@ VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
 
 class LedgerOperationTimeout(TimeoutError):
     """A caller-scoped PostgreSQL deadline expired before work completed."""
+
+
+class ReadOnlyLedgerError(RuntimeError):
+    """A read-only ledger was asked for the writer lock."""
+
+
+class _RefusingWriterGate:
+    """Stands in for the writer lock on a read-only ledger.
+
+    Every fenced statement and every writer-lock read in PsqlShareLedger --
+    appends, block landing, settlement, and the O(recipients) reads like
+    current_owed_balances() and audit_bundle() -- reaches the lock through
+    ``_operation_gate(self._lock, "writer lock")``. Substituting a gate that
+    refuses to be acquired makes "this process never fences" a property of the
+    object rather than of which methods its callers happen to use, so a future
+    public route that reached a fenced read would fail loudly here instead of
+    quietly serializing dashboard traffic against the block-landing path.
+    """
+
+    __slots__ = ()
+
+    _MESSAGE = "ledger is read-only: the writer lock is not available"
+
+    def acquire(self, timeout: float = -1.0) -> bool:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+    def release(self) -> None:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+    def __enter__(self) -> None:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+    def __exit__(self, *exc_info: object) -> None:
+        raise ReadOnlyLedgerError(self._MESSAGE)
 
 
 def _is_postgres_deadline_error(error: BaseException | str) -> bool:
@@ -1151,20 +1190,47 @@ class SingleWriterShareLedger:
         }
 
     def dashboard_public_artifact(self, *, sha256: str) -> dict[str, object] | None:
+        document = self.dashboard_public_artifact_document(sha256=sha256)
+        if document is None:
+            return None
+        return document.get("payload")
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        """Artifact payload plus, for manifest kinds, its canonical text.
+
+        canonical_json is the exact serialized text the artifact's sha256 was
+        computed over, persisted at record time. Audit bundles are hashed
+        over Rust struct-order bytes that are not stored, so their
+        canonical_json is None and they keep the re-serialized response.
+        """
         with self._lock:
             for payload in self._ctv_fanout_sets.values():
                 if payload.get("audit_bundle_sha256") == sha256:
                     audit_bundle = payload.get("audit_bundle")
-                    return copy.deepcopy(audit_bundle) if isinstance(audit_bundle, dict) else None
+                    if not isinstance(audit_bundle, dict):
+                        return None
+                    return {"payload": copy.deepcopy(audit_bundle), "canonical_json": None}
                 if payload.get("manifest_set_sha256") == sha256:
                     manifest_set = payload.get("manifest_set")
-                    return copy.deepcopy(manifest_set) if isinstance(manifest_set, dict) else None
+                    if not isinstance(manifest_set, dict):
+                        return None
+                    manifest_set_json = payload.get("manifest_set_json")
+                    return {
+                        "payload": copy.deepcopy(manifest_set),
+                        "canonical_json": manifest_set_json if isinstance(manifest_set_json, str) else None,
+                    }
                 for artifact in payload.get("artifacts", []):
                     if not isinstance(artifact, dict):
                         continue
                     if artifact.get("manifest_sha256") == sha256:
                         manifest = artifact.get("manifest")
-                        return copy.deepcopy(manifest) if isinstance(manifest, dict) else None
+                        if not isinstance(manifest, dict):
+                            return None
+                        manifest_json = artifact.get("manifest_json")
+                        return {
+                            "payload": copy.deepcopy(manifest),
+                            "canonical_json": manifest_json if isinstance(manifest_json, str) else None,
+                        }
         return None
 
     def update_ctv_fanout_status(self, *, fanout_txid: str, settlement_status: str) -> dict[str, int | str]:
@@ -1699,6 +1765,11 @@ class SingleWriterShareLedger:
                 }:
                     return {"backend": "memory", "confirmed_count": -1}
                 return {"backend": "memory", "confirmed_count": 0}
+            # Mirror the Postgres disposition split again: only a flip out of
+            # 'prepared' is a fresh confirmation (1). A row already confirmed
+            # at this height is an idempotent replay (2) that keeps the
+            # ordinal its flip allocated and burns none.
+            already_confirmed = block[1] == "confirmed"
             publication_sequence = self._audit_publication_sequences.get(block_hash)
             if publication_sequence is None:
                 publication_sequence = self._next_audit_publication_sequence
@@ -1711,7 +1782,7 @@ class SingleWriterShareLedger:
             )
         return {
             "backend": "memory",
-            "confirmed_count": 1,
+            "confirmed_count": 2 if already_confirmed else 1,
             "audit_publication_sequence": publication_sequence,
         }
 
@@ -2493,6 +2564,7 @@ class PsqlShareLedger:
         postgres_tcp_keepalives_idle_seconds: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
         postgres_tcp_keepalives_interval_seconds: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
         postgres_tcp_keepalives_count: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+        read_only: bool = False,
         read_concurrency: int = 4,
         accepted_stats_cache_seconds: float = 60.0,
         reward_window_cache_seconds: float = 30.0,
@@ -2505,6 +2577,9 @@ class PsqlShareLedger:
     ):
         if writer_epoch < 0:
             raise ValueError("writer_epoch must be >= 0")
+        read_only = bool(read_only)
+        if read_only and initialize_schema:
+            raise ValueError("a read-only ledger cannot initialize the schema")
         accepted_stats_cache_seconds = float(accepted_stats_cache_seconds)
         if not math.isfinite(accepted_stats_cache_seconds) or accepted_stats_cache_seconds < 0:
             raise ValueError("accepted_stats_cache_seconds must be finite and non-negative")
@@ -2637,7 +2712,10 @@ class PsqlShareLedger:
         # remove. The scope keeps its lazy fallback for ledgers built through
         # __new__ in focused tests; the production path must not race.
         self._operation_progress_local = local()
-        self._lock = Lock()
+        self._read_only = read_only
+        # A read-only ledger never holds the writer lock, so it is not given
+        # one: see _RefusingWriterGate. Read-slot traffic is unaffected.
+        self._lock = _RefusingWriterGate() if read_only else Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         audit_share_segment_size = int(audit_share_segment_size)
         if audit_share_segment_size < 0:
@@ -2691,11 +2769,16 @@ class PsqlShareLedger:
         )
         self._writer_lease_guard: LeaseGuardPort | None = None
         try:
-            self._initialize_writer_lease_guard(database_url)
-            if initialize_schema:
-                path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
-                self._run_script(path.read_text(encoding="utf-8"))
-            self._ensure_writer_lease()
+            if not read_only:
+                # Constructing an ordinary ledger claims the single-writer
+                # lease. A read-only ledger must not, or a second process
+                # opening one would contend with -- and could adopt -- the
+                # lease the coordinator lands blocks under.
+                self._initialize_writer_lease_guard(database_url)
+                if initialize_schema:
+                    path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
+                    self._run_script(path.read_text(encoding="utf-8"))
+                self._ensure_writer_lease()
         except BaseException:
             self.close()
             raise
@@ -2870,6 +2953,62 @@ class PsqlShareLedger:
     @property
     def backend_name(self) -> str:
         return "postgres-psql"
+
+    def read_replica_status(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_READ_REPLICA_PROBE_TIMEOUT_SECONDS,
+    ) -> dict[str, object]:
+        """Replication-state probe backing the public read staleness contract.
+
+        Returns:
+
+        - ``in_recovery`` -- true only on a hot standby;
+        - ``replay_lag_seconds`` -- wall clock minus the newest replayed
+          transaction's commit time (None before any replay). This is an
+          informational staleness *indicator*, not a freshness proof: on an
+          idle primary it grows with wall time even though the replica is
+          fully caught up;
+        - ``receiver_heartbeat_age_seconds`` -- wall clock minus the newest
+          message from the primary's WAL sender (None when the walreceiver
+          is not connected). Heartbeats flow every
+          ``wal_receiver_status_interval`` (default 10s) even when the
+          primary is idle, so this is the replica-side liveness proof the
+          public read service enforces;
+        - ``apply_backlog_bytes`` -- WAL bytes received but not yet replayed.
+
+        The extracted public read service (issue #145) polls this to enforce
+        its bounded-staleness contract and to refuse serving from a writable
+        primary. Reads run through the ordinary read pool, so the probe never
+        touches the writer lease.
+
+        Bounded by default: this runs on the service's background probe
+        thread, and an unbounded probe against a wedged standby would leave
+        the freshness gate holding its last answer indefinitely rather than
+        ageing out into a refusal.
+        """
+        sql = """
+SELECT json_build_object(
+    'in_recovery', pg_is_in_recovery(),
+    'replay_lag_seconds', CASE
+        WHEN pg_last_xact_replay_timestamp() IS NULL THEN NULL
+        ELSE extract(epoch FROM (clock_timestamp() - pg_last_xact_replay_timestamp()))
+    END,
+    'receiver_heartbeat_age_seconds', CASE
+        WHEN (SELECT last_msg_receipt_time FROM pg_stat_wal_receiver) IS NULL THEN NULL
+        ELSE extract(epoch FROM (clock_timestamp() - (SELECT last_msg_receipt_time FROM pg_stat_wal_receiver)))
+    END,
+    'apply_backlog_bytes', CASE
+        WHEN pg_last_wal_receive_lsn() IS NULL OR pg_last_wal_replay_lsn() IS NULL THEN NULL
+        ELSE pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())
+    END
+);
+"""
+        with self.operation_timeout(timeout_seconds):
+            row = self._run_read_json(sql)
+        if not isinstance(row, dict):
+            raise RuntimeError("read replica status probe did not return an object")
+        return row
 
     @contextmanager
     def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:
@@ -4183,6 +4322,49 @@ WHERE owed_balance_sats > 0;
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
 
+    def dashboard_readiness_probe(self) -> bool:
+        """Cheapest possible proof that Postgres is reachable through a read slot.
+
+        The extracted public read tier's /healthz needs to answer "can I still
+        reach the database" without running any aggregate: a health check that
+        scans the share ledger turns a liveness probe into load, and the
+        compose healthcheck runs it on an interval forever. This is a constant
+        select -- it touches no PRISM table -- taken through the same bounded
+        read slot as every other public read, so a saturated read pool shows up
+        as an unhealthy service rather than as a probe that jumps the queue.
+        """
+        payload = self._run_read_json("SELECT json_build_object('ok', true);")
+        return bool(isinstance(payload, dict) and payload.get("ok"))
+
+    def dashboard_miner_owed_balance_bits(self, *, recipient_id: str) -> int:
+        """One recipient's owed balance, read without the writer lock.
+
+        The same total as summing current_owed_balances() for this recipient,
+        but filtered in SQL and taken through the bounded read slot instead of
+        the writer gate. current_owed_balances() returns every recipient's
+        balance under the writer lock, so serving the most-polled public route
+        (/public/v1/miners/{recipient_id}) from it made a dashboard poll
+        serialize against the lease-holding writer. The predicates match that
+        method exactly -- rows from qbit_current_owed_balances() with
+        owed_balance_sats > 0, restricted to this miner_id -- so the integer
+        returned here is the integer the Python sum produced.
+        """
+        if not recipient_id:
+            raise ValueError("recipient_id is required")
+        sql = f"""
+SELECT json_build_object(
+    'owed_balance_bits',
+    COALESCE((
+        SELECT sum(owed_balance_sats)
+        FROM qbit_current_owed_balances()
+        WHERE owed_balance_sats > 0
+          AND miner_id = {self._text_literal(recipient_id)}
+    ), 0)::text
+);
+"""
+        payload = self._run_read_json(sql)
+        return int(payload["owed_balance_bits"])
+
     def prior_balances_after_pool_block(
         self,
         *,
@@ -4936,6 +5118,91 @@ SELECT COALESCE(
             row = self._run_retry_safe_read_json(sql)
         return self._resolve_audit_bundle_row(row)
 
+    def dashboard_direct_coinbase_settlement(
+        self,
+        *,
+        block_hash: str,
+    ) -> dict[str, object] | None:
+        """Public settlement facts for a direct-coinbase block, without fencing.
+
+        /public/v1/blocks/{block_hash}/settlement-artifacts serves CTV blocks
+        from audit_ctv_fanout_manifest_set() (a read slot), but a
+        direct-coinbase block fell through to audit_bundle(), which reads the
+        same row under the writer lock. This is that read taken through the
+        bounded read slot instead, returning exactly the dict
+        public_api.direct_coinbase_settlement_payload() builds today.
+
+        The row is resolved through _resolve_audit_bundle_row, so an
+        externalized body is read from body_uri on disk and sha256-verified
+        against audit_bundle_sha256 by the same helper the fenced path uses.
+        A body that is unretrievable, hash-mismatched, or not valid JSON is
+        reported as None rather than raised, matching what
+        public_api.audit_bundle_body_read_failed() already tolerates.
+
+        Returns None when the block has no audit bundle, or when the bundle
+        settled in any mode other than direct_coinbase.
+        """
+        from lab.prism import public_api
+
+        sql = f"""
+SELECT COALESCE(
+    (
+        SELECT json_build_object(
+            'block_hash', bundle.block_hash,
+            'block_height', block.block_height,
+            'payout_manifest_sha256', block.payout_manifest_sha256,
+            'audit_bundle_sha256', bundle.audit_bundle_sha256,
+            'audit_bundle', bundle.audit_bundle,
+            'body_uri', bundle.body_uri
+        )
+        FROM qbit_pool_audit_bundles bundle
+        JOIN qbit_pool_blocks block
+          ON block.block_hash = bundle.block_hash
+        WHERE bundle.block_hash = {self._text_literal(block_hash)}
+    ),
+    'null'::json
+);
+"""
+        row = self._run_read_json(sql)
+        try:
+            resolved = self._resolve_audit_bundle_row(row)
+        except RuntimeError as exc:
+            if public_api.audit_bundle_body_read_failed(exc):
+                return None
+            raise
+        if not isinstance(resolved, dict):
+            return None
+        bundle = resolved.get("audit_bundle")
+        if not isinstance(bundle, dict):
+            return None
+        if public_api.audit_bundle_settlement_mode(bundle) != "direct_coinbase":
+            return None
+        return {
+            "block_hash": public_api.optional_hex_hash(resolved.get("block_hash"))
+            or block_hash,
+            "block_height": public_api.first_int(
+                resolved.get("block_height"),
+                public_api.audit_bundle_section_value(
+                    bundle, "found_block", "block_height"
+                ),
+                public_api.audit_bundle_section_value(
+                    bundle, "reward_manifest", "block_height"
+                ),
+                public_api.audit_bundle_section_value(
+                    bundle, "ledger_window_attestation", "block_height"
+                ),
+                default=0,
+            ),
+            "settlement_mode": "direct_coinbase",
+            "audit_bundle_sha256": public_api.nullable_str(
+                resolved.get("audit_bundle_sha256")
+            ),
+            "payout_manifest_sha256": public_api.nullable_str(
+                resolved.get("payout_manifest_sha256")
+            ),
+            "artifacts": [],
+        }
+
     def audit_bundle_by_commitment(self, *, commitment_leaf_hex: str) -> dict[str, object] | None:
         leaf = self._text_literal(commitment_leaf_hex)
         sql = f"""
@@ -5446,6 +5713,21 @@ SELECT json_build_object(
         }
 
     def dashboard_public_artifact(self, *, sha256: str) -> dict[str, object] | None:
+        document = self.dashboard_public_artifact_document(sha256=sha256)
+        if document is None:
+            return None
+        return document.get("payload")
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        """Artifact payload plus, for manifest kinds, its canonical text.
+
+        canonical_json is the manifest_set_json/manifest_json text persisted
+        at record time next to the JSONB copies — the exact byte sequence the
+        artifact's sha256 was computed over. Audit bundles have no stored
+        canonical serialization (their hash covers Rust struct-order bytes),
+        so their canonical_json is None. One statement serves both reads so a
+        request touches each artifact table at most once.
+        """
         sha256 = str(sha256).lower()
         lit = self._text_literal(sha256)
         sql = f"""
@@ -5455,6 +5737,20 @@ WITH audit AS (
     WHERE audit_bundle_sha256 = {lit}
     ORDER BY created_at DESC
     LIMIT 1
+),
+set_row AS (
+    SELECT manifest_set, manifest_set_json
+    FROM qbit_ctv_fanout_sets
+    WHERE manifest_set_sha256 = {lit}
+    ORDER BY created_at DESC
+    LIMIT 1
+),
+artifact_row AS (
+    SELECT manifest, manifest_json
+    FROM qbit_ctv_fanout_artifacts
+    WHERE manifest_sha256 = {lit}
+    ORDER BY updated_at DESC
+    LIMIT 1
 )
 SELECT json_build_object(
     'audit_bundle', (SELECT audit_bundle FROM audit),
@@ -5462,20 +5758,12 @@ SELECT json_build_object(
     'body_uri', (SELECT body_uri FROM audit),
     'has_audit_row', (SELECT count(*) FROM audit) > 0,
     'fallback', COALESCE(
-        (
-            SELECT manifest_set
-            FROM qbit_ctv_fanout_sets
-            WHERE manifest_set_sha256 = {lit}
-            ORDER BY created_at DESC
-            LIMIT 1
-        ),
-        (
-            SELECT manifest
-            FROM qbit_ctv_fanout_artifacts
-            WHERE manifest_sha256 = {lit}
-            ORDER BY updated_at DESC
-            LIMIT 1
-        )
+        (SELECT manifest_set FROM set_row),
+        (SELECT manifest FROM artifact_row)
+    ),
+    'fallback_canonical', COALESCE(
+        (SELECT manifest_set_json FROM set_row),
+        (SELECT manifest_json FROM artifact_row)
     )
 );
 """
@@ -5487,9 +5775,15 @@ SELECT json_build_object(
             if body is None:
                 body = self._read_external_body(row.get("body_uri"), expected_sha256=sha256)
             if body is not None:
-                return body
+                return {"payload": body, "canonical_json": None}
         fallback = row.get("fallback")
-        return fallback if isinstance(fallback, dict) else None
+        if not isinstance(fallback, dict):
+            return None
+        fallback_canonical = row.get("fallback_canonical")
+        return {
+            "payload": fallback,
+            "canonical_json": fallback_canonical if isinstance(fallback_canonical, str) else None,
+        }
 
     def dashboard_public_artifact_exists(self, *, sha256: str) -> bool:
         sha256 = str(sha256).lower()
@@ -7096,7 +7390,15 @@ SELECT json_build_object(
                 raise RuntimeError(str(result["error"]))
             confirmed_count = int(result["confirmed_count"])
             publication_sequence: object | None = None
-            if confirmed_count == 1:
+            if confirmed_count in {1, 2}:
+                # Both confirming dispositions leave a confirmed row carrying
+                # an ordinal: 1 allocated one in the statement above, and 2 --
+                # the idempotent replay -- returns the one its original flip
+                # allocated. The caller needs the ordinal either way to
+                # address this block's audit publication, so read it for
+                # both. Non-confirming dispositions (0, -1) have no row to
+                # read and stay a single statement.
+                #
                 # A data-modifying PL/pgSQL function runs under the statement's
                 # command snapshot, so a join in that same statement cannot see
                 # the freshly assigned ordinal. Read it in the next statement

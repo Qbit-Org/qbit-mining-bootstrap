@@ -180,6 +180,84 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
             after_attempt,
         )
 
+    def test_coordinator_lock_counts_every_granted_acquisition(self) -> None:
+        server = coordinator()
+        server.lock = _ObservedRLock()
+
+        with server.lock:
+            # Re-entrant re-acquisition is an acquire() call and counts as one:
+            # the contended counter is per call, so the denominator must be too.
+            with server.lock:
+                pass
+        self.assertTrue(server.lock.acquire(blocking=False))
+        server.lock.release()
+
+        acquisitions, contentions, _sum, _max = (
+            server.coordinator_lock_contention_snapshot()
+        )
+        self.assertEqual((acquisitions, contentions), (3, 0))
+
+        lock_wait_started = threading.Event()
+
+        def contend() -> None:
+            lock_wait_started.set()
+            with server.lock:
+                pass
+
+        with server.lock:
+            waiter = threading.Thread(target=contend)
+            waiter.start()
+            self.assertTrue(lock_wait_started.wait(1))
+            time.sleep(0.02)
+        waiter.join(1)
+        self.assertFalse(waiter.is_alive())
+
+        acquisitions, contentions, _sum, _max = (
+            server.coordinator_lock_contention_snapshot()
+        )
+        # The waiter's grant is one acquisition and one contention; the holder's
+        # own acquisition was uncontended.
+        self.assertEqual((acquisitions, contentions), (5, 1))
+
+        metrics = "\n".join(server.coordinator_lock_metrics_lines())
+        self.assertIn("qbit_prism_coordinator_lock_acquisitions_total 5", metrics)
+        self.assertIn("qbit_prism_coordinator_lock_contentions_total 1", metrics)
+
+    def test_coordinator_lock_timeout_is_contention_without_acquisition(self) -> None:
+        server = coordinator()
+        server.lock = _ObservedRLock()
+        timed_out = threading.Event()
+
+        def give_up() -> None:
+            if not server.lock.acquire(timeout=0.05):
+                timed_out.set()
+
+        with server.lock:
+            waiter = threading.Thread(target=give_up)
+            waiter.start()
+            waiter.join(1)
+        self.assertFalse(waiter.is_alive())
+        self.assertTrue(timed_out.is_set())
+
+        acquisitions, contentions, _sum, _max = (
+            server.coordinator_lock_contention_snapshot()
+        )
+        # Only the holder acquired. The abandoned wait is real contention, which
+        # is why the derived contended fraction is an upper bound.
+        self.assertEqual((acquisitions, contentions), (1, 1))
+
+    def test_accepted_share_rate_is_left_to_the_counter(self) -> None:
+        server = coordinator()
+
+        metrics = server.metrics_payload()
+
+        # The gauge divided the ledger's lifetime accepted count by this
+        # process's uptime. Removed rather than redefined: a series that
+        # disappears is loud, a series that silently changes meaning is not.
+        self.assertNotIn("qbit_prism_shares_per_second", metrics)
+        self.assertRegex(metrics, r"\nqbit_prism_accepted_shares_total \d+\n")
+        self.assertIn("qbit_prism_vardiff_lane_accepted_shares_total", metrics)
+
     def test_metrics_include_bounded_worker_share_and_rejection_counters(self) -> None:
         server = coordinator()
         server.worker_metrics_limit = 1

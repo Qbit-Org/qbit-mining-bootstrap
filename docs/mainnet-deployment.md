@@ -137,7 +137,7 @@ docker compose \
   --profile permissionless \
   --profile auxpow \
   --profile prism \
-  config --quiet qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator
+  config --quiet qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator prism-public-api
 ```
 
 Pull reviewed artifacts before stopping the prior release. Start operator
@@ -151,7 +151,7 @@ docker compose \
   --env-file "$DEPLOY_ENV_FILE" \
   -f compose.yaml \
   -f compose.production.yaml \
-  pull qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator
+  pull qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator prism-public-api
 
 docker compose \
   --project-name "$COMPOSE_PROJECT_NAME" \
@@ -186,7 +186,7 @@ docker compose \
   --env-file "$DEPLOY_ENV_FILE" \
   -f compose.yaml \
   -f compose.production.yaml \
-  up -d --no-build --pull never ckpool auxpow-stratum prism-coordinator
+  up -d --no-build --pull never ckpool auxpow-stratum prism-coordinator prism-public-api
 ```
 
 Remove services for lanes that are not enabled. The `make
@@ -234,7 +234,7 @@ Compose contract:
 | Lane | Operator services |
 | --- | --- |
 | CKPool solo | `qbitd ckpool` |
-| PRISM | `qbitd prism-postgres prism-coordinator` |
+| PRISM | `qbitd prism-postgres prism-coordinator prism-public-api` |
 | AuxPoW Stratum | `qbitd bitcoind auxpow-stratum` |
 
 `permissionless-miner`, `real-miner`, `auxpow-real-miner`, and the one-shot

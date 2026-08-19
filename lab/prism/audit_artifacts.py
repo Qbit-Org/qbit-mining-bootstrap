@@ -288,7 +288,18 @@ class AuditArtifactStore:
         canonicalizer: Callable[[dict[str, Any]], bytes] | None = None,
         verifier: Callable[..., dict[str, Any]] | None = None,
         wall_time: Callable[[], float] = time.time,
+        read_only: bool = False,
     ) -> None:
+        """Own one audit artifact root.
+
+        ``read_only`` opens the root for reading published bodies and nothing
+        else. The publication lock is an ordinary file opened O_RDWR and
+        created on demand, so acquiring it needs a writable filesystem; the
+        extracted public read tier mounts this volume ``:ro`` precisely so it
+        cannot write, and would fail to construct a store at all. A read-only
+        store therefore skips the lock, and every publication path refuses
+        rather than running unserialized.
+        """
         live_bundle_retention = int(config.live_bundle_retention)
         candidate_retention_seconds = int(config.candidate_retention_seconds)
         share_segment_size = int(config.share_segment_size)
@@ -298,33 +309,43 @@ class AuditArtifactStore:
         if verifier_timeout_seconds <= 0:
             raise ValueError("verifier timeout must be positive")
         configured_root = Path(config.root).expanduser().absolute()
-        configured_root.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            configured_root.mkdir(parents=True, exist_ok=True)
         root_stat = configured_root.lstat()
         if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
             raise RuntimeError("audit artifact root must be a non-symlink directory")
         root = configured_root.resolve(strict=True)
         configured_evidence = Path(config.evidence_path).expanduser().absolute()
-        configured_evidence.parent.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            configured_evidence.parent.mkdir(parents=True, exist_ok=True)
         evidence_path = configured_evidence.parent.resolve(strict=True) / configured_evidence.name
+        self._read_only = bool(read_only)
         self._root = root
         self._evidence_path = evidence_path
         self._root_fd, self._root_identity = self._open_directory_authority(root)
         try:
-            (
-                self._publication_lock_fd,
-                self._publication_lock_identity,
-            ) = self._open_publication_lock_authority(
-                root,
-                self._root_fd,
-                self._root_identity,
-            )
-            self._publication_lifecycle_lock = threading.RLock()
-            self._publication_inode_thread_lock = _publication_thread_lock(
+            if read_only:
+                # No lock file, and no fd that could ever authorize a write.
+                self._publication_lock_fd = -1
+                self._publication_lock_identity = None
+                self._publication_lifecycle_lock = threading.RLock()
+                self._publication_inode_thread_lock = threading.RLock()
+            else:
                 (
-                    self._publication_lock_identity.device,
-                    self._publication_lock_identity.inode,
+                    self._publication_lock_fd,
+                    self._publication_lock_identity,
+                ) = self._open_publication_lock_authority(
+                    root,
+                    self._root_fd,
+                    self._root_identity,
                 )
-            )
+                self._publication_lifecycle_lock = threading.RLock()
+                self._publication_inode_thread_lock = _publication_thread_lock(
+                    (
+                        self._publication_lock_identity.device,
+                        self._publication_lock_identity.inode,
+                    )
+                )
             self._publication_guard_owner: int | None = None
             self._publication_guard_depth = 0
             (
@@ -527,6 +548,10 @@ class AuditArtifactStore:
         lock_fd: int | None = None,
         lock_identity: _FileIdentity | None = None,
     ) -> None:
+        if getattr(self, "_read_only", False):
+            raise RuntimeError(
+                "audit artifact store is read-only: it holds no publication lock"
+            )
         root = self._root if root is None else root
         root_fd = self._root_fd if root_fd is None else root_fd
         root_identity = (
@@ -563,6 +588,10 @@ class AuditArtifactStore:
     def publication_order_guard(self) -> Iterator[None]:
         """Serialize ordinal allocation/publication across threads/processes."""
 
+        if getattr(self, "_read_only", False):
+            raise RuntimeError(
+                "audit artifact store is read-only: publication is not available"
+            )
         with self._publication_order_guard(validate_on_exit=True):
             yield
 
@@ -2024,6 +2053,28 @@ class AuditArtifactStore:
                             replay_annotations[annotation] = (
                                 self._latest_evidence[annotation]
                             )
+                    replay_confirmation = replay_annotations.get("confirmation")
+                    current_confirmation = self._latest_evidence.get("confirmation")
+                    if (
+                        isinstance(replay_confirmation, dict)
+                        and isinstance(current_confirmation, dict)
+                        and "confirmed_count" in current_confirmation
+                        and "confirmed_count" in replay_confirmation
+                    ):
+                        # The confirm disposition says how *this* call landed,
+                        # not what the block is. The flip that first published
+                        # this evidence reported a fresh confirmation (1);
+                        # every later replay of the same durable row reports
+                        # the idempotent disposition (2) -- which is the point
+                        # of that split (issue #61). Reuse the originally
+                        # durable value so an exact replay is not stranded as
+                        # a payload conflict. The publication ordinal inside
+                        # the same confirmation is block identity and is
+                        # compared unchanged: a replay that returned a
+                        # different ordinal still conflicts.
+                        replay_confirmation["confirmed_count"] = (
+                            current_confirmation["confirmed_count"]
+                        )
                     replay_persistence = copy.deepcopy(dict(persistence))
                     current_persistence = self._latest_evidence.get(
                         "persistence"

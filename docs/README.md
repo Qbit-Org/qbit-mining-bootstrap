@@ -16,6 +16,12 @@ references. For public-facing navigation, prefer the short path below.
   API ownership boundary and endpoint conventions.
 - [public-dashboard-api-v1.openapi.yaml](public-dashboard-api-v1.openapi.yaml):
   OpenAPI contract for `/public/v1`.
+- [prism-public-operator-endpoint-split.md](prism-public-operator-endpoint-split.md):
+  every HTTP endpoint classified as public read, operator, or payout-affecting,
+  with the evidence behind each call.
+- [prism-postgres-replica.md](prism-postgres-replica.md): provisioning and
+  operating the hot standby the public read tier answers from, including
+  replication slot management and the staleness bound it enforces.
 - [prism-storage-sizing.md](prism-storage-sizing.md): storage, VM sizing,
   artifact retention, and monitoring guidance.
 - [mainnet-deployment.md](mainnet-deployment.md): fail-closed production

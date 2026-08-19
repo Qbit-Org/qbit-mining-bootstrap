@@ -1,4 +1,10 @@
-"""Audit/public HTTP routing and bounded server lifecycle for PRISM."""
+"""Operator audit/ops HTTP routing and bounded server lifecycle for PRISM.
+
+The public ``/public/v1`` read surface is served by its own process
+(``lab/prism/public_read_service.py``), so nothing here imports
+``lab.prism.public_api``: an unknown ``/public/v1`` request reaches this
+listener's ordinary unknown-endpoint 404.
+"""
 
 from __future__ import annotations
 
@@ -9,8 +15,6 @@ import threading
 import time
 from typing import Mapping, Protocol
 import urllib.parse
-
-from lab.prism import public_api
 
 
 class AuditHttpPort(Protocol):
@@ -27,12 +31,6 @@ class AuditHttpPort(Protocol):
     def carry_forward_integrity_payload(self) -> Mapping[str, object]: ...
 
     def miner_status_payload(self, recipient_id: str) -> Mapping[str, object]: ...
-
-    def public_payload(
-        self,
-        path: str,
-        query: Mapping[str, list[str]],
-    ) -> tuple[int, object]: ...
 
     def ledger_backend(self) -> str: ...
 
@@ -155,7 +153,6 @@ class AuditHttpFacade:
     ) -> None:
         self.port = port
         self.config = config
-        self._public_response_cache = public_api.PublicResponseCache()
         self._lifecycle_lock = threading.Lock()
         self._server: _BoundedThreadingHttpServer | None = None
         self._thread: threading.Thread | None = None
@@ -352,9 +349,6 @@ class AuditHttpFacade:
                             "text/plain; version=0.0.4",
                         )
                         return
-                    if path == "/public/v1" or path.startswith("/public/v1/"):
-                        self.handle_public(path, query)
-                        return
                     if path == "/audit/latest":
                         payload = facade.port.latest_evidence_payload()
                         if payload is None:
@@ -454,59 +448,10 @@ class AuditHttpFacade:
                         self.handle_block_bundle(block_hash)
                         return
                     self.write_json(404, {"error": "unknown endpoint"})
-                except public_api.PublicApiError as exc:
-                    self.write_json(
-                        exc.status,
-                        public_api.error_payload(exc.code, exc.message),
-                        headers=public_api.public_error_headers(),
-                    )
                 except ValueError as exc:
-                    if path == "/public/v1" or path.startswith("/public/v1/"):
-                        self.write_json(
-                            500,
-                            public_api.error_payload(
-                                "internal_error",
-                                "internal server error",
-                            ),
-                            headers=public_api.public_error_headers(),
-                        )
-                    else:
-                        self.write_json(400, {"error": str(exc)})
+                    self.write_json(400, {"error": str(exc)})
                 except Exception as exc:
-                    if path == "/public/v1" or path.startswith("/public/v1/"):
-                        self.write_json(
-                            500,
-                            public_api.error_payload(
-                                "internal_error",
-                                "internal server error",
-                            ),
-                            headers=public_api.public_error_headers(),
-                        )
-                    else:
-                        self.write_json(500, {"error": str(exc)})
-
-            def handle_public(
-                self,
-                path: str,
-                query: dict[str, list[str]],
-            ) -> None:
-                cache_policy = public_api.public_cache_policy(path)
-                status, payload, cache_state, age_seconds = (
-                    facade._public_response_cache.get_or_compute(
-                        key=public_api.public_cache_key(path, query),
-                        ttl_seconds=cache_policy.ttl_seconds,
-                        compute=lambda: facade.port.public_payload(path, query),
-                    )
-                )
-                self.write_json(
-                    status,
-                    payload,
-                    headers=public_api.public_cache_headers(
-                        cache_policy,
-                        cache_state=cache_state,
-                        age_seconds=age_seconds,
-                    ),
-                )
+                    self.write_json(500, {"error": str(exc)})
 
             def handle_share_window(self, query: dict[str, list[str]]) -> None:
                 anchor_raw = self.first_query_value(
@@ -665,6 +610,11 @@ class AuditHttpFacade:
                 payload: object,
                 headers: dict[str, str] | None = None,
             ) -> None:
+                # The one content-addressed payload this listener used to
+                # serve (#154's /public/v1/artifacts/{sha256} RawJsonBody)
+                # left with the public read surface, so no route reaching
+                # here carries pre-serialized bytes and this module needs no
+                # public-API import at all.
                 body = json.dumps(payload, sort_keys=True).encode() + b"\n"
                 try:
                     self.send_response(status)
