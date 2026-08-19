@@ -628,17 +628,20 @@ class PayoutStateService:
             runtime._job_cache_lock
         )
         # Guarded by _job_cache_lock. The highest declared anchor among
-        # published job windows whose walk exposure retired without a
-        # seeded artifact to carry it (a build under the reuse
-        # kill-switch, or one with nothing to seed). Jobs stamped from
-        # such a bundle keep serving the window until they retire, and
-        # nothing else exposes its anchor between publication and the
-        # landing's own exposure -- so the anchor must stay visible to
-        # the append-side predates() checks: a replay-shaped append
-        # committing in that gap has to advance the epoch those jobs'
-        # landing fences compare against. Monotonic and never retired;
-        # ordinary share commits can never match it because every job
-        # anchor is clamped below the pending-commit floor.
+        # published job windows that nothing else keeps exposed: a
+        # seedless publication hands its anchor over at the publication
+        # fence (a build under the reuse kill-switch, or one with nothing
+        # to seed), and the armed artifact's anchor is folded in before
+        # the slot can drop or replace it
+        # (_replace_payout_ledger_artifact_locked). Jobs stamped from such
+        # a window keep serving it until they retire, and nothing else
+        # exposes its anchor between publication and the landing's own
+        # exposure -- so the anchor must stay visible to the append-side
+        # predates() checks: a replay-shaped append committing in that gap
+        # has to advance the epoch those jobs' landing fences compare
+        # against. Monotonic and never retired; ordinary share commits can
+        # never match it because every job anchor is clamped below the
+        # pending-commit floor.
         self._payout_published_job_window_anchor_ms: int | None = None
         # Guarded by _payout_state_prepare_lock. It is independent of the
         # published artifact generation: normal generation bumps retag
@@ -1061,7 +1064,7 @@ class PayoutStateService:
                                         armed_balances_sha256
                                         == reused_prior_balances_sha256
                                     ):
-                                        runtime._payout_ledger_artifact = None
+                                        self._disarm_payout_ledger_artifact_locked()
                     except Exception:
                         # The carry backstop is independent of the window
                         # oracle that just succeeded. Reverting here would
@@ -1533,15 +1536,17 @@ class PayoutStateService:
                 # fence hashes against the published payout state
                 # (including an accepted parent's preview patch).
                 anchor_advanced = artifact_anchor_ms > current_anchor_ms
-                runtime._payout_ledger_artifact = dataclass_replace(
-                    current,
-                    accepted_share_count=artifact.accepted_share_count,
-                    prepared_monotonic=time.monotonic(),
-                    snapshot_anchor_ms=(
-                        artifact.snapshot_anchor_ms
-                        if anchor_advanced
-                        else current.snapshot_anchor_ms
-                    ),
+                self._replace_payout_ledger_artifact_locked(
+                    dataclass_replace(
+                        current,
+                        accepted_share_count=artifact.accepted_share_count,
+                        prepared_monotonic=time.monotonic(),
+                        snapshot_anchor_ms=(
+                            artifact.snapshot_anchor_ms
+                            if anchor_advanced
+                            else current.snapshot_anchor_ms
+                        ),
+                    )
                 )
                 if anchor_advanced:
                     return "refreshed", int(current.generation)
@@ -1572,10 +1577,12 @@ class PayoutStateService:
         # mid-bundle-build and reaches cache publication only after the
         # audit builder, so stamping here keeps the budget honest at every
         # install site.
-        runtime._payout_ledger_artifact = dataclass_replace(
-            artifact,
-            generation=runtime._payout_ledger_artifact_generation,
-            prepared_monotonic=time.monotonic(),
+        self._replace_payout_ledger_artifact_locked(
+            dataclass_replace(
+                artifact,
+                generation=runtime._payout_ledger_artifact_generation,
+                prepared_monotonic=time.monotonic(),
+            )
         )
         return "installed", int(runtime._payout_ledger_artifact_generation)
 
@@ -1865,7 +1872,7 @@ class PayoutStateService:
                 # A candidate can carry a ledger snapshot prepared before its
                 # payout state is published. Never keep retrying that stale
                 # shortcut; the synchronous path will take a fresh snapshot.
-                runtime._payout_ledger_artifact = None
+                self._disarm_payout_ledger_artifact_locked()
                 return None
             served = artifact
         # Recorded outside the cache lock the event counter's own lock
@@ -3429,10 +3436,12 @@ class PayoutStateService:
                             # generation must never arm an already-stale
                             # artifact and force the next builds back through
                             # the synchronous reward-window walk.
-                            runtime._payout_ledger_artifact = dataclass_replace(
-                                prepared_artifact,
-                                generation=runtime._payout_ledger_artifact_generation,
-                                prepared_monotonic=time.monotonic(),
+                            self._replace_payout_ledger_artifact_locked(
+                                dataclass_replace(
+                                    prepared_artifact,
+                                    generation=runtime._payout_ledger_artifact_generation,
+                                    prepared_monotonic=time.monotonic(),
+                                )
                             )
                             publication_installed = (
                                 runtime._payout_ledger_artifact_generation,
@@ -3464,7 +3473,7 @@ class PayoutStateService:
                                     candidate_anchor_age_ms,
                                     len(prepared_artifact.shares_json),
                                 )
-                            runtime._payout_ledger_artifact = None
+                            self._disarm_payout_ledger_artifact_locked()
                         runtime._published_payout_state = PublishedPayoutState(
                             generation=published_generation,
                             source_generation=candidate.source_generation,
@@ -3736,6 +3745,31 @@ class PayoutStateService:
         with runtime._job_cache_lock:
             runtime._payout_window_inflight_scan_anchors.pop(int(token), None)
 
+    def _fold_published_job_window_anchor_locked(
+        self,
+        anchor_ms: int | None,
+    ) -> None:
+        """Raise the published-window anchor watermark to ``anchor_ms``.
+
+        Caller holds _job_cache_lock -- the lock every predates() read
+        takes -- so the raise is atomic with whatever exposure handed the
+        anchor over: no append can be classified against an anchor set
+        that has already lost the anchor but not yet gained the watermark.
+        Raising it early or redundantly is always safe, because a higher
+        watermark can only classify MORE rows as predating, and that is
+        the fail-closed direction: an extra bump is forgiven per anchor by
+        _append_epoch_invalidated_declared_anchor, while a missing one
+        leaves no stamp for a landing's fences to refuse. ``None`` is a
+        no-op.
+        """
+        if anchor_ms is None:
+            return
+        runtime = self._runtime
+        runtime._payout_published_job_window_anchor_ms = max(
+            int(anchor_ms),
+            runtime._payout_published_job_window_anchor_ms or 0,
+        )
+
     def _publish_seedless_job_window_anchor_locked(self, anchor_ms: int) -> None:
         """Keep a seedless published window's anchor visible to appends.
 
@@ -3751,11 +3785,47 @@ class PayoutStateService:
         retired; the pending-commit floor keeps every ordinary share commit
         above it.
         """
+        self._fold_published_job_window_anchor_locked(anchor_ms)
+
+    def _replace_payout_ledger_artifact_locked(
+        self,
+        artifact: PayoutLedgerArtifact | None,
+    ) -> None:
+        """Every write to the armed-artifact slot goes through here.
+
+        Caller holds _job_cache_lock. A seeded window's anchor may be
+        exposed to the append-side predates() checks by nothing but the
+        armed artifact, while jobs stamped from that window stay landable
+        after the slot changes: a disarm or replacement retires the cache,
+        never the jobs. Folding the outgoing artifact's anchor into the
+        never-retired published-window watermark BEFORE the slot moves --
+        under the same lock every predates() read takes, so no append can
+        observe the anchor gone with the watermark not yet raised --
+        preserves the invariant the landing fences assume: the anchor-set
+        maximum never decreases while any job is landable, so every append
+        that predates a live or seeded anchor bumps the epoch and leaves a
+        stamp for the fences to read. Skipping the fold is the disarm gap:
+        the bump that consults the seeded anchor also disarms the artifact,
+        emptying the anchor set, and a later row genuinely predating a
+        still-landable candidate's window then commits with no bump at all
+        -- nothing for the anchor-scoped predicate to refuse, so the
+        landing submits an invalidated window. The permanence is what the
+        per-anchor predicate makes affordable: a retired anchor forces
+        extra bumps only from replay-shaped rows (the pending-commit floor
+        keeps ordinary commits above every job anchor), and each is
+        forgiven per anchor instead of over-abandoning (issue #126).
+        """
         runtime = self._runtime
-        runtime._payout_published_job_window_anchor_ms = max(
-            int(anchor_ms),
-            runtime._payout_published_job_window_anchor_ms or 0,
-        )
+        outgoing = runtime._payout_ledger_artifact
+        if outgoing is not None:
+            self._fold_published_job_window_anchor_locked(
+                outgoing.snapshot_anchor_ms
+            )
+        runtime._payout_ledger_artifact = artifact
+
+    def _disarm_payout_ledger_artifact_locked(self) -> None:
+        """Drop the armed artifact, keeping its anchor in the watermark."""
+        self._replace_payout_ledger_artifact_locked(None)
 
     @staticmethod
     def _pending_share_predates_anchor(
@@ -3923,8 +3993,9 @@ class PayoutStateService:
         locked emptiness check. Commit-scoped retention is sound because an
         append that completed before this drain cannot have predated
         ``anchor_ms`` silently: every landable declared anchor is exposed
-        from publication onward (the armed artifact's anchor, or the
-        published-window watermark a seedless build hands its anchor to at
+        from publication onward (the armed artifact's anchor -- which the
+        published-window watermark absorbs before the slot can drop it --
+        or that same watermark a seedless build hands its anchor to at
         the publication fence), so such an append classified as fenced and
         advanced the epoch this landing's fences compare against.
         """
@@ -3996,7 +4067,13 @@ class PayoutStateService:
                 self._record_append_invalidation_stamp_locked(
                     epoch, pending_share
                 )
-                runtime._payout_ledger_artifact = None
+                # The fold inside the disarm is load-bearing here: this bump
+                # may be consulting the armed artifact's anchor as the last
+                # live exposure of a seeded window, and dropping it bare
+                # would let the NEXT predating row commit against an empty
+                # anchor set -- silently, with no stamp for a still-landable
+                # candidate's fences to refuse.
+                self._disarm_payout_ledger_artifact_locked()
                 return epoch
 
         if landing_fence_owned:

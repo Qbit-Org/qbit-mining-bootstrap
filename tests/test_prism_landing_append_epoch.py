@@ -31,6 +31,19 @@ The two fail-closed cases that have nothing to do with stamps are here too:
 a baseline epoch older than the retained stamp history cannot be answered,
 and neither can a candidate that declares no anchor. Both abandon, which is
 what the bare counter did for every candidate.
+
+The scoped predicate reads recorded bumps, so it is only as good as the
+guarantee that every predating append bumps. The disarm-gap scenario pins
+that guarantee at its one weak point: a seeded window's anchor is exposed
+only by the armed artifact, and the bump that consults it also disarms it,
+so without the watermark fold a second append could predate the candidate's
+window with the anchor set empty -- no bump, no stamp, and a fence that
+reads only harmless history submits an invalidated window.
+
+Finally, the recorded stamp itself is pinned. A row predates an anchor iff
+BOTH its stamps do -- iff their max does -- and every equal-stamp scenario
+above records the same number under max(), min(), or either stamp alone.
+The straddling pair pulls the stamps apart so only max() survives it.
 """
 
 from __future__ import annotations
@@ -38,6 +51,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -64,6 +78,14 @@ LATER_THAN_ANCHOR_MS = 15_000
 # Stamped inside the candidate's own window, and on its exact boundary.
 INSIDE_ANCHOR_MS = 9_000
 AT_ANCHOR_MS = ANCHOR_MS
+# A newer SEEDED window. Unlike NEWER_WINDOW_ANCHOR_MS it is never handed
+# to the published-window watermark: its anchor is exposed only by the
+# armed payout-ledger artifact, which the first bump disarms -- the
+# precondition for the disarm gap.
+NEWER_SEEDED_ANCHOR_MS = 20_000
+# The acceptance stamp of a row whose two stamps differ while both sit
+# inside the candidate's window.
+ALSO_INSIDE_ANCHOR_MS = 11_000
 
 # The last phase the landing names before the fallback lane's authoritative
 # fence. Stopping here puts a tail past the advisory pre-offer read, with no
@@ -152,6 +174,89 @@ def _land_across_the_authoritative_fence(
 
     outcome = _landing_outcome(harness, found)
     outcome["epoch_at_advisory_read"] = epoch_at_advisory_read
+    outcome["bumped_to"] = appended.value()
+    return outcome
+
+
+def _silent_append_after_disarm(harness: LandingHarness) -> dict[str, object]:
+    """The disarm gap: a predating append that leaves no bump at all.
+
+    A newer SEEDED window's anchor lives only on the armed artifact --
+    deliberately NOT ``publish_window_anchor()``, whose seedless watermark
+    is immortal and would hide the gap. The first append predates only that
+    newer window, so it bumps; the bump also disarms the artifact, and with
+    it the window's only anchor exposure. The second append genuinely
+    predates the candidate's declared anchor, but if the disarm emptied the
+    anchor set it records nothing: no bump, no stamp, and the landing's
+    anchor-scoped fences read only the first bump's harmless stamp and
+    submit a window a durable share invalidated. The fold of the armed
+    artifact's anchor into the published-window watermark is what closes
+    this: the second append still finds an anchor to predate and leaves the
+    stamp the fences then refuse.
+    """
+    harness.boot()
+    found = harness.found_block(
+        BLOCK,
+        height=10,
+        anchor_job_issued_at_ms=ANCHOR_MS,
+    )
+    # A staging liberty: production arms a full PayoutLedgerArtifact, but
+    # the anchor-set arithmetic under test reads only snapshot_anchor_ms.
+    harness.pool._payout_ledger_artifact = SimpleNamespace(
+        snapshot_anchor_ms=NEWER_SEEDED_ANCHOR_MS
+    )
+    bump = harness.append_late_visible_share(stamp_ms=LATER_THAN_ANCHOR_MS)
+    harness.drain([harness.appender])
+    silent = harness.append_late_visible_share(
+        stamp_ms=INSIDE_ANCHOR_MS,
+        share_id="appender:silent",
+    )
+    harness.drain([harness.appender])
+
+    harness.land_on_accounting_tail(found)
+    harness.drain([harness.accounting, harness.appender])
+
+    outcome = _landing_outcome(harness, found)
+    outcome["bumped_to"] = bump.value()
+    outcome["silent_bump"] = silent.value()
+    outcome["artifact_disarmed"] = harness.pool._payout_ledger_artifact is None
+    return outcome
+
+
+def _append_with_distinct_stamps_then_land(
+    harness: LandingHarness,
+    *,
+    job_issued_at_ms: int,
+    accepted_at_ms: int,
+) -> dict[str, object]:
+    """The drained shape above, with the row's two stamps pulled apart.
+
+    The recorded bump stamp is ``max(job_issued_at_ms, accepted_at_ms)``: a
+    row predates an anchor iff BOTH stamps do, i.e. iff that max does. The
+    equal-stamp scenarios in this file cannot tell that choice from
+    ``min()`` or either stamp alone. A straddling row -- issued at or
+    before the candidate's anchor, accepted after -- is where they part
+    ways: it does not predate the candidate's window, so recording anything
+    but the max would abandon a block whose window was never invalidated,
+    which is #126's over-abandon back again.
+    """
+    harness.boot()
+    found = harness.found_block(
+        BLOCK,
+        height=10,
+        anchor_job_issued_at_ms=ANCHOR_MS,
+    )
+    harness.publish_window_anchor(NEWER_WINDOW_ANCHOR_MS)
+    appended = harness.append_late_visible_share(
+        stamp_ms=job_issued_at_ms,
+        accepted_at_ms=accepted_at_ms,
+    )
+    harness.drain([harness.appender])
+
+    harness.land_on_accounting_tail(found)
+    harness.drain([harness.accounting, harness.appender])
+
+    outcome = _landing_outcome(harness, found)
     outcome["bumped_to"] = appended.value()
     return outcome
 
@@ -290,6 +395,66 @@ class AppendEpochScopedToTheDeclaredAnchorTests(unittest.TestCase):
         """
         outcome = self._deterministic(
             lambda harness: _append_then_land(harness, stamp_ms=AT_ANCHOR_MS)
+        )
+        self.assertEqual(outcome["bumped_to"], 1)
+        self._assert_abandoned_as_append_epoch_stale(outcome)
+
+    # -- the disarm gap ------------------------------------------------------
+
+    def test_a_predating_append_after_the_seeded_anchor_disarms_still_abandons(
+        self,
+    ) -> None:
+        """A bump that disarms the artifact must not blind the next append.
+
+        Before the watermark fold this submitted: the second append
+        returned ``None`` (no live anchor covered it), the fences saw only
+        the first bump's harmless stamp, and ``submitted`` held the block
+        -- a coinbase whose window omitted a durable share.
+        """
+        outcome = self._deterministic(_silent_append_after_disarm)
+        # The premise: the first append moved the epoch by predating the
+        # seeded window, and doing so disarmed the artifact that was that
+        # window's only anchor exposure.
+        self.assertEqual(outcome["bumped_to"], 1)
+        self.assertTrue(outcome["artifact_disarmed"])
+        # The fix: the second append still finds an anchor to predate --
+        # the disarm folded the seeded anchor into the watermark -- so its
+        # bump and stamp exist for the fences to refuse.
+        self.assertEqual(outcome["silent_bump"], 2)
+        self.assertEqual(outcome["live_epoch"], 2)
+        self._assert_abandoned_as_append_epoch_stale(outcome)
+
+    # -- the recorded stamp is the max of the row's two ----------------------
+
+    def test_a_straddling_append_lands_the_block(self) -> None:
+        """Issued at or before the anchor, accepted after: not predating.
+
+        The row invalidates the newer published window (both stamps are at
+        or before its anchor), so the epoch moves -- but the candidate's
+        own window is intact, and only a recorded stamp of
+        ``max(job_issued_at_ms, accepted_at_ms)`` says so. ``min()`` or the
+        issue stamp alone records 9_000 here and abandons a valid block.
+        """
+        outcome = self._deterministic(
+            lambda harness: _append_with_distinct_stamps_then_land(
+                harness,
+                job_issued_at_ms=INSIDE_ANCHOR_MS,
+                accepted_at_ms=LATER_THAN_ANCHOR_MS,
+            )
+        )
+        self.assertEqual(outcome["bumped_to"], 1)
+        self._assert_landed(outcome)
+
+    def test_an_append_with_distinct_stamps_inside_the_window_still_abandons(
+        self,
+    ) -> None:
+        """And the same distinct-stamp row is terminal once both predate."""
+        outcome = self._deterministic(
+            lambda harness: _append_with_distinct_stamps_then_land(
+                harness,
+                job_issued_at_ms=INSIDE_ANCHOR_MS,
+                accepted_at_ms=ALSO_INSIDE_ANCHOR_MS,
+            )
         )
         self.assertEqual(outcome["bumped_to"], 1)
         self._assert_abandoned_as_append_epoch_stale(outcome)

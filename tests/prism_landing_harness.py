@@ -770,21 +770,27 @@ class LandingHarness(HarnessBase):
         *,
         stamp_ms: int,
         share_id: str | None = None,
+        accepted_at_ms: int | None = None,
     ) -> Call:
         """Make one share durable and let it advance the invalidation epoch.
 
         Queued on its own actor, because the append side is a third thread in
         production (the share writer) and because the bump takes the landing
-        fence, which a landing may be holding. ``stamp_ms`` sets both the job
-        issue and acceptance stamps, so it is exactly the quantity the
-        append-side ``predates`` test compares against an anchor: the row
-        invalidates a window whose declared anchor is at or after it, and no
-        other.
+        fence, which a landing may be holding. ``stamp_ms`` sets the job
+        issue stamp and, unless ``accepted_at_ms`` says otherwise, the
+        acceptance stamp too. With both stamps equal it is exactly the
+        quantity the append-side ``predates`` test compares against an
+        anchor: the row invalidates a window whose declared anchor is at or
+        after it, and no other. A distinct ``accepted_at_ms`` stages a
+        straddling row -- issued at or before an anchor, accepted after --
+        which predates only anchors at or after *both* stamps, and whose
+        recorded bump stamp is their max.
 
         Returns the queued call; its value is the advanced epoch, or None when
         no live anchor predated the row.
         """
         stamp = int(stamp_ms)
+        accepted = stamp if accepted_at_ms is None else int(accepted_at_ms)
         share = PendingShare(
             share_id=share_id or f"appender:{stamp}",
             miner_id="miner-b",
@@ -795,7 +801,7 @@ class LandingHarness(HarnessBase):
             template_height=self.block_height - 1,
             job_id="append-job",
             job_issued_at_ms=stamp,
-            accepted_at_ms=stamp,
+            accepted_at_ms=accepted,
             ntime=1_700_000_000,
         )
 
@@ -805,7 +811,8 @@ class LandingHarness(HarnessBase):
             )
             return self.pool._record_late_visible_payout_append(share)
 
-        return self.appender.submit(run, label=f"append:{stamp}")
+        label = f"append:{stamp}" if accepted == stamp else f"append:{stamp}:{accepted}"
+        return self.appender.submit(run, label=label)
 
     def live_append_epoch(self) -> int:
         return int(self.pool._payout_ledger_append_invalidation_epoch)

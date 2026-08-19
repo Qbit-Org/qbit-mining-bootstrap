@@ -930,11 +930,23 @@ class BlockFinalizationService:
                             # Anchor-scoped, exactly as the advisory read
                             # above: a bump that commits inside this window
                             # is terminal only if the row that caused it
-                            # predates this candidate's declared anchor. The
-                            # fence lock is what makes the answer
-                            # authoritative -- the bump takes the same lock,
-                            # so the recorded stamp this reads is the whole
-                            # history the block's window can still see.
+                            # predates this candidate's declared anchor.
+                            # Two guarantees make reading recorded bumps
+                            # sufficient. The fence lock makes the answer
+                            # authoritative: the bump takes the same lock,
+                            # so none can commit between this comparison
+                            # and the RPC below. And every append that
+                            # predates this candidate's window has a bump
+                            # to read: the landing's own anchor is exposed
+                            # for the landing's duration, and the anchor-
+                            # set maximum never decreases while any job is
+                            # landable (an armed artifact's anchor is
+                            # folded into the never-retired published-
+                            # window watermark before the slot can drop
+                            # it), so a predating row always finds an
+                            # anchor to predate and stamps the epoch it
+                            # advances -- never a silent commit this read
+                            # would mistake for harmless history.
                             if self.runtime._append_epoch_invalidated_declared_anchor(
                                 baseline_epoch=effective_append_epoch,
                                 live_epoch=live_append_epoch,
