@@ -476,12 +476,41 @@ PRISM_TEMPLATE_FINGERPRINT_VOLATILE_KEYS = frozenset(
 
 
 class _ObservedRLock:
-    """RLock with zero shared-metrics work on uncontended acquisitions.
+    """RLock with no mutex acquisition on uncontended acquisitions.
 
-    The coordinator lock protects control-plane publication state. Its
-    contention counters intentionally record only acquisitions that fail an
-    immediate probe, so observing it cannot recreate the share-path convoy the
-    metrics are meant to diagnose.
+    The coordinator lock protects control-plane publication state. Its wait
+    counters intentionally record only acquisitions that fail an immediate
+    probe, and the shared mutex guarding them is therefore never taken on an
+    uncontended acquisition, so observing this lock cannot recreate the
+    share-path convoy the metrics are meant to diagnose.
+
+    A contended count on its own is an absolute number with no denominator, so
+    a contended percentage cannot be derived from a live process. The
+    acquisition counter that supplies that denominator does run on every
+    acquisition, contended or not, and preserves the property above by where
+    it runs rather than by how often: it is incremented only while the
+    underlying RLock is already held, which puts it inside a critical section
+    the lock has already serialised. It therefore adds no mutex acquisition
+    and no cross-thread ordering that the lock did not already impose, and it
+    cannot convoy the fast path.
+
+    That placement is also why this counter does not rest on an increment
+    being atomic under the GIL -- the lock, not the interpreter, is what makes
+    it safe, so it stays correct on a free-threaded build (see #150, which
+    audits that class of assumption in this tree). The one unsynchronised
+    access is the read in contention_snapshot, which holds only
+    _metrics_lock: it assumes an attribute read yields a whole value rather
+    than a torn one, and may observe the counter one increment stale. Both are
+    acceptable for a monotonic counter read by a metrics scrape, and neither
+    is load-bearing for correctness anywhere else.
+
+    Only granted acquisitions are counted. A wait that times out records
+    contention without an acquisition, so where a caller passes a timeout the
+    derived contended percentage is an upper bound. Hold *duration* is
+    deliberately not instrumented: a re-entrant lock would need per-thread
+    depth tracking to avoid double counting nested holds, and a clock read on
+    every acquire and release is exactly the fast-path work this class exists
+    to avoid.
     """
 
     def __init__(
@@ -491,6 +520,9 @@ class _ObservedRLock:
     ) -> None:
         self._lock = threading.RLock()
         self._metrics_lock = threading.Lock()
+        # Guarded by _lock itself, never by _metrics_lock. See the class
+        # docstring: every write below happens with _lock held.
+        self._acquisition_count = 0
         self._contention_count = 0
         self._wait_seconds_sum = 0.0
         self._wait_seconds_max = 0.0
@@ -498,8 +530,12 @@ class _ObservedRLock:
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         if not blocking:
-            return self._lock.acquire(blocking=False)
+            if not self._lock.acquire(blocking=False):
+                return False
+            self._acquisition_count += 1
+            return True
         if self._lock.acquire(blocking=False):
+            self._acquisition_count += 1
             return True
         started = time.monotonic()
         observer = self._wait_observer
@@ -522,6 +558,9 @@ class _ObservedRLock:
                 if not acquired:
                     observer(max(0.0, time.monotonic() - started))
         waited = max(0.0, time.monotonic() - started)
+        if acquired:
+            # Still under _lock, as on the uncontended path above.
+            self._acquisition_count += 1
         with self._metrics_lock:
             self._contention_count += 1
             self._wait_seconds_sum += waited
@@ -541,9 +580,16 @@ class _ObservedRLock:
     def _is_owned(self) -> bool:
         return self._lock._is_owned()  # type: ignore[attr-defined]
 
-    def contention_snapshot(self) -> tuple[int, float, float]:
+    def contention_snapshot(self) -> tuple[int, int, float, float]:
+        """Return (acquisitions, contentions, wait_sum, wait_max).
+
+        The acquisition count is read without _lock on purpose -- taking the
+        coordinator lock to publish a metric would be the observation cost
+        this class refuses to pay.
+        """
         with self._metrics_lock:
             return (
+                self._acquisition_count,
                 self._contention_count,
                 self._wait_seconds_sum,
                 self._wait_seconds_max,
@@ -9496,13 +9542,18 @@ class PrismCoordinator:
             pass
         return rss_bytes, open_descriptors
 
-    def coordinator_lock_contention_snapshot(self) -> tuple[int, float, float]:
-        """Raw (count, wait_sum, wait_max) from the control-plane lock."""
+    def coordinator_lock_contention_snapshot(self) -> tuple[int, int, float, float]:
+        """Raw (acquisitions, contentions, wait_sum, wait_max) from the lock."""
         snapshot = getattr(self.lock, "contention_snapshot", None)
         if callable(snapshot):
-            contention_count, wait_sum, wait_max = snapshot()
-            return int(contention_count), float(wait_sum), float(wait_max)
-        return 0, 0.0, 0.0
+            acquisition_count, contention_count, wait_sum, wait_max = snapshot()
+            return (
+                int(acquisition_count),
+                int(contention_count),
+                float(wait_sum),
+                float(wait_max),
+            )
+        return 0, 0, 0.0, 0.0
 
     def coordinator_lock_metrics_lines(self) -> list[str]:
         # Compatibility wrapper for the extracted metrics owner.
