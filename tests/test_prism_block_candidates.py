@@ -3303,6 +3303,157 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertFalse(server._payout_state_publication_blocked)
         self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
 
+    def test_at_tip_idempotent_confirm_replay_skips_publication(self) -> None:
+        """An at-tip replay reports the idempotent disposition, not a flip.
+
+        qbit_confirm_pool_block returns 2 when its UPDATE matched nothing but
+        the row is already confirmed at that (hash, height): the call changed
+        nothing and allocated no publication ordinal. Before that split the
+        same replay reported 1 and was indistinguishable from a fresh flip,
+        so the window after finding a block -- where the candidate replays
+        while its own block is still the best tip -- republished payout state
+        on every pass. The replay must complete the candidate without
+        reserving a source, bumping the generation, wiping the job-bundle
+        cache or scheduling refresh churn, and must never be mistaken for a
+        failed confirmation, which fences delivery, republishes a withdrawal
+        and halts the pool (issue #61).
+        """
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.max_blocks = 2
+        server.stop_after_block = False
+        block_hash = "da" * 32
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+            self.assertEqual(server._payout_state_generation, 1)
+            self.assertEqual(
+                server._published_payout_state.source_tip_hash,
+                block_hash,
+            )
+            self.assertEqual(server._payout_state_source[0], 1)
+            flipped_sequence = int(
+                ledger._audit_publication_sequences[block_hash]
+            )
+
+            # Replay the durable candidate while its own block is still the
+            # best tip -- no successor has arrived, so nothing about the
+            # active chain distinguishes this pass from the original landing.
+
+            class AtTipReplayRpc:
+                def call(self, method: str, params: object = None) -> object:
+                    if method == "getbestblockhash":
+                        return block_hash
+                    if method == "getblockheader":
+                        if params != [block_hash]:
+                            raise AssertionError(params)
+                        return {"height": 10, "confirmations": 1}
+                    if method == "getblockhash":
+                        if params != [10]:
+                            raise AssertionError(params)
+                        return block_hash
+                    if method == "getblockcount":
+                        return 10
+                    if method == "submitblock":
+                        raise AssertionError(
+                            "active tip must not be resubmitted"
+                        )
+                    raise RuntimeError(method)
+
+            server.rpc = AtTipReplayRpc()
+            ledger.pool_block_state = (  # type: ignore[attr-defined]
+                lambda **_kwargs: {
+                    "chain_state": "confirmed",
+                    "maturity_state": "immature",
+                }
+            )
+
+            def confirm_at_tip_replay(**kwargs: object) -> dict[str, object]:
+                self.assertEqual(kwargs["block_hash"], block_hash)
+                self.assertEqual(kwargs["active_tip_height"], 10)
+                # The idempotent arm returns the ordinal the original flip
+                # allocated and burns no sequence.
+                return {
+                    "backend": "fake",
+                    "confirmed_count": 2,
+                    "audit_publication_sequence": flipped_sequence,
+                }
+
+            ledger.confirm_accepted_block = confirm_at_tip_replay  # type: ignore[method-assign]
+            retry_calls = 0
+
+            def count_retry() -> None:
+                nonlocal retry_calls
+                retry_calls += 1
+
+            server._schedule_tip_refresh_retry = count_retry  # type: ignore[method-assign]
+            cache_key = ("sentinel",)
+            server._job_bundle_cache[cache_key] = object()
+            discarded_before = server.payout_state_candidates_discarded
+            pending_marks_before = server._tip_refresh_pending_counter
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+            latest_evidence = server.latest_evidence
+
+        self.assertEqual(server._payout_state_generation, 1)
+        self.assertEqual(server._published_payout_state.source_generation, 1)
+        self.assertEqual(server._published_payout_state.source_tip_hash, block_hash)
+        self.assertEqual(server._payout_state_source[0], 1)
+        self.assertIn(cache_key, server._job_bundle_cache)
+        self.assertEqual(retry_calls, 0)
+        self.assertEqual(
+            server._tip_refresh_pending_counter,
+            pending_marks_before,
+        )
+        self.assertEqual(
+            server.payout_state_candidates_discarded,
+            discarded_before,
+        )
+        self.assertFalse(server._payout_state_publication_blocked)
+        self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
+        # A covered replay is not a confirmation failure: no shutdown, and the
+        # candidate stays accepted rather than being abandoned.
+        self.assertFalse(server.stop_event.is_set())
+        self.assertEqual(server.accepted_block_count, 1)
+        # The audit publication replays exactly against the ordinal the flip
+        # allocated. The disposition itself is observational -- reporting 2
+        # where the published evidence recorded 1 must not strand the replay
+        # as a payload conflict.
+        self.assertIsNotNone(latest_evidence)
+        assert latest_evidence is not None
+        self.assertEqual(
+            latest_evidence["audit_publication_identity"]["sequence"],
+            flipped_sequence,
+        )
+        self.assertEqual(latest_evidence["confirmation"]["confirmed_count"], 1)
+
     def test_leaked_publication_fence_replay_republishes(self) -> None:
         server, state, ledger = submit_coordinator()
         server._ensure_job_cache_state()

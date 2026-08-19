@@ -248,12 +248,16 @@ class RecordingLedger(FakeLedger):
         self.confirmed.append({**kwargs, "submit_seen_at_confirm": self.submit_seen})
         block_hash = str(kwargs.get("block_hash") or "")
         sequence = self._audit_publication_sequences.get(block_hash)
+        already_confirmed = sequence is not None
         if sequence is None:
             sequence = len(self._audit_publication_sequences) + 1
             self._audit_publication_sequences[block_hash] = sequence
         return {
             "backend": "fake",
-            "confirmed_count": 1,
+            # Mirror the production disposition split: 1 is the fresh flip
+            # that allocates the ordinal, 2 the idempotent replay of a row
+            # this writer already confirmed, which allocates none.
+            "confirmed_count": 2 if already_confirmed else 1,
             "audit_publication_sequence": sequence,
         }
 
