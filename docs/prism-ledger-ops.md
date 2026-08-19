@@ -459,10 +459,13 @@ reproduce the ordinals observed before the revert, and external consumers
 that recorded pre-revert ordinals will see the sequence renumbered.
 
 Apply the revert with the ledger role whose `search_path` selects the PRISM
-schema, and stop on the first error:
+schema, inside a single transaction, and stop on the first error (the revert
+script wraps itself in one `BEGIN`/`COMMIT` and relies on it, matching the
+forward script):
 
 ```sh
 psql "$PRISM_DATABASE_URL" \
+  --single-transaction \
   --set ON_ERROR_STOP=1 \
   -f crates/qbit-prism/sql/001_share_ledger_revert_audit_publication_sequence.sql
 ```
