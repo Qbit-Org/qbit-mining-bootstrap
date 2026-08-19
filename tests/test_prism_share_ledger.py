@@ -42,6 +42,7 @@ from lab.prism.share_ledger import (
     _NativePostgresLeaseGuard,
     _prism_window_shares,
     _writer_lease_advisory_lock_key,
+    canonical_json_text,
     sha256_json_hex,
 )
 
@@ -1211,6 +1212,39 @@ class PrismShareLedgerTests(unittest.TestCase):
         )
 
         self.assertIsNone(ledger.dashboard_public_artifact(sha256=audit_bundle_sha256))
+
+    def test_memory_ledger_public_artifact_canonical_json_returns_hashed_text(self) -> None:
+        # The canonical text is the exact byte sequence the advertised sha256
+        # was computed over; serving anything else breaks external
+        # verification of content-addressed artifacts.
+        ledger = SingleWriterShareLedger()
+        block_hash = "aa" * 32
+        audit_bundle_sha256 = "77" * 32
+        manifest_set = {
+            **sample_ctv_manifest_set(),
+            "audit_bundle_sha256": audit_bundle_sha256,
+            "audit_bundle": {"schema": "qbit.prism.audit-bundle.v1"},
+        }
+        manifest = manifest_set["manifests"][0]  # type: ignore[index]
+        manifest_set_sha256 = sha256_json_hex(manifest_set)
+
+        ledger.persist_ctv_fanout_manifest_set(
+            block_hash=block_hash,
+            manifest_set=manifest_set,
+            manifest_set_sha256=manifest_set_sha256,
+        )
+
+        manifest_set_json = ledger.dashboard_public_artifact_canonical_json(sha256=manifest_set_sha256)
+        manifest_json = ledger.dashboard_public_artifact_canonical_json(sha256=sha256_json_hex(manifest))
+
+        self.assertEqual(manifest_set_json, canonical_json_text(manifest_set))
+        self.assertEqual(manifest_json, canonical_json_text(manifest))
+        self.assertEqual(
+            hashlib.sha256(manifest_set_json.encode()).hexdigest(),  # type: ignore[union-attr]
+            manifest_set_sha256,
+        )
+        self.assertIsNone(ledger.dashboard_public_artifact_canonical_json(sha256=audit_bundle_sha256))
+        self.assertIsNone(ledger.dashboard_public_artifact_canonical_json(sha256="99" * 32))
 
     def test_reorg_watch_blocks_keeps_height_mature_immature_rows(self) -> None:
         ledger = QueryCapturePsqlShareLedger()
@@ -4421,6 +4455,36 @@ class PrismShareLedgerTests(unittest.TestCase):
         query = ledger.lease_queries[-1]
         self.assertIn("FROM qbit_pool_audit_bundles", query)
         self.assertIn("body_uri", query)
+
+    def test_psql_public_artifact_canonical_json_reads_persisted_text(self) -> None:
+        manifest_set = sample_ctv_manifest_set()
+        manifest_set_json = canonical_json_text(manifest_set)
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"canonical_json": manifest_set_json},
+            ]
+        )
+
+        self.assertEqual(
+            ledger.dashboard_public_artifact_canonical_json(sha256=sha256_json_hex(manifest_set)),
+            manifest_set_json,
+        )
+        query = ledger.lease_queries[-1]
+        self.assertIn("SELECT manifest_set_json", query)
+        self.assertIn("FROM qbit_ctv_fanout_sets", query)
+        self.assertIn("SELECT manifest_json", query)
+        self.assertIn("FROM qbit_ctv_fanout_artifacts", query)
+
+    def test_psql_public_artifact_canonical_json_returns_none_when_unmatched(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"canonical_json": None},
+            ]
+        )
+
+        self.assertIsNone(ledger.dashboard_public_artifact_canonical_json(sha256="aa" * 32))
 
     def test_psql_public_artifact_exists_rejects_missing_external_body(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
