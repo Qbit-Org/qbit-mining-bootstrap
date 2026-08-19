@@ -66,6 +66,20 @@ services:
         bind:
           create_host_path: false
 
+  # Same image as the coordinator, overlaid the same way; the audit root is
+  # bound read-only here because this tier only publishes evidence it reads.
+  prism-public-api:
+    image: ${PRISM_COORDINATOR_IMAGE:-invalid.invalid/qbit-mining-bootstrap/prism:production-image-not-configured}
+    pull_policy: always
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ${PRISM_AUDIT_DATA_SOURCE:-/production-source-not-configured/prism/audit}
+        target: ${PRISM_AUDIT_DIR:-/var/lib/qbit-prism/audit}
+        read_only: true
+        bind:
+          create_host_path: false
+
   permissionless-miner:
     profiles: !override ["production-disabled"]
 

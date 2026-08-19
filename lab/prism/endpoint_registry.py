@@ -51,6 +51,52 @@ The three axes a classification answers:
 
 ``Disposition``
     Where the route lands after issue #145.
+
+``max_staleness_seconds``
+    How old an answer an extracted route may serve before it must refuse.
+
+Staleness is a contract, not a nicety: a silently stale dashboard is worse than
+an honest one. ``lab/prism/observability.py`` set the precedent for this
+process -- the cached ``/metrics`` endpoint returns 503 rather than serve an
+unbounded-stale snapshot, using ``stale_after = max(3 * refresh_seconds,
+MINIMUM_HEALTH_STALE_SECONDS)`` with a 15-second floor, and always publishes
+the observed age. The extracted public tier follows the same discipline with
+budgets derived from the caches that actually sit under each route rather than
+hand-picked per endpoint:
+
+    budget = max(3 * (cache_ttl_seconds + underlying_cache_seconds),
+                 MINIMUM_PUBLIC_STALE_SECONDS)
+
+``cache_ttl_seconds`` is the route's own shared-response TTL from
+``public_api.public_cache_policy`` at its documented default: 5s for the plain
+row reads, 30s for the pool-wide aggregates (``/public/v1/pool-summary``,
+``/public/v1/hashrate-series``, ``/public/v1/miners/{recipient_id}/workers``),
+and 300s for ``/public/v1/mining-configuration``.
+
+``underlying_cache_seconds`` is any second cache stacked beneath that one. Only
+one exists today: the ledger's pool reward-window aggregate
+(``share_ledger._pool_reward_window_aggregate``,
+``PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS``, default 30s), reached from
+``dashboard_miner_reward_window`` and therefore counted only for the miner page
+``/public/v1/miners/{recipient_id}``. Two caches in series compound, so the
+budget must cover their sum, not the larger of the two.
+
+The factor of 3 and the 15-second floor are the precedent's, deliberately: a
+budget of exactly one TTL would refuse a response that is merely due for
+refresh, and a sub-15s budget on a 5s TTL would make ordinary scheduling jitter
+look like an outage.
+
+``/public/v1/artifacts/{sha256}`` is the one route with no budget at all, and
+says so through ``immutable_content`` rather than by omission. Its content is
+immutable and content-addressed: a body that hashes to the requested sha256 is
+correct no matter how old it is, so refusing it for age would be refusing a
+correct answer. The only observable staleness is the 404 -> 200 transition for
+an artifact published moments ago, which no budget would fix.
+
+Replica lag is the third staleness source named in
+``docs/prism-public-operator-endpoint-split.md``. No replica exists yet, so it
+contributes 0 here; when one lands it becomes another
+``underlying_cache_seconds`` term rather than a new mechanism.
 """
 
 from __future__ import annotations
@@ -79,6 +125,37 @@ class Disposition(Enum):
     RETAIN = "retain"
 
 
+# The staleness floor, matching observability.MINIMUM_HEALTH_STALE_SECONDS.
+MINIMUM_PUBLIC_STALE_SECONDS = 15
+
+# Documented defaults of the caches a public response can sit behind. These are
+# the defaults the budgets below are derived from; an operator who raises a TTL
+# past its budget is told so by tests/test_prism_endpoint_registry.py.
+PUBLIC_CACHE_TTL_DEFAULT_SECONDS = 5
+PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS = 30
+PUBLIC_CONFIG_CACHE_TTL_DEFAULT_SECONDS = 300
+POOL_REWARD_WINDOW_CACHE_DEFAULT_SECONDS = 30
+
+
+def staleness_budget_seconds(
+    *,
+    cache_ttl_seconds: int,
+    underlying_cache_seconds: int = 0,
+) -> int:
+    """Derive one route's staleness budget from the caches beneath it.
+
+    See the module docstring: three refresh intervals of every cache in the
+    series, floored at MINIMUM_PUBLIC_STALE_SECONDS.
+    """
+
+    if cache_ttl_seconds < 0 or underlying_cache_seconds < 0:
+        raise ValueError("cache seconds must be nonnegative")
+    return max(
+        3 * (cache_ttl_seconds + underlying_cache_seconds),
+        MINIMUM_PUBLIC_STALE_SECONDS,
+    )
+
+
 @dataclass(frozen=True)
 class Endpoint:
     """One classified route.
@@ -97,6 +174,13 @@ class Endpoint:
     # Set when a route's audience and its current implementation disagree --
     # the work the extraction must do before the route can move.
     extraction_blocker: str | None = None
+    # How old a response this route may serve before it must refuse with 503.
+    # Derived through staleness_budget_seconds(), never hand-picked. None means
+    # no budget, which is only legitimate together with immutable_content.
+    max_staleness_seconds: float | None = None
+    # Content-addressed, immutable bodies: correct at any age, so this route
+    # never refuses for staleness. Stated rather than left implicit.
+    immutable_content: bool = False
 
     def __post_init__(self) -> None:
         if not self.paths:
@@ -123,6 +207,36 @@ class Endpoint:
             raise ValueError(
                 f"endpoint {self.paths[0]} takes the writer lock and cannot be "
                 "extracted without recording the blocker that must be removed"
+            )
+        if self.immutable_content and self.disposition is not Disposition.EXTRACT:
+            raise ValueError(
+                f"endpoint {self.paths[0]}: immutable_content describes the "
+                "extracted public contract only"
+            )
+        if self.immutable_content and self.max_staleness_seconds is not None:
+            raise ValueError(
+                f"endpoint {self.paths[0]}: immutable content is correct at any "
+                "age, so it must not also carry a staleness budget"
+            )
+        if self.disposition is Disposition.EXTRACT:
+            if self.max_staleness_seconds is None and not self.immutable_content:
+                raise ValueError(
+                    f"endpoint {self.paths[0]}: every extracted route must state "
+                    "the staleness it tolerates, or declare immutable_content"
+                )
+            if (
+                self.max_staleness_seconds is not None
+                and self.max_staleness_seconds < MINIMUM_PUBLIC_STALE_SECONDS
+            ):
+                raise ValueError(
+                    f"endpoint {self.paths[0]}: staleness budget must not fall "
+                    f"below {MINIMUM_PUBLIC_STALE_SECONDS}s"
+                )
+        elif self.max_staleness_seconds is not None:
+            raise ValueError(
+                f"endpoint {self.paths[0]}: the staleness contract covers the "
+                "extracted public surface; retained routes answer for "
+                "themselves"
             )
 
     @property
@@ -346,6 +460,10 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
             "network summary, which the extracted service gets its own copy "
             "of -- it is a node read, not coordinator state."
         ),
+        # Pool-wide aggregate: the 30s aggregate TTL, nothing beneath it.
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/blocks",),
@@ -354,6 +472,9 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
         access=(LedgerAccess.READ_SLOT,),
         ledger_methods=("dashboard_blocks",),
         rationale="Paginated found-block history.",
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CACHE_TTL_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/leaderboard",),
@@ -366,6 +487,12 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
             "window=reward additionally needs the network difficulty from RPC "
             "to size the reward window."
         ),
+        # Both windows read the ledger directly. dashboard_reward_leaderboard
+        # runs its own qbit_prism_window scan rather than going through the
+        # cached pool aggregate, so nothing stacks under the response TTL.
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CACHE_TTL_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/hashrate-series",),
@@ -377,6 +504,9 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
             "Bucketed hashrate history for the pool or one miner. The widest "
             "ledger scan on the public surface and the strongest single "
             "argument for moving this traffic off the primary."
+        ),
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS,
         ),
     ),
     Endpoint(
@@ -394,6 +524,11 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
             "unset. The extracted service has no coordinator, so "
             "PRISM_PUBLIC_STRATUM_URL / PRISM_STRATUM_PORT must be supplied "
             "explicitly rather than inferred."
+        ),
+        # Environment-derived and near-static, so it carries the longest
+        # response TTL on the surface and, from it, the longest budget.
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CONFIG_CACHE_TTL_DEFAULT_SECONDS,
         ),
     ),
     Endpoint(
@@ -426,6 +561,13 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
             "the writer lock today. The extracted service needs a "
             "per-recipient owed-balance read that does not fence."
         ),
+        # The one route with a second cache beneath the response cache: its
+        # reward-window slice comes from the shared pool aggregate, so the two
+        # TTLs compound.
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CACHE_TTL_DEFAULT_SECONDS,
+            underlying_cache_seconds=POOL_REWARD_WINDOW_CACHE_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/miners/{recipient_id}/earnings",),
@@ -434,6 +576,9 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
         access=(LedgerAccess.READ_SLOT,),
         ledger_methods=("dashboard_miner_earning_rows",),
         rationale="Per-block earnings history for one miner.",
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CACHE_TTL_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/miners/{recipient_id}/payouts",),
@@ -442,6 +587,9 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
         access=(LedgerAccess.READ_SLOT,),
         ledger_methods=("dashboard_miner_payout_rows",),
         rationale="Per-payout history for one miner.",
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CACHE_TTL_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/miners/{recipient_id}/workers",),
@@ -450,6 +598,11 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
         access=(LedgerAccess.READ_SLOT,),
         ledger_methods=("dashboard_miner_worker_rows",),
         rationale="Worker list for one miner.",
+        # Classified as a pool-wide aggregate by public_cache_policy: it
+        # aggregates a miner's whole recent share history.
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/blocks/{block_hash}/settlement-artifacts",),
@@ -477,6 +630,9 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
             "audit_bundle() under the writer lock. The extracted service must "
             "take the direct-coinbase branch from the artifact file."
         ),
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CACHE_TTL_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/fanouts/pending",),
@@ -485,6 +641,9 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
         access=(LedgerAccess.READ_SLOT,),
         ledger_methods=("dashboard_pending_fanout_rows",),
         rationale="Public paginated view of fanouts awaiting broadcast.",
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CACHE_TTL_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/fanouts/{fanout_txid}",),
@@ -493,6 +652,9 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
         access=(LedgerAccess.READ_SLOT,),
         ledger_methods=("ctv_fanout_status",),
         rationale="Public view of one fanout's broadcast state.",
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CACHE_TTL_DEFAULT_SECONDS,
+        ),
     ),
     Endpoint(
         paths=("/public/v1/artifacts/{sha256}",),
@@ -506,8 +668,12 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
             "keep /audit/* internal. Already resolves the body from body_uri "
             "on disk when the inline column is NULL, verified against the "
             "requested sha256. Its PRISM_PUBLIC_ARTIFACT_CACHE_* knobs move "
-            "with the extracted service."
+            "with the extracted service. Content-addressed and immutable: a "
+            "body that hashes to the requested sha256 is correct at any age, "
+            "so this route carries no staleness budget and must never refuse "
+            "for staleness."
         ),
+        immutable_content=True,
     ),
 )
 
@@ -553,6 +719,41 @@ def extraction_blockers() -> tuple[tuple[str, str], ...]:
     )
 
 
+def _template_matches(template: str, path: str) -> bool:
+    """True when a concrete request path fills one registry path template."""
+
+    template_parts = template.split("/")
+    path_parts = path.split("/")
+    if len(template_parts) != len(path_parts):
+        return False
+    for expected, actual in zip(template_parts, path_parts):
+        if expected.startswith("{") and expected.endswith("}"):
+            if not actual:
+                return False
+            continue
+        if expected != actual:
+            return False
+    return True
+
+
+def endpoint_for_request_path(path: str) -> Endpoint | None:
+    """Classify one concrete request path, or None when it is not a route.
+
+    Literal paths win over templates so /public/v1/fanouts/pending resolves to
+    the pending list rather than to /public/v1/fanouts/{fanout_txid}, which is
+    the same precedence dispatch() applies.
+    """
+
+    for endpoint in ENDPOINTS:
+        if path in endpoint.paths:
+            return endpoint
+    for endpoint in ENDPOINTS:
+        for template in endpoint.paths:
+            if "{" in template and _template_matches(template, path):
+                return endpoint
+    return None
+
+
 def writer_lock_paths() -> tuple[str, ...]:
     """Paths that currently serialize against the lease-holding writer."""
 
@@ -570,10 +771,17 @@ __all__ = [
     "ENDPOINTS",
     "Endpoint",
     "LedgerAccess",
+    "MINIMUM_PUBLIC_STALE_SECONDS",
+    "POOL_REWARD_WINDOW_CACHE_DEFAULT_SECONDS",
+    "PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS",
+    "PUBLIC_CACHE_TTL_DEFAULT_SECONDS",
+    "PUBLIC_CONFIG_CACHE_TTL_DEFAULT_SECONDS",
+    "endpoint_for_request_path",
     "endpoints_by_audience",
     "endpoints_by_disposition",
     "extracted_paths",
     "extraction_blockers",
     "retained_paths",
+    "staleness_budget_seconds",
     "writer_lock_paths",
 ]

@@ -21,6 +21,9 @@ OPERATOR_SERVICES = {
     "auxpow-stratum",
     "prism-postgres",
     "prism-coordinator",
+    # The /public/v1 read tier runs in its own process (issue #145) so public
+    # read volume cannot contend with share acknowledgement or block landing.
+    "prism-public-api",
 }
 
 
