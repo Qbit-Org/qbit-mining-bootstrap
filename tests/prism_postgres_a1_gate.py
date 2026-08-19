@@ -611,13 +611,25 @@ WHERE block_hash = '{api_hash}';
         known.append(api_hash)
         assert_states_equal(postgres, memory, known, "public persist API parity")
 
+        # The confirm disposition matrix. Every value is asserted on both
+        # backends through call_both, which compares the full responses, so
+        # the memory ledger stays a parity implementation of the SQL function:
+        #   1  fresh flip out of 'prepared', allocates a publication ordinal
+        #   2  idempotent replay of an already-confirmed row, allocates none
+        #   0  no row, or a live row this confirmation does not match
+        #  -1  terminally disposed before the confirmation landed
+        # 1 and 2 are the split issue #61 needs: only a fresh confirmation has
+        # payout state to publish.
         before = allocator_state(postgres)
-        call_both(postgres, memory, "confirm_accepted_block", block_hash=block_a, active_tip_height=9, known_hashes=known, message="wrong-height confirmation")
+        unmatched = call_both(postgres, memory, "confirm_accepted_block", block_hash=block_a, active_tip_height=9, known_hashes=known, message="wrong-height confirmation")
+        assert_equal(unmatched["confirmed_count"], 0, "wrong-height confirmation disposition")
         assert_equal(allocator_state(postgres), before, "wrong-height confirmation allocator immobility")
         confirmed = call_both(postgres, memory, "confirm_accepted_block", block_hash=block_a, active_tip_height=10, known_hashes=known, message="first confirmation")
+        assert_equal(confirmed["confirmed_count"], 1, "first confirmation disposition")
         assert_equal(confirmed["audit_publication_sequence"], 1, "first event ordinal")
         before = allocator_state(postgres)
         replay = call_both(postgres, memory, "confirm_accepted_block", block_hash=block_a, active_tip_height=10, known_hashes=known, message="exact confirmation replay")
+        assert_equal(replay["confirmed_count"], 2, "exact confirmation replay disposition")
         assert_equal(replay["audit_publication_sequence"], 1, "replay ordinal")
         for replay_round in range(2, 4):
             replay = call_both(
@@ -630,6 +642,11 @@ WHERE block_hash = '{api_hash}';
                 message=f"exact confirmation replay round {replay_round}",
             )
             assert_equal(
+                replay["confirmed_count"],
+                2,
+                f"replay round {replay_round} disposition",
+            )
+            assert_equal(
                 replay["audit_publication_sequence"],
                 1,
                 f"replay round {replay_round} ordinal",
@@ -640,7 +657,7 @@ WHERE block_hash = '{api_hash}';
         assert_equal(allocator_state(postgres), before, "count-zero reactivation allocator immobility")
         call_both(postgres, memory, "mark_pool_block_inactive", block_hash=block_a, active_tip_height=10, known_hashes=known, message="inactive transition")
         before = allocator_state(postgres)
-        call_both(
+        inactive_confirmation = call_both(
             postgres,
             memory,
             "confirm_accepted_block",
@@ -648,6 +665,11 @@ WHERE block_hash = '{api_hash}';
             active_tip_height=10,
             known_hashes=known,
             message="inactive confirmation",
+        )
+        assert_equal(
+            inactive_confirmation["confirmed_count"],
+            -1,
+            "inactive confirmation disposition",
         )
         assert_equal(
             allocator_state(postgres),
@@ -688,6 +710,13 @@ WHERE block_hash = '{api_hash}';
             known_hashes=known,
             message="reactivated confirmation replay",
         )
+        # Reactivation restores 'confirmed' without returning the row to
+        # 'prepared', so a confirmation after it is an idempotent replay too.
+        assert_equal(
+            reactivated_confirmation["confirmed_count"],
+            2,
+            "reactivated confirmation replay disposition",
+        )
         assert_equal(
             reactivated_confirmation["audit_publication_sequence"],
             1,
@@ -712,7 +741,12 @@ WHERE block_hash = '{api_hash}';
             before,
             "reversed restart allocator preservation",
         )
-        call_both(postgres, memory, "confirm_accepted_block", block_hash=block_a, active_tip_height=10, known_hashes=known, message="reversed confirmation")
+        reversed_confirmation = call_both(postgres, memory, "confirm_accepted_block", block_hash=block_a, active_tip_height=10, known_hashes=known, message="reversed confirmation")
+        assert_equal(
+            reversed_confirmation["confirmed_count"],
+            -1,
+            "reversed confirmation disposition",
+        )
         call_both(postgres, memory, "reactivate_pool_block", block_hash=block_a, active_tip_height=10, known_hashes=known, message="reversed reactivation")
         assert_equal(allocator_state(postgres), before, "terminal transition allocator immobility")
 
@@ -738,6 +772,11 @@ WHERE block_hash = '{api_hash}';
             active_tip_height=0,
             known_hashes=known,
             message="post-replay fresh confirmation",
+        )
+        assert_equal(
+            final_confirmation["confirmed_count"],
+            1,
+            "post-replay fresh confirmation disposition",
         )
         assert_equal(
             final_confirmation["audit_publication_sequence"],
@@ -1230,6 +1269,11 @@ ROLLBACK;
             replay = ledger.confirm_accepted_block(
                 block_hash=block_a,
                 active_tip_height=10,
+            )
+            assert_equal(
+                replay["confirmed_count"],
+                2,
+                "gap-vector confirmation replay disposition",
             )
             assert_equal(
                 replay["audit_publication_sequence"],

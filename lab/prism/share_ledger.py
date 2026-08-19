@@ -1699,6 +1699,11 @@ class SingleWriterShareLedger:
                 }:
                     return {"backend": "memory", "confirmed_count": -1}
                 return {"backend": "memory", "confirmed_count": 0}
+            # Mirror the Postgres disposition split again: only a flip out of
+            # 'prepared' is a fresh confirmation (1). A row already confirmed
+            # at this height is an idempotent replay (2) that keeps the
+            # ordinal its flip allocated and burns none.
+            already_confirmed = block[1] == "confirmed"
             publication_sequence = self._audit_publication_sequences.get(block_hash)
             if publication_sequence is None:
                 publication_sequence = self._next_audit_publication_sequence
@@ -1711,7 +1716,7 @@ class SingleWriterShareLedger:
             )
         return {
             "backend": "memory",
-            "confirmed_count": 1,
+            "confirmed_count": 2 if already_confirmed else 1,
             "audit_publication_sequence": publication_sequence,
         }
 
@@ -7088,7 +7093,15 @@ SELECT json_build_object(
                 raise RuntimeError(str(result["error"]))
             confirmed_count = int(result["confirmed_count"])
             publication_sequence: object | None = None
-            if confirmed_count == 1:
+            if confirmed_count in {1, 2}:
+                # Both confirming dispositions leave a confirmed row carrying
+                # an ordinal: 1 allocated one in the statement above, and 2 --
+                # the idempotent replay -- returns the one its original flip
+                # allocated. The caller needs the ordinal either way to
+                # address this block's audit publication, so read it for
+                # both. Non-confirming dispositions (0, -1) have no row to
+                # read and stay a single statement.
+                #
                 # A data-modifying PL/pgSQL function runs under the statement's
                 # command snapshot, so a join in that same statement cannot see
                 # the freshly assigned ordinal. Read it in the next statement

@@ -2169,6 +2169,19 @@ BEGIN
       AND maturity_state = 'immature';
     GET DIAGNOSTICS confirmed_count = ROW_COUNT;
 
+    -- The row is already confirmed at this (hash, height): this call changed
+    -- nothing. Report the distinct idempotent disposition (2) rather than 1.
+    -- 1 means exactly "this call flipped a prepared row", and only a flip
+    -- allocates an audit publication ordinal through the nextval above; the
+    -- replay below returns with the ordinal its original flip assigned and no
+    -- sequence burned. A caller must be able to tell the two apart: a
+    -- genuinely new confirmation has to publish payout state, while a replay
+    -- is already covered by the publication its flip produced, and
+    -- republishing it bumps the payout generation, wipes the job-bundle
+    -- cache, and aborts in-flight refreshes for identical state (issue #61).
+    -- This is the durable form of that distinction -- it is recorded in the
+    -- row, not inferred from process state -- so it survives reorg corners
+    -- that no in-memory discriminator can cover.
     IF confirmed_count = 0
        AND EXISTS (
            SELECT 1
@@ -2178,7 +2191,7 @@ BEGIN
              AND chain_state = 'confirmed'
              AND maturity_state <> 'reversed'
        ) THEN
-        RETURN 1;
+        RETURN 2;
     END IF;
 
     -- The candidate row was terminally disposed before this confirmation

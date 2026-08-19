@@ -2024,6 +2024,28 @@ class AuditArtifactStore:
                             replay_annotations[annotation] = (
                                 self._latest_evidence[annotation]
                             )
+                    replay_confirmation = replay_annotations.get("confirmation")
+                    current_confirmation = self._latest_evidence.get("confirmation")
+                    if (
+                        isinstance(replay_confirmation, dict)
+                        and isinstance(current_confirmation, dict)
+                        and "confirmed_count" in current_confirmation
+                        and "confirmed_count" in replay_confirmation
+                    ):
+                        # The confirm disposition says how *this* call landed,
+                        # not what the block is. The flip that first published
+                        # this evidence reported a fresh confirmation (1);
+                        # every later replay of the same durable row reports
+                        # the idempotent disposition (2) -- which is the point
+                        # of that split (issue #61). Reuse the originally
+                        # durable value so an exact replay is not stranded as
+                        # a payload conflict. The publication ordinal inside
+                        # the same confirmation is block identity and is
+                        # compared unchanged: a replay that returned a
+                        # different ordinal still conflicts.
+                        replay_confirmation["confirmed_count"] = (
+                            current_confirmation["confirmed_count"]
+                        )
                     replay_persistence = copy.deepcopy(dict(persistence))
                     current_persistence = self._latest_evidence.get(
                         "persistence"
