@@ -431,7 +431,15 @@ class ReconnectResumeTests(unittest.TestCase):
         # re-stamped the entry, cycles shorter than the TTL would keep that
         # value adoptable forever and the short TTL would protect nothing.
         server = resume_coordinator(vardiff_resume_ttl_seconds=900.0)
-        start = time.monotonic()
+        # The +900.0s cycle probes the TTL boundary exactly, where the store
+        # keeps the entry (expiry is strictly age > TTL). A real time.
+        # monotonic() reading makes that comparison depend on float
+        # rounding: (start + 900.0) - start exceeds 900.0 for roughly one in
+        # five thousand captured clock values, flipping the boundary cycle
+        # to "expired" and failing the test. Every record and lookup below
+        # runs under frozen_clock, so an exactly-representable constant
+        # makes the boundary arithmetic exact instead of lucky.
+        start = 1_000_000.0
         with frozen_clock(start):
             first = connect_client(server, 1)
             authorize(server, first)
