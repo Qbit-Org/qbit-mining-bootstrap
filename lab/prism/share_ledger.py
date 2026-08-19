@@ -529,6 +529,42 @@ class BlockCandidateIntentPersistResult:
         return self.inserted
 
 
+def _block_candidate_cursor_parts(cursor: object) -> tuple[object, str]:
+    """Split one opaque pending-candidate cursor into its ordering parts.
+
+    The cursor is whatever ``pending_block_candidate_rows`` handed back on a
+    prior row and travels through the caller (and, for the Postgres backend,
+    through JSON) untouched, so it is validated on the way back in rather
+    than trusted. The shape is deliberately the two ordering columns and
+    nothing else: ordering by the creation stamp alone cannot resume, because
+    equal stamps would either re-emit or skip their peers.
+    """
+    if isinstance(cursor, str) or not isinstance(cursor, Sequence):
+        raise ValueError("pending block candidate cursor is not a two-element list")
+    parts = list(cursor)
+    if len(parts) != 2:
+        raise ValueError("pending block candidate cursor is not a two-element list")
+    created_at, block_hash = parts
+    if not isinstance(block_hash, str) or not block_hash:
+        raise ValueError("pending block candidate cursor has no block hash")
+    return created_at, block_hash
+
+
+def _memory_block_candidate_row_key(row: dict[str, Any]) -> tuple[float, str]:
+    """Total-order key for one in-memory pending outbox row."""
+    return (float(row.get("created_monotonic", 0.0)), str(row["block_hash"]))
+
+
+def _memory_block_candidate_cursor_key(cursor: object) -> tuple[float, str]:
+    """Rebuild the in-memory ordering key from a returned cursor."""
+    created_monotonic, block_hash = _block_candidate_cursor_parts(cursor)
+    if isinstance(created_monotonic, bool) or not isinstance(
+        created_monotonic, (int, float)
+    ):
+        raise ValueError("pending block candidate cursor has no creation stamp")
+    return (float(created_monotonic), block_hash)
+
+
 class ShareReplayConflict(RuntimeError):
     """A recovery row reused a share ID with a different durable payload."""
 
@@ -818,9 +854,38 @@ class SingleWriterShareLedger:
             for row in self.pending_block_candidate_rows(limit=limit)
         ]
 
-    def pending_block_candidate_rows(self, *, limit: int = 32) -> list[dict[str, Any]]:
-        """Return pending payloads together with their authoritative row keys."""
+    def pending_block_candidate_rows(
+        self,
+        *,
+        limit: int = 32,
+        after_cursor: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return pending payloads together with their authoritative row keys.
+
+        Rows carry an opaque ``cursor`` the caller passes back verbatim as
+        ``after_cursor`` to resume strictly after that row. The order is the
+        total order ``(created, block_hash)``, so a page shorter than
+        ``limit`` proves no further pending row existed at query time and a
+        backlog of any size enumerates completely in bounded pages. The
+        block-hash tiebreak is what makes it a *total* order: creation
+        stamps collide (``time.monotonic`` here, one transaction's
+        ``clock_timestamp`` in Postgres), and a cursor on a colliding stamp
+        alone would either replay or skip its peers.
+        """
+        after = (
+            None
+            if after_cursor is None
+            else _memory_block_candidate_cursor_key(after_cursor)
+        )
         with self._lock:
+            ordered = sorted(
+                (
+                    (_memory_block_candidate_row_key(row), row)
+                    for row in self._block_candidate_outbox.values()
+                    if row["state"] == "pending"
+                ),
+                key=lambda entry: entry[0],
+            )
             return [
                 {
                     "block_hash": str(row["block_hash"]),
@@ -829,9 +894,10 @@ class SingleWriterShareLedger:
                         if isinstance(row["candidate"], dict)
                         else row["candidate"]
                     ),
+                    "cursor": list(key),
                 }
-                for row in self._block_candidate_outbox.values()
-                if row["state"] == "pending"
+                for key, row in ordered
+                if after is None or key > after
             ][:limit]
 
     def block_candidate_pending_metrics(self) -> dict[str, int | float]:
@@ -1651,6 +1717,39 @@ class SingleWriterShareLedger:
 
     def reorg_watch_blocks(self, *, active_tip_height: int) -> list[dict[str, object]]:
         return []
+
+    def stranded_prepared_blocks(
+        self,
+        *,
+        active_tip_height: int,
+        min_depth: int,
+        limit: int = 64,
+    ) -> list[dict[str, object]]:
+        """Return deeply buried rows still parked in the prepared state.
+
+        ``reorg_watch_blocks`` deliberately watches only confirmed/inactive
+        rows, and a prepared row is normally resolved by the live
+        submit/replay path that owns it. A row whose outbox entry is gone
+        (quarantined, or completed by a process that died before confirming)
+        therefore has nothing left to re-examine it, and stays prepared
+        forever. This read finds those rows; the caller decides, against the
+        active chain, which ones are provably orphaned.
+        """
+        with self._lock:
+            rows = [
+                {
+                    "block_hash": block_hash,
+                    "block_height": int(block[0]),
+                    "parent_hash": str(block[2]),
+                }
+                for block_hash, block in self._memory_pool_blocks.items()
+                # The memory backend derives maturity_state from chain_state
+                # (see pool_block_state): 'prepared' is always 'immature'.
+                if block[1] == "prepared"
+                and int(block[0]) <= int(active_tip_height) - int(min_depth)
+            ]
+        rows.sort(key=lambda row: (int(row["block_height"]), str(row["block_hash"])))
+        return rows[: max(0, int(limit))]
 
     def mark_pool_block_inactive(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
         block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
@@ -3475,22 +3574,69 @@ END;
             for row in self.pending_block_candidate_rows(limit=limit)
         ]
 
-    def pending_block_candidate_rows(self, *, limit: int = 32) -> list[dict[str, Any]]:
-        """Return pending payloads together with their authoritative row keys."""
+    def pending_block_candidate_rows(
+        self,
+        *,
+        limit: int = 32,
+        after_cursor: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return pending payloads together with their authoritative row keys.
+
+        Rows carry an opaque ``cursor`` the caller passes back verbatim as
+        ``after_cursor`` to resume strictly after that row, so a backlog
+        larger than one window enumerates completely in bounded pages
+        instead of forcing an ever-wider single query. The keyset predicate
+        and the ordering both stay on ``(created_at, block_hash)``, which is
+        exactly the partial index
+        ``qbit_block_candidate_outbox_pending_idx``: every page is one
+        bounded index range scan regardless of how far in the backlog it
+        starts.
+
+        The cursor stamp is rendered at microsecond precision with an
+        explicit UTC marker because ``created_at`` is a ``timestamptz`` whose
+        stored resolution is microseconds: a second-precision stamp (the
+        format the public API endpoints use) would truncate, and the
+        resulting predicate would re-emit or skip whole sub-second groups.
+        """
         if limit <= 0:
             return []
+        after_predicate = ""
+        if after_cursor is not None:
+            created_at_text, cursor_block_hash = _block_candidate_cursor_parts(
+                after_cursor
+            )
+            if not isinstance(created_at_text, str):
+                raise ValueError(
+                    "pending block candidate cursor has no creation stamp"
+                )
+            after_predicate = (
+                "\n      AND (created_at, block_hash) > "
+                f"({self._text_literal(created_at_text)}::timestamptz, "
+                f"{self._text_literal(cursor_block_hash)})"
+            )
         sql = f"""
 SELECT COALESCE(
     json_agg(
-        json_build_object('block_hash', block_hash, 'candidate', candidate)
+        json_build_object(
+            'block_hash', block_hash,
+            'candidate', candidate,
+            'cursor', json_build_array(cursor_created_at, block_hash)
+        )
         ORDER BY created_at, block_hash
     ),
     '[]'::json
 )
 FROM (
-    SELECT candidate, created_at, block_hash
+    SELECT
+        candidate,
+        created_at,
+        to_char(
+            created_at AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+        ) AS cursor_created_at,
+        block_hash
     FROM qbit_block_candidate_outbox
-    WHERE state = 'pending'
+    WHERE state = 'pending'{after_predicate}
     ORDER BY created_at, block_hash
     LIMIT {int(limit)}
 ) pending;
@@ -7046,6 +7192,54 @@ FROM qbit_pool_blocks
 WHERE chain_state IN ('confirmed', 'inactive')
   AND maturity_state = 'immature'
 ;
+"""
+        with self._operation_gate(self._lock, "writer lock"):
+            rows = self._run_retry_safe_read_json(sql)
+        for row in rows:
+            row["block_height"] = int(row["block_height"])
+        return rows
+
+    def stranded_prepared_blocks(
+        self,
+        *,
+        active_tip_height: int,
+        min_depth: int,
+        limit: int = 64,
+    ) -> list[dict[str, object]]:
+        """Return deeply buried rows still parked in the prepared state.
+
+        ``reorg_watch_blocks`` deliberately watches only confirmed/inactive
+        rows, and a prepared row is normally resolved by the live
+        submit/replay path that owns it through its outbox entry. A row
+        whose outbox entry is gone (quarantined, or completed by a process
+        that died before confirming) therefore has nothing left to
+        re-examine it, and stays prepared forever — holding immature payout
+        entries, carry-forward, and CTV fanout artifacts open with it. This
+        read finds those rows; the caller decides, against the active chain,
+        which ones are provably orphaned.
+
+        The predicate leads with ``maturity_state`` and ``block_height`` so
+        it rides ``qbit_pool_blocks_maturity_idx``, and the depth floor
+        keeps the scan to rows the caller could actually act on.
+        """
+        if limit <= 0:
+            return []
+        depth_ceiling = int(active_tip_height) - int(min_depth)
+        sql = f"""
+SELECT COALESCE(json_agg(json_build_object(
+    'block_hash', block_hash,
+    'block_height', block_height,
+    'parent_hash', parent_hash
+) ORDER BY block_height ASC, block_hash ASC), '[]'::json)
+FROM (
+    SELECT block_hash, block_height, parent_hash
+    FROM qbit_pool_blocks
+    WHERE maturity_state = 'immature'
+      AND block_height <= {depth_ceiling}
+      AND chain_state = 'prepared'
+    ORDER BY block_height ASC, block_hash ASC
+    LIMIT {int(limit)}
+) stranded;
 """
         with self._operation_gate(self._lock, "writer lock"):
             rows = self._run_retry_safe_read_json(sql)

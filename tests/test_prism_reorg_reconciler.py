@@ -4,12 +4,15 @@ import inspect
 import threading
 import time
 import unittest
+from unittest import mock
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace as dataclass_replace
 from types import SimpleNamespace
 
 from lab.prism.prism_coordinator import PrismCoordinator
 from lab.prism.reorg_reconciler import (
+    STRANDED_PREPARED_REJECT_MIN_DEPTH,
+    STRANDED_PREPARED_SWEEP_LIMIT,
     ReorgPorts,
     ReorgReconcilerService,
     qbit_chain_view_untrusted,
@@ -47,18 +50,23 @@ def make_ports(
     publish: object = 7,
     chain_untrusted: bool = False,
     ensure_tip: object = None,
+    tip_height: int = 10,
+    block_hashes: dict[int, str] | None = None,
 ) -> tuple[ReorgPorts, list[tuple[str, object]]]:
     events: list[tuple[str, object]] = []
     active_ledger = FakeLedger() if ledger is None else ledger
     state_lock = threading.RLock()
+    active_chain = {8: "not-aa", 9: "bb"} if block_hashes is None else block_hashes
 
     def rpc_call(method: str, params: object = None) -> object:
         if method == "getbestblockhash":
             return "tip"
         if method == "getblockcount":
-            return 10
+            return tip_height
         if method == "getblockhash":
-            return {8: "not-aa", 9: "bb"}[int(params[0])]  # type: ignore[index]
+            height = int(params[0])  # type: ignore[index]
+            events.append(("getblockhash", height))
+            return active_chain[height]
         raise AssertionError(method)
 
     @contextmanager
@@ -368,3 +376,237 @@ class CoordinatorReorgIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StrandedPreparedLedger:
+    """A ledger whose only outstanding reorg work is a stranded prepared row.
+
+    ``reorg_watch_blocks`` returns nothing because it structurally cannot see
+    prepared rows -- that is exactly why the sweep exists. The depth filter
+    lives here, in the read, so the tests exercise the real constant the
+    reconciler passes rather than a value they choose themselves.
+    """
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+        self.requests: list[dict[str, int]] = []
+        self.rejected: list[str] = []
+
+    def reorg_watch_blocks(self, *, active_tip_height: int) -> list[dict[str, object]]:
+        return []
+
+    def stranded_prepared_blocks(
+        self,
+        *,
+        active_tip_height: int,
+        min_depth: int,
+        limit: int,
+    ) -> list[dict[str, object]]:
+        self.requests.append(
+            {
+                "active_tip_height": int(active_tip_height),
+                "min_depth": int(min_depth),
+                "limit": int(limit),
+            }
+        )
+        return [
+            row
+            for row in self.rows
+            if int(row["block_height"]) <= int(active_tip_height) - int(min_depth)
+        ][:limit]
+
+    def reject_prepared_block(
+        self,
+        *,
+        block_hash: str,
+        active_tip_height: int,
+    ) -> dict[str, int]:
+        self.rejected.append(str(block_hash))
+        return {"rejected_count": 1}
+
+
+class StrandedPreparedSweepTests(unittest.TestCase):
+    """The reconciler's heal for prepared rows that lost their owner.
+
+    A prepared pool block is resolved by the live submit/replay path that
+    holds its outbox row. When that row is gone -- quarantined, or completed
+    by a process that died before confirming -- nothing re-examines the
+    ledger row again: reorg_watch_blocks selects confirmed/inactive only.
+    Testnet4 carried one such row (height 30822) for six weeks with its
+    payout entries, carry forward, and fanout artifacts pinned immature.
+    """
+
+    def orphan_row(self, block_height: int = 30822) -> dict[str, object]:
+        return {
+            "block_hash": "19" * 32,
+            "block_height": block_height,
+            "parent_hash": "20" * 32,
+        }
+
+    def test_orphaned_stranded_row_is_rejected_and_republished(self) -> None:
+        row = self.orphan_row()
+        ledger = StrandedPreparedLedger([row])
+        ports, events = make_ports(
+            ledger=ledger,
+            tip_height=31000,
+            # The canonical block at that height is a different hash: the
+            # pool block was orphaned and never rejected.
+            block_hashes={30822: "aa" * 32},
+        )
+        service = ReorgReconcilerService(ports)
+
+        with mock.patch("builtins.print"):
+            summary = service.reconcile(tip_hash="tip")
+
+        self.assertEqual(ledger.rejected, ["19" * 32])
+        self.assertEqual(summary["stranded_prepared_rejected"], 1)
+        self.assertEqual(summary["stranded_prepared_canonical"], 0)
+        # The rejection cascades payout entries, carry forward, and fanout
+        # artifacts, so the pass must republish rather than serve balances
+        # computed before it.
+        self.assertIn(("prepare", {"force_full_window_rescan": True}), events)
+        self.assertEqual(summary["published_generation"], 7)
+        self.assertIn(("block", {"force": True}), events)
+        # A row mutation invalidates proofs memoized for every other tip.
+        service._reorg_reconcile_trusted_memo["other"] = time.monotonic()
+        self.assertEqual(
+            ledger.requests,
+            [
+                {
+                    "active_tip_height": 31000,
+                    "min_depth": STRANDED_PREPARED_REJECT_MIN_DEPTH,
+                    "limit": STRANDED_PREPARED_SWEEP_LIMIT,
+                }
+            ],
+        )
+
+    def test_canonical_stranded_row_is_counted_but_never_mutated(self) -> None:
+        """The confirm path owns audit publication sequencing, not the sweep."""
+        row = self.orphan_row()
+        ledger = StrandedPreparedLedger([row])
+        ports, events = make_ports(
+            ledger=ledger,
+            tip_height=31000,
+            # The pool block *is* the canonical block at its height; it was
+            # simply never confirmed.
+            block_hashes={30822: "19" * 32},
+        )
+        service = ReorgReconcilerService(ports)
+
+        printed: list[str] = []
+        with mock.patch(
+            "builtins.print",
+            side_effect=lambda *args, **_kwargs: printed.append(
+                " ".join(str(value) for value in args)
+            ),
+        ):
+            summary = service.reconcile(tip_hash="tip")
+
+        self.assertEqual(ledger.rejected, [])
+        self.assertEqual(summary["stranded_prepared_canonical"], 1)
+        self.assertEqual(summary["stranded_prepared_rejected"], 0)
+        # Nothing changed, so nothing is prepared or published.
+        self.assertNotIn(("block", {"force": True}), events)
+        self.assertIsNone(summary["published_generation"])
+        self.assertTrue(
+            any(
+                "canonical and needs operator review" in message
+                and "19" * 32 in message
+                for message in printed
+            ),
+            printed,
+        )
+
+    def test_rows_inside_the_depth_floor_are_never_examined(self) -> None:
+        """A finalization still in flight owns its own row; depth is the proxy."""
+        shallow = self.orphan_row(block_height=31000 - 1)
+        ledger = StrandedPreparedLedger([shallow])
+        ports, events = make_ports(
+            ledger=ledger,
+            tip_height=31000,
+            block_hashes={},
+        )
+        service = ReorgReconcilerService(ports)
+
+        summary = service.reconcile(tip_hash="tip")
+
+        self.assertEqual(ledger.rejected, [])
+        self.assertEqual(summary["stranded_prepared_rejected"], 0)
+        self.assertEqual(summary["stranded_prepared_canonical"], 0)
+        # Not even a getblockhash: the row never left the ledger read.
+        self.assertNotIn(
+            "getblockhash",
+            [name for name, _payload in events],
+        )
+        self.assertGreaterEqual(STRANDED_PREPARED_REJECT_MIN_DEPTH, 100)
+
+    def test_sweep_stamps_progress_for_every_row_it_walks(self) -> None:
+        """Each row costs a getblockhash plus a fenced mutation, like watch rows."""
+        rows = [
+            self.orphan_row(block_height=30820),
+            self.orphan_row(block_height=30822),
+        ]
+        rows[0]["block_hash"] = "18" * 32
+        ledger = StrandedPreparedLedger(rows)
+        ports, _events = make_ports(
+            ledger=ledger,
+            tip_height=31000,
+            block_hashes={30820: "aa" * 32, 30822: "aa" * 32},
+        )
+        phases: list[str] = []
+        service = ReorgReconcilerService(
+            dataclass_replace(ports, record_progress=phases.append)
+        )
+
+        with mock.patch("builtins.print"):
+            summary = service.reconcile(tip_hash="tip")
+
+        self.assertEqual(summary["stranded_prepared_rejected"], 2)
+        self.assertEqual(phases.count("reorg-reconcile:stranded-prepared"), 2)
+        self.assertIn("reorg-reconcile:stranded-prepared-blocks", phases)
+
+    def test_partial_sweep_that_raises_still_accounts_its_mutations(self) -> None:
+        """A pass that dies mid-sweep must not lose the rows it already moved."""
+        rows = [
+            self.orphan_row(block_height=30820),
+            self.orphan_row(block_height=30822),
+        ]
+        rows[0]["block_hash"] = "18" * 32
+        ledger = StrandedPreparedLedger(rows)
+        original_reject = ledger.reject_prepared_block
+
+        def failing_reject(**kwargs: object) -> dict[str, int]:
+            if kwargs["block_hash"] == "19" * 32:
+                raise RuntimeError("postgres unavailable")
+            return original_reject(**kwargs)  # type: ignore[arg-type]
+
+        ledger.reject_prepared_block = failing_reject  # type: ignore[method-assign]
+        ports, events = make_ports(
+            ledger=ledger,
+            tip_height=31000,
+            block_hashes={30820: "aa" * 32, 30822: "aa" * 32},
+        )
+        service = ReorgReconcilerService(ports)
+
+        with mock.patch("builtins.print"), self.assertRaisesRegex(
+            RuntimeError, "postgres unavailable"
+        ):
+            service.reconcile(tip_hash="tip")
+
+        # The first rejection committed; the error path republishes against a
+        # forced full rescan rather than leaving stale balances served.
+        self.assertEqual(ledger.rejected, ["18" * 32])
+        self.assertIn(("prepare", {"force_full_window_rescan": True}), events)
+        self.assertEqual(service.snapshot().reconcile_error_count, 1)
+        self.assertEqual(dict(service._reorg_reconcile_trusted_memo), {})
+
+    def test_ledger_without_the_sweep_read_is_left_alone(self) -> None:
+        """Feature-detected like every other reconcile step."""
+        ledger = FakeLedger()
+        ports, _events = make_ports(ledger=ledger)
+        service = ReorgReconcilerService(ports)
+
+        summary = service.reconcile(tip_hash="tip", force_publish=True)
+
+        self.assertEqual(summary["stranded_prepared_rejected"], 0)
+        self.assertEqual(summary["stranded_prepared_canonical"], 0)

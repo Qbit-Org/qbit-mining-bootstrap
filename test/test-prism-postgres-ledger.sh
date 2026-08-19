@@ -225,10 +225,34 @@ except ShareReplayConflict:
 else:
     raise SystemExit("typed recovery payload conflict was not rejected")
 assert_equal(ledger.pending_block_candidates(), [candidate_intent], "pending candidate replay")
+pending_rows = ledger.pending_block_candidate_rows()
 assert_equal(
-    ledger.pending_block_candidate_rows(),
+    [
+        {key: value for key, value in row.items() if key != "cursor"}
+        for row in pending_rows
+    ],
     [{"block_hash": "ab" * 32, "candidate": candidate_intent}],
     "pending candidate replay retains authoritative outbox key",
+)
+# Startup enumeration pages this read with a keyset cursor, so the cursor
+# has to round-trip through the server exactly: a truncated stamp would
+# make a page re-emit or skip its equal-timestamp peers.
+assert_equal(
+    ledger.pending_block_candidate_rows(after_cursor=pending_rows[0]["cursor"]),
+    [],
+    "pending candidate cursor resumes strictly after its own row",
+)
+cursor_stamp, cursor_hash = pending_rows[0]["cursor"]
+assert_equal(cursor_hash, "ab" * 32, "pending candidate cursor carries its row key")
+assert_equal(
+    ledger._run_json(
+        "SELECT json_build_object('matched', ("
+        "SELECT count(*) FROM qbit_block_candidate_outbox "
+        f"WHERE created_at = '{cursor_stamp}'::timestamptz "
+        f"AND block_hash = '{cursor_hash}'))"
+    )["matched"],
+    1,
+    "pending candidate cursor stamp round-trips at full precision",
 )
 assert ledger.mark_block_candidate_submitted(block_hash="ab" * 32)
 assert_equal(ledger.pending_block_candidates(), [], "submitted candidate leaves pending set")
@@ -1014,8 +1038,45 @@ replacement.persist_accepted_block(
     final_bundle=zero_net_bundle,
     audit_report=zero_net_report,
 )
+# The stranded-prepared sweep finds exactly the rows the reorg watch read
+# structurally cannot: prepared and buried past the reject depth floor.
+# Nothing else re-examines them once their outbox row is gone.
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 100,
+        min_depth=100,
+    ),
+    [{"block_hash": "46" * 32, "block_height": 9, "parent_hash": "45" * 32}],
+    "stranded prepared sweep finds a buried prepared row",
+)
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 99,
+        min_depth=100,
+    ),
+    [],
+    "stranded prepared sweep leaves rows inside the depth floor alone",
+)
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 100,
+        min_depth=100,
+        limit=0,
+    ),
+    [],
+    "stranded prepared sweep honours its page bound",
+)
 rejected_count = replacement.reject_prepared_block(block_hash="46" * 32, active_tip_height=8)["rejected_count"]
 assert_equal(rejected_count, 3, "reject prepared block/payout/carry row count")
+# The fenced rejection is what retires the row from the sweep.
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 100,
+        min_depth=100,
+    ),
+    [],
+    "rejected block leaves the stranded prepared sweep",
+)
 rejected_state = replacement._run_json(
     """
 SELECT json_build_object(

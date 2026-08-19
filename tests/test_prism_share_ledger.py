@@ -694,10 +694,17 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertTrue(records[0].newly_inserted)
         self.assertEqual(records[0].candidate_outbox_state, "pending")
         self.assertEqual(ledger.pending_block_candidates(), [intent])
+        rows = ledger.pending_block_candidate_rows()
         self.assertEqual(
-            ledger.pending_block_candidate_rows(),
+            [
+                {key: value for key, value in row.items() if key != "cursor"}
+                for row in rows
+            ],
             [{"block_hash": "ab" * 32, "candidate": intent}],
         )
+        # The pagination cursor is opaque to callers but always keyed on the
+        # row it came from.
+        self.assertEqual(rows[0]["cursor"][1], "ab" * 32)
         # Exact replay returns the original row and does not duplicate outbox
         # work. A changed intent with the same hash is rejected as corruption.
         replay = ledger.append_batch([(share, intent)])[0]
@@ -743,6 +750,194 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(
             ledger._block_candidate_outbox[block_hash]["attempt_count"],
             1,
+        )
+
+    def test_pending_candidate_cursor_pages_walk_a_stable_total_order(self) -> None:
+        """Startup enumeration must complete for a backlog of any size.
+
+        The doubling window it replaces fails closed once one query would
+        have to hold the whole backlog, which blocks every job build until
+        the outbox drains on its own. Pagination needs three properties for
+        that gate to be safe: one stable total order, a cursor that resumes
+        strictly after its own row, and a short page that proves nothing
+        followed it.
+        """
+        ledger = SingleWriterShareLedger()
+        hashes = [f"{index:02x}" * 32 for index in (0xA1, 0xA2, 0xB1, 0xB2, 0xC1)]
+        # Inserted out of order so the assertions below prove the ordering
+        # comes from the row keys and not from the outbox's insertion order.
+        for index in (2, 4, 0, 3, 1):
+            ledger.persist_block_candidate_intent(
+                {
+                    "schema": "qbit.prism.block-candidate-intent.v1",
+                    "block_hash_hex": hashes[index],
+                    "block_hex": "00",
+                }
+            )
+        # Colliding creation stamps are the interesting case: time.monotonic
+        # (like one transaction's clock_timestamp) repeats, so ordering on
+        # the stamp alone would let a cursor replay or skip a whole group.
+        stamps = {
+            hashes[0]: 100.0,
+            hashes[1]: 100.0,
+            hashes[2]: 100.0,
+            hashes[3]: 200.0,
+            hashes[4]: 300.0,
+        }
+        for block_hash, stamp in stamps.items():
+            ledger._block_candidate_outbox[block_hash]["created_monotonic"] = stamp
+
+        walked: list[str] = []
+        pages: list[int] = []
+        after_cursor: object | None = None
+        while True:
+            page = ledger.pending_block_candidate_rows(
+                limit=2,
+                after_cursor=after_cursor,
+            )
+            pages.append(len(page))
+            walked.extend(str(row["block_hash"]) for row in page)
+            if len(page) < 2:
+                break
+            after_cursor = page[-1]["cursor"]
+
+        # Total order: creation stamp first, block hash as the tiebreak.
+        self.assertEqual(walked, sorted(hashes, key=lambda h: (stamps[h], h)))
+        # Full pages until one short page proves the walk reached the end.
+        self.assertEqual(pages, [2, 2, 1])
+        # No row was served twice, and the walk saw every pending row.
+        self.assertEqual(len(set(walked)), len(hashes))
+
+        # A cursor resumes strictly after its own row, including when its
+        # stamp collides with the next row's.
+        tied_cursor = [100.0, hashes[0]]
+        self.assertEqual(
+            [
+                str(row["block_hash"])
+                for row in ledger.pending_block_candidate_rows(
+                    limit=32,
+                    after_cursor=tied_cursor,
+                )
+            ],
+            [hashes[1], hashes[2], hashes[3], hashes[4]],
+        )
+        # The cursor round-trips: handing back a returned cursor verbatim is
+        # equivalent to reconstructing it from the row's own ordering parts.
+        last_first_page = ledger.pending_block_candidate_rows(limit=1)[0]
+        self.assertEqual(last_first_page["cursor"], [100.0, hashes[0]])
+        # A cursor past every row proves completion with an empty page.
+        self.assertEqual(
+            ledger.pending_block_candidate_rows(
+                limit=32,
+                after_cursor=[300.0, hashes[4]],
+            ),
+            [],
+        )
+        # Terminal rows leave the pending order entirely.
+        self.assertTrue(
+            ledger.mark_block_candidate_submitted(block_hash=hashes[1])
+        )
+        self.assertNotIn(
+            hashes[1],
+            [
+                str(row["block_hash"])
+                for row in ledger.pending_block_candidate_rows(limit=32)
+            ],
+        )
+
+    def test_pending_candidate_cursor_rejects_unusable_shapes(self) -> None:
+        """A cursor crosses process and JSON boundaries, so it is validated."""
+        ledger = SingleWriterShareLedger()
+        for cursor in (
+            [],
+            [1.0],
+            [1.0, "ab" * 32, "extra"],
+            [1.0, ""],
+            ["not-a-stamp", "ab" * 32],
+            "1.0,ab",
+        ):
+            with self.assertRaises(ValueError):
+                ledger.pending_block_candidate_rows(after_cursor=cursor)
+
+    def test_stranded_prepared_blocks_filter_by_depth_and_state(self) -> None:
+        """The sweep's read only surfaces rows an operator-free heal may touch.
+
+        reorg_watch_blocks selects confirmed/inactive rows only, so a
+        prepared row whose outbox entry is gone has nothing left to
+        re-examine it. The depth floor is what separates that from a
+        finalization still legitimately in flight.
+        """
+        ledger = SingleWriterShareLedger()
+        heights = {
+            "deep": ("a1" * 32, 100),
+            "at_floor": ("a2" * 32, 900),
+            "shallow": ("a3" * 32, 901),
+            "confirmed": ("a4" * 32, 200),
+        }
+        for block_hash, block_height in heights.values():
+            ledger.persist_accepted_block(
+                block_hash=block_hash,
+                block_height=block_height,
+                parent_hash="bb" * 32,
+                final_bundle={},
+                audit_report={},
+            )
+        confirmed_hash, confirmed_height = heights["confirmed"]
+        self.assertEqual(
+            ledger.confirm_accepted_block(
+                block_hash=confirmed_hash,
+                active_tip_height=confirmed_height,
+            )["confirmed_count"],
+            1,
+        )
+
+        stranded = ledger.stranded_prepared_blocks(
+            active_tip_height=1000,
+            min_depth=100,
+        )
+
+        self.assertEqual(
+            [(row["block_hash"], row["block_height"]) for row in stranded],
+            [
+                (heights["deep"][0], heights["deep"][1]),
+                (heights["at_floor"][0], heights["at_floor"][1]),
+            ],
+        )
+        self.assertEqual(stranded[0]["parent_hash"], "bb" * 32)
+        # A confirmed row belongs to the watch loop, not this sweep, and a
+        # row shallower than the floor may still be finalizing.
+        returned = {str(row["block_hash"]) for row in stranded}
+        self.assertNotIn(heights["confirmed"][0], returned)
+        self.assertNotIn(heights["shallow"][0], returned)
+        # The limit bounds one pass; the remainder waits for the next one.
+        self.assertEqual(
+            [
+                row["block_hash"]
+                for row in ledger.stranded_prepared_blocks(
+                    active_tip_height=1000,
+                    min_depth=100,
+                    limit=1,
+                )
+            ],
+            [heights["deep"][0]],
+        )
+        # Rejecting through the fenced method retires the row from the sweep.
+        self.assertEqual(
+            ledger.reject_prepared_block(
+                block_hash=heights["deep"][0],
+                active_tip_height=1000,
+            )["rejected_count"],
+            1,
+        )
+        self.assertEqual(
+            [
+                row["block_hash"]
+                for row in ledger.stranded_prepared_blocks(
+                    active_tip_height=1000,
+                    min_depth=100,
+                )
+            ],
+            [heights["at_floor"][0]],
         )
 
     def test_batch_validation_is_all_or_nothing(self) -> None:
@@ -807,7 +1002,10 @@ class PrismShareLedgerTests(unittest.TestCase):
             ledger.append_batch([(retry_share, retry_intent)])[0].share_seq, 1
         )
         self.assertEqual(
-            ledger.pending_block_candidate_rows(),
+            [
+                {key: value for key, value in row.items() if key != "cursor"}
+                for row in ledger.pending_block_candidate_rows()
+            ],
             [{"block_hash": "ef" * 32, "candidate": intent}],
         )
         self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="ef" * 32))
@@ -1368,20 +1566,132 @@ class PrismShareLedgerTests(unittest.TestCase):
             "schema": "unsupported",
             "block_hex": "00",
         }
+        cursor = ["2026-07-08T21:02:03.123456Z", "ef" * 32]
         ledger = FakeLeasePsqlShareLedger(
             [
                 acquired_lease(),
-                [{"block_hash": "ef" * 32, "candidate": intent}],
+                [
+                    {
+                        "block_hash": "ef" * 32,
+                        "candidate": intent,
+                        "cursor": cursor,
+                    }
+                ],
             ]
         )
 
         self.assertEqual(
             ledger.pending_block_candidate_rows(),
-            [{"block_hash": "ef" * 32, "candidate": intent}],
+            [
+                {
+                    "block_hash": "ef" * 32,
+                    "candidate": intent,
+                    "cursor": cursor,
+                }
+            ],
         )
         query = ledger.lease_queries[-1]
-        self.assertIn("json_build_object('block_hash', block_hash, 'candidate', candidate)", query)
+        self.assertIn("'block_hash', block_hash,", query)
+        self.assertIn("'candidate', candidate,", query)
+        # The cursor is the two ordering columns, and its stamp keeps the
+        # microsecond precision the column stores.
+        self.assertIn(
+            "'cursor', json_build_array(cursor_created_at, block_hash)",
+            query,
+        )
+        self.assertIn(
+            "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'",
+            query,
+        )
         self.assertIn("ORDER BY created_at, block_hash", query)
+        # A first page carries no keyset predicate at all.
+        self.assertNotIn("(created_at, block_hash) >", query)
+
+    def test_postgres_pending_candidate_page_uses_an_indexable_keyset(self) -> None:
+        """Each page must stay one bounded range scan of the partial index.
+
+        qbit_block_candidate_outbox_pending_idx is (created_at, block_hash)
+        WHERE state = 'pending'. A row-comparison predicate on exactly those
+        columns is what keeps page N of a 5,000-row backlog as cheap as page
+        one; an OFFSET walk, or a predicate on either column alone, would
+        not be.
+        """
+        ledger = FakeLeasePsqlShareLedger([acquired_lease(), []])
+
+        self.assertEqual(
+            ledger.pending_block_candidate_rows(
+                limit=1024,
+                after_cursor=["2026-07-08T21:02:03.123456Z", "ef" * 32],
+            ),
+            [],
+        )
+
+        query = ledger.lease_queries[-1]
+        self.assertIn(
+            "AND (created_at, block_hash) > "
+            "('2026-07-08T21:02:03.123456Z'::timestamptz, "
+            f"'{'ef' * 32}')",
+            query,
+        )
+        self.assertIn("WHERE state = 'pending'", query)
+        self.assertIn("ORDER BY created_at, block_hash", query)
+        self.assertIn("LIMIT 1024", query)
+        # A hostile cursor is a literal like any other and is escaped, not
+        # interpolated raw.
+        ledger.lease_results.append([])
+        ledger.pending_block_candidate_rows(
+            after_cursor=["2026-07-08T21:02:03.123456Z", "ef' OR true --"],
+        )
+        self.assertIn("'ef'' OR true --'", ledger.lease_queries[-1])
+
+    def test_postgres_stranded_prepared_blocks_bound_depth_and_page(self) -> None:
+        """The sweep read is depth-floored, state-filtered, and bounded."""
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                [
+                    {
+                        "block_hash": "19" * 32,
+                        "block_height": "30822",
+                        "parent_hash": "20" * 32,
+                    }
+                ],
+            ]
+        )
+
+        self.assertEqual(
+            ledger.stranded_prepared_blocks(
+                active_tip_height=31000,
+                min_depth=100,
+                limit=64,
+            ),
+            [
+                {
+                    "block_hash": "19" * 32,
+                    "block_height": 30822,
+                    "parent_hash": "20" * 32,
+                }
+            ],
+        )
+
+        query = ledger.lease_queries[-1]
+        self.assertIn("FROM qbit_pool_blocks", query)
+        # Leads with the qbit_pool_blocks_maturity_idx columns.
+        self.assertIn("WHERE maturity_state = 'immature'", query)
+        self.assertIn("AND block_height <= 30900", query)
+        self.assertIn("AND chain_state = 'prepared'", query)
+        self.assertIn("ORDER BY block_height ASC, block_hash ASC", query)
+        self.assertIn("LIMIT 64", query)
+        # Nothing is fetched at all when the caller allows no rows.
+        self.assertEqual(
+            ledger.stranded_prepared_blocks(
+                active_tip_height=31000,
+                min_depth=100,
+                limit=0,
+            ),
+            [],
+        )
+        self.assertIs(ledger.lease_queries[-1], query)
 
     def test_postgres_pending_candidate_metrics_are_aggregate_and_indexable(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
