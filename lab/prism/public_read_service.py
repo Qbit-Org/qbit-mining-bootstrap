@@ -516,7 +516,15 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
             # Byte-identical framing to the coordinator listener's write_json:
             # sorted keys and a trailing newline, so the extracted bodies match
             # the pre-extraction ones exactly.
-            body = json.dumps(payload, sort_keys=True).encode() + b"\n"
+            if isinstance(payload, public_api.RawJsonBody):
+                # Content-addressed bytes (#154): any re-serialization (key
+                # order, separators, trailing newline) would break
+                # sha256(response body) == the advertised artifact hash.
+                # /public/v1/artifacts/{sha256} moved here, so this branch
+                # moved with it.
+                body = payload.body
+            else:
+                body = json.dumps(payload, sort_keys=True).encode() + b"\n"
             service_metrics.record_response(status)
             try:
                 self.send_response(status)
