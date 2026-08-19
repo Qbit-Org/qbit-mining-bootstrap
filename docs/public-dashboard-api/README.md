@@ -27,14 +27,30 @@ The dashboard app must not query Postgres, qbit RPC, private command sockets, or
 internal audit endpoints directly. Its only stable data dependency should be the
 sanitized `/public/v1` API described by this contract.
 
-In deployment, the `prism-coordinator` audit HTTP listener serves `/public/v1`.
+In deployment, `/public/v1` is served by its own process — the
+`prism-public-api` service (`python3 -m lab.prism.public_read_service`), on
+`PRISM_PUBLIC_API_PORT` (default `3342`). It is no longer served by the
+`prism-coordinator` audit HTTP listener, which now answers only `/audit/*`,
+`/healthz`, `/metrics`, `/owed*`, and the operator miner/payout status routes; a
+`/public/v1` request to the coordinator returns its ordinary
+`{"error": "unknown endpoint"}` 404.
+
+The split exists because public read traffic scales with public interest rather
+than with hashrate. Served in-process it shared the GIL that acknowledges shares
+and lands blocks, and the primary Postgres connection the lease-holding writer
+commits through. The extracted tier reads through bounded read slots only, never
+acquires a writer lease, and depends on Postgres rather than on the coordinator,
+so it keeps serving across coordinator restarts.
+
 Operators can expose only that path from the pool service, or place a
 dashboard/web proxy in front of it. The ownership boundary stays the same: pool
 read models live here; dashboard rendering lives outside the pool process.
+`prism-public-api` also serves its own `/healthz` and `/metrics` for that
+process; those are operator surfaces and must not be exposed publicly.
 
 ## Caching
 
-Successful `GET /public/v1` responses are safe to cache briefly. The coordinator
+Successful `GET /public/v1` responses are safe to cache briefly. The service
 emits conservative browser caching (`Cache-Control: public, max-age=0,
 must-revalidate`) plus shared-cache headers for CDNs such as Vercel. Dynamic
 dashboard read models default to a 5-second shared-cache TTL with 30 seconds of
@@ -61,13 +77,68 @@ Operators can tune the defaults with:
 - `PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES`
 - `PRISM_PUBLIC_CACHE_DEBUG_HEADERS`
 
-The coordinator also keeps a small in-process origin cache keyed by normalized
-path and query string, and coalesces concurrent misses for the same key. Error
-responses use `Cache-Control: no-store` and are not cached by that origin cache.
+The public read service also keeps a small in-process origin cache keyed by
+normalized path and query string, and coalesces concurrent misses for the same
+key. Error responses use `Cache-Control: no-store` and are not cached by that
+origin cache.
 Miner pages additionally share one briefly cached pool-wide reward-window
 aggregate (`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`, default 30 seconds, 0
 disables), so requests for different miners reuse a single recursive
 reward-window scan instead of each re-running it.
+
+## Staleness
+
+Every `/public/v1` response states how old an answer that route is willing to
+serve, and refuses rather than serve past it. A silently stale dashboard is
+worse than an honest one.
+
+- `X-Prism-Staleness-Budget-Seconds` — the budget for this route, in seconds.
+  `/public/v1/artifacts/{sha256}` reports `unbounded`: its content is
+  content-addressed and immutable, so a body that hashes to the requested
+  sha256 is correct at any age and this route never refuses for staleness.
+- `Age` — the observed age of the response actually served, as before.
+
+When the observed age exceeds the budget, the service returns **503** with
+`Cache-Control: no-store` and an ordinary `prism.dashboard.error.v1` body whose
+message names both the budget and the observed age. Clients should treat this
+as "the data behind this route is too old to answer with", not as a new error
+schema — the error code is `upstream_unavailable`, already in the documented
+enum.
+
+Budgets are derived from the caches that sit under each route rather than
+hand-picked:
+
+```
+budget = max(3 * (cache_ttl_seconds + underlying_cache_seconds), 15)
+```
+
+`cache_ttl_seconds` is the route's own shared-response TTL and
+`underlying_cache_seconds` is any second cache stacked beneath it — today only
+the pool reward-window aggregate (`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`,
+default 30s) under `/public/v1/miners/{recipient_id}`. The factor of three and
+the 15-second floor match the existing precedent for PRISM's cached `/metrics`
+endpoint. At the documented defaults this yields:
+
+| Route | Budget |
+| --- | --- |
+| `/public/v1/blocks` | 15s |
+| `/public/v1/leaderboard` | 15s |
+| `/public/v1/miners/{recipient_id}/earnings` | 15s |
+| `/public/v1/miners/{recipient_id}/payouts` | 15s |
+| `/public/v1/blocks/{block_hash}/settlement-artifacts` | 15s |
+| `/public/v1/fanouts/pending` | 15s |
+| `/public/v1/fanouts/{fanout_txid}` | 15s |
+| `/public/v1/pool-summary` | 90s |
+| `/public/v1/hashrate-series` | 90s |
+| `/public/v1/miners/{recipient_id}/workers` | 90s |
+| `/public/v1/miners/{recipient_id}` | 105s |
+| `/public/v1/mining-configuration` | 900s |
+| `/public/v1/artifacts/{sha256}` | unbounded |
+
+The budgets are constants derived from the documented cache defaults, so an
+operator who raises a cache TTL above its route's budget will see that route
+begin refusing with 503 rather than quietly serving older data. Raise the TTL
+and the budget together, or leave the defaults alone.
 
 ## Conventions
 

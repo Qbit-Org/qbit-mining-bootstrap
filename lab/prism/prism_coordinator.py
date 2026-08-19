@@ -37,7 +37,7 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lab.auxpow import stratum_codec, vardiff
-from lab.prism import direct_stratum, public_api
+from lab.prism import direct_stratum
 # Compatibility re-exports; new callers should import lab.prism.bounded_executor.
 from lab.prism.bounded_executor import (
     _BoundedPriorityExecutor,  # noqa: F401 - compatibility re-export
@@ -1131,13 +1131,6 @@ class _CoordinatorAuditHttp(AuditHttpPort):
 
     def miner_status_payload(self, recipient_id: str) -> Mapping[str, object]:
         return self.coordinator.miner_status_payload(recipient_id)
-
-    def public_payload(
-        self,
-        path: str,
-        query: Mapping[str, list[str]],
-    ) -> tuple[int, object]:
-        return public_api.dispatch(self.coordinator, path, dict(query))
 
     def ledger_backend(self) -> str:
         return str(self.coordinator.ledger.backend_name)

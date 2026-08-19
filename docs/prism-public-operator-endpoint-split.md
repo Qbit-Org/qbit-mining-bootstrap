@@ -201,29 +201,75 @@ returns 503 rather than serving an unbounded-stale snapshot.
   `qbit_prism_metrics_snapshot_age_seconds`, `qbit_prism_metrics_snapshot_stale`
   and `qbit_prism_metrics_snapshot_available`
 
-Each extracted endpoint states the staleness it tolerates, surfaces the observed
-age to callers, and refuses rather than serving beyond its budget. The
-per-endpoint budgets are defined with the extraction.
+**Landed.** Each extracted endpoint states the staleness it tolerates, surfaces
+the observed age to callers, and refuses rather than serving beyond its budget.
+The budgets live in the `max_staleness_seconds` field of `Endpoint` in
+`lab/prism/endpoint_registry.py`, derived rather than hand-picked:
+
+```
+budget = max(3 * (cache_ttl_seconds + underlying_cache_seconds),
+             MINIMUM_PUBLIC_STALE_SECONDS)
+```
+
+with `MINIMUM_PUBLIC_STALE_SECONDS = 15`, matching the precedent's floor. The
+derivation is documented in that module's docstring and pinned by
+`tests/test_prism_endpoint_registry.py`, which asserts the budgets against the
+formula and against `public_cache_policy` itself, so a changed cache default
+cannot silently leave a budget behind.
 
 Three sources of staleness compound and must all be counted:
 
 1. The shared in-process response cache (`PublicResponseCache`), whose TTL is
-   already per-route via `public_cache_policy`.
+   already per-route via `public_cache_policy`. Counted.
 2. The pool reward-window aggregate cache in the ledger
    (`_pool_reward_window_aggregate`, `PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`,
-   default 30s), which sits underneath every miner page.
-3. Replica lag, once a replica exists.
+   default 30s), which sits underneath every miner page. Counted, and it is the
+   only route where two caches sit in series: `/public/v1/miners/{recipient_id}`
+   at 105s versus 15s for the other plain row reads.
+3. Replica lag, once a replica exists. Contributes 0 today because no replica
+   exists; when one lands it becomes another `underlying_cache_seconds` term
+   rather than a new mechanism.
 
-`/public/v1/artifacts/{sha256}` is the exception: content is immutable and
-content-addressed, so staleness is harmless except at the 404→200 transition for
-an artifact published within the budget.
+On the wire, every extracted response carries
+`X-Prism-Staleness-Budget-Seconds` beside the existing `Age` header. Past the
+budget the service returns 503 with `Cache-Control: no-store` and an ordinary
+`prism.dashboard.error.v1` body naming both the budget and the observed age —
+error code `upstream_unavailable`, already in the documented enum, rather than a
+new error schema.
+
+At the documented cache defaults the budgets are 15s for the plain row reads
+(`/blocks`, `/leaderboard`, `/miners/{id}/earnings`, `/miners/{id}/payouts`,
+`/blocks/{h}/settlement-artifacts`, `/fanouts/pending`, `/fanouts/{txid}`), 90s
+for the pool-wide aggregates (`/pool-summary`, `/hashrate-series`,
+`/miners/{id}/workers`), 105s for `/miners/{recipient_id}`, and 900s for
+`/mining-configuration`.
+
+`/public/v1/artifacts/{sha256}` is the exception, and says so explicitly through
+the registry's `immutable_content` flag rather than by omitting a budget: content
+is immutable and content-addressed, so a body that hashes to the requested
+sha256 is correct at any age. It reports `X-Prism-Staleness-Budget-Seconds:
+unbounded` and never refuses for staleness. The only observable staleness is the
+404→200 transition for an artifact published moments ago, which no budget would
+fix.
 
 ## Out of scope
 
 Anything payout-affecting stays on the coordinator: the writer lease, share
 acknowledgement, block landing, settlement, and the surfaces listed above. The
 extracted service is read-only — it opens no write path to the ledger and holds
-no lease.
+no lease. That is now structural rather than aspirational: it is constructed
+without any `PRISM_LEDGER_WRITER_*` input, receives none of the signing or
+block-submission configuration in compose, mounts the audit artifact volume
+`:ro`, and refuses to start on the in-memory ledger (whose missing `dashboard_*`
+read models would send `public_api`'s fallbacks back onto writer-lock reads).
+`tests/test_prism_public_read_service.py` drives every extracted route against a
+ledger that raises if any writer-lock read is reached.
+
+The two blockers named above are removed. `dashboard_miner_owed_balance_bits`
+and `dashboard_direct_coinbase_settlement` on `PsqlShareLedger` answer both
+formerly-fenced public reads through `_run_read_json`, and `public_api` prefers
+them through the same duck-typed pattern used by every other read model, keeping
+the old paths as in-memory-ledger fallbacks.
 
 Replica wiring is tracked separately. It needs `wal_level`, a replication slot,
 and a standby service in the Postgres setup; today `prism-postgres` has a

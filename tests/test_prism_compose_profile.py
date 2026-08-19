@@ -189,22 +189,7 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS"], "1800")
         self.assertEqual(env["PRISM_STRATUM_BIND"], "0.0.0.0")
         self.assertEqual(env["PRISM_STRATUM_PORT"], "43340")
-        self.assertEqual(env["PRISM_PUBLIC_STRATUM_URL"], "stratum+tcp://public-pool.example:3335")
-        self.assertEqual(env["PRISM_PUBLIC_STRATUM_HIGHDIFF_URL"], "stratum+tcp://public-pool.example:4334")
-        self.assertEqual(env["PRISM_PUBLIC_POOL_FEE_BPS"], "200")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_ENABLED"], "1")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_TTL_SECONDS"], "5")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "30")
-        self.assertEqual(env["PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS"], "30")
-        self.assertEqual(env["PRISM_PUBLIC_AGGREGATE_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "30")
         self.assertEqual(env["PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS"], "30")
-        self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS"], "300")
-        self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "3600")
-        self.assertEqual(env["PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS"], "86400")
-        self.assertEqual(env["PRISM_PUBLIC_ARTIFACT_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "86400")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_MAX_ENTRIES"], "512")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES"], "1048576")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_DEBUG_HEADERS"], "0")
         self.assertEqual(env["PRISM_AUDIT_BIND"], "127.0.0.1")
         self.assertEqual(env["PRISM_AUDIT_PORT"], "3341")
         self.assertEqual(env["PRISM_AUDIT_SHARE_SEGMENT_SIZE"], "10000")
@@ -283,6 +268,120 @@ class PrismComposeProfileTests(unittest.TestCase):
         nofile = self.config["services"]["prism-coordinator"]["ulimits"]["nofile"]
 
         self.assertEqual(nofile, {"soft": 60000, "hard": 65000})
+
+    # -- the extracted public read tier (issue #145) ------------------------
+
+    def test_public_api_runs_the_public_read_service_from_the_prism_image(self) -> None:
+        service = self.config["services"]["prism-public-api"]
+
+        self.assertEqual(service["command"], ["python3", "-m", "lab.prism.public_read_service"])
+        self.assertEqual(
+            service["build"]["dockerfile"],
+            "lab/prism/Dockerfile",
+        )
+        self.assertEqual(
+            service["image"],
+            self.config["services"]["prism-coordinator"]["image"],
+        )
+        self.assertEqual(service.get("restart"), "on-failure")
+
+    def test_public_api_survives_coordinator_restarts(self) -> None:
+        # The public tier must not depend on the coordinator: independence from
+        # coordinator restarts is a large part of why the surface was extracted.
+        depends_on = self.config["services"]["prism-public-api"].get("depends_on", {})
+
+        self.assertIn("prism-postgres", depends_on)
+        self.assertEqual(
+            depends_on["prism-postgres"]["condition"],
+            "service_healthy",
+        )
+        self.assertNotIn("prism-coordinator", depends_on)
+
+    def test_public_api_mounts_the_audit_volume_read_only(self) -> None:
+        volumes = self.config["services"]["prism-public-api"].get("volumes", [])
+        audit = [
+            volume
+            for volume in volumes
+            if isinstance(volume, dict) and volume.get("source") == "prism-audit-data"
+        ]
+
+        self.assertEqual(1, len(audit), f"expected one audit mount in {volumes!r}")
+        self.assertTrue(
+            audit[0].get("read_only"),
+            f"the audit artifact volume must be mounted read-only: {audit[0]!r}",
+        )
+
+    def test_public_api_receives_the_moved_public_knobs(self) -> None:
+        env = self._service_environment("prism-public-api")
+
+        self.assertEqual(env["PRISM_PUBLIC_STRATUM_URL"], "stratum+tcp://public-pool.example:3335")
+        self.assertEqual(env["PRISM_PUBLIC_STRATUM_HIGHDIFF_URL"], "stratum+tcp://public-pool.example:4334")
+        self.assertEqual(env["PRISM_PUBLIC_POOL_FEE_BPS"], "200")
+        self.assertEqual(env["PRISM_PUBLIC_CACHE_ENABLED"], "1")
+        self.assertEqual(env["PRISM_PUBLIC_CACHE_TTL_SECONDS"], "5")
+        self.assertEqual(env["PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS"], "30")
+        self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS"], "300")
+        self.assertEqual(env["PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS"], "86400")
+        self.assertEqual(env["PRISM_PUBLIC_CACHE_MAX_ENTRIES"], "512")
+        self.assertEqual(env["PRISM_PUBLIC_CACHE_DEBUG_HEADERS"], "0")
+        self.assertEqual(env["PRISM_DATABASE_URL"], "postgresql://qbit:change-this@prism-postgres:5432/qbit")
+        self.assertEqual(env["PRISM_AUDIT_DIR"], "/var/lib/qbit-prism/audit")
+        self.assertEqual(env["QBIT_RPC_HOST"], "qbitd")
+
+    def test_the_coordinator_no_longer_carries_the_moved_public_knobs(self) -> None:
+        # The coordinator serves no route that reads these any more; leaving
+        # them behind would imply it still did.
+        env = self._service_environment("prism-coordinator")
+
+        for name in (
+            "PRISM_PUBLIC_STRATUM_URL",
+            "PRISM_PUBLIC_POOL_NAME",
+            "PRISM_PUBLIC_CACHE_ENABLED",
+            "PRISM_PUBLIC_CACHE_TTL_SECONDS",
+            "PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS",
+            "PRISM_PUBLIC_EXPLORER_TX_URL_PREFIX",
+        ):
+            with self.subTest(name=name):
+                self.assertNotIn(name, env)
+
+    def test_the_reward_window_cache_knob_stays_on_both(self) -> None:
+        # Read by the ledger itself, and both processes construct one.
+        for service in ("prism-coordinator", "prism-public-api"):
+            with self.subTest(service=service):
+                env = self._service_environment(service)
+                self.assertEqual(env["PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS"], "30")
+
+    def test_public_api_never_receives_writer_or_signing_configuration(self) -> None:
+        # A read tier that could acquire a writer lease or sign a manifest
+        # would not be a read tier.
+        env = self._service_environment("prism-public-api")
+
+        self.assertEqual(env.get("PRISM_ALLOW_MEMORY_LEDGER"), "0")
+        for name in env:
+            self.assertFalse(
+                name.startswith("PRISM_LEDGER_WRITER_"),
+                f"{name} must not reach the public read tier",
+            )
+        for name in (
+            "PRISM_MANIFEST_SIGNING_SEED_HEX",
+            "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX",
+            "PRISM_POSTGRES_INIT_SCHEMA",
+        ):
+            with self.subTest(name=name):
+                self.assertNotIn(name, env)
+
+    def test_public_api_publishes_its_port_and_healthcheck(self) -> None:
+        service = self.config["services"]["prism-public-api"]
+        published = {
+            str(port.get("published"))
+            for port in service.get("ports", [])
+            if isinstance(port, dict)
+        }
+        self.assertIn("3342", published)
+
+        command = " ".join(service["healthcheck"]["test"])
+        self.assertIn("/healthz", command)
+        self.assertIn("urllib.request.urlopen", command)
 
     def _service_environment(self, name: str) -> dict[str, str]:
         raw_env = self.config["services"][name]["environment"]

@@ -82,7 +82,14 @@ class MiningComposeProfileTests(unittest.TestCase):
                 "auxpow-stratum",
                 "auxpow-real-miner",
             },
-            "prism": {"qbitd", "prism-postgres", "prism-coordinator"},
+            # prism-public-api serves the extracted /public/v1 read tier
+            # in its own process (issue #145).
+            "prism": {
+                "qbitd",
+                "prism-postgres",
+                "prism-coordinator",
+                "prism-public-api",
+            },
         }
 
         for profile, services in expected.items():

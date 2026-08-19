@@ -109,6 +109,40 @@ class LedgerOperationTimeout(TimeoutError):
     """A caller-scoped PostgreSQL deadline expired before work completed."""
 
 
+class ReadOnlyLedgerError(RuntimeError):
+    """A read-only ledger was asked for the writer lock."""
+
+
+class _RefusingWriterGate:
+    """Stands in for the writer lock on a read-only ledger.
+
+    Every fenced statement and every writer-lock read in PsqlShareLedger --
+    appends, block landing, settlement, and the O(recipients) reads like
+    current_owed_balances() and audit_bundle() -- reaches the lock through
+    ``_operation_gate(self._lock, "writer lock")``. Substituting a gate that
+    refuses to be acquired makes "this process never fences" a property of the
+    object rather than of which methods its callers happen to use, so a future
+    public route that reached a fenced read would fail loudly here instead of
+    quietly serializing dashboard traffic against the block-landing path.
+    """
+
+    __slots__ = ()
+
+    _MESSAGE = "ledger is read-only: the writer lock is not available"
+
+    def acquire(self, timeout: float = -1.0) -> bool:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+    def release(self) -> None:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+    def __enter__(self) -> None:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+    def __exit__(self, *exc_info: object) -> None:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+
 def _is_postgres_deadline_error(error: BaseException | str) -> bool:
     """Recognize backend cancellations caused by an armed caller deadline."""
     message = str(error).casefold()
@@ -2525,6 +2559,7 @@ class PsqlShareLedger:
         postgres_tcp_keepalives_idle_seconds: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
         postgres_tcp_keepalives_interval_seconds: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
         postgres_tcp_keepalives_count: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+        read_only: bool = False,
         read_concurrency: int = 4,
         accepted_stats_cache_seconds: float = 60.0,
         reward_window_cache_seconds: float = 30.0,
@@ -2537,6 +2572,9 @@ class PsqlShareLedger:
     ):
         if writer_epoch < 0:
             raise ValueError("writer_epoch must be >= 0")
+        read_only = bool(read_only)
+        if read_only and initialize_schema:
+            raise ValueError("a read-only ledger cannot initialize the schema")
         accepted_stats_cache_seconds = float(accepted_stats_cache_seconds)
         if not math.isfinite(accepted_stats_cache_seconds) or accepted_stats_cache_seconds < 0:
             raise ValueError("accepted_stats_cache_seconds must be finite and non-negative")
@@ -2669,7 +2707,10 @@ class PsqlShareLedger:
         # remove. The scope keeps its lazy fallback for ledgers built through
         # __new__ in focused tests; the production path must not race.
         self._operation_progress_local = local()
-        self._lock = Lock()
+        self._read_only = read_only
+        # A read-only ledger never holds the writer lock, so it is not given
+        # one: see _RefusingWriterGate. Read-slot traffic is unaffected.
+        self._lock = _RefusingWriterGate() if read_only else Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         audit_share_segment_size = int(audit_share_segment_size)
         if audit_share_segment_size < 0:
@@ -2723,11 +2764,16 @@ class PsqlShareLedger:
         )
         self._writer_lease_guard: LeaseGuardPort | None = None
         try:
-            self._initialize_writer_lease_guard(database_url)
-            if initialize_schema:
-                path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
-                self._run_script(path.read_text(encoding="utf-8"))
-            self._ensure_writer_lease()
+            if not read_only:
+                # Constructing an ordinary ledger claims the single-writer
+                # lease. A read-only ledger must not, or a second process
+                # opening one would contend with -- and could adopt -- the
+                # lease the coordinator lands blocks under.
+                self._initialize_writer_lease_guard(database_url)
+                if initialize_schema:
+                    path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
+                    self._run_script(path.read_text(encoding="utf-8"))
+                self._ensure_writer_lease()
         except BaseException:
             self.close()
             raise
@@ -4207,6 +4253,49 @@ WHERE owed_balance_sats > 0;
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
 
+    def dashboard_readiness_probe(self) -> bool:
+        """Cheapest possible proof that Postgres is reachable through a read slot.
+
+        The extracted public read tier's /healthz needs to answer "can I still
+        reach the database" without running any aggregate: a health check that
+        scans the share ledger turns a liveness probe into load, and the
+        compose healthcheck runs it on an interval forever. This is a constant
+        select -- it touches no PRISM table -- taken through the same bounded
+        read slot as every other public read, so a saturated read pool shows up
+        as an unhealthy service rather than as a probe that jumps the queue.
+        """
+        payload = self._run_read_json("SELECT json_build_object('ok', true);")
+        return bool(isinstance(payload, dict) and payload.get("ok"))
+
+    def dashboard_miner_owed_balance_bits(self, *, recipient_id: str) -> int:
+        """One recipient's owed balance, read without the writer lock.
+
+        The same total as summing current_owed_balances() for this recipient,
+        but filtered in SQL and taken through the bounded read slot instead of
+        the writer gate. current_owed_balances() returns every recipient's
+        balance under the writer lock, so serving the most-polled public route
+        (/public/v1/miners/{recipient_id}) from it made a dashboard poll
+        serialize against the lease-holding writer. The predicates match that
+        method exactly -- rows from qbit_current_owed_balances() with
+        owed_balance_sats > 0, restricted to this miner_id -- so the integer
+        returned here is the integer the Python sum produced.
+        """
+        if not recipient_id:
+            raise ValueError("recipient_id is required")
+        sql = f"""
+SELECT json_build_object(
+    'owed_balance_bits',
+    COALESCE((
+        SELECT sum(owed_balance_sats)
+        FROM qbit_current_owed_balances()
+        WHERE owed_balance_sats > 0
+          AND miner_id = {self._text_literal(recipient_id)}
+    ), 0)::text
+);
+"""
+        payload = self._run_read_json(sql)
+        return int(payload["owed_balance_bits"])
+
     def prior_balances_after_pool_block(
         self,
         *,
@@ -4959,6 +5048,91 @@ SELECT COALESCE(
         with self._operation_gate(self._lock, "writer lock"):
             row = self._run_retry_safe_read_json(sql)
         return self._resolve_audit_bundle_row(row)
+
+    def dashboard_direct_coinbase_settlement(
+        self,
+        *,
+        block_hash: str,
+    ) -> dict[str, object] | None:
+        """Public settlement facts for a direct-coinbase block, without fencing.
+
+        /public/v1/blocks/{block_hash}/settlement-artifacts serves CTV blocks
+        from audit_ctv_fanout_manifest_set() (a read slot), but a
+        direct-coinbase block fell through to audit_bundle(), which reads the
+        same row under the writer lock. This is that read taken through the
+        bounded read slot instead, returning exactly the dict
+        public_api.direct_coinbase_settlement_payload() builds today.
+
+        The row is resolved through _resolve_audit_bundle_row, so an
+        externalized body is read from body_uri on disk and sha256-verified
+        against audit_bundle_sha256 by the same helper the fenced path uses.
+        A body that is unretrievable, hash-mismatched, or not valid JSON is
+        reported as None rather than raised, matching what
+        public_api.audit_bundle_body_read_failed() already tolerates.
+
+        Returns None when the block has no audit bundle, or when the bundle
+        settled in any mode other than direct_coinbase.
+        """
+        from lab.prism import public_api
+
+        sql = f"""
+SELECT COALESCE(
+    (
+        SELECT json_build_object(
+            'block_hash', bundle.block_hash,
+            'block_height', block.block_height,
+            'payout_manifest_sha256', block.payout_manifest_sha256,
+            'audit_bundle_sha256', bundle.audit_bundle_sha256,
+            'audit_bundle', bundle.audit_bundle,
+            'body_uri', bundle.body_uri
+        )
+        FROM qbit_pool_audit_bundles bundle
+        JOIN qbit_pool_blocks block
+          ON block.block_hash = bundle.block_hash
+        WHERE bundle.block_hash = {self._text_literal(block_hash)}
+    ),
+    'null'::json
+);
+"""
+        row = self._run_read_json(sql)
+        try:
+            resolved = self._resolve_audit_bundle_row(row)
+        except RuntimeError as exc:
+            if public_api.audit_bundle_body_read_failed(exc):
+                return None
+            raise
+        if not isinstance(resolved, dict):
+            return None
+        bundle = resolved.get("audit_bundle")
+        if not isinstance(bundle, dict):
+            return None
+        if public_api.audit_bundle_settlement_mode(bundle) != "direct_coinbase":
+            return None
+        return {
+            "block_hash": public_api.optional_hex_hash(resolved.get("block_hash"))
+            or block_hash,
+            "block_height": public_api.first_int(
+                resolved.get("block_height"),
+                public_api.audit_bundle_section_value(
+                    bundle, "found_block", "block_height"
+                ),
+                public_api.audit_bundle_section_value(
+                    bundle, "reward_manifest", "block_height"
+                ),
+                public_api.audit_bundle_section_value(
+                    bundle, "ledger_window_attestation", "block_height"
+                ),
+                default=0,
+            ),
+            "settlement_mode": "direct_coinbase",
+            "audit_bundle_sha256": public_api.nullable_str(
+                resolved.get("audit_bundle_sha256")
+            ),
+            "payout_manifest_sha256": public_api.nullable_str(
+                resolved.get("payout_manifest_sha256")
+            ),
+            "artifacts": [],
+        }
 
     def audit_bundle_by_commitment(self, *, commitment_leaf_hex: str) -> dict[str, object] | None:
         leaf = self._text_literal(commitment_leaf_hex)

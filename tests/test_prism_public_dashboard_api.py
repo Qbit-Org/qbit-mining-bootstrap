@@ -18,8 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from lab.prism import direct_stratum, public_api
-from lab.prism.prism_coordinator import make_audit_handler
+from lab.prism import direct_stratum, public_api, public_read_service
 from lab.prism.share_ledger import (
     PendingShare,
     PsqlShareLedger,
@@ -27,6 +26,20 @@ from lab.prism.share_ledger import (
     canonical_json_text,
     sha256_json_hex,
 )
+
+
+def make_public_handler(coordinator: object) -> type:
+    """Serve /public/v1 through the process that owns it.
+
+    These routes left the coordinator's audit listener in issue #145, so the
+    handler under test here is the extracted public read service's. It wraps
+    the same public_api.dispatch behind the same PublicResponseCache, which is
+    what keeps these assertions meaningful across the move;
+    tests/test_prism_public_read_service.py pins that equivalence directly.
+    """
+
+    service = public_read_service.PublicReadService(coordinator)  # type: ignore[arg-type]
+    return public_read_service.make_handler(service)
 
 
 class FanoutPublicRowTests(unittest.TestCase):
@@ -759,7 +772,7 @@ class MemoryCoordinator:
 
 class PrismPublicDashboardApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        handler = make_audit_handler(FakeCoordinator())  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator())  # type: ignore[arg-type]
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -843,7 +856,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_missing_compact_bits_fail_endpoints_before_reward_ledger_reads(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(
+        handler = make_public_handler(
             FakeCoordinator(ledger=ledger, rpc=FakeRpc(template_bits=None))
         )  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -940,7 +953,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_hashrate_series_fetches_lookback_and_trims_pre_range_points(self) -> None:
         ledger = RangeBoundaryPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1126,7 +1139,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_origin_cache_separates_legacy_and_reward_leaderboards(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1194,7 +1207,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_successes_emit_cache_headers_and_hit_origin_cache(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1237,7 +1250,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_errors_are_no_store_and_not_cached(self) -> None:
         ledger = BrokenPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1259,7 +1272,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_coalesces_concurrent_origin_cache_misses(self) -> None:
         ledger = SlowPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1300,7 +1313,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         # An oversize (non-cacheable) response must still coalesce concurrent
         # waiters onto the owner's single origin call instead of re-running it.
         ledger = SlowPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1410,7 +1423,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_cache_headers_use_route_specific_ttls(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1520,7 +1533,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             public_api.scaled_network_difficulty("00000000")
 
     def test_unexpected_public_api_errors_do_not_leak_internal_details(self) -> None:
-        handler = make_audit_handler(FakeCoordinator(BrokenPublicLedger()))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(BrokenPublicLedger()))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1545,7 +1558,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(payload["error"], {"code": "internal_error", "message": "internal server error", "request_id": None})
 
     def test_public_value_errors_do_not_leak_internal_details(self) -> None:
-        handler = make_audit_handler(FakeCoordinator(ValueErrorPublicLedger()))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ValueErrorPublicLedger()))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1598,7 +1611,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_settlement_artifacts_returns_direct_coinbase_bundle_without_fanouts(self) -> None:
         ledger = DirectCoinbasePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1636,7 +1649,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
     def test_settlement_artifacts_supports_externalized_direct_coinbase_audit_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger = ExternalizedDirectCoinbasePublicLedger(tmp)
-            handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+            handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -1663,7 +1676,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = ExternalizedDirectCoinbasePublicLedger(tmp)
             ledger.body_uri.unlink()
-            handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+            handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -2143,7 +2156,7 @@ class PublicArtifactByteExactnessTests(unittest.TestCase):
     trailing newline."""
 
     def serve(self, ledger: FakePublicLedger) -> str:
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -2240,7 +2253,7 @@ class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
                 ntime=1,
             )
         )
-        handler = make_audit_handler(coordinator)  # type: ignore[arg-type]
+        handler = make_public_handler(coordinator)  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -2272,7 +2285,7 @@ class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
             manifest_set=manifest_set,
             manifest_set_sha256=manifest_set_sha256,
         )
-        handler = make_audit_handler(coordinator)  # type: ignore[arg-type]
+        handler = make_public_handler(coordinator)  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()

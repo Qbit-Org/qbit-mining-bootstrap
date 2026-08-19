@@ -97,13 +97,6 @@ class _RoutingPort:
     def miner_status_payload(self, recipient_id: str) -> dict[str, object]:
         return {"recipient_id": recipient_id}
 
-    def public_payload(
-        self,
-        path: str,
-        query: dict[str, list[str]],
-    ) -> tuple[int, object]:
-        return 200, {"path": path}
-
     def ledger_backend(self) -> str:
         return "fixture"
 
@@ -258,6 +251,185 @@ class EndpointRegistryShapeTests(unittest.TestCase):
                 self.assertIn(path, blockers)
 
 
+class StalenessBudgetTests(unittest.TestCase):
+    """The staleness contract must be derived and stated, never hand-picked."""
+
+    def extracted_endpoints(self) -> list[endpoint_registry.Endpoint]:
+        return [
+            endpoint
+            for endpoint in ENDPOINTS
+            if endpoint.disposition is Disposition.EXTRACT
+        ]
+
+    def test_every_extracted_route_states_a_budget_or_declares_immutability(self) -> None:
+        for endpoint in self.extracted_endpoints():
+            with self.subTest(path=endpoint.primary_path):
+                self.assertTrue(
+                    endpoint.max_staleness_seconds is not None
+                    or endpoint.immutable_content,
+                    f"{endpoint.primary_path} states no staleness tolerance",
+                )
+
+    def test_retained_routes_carry_no_public_staleness_budget(self) -> None:
+        # The contract covers the extracted public surface. A budget on a
+        # retained route would imply the coordinator enforces one, which it
+        # does not.
+        for endpoint in ENDPOINTS:
+            if endpoint.disposition is Disposition.EXTRACT:
+                continue
+            with self.subTest(path=endpoint.primary_path):
+                self.assertIsNone(endpoint.max_staleness_seconds)
+                self.assertFalse(endpoint.immutable_content)
+
+    def test_budgets_match_the_documented_derivation(self) -> None:
+        # Pin each budget to the formula rather than to a literal, so changing
+        # a cache default without revisiting the budget fails here.
+        aggregate = endpoint_registry.PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS
+        plain = endpoint_registry.PUBLIC_CACHE_TTL_DEFAULT_SECONDS
+        config = endpoint_registry.PUBLIC_CONFIG_CACHE_TTL_DEFAULT_SECONDS
+        reward_window = endpoint_registry.POOL_REWARD_WINDOW_CACHE_DEFAULT_SECONDS
+        derive = endpoint_registry.staleness_budget_seconds
+        expected = {
+            "/public/v1/pool-summary": derive(cache_ttl_seconds=aggregate),
+            "/public/v1/blocks": derive(cache_ttl_seconds=plain),
+            "/public/v1/leaderboard": derive(cache_ttl_seconds=plain),
+            "/public/v1/hashrate-series": derive(cache_ttl_seconds=aggregate),
+            "/public/v1/mining-configuration": derive(cache_ttl_seconds=config),
+            # The one route with a second cache in series beneath it.
+            "/public/v1/miners/{recipient_id}": derive(
+                cache_ttl_seconds=plain,
+                underlying_cache_seconds=reward_window,
+            ),
+            "/public/v1/miners/{recipient_id}/earnings": derive(cache_ttl_seconds=plain),
+            "/public/v1/miners/{recipient_id}/payouts": derive(cache_ttl_seconds=plain),
+            "/public/v1/miners/{recipient_id}/workers": derive(cache_ttl_seconds=aggregate),
+            "/public/v1/blocks/{block_hash}/settlement-artifacts": derive(
+                cache_ttl_seconds=plain
+            ),
+            "/public/v1/fanouts/pending": derive(cache_ttl_seconds=plain),
+            "/public/v1/fanouts/{fanout_txid}": derive(cache_ttl_seconds=plain),
+        }
+        actual = {
+            endpoint.primary_path: endpoint.max_staleness_seconds
+            for endpoint in self.extracted_endpoints()
+            if endpoint.max_staleness_seconds is not None
+        }
+        self.assertEqual(expected, actual)
+
+    def test_the_aggregate_ttl_really_is_what_the_cache_policy_applies(self) -> None:
+        # The derivation above assumes public_cache_policy classifies these
+        # three as aggregates and everything else as a plain row read. Assert
+        # that against the policy itself so the two cannot drift apart.
+        for path, expected_ttl in (
+            ("/public/v1/pool-summary", endpoint_registry.PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS),
+            ("/public/v1/hashrate-series", endpoint_registry.PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS),
+            ("/public/v1/miners/miner-1/workers", endpoint_registry.PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS),
+            ("/public/v1/blocks", endpoint_registry.PUBLIC_CACHE_TTL_DEFAULT_SECONDS),
+            ("/public/v1/miners/miner-1/earnings", endpoint_registry.PUBLIC_CACHE_TTL_DEFAULT_SECONDS),
+            ("/public/v1/mining-configuration", endpoint_registry.PUBLIC_CONFIG_CACHE_TTL_DEFAULT_SECONDS),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    expected_ttl,
+                    public_api.public_cache_policy(path).ttl_seconds,
+                )
+
+    def test_no_budget_falls_below_the_documented_floor(self) -> None:
+        for endpoint in self.extracted_endpoints():
+            if endpoint.max_staleness_seconds is None:
+                continue
+            with self.subTest(path=endpoint.primary_path):
+                self.assertGreaterEqual(
+                    endpoint.max_staleness_seconds,
+                    endpoint_registry.MINIMUM_PUBLIC_STALE_SECONDS,
+                )
+
+    def test_only_the_artifact_route_is_exempt_from_staleness(self) -> None:
+        # Content-addressed and immutable: correct at any age. Stated in the
+        # registry rather than left implicit, so the exemption is reviewable.
+        exempt = [
+            endpoint.primary_path
+            for endpoint in ENDPOINTS
+            if endpoint.immutable_content
+        ]
+        self.assertEqual(["/public/v1/artifacts/{sha256}"], exempt)
+
+    def test_immutable_content_and_a_budget_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(ValueError):
+            endpoint_registry.Endpoint(
+                paths=("/public/v1/example",),
+                audience=Audience.PUBLIC_READ,
+                disposition=Disposition.EXTRACT,
+                access=(LedgerAccess.READ_SLOT,),
+                rationale="fixture",
+                immutable_content=True,
+                max_staleness_seconds=30,
+            )
+
+    def test_an_extracted_route_cannot_omit_its_staleness_tolerance(self) -> None:
+        with self.assertRaises(ValueError):
+            endpoint_registry.Endpoint(
+                paths=("/public/v1/example",),
+                audience=Audience.PUBLIC_READ,
+                disposition=Disposition.EXTRACT,
+                access=(LedgerAccess.READ_SLOT,),
+                rationale="fixture",
+            )
+
+    def test_derivation_rejects_negative_cache_seconds(self) -> None:
+        with self.assertRaises(ValueError):
+            endpoint_registry.staleness_budget_seconds(cache_ttl_seconds=-1)
+        with self.assertRaises(ValueError):
+            endpoint_registry.staleness_budget_seconds(
+                cache_ttl_seconds=5,
+                underlying_cache_seconds=-1,
+            )
+
+
+class EndpointForRequestPathTests(unittest.TestCase):
+    """Concrete request paths must resolve to the endpoint that serves them."""
+
+    def test_literal_paths_win_over_templates(self) -> None:
+        # /public/v1/fanouts/pending is a literal list route that would also
+        # match /public/v1/fanouts/{fanout_txid}; dispatch() gives the literal
+        # precedence, so the registry lookup must too.
+        endpoint = endpoint_registry.endpoint_for_request_path(
+            "/public/v1/fanouts/pending"
+        )
+        assert endpoint is not None
+        self.assertEqual("/public/v1/fanouts/pending", endpoint.primary_path)
+
+    def test_templates_match_concrete_segments(self) -> None:
+        for path, expected in (
+            (f"/public/v1/fanouts/{HEX64}", "/public/v1/fanouts/{fanout_txid}"),
+            ("/public/v1/miners/miner-1", "/public/v1/miners/{recipient_id}"),
+            (
+                "/public/v1/miners/miner-1/workers",
+                "/public/v1/miners/{recipient_id}/workers",
+            ),
+            (
+                f"/public/v1/blocks/{HEX64}/settlement-artifacts",
+                "/public/v1/blocks/{block_hash}/settlement-artifacts",
+            ),
+        ):
+            with self.subTest(path=path):
+                endpoint = endpoint_registry.endpoint_for_request_path(path)
+                assert endpoint is not None
+                self.assertEqual(expected, endpoint.primary_path)
+
+    def test_unknown_paths_resolve_to_nothing(self) -> None:
+        for path in ("/public/v1/not-a-route", "/public/v1", "/nope"):
+            with self.subTest(path=path):
+                self.assertIsNone(endpoint_registry.endpoint_for_request_path(path))
+
+    def test_every_extracted_path_resolves(self) -> None:
+        for path in endpoint_registry.extracted_paths():
+            with self.subTest(path=path):
+                self.assertIsNotNone(
+                    endpoint_registry.endpoint_for_request_path(concrete_path(path))
+                )
+
+
 class EndpointRegistryRoutingTests(unittest.TestCase):
     """Every classified path must actually be routed today."""
 
@@ -386,8 +558,6 @@ class RegistryCoverageTests(unittest.TestCase):
             "/owed-balances",
             "/payouts",
             "/payouts/",
-            "/public/v1",
-            "/public/v1/",
             "/status",
         }
     )
