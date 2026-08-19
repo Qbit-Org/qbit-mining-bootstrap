@@ -292,9 +292,9 @@ up-prism-pool:
 	fi; \
 	printf 'audit HTTP stays inside the coordinator namespace at %s:%s\n' "$$(compose_env_value PRISM_AUDIT_BIND 127.0.0.1)" "$$(compose_env_value PRISM_AUDIT_PORT 3341)"; \
 	if [[ "$$(operator_build_mode)" == no-build ]]; then \
-		$(PRODUCTION_COMPOSE) --profile prism up -d --no-build --pull never qbitd prism-postgres prism-coordinator; \
+		$(PRODUCTION_COMPOSE) --profile prism up -d --no-build --pull never qbitd prism-postgres prism-coordinator prism-public-api; \
 	else \
-		$(COMPOSE) --profile prism up --build qbitd prism-postgres prism-coordinator; \
+		$(COMPOSE) --profile prism up --build qbitd prism-postgres prism-coordinator prism-public-api; \
 	fi
 
 up-dual-pools: export MINING_LANES=ckpool,auxpow

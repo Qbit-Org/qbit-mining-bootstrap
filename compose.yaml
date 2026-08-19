@@ -708,6 +708,13 @@ services:
       PRISM_PUBLIC_API_PORT: ${PRISM_PUBLIC_API_PORT:-3342}
       PRISM_PUBLIC_READINESS_PROBE_INTERVAL_SECONDS: ${PRISM_PUBLIC_READINESS_PROBE_INTERVAL_SECONDS:-5}
       PRISM_PUBLIC_POOL_NAME: ${PRISM_PUBLIC_POOL_NAME:-PRISM}
+      # This process runs no Stratum listener, but /public/v1/mining-configuration
+      # still renders from these: PRISM_STRATUM_PORT is the primary endpoint's
+      # fallback port, and the High-diff endpoint appears only when
+      # PRISM_STRATUM_HIGHDIFF_PORT is set. Without the pass-through the rendered
+      # body silently drops the high-diff listener the coordinator is running.
+      PRISM_STRATUM_PORT: ${PRISM_STRATUM_PORT:-3340}
+      PRISM_STRATUM_HIGHDIFF_PORT: ${PRISM_STRATUM_HIGHDIFF_PORT:-}
       PRISM_PUBLIC_STRATUM_HOST: ${PRISM_PUBLIC_STRATUM_HOST:-}
       # Required: this process runs no Stratum listener, so it cannot infer the
       # pool's endpoint and refuses to start rather than advertise 127.0.0.1.

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Pin the extracted PRISM public read tier against the surface it replaced.
 
-Issue #145 moved exactly the 13 ``/public/v1`` routes out of the coordinator's
-audit/ops listener into ``lab/prism/public_read_service.py``. An extraction is
+The extraction step of issue #145 moved exactly the 13 ``/public/v1`` routes
+out of the coordinator's audit/ops listener into
+``lab/prism/public_read_service.py``. The issue's read-replica back-end is a
+separate follow-up -- this service still reads the primary Postgres, through
+bounded read slots rather than the writer path. An extraction is
 only worth doing if it changes nothing a client can observe and everything the
 coordinator can feel, so these tests assert both halves:
 
@@ -26,6 +29,7 @@ coordinator can feel, so these tests assert both halves:
 from __future__ import annotations
 
 import json
+import os
 import threading
 from threading import BoundedSemaphore, Lock
 import unittest
@@ -242,6 +246,40 @@ class ContractEqualityTests(unittest.TestCase):
                         served.headers.get(name),
                         f"{path}: {name} changed across the extraction",
                     )
+
+    def test_mining_configuration_highdiff_endpoint_survives_the_extraction(self) -> None:
+        # This process runs no Stratum listener, so the High-diff endpoint in
+        # the rendered body comes only from PRISM_STRATUM_HIGHDIFF_PORT in this
+        # process's own environment (compose passes it through; see
+        # tests/test_prism_compose_profile.py). With the env set the served
+        # body must still match dispatch and must carry the High-diff endpoint.
+        route = ("/public/v1/mining-configuration", "")
+        with patch.dict(
+            os.environ,
+            {
+                "PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://public-pool.example:3335",
+                "PRISM_STRATUM_HIGHDIFF_PORT": "4334",
+            },
+            clear=True,
+        ):
+            served = self.harness.get(request_path(route))
+            status, payload, headers = self.expected_success(*route)
+
+        self.assertEqual(status, served.status)
+        self.assertEqual(payload, served.payload)
+        for name in CACHE_HEADERS:
+            self.assertEqual(headers.get(name), served.headers.get(name))
+
+        endpoints = served.payload["configurations"][0]["stratum_endpoints"]
+        self.assertEqual(
+            ["Primary", "High-diff"],
+            [endpoint["label"] for endpoint in endpoints],
+        )
+        self.assertEqual(
+            "stratum+tcp://public-pool.example:4334",
+            endpoints[1]["url"],
+        )
+        self.assertEqual(4334, endpoints[1]["default_port"])
 
     def test_content_type_is_unchanged(self) -> None:
         for route in EXTRACTED_ROUTES:

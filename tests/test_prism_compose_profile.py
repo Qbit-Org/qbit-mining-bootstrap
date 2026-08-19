@@ -38,6 +38,7 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "QBIT_NODE_EXTRA_ARG": "-listen=1",
                 "PRISM_STRATUM_PORT": "43340",
                 "PRISM_STRATUM_PORT_HOST": "127.0.0.1:43340",
+                "PRISM_STRATUM_HIGHDIFF_PORT": "44334",
                 "PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://public-pool.example:3335",
                 "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": "stratum+tcp://public-pool.example:4334",
                 "PRISM_PUBLIC_POOL_FEE_BPS": "200",
@@ -327,6 +328,18 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_DATABASE_URL"], "postgresql://qbit:change-this@prism-postgres:5432/qbit")
         self.assertEqual(env["PRISM_AUDIT_DIR"], "/var/lib/qbit-prism/audit")
         self.assertEqual(env["QBIT_RPC_HOST"], "qbitd")
+
+    def test_public_api_receives_the_advertised_stratum_ports(self) -> None:
+        # The service runs no Stratum listener, but mining-configuration still
+        # renders from these: PRISM_STRATUM_PORT is the primary endpoint's
+        # fallback port and the High-diff endpoint appears only when
+        # PRISM_STRATUM_HIGHDIFF_PORT is set. Without the pass-through the
+        # rendered body silently drops the high-diff listener the coordinator
+        # is running.
+        env = self._service_environment("prism-public-api")
+
+        self.assertEqual(env["PRISM_STRATUM_PORT"], "43340")
+        self.assertEqual(env["PRISM_STRATUM_HIGHDIFF_PORT"], "44334")
 
     def test_the_coordinator_no_longer_carries_the_moved_public_knobs(self) -> None:
         # The coordinator serves no route that reads these any more; leaving

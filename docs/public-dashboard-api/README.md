@@ -135,10 +135,18 @@ endpoint. At the documented defaults this yields:
 | `/public/v1/mining-configuration` | 900s |
 | `/public/v1/artifacts/{sha256}` | unbounded |
 
-The budgets are constants derived from the documented cache defaults, so an
-operator who raises a cache TTL above its route's budget will see that route
-begin refusing with 503 rather than quietly serving older data. Raise the TTL
-and the budget together, or leave the defaults alone.
+The budgets are constants derived from the documented cache defaults — the
+`max_staleness_seconds` values in `lab/prism/endpoint_registry.py` — and there
+is no environment knob that raises a budget. An operator who raises one of the
+cache TTL knobs that do exist (`PRISM_PUBLIC_CACHE_TTL_SECONDS`,
+`PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS`,
+`PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS`, or
+`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`) above its route's budget will see
+that route begin refusing with 503 rather than quietly serving older data.
+Raising a TTL past its budget therefore also requires changing the registry
+constant in the same change; otherwise leave the defaults alone. The
+`PRISM_PUBLIC_ARTIFACT_CACHE_*` TTLs are exempt: the artifact route is
+content-addressed and never refuses for staleness.
 
 ## Conventions
 
