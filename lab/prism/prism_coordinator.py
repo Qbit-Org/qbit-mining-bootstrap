@@ -476,20 +476,23 @@ PRISM_TEMPLATE_FINGERPRINT_VOLATILE_KEYS = frozenset(
 
 
 class _ObservedRLock:
-    """RLock with zero shared-metrics work on uncontended acquisitions.
+    """RLock with no mutex acquisition on uncontended acquisitions.
 
-    The coordinator lock protects control-plane publication state. Its
-    contention counters intentionally record only acquisitions that fail an
-    immediate probe, so observing it cannot recreate the share-path convoy the
-    metrics are meant to diagnose.
+    The coordinator lock protects control-plane publication state. Its wait
+    counters intentionally record only acquisitions that fail an immediate
+    probe, and the shared mutex guarding them is therefore never taken on an
+    uncontended acquisition, so observing this lock cannot recreate the
+    share-path convoy the metrics are meant to diagnose.
 
     A contended count on its own is an absolute number with no denominator, so
     a contended percentage cannot be derived from a live process. The
-    acquisition counter that supplies that denominator keeps the property
-    above: it is incremented only while the underlying RLock is already held,
-    which puts it inside a critical section the lock has already serialised.
-    It therefore adds no mutex acquisition and no cross-thread ordering that
-    the lock did not already impose, and it cannot convoy the fast path.
+    acquisition counter that supplies that denominator does run on every
+    acquisition, contended or not, and preserves the property above by where
+    it runs rather than by how often: it is incremented only while the
+    underlying RLock is already held, which puts it inside a critical section
+    the lock has already serialised. It therefore adds no mutex acquisition
+    and no cross-thread ordering that the lock did not already impose, and it
+    cannot convoy the fast path.
 
     That placement is also why this counter does not rest on an increment
     being atomic under the GIL -- the lock, not the interpreter, is what makes

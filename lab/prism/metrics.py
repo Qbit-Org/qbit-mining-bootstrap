@@ -527,7 +527,7 @@ class MetricsRenderer:
             # as the process aged, and never once the pool's throughput. Use
             # rate(qbit_prism_accepted_shares_total[5m]), which is what the
             # counter above exists for, or sum the per-lane gauge for this
-            # process's since-start average.
+            # process's own since-start commit rate.
             "# HELP qbit_prism_stale_share_percent Percent of submitted shares classified stale.",
             "# TYPE qbit_prism_stale_share_percent gauge",
             f"qbit_prism_stale_share_percent {stale_percent:.12g}",
@@ -630,9 +630,14 @@ class MetricsRenderer:
 
         The lane label set is deterministic: configured listener profiles in
         order, then any additional lane names observed in the counters,
-        sorted. The per-second gauge divides a process-local accepted count by
-        this process's uptime, so numerator and denominator share a domain and
-        the lanes sum to the coordinator's own since-start average.
+        sorted. The per-second gauge divides a process-local count by this
+        process's uptime, so numerator and denominator share a domain -- but
+        that numerator is narrower than "accepted". VardiffService.note_accepted
+        runs only where the share writer sees a newly inserted ledger row, and
+        the startup recovery-journal replay reaches the ledger without passing
+        through it at all, so an exact replay and a recovered share are both
+        acked accepted while never being lane-counted. The lanes therefore sum
+        to this coordinator's own commit rate, not to its accepted-ack count.
         """
         snapshot = self.port.vardiff_convergence_snapshot()
         lane_accepted = snapshot["lane_accepted_shares"]
@@ -655,7 +660,7 @@ class MetricsRenderer:
                 f'qbit_prism_vardiff_lane_accepted_shares_total{{lane="{self.port.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0))}'
                 for lane in lanes
             ],
-            "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. The numerator counts shares this process accepted, not the ledger lifetime total published by qbit_prism_accepted_shares_total, so the lanes sum to this coordinator's since-start average and not to a rate over the durable ledger.",
+            "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. The numerator counts shares this process newly committed on the live submission path, not the ledger lifetime total published by qbit_prism_accepted_shares_total: an exact replay of an already-durable share and a startup recovery-journal replay are both acked accepted without being lane-counted, so the lanes sum to this coordinator's own commit rate and need not reconcile against an accepted-ack count.",
             "# TYPE qbit_prism_vardiff_lane_accepted_shares_per_second gauge",
             *[
                 f'qbit_prism_vardiff_lane_accepted_shares_per_second{{lane="{self.port.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0)) / elapsed:.12g}'

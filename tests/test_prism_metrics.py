@@ -627,7 +627,7 @@ def reference_vardiff_convergence_metrics_lines(server) -> list[str]:
             f'qbit_prism_vardiff_lane_accepted_shares_total{{lane="{server.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0))}'
             for lane in lanes
         ],
-        "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. The numerator counts shares this process accepted, not the ledger lifetime total published by qbit_prism_accepted_shares_total, so the lanes sum to this coordinator's since-start average and not to a rate over the durable ledger.",
+        "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. The numerator counts shares this process newly committed on the live submission path, not the ledger lifetime total published by qbit_prism_accepted_shares_total: an exact replay of an already-durable share and a startup recovery-journal replay are both acked accepted without being lane-counted, so the lanes sum to this coordinator's own commit rate and need not reconcile against an accepted-ack count.",
         "# TYPE qbit_prism_vardiff_lane_accepted_shares_per_second gauge",
         *[
             f'qbit_prism_vardiff_lane_accepted_shares_per_second{{lane="{server.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0)) / elapsed:.12g}'
