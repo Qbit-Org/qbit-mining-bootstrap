@@ -1151,42 +1151,47 @@ class SingleWriterShareLedger:
         }
 
     def dashboard_public_artifact(self, *, sha256: str) -> dict[str, object] | None:
+        document = self.dashboard_public_artifact_document(sha256=sha256)
+        if document is None:
+            return None
+        return document.get("payload")
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        """Artifact payload plus, for manifest kinds, its canonical text.
+
+        canonical_json is the exact serialized text the artifact's sha256 was
+        computed over, persisted at record time. Audit bundles are hashed
+        over Rust struct-order bytes that are not stored, so their
+        canonical_json is None and they keep the re-serialized response.
+        """
         with self._lock:
             for payload in self._ctv_fanout_sets.values():
                 if payload.get("audit_bundle_sha256") == sha256:
                     audit_bundle = payload.get("audit_bundle")
-                    return copy.deepcopy(audit_bundle) if isinstance(audit_bundle, dict) else None
+                    if not isinstance(audit_bundle, dict):
+                        return None
+                    return {"payload": copy.deepcopy(audit_bundle), "canonical_json": None}
                 if payload.get("manifest_set_sha256") == sha256:
                     manifest_set = payload.get("manifest_set")
-                    return copy.deepcopy(manifest_set) if isinstance(manifest_set, dict) else None
+                    if not isinstance(manifest_set, dict):
+                        return None
+                    manifest_set_json = payload.get("manifest_set_json")
+                    return {
+                        "payload": copy.deepcopy(manifest_set),
+                        "canonical_json": manifest_set_json if isinstance(manifest_set_json, str) else None,
+                    }
                 for artifact in payload.get("artifacts", []):
                     if not isinstance(artifact, dict):
                         continue
                     if artifact.get("manifest_sha256") == sha256:
                         manifest = artifact.get("manifest")
-                        return copy.deepcopy(manifest) if isinstance(manifest, dict) else None
-        return None
-
-    def dashboard_public_artifact_canonical_json(self, *, sha256: str) -> str | None:
-        """Exact serialized text the artifact's sha256 was computed over.
-
-        Only CTV manifests and manifest sets persist their canonical text;
-        audit bundles are hashed over Rust struct-order bytes that are not
-        stored, so they return None and keep the re-serialized response.
-        """
-        with self._lock:
-            for payload in self._ctv_fanout_sets.values():
-                if payload.get("audit_bundle_sha256") == sha256:
-                    return None
-                if payload.get("manifest_set_sha256") == sha256:
-                    manifest_set_json = payload.get("manifest_set_json")
-                    return manifest_set_json if isinstance(manifest_set_json, str) else None
-                for artifact in payload.get("artifacts", []):
-                    if not isinstance(artifact, dict):
-                        continue
-                    if artifact.get("manifest_sha256") == sha256:
+                        if not isinstance(manifest, dict):
+                            return None
                         manifest_json = artifact.get("manifest_json")
-                        return manifest_json if isinstance(manifest_json, str) else None
+                        return {
+                            "payload": copy.deepcopy(manifest),
+                            "canonical_json": manifest_json if isinstance(manifest_json, str) else None,
+                        }
         return None
 
     def update_ctv_fanout_status(self, *, fanout_txid: str, settlement_status: str) -> dict[str, int | str]:
@@ -5460,6 +5465,21 @@ SELECT json_build_object(
         }
 
     def dashboard_public_artifact(self, *, sha256: str) -> dict[str, object] | None:
+        document = self.dashboard_public_artifact_document(sha256=sha256)
+        if document is None:
+            return None
+        return document.get("payload")
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        """Artifact payload plus, for manifest kinds, its canonical text.
+
+        canonical_json is the manifest_set_json/manifest_json text persisted
+        at record time next to the JSONB copies — the exact byte sequence the
+        artifact's sha256 was computed over. Audit bundles have no stored
+        canonical serialization (their hash covers Rust struct-order bytes),
+        so their canonical_json is None. One statement serves both reads so a
+        request touches each artifact table at most once.
+        """
         sha256 = str(sha256).lower()
         lit = self._text_literal(sha256)
         sql = f"""
@@ -5469,6 +5489,20 @@ WITH audit AS (
     WHERE audit_bundle_sha256 = {lit}
     ORDER BY created_at DESC
     LIMIT 1
+),
+set_row AS (
+    SELECT manifest_set, manifest_set_json
+    FROM qbit_ctv_fanout_sets
+    WHERE manifest_set_sha256 = {lit}
+    ORDER BY created_at DESC
+    LIMIT 1
+),
+artifact_row AS (
+    SELECT manifest, manifest_json
+    FROM qbit_ctv_fanout_artifacts
+    WHERE manifest_sha256 = {lit}
+    ORDER BY updated_at DESC
+    LIMIT 1
 )
 SELECT json_build_object(
     'audit_bundle', (SELECT audit_bundle FROM audit),
@@ -5476,20 +5510,12 @@ SELECT json_build_object(
     'body_uri', (SELECT body_uri FROM audit),
     'has_audit_row', (SELECT count(*) FROM audit) > 0,
     'fallback', COALESCE(
-        (
-            SELECT manifest_set
-            FROM qbit_ctv_fanout_sets
-            WHERE manifest_set_sha256 = {lit}
-            ORDER BY created_at DESC
-            LIMIT 1
-        ),
-        (
-            SELECT manifest
-            FROM qbit_ctv_fanout_artifacts
-            WHERE manifest_sha256 = {lit}
-            ORDER BY updated_at DESC
-            LIMIT 1
-        )
+        (SELECT manifest_set FROM set_row),
+        (SELECT manifest FROM artifact_row)
+    ),
+    'fallback_canonical', COALESCE(
+        (SELECT manifest_set_json FROM set_row),
+        (SELECT manifest_json FROM artifact_row)
     )
 );
 """
@@ -5501,45 +5527,15 @@ SELECT json_build_object(
             if body is None:
                 body = self._read_external_body(row.get("body_uri"), expected_sha256=sha256)
             if body is not None:
-                return body
+                return {"payload": body, "canonical_json": None}
         fallback = row.get("fallback")
-        return fallback if isinstance(fallback, dict) else None
-
-    def dashboard_public_artifact_canonical_json(self, *, sha256: str) -> str | None:
-        """Exact serialized text the artifact's sha256 was computed over.
-
-        Reads the manifest_set_json/manifest_json text persisted at record
-        time next to the JSONB copies. Audit bundles have no stored canonical
-        serialization (their hash covers Rust struct-order bytes), so their
-        sha256 misses both tables and returns None.
-        """
-        sha256 = str(sha256).lower()
-        lit = self._text_literal(sha256)
-        sql = f"""
-SELECT json_build_object(
-    'canonical_json', COALESCE(
-        (
-            SELECT manifest_set_json
-            FROM qbit_ctv_fanout_sets
-            WHERE manifest_set_sha256 = {lit}
-            ORDER BY created_at DESC
-            LIMIT 1
-        ),
-        (
-            SELECT manifest_json
-            FROM qbit_ctv_fanout_artifacts
-            WHERE manifest_sha256 = {lit}
-            ORDER BY updated_at DESC
-            LIMIT 1
-        )
-    )
-);
-"""
-        row = self._run_read_json(sql)
-        if not isinstance(row, dict):
+        if not isinstance(fallback, dict):
             return None
-        canonical_json = row.get("canonical_json")
-        return canonical_json if isinstance(canonical_json, str) else None
+        fallback_canonical = row.get("fallback_canonical")
+        return {
+            "payload": fallback,
+            "canonical_json": fallback_canonical if isinstance(fallback_canonical, str) else None,
+        }
 
     def dashboard_public_artifact_exists(self, *, sha256: str) -> bool:
         sha256 = str(sha256).lower()

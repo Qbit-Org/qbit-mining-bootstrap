@@ -965,9 +965,12 @@ def fanout(coordinator: Any, *, fanout_txid: str) -> dict[str, object]:
 
 
 def artifact(coordinator: Any, *, sha256: str) -> object:
-    canonical = getattr(coordinator.ledger, "dashboard_public_artifact_canonical_json", None)
-    if callable(canonical):
-        canonical_json = canonical(sha256=sha256)
+    document = getattr(coordinator.ledger, "dashboard_public_artifact_document", None)
+    if callable(document):
+        row = document(sha256=sha256)
+        if not isinstance(row, dict):
+            raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
+        canonical_json = row.get("canonical_json")
         if isinstance(canonical_json, str):
             body = canonical_json.encode()
             if hashlib.sha256(body).hexdigest() == sha256:
@@ -975,6 +978,10 @@ def artifact(coordinator: Any, *, sha256: str) -> object:
             # Stored canonical text that does not hash to its content address
             # is a store-integrity fault; fall through to the re-serialized
             # response rather than serve bytes that contradict the address.
+        payload = row.get("payload")
+        if payload is None:
+            raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
+        return payload
     getter = getattr(coordinator.ledger, "dashboard_public_artifact", None)
     if not callable(getter):
         raise PublicApiError(404, "not_found", "unknown public PRISM artifact")

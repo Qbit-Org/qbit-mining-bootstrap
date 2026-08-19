@@ -602,21 +602,25 @@ class CanonicalArtifactPublicLedger(FakePublicLedger):
             return self.manifest
         return None
 
-    def dashboard_public_artifact_canonical_json(self, *, sha256: str) -> str | None:
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        payload = self.dashboard_public_artifact(sha256=sha256)
+        if payload is None:
+            return None
+        canonical_json = None
         if sha256 == self.manifest_set_sha256:
-            return canonical_json_text(self.manifest_set)
+            canonical_json = canonical_json_text(self.manifest_set)
         if sha256 == self.manifest_sha256:
-            return canonical_json_text(self.manifest)
-        return None
+            canonical_json = canonical_json_text(self.manifest)
+        return {"payload": payload, "canonical_json": canonical_json}
 
 
 class TamperedCanonicalArtifactPublicLedger(CanonicalArtifactPublicLedger):
-    def dashboard_public_artifact_canonical_json(self, *, sha256: str) -> str | None:
-        text = super().dashboard_public_artifact_canonical_json(sha256=sha256)
-        if text is None:
-            return None
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        document = super().dashboard_public_artifact_document(sha256=sha256)
+        if document is None or document.get("canonical_json") is None:
+            return document
         # Same document, different bytes: must never be served raw.
-        return text + " "
+        return {**document, "canonical_json": str(document["canonical_json"]) + " "}
 
 
 class DirectCoinbasePublicLedger(FakePublicLedger):
