@@ -502,6 +502,32 @@ assert_repaired(native_ledger, "native apply path")
 native_ledger.release_writer_lease()
 native_ledger.close()
 
+# 7. The guard's drift-only branch: a summary whose active row-count total
+#    still matches the carry history but whose balances were corrupted.
+#    Row counts alone cannot catch this; the drift comparison must.
+psql_autocommit_apply(
+    "UPDATE qbit_payout_carry_forward_current "
+    "SET balance_sats = balance_sats + 1 WHERE miner_id = 'miner-a';"
+)
+assert_equal(
+    reported_balances(),
+    [
+        {"miner_id": "miner-a", "balance_sats": "1001"},
+        {"miner_id": "miner-b", "balance_sats": "500"},
+    ],
+    "balance-only corruption is visible in the reported balances",
+)
+drift_ledger = PsqlShareLedger(
+    psql_command=psql_command("qbit"),
+    native_client_mode="0",
+    writer_id="seed-guard-drift",
+    writer_epoch=1,
+    initialize_schema=True,
+)
+assert_repaired(drift_ledger, "drift-only corruption repair")
+drift_ledger.release_writer_lease()
+drift_ledger.close()
+
 # --------------------------------------------------------------------------
 # Scenario B: a failing apply commits nothing on either path. The failure is
 # injected just before the script's own final COMMIT so it lands inside the

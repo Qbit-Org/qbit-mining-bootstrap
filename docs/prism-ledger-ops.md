@@ -341,9 +341,14 @@ post-trigger deltas: every miner's balance was silently under-reported by
 their full pre-upgrade carry, and the seed's emptiness guard locked that
 partial state in permanently. The schema's seed guard now compares the
 summary against the carry history it summarizes and repairs a partial
-summary on the next apply, and the writer must still be stopped during the
-apply, because the trigger drop/create pairs drop concurrent mutations
-mid-apply.
+summary on the next apply. The writer must still be stopped during the
+apply: concurrent mutations block on the apply's table locks and then fire
+the freshly (re)created triggers after it commits, which invites long
+lock waits and deadlocks even though the apply itself is atomic. Note that
+combining `--single-transaction` with the script's own `BEGIN`/`COMMIT`
+wrapper makes psql print two harmless warnings ("there is already a
+transaction in progress" / "there is no transaction in progress"); the apply
+is still exactly one transaction.
 
 ### Audit publication ordering migration
 

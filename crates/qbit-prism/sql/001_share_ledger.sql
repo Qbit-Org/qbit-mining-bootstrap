@@ -760,11 +760,15 @@ BEGIN
 END;
 $$;
 
--- Sequence operations are nontransactional in PostgreSQL only outside an
--- enclosing transaction. The whole file applies inside one (see the top of
--- the file), so any rejection of this or an earlier statement rolls the
--- allocator mutation back with everything else; the sole setval still runs
--- last, after every row and catalog validation.
+-- Sequence operations are nontransactional in PostgreSQL: a setval against a
+-- pre-existing sequence is NOT undone by a rollback of this transaction (only
+-- a sequence created inside it disappears with it). The sole allocator
+-- mutation therefore still runs last, after every row and catalog validation,
+-- so a rejected apply leaves an existing sequence's exact state untouched;
+-- if a later statement of the apply fails, the row assignments roll back but
+-- the setval persists. That residue is benign: this block only ever advances
+-- the sequence, so the next apply assigns higher ordinals, leaving gaps that
+-- no validation rejects. Do not move validation after the setval.
 DO $$
 DECLARE
     maximum_sequence bigint;
