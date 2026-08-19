@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -49,6 +50,19 @@ class PublicCachePolicy:
     ttl_seconds: int
     stale_while_revalidate_seconds: int
     immutable: bool = False
+
+
+@dataclass(frozen=True)
+class RawJsonBody:
+    """Pre-serialized JSON response body served byte-for-byte.
+
+    Content-addressed artifact responses must satisfy
+    sha256(response bytes) == the advertised artifact sha256, so the exact
+    canonical bytes bypass write_json's generic sorted-key re-serialization
+    and its trailing newline.
+    """
+
+    body: bytes
 
 
 @dataclass
@@ -276,6 +290,8 @@ def cacheable_payload_size(payload: object) -> bool:
     max_bytes = env_nonnegative_int("PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES", 1_048_576)
     if max_bytes <= 0:
         return False
+    if isinstance(payload, RawJsonBody):
+        return len(payload.body) <= max_bytes
     body_size = len(json.dumps(payload, sort_keys=True).encode()) + 1
     return body_size <= max_bytes
 
@@ -949,6 +965,23 @@ def fanout(coordinator: Any, *, fanout_txid: str) -> dict[str, object]:
 
 
 def artifact(coordinator: Any, *, sha256: str) -> object:
+    document = getattr(coordinator.ledger, "dashboard_public_artifact_document", None)
+    if callable(document):
+        row = document(sha256=sha256)
+        if not isinstance(row, dict):
+            raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
+        canonical_json = row.get("canonical_json")
+        if isinstance(canonical_json, str):
+            body = canonical_json.encode()
+            if hashlib.sha256(body).hexdigest() == sha256:
+                return RawJsonBody(body=body)
+            # Stored canonical text that does not hash to its content address
+            # is a store-integrity fault; fall through to the re-serialized
+            # response rather than serve bytes that contradict the address.
+        payload = row.get("payload")
+        if payload is None:
+            raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
+        return payload
     getter = getattr(coordinator.ledger, "dashboard_public_artifact", None)
     if not callable(getter):
         raise PublicApiError(404, "not_found", "unknown public PRISM artifact")

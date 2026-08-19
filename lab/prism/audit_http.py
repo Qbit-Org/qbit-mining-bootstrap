@@ -665,7 +665,13 @@ class AuditHttpFacade:
                 payload: object,
                 headers: dict[str, str] | None = None,
             ) -> None:
-                body = json.dumps(payload, sort_keys=True).encode() + b"\n"
+                if isinstance(payload, public_api.RawJsonBody):
+                    # Content-addressed bytes: any re-serialization (key
+                    # order, separators, trailing newline) would break
+                    # sha256(response body) == the advertised artifact hash.
+                    body = payload.body
+                else:
+                    body = json.dumps(payload, sort_keys=True).encode() + b"\n"
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
