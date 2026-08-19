@@ -91,10 +91,13 @@ def reference_share_ack_metrics_lines(server) -> list[str]:
 def reference_coordinator_lock_metrics_lines(server) -> list[str]:
     snapshot = getattr(server.lock, "contention_snapshot", None)
     if callable(snapshot):
-        contention_count, wait_sum, wait_max = snapshot()
+        acquisition_count, contention_count, wait_sum, wait_max = snapshot()
     else:
-        contention_count, wait_sum, wait_max = 0, 0.0, 0.0
+        acquisition_count, contention_count, wait_sum, wait_max = 0, 0, 0.0, 0.0
     return [
+        "# HELP qbit_prism_coordinator_lock_acquisitions_total Coordinator control-plane lock acquisitions granted, contended or not; divide qbit_prism_coordinator_lock_contentions_total by this for the contended fraction. A timed-out wait is counted as contention without an acquisition, so that fraction is an upper bound where a caller passes a timeout.",
+        "# TYPE qbit_prism_coordinator_lock_acquisitions_total counter",
+        f"qbit_prism_coordinator_lock_acquisitions_total {int(acquisition_count)}",
         "# HELP qbit_prism_coordinator_lock_contentions_total Coordinator control-plane lock acquisitions that had to wait.",
         "# TYPE qbit_prism_coordinator_lock_contentions_total counter",
         f"qbit_prism_coordinator_lock_contentions_total {int(contention_count)}",
@@ -624,7 +627,7 @@ def reference_vardiff_convergence_metrics_lines(server) -> list[str]:
             f'qbit_prism_vardiff_lane_accepted_shares_total{{lane="{server.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0))}'
             for lane in lanes
         ],
-        "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. Kept on the same elapsed formula as qbit_prism_shares_per_second so the two stay comparable.",
+        "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. The numerator counts shares this process accepted, not the ledger lifetime total published by qbit_prism_accepted_shares_total, so the lanes sum to this coordinator's since-start average and not to a rate over the durable ledger.",
         "# TYPE qbit_prism_vardiff_lane_accepted_shares_per_second gauge",
         *[
             f'qbit_prism_vardiff_lane_accepted_shares_per_second{{lane="{server.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0)) / elapsed:.12g}'
@@ -648,8 +651,6 @@ def reference_render_metrics_payload(server) -> str:
     mining_metrics = server.mining_delivery_snapshot()
     process_rss_bytes, process_open_fds = server.process_resource_metrics()
     accepted_share_count = server.accepted_share_stats()[0]
-    elapsed = max(0.001, time.monotonic() - server.started_monotonic)
-    shares_per_second = accepted_share_count / elapsed
     server._ensure_share_hot_path_state()
     with server._share_accounting_lock:
         submitted_share_count = int(getattr(server, "submitted_share_count", 0))
@@ -999,9 +1000,6 @@ def reference_render_metrics_payload(server) -> str:
         "# HELP qbit_prism_vardiff_idle_retargets_total Vardiff retargets triggered by the idle zero-accepted-share sweep.",
         "# TYPE qbit_prism_vardiff_idle_retargets_total counter",
         f"qbit_prism_vardiff_idle_retargets_total {idle_retarget_count}",
-        "# HELP qbit_prism_shares_per_second Accepted shares per second since coordinator start.",
-        "# TYPE qbit_prism_shares_per_second gauge",
-        f"qbit_prism_shares_per_second {shares_per_second:.12g}",
         "# HELP qbit_prism_stale_share_percent Percent of submitted shares classified stale.",
         "# TYPE qbit_prism_stale_share_percent gauge",
         f"qbit_prism_stale_share_percent {stale_percent:.12g}",

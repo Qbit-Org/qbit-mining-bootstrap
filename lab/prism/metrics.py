@@ -141,7 +141,7 @@ class MetricsPort(Protocol):
     def block_finalization_metrics_lines(self) -> Any: ...
     def block_ledger_call_class_metrics(self) -> Any: ...
     def block_submitter_snapshot(self) -> dict[str, object]: ...
-    def coordinator_lock_contention_snapshot(self) -> tuple[int, float, float]: ...
+    def coordinator_lock_contention_snapshot(self) -> tuple[int, int, float, float]: ...
     def ctv_fanout_broadcaster_metrics_lines(self) -> Any: ...
     def mining_delivery_snapshot(self) -> Any: ...
     def payout_state_metrics_lines(self) -> Any: ...
@@ -170,8 +170,6 @@ class MetricsRenderer:
         mining_metrics = self.port.mining_delivery_snapshot()
         process_rss_bytes, process_open_fds = self.port.process_resource_metrics()
         accepted_share_count = self.port.accepted_share_stats()[0]
-        elapsed = max(0.001, time.monotonic() - self.port.started_monotonic)
-        shares_per_second = accepted_share_count / elapsed
         share_accounting = self.port.share_accounting_snapshot()
         submitted_share_count = int(share_accounting["submitted"])
         stale_share_count = int(share_accounting["stale"])
@@ -522,9 +520,14 @@ class MetricsRenderer:
             "# HELP qbit_prism_vardiff_idle_retargets_total Vardiff retargets triggered by the idle zero-accepted-share sweep.",
             "# TYPE qbit_prism_vardiff_idle_retargets_total counter",
             f"qbit_prism_vardiff_idle_retargets_total {idle_retarget_count}",
-            "# HELP qbit_prism_shares_per_second Accepted shares per second since coordinator start.",
-            "# TYPE qbit_prism_shares_per_second gauge",
-            f"qbit_prism_shares_per_second {shares_per_second:.12g}",
+            # qbit_prism_shares_per_second is deliberately absent. It divided
+            # the ledger's lifetime accepted count by this process's uptime --
+            # different domains, so the value tracked 1/uptime rather than any
+            # share rate: enormous right after a restart, decaying toward zero
+            # as the process aged, and never once the pool's throughput. Use
+            # rate(qbit_prism_accepted_shares_total[5m]), which is what the
+            # counter above exists for, or sum the per-lane gauge for this
+            # process's since-start average.
             "# HELP qbit_prism_stale_share_percent Percent of submitted shares classified stale.",
             "# TYPE qbit_prism_stale_share_percent gauge",
             f"qbit_prism_stale_share_percent {stale_percent:.12g}",
@@ -627,8 +630,9 @@ class MetricsRenderer:
 
         The lane label set is deterministic: configured listener profiles in
         order, then any additional lane names observed in the counters,
-        sorted. The per-second gauge uses the same elapsed formula as
-        qbit_prism_shares_per_second so the two stay comparable.
+        sorted. The per-second gauge divides a process-local accepted count by
+        this process's uptime, so numerator and denominator share a domain and
+        the lanes sum to the coordinator's own since-start average.
         """
         snapshot = self.port.vardiff_convergence_snapshot()
         lane_accepted = snapshot["lane_accepted_shares"]
@@ -651,7 +655,7 @@ class MetricsRenderer:
                 f'qbit_prism_vardiff_lane_accepted_shares_total{{lane="{self.port.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0))}'
                 for lane in lanes
             ],
-            "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. Kept on the same elapsed formula as qbit_prism_shares_per_second so the two stay comparable.",
+            "# HELP qbit_prism_vardiff_lane_accepted_shares_per_second Accepted shares per second by Stratum lane, averaged since coordinator start; a long-run average cannot show a transient reconnect storm -- use rate(qbit_prism_vardiff_lane_accepted_shares_total[5m]) for that. The numerator counts shares this process accepted, not the ledger lifetime total published by qbit_prism_accepted_shares_total, so the lanes sum to this coordinator's since-start average and not to a rate over the durable ledger.",
             "# TYPE qbit_prism_vardiff_lane_accepted_shares_per_second gauge",
             *[
                 f'qbit_prism_vardiff_lane_accepted_shares_per_second{{lane="{self.port.prometheus_label_value(lane)}"}} {int(lane_accepted.get(lane, 0)) / elapsed:.12g}'
@@ -669,10 +673,13 @@ class MetricsRenderer:
         ]
 
     def coordinator_lock_metrics_lines(self) -> list[str]:
-        contention_count, wait_sum, wait_max = (
+        acquisition_count, contention_count, wait_sum, wait_max = (
             self.port.coordinator_lock_contention_snapshot()
         )
         return [
+            "# HELP qbit_prism_coordinator_lock_acquisitions_total Coordinator control-plane lock acquisitions granted, contended or not; divide qbit_prism_coordinator_lock_contentions_total by this for the contended fraction. A timed-out wait is counted as contention without an acquisition, so that fraction is an upper bound where a caller passes a timeout.",
+            "# TYPE qbit_prism_coordinator_lock_acquisitions_total counter",
+            f"qbit_prism_coordinator_lock_acquisitions_total {int(acquisition_count)}",
             "# HELP qbit_prism_coordinator_lock_contentions_total Coordinator control-plane lock acquisitions that had to wait.",
             "# TYPE qbit_prism_coordinator_lock_contentions_total counter",
             f"qbit_prism_coordinator_lock_contentions_total {int(contention_count)}",
