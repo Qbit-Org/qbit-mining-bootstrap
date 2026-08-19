@@ -1549,6 +1549,72 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         # fence must revalidate the recorded window instead.
         self.assertEqual(replayed.context.payout_append_invalidation_epoch, -1)
 
+    def test_b1_intent_refuses_a_submission_with_no_serialized_block(self) -> None:
+        """An unmaterialized block must never become a durable intent.
+
+        ``assemble_submission`` builds ``block_hex`` only for a hash that
+        solved the block, which every candidate route requires. If that
+        coupling were ever broken the block is already lost; persisting the
+        empty value would lose it again after every restart, as a candidate
+        that can never be offered to the node. Fail on the client thread
+        instead, before the durable write.
+        """
+        server, state, _ledger = submit_coordinator()
+        candidate = block_candidate(
+            server,
+            state,
+            direct_stratum.DirectQbitSubmission(
+                coinbase_tx_hex="11",
+                coinbase_txid_preimage_hex="",
+                header_hex="",
+                block_hex="",
+                block_hash_hex="cb" * 32,
+                block_hash_int=1,
+                share_pass=True,
+                block_pass=True,
+                applied_version_hex="",
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "carries no serialized block"):
+            block_candidate_intent(candidate)
+
+    def test_b1_intent_still_tolerates_an_embedder_without_block_bytes(self) -> None:
+        """The invariant belongs to the real submission type, not to stubs.
+
+        Some integrations retain no block bytes at all; the landing path
+        already guards them by attribute probe. Tightening the codec must not
+        turn those into hard failures.
+        """
+        server, state, _ledger = submit_coordinator()
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                block_hash_hex="cc" * 32,
+                coinbase_tx_hex="11",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=PendingShare(
+                share_id="embedder-share",
+                miner_id="miner-a",
+                order_key="miner-a",
+                p2mr_program_hex="11" * 32,
+                share_difficulty=1,
+                network_difficulty=1,
+                template_height=10,
+                job_id="job-1",
+                job_issued_at_ms=1,
+                accepted_at_ms=2,
+                ntime=3,
+            ),
+        )
+
+        intent = block_candidate_intent(candidate)
+
+        self.assertEqual(intent["block_hex"], "")
+
     def test_b1_service_owns_queue_and_structured_attempt_results(self) -> None:
         server, state, _ledger = submit_coordinator()
         service = server._ensure_block_candidate_service()

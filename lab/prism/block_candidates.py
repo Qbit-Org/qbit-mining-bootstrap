@@ -268,6 +268,26 @@ class BlockCandidatePorts:
     log: Callable[[str], None]
 
 
+def _candidate_block_hex(submission: Any) -> str:
+    """Return the candidate's serialized block, never an unmaterialized one.
+
+    ``assemble_submission`` materializes ``block_hex`` only for a hash that
+    solved the block, which every candidate route requires, so a real
+    submission always carries the bytes by the time a candidate exists. If one
+    ever does not, the cause is a defect in that coupling and the block is
+    already lost -- but an empty value written to the durable intent loses it
+    twice, resurrecting after every restart as a candidate that can never be
+    offered to the node. Fail on the client thread instead, before the intent
+    is written. Duck-typed embedders that retain no block bytes at all keep
+    the historical empty-string behaviour: the invariant is a property of the
+    real submission type, and the landing path already guards them separately.
+    """
+    block_hex = str(getattr(submission, "block_hex", ""))
+    if not block_hex and isinstance(submission, direct_stratum.DirectQbitSubmission):
+        raise ValueError("block candidate submission carries no serialized block")
+    return block_hex
+
+
 def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
     """Return the immutable JSON needed to resume a candidate after restart."""
     context = candidate.context
@@ -275,7 +295,7 @@ def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
     intent = {
         "schema": BLOCK_CANDIDATE_INTENT_SCHEMA,
         "block_hash_hex": str(submission.block_hash_hex).lower(),
-        "block_hex": str(getattr(submission, "block_hex", "")),
+        "block_hex": _candidate_block_hex(submission),
         "coinbase_tx_hex": str(getattr(submission, "coinbase_tx_hex", "")),
         "parent_hash": str(context.template["previousblockhash"]).lower(),
         "expected_height": int(context.template["height"]),

@@ -273,6 +273,41 @@ class SubmitClassificationTests(unittest.TestCase):
             )
         self.assertEqual(low.exception.reason, PRISM_REJECTION_LOW_DIFFICULTY)
 
+    def test_every_block_route_requires_block_pass(self) -> None:
+        """The precondition ``assemble_submission`` gates serialization on.
+
+        ``block_hex`` is materialized only when ``block_pass`` is set, on the
+        strength of this classifier: no route that builds a block candidate
+        can be reached without it. If a future route reaches the candidate
+        path on ``share_pass`` alone, that submission would carry no block
+        bytes -- so pin the coupling here, next to the routing it constrains.
+        """
+        value = context()
+
+        for share_pass in (False, True):
+            for block_pass in (False, True):
+                for credit_policy in (None, PRISM_CREDIT_POLICY_STALE_GRACE):
+                    with self.subTest(
+                        share_pass=share_pass,
+                        block_pass=block_pass,
+                        credit_policy=credit_policy,
+                    ):
+                        try:
+                            work = classify_submit_work(
+                                value,  # type: ignore[arg-type]
+                                SimpleNamespace(
+                                    share_pass=share_pass,
+                                    block_pass=block_pass,
+                                    header_hex="e",
+                                ),
+                                credit_policy=credit_policy,
+                            )
+                        except SubmitRejected:
+                            continue
+                        if work.route != "share":
+                            self.assertTrue(block_pass)
+                        self.assertEqual(work.block_worthy, work.route != "share")
+
 
 class SubmissionMetricsOwnerTests(unittest.TestCase):
     def make_server(self) -> PrismCoordinator:
