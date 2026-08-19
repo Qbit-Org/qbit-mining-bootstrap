@@ -67,6 +67,18 @@ PRISM_PAYOUT_DELIVERY_GENERATIONS = ("current", "stale", "future")
 # while the underlying condition persists. Any successful install or
 # event-driven preparation resets the backoff.
 PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP = 16
+# How many append-invalidation bumps keep the stamp of the row that caused
+# them. The stamps are what let a landing ask whether a bump between its own
+# baseline epoch and the live one invalidated ITS window, instead of reading
+# the bare counter and abandoning for an append that only invalidated a newer
+# window (issue #126). Only a replay-shaped append -- a durable row that
+# predates a live anchor -- ever adds an entry, and a landing's baseline is
+# stamped when its job was issued and stops mattering the moment the block
+# lands, so a few hundred spans far more such appends than any candidate can
+# outlive. Falling off the end costs nothing but the relaxation: a baseline
+# older than the retained history fails closed, exactly as the bare counter
+# did.
+PRISM_PAYOUT_APPEND_INVALIDATION_STAMP_HISTORY = 256
 # Owner-local copies of the still-coordinator-visible reward-window constants
 # and the admission poll cadence; compatibility duplicates by design so this
 # leaf module never imports upward.
@@ -566,6 +578,20 @@ class PayoutStateService:
         # advances only when a newly visible row predates an anchored
         # share window and makes pre-append work unsafe to publish.
         self._payout_ledger_append_invalidation_epoch = 0
+        # Guarded by _job_cache_lock. Per advanced epoch, the stamp of the
+        # row whose durability caused that bump: max(job_issued_at_ms,
+        # accepted_at_ms), which is exactly the quantity
+        # _pending_share_predates_anchor tests against an anchor -- a row
+        # predates an anchor iff both its stamps do, i.e. iff this max does.
+        # Bounded to the most recent
+        # PRISM_PAYOUT_APPEND_INVALIDATION_STAMP_HISTORY bumps;
+        # _payout_append_invalidation_oldest_epoch names the oldest epoch
+        # still retained (the epoch the next bump would take, while there
+        # has been none), so a landing whose baseline fell off the end is
+        # told the question cannot be answered rather than answered from a
+        # gap.
+        self._payout_append_invalidation_stamps: dict[int, int] = {}
+        self._payout_append_invalidation_oldest_epoch = 1
         # Serializes the append-side epoch bump against the landing's
         # final epoch-check-and-submitblock boundary. Ordinary share
         # commits never touch it: the append side acquires it only for
@@ -3966,8 +3992,12 @@ class PayoutStateService:
                 ):
                     return None
                 runtime._payout_ledger_append_invalidation_epoch += 1
+                epoch = int(runtime._payout_ledger_append_invalidation_epoch)
+                self._record_append_invalidation_stamp_locked(
+                    epoch, pending_share
+                )
                 runtime._payout_ledger_artifact = None
-                return int(runtime._payout_ledger_append_invalidation_epoch)
+                return epoch
 
         if landing_fence_owned:
             return bump_if_predating_locked()
@@ -3978,6 +4008,90 @@ class PayoutStateService:
                 return None
         with runtime._payout_append_landing_fence_lock:
             return bump_if_predating_locked()
+
+    def _record_append_invalidation_stamp_locked(
+        self,
+        epoch: int,
+        pending_share: PendingShare,
+    ) -> None:
+        """Remember which row caused ``epoch``, and prune the oldest.
+
+        Caller holds _job_cache_lock and has just advanced the epoch to
+        ``epoch``. The stamp recorded is the row's own predating quantity,
+        so a landing can compare it against its declared anchor with the
+        same test the append side used against the live anchor set.
+
+        Pruning drops entries from the old end only, and advances the
+        retained floor by exactly what it dropped. Acceptance therefore
+        never widens: a baseline that can no longer be answered is refused
+        by _append_epoch_invalidated_declared_anchor rather than treated as
+        a bump-free stretch.
+        """
+        stamps = self._payout_append_invalidation_stamps
+        stamps[epoch] = max(
+            int(pending_share.job_issued_at_ms),
+            int(pending_share.accepted_at_ms),
+        )
+        oldest_retained = epoch - PRISM_PAYOUT_APPEND_INVALIDATION_STAMP_HISTORY + 1
+        if oldest_retained > self._payout_append_invalidation_oldest_epoch:
+            for dropped in range(
+                self._payout_append_invalidation_oldest_epoch, oldest_retained
+            ):
+                stamps.pop(dropped, None)
+            self._payout_append_invalidation_oldest_epoch = oldest_retained
+
+    def _append_epoch_invalidated_declared_anchor(
+        self,
+        *,
+        baseline_epoch: int,
+        live_epoch: int,
+        declared_anchor_ms: int | None,
+    ) -> bool:
+        """Did an append between two epochs invalidate THIS window?
+
+        The invalidation epoch is one global counter, so a landing that
+        compares its baseline against the live value learns only that some
+        window somewhere was invalidated. An append stamped after this
+        candidate's declared anchor but before a newer live window's anchor
+        bumps that counter without touching this candidate's payout window,
+        and on the fallback submit path the bare comparison abandoned the
+        block before it ever reached qbitd (issue #126). Scoping the
+        question to the anchor answers what the fence actually needs.
+
+        Fails closed on anything it cannot prove: an unknown declared
+        anchor is as terminal as it was before, and so is a baseline older
+        than the retained stamp history or an epoch that somehow moved
+        backwards. Only a bump whose recorded row provably does not predate
+        this anchor is forgiven.
+
+        Must not be called while holding _job_cache_lock; it takes that
+        lock itself. The caller that needs the answer to be authoritative
+        holds _payout_append_landing_fence_lock across its live-epoch read
+        and this call, which is what stops a bump from landing in between.
+        """
+        baseline = int(baseline_epoch)
+        live = int(live_epoch)
+        if baseline == live:
+            return False
+        if live < baseline:
+            return True
+        if declared_anchor_ms is None:
+            return True
+        anchor = int(declared_anchor_ms)
+        runtime = self._runtime
+        runtime._ensure_job_cache_state()
+        with runtime._job_cache_lock:
+            if baseline + 1 < self._payout_append_invalidation_oldest_epoch:
+                return True
+            stamps = self._payout_append_invalidation_stamps
+            # Bounded by the retention above: the floor check just proved
+            # every epoch in this range is retained, so the walk is at most
+            # PRISM_PAYOUT_APPEND_INVALIDATION_STAMP_HISTORY entries long.
+            for epoch in range(baseline + 1, live + 1):
+                stamp = stamps.get(epoch)
+                if stamp is None or stamp <= anchor:
+                    return True
+        return False
 
     def _invalidate_incremental_payout_window_for_append(
         self,
