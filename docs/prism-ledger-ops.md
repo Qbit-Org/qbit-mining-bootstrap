@@ -322,6 +322,29 @@ reward-window calls, pool-block confirmation/reactivation, and audit evidence
 publication because required columns, functions, and the durable publication
 ordinal will be missing.
 
+Apply the file in a single transaction and stop the PRISM share writer
+first. The script enforces this itself with a `BEGIN`/`COMMIT` wrapper, so
+even a plain autocommit `psql -f` runs as one transaction — but pass
+`--single-transaction` (or `-1`) anyway, together with `ON_ERROR_STOP`, so
+the intent is explicit and a failure cannot strand an open transaction:
+
+```sh
+psql "$PRISM_DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 \
+  -f crates/qbit-prism/sql/001_share_ledger.sql
+```
+
+Before that wrapper existed, a per-statement autocommit apply could commit
+the carry-forward summary triggers before the summary seeding block later in
+the file ran. If the apply was interrupted in that gap, or a still-running
+writer confirmed or reversed a block in it, the summary received only those
+post-trigger deltas: every miner's balance was silently under-reported by
+their full pre-upgrade carry, and the seed's emptiness guard locked that
+partial state in permanently. The schema's seed guard now compares the
+summary against the carry history it summarizes and repairs a partial
+summary on the next apply, and the writer must still be stopped during the
+apply, because the trigger drop/create pairs drop concurrent mutations
+mid-apply.
+
 ### Audit publication ordering migration
 
 Existing databases must receive the new `audit_publication_sequence` migration.
@@ -336,16 +359,16 @@ audit publication.
 
 The migration includes `ALTER TABLE` operations that require PostgreSQL's
 `ACCESS EXCLUSIVE` table lock. They wait for existing readers and writers and
-can interrupt new reads as well as writes while held. A later serialized phase
-takes a transaction-scoped advisory lock and a `SHARE ROW EXCLUSIVE` lock on
+can interrupt new reads as well as writes while held. A serialized phase takes
+a transaction-scoped advisory lock and a `SHARE ROW EXCLUSIVE` lock on
 `qbit_pool_blocks`, and the unique index is built non-concurrently. Treat the
 whole migration as read-impacting: stop the old coordinator or use a reviewed
 maintenance window, take the normal database backup, and apply the file with
-`ON_ERROR_STOP` using the same database role and schema search path as PRISM.
-For example:
+`ON_ERROR_STOP` inside a single transaction (see the apply requirements above),
+using the same database role and schema search path as PRISM. For example:
 
 ```sh
-psql "$PRISM_DATABASE_URL" -v ON_ERROR_STOP=1 \
+psql "$PRISM_DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 \
   -f crates/qbit-prism/sql/001_share_ledger.sql
 ```
 

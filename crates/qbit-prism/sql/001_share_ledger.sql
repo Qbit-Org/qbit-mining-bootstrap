@@ -3,6 +3,20 @@
 -- Invariant: only one logical writer inserts into qbit_share_ledger. Stratum
 -- frontends may scale horizontally, but they must feed that writer through a
 -- queue instead of inserting shares independently.
+--
+-- The whole file applies inside exactly one transaction, enforced by the
+-- BEGIN/COMMIT wrapper below rather than by any caller's flags. This is what
+-- makes the apply atomic everywhere it runs: the coordinator's psql backend
+-- (which additionally passes --single-transaction), the native psycopg client
+-- (whose single script execution wraps the string in the simple-query
+-- protocol), and a manual operator apply with plain autocommit psql. Without
+-- it, a failure or interruption mid-file commits some statements -- the
+-- carry-forward summary sync triggers -- while later statements, including
+-- the summary seed near the end of the file, never run; a live writer
+-- mutating carry state in that gap leaves a permanently partial summary
+-- (#124). A per-statement autocommit apply of this file is a bug regardless
+-- of who performs it.
+BEGIN;
 
 CREATE TABLE IF NOT EXISTS qbit_ledger_writer_lease (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
@@ -176,7 +190,10 @@ ALTER TABLE qbit_pool_blocks
 -- independent of block height. Upgrade existing confirmed and inactive rows
 -- deterministically and advance the sequence beyond any value already installed
 -- by a partial migration.
-BEGIN;
+--
+-- This serialized phase relies on the whole-file BEGIN/COMMIT wrapper: the
+-- transaction-scoped advisory lock is held from here until the end of the
+-- entire apply, serializing concurrent appliers of this migration.
 SELECT pg_advisory_xact_lock(
     hashtext('qbit_audit_publication_sequence_migration')
 );
@@ -743,9 +760,11 @@ BEGIN
 END;
 $$;
 
--- Sequence operations are nontransactional in PostgreSQL. Keep the sole
--- allocator mutation after every row and catalog validation so any earlier
--- rejection leaves an existing sequence's exact state untouched.
+-- Sequence operations are nontransactional in PostgreSQL only outside an
+-- enclosing transaction. The whole file applies inside one (see the top of
+-- the file), so any rejection of this or an earlier statement rolls the
+-- allocator mutation back with everything else; the sole setval still runs
+-- last, after every row and catalog validation.
 DO $$
 DECLARE
     maximum_sequence bigint;
@@ -783,7 +802,6 @@ BEGIN
     END IF;
 END;
 $$;
-COMMIT;
 
 CREATE TABLE IF NOT EXISTS qbit_pool_audit_bundles (
     block_hash text PRIMARY KEY REFERENCES qbit_pool_blocks(block_hash),
@@ -1491,27 +1509,6 @@ CREATE TRIGGER qbit_pool_blocks_carry_forward_current_truncate_sync
     FOR EACH STATEMENT
     EXECUTE FUNCTION qbit_carry_forward_current_truncate_sync();
 
--- Seed the summary exactly once when this schema is applied to a database
--- that already holds active carry history (the summary can only be empty
--- while active rows exist before the triggers above have ever run).
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM qbit_payout_carry_forward_current)
-       AND EXISTS (
-           SELECT 1
-           FROM qbit_payout_carry_forward carry
-           JOIN qbit_pool_blocks block
-             ON block.block_hash = carry.block_hash
-           WHERE carry.maturity_state <> 'reversed'
-             AND block.chain_state = 'confirmed'
-             AND block.maturity_state <> 'reversed'
-       )
-    THEN
-        PERFORM qbit_rebuild_carry_forward_current_balances();
-    END IF;
-END
-$$;
-
 CREATE OR REPLACE FUNCTION qbit_current_carry_forward_balances()
 RETURNS TABLE (
     miner_id text,
@@ -1616,6 +1613,47 @@ AS $$
        OR current_row.miner_id IS DISTINCT FROM recomputed_row.miner_id
        OR current_row.payout_order_key IS DISTINCT FROM recomputed_row.payout_order_key
     ORDER BY 1;
+$$;
+
+-- Seed or repair the summary from carry history whenever the summary
+-- disagrees with what it summarizes. This must run after the drift function
+-- above and after the sync triggers earlier in the file. A non-atomic apply
+-- (a per-statement autocommit psql run) can commit those triggers before
+-- this block runs; a live writer mutating carry state in that gap leaves a
+-- partial summary holding only post-trigger deltas. The previous guard
+-- seeded only when the summary was empty, so it treated that partial
+-- summary as already seeded and locked the damage in permanently on this
+-- apply and every later one, silently under-reporting every miner's balance
+-- by their pre-upgrade carry. Comparing the summary's active row-count
+-- total against the active carry history -- plus the drift check for
+-- balance-only divergence -- makes this a repair instead: an
+-- already-poisoned deployment is rebuilt from history by the next apply.
+-- Both counts come from one statement, so a concurrent commit cannot
+-- manufacture a false mismatch between them; a rebuild it triggers is
+-- correct by construction (it is the same recomputation the truncate
+-- triggers perform).
+DO $$
+DECLARE
+    summary_active_rows bigint;
+    ledger_active_rows bigint;
+BEGIN
+    SELECT
+        (SELECT COALESCE(SUM(active_row_count), 0)
+           FROM qbit_payout_carry_forward_current),
+        (SELECT COUNT(*)
+           FROM qbit_payout_carry_forward carry
+           JOIN qbit_pool_blocks block
+             ON block.block_hash = carry.block_hash
+          WHERE carry.maturity_state <> 'reversed'
+            AND block.chain_state = 'confirmed'
+            AND block.maturity_state <> 'reversed')
+    INTO summary_active_rows, ledger_active_rows;
+    IF summary_active_rows <> ledger_active_rows
+       OR EXISTS (SELECT 1 FROM qbit_carry_forward_current_drift())
+    THEN
+        PERFORM qbit_rebuild_carry_forward_current_balances();
+    END IF;
+END
 $$;
 
 CREATE OR REPLACE FUNCTION qbit_current_owed_balances()
@@ -2472,3 +2510,7 @@ BEGIN
     RETURN block_count + payout_count + carry_count + fanout_count;
 END;
 $$;
+
+-- Pairs with the BEGIN at the top of the file: the apply is one transaction
+-- no matter which client performs it.
+COMMIT;

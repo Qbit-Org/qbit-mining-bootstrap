@@ -2746,8 +2746,16 @@ class PsqlShareLedger:
                 raise ValueError(
                     "PRISM_POSTGRES_NATIVE_CLIENT=1 requires the psycopg package"
                 ) from None
-            # Silent fallback: which execution backend is active is reported
-            # by the owning daemon's startup line via execution_backend.
+            # The daemon's startup line reports the active execution backend,
+            # but this silent capability loss is worth its own line too: the
+            # psql fallback applies the schema through a subprocess whose
+            # atomicity contract every operator relies on.
+            print(
+                "prism ledger native PostgreSQL client unavailable: "
+                "psycopg import failed; falling back to the psql subprocess "
+                "backend",
+                flush=True,
+            )
             return None
 
     def _make_writer_lease_guard(
@@ -8181,6 +8189,19 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
         cmd = [
             *self._command,
             "--no-psqlrc",
+            # One transaction per invocation. For the multi-statement schema
+            # script this is belt-and-braces alongside the BEGIN/COMMIT
+            # wrapper inside the script itself (psql tolerates the nested
+            # BEGIN with a warning): without atomicity, a failure or
+            # interruption mid-script can commit trigger definitions while
+            # later statements -- including the carry-forward summary seed --
+            # never run, and a live writer mutating carry state in that gap
+            # leaves a permanently partial summary. For single-statement
+            # queries this is semantically identical to autocommit. The SQL
+            # sent here contains no \connect and no commands that cannot run
+            # inside a transaction block; --no-psqlrc means no ON_ERROR_
+            # ROLLBACK can be injected from a psqlrc either.
+            "--single-transaction",
             "--set",
             "ON_ERROR_STOP=1",
             "--set",
