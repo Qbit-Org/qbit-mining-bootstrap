@@ -351,54 +351,139 @@ class PublicDispatchRoutingTests(unittest.TestCase):
 
 
 class RegistryCoverageTests(unittest.TestCase):
-    """No route literal may exist in the HTTP layer without a classification."""
+    """The HTTP layer's route literals must match the registry exactly.
+
+    The guard is a frozen snapshot of the string literals in each dispatch
+    function, compared for exact set equality. A looser substring match was
+    rejected on review: a new route that merely *extends* an existing literal
+    (for example a new ``/public/v1/blocks/...`` sub-route) would pass
+    unclassified, which is precisely the drift this guard exists to catch.
+    """
+
+    # Every "/"-prefixed string constant in audit_http.do_GET, including the
+    # prefix fragments the dispatcher matches against ("/audit/blocks/",
+    # "/status", ...). Adding a route without classifying it in
+    # lab/prism/endpoint_registry.py fails the snapshot equality first.
+    EXPECTED_DO_GET_LITERALS = frozenset(
+        {
+            "/",
+            "/audit/block/",
+            "/audit/blocks/",
+            "/audit/carry-forward-integrity",
+            "/audit/commitments/",
+            "/audit/fanouts/",
+            "/audit/fanouts/pending",
+            "/audit/latest",
+            "/audit/ledger-integrity",
+            "/audit/share-window",
+            "/bundle",
+            "/ctv-fanout-manifest-set",
+            "/ctv-fanouts",
+            "/healthz",
+            "/metrics",
+            "/miners/",
+            "/owed",
+            "/owed-balances",
+            "/payouts",
+            "/payouts/",
+            "/public/v1",
+            "/public/v1/",
+            "/status",
+        }
+    )
+
+    # Every "/"-prefixed string constant in public_api.dispatch.
+    EXPECTED_DISPATCH_LITERALS = frozenset(
+        {
+            "/",
+            "/public/v1/artifacts/",
+            "/public/v1/blocks",
+            "/public/v1/blocks/",
+            "/public/v1/fanouts/",
+            "/public/v1/fanouts/pending",
+            "/public/v1/hashrate-series",
+            "/public/v1/leaderboard",
+            "/public/v1/miners/",
+            "/public/v1/mining-configuration",
+            "/public/v1/pool-summary",
+            "/settlement-artifacts",
+        }
+    )
 
     def registry_paths(self) -> set[str]:
         return {path for endpoint in ENDPOINTS for path in endpoint.paths}
 
-    def normalized_registry_fragments(self) -> set[str]:
-        """Registry paths with placeholders removed, for substring matching."""
+    def assert_snapshot(self, literals: set[str], expected: frozenset[str]) -> None:
+        added = sorted(literals - expected)
+        removed = sorted(expected - literals)
+        self.assertEqual(
+            (added, removed),
+            ([], []),
+            "route literals in the HTTP layer changed without a matching "
+            "classification update in lab/prism/endpoint_registry.py "
+            f"(new: {added}, gone: {removed})",
+        )
 
-        fragments: set[str] = set()
+    def test_audit_http_route_literals_match_snapshot(self) -> None:
+        literals = string_literals(AUDIT_HTTP_PATH, "do_GET")
+        self.assertIn("/healthz", literals)
+        self.assert_snapshot(literals, self.EXPECTED_DO_GET_LITERALS)
+
+    def test_public_dispatch_route_literals_match_snapshot(self) -> None:
+        literals = string_literals(PUBLIC_API_PATH, "dispatch")
+        self.assertIn("/public/v1/pool-summary", literals)
+        self.assert_snapshot(literals, self.EXPECTED_DISPATCH_LITERALS)
+
+    def test_every_registry_path_is_reachable_through_a_route_literal(self) -> None:
+        # The snapshots pin the literals; this pins the other direction: every
+        # classified path must actually be matched by a literal from the
+        # dispatcher that owns it, so the registry cannot list a path nothing
+        # serves.
+        public = set(endpoint_registry.extracted_paths())
         for path in self.registry_paths():
-            fragments.add(path)
-            for placeholder in PLACEHOLDERS:
-                path = path.replace(placeholder, "\x00")
-            # Trailing placeholders leave an empty tail part, and a bare "/"
-            # part matches everything -- both would make this guard vacuous.
-            fragments.update(
-                part for part in path.split("\x00") if part not in {"", "/"}
+            surface = (
+                self.EXPECTED_DISPATCH_LITERALS
+                if path in public
+                else self.EXPECTED_DO_GET_LITERALS
             )
-        return fragments
+            with self.subTest(path=path):
+                self.assertTrue(
+                    any(
+                        path == literal or path.startswith(literal)
+                        for literal in surface
+                        if literal != "/"
+                    ),
+                    f"{path} is classified but no route literal in its "
+                    "dispatcher can match it",
+                )
 
-    def assert_literals_are_classified(self, literals: set[str]) -> None:
-        fragments = self.normalized_registry_fragments()
-        unclassified = sorted(
-            literal
-            for literal in literals
-            if not any(
-                literal == fragment
-                or fragment.startswith(literal)
-                or literal.startswith(fragment)
-                for fragment in fragments
-            )
+    def test_path_counts_are_pinned(self) -> None:
+        # The extraction set and the total surface are contract numbers:
+        # PR 2 moves exactly the 13 /public/v1 routes, and the registry
+        # classifies all 31 request paths the HTTP surface serves.
+        self.assertEqual(13, len(endpoint_registry.extracted_paths()))
+        self.assertEqual(31, len(self.registry_paths()))
+
+    def test_http_handler_is_get_only(self) -> None:
+        # The registry -- and the snapshot guard above -- only inspect do_GET
+        # and dispatch. If a do_POST ever appears, its routes would be
+        # invisible to the coverage tests, so pin the assumption the registry
+        # rests on: the HTTP surface answers GET only.
+        source = AUDIT_HTTP_PATH.read_text(encoding="utf-8")
+        handler_methods = sorted(
+            node.name
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FunctionDef)
+            and node.name.startswith("do_")
+            and node.name.isupper() is False
+            and node.name != "do_GET"
         )
         self.assertEqual(
             [],
-            unclassified,
-            "route literals present in the HTTP layer but absent from "
-            "lab/prism/endpoint_registry.py",
+            handler_methods,
+            "the endpoint registry only covers GET; new HTTP verb methods "
+            "need registry coverage first",
         )
-
-    def test_audit_http_route_literals_are_classified(self) -> None:
-        literals = string_literals(AUDIT_HTTP_PATH, "do_GET")
-        self.assertIn("/healthz", literals)
-        self.assert_literals_are_classified(literals)
-
-    def test_public_dispatch_route_literals_are_classified(self) -> None:
-        literals = string_literals(PUBLIC_API_PATH, "dispatch")
-        self.assertIn("/public/v1/pool-summary", literals)
-        self.assert_literals_are_classified(literals)
 
 
 if __name__ == "__main__":
