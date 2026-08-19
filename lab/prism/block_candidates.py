@@ -268,6 +268,41 @@ class BlockCandidatePorts:
     log: Callable[[str], None]
 
 
+def _candidate_block_hex(candidate: PrismBlockCandidate) -> str:
+    """Return the candidate's serialized block, never an unmaterialized one.
+
+    ``assemble_submission`` materializes ``block_hex`` only for a hash that
+    solved the block, which every candidate route requires, so a real
+    submission always carries the bytes by the time a candidate exists. If one
+    ever does not, the cause is a defect in that coupling and the block is
+    already lost -- but an empty value written to the durable intent loses it
+    twice, resurrecting after every restart as a candidate that can never be
+    offered to the node. Fail on the client thread instead, before the intent
+    is written. Duck-typed embedders that retain no block bytes at all keep
+    the historical empty-string behaviour: the invariant is a property of the
+    real submission type, and the landing path already guards them separately.
+
+    The guard deliberately does not apply to a durable replay. A replayed
+    candidate's intent already exists, and ``block_candidate_from_intent``
+    rebuilds every one of them as a real ``DirectQbitSubmission`` -- so an
+    embedder's tolerated empty value comes back wearing the strict type. The
+    only caller that re-encodes a replayed candidate is the credit-on-accept
+    append, which runs *after* the block has landed; raising there would fail
+    a credit for a block already in the chain, which is strictly worse than
+    re-persisting the same empty value the row already holds. Re-persisting an
+    existing intent is not the write this guard exists to stop.
+    """
+    submission = candidate.submission
+    block_hex = str(getattr(submission, "block_hex", ""))
+    if (
+        not block_hex
+        and not candidate.durable_replay
+        and isinstance(submission, direct_stratum.DirectQbitSubmission)
+    ):
+        raise ValueError("block candidate submission carries no serialized block")
+    return block_hex
+
+
 def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
     """Return the immutable JSON needed to resume a candidate after restart."""
     context = candidate.context
@@ -275,7 +310,7 @@ def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
     intent = {
         "schema": BLOCK_CANDIDATE_INTENT_SCHEMA,
         "block_hash_hex": str(submission.block_hash_hex).lower(),
-        "block_hex": str(getattr(submission, "block_hex", "")),
+        "block_hex": _candidate_block_hex(candidate),
         "coinbase_tx_hex": str(getattr(submission, "coinbase_tx_hex", "")),
         "parent_hash": str(context.template["previousblockhash"]).lower(),
         "expected_height": int(context.template["height"]),
